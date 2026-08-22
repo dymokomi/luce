@@ -1,3 +1,344 @@
+# A layout-aware lexer for Luce source. tokenize() turns a source string into a
+# flat token stream: the significant text tokens, the NEWLINE that ends each
+# logical line, the INDENT/DEDENT that open and close blocks, and a final EOF.
+# Newlines and indentation inside (), [], {} are suspended, per the layout rule.
+#
+# Literal tokens carry their exact source text; decoding escapes, numeric bases,
+# and interpolation is left to later passes. Errors report the first offending
+# position as tokenizer:LINE:COLUMN. A Tokenizer scans one source once.
+
+enum TokenKind:
+    name
+    keyword
+    int_lit
+    float_lit
+    str_lit
+    char_lit
+    op
+    newline
+    indent
+    dedent
+    eof
+
+struct Token:
+    kind: TokenKind
+    text: str
+    line: i64
+    column: i64
+
 class Tokenizer:
-    init():
-        print("Tokenizer")
+    private source: str
+    private tokens: list[Token]
+    private indents: list[i64]
+    private pos: i64
+    private line: i64
+    private line_start: i64
+    private depth: i64
+    private pending_layout: bool
+
+    init(source: str):
+        self.source = source
+        self.tokens = list[Token]()
+        self.indents = list[i64]()
+        self.indents.append(0)
+        self.pos = 0
+        self.line = 1
+        self.line_start = 0
+        self.depth = 0
+        self.pending_layout = true
+
+    func tokenize() -> list[Token]!:
+        while not self.at_end():
+            if self.pending_layout and self.depth == 0:
+                try self.take_layout()
+            else:
+                try self.take_token()
+        self.finish()
+        return self.tokens
+
+    # Resolve indentation at the start of a logical line. Blank and comment-only
+    # lines are skipped first — they never change the indentation.
+    private func take_layout() -> !:
+        while not self.at_end():
+            var width = 0
+            while self.pos + width < len(self.source) and self.source[self.pos + width] == ' ':
+                width += 1
+            let head = self.pos + width
+            if head < len(self.source) and self.source[head] == '\t':
+                error(self.at(width + 1) + "tabs are not valid indentation; use four spaces")
+
+            if head >= len(self.source):
+                self.pos = head
+                return
+            if self.source[head] == '\n':
+                self.pos = head
+                self.advance_line()
+            elif self.source[head] == '#':
+                self.pos = head
+                self.skip_comment()
+            else:
+                self.pos = head
+                try self.open_or_close_blocks(width)
+                self.pending_layout = false
+                return
+
+    # Emit the INDENT or DEDENT tokens that move from the current block depth to
+    # a line indented by `width`. Blocks step in by exactly four spaces (§3.2).
+    private func open_or_close_blocks(width: i64) -> !:
+        let top = self.indents[len(self.indents) - 1]
+        if width > top:
+            if width != top + 4:
+                error(self.at(width + 1) + "indentation must increase by four spaces")
+            self.indents.append(width)
+            self.emit(TokenKind.indent, "", width + 1)
+            return
+        while len(self.indents) > 1 and width < self.indents[len(self.indents) - 1]:
+            self.indents.remove(len(self.indents) - 1)
+            self.emit(TokenKind.dedent, "", width + 1)
+        if width != self.indents[len(self.indents) - 1]:
+            error(self.at(width + 1) + "dedent does not match any outer indentation")
+
+    # Scan one token, or consume one run of insignificant text (a space, a
+    # comment, or a newline).
+    private func take_token() -> !:
+        let start = self.pos
+        let col = start - self.line_start + 1
+        let c = self.peek()
+
+        if c == ' ':
+            self.pos += 1
+            return
+        if c == '#':
+            self.skip_comment()
+            return
+        if c == '\n':
+            if self.depth == 0:
+                self.emit(TokenKind.newline, "", col)
+                self.pending_layout = true
+            self.advance_line()
+            return
+        if c == '\t':
+            error(self.at(col) + "tabs are not allowed; use spaces")
+
+        if self.starts(start, "\"\"\""):
+            error(self.at(col) + "triple-quoted strings are not supported yet")
+
+        # f"...", r"...", b"..." — capture the whole literal, prefix included.
+        if is_string_prefix(c) and self.peek1() == '"':
+            self.pos += 1
+            try self.scan_quoted('"')
+            self.emit(TokenKind.str_lit, self.source[start:self.pos], col)
+            return
+        if c == '"':
+            try self.scan_quoted('"')
+            self.emit(TokenKind.str_lit, self.source[start:self.pos], col)
+            return
+        if c == '\'':
+            try self.scan_quoted('\'')
+            self.emit(TokenKind.char_lit, self.source[start:self.pos], col)
+            return
+
+        if is_ident_start(c):
+            self.pos += 1
+            while is_ident_continue(self.peek()):
+                self.pos += 1
+            let word = self.source[start:self.pos]
+            if is_keyword(word):
+                self.emit(TokenKind.keyword, word, col)
+            else:
+                self.emit(TokenKind.name, word, col)
+            return
+
+        if is_digit(c):
+            let kind = self.scan_number()
+            self.emit(kind, self.source[start:self.pos], col)
+            return
+
+        let width = self.operator_length(start)
+        if width > 0:
+            let text = self.source[start:start + width]
+            self.pos = start + width
+            self.emit(TokenKind.op, text, col)
+            if text == "(" or text == "[" or text == "{":
+                self.depth += 1
+            elif (text == ")" or text == "]" or text == "}") and self.depth > 0:
+                self.depth -= 1
+            return
+
+        error(self.at(col) + "unexpected character")
+
+    # Consume the opening quote through the matching close, backslash escapes
+    # included. A raw newline or end of source before the close is an error.
+    private func scan_quoted(quote: char) -> !:
+        let col = self.pos - self.line_start + 1
+        self.pos += 1
+        while not self.at_end():
+            let c = self.peek()
+            if c == '\\':
+                if self.pos + 1 >= len(self.source):
+                    error(self.at(col) + "unterminated literal")
+                self.pos += 2
+            elif c == '\n':
+                error(self.at(col) + "unterminated literal")
+            elif c == quote:
+                self.pos += 1
+                return
+            else:
+                self.pos += 1
+        error(self.at(col) + "unterminated literal")
+
+    # Consume a numeric literal, reporting whether it is integer or float. Bases
+    # and separators are consumed but not validated; that is a later pass.
+    private func scan_number() -> TokenKind:
+        var kind = TokenKind.int_lit
+        if self.peek() == '0' and is_base_prefix(self.peek1()):
+            self.pos += 2
+            self.skip_digits_of(true)
+        else:
+            self.skip_digits_of(false)
+            # A dot is a fraction only when a digit follows; "1.method" is not one.
+            if self.peek() == '.' and is_digit(self.peek1()):
+                kind = TokenKind.float_lit
+                self.pos += 1
+                self.skip_digits_of(false)
+            if self.peek() == 'e' or self.peek() == 'E':
+                kind = TokenKind.float_lit
+                self.pos += 1
+                if self.peek() == '+' or self.peek() == '-':
+                    self.pos += 1
+                self.skip_digits_of(false)
+        # An f32/f64 suffix forces float; other suffixes (u8, i32 …) keep the kind.
+        if is_alpha(self.peek()):
+            let suffix_start = self.pos
+            while is_ident_continue(self.peek()):
+                self.pos += 1
+            let suffix = self.source[suffix_start:self.pos]
+            if suffix == "f32" or suffix == "f64":
+                kind = TokenKind.float_lit
+        return kind
+
+    private func skip_digits_of(hex: bool):
+        while (hex and is_hex(self.peek())) or is_digit(self.peek()) or self.peek() == '_':
+            self.pos += 1
+
+    private func operator_length(i: i64) -> i64:
+        if self.starts(i, "//=") or self.starts(i, "<<=") or self.starts(i, ">>="):
+            return 3
+        if self.starts(i, "->") or self.starts(i, "==") or self.starts(i, "!=") or self.starts(i, "<=") or self.starts(i, ">=") or self.starts(i, "//") or self.starts(i, "<<") or self.starts(i, ">>") or self.starts(i, "+=") or self.starts(i, "-=") or self.starts(i, "*=") or self.starts(i, "/=") or self.starts(i, "%=") or self.starts(i, "&=") or self.starts(i, "|=") or self.starts(i, "^="):
+            return 2
+        if is_single_op(self.source[i]):
+            return 1
+        return 0
+
+    # Close any line the source left open, then close every block still on the
+    # stack, so the stream always ends NEWLINE-terminated and balanced.
+    private func finish():
+        if len(self.tokens) > 0:
+            let last = self.tokens[len(self.tokens) - 1]
+            if last.kind != TokenKind.newline and last.kind != TokenKind.indent and last.kind != TokenKind.dedent:
+                self.emit(TokenKind.newline, "", 1)
+        while len(self.indents) > 1:
+            self.indents.remove(len(self.indents) - 1)
+            self.emit(TokenKind.dedent, "", 1)
+        self.emit(TokenKind.eof, "", 1)
+
+    private func skip_comment():
+        while not self.at_end() and self.peek() != '\n':
+            self.pos += 1
+
+    private func advance_line():
+        self.pos += 1
+        self.line += 1
+        self.line_start = self.pos
+
+    private func emit(kind: TokenKind, text: str, col: i64):
+        self.tokens.append(Token(kind = kind, text = text, line = self.line, column = col))
+
+    private func at(col: i64) -> str:
+        return "tokenizer:" + str(self.line) + ":" + str(col) + ": "
+
+    private func starts(i: i64, s: str) -> bool:
+        if i + len(s) > len(self.source):
+            return false
+        return self.source[i:i + len(s)] == s
+
+    private func at_end() -> bool:
+        return self.pos >= len(self.source)
+
+    # peek/peek1 return '\u{0}' past the end; no valid token matches it, so scanning
+    # loops stop without a separate bounds check.
+    private func peek() -> char:
+        if self.pos >= len(self.source):
+            return '\u{0}'
+        return self.source[self.pos]
+
+    private func peek1() -> char:
+        if self.pos + 1 >= len(self.source):
+            return '\u{0}'
+        return self.source[self.pos + 1]
+
+
+func kind_name(kind: TokenKind) -> str:
+    match kind:
+        name:
+            return "name"
+        keyword:
+            return "keyword"
+        int_lit:
+            return "int"
+        float_lit:
+            return "float"
+        str_lit:
+            return "string"
+        char_lit:
+            return "char"
+        op:
+            return "op"
+        newline:
+            return "newline"
+        indent:
+            return "indent"
+        dedent:
+            return "dedent"
+        eof:
+            return "eof"
+
+func dump(tokens: list[Token]) -> str:
+    var out = ""
+    for t in tokens:
+        out = out + kind_name(t.kind)
+        if len(t.text) > 0:
+            out = out + " '" + t.text + "'"
+        out = out + " @" + str(t.line) + ":" + str(t.column) + "\n"
+    return out
+
+private func is_keyword(word: str) -> bool:
+    match word:
+        "and", "or", "not", "if", "elif", "else", "for", "while", "match", "in", "is", "break", "continue", "return", "defer", "func", "let", "var", "const", "class", "struct", "enum", "union", "interface", "import", "public", "private", "static", "mutating", "init", "deinit", "self", "weak", "spawn", "try", "catch", "alias", "extern", "true", "false", "none":
+            return true
+        else:
+            return false
+
+private func is_string_prefix(c: char) -> bool:
+    return c == 'f' or c == 'r' or c == 'b'
+
+private func is_digit(c: char) -> bool:
+    return c >= '0' and c <= '9'
+
+private func is_alpha(c: char) -> bool:
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+
+private func is_ident_start(c: char) -> bool:
+    return is_alpha(c)
+
+private func is_ident_continue(c: char) -> bool:
+    return is_alpha(c) or is_digit(c) or c == '_'
+
+private func is_hex(c: char) -> bool:
+    return is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+
+private func is_base_prefix(c: char) -> bool:
+    return c == 'x' or c == 'X' or c == 'o' or c == 'O' or c == 'b' or c == 'B'
+
+private func is_single_op(c: char) -> bool:
+    return c == '+' or c == '-' or c == '*' or c == '/' or c == '%' or c == '&' or c == '|' or c == '^' or c == '~' or c == '<' or c == '>' or c == '=' or c == ':' or c == ',' or c == '.' or c == '?' or c == '!' or c == '(' or c == ')' or c == '[' or c == ']' or c == '{' or c == '}' or c == '_'
