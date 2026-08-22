@@ -84,7 +84,7 @@ Small does not mean:
 
 | Area | Epoch 1 decision |
 | --- | --- |
-| Layout | Four-space indentation, no tabs, no semicolons, canonical formatter |
+| Layout | Four-space blocks; statement suites may stay on one line; no tabs or semicolons; canonical formatter |
 | Names | Static lexical scopes, case-sensitive, no local shadowing |
 | Bindings | Immutable `let`, mutable `var`; initializer required |
 | Numerics | Fixed-width integers/floats, explicit conversions, checked safe arithmetic |
@@ -120,15 +120,20 @@ Small does not mean:
 
 ### 3.2 Indentation and lines
 
-- A block begins after `:` and is indented exactly four spaces.
+- A statement suite after `:` is either exactly one simple statement on the same physical line or a newline followed by a block indented exactly four spaces. Type, enum, and interface bodies always use the indented form.
+- A same-line suite cannot contain a compound statement (`if`, `while`, `for`, or `match`), a nested suite such as a closure or `catch` handler, or a second statement. With no semicolons, the newline closes it unambiguously.
+- Same-line and indented suites create the same lexical scope. A following `elif` or `else` begins on its own line aligned with the original header.
 - Tabs are errors with a machine-applicable replacement.
 - Newlines terminate statements except inside `()`, `[]`, or `{}`.
 - There is no semicolon and no backslash line continuation.
 - A trailing comma is accepted in multi-line parameter, argument, tuple, array/list, map, and case-payload lists; the formatter inserts/preserves it where it stabilizes diffs.
 - Blank lines do not affect meaning.
 - The formatter is the single authority for line breaking and indentation.
+- The formatter preserves a valid same-line suite while it remains one statement on one physical line. If the statement must wrap, the formatter expands it to an indented suite.
 
 ```luce
+if cached: return result
+
 if image.width > maximum_width:
     let scale = maximum_width / f64(image.width)
     image.resize(scale)
@@ -694,12 +699,21 @@ A range is an immutable value `range[T]`. A closed range whose end is the intege
 
 ```luce
 match command:
-    .open(path):
-        open_document(path)
+    .open(path): open_document(path)
     .save(path):
+        validate_destination(path)
         save_document(path)
-    .quit:
-        return
+    .quit: return
+```
+
+An arm body is an ordinary suite. A single simple statement may follow the arm's `:` on the same line; multi-statement and nested control flow use the indented form. Compactness changes no semantics: `'0': return 0` is an explicit `return`, not a value silently produced by the arm.
+
+```luce
+func bit_value(c: char) -> u8?:
+    match c:
+        '0': return 0
+        '1': return 1
+        _: return none
 ```
 
 Epoch 1 patterns are deliberately closed:
@@ -713,7 +727,25 @@ A binding in a pattern is immutable and scoped to its case. Cases do not fall th
 
 Every `match` is exhaustive. The compiler names missing enum/optional/Boolean cases; integer/character/string matches normally end in `_`. Duplicate or unreachable cases are errors. A catch-all is permitted for a closed type, but the linter warns when spelling every case would preserve future diagnostics.
 
-Epoch 1 `match` is a statement, not an expression. Put the result in a small function when a value is needed; this avoids a second family of expression blocks and return rules.
+`match` is both a statement and an expression. As a statement each arm opens
+a `:` suite; where an expression is expected each arm instead **yields** a
+value with `=>`, and the whole `match` is the value the chosen arm yields.
+The two forms do not mix within one `match`: every arm is `:` or every arm is
+`=>`.
+
+This adopts the expression form the earlier freeze left open (it was gated on
+"substantial Luce code proves that exhaustive value selection needs too much
+helper or mutable staging code" — dogfooding the self-hosting compiler proved
+exactly that). It enters under a coherent rule that keeps the three arrows
+distinct, not as punctuation-only shorthand: **`->` declares a type**
+(a result, a function type), **`=>` yields a value** (a lambda body, a match
+arm), and **`:` opens a suite** of statements. An expression `match` takes its
+single result type from where it lands (a typed binding, a `return`, a declared
+argument) rather than from arm-type unification, is exhaustive by the same rule
+as the statement form, evaluates its scrutinee once, and `=>` yields into the
+surrounding expression — it is not an implicit `return`. It desugars to a
+hidden slot the chosen arm assigns and the surrounding expression reads, so it
+adds no new runtime instruction and no second family of return rules.
 
 ### 9.7 `return`
 
@@ -2182,6 +2214,8 @@ Diagnostics must trace generic constraints, effect propagation, import origins, 
 
 `luce fmt` is canonical and intentionally minimally configurable. It owns indentation, line breaks, spaces, imports, and trailing delimiters. Stability across versions is a compatibility goal; format churn requires an epoch/migration rationale.
 
+A legal same-line suite remains compact only while its body is one simple statement on one physical line. The formatter expands it to the ordinary four-space form rather than wrapping after `:`; it never joins an existing indented suite automatically.
+
 There is no formatter-disable directive in ordinary source. Generated native files are recognized as generated and formatted by the generator.
 
 ### 24.5 Tests
@@ -2341,7 +2375,8 @@ Repetition is first attacked through generics, functions, data tables, declarati
 
 - exceptions, `throw`, stack-region `try/catch`, and exception classes;
 - typed error-set unions;
-- `goto`, labels, loop values, match fallthrough/guards;
+- `goto`, labels, loop values, match fallthrough/guards (expression-valued
+  `match` was later adopted — §9.6);
 - force unwrap and implicit optional chaining;
 - implicit return of final expressions;
 - statement/expression blocks with competing value rules.
@@ -2349,7 +2384,7 @@ Repetition is first attacked through generics, functions, data tables, declarati
 
 ### 25.5 Surface and ecosystem exclusions
 
-- semicolons, indentation alternatives, formatter dialects;
+- semicolons, brace-delimited suite alternatives, formatter dialects;
 - wildcard/selective imports and ambient preludes;
 - mutable globals and module initialization code;
 - multiple package managers/manifests/lock formats;
@@ -2569,12 +2604,14 @@ export c func name(parameters) -> Type:
 
 ```luce
 if condition:
+if condition: return value
 elif condition:
 else:
 if let value = optional:
 while condition:
 for value in iterable:
 match value:
+    .case: return value
 break
 continue
 return value
@@ -2705,14 +2742,17 @@ c_enum_case     = IDENT, "=", INTEGER_LITERAL, NEWLINE ;
 export_c_function
                 = "func", IDENT, parameter_list, result_clause, ":", suite ;
 
-suite           = NEWLINE, INDENT, statement, { statement }, DEDENT ;
+suite           = simple_stmt
+                | NEWLINE, INDENT, statement, { statement }, DEDENT ;
 
-statement       = binding_stmt
-                | assignment_stmt
+statement       = simple_stmt
                 | if_stmt
                 | while_stmt
                 | for_stmt
-                | match_stmt
+                | match_stmt ;
+
+simple_stmt     = binding_stmt
+                | assignment_stmt
                 | "break", NEWLINE
                 | "continue", NEWLINE
                 | return_stmt
@@ -2872,7 +2912,7 @@ The page-by-page baseline remains the public [Luce documentation](https://luce.l
 
 ### 30.3 Decisions intentionally reopened by implementation evidence
 
-The compiler and standard library are the first pressure tests. If they expose a concrete shortfall, revisit the smallest adjacent mechanism—not the whole doctrine. Examples include measuring whether ARC/copy elision is sufficient before proposing regions, whether closure-scoped mutable views cover parsing/codegen before proposing `inout`, and whether generated C++ thunks meet performance budgets before coupling the language to one backend.
+The compiler and standard library are the first pressure tests. If they expose a concrete shortfall, revisit the smallest adjacent mechanism—not the whole doctrine. Examples include measuring whether ARC/copy elision is sufficient before proposing regions, whether one-statement arms avoid helper or mutable staging code before proposing expression-valued `match`, whether closure-scoped mutable views cover parsing/codegen before proposing `inout`, and whether generated C++ thunks meet performance budgets before coupling the language to one backend.
 
 The companion documents retain the deeper product requirements and C++ fixtures. This document is the normative source-surface/runtime/tool contract; where an older proposal conflicts with it, this clean-break specification wins after the conflict is recorded as a design decision.
 
@@ -2920,6 +2960,7 @@ This is the last whole-design audit before implementation. It applies the interv
 | --- | --- | --- |
 | Separate payload-free `enum` and payload-carrying `union` declarations | One payload-capable `enum` | Removes one keyword, declaration grammar, generic/layout rule family, teaching distinction, and tooling path without losing any data model. |
 | `**` exponent operator | Named checked integer power and `math.pow` APIs | Removes a precedence level and several mixed numeric/overflow rules; the uncommon operation remains clear and searchable. |
+| `=>` as shorthand for a short `match` arm | ~~The existing `:` plus a one-statement suite~~ — **later adopted (§9.6)** as the arm delimiter of the expression-valued `match` | A post-freeze revision took the expression form the audit had gated on dogfooding evidence. `=>` is not shorthand for `:`: it means "yields a value", the same role it plays in a lambda body, under a coherent `-> `/`=>`/`:` rule. |
 | `error` and `trap` as reserved syntax words | Compiler-known core calls returning `never` | Keeps exact failure semantics while shrinking the lexer/parser and making all terminators visibly call-shaped. |
 | A testing framework assembled from attributes, reflection, naming conventions, and privileged helpers | One static `test` declaration plus ordinary library/manifest facilities | Adds one high-yield keyword while removing several ecosystem mechanisms and making discovery, isolation, effects, and production erasure compiler-verifiable. |
 
