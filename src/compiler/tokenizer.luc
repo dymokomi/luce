@@ -1,11 +1,10 @@
-# A layout-aware lexer for Luce source. tokenize() turns a source string into a
-# flat token stream: the significant text tokens, the NEWLINE that ends each
-# logical line, the INDENT/DEDENT that open and close blocks, and a final EOF.
-# Newlines and indentation inside (), [], {} are suspended, per the layout rule.
+# The epoch-1 Luce tokenizer. It turns source text into significant tokens plus
+# the NEWLINE/INDENT/DEDENT layout stream consumed by the parser.
 #
-# Literal tokens carry their exact source text; decoding escapes, numeric bases,
-# and interpolation is left to later passes. Errors report the first offending
-# position as tokenizer:LINE:COLUMN. A Tokenizer scans one source once.
+# The implementation follows the lexical contracts in sections 3, 4, and 29 of
+# LUCE_LANGUAGE_DESIGN.md. Literal tokens retain their exact source spelling;
+# decoding their values remains a later compiler stage. Errors use stable
+# tokenizer:LINE:COLUMN locations and stop at the first invalid source form.
 
 enum TokenKind:
     name
@@ -13,6 +12,7 @@ enum TokenKind:
     int_lit
     float_lit
     str_lit
+    byte_lit
     char_lit
     op
     newline
@@ -30,46 +30,83 @@ class Tokenizer:
     private source: str
     private tokens: list[Token]
     private indent: i64
+    private brackets: list[char]
     private pos: i64
     private line: i64
     private line_start: i64
-    private bracket_depth: i64
     private pending_layout: bool
 
     init(source: str):
         self.source = source
         self.tokens = list[Token]()
         self.indent = 0
+        self.brackets = list[char]()
         self.pos = 0
         self.line = 1
         self.line_start = 0
-        self.bracket_depth = 0
         self.pending_layout = true
 
     func tokenize() -> list[Token]!:
+        try self.prepare_source()
         while not self.at_end():
-            if self.pending_layout and self.bracket_depth == 0:
+            if self.pending_layout and len(self.brackets) == 0:
                 try self.scan_layout()
             else:
                 try self.scan_token()
-        self.finish()
+        try self.finish()
         return self.tokens
 
+    # Validate source-wide rules before tokenization. The stage-0 `str` boundary
+    # already guarantees valid UTF-8, so this pass handles the remaining source
+    # restrictions and makes a byte-zero BOM invisible to token columns.
+    private func prepare_source() -> !:
+        if len(self.source) > 0 and self.source[0] == '\u{feff}':
+            self.pos = 1
+            self.line_start = 1
+
+        var i = self.pos
+        var source_line = 1
+        var source_column = 1
+        while i < len(self.source):
+            let c = self.source[i]
+            if c == '\u{0}':
+                error(location(source_line, source_column) + "NUL is not allowed in source")
+            if c == '\u{feff}':
+                error(location(source_line, source_column) + "a UTF-8 BOM is allowed only at byte zero")
+            if is_bidi_control(c):
+                error(location(source_line, source_column) + "bidirectional controls are not allowed in source")
+            if c == '\t':
+                error(location(source_line, source_column) + "tabs are not allowed; use spaces")
+
+            if c == '\r':
+                if i + 1 >= len(self.source) or self.source[i + 1] != '\n':
+                    error(location(source_line, source_column) + "carriage return must be followed by newline")
+                i += 2
+                source_line += 1
+                source_column = 1
+            elif c == '\n':
+                i += 1
+                source_line += 1
+                source_column = 1
+            else:
+                i += 1
+                source_column += 1
+
+    # Layout -----------------------------------------------------------------
+
     # Resolve indentation at the start of a logical line. Blank and comment-only
-    # lines are skipped first — they never change the indentation.
+    # lines are skipped first, so they never change the active block depth.
     private func scan_layout() -> !:
         while not self.at_end():
             var width = 0
             while self.pos + width < len(self.source) and self.source[self.pos + width] == ' ':
                 width += 1
             let head = self.pos + width
-            if head < len(self.source) and self.source[head] == '\t':
-                error(self.at(width + 1) + "tabs are not valid indentation; use four spaces")
 
             if head >= len(self.source):
                 self.pos = head
                 return
-            if self.source[head] == '\n':
+            if self.is_line_break_at(head):
                 self.pos = head
                 self.advance_line()
             elif self.source[head] == '#':
@@ -81,8 +118,8 @@ class Tokenizer:
                 self.pending_layout = false
                 return
 
-    # Move from the current indentation to `width`. Because every block is
-    # exactly four spaces, one number contains the same information as a stack.
+    # Every block step is exactly four spaces, so the current width contains the
+    # same information that a general indentation stack would contain.
     private func adjust_indent(width: i64) -> !:
         if width > self.indent:
             if width != self.indent + 4:
@@ -90,17 +127,21 @@ class Tokenizer:
             self.indent = width
             self.emit(TokenKind.indent, "", width + 1)
             return
+
         while width < self.indent:
             self.indent -= 4
             self.emit(TokenKind.dedent, "", width + 1)
         if width != self.indent:
             error(self.at(width + 1) + "dedent does not match any outer indentation")
 
-    # Scan one token, or consume one run of insignificant text (a space, a
-    # comment, or a newline).
+    # Token dispatch ----------------------------------------------------------
+
+    # Scan one significant token, or consume one run of insignificant source.
+    # Each token family owns its detailed scanning rules below.
     private func scan_token() -> !:
         let start = self.pos
-        let col = start - self.line_start + 1
+        let start_line = self.line
+        let column = self.current_column()
         let c = self.peek()
 
         if c == ' ':
@@ -109,118 +150,295 @@ class Tokenizer:
         if c == '#':
             self.skip_comment()
             return
-        if c == '\n':
-            if self.bracket_depth == 0:
-                self.emit(TokenKind.newline, "", col)
+        if c == '\n' or c == '\r':
+            if len(self.brackets) == 0:
+                self.emit(TokenKind.newline, "", column)
                 self.pending_layout = true
             self.advance_line()
             return
-        if c == '\t':
-            error(self.at(col) + "tabs are not allowed; use spaces")
 
-        if self.starts(start, "\"\"\""):
-            error(self.at(col) + "triple-quoted strings are not supported yet")
-
-        # f"...", r"...", b"..." — capture the whole literal, prefix included.
+        # A prefix is part of a string/byte literal only when a quote follows it.
         if is_string_prefix(c) and self.peek1() == '"':
-            self.pos += 1
-            try self.scan_quoted('"')
-            self.emit(TokenKind.str_lit, self.source[start:self.pos], col)
+            try self.scan_string_literal(start, start_line, column, c)
             return
         if c == '"':
-            try self.scan_quoted('"')
-            self.emit(TokenKind.str_lit, self.source[start:self.pos], col)
+            try self.scan_string_literal(start, start_line, column, '\u{0}')
             return
         if c == '\'':
-            try self.scan_quoted('\'')
-            self.emit(TokenKind.char_lit, self.source[start:self.pos], col)
+            try self.scan_char_literal(start, start_line, column)
             return
-
         if is_ident_start(c):
-            self.pos += 1
-            while is_ident_continue(self.peek()):
-                self.pos += 1
-            let word = self.source[start:self.pos]
-            if is_keyword(word):
-                self.emit(TokenKind.keyword, word, col)
-            else:
-                self.emit(TokenKind.name, word, col)
+            self.scan_identifier(start, start_line, column)
             return
-
         if is_digit(c):
-            let kind = self.scan_number()
-            self.emit(kind, self.source[start:self.pos], col)
+            try self.scan_number_token(start, start_line, column)
+            return
+        if self.operator_length(start) > 0:
+            try self.scan_operator(start, start_line, column)
             return
 
-        let width = self.operator_length(start)
-        if width > 0:
-            let text = self.source[start:start + width]
-            self.pos = start + width
-            self.emit(TokenKind.op, text, col)
-            if text == "(" or text == "[" or text == "{":
-                self.bracket_depth += 1
-            elif (text == ")" or text == "]" or text == "}") and self.bracket_depth > 0:
-                self.bracket_depth -= 1
-            return
+        error(self.at(column) + "unexpected character")
 
-        error(self.at(col) + "unexpected character")
-
-    # Consume the opening quote through the matching close, backslash escapes
-    # included. A raw newline or end of source before the close is an error.
-    private func scan_quoted(quote: char) -> !:
-        let col = self.pos - self.line_start + 1
+    private func scan_identifier(start: i64, start_line: i64, column: i64):
         self.pos += 1
+        while is_ident_continue(self.peek()):
+            self.pos += 1
+        let word = self.source[start:self.pos]
+        if is_keyword(word):
+            self.emit_at(TokenKind.keyword, word, start_line, column)
+        else:
+            self.emit_at(TokenKind.name, word, start_line, column)
+
+    # Literals ----------------------------------------------------------------
+
+    # String prefixes have deliberately separate meanings: r disables escapes,
+    # f enables interpolation fields, and b selects the byte-literal token kind.
+    private func scan_string_literal(start: i64, start_line: i64, column: i64, prefix: char) -> !:
+        var raw = false
+        var formatted = false
+        var byte_mode = false
+        if prefix != '\u{0}':
+            raw = prefix == 'r'
+            formatted = prefix == 'f'
+            byte_mode = prefix == 'b'
+            self.pos += 1
+
+        try self.scan_string_body(raw, formatted, byte_mode, start_line, column)
+        var kind = TokenKind.str_lit
+        if byte_mode:
+            kind = TokenKind.byte_lit
+        self.emit_at(kind, self.source[start:self.pos], start_line, column)
+
+    # Consume either a single-line or triple-quoted body. Triple strings update
+    # source positions for every physical line but remain one literal token.
+    private func scan_string_body(raw: bool, formatted: bool, byte_mode: bool, start_line: i64, column: i64) -> !:
+        let triple = self.starts(self.pos, "\"\"\"")
+        if triple:
+            self.pos += 3
+        else:
+            self.pos += 1
+
+        while not self.at_end():
+            if triple and self.starts(self.pos, "\"\"\""):
+                self.pos += 3
+                return
+
+            let c = self.peek()
+            if not triple and c == '"':
+                self.pos += 1
+                return
+            if not raw and c == '\\':
+                try self.scan_escape(byte_mode, start_line, column)
+            elif formatted and c == '{':
+                if self.starts(self.pos, "{{"):
+                    self.pos += 2
+                else:
+                    try self.scan_interpolation(triple, start_line, column)
+            elif formatted and c == '}':
+                if self.starts(self.pos, "}}"):
+                    self.pos += 2
+                else:
+                    error(location(start_line, column) + "unescaped '}' in formatted string")
+            elif c == '\n' or c == '\r':
+                if not triple:
+                    error(location(start_line, column) + "unterminated string literal")
+                self.advance_line()
+            else:
+                if byte_mode and c > '\u{7f}':
+                    error(self.at(self.current_column()) + "byte literals require ASCII source characters")
+                self.pos += 1
+
+        error(location(start_line, column) + "unterminated string literal")
+
+    # Interpolation stays inside one STRING token, but its balanced braces and
+    # nested quoted literals must be understood so an inner quote cannot end the
+    # outer formatted string accidentally.
+    private func scan_interpolation(multiline: bool, start_line: i64, column: i64) -> !:
+        self.pos += 1
+        var braces = 1
+        while not self.at_end():
+            let c = self.peek()
+            if is_string_prefix(c) and self.peek1() == '"':
+                let nested_line = self.line
+                let nested_column = self.current_column()
+                self.pos += 1
+                try self.scan_string_body(c == 'r', c == 'f', c == 'b', nested_line, nested_column)
+            elif c == '"':
+                let nested_line = self.line
+                let nested_column = self.current_column()
+                try self.scan_string_body(false, false, false, nested_line, nested_column)
+            elif c == '\'':
+                let nested_line = self.line
+                let nested_column = self.current_column()
+                try self.scan_char_body(nested_line, nested_column)
+            elif c == '{':
+                braces += 1
+                self.pos += 1
+            elif c == '}':
+                braces -= 1
+                self.pos += 1
+                if braces == 0:
+                    return
+            elif c == '#':
+                if not multiline:
+                    error(location(start_line, column) + "formatted string interpolation cannot cross a line")
+                self.skip_comment()
+            elif c == '\n' or c == '\r':
+                if not multiline:
+                    error(location(start_line, column) + "formatted string interpolation cannot cross a line")
+                self.advance_line()
+            else:
+                self.pos += 1
+
+        error(location(start_line, column) + "unterminated formatted string interpolation")
+
+    # A character literal is lexically one Unicode scalar after escape decoding.
+    private func scan_char_literal(start: i64, start_line: i64, column: i64) -> !:
+        try self.scan_char_body(start_line, column)
+        self.emit_at(TokenKind.char_lit, self.source[start:self.pos], start_line, column)
+
+    private func scan_char_body(start_line: i64, column: i64) -> !:
+        self.pos += 1
+        var scalars = 0
         while not self.at_end():
             let c = self.peek()
             if c == '\\':
-                if self.pos + 1 >= len(self.source):
-                    error(self.at(col) + "unterminated literal")
-                self.pos += 2
-            elif c == '\n':
-                error(self.at(col) + "unterminated literal")
-            elif c == quote:
+                try self.scan_escape(false, start_line, column)
+                scalars += 1
+            elif c == '\'':
                 self.pos += 1
+                if scalars != 1:
+                    error(location(start_line, column) + "character literal must contain one Unicode scalar")
                 return
+            elif c == '\n' or c == '\r':
+                error(location(start_line, column) + "unterminated character literal")
             else:
+                scalars += 1
                 self.pos += 1
-        error(self.at(col) + "unterminated literal")
+        error(location(start_line, column) + "unterminated character literal")
 
-    # Consume a numeric literal, reporting whether it is integer or float. Bases
-    # and separators are consumed but not validated; that is a later pass.
-    private func scan_number() -> TokenKind:
+    # Validate the finite escape vocabulary while leaving actual value decoding
+    # to the literal-lowering pass.
+    private func scan_escape(byte_mode: bool, start_line: i64, column: i64) -> !:
+        let escape_column = self.current_column()
+        self.pos += 1
+        if self.at_end() or self.peek() == '\n' or self.peek() == '\r':
+            error(location(start_line, column) + "unterminated literal escape")
+
+        let escaped = self.peek()
+        if escaped == '\\' or escaped == '"' or escaped == '\'' or escaped == 'n' or escaped == 'r' or escaped == 't' or escaped == '0':
+            self.pos += 1
+            return
+
+        if escaped == 'u' and self.peek1() == '{':
+            self.pos += 2
+            var digits = 0
+            var scalar = 0
+            while is_hex(self.peek()):
+                scalar = scalar * 16 + hex_value(self.peek())
+                digits += 1
+                self.pos += 1
+            if digits == 0 or digits > 6 or self.peek() != '}':
+                error(self.at(escape_column) + "Unicode escape must be \\u{HEX}")
+            if scalar > 1114111 or (scalar >= 55296 and scalar <= 57343):
+                error(self.at(escape_column) + "Unicode escape is not a scalar value")
+            self.pos += 1
+            return
+
+        if byte_mode and escaped == 'x':
+            self.pos += 1
+            if not is_hex(self.peek()) or not is_hex(self.peek1()):
+                error(self.at(escape_column) + "byte escape must contain exactly two hex digits")
+            self.pos += 2
+            return
+
+        error(self.at(escape_column) + "invalid literal escape")
+
+    # Numbers -----------------------------------------------------------------
+
+    # Consume and validate a complete numeric spelling. Literal lowering still
+    # owns value conversion and contextual range checks.
+    private func scan_number_token(start: i64, start_line: i64, column: i64) -> !:
+        let kind = try self.scan_number(column)
+        self.emit_at(kind, self.source[start:self.pos], start_line, column)
+
+    private func scan_number(column: i64) -> TokenKind!:
         var kind = TokenKind.int_lit
         if self.peek() == '0' and is_base_prefix(self.peek1()):
+            let base = self.peek1()
             self.pos += 2
-            self.skip_digits(true)
+            try self.scan_digit_sequence(base, column)
+            if is_digit(self.peek()):
+                error(self.at(self.current_column()) + "digit is not valid for this numeric base")
+            let suffix = self.scan_numeric_suffix()
+            if len(suffix) > 0 and not is_integer_suffix(suffix):
+                error(self.at(column) + "invalid integer literal suffix")
         else:
-            self.skip_digits(false)
-            # A dot is a fraction only when a digit follows; "1.method" is not one.
+            try self.scan_digit_sequence('d', column)
+            # A dot starts a fraction only when a digit follows. This keeps both
+            # `1.member` and the range spellings unambiguous.
             if self.peek() == '.' and is_digit(self.peek1()):
                 kind = TokenKind.float_lit
                 self.pos += 1
-                self.skip_digits(false)
+                try self.scan_digit_sequence('d', column)
             if self.peek() == 'e' or self.peek() == 'E':
                 kind = TokenKind.float_lit
                 self.pos += 1
                 if self.peek() == '+' or self.peek() == '-':
                     self.pos += 1
-                self.skip_digits(false)
-        # An f32/f64 suffix forces float; other suffixes (u8, i32 …) keep the kind.
-        if is_alpha(self.peek()):
-            let suffix_start = self.pos
-            while is_ident_continue(self.peek()):
-                self.pos += 1
-            let suffix = self.source[suffix_start:self.pos]
-            if suffix == "f32" or suffix == "f64":
+                try self.scan_digit_sequence('d', column)
+
+            let suffix = self.scan_numeric_suffix()
+            if is_float_suffix(suffix):
                 kind = TokenKind.float_lit
+            elif len(suffix) > 0 and (kind == TokenKind.float_lit or not is_integer_suffix(suffix)):
+                error(self.at(column) + "invalid numeric literal suffix")
         return kind
 
-    private func skip_digits(prefixed: bool):
-        while (prefixed and is_hex(self.peek())) or is_digit(self.peek()) or self.peek() == '_':
+    private func scan_digit_sequence(base: char, column: i64) -> !:
+        var digits = 0
+        var after_separator = false
+        while is_digit_for_base(self.peek(), base) or self.peek() == '_':
+            if self.peek() == '_':
+                if digits == 0 or after_separator:
+                    error(self.at(self.current_column()) + "underscores must separate numeric digits")
+                after_separator = true
+            else:
+                digits += 1
+                after_separator = false
             self.pos += 1
+        if digits == 0:
+            error(self.at(column) + "numeric literal requires a digit")
+        if after_separator:
+            error(self.at(self.current_column() - 1) + "numeric literal cannot end with underscore")
 
+    private func scan_numeric_suffix() -> str:
+        if not is_alpha(self.peek()):
+            return ""
+        let start = self.pos
+        while is_ident_continue(self.peek()):
+            self.pos += 1
+        return self.source[start:self.pos]
+
+    # Operators and delimiters -------------------------------------------------
+
+    private func scan_operator(start: i64, start_line: i64, column: i64) -> !:
+        let width = self.operator_length(start)
+        let text = self.source[start:start + width]
+        self.pos = start + width
+
+        if width == 1 and is_open_delimiter(text[0]):
+            self.brackets.append(text[0])
+        elif width == 1 and is_close_delimiter(text[0]):
+            try self.close_delimiter(text[0], column)
+        self.emit_at(TokenKind.op, text, start_line, column)
+
+    # Longest-match ordering is visible here: range and augmented-assignment
+    # spellings win before their two- and one-character prefixes.
     private func operator_length(i: i64) -> i64:
         if self.starts(i, "//=") or self.starts(i, "<<=") or self.starts(i, ">>="):
+            return 3
+        if self.starts(i, "..<") or self.starts(i, "..="):
             return 3
         if self.starts(i, "->") or self.starts(i, "==") or self.starts(i, "!="):
             return 2
@@ -232,47 +450,74 @@ class Tokenizer:
             return 2
         if self.starts(i, "%=") or self.starts(i, "&=") or self.starts(i, "|=") or self.starts(i, "^="):
             return 2
+        if self.starts(i, ".."):
+            return 2
         if is_single_op(self.source[i]):
             return 1
         return 0
 
-    # Close any line the source left open, then close every block still on the
-    # stack, so the stream always ends NEWLINE-terminated and balanced.
-    private func finish():
+    private func close_delimiter(close: char, column: i64) -> !:
+        if len(self.brackets) == 0:
+            error(self.at(column) + "closing delimiter has no matching opener")
+        let open = self.brackets[len(self.brackets) - 1]
+        if close != matching_close(open):
+            error(self.at(column) + "closing delimiter does not match its opener")
+        self.brackets.remove(len(self.brackets) - 1)
+
+    # Completion and source movement -----------------------------------------
+
+    private func finish() -> !:
+        if len(self.brackets) > 0:
+            error(self.at(self.current_column()) + "unclosed delimiter")
+
         if len(self.tokens) > 0:
             let last = self.tokens[len(self.tokens) - 1]
             if last.kind != TokenKind.newline and last.kind != TokenKind.indent and last.kind != TokenKind.dedent:
-                self.emit(TokenKind.newline, "", 1)
+                self.emit(TokenKind.newline, "", self.current_column())
         while self.indent > 0:
             self.indent -= 4
-            self.emit(TokenKind.dedent, "", 1)
-        self.emit(TokenKind.eof, "", 1)
+            self.emit(TokenKind.dedent, "", self.current_column())
+        self.emit(TokenKind.eof, "", self.current_column())
 
     private func skip_comment():
-        while not self.at_end() and self.peek() != '\n':
+        while not self.at_end() and self.peek() != '\n' and self.peek() != '\r':
             self.pos += 1
 
     private func advance_line():
-        self.pos += 1
+        if self.peek() == '\r':
+            self.pos += 2
+        else:
+            self.pos += 1
         self.line += 1
         self.line_start = self.pos
 
-    private func emit(kind: TokenKind, text: str, col: i64):
-        self.tokens.append(Token(kind = kind, text = text, line = self.line, column = col))
-
-    private func at(col: i64) -> str:
-        return "tokenizer:" + str(self.line) + ":" + str(col) + ": "
-
-    private func starts(i: i64, s: str) -> bool:
-        if i + len(s) > len(self.source):
+    private func is_line_break_at(i: i64) -> bool:
+        if i >= len(self.source):
             return false
-        return self.source[i:i + len(s)] == s
+        return self.source[i] == '\n' or self.source[i] == '\r'
+
+    private func emit(kind: TokenKind, text: str, column: i64):
+        self.emit_at(kind, text, self.line, column)
+
+    private func emit_at(kind: TokenKind, text: str, token_line: i64, column: i64):
+        self.tokens.append(Token(kind = kind, text = text, line = token_line, column = column))
+
+    private func current_column() -> i64:
+        return self.pos - self.line_start + 1
+
+    private func at(column: i64) -> str:
+        return location(self.line, column)
+
+    private func starts(i: i64, text: str) -> bool:
+        if i + len(text) > len(self.source):
+            return false
+        return self.source[i:i + len(text)] == text
 
     private func at_end() -> bool:
         return self.pos >= len(self.source)
 
-    # peek/peek1 return '\u{0}' past the end; no valid token matches it, so scanning
-    # loops stop without a separate bounds check.
+    # Sentinel peeks keep scanners compact. Raw NUL source is rejected by the
+    # preparation pass, so the sentinel can never be mistaken for source text.
     private func peek() -> char:
         if self.pos >= len(self.source):
             return '\u{0}'
@@ -284,21 +529,24 @@ class Tokenizer:
         return self.source[self.pos + 1]
 
 
+private func location(line: i64, column: i64) -> str:
+    return "tokenizer:" + str(line) + ":" + str(column) + ": "
+
 private func is_keyword(word: str) -> bool:
+    # Section 29.5 fixes this list at exactly 41 reserved words. `c`, `cpp`,
+    # `copy`, core types, effect names, `init`, and `deinit` remain contextual.
     match word:
-        "and", "or", "not", "in", "is":
+        "and", "as", "break", "catch", "class", "continue", "defer":
             return true
-        "if", "elif", "else", "match":
+        "elif", "else", "enum", "export", "false", "for", "func", "if":
             return true
-        "for", "while", "break", "continue", "return", "defer":
+        "implements", "import", "in", "interface", "is", "let", "match":
             return true
-        "func", "let", "var", "const", "class", "struct", "enum", "union", "interface":
+        "mutating", "new", "none", "not", "or", "public", "recover":
             return true
-        "import", "public", "private", "static", "mutating":
+        "return", "self", "spawn", "struct", "test", "true", "try", "type":
             return true
-        "init", "deinit", "self", "weak", "spawn":
-            return true
-        "try", "catch", "alias", "extern", "true", "false", "none":
+        "uses", "var", "weak", "while":
             return true
         else:
             return false
@@ -321,8 +569,82 @@ private func is_ident_continue(c: char) -> bool:
 private func is_hex(c: char) -> bool:
     return is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
 
+private func is_digit_for_base(c: char, base: char) -> bool:
+    if base == 'b' or base == 'B':
+        return c == '0' or c == '1'
+    if base == 'o' or base == 'O':
+        return c >= '0' and c <= '7'
+    if base == 'x' or base == 'X':
+        return is_hex(c)
+    return is_digit(c)
+
+private func is_integer_suffix(suffix: str) -> bool:
+    match suffix:
+        "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64":
+            return true
+        else:
+            return false
+
+private func is_float_suffix(suffix: str) -> bool:
+    return suffix == "f16" or suffix == "f32" or suffix == "f64"
+
+private func hex_value(c: char) -> i64:
+    match c:
+        '0':
+            return 0
+        '1':
+            return 1
+        '2':
+            return 2
+        '3':
+            return 3
+        '4':
+            return 4
+        '5':
+            return 5
+        '6':
+            return 6
+        '7':
+            return 7
+        '8':
+            return 8
+        '9':
+            return 9
+        'a', 'A':
+            return 10
+        'b', 'B':
+            return 11
+        'c', 'C':
+            return 12
+        'd', 'D':
+            return 13
+        'e', 'E':
+            return 14
+        else:
+            return 15
+
 private func is_base_prefix(c: char) -> bool:
     return c == 'x' or c == 'X' or c == 'o' or c == 'O' or c == 'b' or c == 'B'
+
+private func is_open_delimiter(c: char) -> bool:
+    return c == '(' or c == '[' or c == '{'
+
+private func is_close_delimiter(c: char) -> bool:
+    return c == ')' or c == ']' or c == '}'
+
+private func matching_close(open: char) -> char:
+    if open == '(':
+        return ')'
+    if open == '[':
+        return ']'
+    return '}'
+
+private func is_bidi_control(c: char) -> bool:
+    if c == '\u{061c}' or c == '\u{200e}' or c == '\u{200f}':
+        return true
+    if c >= '\u{202a}' and c <= '\u{202e}':
+        return true
+    return c >= '\u{2066}' and c <= '\u{2069}'
 
 private func is_single_op(c: char) -> bool:
     match c:
