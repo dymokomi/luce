@@ -1,11 +1,32 @@
 # Luce
 
-The Luce language, epoch 1 — written in Luce.
+Luce is the epoch-1 compiler, written in the language it is building. The
+frozen [Luce 0.18 toolchain](https://github.com/dymokomi/luce-stage-0) provides
+the seed compiler and differential oracle.
 
-This repository holds the next Luce compiler, built with the frozen
-[stage-0 toolchain](https://github.com/dymokomi/luce-stage-0) as its
-seed and differential oracle. `LUCE_LANGUAGE_DESIGN.md` is the
-normative design.
+## Mental model
 
-Stage 0 imposes no compatibility requirement on this language — it is
-only the seed.
+`src/luce.luc` → `src/compiler/pipeline.luc` → `src/compiler/tokenizer.luc`
+
+- `luce.luc` owns the command-line interface.
+- `pipeline.luc` applies compiler stages to each input file.
+- `tokenizer.luc` turns source text into layout-aware tokens.
+- `*_test.luc` files sit beside the code they test.
+
+The compiler is intentionally early: `luce build` currently reads and tokenizes
+each input. New stages should extend the pipeline without leaking compiler logic
+into the CLI.
+
+## Develop
+
+```sh
+./bootstrap.sh
+./stage0/bin/luce-0 check src/luce.luc
+./stage0/bin/luce-0 test src
+mkdir -p build
+./stage0/bin/luce-0 build src/luce.luc -o build/luce
+```
+
+`LUCE_LANGUAGE_DESIGN.md` is the normative epoch-1 specification. Source under
+`src/` must still use the stage-0 Luce 0.18 subset so the seed compiler can
+build it.
