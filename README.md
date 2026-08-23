@@ -32,3 +32,9 @@ mkdir -p build
 `LUCE_LANGUAGE_DESIGN.md` is the normative epoch-1 specification. Source under
 `src/` must still use the Stage-0 0.19 subset so the seed compiler can
 build it.
+
+## Examples
+
+`examples/` contains epoch-1 programs ranging from `hello.luc` to multi-module
+and native-C interop examples. They are parsed as part of the test suite; see
+`examples/FEATURES.md` for complete source-surface coverage.

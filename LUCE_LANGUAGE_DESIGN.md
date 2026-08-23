@@ -102,7 +102,7 @@ Small does not mean:
 | Interfaces | Explicit conformance, methods only, no inheritance/defaults/associated types/casts |
 | Effects | Public `uses` sets, private inference, loader validation |
 | Concurrency | Isolated `spawn`, copied sendable value graphs, structured `task.wait()` |
-| Modules | One source file per module, explicit qualified imports, private by default |
+| Modules | One source file per module, explicit imports, private by default |
 | Packages | Manifest + exact lock + content identities; no ambient build scripts |
 | Testing | Static `test` declaration, ordinary safety/effects, isolated deterministic harness, complete production erasure |
 | Native | Direct safe C subset; generated C++ bridges; raw pointers only in audited `native` code |
@@ -146,7 +146,7 @@ if image.width > maximum_width:
 
 ## Public summary used by `luce doc`.
 ## Additional paragraphs remain plain Markdown.
-public func area(width: f64, height: f64) -> f64:
+pub func area(width: f64, height: f64) -> f64:
     return width * height
 ```
 
@@ -168,8 +168,8 @@ Style violations are formatter/linter diagnostics, not alternate language semant
 ### 3.5 Scope and shadowing
 
 - Names are resolved lexically.
-- Module declarations share one namespace: a type, function, constant, interface, or imported module cannot reuse the same visible name. Members have their own per-type namespace.
-- A local name may not shadow another still-visible local, parameter, capture, or imported module name.
+- Module declarations share one namespace: a type, function, constant, interface, or imported name cannot reuse the same visible name. Members have their own per-type namespace.
+- A local name may not shadow another still-visible local, parameter, capture, or imported name.
 - A case/catch/loop binding owns its nested scope and disappears afterward.
 - Type members and local variables may share a spelling because member access is qualified through `self` or another value.
 - Module declarations are order-independent. Local statements are sequential.
@@ -307,7 +307,7 @@ Generic brackets always contain types except the built-in `array[T, N]`, whose s
 ### 5.4 Type aliases
 
 ```luce
-public type Pixel = array[f32, 4]
+pub type Pixel = array[f32, 4]
 type SymbolTable = map[str, Symbol]
 ```
 
@@ -318,8 +318,8 @@ Epoch 1 aliases are non-generic and non-recursive. If a family deserves paramete
 For a domain distinction, use a one-field struct:
 
 ```luce
-public struct UserId:
-    public let value: u64
+pub struct UserId:
+    pub let value: u64
 ```
 
 Structs receive memberwise construction and structural operations when valid, so a domain type does not require a separate “newtype” feature in epoch 1.
@@ -513,7 +513,7 @@ Function/method calls may appear as statements. A non-`unit` result is discarded
 ### 8.1 Declaration
 
 ```luce
-public func clamp(value: f64, minimum: f64, maximum: f64) -> f64:
+pub func clamp(value: f64, minimum: f64, maximum: f64) -> f64:
     if value < minimum:
         return minimum
     if value > maximum:
@@ -585,8 +585,8 @@ Methods are functions declared inside a type. An explicit first `self` parameter
 
 ```luce
 struct Point:
-    public let x: f64
-    public let y: f64
+    pub let x: f64
+    pub let y: f64
 
     func distance_to(self, other: Point) -> f64:
         let dx = self.x - other.x
@@ -607,7 +607,7 @@ struct Point:
 
 ```luce
 struct Cursor:
-    public var position: u64
+    pub var position: u64
 
     mutating func advance(self, amount: u64):
         self.position += amount
@@ -782,16 +782,16 @@ Both may declare methods/type functions and implement interfaces. Structs store 
 ### 10.1 Structs
 
 ```luce
-public struct Point:
-    public let x: f64
-    public let y: f64
+pub struct Point:
+    pub let x: f64
+    pub let y: f64
     var cached_length: f64?
 ```
 
 A struct is a fixed collection of fields:
 
 - Every field uses the same binding words as a local: `let` for immutable or `var` for mutable.
-- A field is private to its module unless declared `public`.
+- A field is private to its module unless declared `pub`.
 - Fields have declaration order; that order is not a stable external ABI unless the type is explicitly exported through a native boundary.
 - A struct cannot inherit from another type.
 - A struct cannot directly contain itself. Recursive value data uses a class reference, list, or another indirection.
@@ -805,18 +805,18 @@ let point = Point(x: 10.0, y: 20.0, cached_length: none)
 The synthesized initializer is public only when the struct and every required field are public. Field defaults may omit arguments:
 
 ```luce
-public struct Style:
-    public let color: Color = Color(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
-    public let line_width: f64 = 1.0
+pub struct Style:
+    pub let color: Color = Color(red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0)
+    pub let line_width: f64 = 1.0
 ```
 
 A custom initializer uses a type function named `init`:
 
 ```luce
-public struct Percentage:
+pub struct Percentage:
     let value: f64
 
-    public func init(self, value: f64) -> unit!:
+    pub func init(self, value: f64) -> unit!:
         if value < 0.0 or value > 100.0:
             error(percent.out_of_range, "percentage must be 0 through 100")
         self.value = value
@@ -863,13 +863,13 @@ let magic: array[u8, 4] = [0x4c, 0x55, 0x43, 0x45]
 An enum is a closed sum. A case may have no payload or may carry named values:
 
 ```luce
-public enum Direction:
+pub enum Direction:
     north
     east
     south
     west
 
-public enum Command:
+pub enum Command:
     open(path: str)
     save(path: str)
     resize(width: u32, height: u32)
@@ -894,7 +894,7 @@ There is no user-defined operator overload. A domain needing unusual equality or
 
 ### 10.7 Visibility and representation
 
-`public` controls source API visibility, not memory-layout exposure. An ordinary public struct may change its private layout between package versions. Stable native representation requires a dedicated `export c` declaration checked by the compiler. There is no general-purpose layout attribute in ordinary Luce source.
+`pub` controls source API visibility, not memory-layout exposure. An ordinary public struct may change its private layout between package versions. Stable native representation requires a dedicated `export c` declaration checked by the compiler. There is no general-purpose layout attribute in ordinary Luce source.
 
 ## 11. Reference identity and classes
 
@@ -903,17 +903,17 @@ A class represents shared identity. It is reference-counted, final, and never co
 ### 11.1 Declaration and construction
 
 ```luce
-public class Document:
-    public let title: str
-    public var dirty: bool
+pub class Document:
+    pub let title: str
+    pub var dirty: bool
     var pages: list[Page]
 
-    public func init(self, title: str):
+    pub func init(self, title: str):
         self.title = title
         self.dirty = false
         self.pages = []
 
-    public func append(self, page: Page):
+    pub func append(self, page: Page):
         self.pages.append(page)
         self.dirty = true
 ```
@@ -963,9 +963,9 @@ Normal source contains no `retain`, `release`, `free`, ownership transfer, or bo
 
 ```luce
 class TreeNode:
-    public let name: str
-    public var children: list[TreeNode]
-    public weak var parent: TreeNode?
+    pub let name: str
+    pub var children: list[TreeNode]
+    pub weak var parent: TreeNode?
 
     func init(self, name: str):
         self.name = name
@@ -1249,9 +1249,9 @@ It is legal only within a fallible function or a `catch` handler. Its code is a 
 The standard error value is deliberately small:
 
 ```luce
-public struct Error:
-    public let code: ErrorCode
-    public let message: str
+pub struct Error:
+    pub let code: ErrorCode
+    pub let message: str
 ```
 
 `ErrorCode` is a small structural value containing a package-stable domain identifier and a `u32` value. The compiler/package tool assigns the domain identity and preserves a symbol table in diagnostics; declarations such as `files.not_found` are typed public constants. Codes do not allocate, collide across packages, or depend on localized text.
@@ -1259,7 +1259,7 @@ public struct Error:
 A package declares a code as a public top-level constant:
 
 ```luce
-public let not_found: ErrorCode = ErrorCode.package(1)
+pub let not_found: ErrorCode = ErrorCode.package(1)
 ```
 
 `ErrorCode.package(number)` is a restricted compile-time constructor that tags the number with the declaring package identity. The package checker requires numbers to be unique within that identity and publishes their symbolic module-qualified names. Runtime code cannot manufacture another package's code.
@@ -1425,8 +1425,8 @@ func first[T](values: slice[T]) -> T?:
     return values[0]
 
 struct Pair[A, B]:
-    public let first: A
-    public let second: B
+    pub let first: A
+    pub let second: B
 ```
 
 Type parameters are declared once in square brackets. Calls normally infer them from arguments; explicit arguments use the same notation when inference is impossible: `decode[Header](bytes)`.
@@ -1479,11 +1479,11 @@ An interface is a nominal set of callable requirements. It contains behavior, ne
 ### 16.1 Declaration and conformance
 
 ```luce
-public interface Writer:
+pub interface Writer:
     func write(self, data: slice[u8]) -> u64! uses files
     func flush(self) -> unit! uses files
 
-public class FileWriter implements Writer:
+pub class FileWriter implements Writer:
     # fields and implementations
 ```
 
@@ -1536,10 +1536,10 @@ The compiler and standard library jointly define a very small set of protocols n
 ### 17.1 Iteration
 
 ```luce
-public interface Iterator[T]:
+pub interface Iterator[T]:
     mutating func next(self) -> T?
 
-public interface Iterable[T]:
+pub interface Iterable[T]:
     func iterator(self) -> Iterator[T]
 ```
 
@@ -1570,7 +1570,7 @@ Effects state which host-controlled capabilities a function may use. They are no
 ### 18.1 Declaring effects
 
 ```luce
-public func fetch_manifest(url: Url) -> Manifest! uses network, clock, log:
+pub func fetch_manifest(url: Url) -> Manifest! uses network, clock, log:
     let response = try network.get(url)
     log.debug(f"received at {clock.now()}")
     return try manifest.parse(response.body)
@@ -1712,21 +1712,28 @@ Module dependency cycles are compile errors. The diagnostic prints the shortest 
 ```luce
 import image.color
 import data.serialization as serial
+from image.geometry import Point
 
 let foreground = image.color.black()
 let result = serial.decode[Project](bytes)
+let origin = Point(x: 0.0, y: 0.0)
 ```
 
-Imports name modules, not individual declarations. Imported names remain qualified except through an optional module alias. Epoch 1 has no wildcard, selective, relative, or implicit prelude imports. The small built-in type/function set is always in scope; everything else has a visible origin.
+`import` keeps a module qualified, with an optional short module alias. `from`
+imports one or more named public declarations into the current module. Selective
+imports have no per-name alias; when names collide, import the module with an
+alias and keep the use qualified. Epoch 1 has no wildcard, relative, re-export,
+or implicit prelude imports. The small built-in type/function set is always in
+scope; everything else has a visible origin at the leading import block.
 
 Imports must appear before declarations. Unused and duplicate imports are errors in checked package source, with automatic removal fixes.
 
 ### 20.3 Visibility
 
-Declarations and stored fields are module-private by default. `public` exposes a declaration through the package's source API:
+Declarations and stored fields are module-private by default. `pub` exposes a declaration through the package's source API. The short spelling mirrors `func`: visibility is explicit without dominating an intentionally small API.
 
 ```luce
-public func parse(text: str) -> Document!
+pub func parse(text: str) -> Document!
 ```
 
 There is no `protected`, package-private keyword, friend declaration, or visibility hierarchy. A package can group implementation into a module or expose a small public facade.
@@ -1738,7 +1745,7 @@ Public signatures may mention only public types from declared public dependencie
 A module may contain type, type-alias, function, interface, import, test, and constant declarations. Except for closures, declarations do not nest: functions contain statements, and types contain only fields/methods. A module may not contain executable statements or mutable globals.
 
 ```luce
-public let max_header_size: u64 = 16 * 1024
+pub let max_header_size: u64 = 16 * 1024
 ```
 
 A top-level `let` initializer is a restricted compile-time constant expression containing literals, arithmetic, tuples/fixed arrays, enum cases, memberwise construction of constant value types, and named compiler constructors such as `ErrorCode.package`. It cannot allocate dynamic storage, call arbitrary user code, fail, use effects, or depend on initialization order.
@@ -1750,7 +1757,7 @@ Global mutable state belongs in an explicitly constructed class owned by the app
 A standalone executable exports one conventional entry function:
 
 ```luce
-public func main(arguments: slice[str]) -> i32! uses files, environment:
+pub func main(arguments: slice[str]) -> i32! uses files, environment:
     return 0
 ```
 
@@ -1865,10 +1872,10 @@ Raw access remains available only in an `unsafe_native` function. Missing owners
 
 ```luce
 export c struct Pixel:
-    public let red: u8
-    public let green: u8
-    public let blue: u8
-    public let alpha: u8
+    let red: u8
+    let green: u8
+    let blue: u8
+    let alpha: u8
 
 export c func luce_blend(left: Pixel, right: Pixel) -> Pixel:
     # ...
@@ -1880,7 +1887,7 @@ export c enum BlendStatus as u32:
 
 `export c` accepts only a closed C-compatible subset with fixed representation. The compiler generates a header and ABI report. Fallible exported functions use generated status/result forms; classes, strings, collections, interface values, and Luce ARC never leak directly across the ABI.
 
-Exported enums spell a fixed integer representation and every numeric value; exported structs use declaration-order C layout and only C-compatible fields. An exported function uses a declared C calling convention, cannot unwind, and receives explicit handles/callbacks for host authority. A Luce trap at an export boundary follows the product's fatal-trap policy and is never presented to C as an ordinary error.
+Exported enums spell a fixed integer representation and every numeric value; exported structs use declaration-order C layout and only C-compatible fields. Every exported struct field is inherently part of both the generated source API and native ABI, so a redundant `pub` modifier is rejected. An exported function uses a declared C calling convention, cannot unwind, and receives explicit handles/callbacks for host authority. A Luce trap at an export boundary follows the product's fatal-trap policy and is never presented to C as an ordinary error.
 
 Opaque exported handles carry runtime/worker-domain affinity. The generated C API either validates that a call enters the owning domain, marshals a declared sendable request through a runtime entry queue, or rejects the operation; it never permits two foreign threads to mutate one ordinary Luce object concurrently.
 
@@ -2267,7 +2274,7 @@ The complete declaration form is `test STRING_LITERAL [uses effects]: suite`. A 
 - has a nonempty description unique within its module; its stable identity is package + module + description;
 - is compiled as a hidden zero-argument `unit!` function, so `try` may propagate directly into the harness and reaching the end means pass;
 - must declare every host effect with the ordinary `uses` clause;
-- cannot be `public`, generic, nested, parameterized, or returned from; reusable setup is an ordinary private function;
+- cannot be `pub`, generic, nested, parameterized, or returned from; reusable setup is an ordinary private function;
 - is checked with exactly the same typing, initialization, overflow, bounds, ARC, effect, and native-safety rules as production code.
 
 An unhandled `Error`, failed assertion, trap, host termination, leaked checked resource, or failed test-library expectation fails the test with its structured source trace. `return` is rejected inside a test so an accidental early pass cannot skip assertions.
@@ -2413,7 +2420,7 @@ Repetition is first attacked through generics, functions, data tables, declarati
 ### 25.5 Surface and ecosystem exclusions
 
 - semicolons, brace-delimited suite alternatives, formatter dialects;
-- wildcard/selective imports and ambient preludes;
+- wildcard imports and ambient preludes;
 - mutable globals and module initialization code;
 - multiple package managers/manifests/lock formats;
 - user-configurable hidden build hooks;
@@ -2608,10 +2615,10 @@ This section is a checklist for parser, formatter, documentation, and editor cov
 ```luce
 let name: Type = value
 var name: Type = value
-public let constant: Type = constant_value
+pub let constant: Type = constant_value
 
 func name(parameters) -> Type:
-public func name[T: Interface](parameters) -> Type! uses effect:
+pub func name[T: Interface](parameters) -> Type! uses effect:
 mutating func name(self, parameters):
 
 struct Name:
@@ -2623,6 +2630,7 @@ test "description":
 test "description" uses effect:
 import module.path
 import module.path as alias
+from module.path import Name, function
 export c struct Name:
 export c enum Name as u32:
 export c func name(parameters) -> Type:
@@ -2696,8 +2704,8 @@ suite or the indented arm list of a `match` expression.
 
 ```text
 and as break catch class continue defer elif else enum export false
-for func if implements import in interface is let match mutating new none not or
-public recover return self spawn struct test true try type uses var weak while
+for from func if implements import in interface is let match mutating new none not or
+pub recover return self spawn struct test true try type uses var weak while
 ```
 
 `c`, `cpp`, capture-list `copy`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
@@ -2709,10 +2717,12 @@ This EBNF fixes the parser shape. Semantic restrictions in the earlier sections 
 ```ebnf
 module          = { import_decl }, { top_decl }, EOF ;
 
-import_decl     = "import", module_path, [ "as", IDENT ], NEWLINE ;
+import_decl     = "import", module_path, [ "as", IDENT ], NEWLINE
+                | "from", module_path, "import", IDENT,
+                  { ",", IDENT }, NEWLINE ;
 module_path     = IDENT, { ".", IDENT } ;
 
-top_decl        = [ "public" ],
+top_decl        = [ "pub" ],
                   ( constant_decl
                   | type_alias
                   | function_decl
@@ -2748,14 +2758,14 @@ struct_decl     = "struct", TYPE_IDENT, [ generic_params ],
 class_decl      = "class", TYPE_IDENT, [ generic_params ],
                   implements_clause, ":", type_suite ;
 type_suite      = NEWLINE, INDENT, type_member, { type_member }, DEDENT ;
-type_member     = [ "public" ], ( field_decl | function_decl ) ;
+type_member     = [ "pub" ], ( field_decl | function_decl ) ;
 field_decl      = [ "weak" ], ( "let" | "var" ), IDENT, ":", type,
                   [ "=", constant_expression ], NEWLINE ;
 
 enum_decl       = "enum", TYPE_IDENT, [ generic_params ],
                   implements_clause, ":", NEWLINE, INDENT,
                   enum_case, { enum_case },
-                  { [ "public" ], function_decl }, DEDENT ;
+                  { [ "pub" ], function_decl }, DEDENT ;
 enum_case       = IDENT, [ payload_list ], NEWLINE ;
 payload_list    = "(", [ payload, { ",", payload }, [ "," ] ], ")" ;
 payload         = IDENT, ":", type ;
@@ -2770,7 +2780,7 @@ export_c_decl   = "export", "c", ( export_c_struct
                                   | export_c_function ) ;
 export_c_struct = "struct", TYPE_IDENT, ":", NEWLINE, INDENT,
                   export_c_field, { export_c_field }, DEDENT ;
-export_c_field  = [ "public" ], "let", IDENT, ":", c_compatible_type, NEWLINE ;
+export_c_field  = "let", IDENT, ":", c_compatible_type, NEWLINE ;
 export_c_enum   = "enum", TYPE_IDENT, "as", integer_type, ":", NEWLINE, INDENT,
                   c_enum_case, { c_enum_case }, DEDENT ;
 c_enum_case     = IDENT, "=", INTEGER_LITERAL, NEWLINE ;
@@ -3011,10 +3021,12 @@ This is the last whole-design audit before implementation. It applies the interv
 | Separate payload-free `enum` and payload-carrying `union` declarations | One payload-capable `enum` | Removes one keyword, declaration grammar, generic/layout rule family, teaching distinction, and tooling path without losing any data model. |
 | `**` exponent operator | Named checked integer power and `math.pow` APIs | Removes a precedence level and several mixed numeric/overflow rules; the uncommon operation remains clear and searchable. |
 | `=>` as shorthand for a short `match` arm | ~~The existing `:` plus a one-statement suite~~ — **later adopted (§9.6)** as the arm delimiter of the expression-valued `match` | A post-freeze revision took the expression form the audit had gated on dogfooding evidence. `=>` is not shorthand for `:`: it means "yields a value", the same role it plays in a lambda body, under a coherent `-> `/`=>`/`:` rule. |
+| Mandatory module qualification at every use | Explicit-name `from` imports alongside qualified module imports | Adds one keyword but removes repeated path noise and local forwarding shims; omitting wildcards and per-name aliases keeps origin and collision repair obvious. |
+| Long `public` visibility modifier | `pub` | Keeps exported boundaries explicit while matching concise `func` and reducing noise in modules with several intentional API declarations. |
 | `error` and `trap` as reserved syntax words | Compiler-known core calls returning `never` | Keeps exact failure semantics while shrinking the lexer/parser and making all terminators visibly call-shaped. |
 | A testing framework assembled from attributes, reflection, naming conventions, and privileged helpers | One static `test` declaration plus ordinary library/manifest facilities | Adds one high-yield keyword while removing several ecosystem mechanisms and making discovery, isolation, effects, and production erasure compiler-verifiable. |
 
-The resulting epoch 1 lexer has 41 reserved words, the ordinary data model has two named value declarations (`struct`, `enum`) plus final `class` identity, and expression precedence has 11 levels. These are budgets, not vanity metrics: any increase must identify the older concept or system complexity it removes.
+The resulting epoch 1 lexer has 42 reserved words, the ordinary data model has two named value declarations (`struct`, `enum`) plus final `class` identity, and expression precedence has 11 levels. These are budgets, not vanity metrics: any increase must identify the older concept or system complexity it removes.
 
 ### 33.2 Features that survive the budget
 
