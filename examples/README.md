@@ -1,10 +1,12 @@
 # Examples
 
-These programs target the epoch-1 language in `LUCE_LANGUAGE_DESIGN.md`. The
-compiler is still in its parsing phase, so the examples currently validate
-source structure rather than execute.
+These programs target the epoch-1 language in `LUCE_LANGUAGE_DESIGN.md`. Every
+example is parser-checked; `semantic_core/` also passes through the current
+name-resolution and type-checking slice. Nothing executes yet.
 
 - `hello.luc` is the smallest executable module.
+- `semantic_core/` is the small multi-module function-and-control-flow slice
+  currently checked beyond parsing.
 - `language_tour.luc` covers declarations, data modeling, functions, control
   flow, closures, failure recovery, effects, workers, and static tests.
 - `operators_and_literals.luc` is a focused reference for the remaining value,
@@ -22,12 +24,9 @@ these files. Payload enums are Luce's tagged unions; there is intentionally no
 second `union` declaration.
 
 Declarations without `pub` are intentionally module-private. Build the
-epoch-1 compiler, then parse individual programs or the complete module set:
+epoch-1 compiler, then exercise the semantic slice or all parser fixtures:
 
 ```sh
-./build/luce build examples/language_tour.luc
-./build/luce build examples/operators_and_literals.luc
-./build/luce build examples/checkout/catalog.luc examples/checkout/pricing.luc examples/checkout/main.luc
-./build/luce build examples/c_api.luc
-./build/luce build examples/c_import/temperature.luc examples/c_import/main.luc
+./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
+./stage0/bin/luce-0 test src/compiler/examples_test.luc
 ```

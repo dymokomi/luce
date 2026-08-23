@@ -2,7 +2,7 @@
 
 The target is the epoch-1 source surface in `LUCE_LANGUAGE_DESIGN.md` §29.6.
 Every syntax-tree form accepted by the current tokenizer and parser appears in
-at least one checked example. Runtime guarantees, package resolution, and
+at least one parser-checked example. Runtime guarantees, package resolution, and
 deliberately excluded syntax are outside this parser-era coverage claim.
 
 | Surface | Examples |

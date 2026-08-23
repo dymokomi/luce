@@ -6,18 +6,21 @@ provides the seed compiler and differential oracle.
 
 ## Mental model
 
-`src/luce.luc` → `pipeline.luc` → `tokenizer.luc` → `parser.luc` → `syntax.luc`
+`luce.luc` → `pipeline.luc` → `Tokenizer` → `Parser` → `Checker` → typed IR
 
 - `luce.luc` owns the command-line interface.
 - `pipeline.luc` applies compiler stages to each input file.
 - `tokenizer.luc` turns source text into layout-aware tokens.
 - `parser.luc` validates grammar and builds the source-faithful tree in
   `syntax.luc`.
+- `checker.luc` resolves module and lexical names, checks the implemented type
+  rules, and produces `typed_ir.luc`.
 - `*_test.luc` files sit beside the code they test.
 
-The compiler is intentionally early: `luce build` currently reads and parses
-each input. New stages should extend the pipeline without leaking compiler logic
-into the CLI.
+The parser covers the epoch-1 source surface. Semantic checking currently forms
+a smaller vertical slice: scalar functions, calls, bindings, assignment, basic
+operators, `if`, `while`, and returns. Other parsed forms fail explicitly until
+their semantic rules are implemented.
 
 ## Develop
 
@@ -27,6 +30,7 @@ into the CLI.
 ./stage0/bin/luce-0 test src
 mkdir -p build
 ./stage0/bin/luce-0 build src/luce.luc -o build/luce
+./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
 ```
 
 `LUCE_LANGUAGE_DESIGN.md` is the normative epoch-1 specification. Source under
