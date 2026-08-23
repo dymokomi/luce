@@ -6,7 +6,7 @@ provides the seed compiler and differential oracle.
 
 ## Mental model
 
-`luce.luc` → `pipeline.luc` → `Tokenizer` → `Parser` → `Checker` → typed IR
+`luce.luc` → `pipeline.luc` → `Tokenizer` → `Parser` → `Checker` → typed IR → `ExecutionBackend`
 
 - `luce.luc` owns the command-line interface.
 - `pipeline.luc` applies compiler stages to each input file.
@@ -15,12 +15,19 @@ provides the seed compiler and differential oracle.
   `syntax.luc`.
 - `checker.luc` resolves module and lexical names, checks the implemented type
   rules, and produces `typed_ir.luc`.
+- `backend.luc` defines the swappable execution boundary used by `luce run`.
+- `interpreter.luc` is the default backend and executes typed IR by resolved
+  symbol identity.
 - `*_test.luc` files sit beside the code they test.
 
-The parser covers the epoch-1 source surface. Semantic checking currently forms
-a smaller vertical slice: scalar functions, calls, bindings, assignment, basic
-operators, `if`, `while`, and returns. Other parsed forms fail explicitly until
-their semantic rules are implemented.
+The parser covers the epoch-1 source surface. The executable vertical slice is
+currently `bool`, `i64`, `f64`, and `unit` functions with calls, bindings,
+assignment, basic operators, `if`, `while`, and returns. Other parsed forms fail
+explicitly until their semantic rules are implemented.
+
+`ExecutionBackend` covers running a checked program. Artifact production will
+get a separate boundary after canonical IR exists, so C/JS emitters are not
+forced into an interpreter-shaped API.
 
 ## Develop
 
@@ -31,6 +38,7 @@ their semantic rules are implemented.
 mkdir -p build
 ./stage0/bin/luce-0 build src/luce.luc -o build/luce
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
+./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
 ```
 
 `LUCE_LANGUAGE_DESIGN.md` is the normative epoch-1 specification. Source under

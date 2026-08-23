@@ -2,11 +2,11 @@
 
 These programs target the epoch-1 language in `LUCE_LANGUAGE_DESIGN.md`. Every
 example is parser-checked; `semantic_core/` also passes through the current
-name-resolution and type-checking slice. Nothing executes yet.
+name-resolution, type-checking, and interpreter slice.
 
 - `hello.luc` is the smallest executable module.
 - `semantic_core/` is the small multi-module function-and-control-flow slice
-  currently checked beyond parsing.
+  currently executable beyond parsing.
 - `language_tour.luc` covers declarations, data modeling, functions, control
   flow, closures, failure recovery, effects, workers, and static tests.
 - `operators_and_literals.luc` is a focused reference for the remaining value,
@@ -28,5 +28,6 @@ epoch-1 compiler, then exercise the semantic slice or all parser fixtures:
 
 ```sh
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
+./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./stage0/bin/luce-0 test src/compiler/examples_test.luc
 ```
