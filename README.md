@@ -6,14 +6,16 @@ provides the seed compiler and differential oracle.
 
 ## Mental model
 
-`src/luce.luc` → `src/compiler/pipeline.luc` → `src/compiler/tokenizer.luc`
+`src/luce.luc` → `pipeline.luc` → `tokenizer.luc` → `parser.luc` → `syntax.luc`
 
 - `luce.luc` owns the command-line interface.
 - `pipeline.luc` applies compiler stages to each input file.
 - `tokenizer.luc` turns source text into layout-aware tokens.
+- `parser.luc` validates grammar and builds the source-faithful tree in
+  `syntax.luc`.
 - `*_test.luc` files sit beside the code they test.
 
-The compiler is intentionally early: `luce build` currently reads and tokenizes
+The compiler is intentionally early: `luce build` currently reads and parses
 each input. New stages should extend the pipeline without leaking compiler logic
 into the CLI.
 
