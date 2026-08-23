@@ -42,7 +42,7 @@ read end to end before the canonical IR grows.
 ```sh
 ./bootstrap.sh
 ./stage0/bin/luce-0 check src/luce.luc
-./stage0/bin/luce-0 test
+./test.sh
 mkdir -p build
 ./stage0/bin/luce-0 build src/luce.luc -o build/luce
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
