@@ -1,8 +1,8 @@
 # Luce
 
 Luce is the epoch-1 compiler, written in the language it is building. The
-frozen [Luce 0.18 toolchain](https://github.com/dymokomi/luce-stage-0) provides
-the seed compiler and differential oracle.
+frozen [Stage-0 0.19 toolchain](https://github.com/dymokomi/luce-stage-0)
+provides the seed compiler and differential oracle.
 
 ## Mental model
 
@@ -28,5 +28,5 @@ mkdir -p build
 ```
 
 `LUCE_LANGUAGE_DESIGN.md` is the normative epoch-1 specification. Source under
-`src/` must still use the stage-0 Luce 0.18 subset so the seed compiler can
+`src/` must still use the Stage-0 0.19 subset so the seed compiler can
 build it.

@@ -6,7 +6,7 @@ Status: normative design draft for the clean-break language
 
 Language epoch: 1
 
-Bootstrap: frozen Luce 0.18 is only the Stage 0 seed and imposes no compatibility requirement
+Bootstrap: frozen Stage-0 0.19 is only the seed and imposes no compatibility requirement
 
 Primary proving programs: the Luce compiler/tooling, LuciaOS evaluators and Views, and serious native applications
 
@@ -747,6 +747,10 @@ surrounding expression — it is not an implicit `return`. It desugars to a
 hidden slot the chosen arm assigns and the surrounding expression reads, so it
 adds no new runtime instruction and no second family of return rules.
 
+Use the expression form when surrounding code consumes the selected value. If
+every arm immediately exits the function, statement arms such as
+`'b', 'B': return is_binary(c)` communicate that control flow more directly.
+
 ### 9.7 `return`
 
 `return expression` exits the current function. A unit-returning function uses bare `return` or reaches its end. Every reachable path of any other function must return or terminate through `error`, `trap`, or `never`.
@@ -1322,14 +1326,38 @@ assert(index < items.length, "index must have been validated")
 
 ## 14. Closures and capture
 
-A closure is an anonymous function plus an environment:
+A closure is an anonymous function plus an environment. A single-expression
+closure uses `=>` to yield its value:
+
+```luce
+let positive: func(i64) -> bool = (value) => value > 0
+```
+
+The expected function type supplies the parameter and result types, so passing
+a lambda remains statically checked:
+
+```luce
+func accepts(value: i64, predicate: func(i64) -> bool) -> bool:
+    return predicate(value)
+
+let large = accepts(8, (value) => value > 5)
+```
+
+A parameter may include its type for clarity, as in
+`(value: i64) => value > 0`, but an expression lambda still requires an
+expected function type. `=>` yields from the lambda; it does not return from
+the enclosing function. The block form handles multiple statements, explicit
+capture policy, or an explicit result/effect signature:
 
 ```luce
 let double = func (value: i64) -> i64:
     return value * 2
 ```
 
-Closure parameter and return rules are identical to named functions. Effects and fallibility are written when required by the expected type or inferred for a local closure and then checked at conversion.
+Both forms use the capture rules below. Block-closure parameter and return
+rules are identical to named functions. Effects and fallibility are written
+when required by the expected type or inferred for a local closure and then
+checked at conversion.
 
 ### 14.1 Default captures
 
@@ -2060,7 +2088,7 @@ source -> tokens/layout -> syntax tree -> resolved typed IR -> ownership/effect 
 
 The canonical IR makes evaluation order, copies, ARC operations, failures, traps, effects, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed.
 
-The compiler is written in Luce after the 0.18 bootstrap compiler is frozen. Each self-hosting stage must reproduce the next stage's observable compiler behavior, with bootstrapping artifacts and hashes published.
+The compiler is written in Luce after the Stage-0 0.19 bootstrap compiler is frozen. Each self-hosting stage must reproduce the next stage's observable compiler behavior, with bootstrapping artifacts and hashes published.
 
 ### 23.2 Backend interface
 
@@ -2429,7 +2457,7 @@ Language epochs are rare, explicit package-manifest choices. Within an epoch:
 - public runtime/native ABI versions are explicit;
 - compiler improvements may optimize but not change observable behavior.
 
-An epoch migration ships with `luce migrate`, an API/behavior report, formatter stabilization, and side-by-side documentation. Luce 0.18 is the frozen bootstrap seed, not a compatibility constraint on Luce Next source.
+An epoch migration ships with `luce migrate`, an API/behavior report, formatter stabilization, and side-by-side documentation. Stage-0 0.19 is the frozen bootstrap seed, not a compatibility constraint on Luce Next source.
 
 ### 26.3 Reconsideration candidates
 
@@ -2450,8 +2478,8 @@ The compiler should be built in vertical slices that always leave one usable, te
 
 ### Phase 0 — freeze and semantic harness
 
-- Freeze 0.18 as the bootstrap compiler; publish exact source/artifact hashes.
-- Create the Luce Next lexer/parser/typed-IR packages in the subset 0.18 can compile.
+- Freeze Stage-0 0.19 as the bootstrap compiler; publish exact source/artifact hashes.
+- Create the Luce Next lexer/parser/typed-IR packages in the subset Stage-0 0.19 can compile.
 - Build golden syntax/diagnostic tests and differential interpreter tests.
 - Define language epoch, target description, package identity, and compiler artifact formats.
 - Treat this document's feature table and exclusions as change-controlled decisions.
@@ -2502,7 +2530,7 @@ Exit: representative libc, SQLite, image, compression, and OS APIs have small sa
 
 ### Phase 5 — self-host and LLVM production path
 
-- Port remaining compiler stages/tooling from 0.18 constraints into Luce Next.
+- Port remaining compiler stages/tooling from Stage-0 0.19 constraints into Luce Next.
 - LLVM debug/release code generation, link/debug/unwind support.
 - serialized generics/typed package artifacts and declaration-level incrementality.
 - reproducible compiler bootstrap comparison and performance budgets.
@@ -2632,7 +2660,10 @@ value[index]
 value[start..<end]
 function(arguments)
 new Class(arguments)
+(parameters) => expression
 func [captures] (parameters) -> Type: ...
+match value:
+    pattern => expression
 try fallible_expression
 fallible_expression catch failure: ...
 value if condition else alternative
@@ -2656,6 +2687,10 @@ From tightest to loosest grouping:
 11. `catch`.
 
 Assignment forms (`=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) are statements and evaluate the target once. An augmented assignment is available only when the corresponding built-in operation returns exactly the target type.
+
+`->`, `=>`, and `:` are grammar delimiters rather than precedence-bearing
+operators: `->` declares a type, `=>` yields a value, and `:` opens a statement
+suite or the indented arm list of a `match` expression.
 
 ### 29.5 Reserved words
 
@@ -2829,6 +2864,8 @@ primary_expr    = literal
                 | tuple_or_group
                 | list_literal
                 | map_literal
+                | lambda_expr
+                | match_expr
                 | closure_expr
                 | "new", base_type, argument_list
                 | "spawn", module_path, argument_list ;
@@ -2839,6 +2876,16 @@ tuple_or_group  = "(", expression,
 list_literal    = "[", [ expression, { ",", expression }, [ "," ] ], "]" ;
 map_literal     = "{", expression, ":", expression,
                   { ",", expression, ":", expression }, [ "," ], "}" ;
+
+lambda_expr     = lambda_parameter_list, "=>", expression ;
+lambda_parameter_list
+                = "(", [ lambda_parameter, { ",", lambda_parameter }, [ "," ] ], ")" ;
+lambda_parameter
+                = IDENT, [ ":", type ] ;
+
+match_expr      = "match", expression, ":", NEWLINE, INDENT,
+                  match_value_arm, { match_value_arm }, DEDENT ;
+match_value_arm = pattern, "=>", expression, NEWLINE ;
 
 closure_expr    = "func", [ capture_list ], parameter_list,
                   result_clause, effect_clause, ":", suite ;
@@ -2870,6 +2917,9 @@ Parser implementation uses the explicit declaration/statement productions and a 
 `constant_expression` and `c_compatible_type` are named semantic subsets rather than separate parsers: the former is section 20.4's effect-free restricted expression set, and the latter is the fixed-representation subset validated by section 21.5. `TYPE_PATH`, `CORE_TYPE`, `EFFECT_IDENT`, and the literal tokens are lexer/parser categories with the naming and literal rules from sections 3–5.
 
 In expression position, brackets immediately followed by an argument list are parsed as generic arguments when their contents form types (`decode[Header](data)`, `list[Node]()`); otherwise brackets are indexing/slicing. PascalCase type-parameter naming and core-type tokens make the common cases syntactically decisive. An actually ambiguous generated/native spelling requires qualification, and the diagnostic shows both parses rather than guessing.
+
+An opening `(` begins a lambda only when a valid lambda parameter list is
+immediately followed by `=>`; otherwise it begins an ordinary group or tuple.
 
 ## 30. Research and Luce reconciliation
 
@@ -2908,7 +2958,7 @@ The page-by-page baseline remains the public [Luce documentation](https://luce.l
 | Generated runtime C ABI but no complete user FFI | Replace with first-class C import/export and safe ownership/error/callback adapters |
 | C++ question unanswered | Add Clang/FIIR discovery, generated C ABI thunks, idiomatic safe wrappers; do not import the C++ object model |
 | Multiple public-version/document truths and incomplete editor tooling | One release manifest and one persistent compiler service generate every surface |
-| 0.18 source/artifact/API details | Freeze only as a reproducible bootstrap seed; promise no compatibility |
+| 0.18 source/artifact/API details | Retain as historical evidence; freeze Stage-0 0.19 as the reproducible seed; promise no compatibility |
 
 ### 30.3 Decisions intentionally reopened by implementation evidence
 
@@ -2920,7 +2970,7 @@ The companion documents retain the deeper product requirements and C++ fixtures.
 
 Do not label the language 1.0 merely because the parser accepts every construct. Epoch 1 becomes a stable adoption promise only when all of these are true:
 
-- the frozen 0.18 seed reproducibly builds the transition compiler, which builds a fixed-point self-hosted compiler;
+- the frozen Stage-0 0.19 seed reproducibly builds the transition compiler, which builds a fixed-point self-hosted compiler;
 - the compiler, formatter, language server, package manager, documentation generator, native binder, and core standard library are themselves substantial Luce programs;
 - the interpreter, LLVM backend, and every claimed direct backend pass the same behavior/trap/cleanup corpus;
 - warm editor/check latency, clean build time, peak compiler memory, generic expansion, runtime ARC/allocation, artifact size, and native bridge costs meet published budgets on named hardware;
