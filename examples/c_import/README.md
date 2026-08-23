@@ -19,7 +19,7 @@ independently:
 
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -fsyntax-only examples/c_import/temperature.c
-./stage0/bin/luce-0 test src/compiler/examples_test.luc
+./stage0/bin/luce-0 test tests/compiler/examples_test.luc
 ```
 
 Once `luce bind` is implemented, this directory becomes the first end-to-end C
