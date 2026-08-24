@@ -1347,7 +1347,11 @@ The linter flags errors discarded without an explicit policy. A package may defi
 - integer overflow in a checked operation;
 - division by zero;
 - failed internal invariant checks;
-- invalid native contract use detected by a checked wrapper.
+- invalid native contract use detected by a checked wrapper — including a
+  null token crossing a non-nullable extern slot (`null_foreign`) and C
+  text that is not valid UTF-8 arriving where a `str` was declared
+  (`invalid_utf8`), both checked at the boundary in every profile
+  (§21.16).
 
 Traps are not recoverable errors. They produce a diagnostic with source location and stack trace, then terminate the task/process according to host policy. Turning them into catchable exceptions would allow execution after memory or program invariants were already suspect.
 
@@ -2089,6 +2093,16 @@ The governing rules, stated once (the stage-0 FFI document is the detailed contr
 - **`out` parameters become extra results**, received by ordinary destructuring in declaration order after the declared return.
 - **`extern struct` is C layout, crossing by pointer** in both directions; by-value aggregates wait for generated shims. `cfunc(params) -> R` is C's function pointer: capture-free functions convert to it, struct fields and results of that type are callable, and the ARC-carrying trampoline is the generator's machinery, not the language's.
 - These declarations are the *raw* layer. FIIR, recipes, and the safe-wrapper generator (§21.1–21.15) stand above them unchanged; nothing here relaxes the ownership-recipe or unsafe-visibility rules.
+
+The finer rulings, each proven by a differential spec during the stage-0 implementation and carried forward as language law:
+
+- **There is no `null` literal, ever.** Absence is `none`; C's `NULL` is a boundary encoding detail. The conversion at absence is the ordinary optional toolkit: `let w = create_window() else error(last_error())` is the whole idiom.
+- **The niche lives in the ABI, never in the type.** A nullable handle is an ordinary `{token, present}` optional with no sentinel representation, because a *present zero token* and `none` must remain distinguishable — a zero token is a value a C library may legitimately traffic in, and a sentinel lowering would make the two engines disagree on `x == none` for exactly that value. The boundary is the decoder: one comparison decodes C's 0 to `none` on the way in and encodes `none` as 0 on the way out.
+- **The zero token is constructible and inert in-language.** An uninitialized handle variable holds it, it compares, it stores; only a *boundary crossing* through a non-`?` slot traps. A nonzero integer constant is never admitted as a handle value — that would be a forged pointer, and hostile modules offering one are refused at verification.
+- **An empty buffer's address is C's null.** A buffer-address operation over zero elements answers the zero token — there is nothing to point at — so a callee accepting C's null-with-zero-count convention declares its pointer parameter nullable, and a bare handle slot correctly traps on the empty case. This fell out of the trap's first run against the existing test corpus and is the design working as intended, not an accommodation.
+- **Text results validate or trap.** `-> str` copies immediately — NUL-scan, copy, UTF-8 validation — and invalid text traps (`invalid_utf8`) rather than laundering the `str` contract. An API that answers arbitrary bytes is not a `str` API; it is read with the byte-copy verb. Text arguments cross as NUL-terminated temporaries **borrowed for the call only**; a callee that keeps the pointer is undefined behavior, and an API that stores its argument needs a wrapper that keeps the buffer alive (recipe territory).
+- **Reading C-owned memory is a copy, spelled once.** Two library verbs — copy `count` bytes from a token; copy-and-validate the C string at a token — are the tier-two door for inbound memory. Copies need no borrow rules, no lifetimes, and no escape analysis. The outbound scoped-buffer form extends to dense numeric arrays, which is the door a BLAS binding walks through.
+- **The two boundary traps are unconditional.** `null_foreign` (a zero token through a bare slot, either direction) and `invalid_utf8` fire in every build profile — profiles cannot change error behavior, and each costs one comparison at a crossing that was never free. The mis-declared extern produces a trap with a trace at the exact call, never a corrupt pointer inside C.
 
 ## 22. Standard library boundary
 
