@@ -18,3 +18,7 @@ luce=./stage0/bin/luce-0-fast
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     ./tests/arm64_macos_test.sh ./stage0/bin/luce-0
 fi
+
+if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
+    ./tests/x86_64_linux_test.sh ./stage0/bin/luce-0
+fi

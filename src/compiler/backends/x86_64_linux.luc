@@ -1,0 +1,177 @@
+from compiler.backend import ArtifactBackend
+from compiler.canonical_ir import CanonicalFunction, CanonicalProgram
+import std.strings
+
+# A direct x86-64 Linux executable encoder, the native counterpart to the
+# Apple-silicon slice. It writes x86-64 instructions and the complete static
+# ELF container itself; the command-line driver only marks the finished bytes
+# executable, since Linux needs neither a signature nor a dynamic loader here.
+
+const elf_class_64: i64 = 2
+const elf_data_lsb: i64 = 1
+const elf_version: i64 = 1
+const elf_type_exec: i64 = 2
+const elf_machine_x86_64: i64 = 62
+
+const program_load: i64 = 1
+const program_flags_rx: i64 = 5
+const program_align: i64 = 0x1000
+
+const elf_header_size: i64 = 64
+const program_header_size: i64 = 56
+const base_address: i64 = 0x400000
+const code_offset: i64 = elf_header_size + program_header_size
+
+# System V AMD64 syscall numbers and the registers each one reads.
+const syscall_write: i64 = 1
+const syscall_exit: i64 = 60
+const stdout: i64 = 1
+
+const reg_rax: i64 = 0
+const reg_rdx: i64 = 2
+const reg_rdi: i64 = 7
+const push_rax: i64 = 0x50
+const pop_rdi: i64 = 0x5F
+
+pub class X86_64LinuxBackend: ArtifactBackend:
+    pub init():
+        return
+
+    pub func emit(program: CanonicalProgram) -> list[u8]!:
+        let entry = try executable_entry(program)
+        let code = try emit_code(entry)
+
+        let output = list[u8]()
+        let file_size = code_offset + len(code)
+        append_elf_header(output)
+        append_program_header(output, file_size)
+        append_all(output, code)
+        return output
+
+func executable_entry(program: CanonicalProgram) -> CanonicalFunction!:
+    var entry_index = -1
+    for index in range(0, len(program.functions)):
+        let function = program.functions[index]
+        if function.is_public and strings.ends_with(function.name, ".main"):
+            if entry_index >= 0: error("x86_64-linux backend: executable has more than one public `main`")
+            entry_index = index
+    if entry_index < 0: error("x86_64-linux backend: executable needs one public `main`")
+
+    let entry = program.functions[entry_index]
+    if entry.result != "i32": error("x86_64-linux backend: `" + entry.name + "` must return `i32`")
+    return entry
+
+# Values live on the machine stack in native 8-byte slots, which keeps the
+# stack aligned without a register allocator. Constant strings sit inline behind
+# a jump, reached by a RIP-relative address, so neither an assembler nor a
+# relocation table is needed for this first slice.
+func emit_code(function: CanonicalFunction) -> list[u8]!:
+    let code = list[u8]()
+    var stack_depth = 0
+    var returned = false
+    for instruction in function.instructions:
+        if returned: error("x86_64-linux backend: instruction follows `Return` in `" + function.name + "`")
+        match instruction:
+            I32Constant(value):
+                append_load_immediate(code, reg_rax, value)
+                code.append(u8(push_rax))
+                stack_depth += 1
+            WriteText(value): try append_print(code, value)
+            Return:
+                if stack_depth != 1: error("x86_64-linux backend: `Return` needs one value in `" + function.name + "`")
+                code.append(u8(pop_rdi))
+                append_load_immediate(code, reg_rax, syscall_exit)
+                append_syscall(code)
+                stack_depth = 0
+                returned = true
+            else:
+                error("x86_64-linux backend does not support instruction `" + str(instruction) + "` yet in `" + function.name + "`")
+    if not returned: error("x86_64-linux backend: `" + function.name + "` has no `Return`")
+    return code
+
+func append_print(code: list[u8], text: str) -> !:
+    let encoded = strings.to_bytes(text + "\n")
+    if len(encoded) > 0x7FFFFFFF: error("x86_64-linux backend: one `print` is limited to 2147483647 UTF-8 bytes")
+
+    append_load_immediate(code, reg_rax, syscall_write)
+    append_load_immediate(code, reg_rdi, stdout)
+    append_load_immediate(code, reg_rdx, len(encoded))
+    # The text begins right after the `syscall` and the `jmp` that steps over
+    # it: two bytes plus five, so it is seven bytes past this instruction.
+    append_lea_rsi_relative(code, 7)
+    append_syscall(code)
+    append_jump(code, len(encoded))
+    append_all(code, encoded)
+
+# mark: x86-64 encoding -------------------------------------------------------
+
+func append_load_immediate(code: list[u8], register: i64, value: i64):
+    code.append(0x48)
+    code.append(u8(0xB8 + register))
+    append_u64(code, value)
+
+func append_lea_rsi_relative(code: list[u8], displacement: i64):
+    code.append(0x48)
+    code.append(0x8D)
+    code.append(0x35)
+    append_u32(code, displacement)
+
+func append_jump(code: list[u8], relative: i64):
+    code.append(0xE9)
+    append_u32(code, relative)
+
+func append_syscall(code: list[u8]):
+    code.append(0x0F)
+    code.append(0x05)
+
+# mark: ELF encoding ----------------------------------------------------------
+
+func append_elf_header(output: list[u8]):
+    output.append(0x7F)
+    output.append(u8('E'))
+    output.append(u8('L'))
+    output.append(u8('F'))
+    output.append(u8(elf_class_64))
+    output.append(u8(elf_data_lsb))
+    output.append(u8(elf_version))
+    # e_ident is 16 bytes: seven are set above, the rest (OS ABI, ABI version,
+    # and padding) stay zero.
+    for pad in range(7, 16): output.append(0)
+    append_u16(output, elf_type_exec)
+    append_u16(output, elf_machine_x86_64)
+    append_u32(output, elf_version)
+    append_u64(output, base_address + code_offset)
+    append_u64(output, elf_header_size)
+    append_u64(output, 0)
+    append_u32(output, 0)
+    append_u16(output, elf_header_size)
+    append_u16(output, program_header_size)
+    append_u16(output, 1)
+    append_u16(output, 0)
+    append_u16(output, 0)
+    append_u16(output, 0)
+
+# One load command maps the whole file, headers included, as a read-execute
+# image at a fixed address; the entry point is the first byte of code.
+func append_program_header(output: list[u8], file_size: i64):
+    append_u32(output, program_load)
+    append_u32(output, program_flags_rx)
+    append_u64(output, 0)
+    append_u64(output, base_address)
+    append_u64(output, base_address)
+    append_u64(output, file_size)
+    append_u64(output, file_size)
+    append_u64(output, program_align)
+
+func append_u16(output: list[u8], value: i64):
+    for shift in [0, 8]: output.append(u8(value >> shift & 0xFF))
+
+func append_u32(output: list[u8], value: i64):
+    for shift in [0, 8, 16, 24]: output.append(u8(value >> shift & 0xFF))
+
+func append_u64(output: list[u8], value: i64):
+    append_u32(output, value)
+    append_u32(output, value >> 32)
+
+func append_all(output: list[u8], values: list[u8]):
+    for value in values: output.append(value)
