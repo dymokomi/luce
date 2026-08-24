@@ -3,9 +3,9 @@
 The target is the epoch-1 source surface in `LUCE_LANGUAGE_DESIGN.md` §29.6.
 Every syntax-tree form accepted by the current tokenizer and parser appears in
 at least one parser-checked example. Runtime guarantees, package resolution, and
-deliberately excluded syntax are outside this parser-era coverage claim.
-The narrower `semantic_core/` fixture is also checked and interpreted, while
-`compiled_core/` reaches canonical IR and the WebAssembly artifact backend.
+deliberately excluded syntax are outside this parser-era coverage claim. The
+narrower `semantic_core/` fixture is checked and interpreted, `compiled_core/`
+reaches WebAssembly, and `hello.luc` reaches a runnable ARM64 Mach-O.
 
 | Surface | Examples |
 | --- | --- |
@@ -27,6 +27,7 @@ The narrower `semantic_core/` fixture is also checked and interpreted, while
 | Boolean, absence, number, character, string, raw, formatted, triple, and byte literals | `operators_and_literals.luc` |
 | Arithmetic, bitwise, range, comparison, identity, and Boolean operators | `operators_and_literals.luc` |
 | Minimal checked, lowered, and directly encoded arithmetic | `compiled_core/main.luc` |
+| Native entry point, terminal output, and direct ARM64 Mach-O emission | `hello.luc` |
 | Optional, fallible, combined, tuple, function, and applied types | `language_tour.luc`, `operators_and_literals.luc` |
 | Static `test` declarations and assertions | `language_tour.luc`, `operators_and_literals.luc` |
 | C import through generated raw bindings | `c_import/` |

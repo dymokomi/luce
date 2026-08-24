@@ -24,6 +24,7 @@ source -> Tokenizer -> Parser -> Checker -> typed IR -> ExecutionBackend -> valu
 - `backend.luc` defines separate execution and artifact boundaries.
 - `backends/interpreter.luc` executes typed IR by resolved symbol identity.
 - `backends/wasm.luc` directly encodes canonical instructions as WebAssembly.
+- `backends/arm64_macos.luc` directly encodes ARM64 instructions and Mach-O.
 - `tests/` is a separate Stage-0 package containing only tests.
 
 The parser covers the epoch-1 source surface. The executable vertical slice is
@@ -31,10 +32,11 @@ currently `bool`, `i64`, `f64`, and `unit` functions with calls, bindings,
 assignment, basic operators, `if`, `while`, and returns. Other parsed forms fail
 explicitly until their semantic rules are implemented.
 
-The initial compiled slice is intentionally tiny: zero-argument `i64`
-functions with literals, `+`, `-`, `*`, and `return`. Unsupported lowering
-fails explicitly. This keeps the complete source-to-WASM path small enough to
-read end to end before the canonical IR grows.
+The compiled slice is intentionally tiny: integer literals, `+`, `-`, `*`,
+constant `print`, and `return`. WebAssembly covers zero-argument `i64`
+functions; the direct Apple-silicon path covers the conventional
+`main(slice[str]) -> i32 uses terminal` entry. Unsupported lowering fails
+explicitly so both paths remain readable end to end.
 
 ## Develop
 
@@ -47,6 +49,8 @@ mkdir -p build
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./build/luce build build/answer.wasm examples/compiled_core/main.luc
+./build/luce build --target arm64-macos build/hello examples/hello.luc
+./build/hello
 node -e 'const fs=require("node:fs"); WebAssembly.instantiate(fs.readFileSync("build/answer.wasm")).then(({instance}) => console.log(instance.exports["main.answer"]().toString()))'
 ```
 

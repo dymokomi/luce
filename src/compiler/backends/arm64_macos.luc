@@ -1,0 +1,199 @@
+from compiler.backend import ArtifactBackend
+from compiler.canonical_ir import CanonicalFunction, CanonicalProgram
+import std.strings
+
+# A direct Apple-silicon executable encoder for the first native slice. It
+# writes ARM64 instructions and the complete unsigned Mach-O container itself;
+# the command-line driver applies the host-required ad-hoc signature after the
+# bytes reach their final path.
+
+const mach_header_64: i64 = 0xFEEDFACF
+const cpu_type_arm64: i64 = 0x0100000C
+const mach_execute: i64 = 0x02
+const executable_flags: i64 = 0x00200085
+
+const load_segment_64: i64 = 0x19
+const load_dyld_info_only: i64 = 0x80000022
+const load_dylinker: i64 = 0x0E
+const load_build_version: i64 = 0x32
+const load_main: i64 = 0x80000028
+const load_dylib: i64 = 0x0C
+
+const text_address: i64 = 0x100000000
+const code_offset: i64 = 0x1000
+const page_size: i64 = 0x4000
+
+const push_x0: i64 = 0xF81F0FE0
+const pop_x0: i64 = 0xF84107E0
+const address_inline_text: i64 = 0x100000A1
+const supervisor_call: i64 = 0xD4001001
+
+pub class Arm64MacosBackend: ArtifactBackend:
+    pub init():
+        return
+
+    pub func emit(program: CanonicalProgram) -> list[u8]!:
+        let entry = try executable_entry(program)
+        let code = try emit_code(entry)
+        if code_offset + len(code) > page_size:
+            error("arm64-macos backend: the executable slice is limited to one 16 KiB page")
+
+        let output = list[u8]()
+        append_mach_header(output)
+        append_segment(output, "__PAGEZERO", 0, text_address, 0, 0, 0)
+        append_segment(output, "__TEXT", text_address, page_size, 0, page_size, 5)
+        append_segment(output, "__LINKEDIT", text_address + page_size, 0, page_size, 0, 1)
+        append_dyld_info(output)
+        append_dylinker(output)
+        append_build_version(output)
+        append_main(output)
+        append_system_library(output)
+        pad_to(output, code_offset)
+        append_all(output, code)
+        pad_to(output, page_size)
+        return output
+
+func executable_entry(program: CanonicalProgram) -> CanonicalFunction!:
+    var entry_index = -1
+    for index in range(0, len(program.functions)):
+        let function = program.functions[index]
+        if function.is_public and strings.ends_with(function.name, ".main"):
+            if entry_index >= 0: error("arm64-macos backend: executable has more than one public `main`")
+            entry_index = index
+    if entry_index < 0: error("arm64-macos backend: executable needs one public `main`")
+
+    let entry = program.functions[entry_index]
+    if entry.result != "i32": error("arm64-macos backend: `" + entry.name + "` must return `i32`")
+    return entry
+
+# Values use 16-byte stack slots, keeping the platform stack aligned without a
+# register allocator. Constant strings sit inline behind a branch, so neither
+# an assembler nor a relocation table is needed for this first slice.
+func emit_code(function: CanonicalFunction) -> list[u8]!:
+    let code = list[u8]()
+    var stack_depth = 0
+    var returned = false
+    for instruction in function.instructions:
+        if returned: error("arm64-macos backend: instruction follows `Return` in `" + function.name + "`")
+        match instruction:
+            I32Constant(value):
+                append_i32_constant(code, value)
+                stack_depth += 1
+            WriteText(value): try append_print(code, value)
+            Return:
+                if stack_depth != 1: error("arm64-macos backend: `Return` needs one value in `" + function.name + "`")
+                append_word(code, pop_x0)
+                append_move(code, 16, 1)
+                append_word(code, supervisor_call)
+                stack_depth = 0
+                returned = true
+            else:
+                error("arm64-macos backend does not support instruction `" + str(instruction) + "` yet in `" + function.name + "`")
+    if not returned: error("arm64-macos backend: `" + function.name + "` has no `Return`")
+    return code
+
+func append_i32_constant(code: list[u8], value: i64):
+    append_move(code, 0, value & 0xFFFF)
+    append_word(code, 0xF2A00000 | ((value >> 16) & 0xFFFF) << 5)
+    append_word(code, push_x0)
+
+func append_print(code: list[u8], text: str) -> !:
+    let encoded = strings.to_bytes(text + "\n")
+    if len(encoded) > 0xFFFF: error("arm64-macos backend: one `print` is limited to 65535 UTF-8 bytes")
+    let padded_size = (len(encoded) + 3) // 4 * 4
+
+    append_move(code, 0, 1)
+    append_word(code, address_inline_text)
+    append_move(code, 2, len(encoded))
+    append_move(code, 16, 4)
+    append_word(code, supervisor_call)
+    append_word(code, 0x14000000 | (1 + padded_size // 4))
+    append_all(code, encoded)
+    while len(code) % 4 != 0: code.append(0)
+
+# mark: ARM64 encoding --------------------------------------------------------
+
+func append_move(output: list[u8], register: i64, value: i64):
+    append_word(output, 0xD2800000 | (value & 0xFFFF) << 5 | register)
+
+func append_word(output: list[u8], value: i64):
+    append_u32(output, value)
+
+# mark: Mach-O encoding -------------------------------------------------------
+
+func append_mach_header(output: list[u8]):
+    append_u32(output, mach_header_64)
+    append_u32(output, cpu_type_arm64)
+    append_u32(output, 0)
+    append_u32(output, mach_execute)
+    append_u32(output, 8)
+    append_u32(output, 400)
+    append_u32(output, executable_flags)
+    append_u32(output, 0)
+
+func append_segment(output: list[u8], name: str, address: i64, memory_size: i64, file_offset: i64, file_size: i64, protection: i64):
+    append_u32(output, load_segment_64)
+    append_u32(output, 72)
+    append_fixed(output, name, 16)
+    append_u64(output, address)
+    append_u64(output, memory_size)
+    append_u64(output, file_offset)
+    append_u64(output, file_size)
+    append_u32(output, protection)
+    append_u32(output, protection)
+    append_u32(output, 0)
+    append_u32(output, 0)
+
+# An explicit empty dyld-info command prevents modern dyld from falling back
+# to the legacy relocation tables that this relocation-free image omits.
+func append_dyld_info(output: list[u8]):
+    append_u32(output, load_dyld_info_only)
+    append_u32(output, 48)
+    for field in range(0, 10): append_u32(output, 0)
+
+func append_dylinker(output: list[u8]):
+    append_u32(output, load_dylinker)
+    append_u32(output, 32)
+    append_u32(output, 12)
+    append_fixed(output, "/usr/lib/dyld", 20)
+
+func append_build_version(output: list[u8]):
+    append_u32(output, load_build_version)
+    append_u32(output, 24)
+    append_u32(output, 1)
+    append_u32(output, 0x000B0000)
+    append_u32(output, 0)
+    append_u32(output, 0)
+
+func append_main(output: list[u8]):
+    append_u32(output, load_main)
+    append_u32(output, 24)
+    append_u64(output, code_offset)
+    append_u64(output, 0)
+
+func append_system_library(output: list[u8]):
+    append_u32(output, load_dylib)
+    append_u32(output, 56)
+    append_u32(output, 24)
+    append_u32(output, 2)
+    append_u32(output, 0)
+    append_u32(output, 0x00010000)
+    append_fixed(output, "/usr/lib/libSystem.B.dylib", 32)
+
+func append_fixed(output: list[u8], value: str, width: i64):
+    let encoded = strings.to_bytes(value)
+    for byte in encoded: output.append(byte)
+    for unused in range(len(encoded), width): output.append(0)
+
+func append_u32(output: list[u8], value: i64):
+    for shift in [0, 8, 16, 24]: output.append(u8(value >> shift & 0xFF))
+
+func append_u64(output: list[u8], value: i64):
+    append_u32(output, value)
+    append_u32(output, value >> 32)
+
+func append_all(output: list[u8], values: list[u8]):
+    for value in values: output.append(value)
+
+func pad_to(output: list[u8], size: i64):
+    while len(output) < size: output.append(0)

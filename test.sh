@@ -8,4 +8,8 @@ cd "$repo_root"
 # fall back to the shipping luce-0 when it is not installed.
 luce=./stage0/bin/luce-0-fast
 [ -x "$luce" ] || luce=./stage0/bin/luce-0
-exec "$luce" test
+"$luce" test
+
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+    ./tests/arm64_macos_test.sh ./stage0/bin/luce-0
+fi
