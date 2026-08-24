@@ -1662,7 +1662,9 @@ Tests replace capabilities with deterministic implementations without global mon
 
 ### 18.4 Unsafe native effect
 
-Raw native operations require `uses unsafe_native`. A safe wrapper validates invariants and exposes an ordinary effect such as `files` or no host effect at all. The compiler can therefore show exactly where memory-safety trust enters the program.
+Raw native operations — the pointer verbs of §21.12: loads, stores, address arithmetic, ABI casts — require `uses unsafe_native`. A safe wrapper validates invariants and exposes an ordinary effect such as `files` or no host effect at all. The compiler can therefore show exactly where memory-safety trust enters the program.
+
+**An extern call is not a raw native operation** (ruled 2026-08-24). The checked boundary of §21.16 — the `null_foreign` trap, validated text, the optional decode — is the safety story for the common shape, so calling a declared extern requires no `unsafe_native`: the trust is visible in the declaration, not gated at the call. What the call *does* carry is whatever ordinary effect its wrapper declares; the raw-memory vocabulary stays reserved for operations that actually touch memory Luce cannot check.
 
 ### 18.5 Why effects remain small
 
@@ -2071,7 +2073,7 @@ Generated raw modules are ordinary Luce source, so the language itself carries t
 
 ```luce
 extern type Window                    # nominal opaque handle, pointer-shaped
-extern type Device = i32              # integer-shaped handle with its exact C width
+extern type Device = i32              # integer-shaped handle; the four boundary widths u32/i32/u64/i64 are the closed set
 
 extern func SDL_GetError() -> str
 extern func SDL_CreateWindow(title: str, w: i32, h: i32, flags: u64) -> Window?
@@ -2092,6 +2094,8 @@ The governing rules, stated once (the stage-0 FFI document is the detailed contr
 - **Nothing crosses silently wrong.** A pointer-shaped handle without `?` is an enforced contract: a zero crossing traps `null_foreign` in every profile. `?` on a handle decodes C's null to `none` — an ordinary optional, no sentinel representation. A `str` result is copied immediately and UTF-8-validated; text arguments cross as NUL-terminated temporaries borrowed for the call. Integer-shaped handles carry no trap: their zero is a value.
 - **`out` parameters become extra results**, received by ordinary destructuring in declaration order after the declared return.
 - **`extern struct` is C layout, crossing by pointer** in both directions; by-value aggregates wait for generated shims. `cfunc(params) -> R` is C's function pointer: capture-free functions convert to it, struct fields and results of that type are callable, and the ARC-carrying trampoline is the generator's machinery, not the language's.
+- **`blocking` opts the call out of the effect lock** and takes on the thread-safety contract: the callee promises its own safety and may park the thread, because workers will reach it concurrently. **`extern var` binds a C global** of boundary-scalar or handle type; reads and writes are direct loads and stores of the symbol, and anything fancier is a shim.
+- **Visibility applies to extern declarations as to any declaration.** `pub extern` exports through the module surface — generated raw modules are ordinary Luce modules and their declarations must be reachable by the safe wrapper that imports them.
 - These declarations are the *raw* layer. FIIR, recipes, and the safe-wrapper generator (§21.1–21.15) stand above them unchanged; nothing here relaxes the ownership-recipe or unsafe-visibility rules.
 
 The finer rulings, each proven by a differential spec during the stage-0 implementation and carried forward as language law:
@@ -2557,7 +2561,8 @@ The following may be researched after epoch 1, in this order and only with evide
 3. a structured message channel if spawn/wait cannot support required pipelines;
 4. a host-integrated async model if synchronous capability APIs cannot deliver necessary scale/debugging;
 5. a constrained declarative derive/generator system if source generation becomes a dominant maintenance burden;
-6. additional direct backends and SIMD intrinsics.
+6. additional direct backends and SIMD intrinsics;
+7. 128-bit integers (`u128`/`i128`) as ordinary checked scalars, if numerics or native interop produce the evidence (owner note, 2026-08-24).
 
 None is promised. Each must reduce total system complexity, not only local character count.
 
@@ -2799,7 +2804,7 @@ for from func if implements import in interface is let match mutating new none n
 pub recover return self spawn struct test true try type uses var weak while
 ```
 
-`c`, `cpp`, capture-list `copy`, extern-declaration `blocking`/`out`/`cfunc`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
+`c`, capture-list `copy`, extern-declaration `blocking`/`out`/`cfunc`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
 
 ### 29.6 Grammar skeleton
 
