@@ -94,7 +94,7 @@ Small does not mean:
 | Values | Tuples, structs, payload-capable enums, fixed arrays |
 | Identity | Final ARC classes, explicit `new`, weak references, deterministic `deinit` |
 | Collections | Reference `list`/`map`/`set`; immutable owner-retaining `slice`; stable iteration order |
-| Absence | One-layer `T?`; no force unwrap or nullable-by-default types |
+| Absence | One-layer `T?` with the three-arm `else` fallback; no force unwrap or nullable-by-default types |
 | Failure | `T!`, `try`, `catch`, `recover`, stable `Error`; no exceptions |
 | Traps | Uncatchable checked-rule/host termination with source trace |
 | Closures | Explicit `func` literal, deterministic capture rules, snapshot/weak capture list |
@@ -1243,7 +1243,7 @@ if let found = user:
     show(found)
 ```
 
-`none` must have an expected optional type. A non-optional value may be promoted to `T?` where expected. The reverse always requires conditional binding, `match`, or an explicit library operation such as `or(default)`.
+`none` must have an expected optional type. A non-optional value may be promoted to `T?` where expected. The reverse always requires conditional binding, `match`, or the explicit `else` fallback below.
 
 Optionals are one layer: applying `?` to an optional type is rejected. If a domain genuinely distinguishes “outer absent” from “present but inner absent,” it declares an enum with names for those states. A fallible function returning an optional is written `T?!`: success carries `T?`, failure carries `Error`.
 
@@ -1785,7 +1785,7 @@ Public signatures may mention only public types from declared public dependencie
 
 ### 20.4 Top-level declarations
 
-A module may contain type, type-alias, function, interface, import, test, and constant declarations. Except for closures, declarations do not nest: functions contain statements, and types contain only fields/methods. A module may not contain executable statements or mutable globals.
+A module may contain type, type-alias, function, interface, import, test, and constant declarations, plus the native boundary forms: `export c` (section 21.5) and `extern` (section 21.16) declarations. Except for closures, declarations do not nest: functions contain statements, and types contain only fields/methods. A module may not contain executable statements or mutable globals.
 
 ```luce
 pub let max_header_size: u64 = 16 * 1024
@@ -3025,6 +3025,7 @@ type            = base_type, [ "?" ], [ "!" ]
                 | function_type
                 | cfunc_type ;
 base_type       = type_name, [ type_arguments ]
+                | "(", type, ")"
                 | "(", type, ",", type, { ",", type }, [ "," ], ")" ;
 type_name       = TYPE_PATH | CORE_TYPE ;
 type_arguments  = "[", type_or_array_length,
@@ -3051,6 +3052,10 @@ In expression position, brackets immediately followed by an argument list are pa
 
 An opening `(` begins a lambda only when a valid lambda parameter list is
 immediately followed by `=>`; otherwise it begins an ordinary group or tuple.
+
+In type position, a parenthesized single type is grouping, never a one-element
+tuple: it exists so an optional function type can be spelled, as in
+`(func() -> unit)?` (section 14.3).
 
 ## 30. Research and Luce reconciliation
 
@@ -3093,7 +3098,7 @@ The page-by-page baseline remains the public [Luce documentation](https://luce.l
 
 ### 30.3 Decisions intentionally reopened by implementation evidence
 
-The compiler and standard library are the first pressure tests. If they expose a concrete shortfall, revisit the smallest adjacent mechanism—not the whole doctrine. Examples include measuring whether ARC/copy elision is sufficient before proposing regions, whether one-statement arms avoid helper or mutable staging code before proposing expression-valued `match`, whether closure-scoped mutable views cover parsing/codegen before proposing `inout`, and whether generated C++ thunks meet performance budgets before coupling the language to one backend.
+The compiler and standard library are the first pressure tests. If they expose a concrete shortfall, revisit the smallest adjacent mechanism—not the whole doctrine. Examples include measuring whether ARC/copy elision is sufficient before proposing regions, whether one-statement arms avoid helper or mutable staging code before proposing expression-valued `match` (evidence that has since arrived — §9.6), whether closure-scoped mutable views cover parsing/codegen before proposing `inout`, and whether generated C++ thunks meet performance budgets before coupling the language to one backend.
 
 The companion documents retain the deeper product requirements and C++ fixtures. This document is the normative source-surface/runtime/tool contract; where an older proposal conflicts with it, this clean-break specification wins after the conflict is recorded as a design decision.
 
