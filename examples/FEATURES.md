@@ -18,7 +18,7 @@ The narrower `semantic_core/` fixture is also checked and interpreted, while
 | Interface requirements, static constraints, and interface values | `language_tour.luc` |
 | `let`, `var`, tuple binding, assignment, and every assignment operator | `language_tour.luc`, `operators_and_literals.luc` |
 | `if`, `if let`, `elif`, `while`, `for`, `break`, and `continue` | `language_tour.luc`, `checkout/main.luc` |
-| Statement and expression `match`, including `:` and `=>` arms | `language_tour.luc`, `checkout/pricing.luc` |
+| Statement and expression `match`, including alternatives, ranges, and `:`/`=>` arms | `language_tour.luc`, `checkout/pricing.luc` |
 | Returns, calls as statements, `defer`, `try`, `catch`, and `recover` | `language_tour.luc` |
 | Lists, maps, sets, fixed arrays, tuples, indexing, and all slice forms | `operators_and_literals.luc` |
 | Lambdas, block closures, default/copy/weak capture, and function types | `language_tour.luc` |

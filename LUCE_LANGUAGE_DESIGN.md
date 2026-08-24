@@ -711,8 +711,7 @@ An arm body is an ordinary suite. A single simple statement may follow the arm's
 ```luce
 func bit_value(c: char) -> u8?:
     match c:
-        '0': return 0
-        '1': return 1
+        '0', '1': return 0 if c == '0' else 1
         _: return none
 ```
 
@@ -721,11 +720,41 @@ Epoch 1 patterns are deliberately closed:
 - enum cases, with bindings for any payload;
 - `.some(value)` and `.none` for optionals;
 - Boolean and integer, character, or string literals;
+- half-open `lower..<upper` and closed `lower..=upper` integer or character
+  literal ranges;
+- comma-separated alternatives that share one arm body;
 - `_` as a catch-all.
 
-A binding in a pattern is immutable and scoped to its case. Cases do not fall through. Guards, ranges, nested destructuring, alternatives, and user-defined pattern protocols are omitted. Compute a predicate before the match or use an `if` inside a case.
+A range's bounds have the same concrete type and are checked at compile time.
+Half-open ranges require `lower < upper`; closed ranges require
+`lower <= upper`. Ranges ascend in source order and use the same `..<` and
+`..=` boundary meanings as range expressions.
 
-Every `match` is exhaustive. The compiler names missing enum/optional/Boolean cases; integer/character/string matches normally end in `_`. Duplicate or unreachable cases are errors. A catch-all is permitted for a closed type, but the linter warns when spelling every case would preserve future diagnostics.
+Alternatives are separated by `,` and mean “any of these patterns”; they are
+not evaluated expressions and have no left-to-right side effects:
+
+```luce
+return match c:
+    '0'..='9' => "digit"
+    'a'..='z', 'A'..='Z' => "letter"
+    ' ', '\t', '\n' => "spacing"
+    _ => "other"
+```
+
+When alternative enum or optional patterns bind payloads, every alternative
+must introduce the same binding names with the same types, so the shared body
+has one lexical environment. A binding is immutable and scoped to its arm.
+Cases do not fall through. Guards, nested destructuring, and user-defined
+pattern protocols are omitted. Compute a predicate before the match or use an
+`if` inside an arm.
+
+Every `match` is exhaustive. The compiler names missing enum/optional/Boolean
+cases; integer, character, and string matches normally end in `_`. Literal and
+range coverage participates in exhaustiveness where the complete finite domain
+is provable. Duplicate values, overlapping ranges, and patterns made unreachable
+by an earlier alternative or arm are errors. A catch-all is permitted for a
+closed type, but the linter warns when spelling every case would preserve future
+diagnostics.
 
 `match` is both a statement and an expression. As a statement each arm opens
 a `:` suite; where an expression is expected each arm instead **yields** a
@@ -2647,7 +2676,8 @@ if let value = optional:
 while condition:
 for value in iterable:
 match value:
-    .case: return value
+    .first, .second: return value
+    0..<10: return value
 break
 continue
 return value
@@ -2671,7 +2701,7 @@ new Class(arguments)
 (parameters) => expression
 func [captures] (parameters) -> Type: ...
 match value:
-    pattern => expression
+    pattern, lower..=upper => expression
 try fallible_expression
 fallible_expression catch failure: ...
 value if condition else alternative
@@ -2825,10 +2855,14 @@ for_stmt        = "for", IDENT, "in", expression, ":", suite ;
 
 match_stmt      = "match", expression, ":", NEWLINE, INDENT,
                   match_arm, { match_arm }, DEDENT ;
-match_arm       = pattern, ":", suite ;
+match_arm       = pattern_list, ":", suite ;
+pattern_list    = pattern, { ",", pattern } ;
 pattern         = "_"
-                | literal
-                | ".", IDENT, [ "(", [ IDENT, { ",", IDENT } ], ")" ] ;
+                | literal_pattern
+                | case_pattern ;
+literal_pattern = literal, [ ( "..<" | "..=" ), literal ] ;
+case_pattern    = ".", IDENT,
+                  [ "(", [ IDENT, { ",", IDENT } ], ")" ] ;
 
 return_stmt     = "return", [ expression ], NEWLINE ;
 defer_stmt      = "defer", call_expression, NEWLINE ;
@@ -2895,7 +2929,7 @@ lambda_parameter
 
 match_expr      = "match", expression, ":", NEWLINE, INDENT,
                   match_value_arm, { match_value_arm }, DEDENT ;
-match_value_arm = pattern, "=>", expression, NEWLINE ;
+match_value_arm = pattern_list, "=>", expression, NEWLINE ;
 
 closure_expr    = "func", [ capture_list ], parameter_list,
                   result_clause, effect_clause, ":", suite ;
