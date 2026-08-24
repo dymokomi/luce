@@ -22,9 +22,8 @@ source -> Tokenizer -> Parser -> Checker -> typed IR -> ExecutionBackend -> valu
 - `lowerer.luc` fixes evaluation order in the backend-independent instruction
   stream defined by `canonical_ir.luc`.
 - `backend.luc` defines separate execution and artifact boundaries.
-- `interpreter.luc` is the default backend and executes typed IR by resolved
-  symbol identity.
-- `wasm_backend.luc` directly encodes canonical instructions as WebAssembly.
+- `backends/interpreter.luc` executes typed IR by resolved symbol identity.
+- `backends/wasm.luc` directly encodes canonical instructions as WebAssembly.
 - `tests/` is a separate Stage-0 package containing only tests.
 
 The parser covers the epoch-1 source surface. The executable vertical slice is
