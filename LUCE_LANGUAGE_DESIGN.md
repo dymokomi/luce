@@ -2716,6 +2716,12 @@ from module.path import Name, function
 export c struct Name:
 export c enum Name as u32:
 export c func name(parameters) -> Type:
+extern type Name
+extern type Name = u32
+extern func name(parameters) -> Type
+extern blocking func name(parameters)
+extern var name: Type
+extern struct Name:
 ```
 
 ### 29.2 Statements
@@ -2758,6 +2764,7 @@ match value:
 try fallible_expression
 fallible_expression catch failure: ...
 value if condition else alternative
+optional_expression else fallback
 spawn named_function(arguments)
 ```
 
@@ -2775,7 +2782,8 @@ From tightest to loosest grouping:
 8. comparison/identity: `==`, `!=`, `<`, `<=`, `>`, `>=`, `is`, `is not` (non-chainable);
 9. Boolean: `and`, then `or`;
 10. conditional expression;
-11. `catch`.
+11. the `else` fallback form (section 13.1), whose arm associates to the right;
+12. `catch`.
 
 Assignment forms (`=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) are statements and evaluate the target once. An augmented assignment is available only when the corresponding built-in operation returns exactly the target type.
 
@@ -2812,7 +2820,8 @@ top_decl        = [ "pub" ],
                   | struct_decl
                   | enum_decl
                   | class_decl
-                  | interface_decl )
+                  | interface_decl
+                  | extern_decl )
                 | test_decl
                 | export_c_decl ;
 
@@ -2870,6 +2879,27 @@ c_enum_case     = IDENT, "=", INTEGER_LITERAL, NEWLINE ;
 export_c_function
                 = "func", IDENT, parameter_list, result_clause, ":", suite ;
 
+extern_decl     = "extern", ( extern_type_decl
+                            | extern_func_decl
+                            | extern_var_decl
+                            | extern_struct_decl ) ;
+extern_type_decl
+                = "type", TYPE_IDENT,
+                  [ "=", ( "u32" | "i32" | "u64" | "i64" ) ], NEWLINE ;
+extern_func_decl
+                = [ "blocking" ], "func", IDENT,
+                  extern_parameter_list, result_clause, NEWLINE ;
+extern_parameter_list
+                = "(", [ extern_parameter, { ",", extern_parameter },
+                  [ "," ] ], ")" ;
+extern_parameter
+                = [ "out" ], IDENT, ":", type ;
+extern_var_decl = "var", IDENT, ":", type, NEWLINE ;
+extern_struct_decl
+                = "struct", TYPE_IDENT, ":", NEWLINE, INDENT,
+                  extern_field, { extern_field }, DEDENT ;
+extern_field    = IDENT, ":", type, NEWLINE ;
+
 suite           = simple_stmt
                 | NEWLINE, INDENT, statement, { statement }, DEDENT ;
 
@@ -2922,8 +2952,9 @@ defer_stmt      = "defer", call_expression, NEWLINE ;
 recover_stmt    = "recover", expression, NEWLINE ;
 expression_stmt = expression, NEWLINE ;
 
-expression      = conditional_expr,
+expression      = else_expr,
                   [ "catch", IDENT, ":", suite ] ;
+else_expr       = conditional_expr, [ "else", else_expr ] ;
 conditional_expr
                 = boolean_or_expr,
                   [ "if", boolean_or_expr, "else", conditional_expr ] ;
@@ -2991,7 +3022,8 @@ capture         = "weak", IDENT
                 | "copy", IDENT, "=", expression ;
 
 type            = base_type, [ "?" ], [ "!" ]
-                | function_type ;
+                | function_type
+                | cfunc_type ;
 base_type       = type_name, [ type_arguments ]
                 | "(", type, ",", type, { ",", type }, [ "," ], ")" ;
 type_name       = TYPE_PATH | CORE_TYPE ;
@@ -3001,6 +3033,8 @@ type_or_array_length
                 = type | INTEGER_LITERAL ;
 function_type   = "func", "(", [ type, { ",", type } ], ")",
                   "->", type, effect_clause ;
+cfunc_type      = "cfunc", "(", [ type, { ",", type } ], ")",
+                  "->", type ;
 
 interface_type  = type_name, [ type_arguments ] ;
 integer_type    = "u8" | "u16" | "u32" | "u64"
