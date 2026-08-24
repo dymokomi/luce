@@ -2786,12 +2786,12 @@ suite or the indented arm list of a `match` expression.
 ### 29.5 Reserved words
 
 ```text
-and as break catch class continue defer elif else enum export false
+and as break catch class continue defer elif else enum export extern false
 for from func if implements import in interface is let match mutating new none not or
 pub recover return self spawn struct test true try type uses var weak while
 ```
 
-`c`, `cpp`, capture-list `copy`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
+`c`, `cpp`, capture-list `copy`, extern-declaration `blocking`/`out`/`cfunc`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
 
 ### 29.6 Grammar skeleton
 
@@ -3113,7 +3113,7 @@ This is the last whole-design audit before implementation. It applies the interv
 | `error` and `trap` as reserved syntax words | Compiler-known core calls returning `never` | Keeps exact failure semantics while shrinking the lexer/parser and making all terminators visibly call-shaped. |
 | A testing framework assembled from attributes, reflection, naming conventions, and privileged helpers | One static `test` declaration plus ordinary library/manifest facilities | Adds one high-yield keyword while removing several ecosystem mechanisms and making discovery, isolation, effects, and production erasure compiler-verifiable. |
 
-The resulting epoch 1 lexer has 42 reserved words, the ordinary data model has two named value declarations (`struct`, `enum`) plus final `class` identity, and expression precedence has 11 levels. These are budgets, not vanity metrics: any increase must identify the older concept or system complexity it removes.
+The resulting epoch 1 lexer has 43 reserved words, the ordinary data model has two named value declarations (`struct`, `enum`) plus final `class` identity, and expression precedence has 12 levels. These are budgets, not vanity metrics: any increase must identify the older concept or system complexity it removes.
 
 ### 33.2 Features that survive the budget
 
