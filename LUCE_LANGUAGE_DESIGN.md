@@ -1247,7 +1247,17 @@ if let found = user:
 
 Optionals are one layer: applying `?` to an optional type is rejected. If a domain genuinely distinguishes “outer absent” from “present but inner absent,” it declares an enum with names for those states. A fallible function returning an optional is written `T?!`: success carries `T?`, failure carries `Error`.
 
-Optional chaining, force-unwrapping, and nil-coalescing syntax are omitted in epoch 1. Their small typing convenience tends to create a second expression language and encourages long chains with poor failure context. Named operations and `if let` make control visible. Evidence from substantial Luce code may justify one coalescing operator later, but never a force-unwrap operator.
+Epoch 1 adopts stage-0's `else` form — one keyword, three arms, each a statement of intent at the point of absence:
+
+```luce
+let count = parse_i64(text) else 0                        # fallback value
+let n = parse_i64(text) else trap("not a number")         # assert with a stated reason
+let w = create_window() else error("no window")           # absence becomes failure, in a `!` function
+```
+
+`a else b` yields `a` when present and `b` otherwise; the arm may instead diverge through `trap(…)` or `error(…)`. The diverging arms are what keep boundary code flat: acquisition sequences (window, then surface, then device) nest under `if let` but read line by line under `else`. Ruled in 2026-08-24 on native-interop evidence, satisfying the reconsideration clause this section previously carried; stage-0 practice showed no second-expression-language effect.
+
+Optional chaining and a bare force-unwrap operator remain omitted. `else trap("reason")` is the explicit spelling of an assert-unwrap — it exists precisely so an unstated `x!` never needs to.
 
 ### 13.2 Recoverable function failure
 
@@ -2051,6 +2061,35 @@ Every binding cache key fingerprints header contents, transitive include graph, 
 
 Dynamic libraries are resolved from explicit package/bundle locations and recorded deployment dependencies. Builds do not depend on an ambient working directory, undocumented system search path, or whichever C++ runtime happens to load first. The first-party driver may use a bundled compiler/linker or a manifest-declared compatible platform SDK; `luce doctor` verifies that contract before a build.
 
+### 21.16 The extern declaration surface (adopted from stage-0 0.21, ruled 2026-08-24)
+
+Generated raw modules are ordinary Luce source, so the language itself carries the boundary declaration forms — the generator emits them, and a hand-written binding (the bootstrap case, and every Tier C adapter) writes them directly. The forms, semantics proven in stage-0 0.21:
+
+```luce
+extern type Window                    # nominal opaque handle, pointer-shaped
+extern type Device = i32              # integer-shaped handle with its exact C width
+
+extern func SDL_GetError() -> str
+extern func SDL_CreateWindow(title: str, w: i32, h: i32, flags: u64) -> Window?
+extern func SDL_GetWindowSize(window: Window, out w: i32, out h: i32) -> bool
+extern blocking func SDL_Delay(ms: u32)
+extern var SDL_version_number: i32
+
+extern struct Rect:
+    x: i32
+    y: i32
+    w: i32
+    h: i32
+```
+
+The governing rules, stated once (the stage-0 FFI document is the detailed contract):
+
+- **Friction sorts by frequency.** The common shape (scalars, strings, structs, null, out-parameters, handles) crosses invisibly — the declaration states the C shape and the compiler translates. The rare shape (buffers, raw reads, ownership transfer) is one visible scoped verb. The exotic shape (variadics, bitfields, by-value aggregates) is generated away by `luce bind` thunks and never appears in user code.
+- **Nothing crosses silently wrong.** A pointer-shaped handle without `?` is an enforced contract: a zero crossing traps `null_foreign` in every profile. `?` on a handle decodes C's null to `none` — an ordinary optional, no sentinel representation. A `str` result is copied immediately and UTF-8-validated; text arguments cross as NUL-terminated temporaries borrowed for the call. Integer-shaped handles carry no trap: their zero is a value.
+- **`out` parameters become extra results**, received by ordinary destructuring in declaration order after the declared return.
+- **`extern struct` is C layout, crossing by pointer** in both directions; by-value aggregates wait for generated shims. `cfunc(params) -> R` is C's function pointer: capture-free functions convert to it, struct fields and results of that type are callable, and the ARC-carrying trampoline is the generator's machinery, not the language's.
+- These declarations are the *raw* layer. FIIR, recipes, and the safe-wrapper generator (§21.1–21.15) stand above them unchanged; nothing here relaxes the ownership-recipe or unsafe-visibility rules.
+
 ## 22. Standard library boundary
 
 A small language does not require a tiny standard library. It requires the language and library to have an obvious boundary, stable conventions, and no feature duplication.
@@ -2499,7 +2538,7 @@ An epoch migration ships with `luce migrate`, an API/behavior report, formatter 
 
 The following may be researched after epoch 1, in this order and only with evidence:
 
-1. one optional default/coalescing operation if named APIs are materially noisy;
+1. ~~one optional default/coalescing operation~~ — **adopted 2026-08-24** as the `else` form (§13.1), on native-interop evidence;
 2. call-scoped `inout` if compiler/native algorithms otherwise allocate or obscure intent;
 3. a structured message channel if spawn/wait cannot support required pipelines;
 4. a host-integrated async model if synchronous capability APIs cannot deliver necessary scale/debugging;
