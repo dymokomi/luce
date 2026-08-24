@@ -4,6 +4,11 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$repo_root"
 
+# The in-repo stage-0 compiler must link against its own matching runtime.
+# Clear any LUCE_LIB inherited from a separately installed toolchain, whose
+# libluce_rt.a can be an older version missing symbols this compiler emits.
+unset LUCE_LIB
+
 # Prefer the fast-codegen compiler (O1 + FastISel) for the edit/test loop;
 # fall back to the shipping luce-0 when it is not installed.
 luce=./stage0/bin/luce-0-fast
