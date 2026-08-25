@@ -2213,16 +2213,28 @@ This preserves discoverability and ownership of APIs. Method syntax is reserved 
 
 ## 23. Runtime, ABI, artifacts, and backends
 
-The language contract is independent of one code generator. All backends consume the same typed IR and runtime ABI.
+The language contract is independent of one code generator. Execution backends consume semantically analyzed typed HIR; compiled backends consume the canonical MIR lowered from it. Neither backend kind decides language semantics, and all native targets share the runtime ABI.
 
 ### 23.1 Compiler pipeline
 
 ```text
-source -> tokens/layout -> syntax tree -> resolved typed IR -> ownership/effect checks
-       -> canonical Luce IR -> backend IR/machine code -> artifact
+source
+-> tokens/layout
+-> source syntax
+-> name/signature resolution
+-> typed HIR
+-> flow/effect/ownership checking
+-> canonical MIR
+-> MIR verification
+-> optimization
+-> MIR verification
+-> target legalization/instruction selection
+-> artifact emission
 ```
 
-The canonical IR makes evaluation order, copies, ARC operations, failures, traps, effects, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed.
+The canonical MIR makes evaluation order, copies, ARC operations, failures, traps, effects, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed, and verification runs both before and after optimization so neither lowering nor a transform can hand malformed MIR to a backend.
+
+The reference interpreter branches after semantic analysis and executes typed HIR directly. It intentionally remains independent of MIR lowering so differential tests can expose lowering and backend defects. A separate MIR interpreter may exist for MIR debugging without replacing that semantic oracle.
 
 The compiler is written in Luce after the Stage-0 0.19 bootstrap compiler is frozen. Each self-hosting stage must reproduce the next stage's observable compiler behavior, with bootstrapping artifacts and hashes published.
 

@@ -3,11 +3,32 @@
 #   pipeline - The compiler spine
 #
 #   DESCRIPTION:
-#       Runs compiler stages in order. Each public workflow spells out its path;
-#       each stage owns one transformation (LUCE_LANGUAGE_DESIGN.md §23):
+#       The compiler's executable architectural roadmap. Read `build` from top
+#       to bottom to see every permanent frontend and middle-end stage in order:
 #
-#       source -> Tokenizer -> Parser -> Checker -> typed IR -> ExecutionBackend -> value
-#                                                  \-> Lowerer -> canonical IR -> ArtifactBackend -> bytes
+#       source files
+#       -> tokens and layout                 Tokenizer
+#       -> source syntax                     Parser
+#       -> names, signatures, typed HIR      Checker
+#       -> flow, effects, ownership          SemanticAnalyzer
+#       -> canonical MIR                     Lowerer
+#       -> verified canonical MIR            MirVerifier
+#       -> optimized canonical MIR           Optimizer
+#       -> verified optimized MIR            MirVerifier
+#       -> target legalization and selection ArtifactBackend
+#       -> artifact bytes                    ArtifactBackend
+#
+#       Two temporary combinations are named honestly in code. `Checker`
+#       currently owns both name/signature resolution and type checking because
+#       no resolved-but-untyped IR exists yet. Each compiled backend currently
+#       owns legalization, instruction selection, and container encoding because
+#       no target IR exists yet. Those boundaries can split later without
+#       changing the permanent path above.
+#
+#       `run` deliberately branches after semantic analysis and interprets typed
+#       HIR. Keeping that independent semantic oracle lets it catch mistakes in
+#       lowering and compiled backends. A future MIR interpreter may be added as
+#       another backend, but should not replace this reference path.
 #
 #   TARGETS:
 #       wasm            WebAssembly module
@@ -23,7 +44,10 @@ from compiler.backends.wasm import WasmBackend
 from compiler.backends.x86_64_linux import X86_64LinuxBackend
 from compiler.checker import Checker, SourceModule
 from compiler.lowerer import Lowerer
+from compiler.mir_verifier import MirVerifier
+from compiler.optimizer import Optimizer
 from compiler.parser import Parser
+from compiler.semantic_analyzer import SemanticAnalyzer
 from compiler.tokenizer import Token, Tokenizer
 from compiler.typed_ir import TypedProgram, Value
 import std.files
@@ -51,57 +75,75 @@ struct TokenizedFile:
 
 # mark: Commands ===============================================================================
 
-## Compile source files into the artifact bytes for a target.
+## Compile source files through every build stage and return target artifact
+## bytes. For example, target `wasm` returns a complete WebAssembly module.
 pub func build(target: BuildTarget, source_paths: list[str]) -> list[u8]!:
     let sources = try read_sources(source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let typed_program = try Checker(modules).check()
-    let canonical_program = try Lowerer(typed_program).lower()
+    let analyzed_program = try SemanticAnalyzer(typed_program).analyze()
+    let canonical_program = try Lowerer(analyzed_program).lower()
+    try MirVerifier(canonical_program).verify()
+    let optimized_program = Optimizer(canonical_program).optimize()
+    try MirVerifier(optimized_program).verify()
 
     match target:
-        wasm:         return try WasmBackend().emit(canonical_program)
-        arm64_macos:  return try Arm64MacosBackend().emit(canonical_program)
-        x86_64_linux: return try X86_64LinuxBackend().emit(canonical_program)
+        wasm:         return try WasmBackend().emit(optimized_program)
+        arm64_macos:  return try Arm64MacosBackend().emit(optimized_program)
+        x86_64_linux: return try X86_64LinuxBackend().emit(optimized_program)
 
-## Read, tokenize, parse, and check source files into one typed program.
+## Run the complete frontend and semantic analysis, returning typed HIR. For
+## example, editor tooling can call this without lowering or choosing a target.
 pub func check(source_paths: list[str]) -> TypedProgram!:
     let sources = try read_sources(source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let typed_program = try Checker(modules).check()
-    return typed_program
+    let analyzed_program = try SemanticAnalyzer(typed_program).analyze()
+    return analyzed_program
 
-## Run one function from source files in the interpreter.
+## Analyze source files and run one public, parameterless function through the
+## typed-HIR reference interpreter; for example, `run(paths, "main", "answer")`.
 pub func run(source_paths: list[str], module_name: str, function_name: str) -> Value!:
     let sources = try read_sources(source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let typed_program = try Checker(modules).check()
-    return try Interpreter().run(typed_program, module_name, function_name)
+    let analyzed_program = try SemanticAnalyzer(typed_program).analyze()
+    return try Interpreter().run(analyzed_program, module_name, function_name)
 
 # mark: Custom backends ========================================================================
 
-## Compile source files with a caller-provided artifact backend.
+## Run the same verified build pipeline as `build`, then let a caller-provided
+## backend legalize, select, and emit the optimized canonical MIR.
 pub func build_with_backend(backend: ArtifactBackend, source_paths: list[str]) -> list[u8]!:
     let sources = try read_sources(source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let typed_program = try Checker(modules).check()
-    let canonical_program = try Lowerer(typed_program).lower()
-    return try backend.emit(canonical_program)
+    let analyzed_program = try SemanticAnalyzer(typed_program).analyze()
+    let canonical_program = try Lowerer(analyzed_program).lower()
+    try MirVerifier(canonical_program).verify()
+    let optimized_program = Optimizer(canonical_program).optimize()
+    try MirVerifier(optimized_program).verify()
+    return try backend.emit(optimized_program)
 
-## Run one function with a caller-provided execution backend.
+## Run the analyzed typed HIR with a caller-provided execution backend. This
+## keeps custom interpreters on the same semantic path as the built-in one.
 pub func run_with_backend(backend: ExecutionBackend, source_paths: list[str], module_name: str, function_name: str) -> Value!:
     let sources = try read_sources(source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let typed_program = try Checker(modules).check()
-    return try backend.run(typed_program, module_name, function_name)
+    let analyzed_program = try SemanticAnalyzer(typed_program).analyze()
+    return try backend.run(analyzed_program, module_name, function_name)
 
 # mark: Source stages =========================================================================
 
-# Read source files from disk.
+# Read each requested path into a named source value. For example,
+# `examples/math.luc` becomes module candidate `math` while retaining its path
+# for later diagnostics.
 func read_sources(source_paths: list[str]) -> list[SourceFile]!:
     let sources = list[SourceFile]()
     for path in source_paths:
@@ -112,7 +154,8 @@ func read_sources(source_paths: list[str]) -> list[SourceFile]!:
         ))
     return sources
 
-# Tokenize source files and add their paths to tokenizer errors.
+# Turn source text into tokens, including synthesized indent/dedent layout, and
+# prefix lexical diagnostics with the originating path.
 func tokenize_sources(sources: list[SourceFile]) -> list[TokenizedFile]!:
     let tokenized_files = list[TokenizedFile]()
     for source in sources:
@@ -125,7 +168,8 @@ func tokenize_sources(sources: list[SourceFile]) -> list[TokenizedFile]!:
         ))
     return tokenized_files
 
-# Parse tokenized files and add their paths to parser errors.
+# Turn each token stream into source syntax and package it with the module name
+# and path the checker needs for cross-file resolution and diagnostics.
 func parse_modules(tokenized_files: list[TokenizedFile]) -> list[SourceModule]!:
     let modules = list[SourceModule]()
     for file in tokenized_files:
