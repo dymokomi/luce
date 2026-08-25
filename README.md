@@ -7,9 +7,13 @@ provides the seed compiler and differential oracle.
 ## Mental model
 
 ```text
-source -> Tokenizer -> Parser -> Checker -> typed IR -> ExecutionBackend -> value
-                                            \-> Lowerer -> canonical IR
-                                                           -> ArtifactBackend -> bytes
+source -> Tokenizer -> Parser -> Checker -> typed HIR -> SemanticAnalyzer
+                                                       |-> HirInterpreter -> value
+                                                       \-> Lowerer -> canonical MIR
+                                                                    -> MirVerifier
+                                                                    -> Optimizer
+                                                                    -> MirVerifier
+                                                                    -> ArtifactBackend -> bytes
 ```
 
 - `luce.luc` owns the command-line interface.
@@ -18,11 +22,19 @@ source -> Tokenizer -> Parser -> Checker -> typed IR -> ExecutionBackend -> valu
 - `parser.luc` validates grammar and builds the source-faithful tree in
   `syntax.luc`.
 - `checker.luc` resolves module and lexical names, checks the implemented type
-  rules, and produces `typed_ir.luc`.
+  rules, and produces `hir.luc`.
+- `hir.luc` is the semantic center: program-wide functions and symbols,
+  canonical type identities, resolved operations, structured effects, and
+  source spans in one readable representation.
+- `semantic_analyzer.luc` is the permanent flow/effect/ownership boundary; it
+  currently preserves the HIR data but returns a distinct `AnalyzedProgram`, so
+  execution and lowering cannot bypass that boundary.
 - `lowerer.luc` fixes evaluation order in the backend-independent instruction
   stream defined by `canonical_ir.luc`.
+- `mir_verifier.luc` checks canonical MIR before and after `optimizer.luc`.
 - `backend.luc` defines separate execution and artifact boundaries.
-- `backends/interpreter.luc` executes typed IR by resolved symbol identity.
+- `backends/interpreter.luc` executes HIR by semantic tags and resolved symbol
+  identity, independently of MIR lowering.
 - `backends/wasm.luc` directly encodes canonical instructions as WebAssembly.
 - `backends/arm64_macos.luc` directly encodes ARM64 instructions and Mach-O.
 - `tests/` is a separate Stage-0 package containing only tests.

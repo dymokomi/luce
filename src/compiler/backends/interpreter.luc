@@ -1,6 +1,6 @@
 #==============================================================================================
 #
-#   interpreter - The semantic oracle
+#   hir_interpreter - The semantic oracle
 #
 #   DESCRIPTION:
 #       The default execution backend: runs analyzed typed HIR directly, with
@@ -8,16 +8,18 @@
 #       what this one does (LUCE_LANGUAGE_DESIGN.md §23.3) — when they disagree,
 #       the interpreter is right.
 #
-#       Public use begins at `Interpreter.run`. Call frames, lexical scope,
+#       Public use begins at `HirInterpreter.run`. Call frames, lexical scope,
 #       argument order, and control transfer stay private to one run, and
 #       evaluation trusts the checker completely: a shape the checker could not
 #       have produced is a trap here, never a user-facing error.
 #
 #==============================================================================================
 
-from compiler.backend import ExecutionBackend
-from compiler.typed_ir import SymbolId, TypedExpression, TypedFunction, TypedProgram
-from compiler.typed_ir import TypedStatement, Value
+from compiler.backend import HirExecutionBackend
+from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirExpression
+from compiler.hir import HirFunction, HirProgram, HirStatement, SymbolId, UnaryOperation, Value
+from compiler.hir import resolve_builtin_type, types_match
+from compiler.semantic_analyzer import AnalyzedProgram
 
 # mark: Run state =============================================================================
 
@@ -35,19 +37,22 @@ union Execution:
     Continued
 
 ## The reusable interpreter backend. Each execution gets private program state.
-pub class Interpreter: ExecutionBackend:
+pub class HirInterpreter: HirExecutionBackend:
+    ## Create a stateless HIR interpreter; each `run` owns its call frames.
     pub init():
         # Stateless; stage-0 requires one statement in an empty init.
         return
 
-    pub func run(program: TypedProgram, module_name: str, function_name: str) -> Value!:
-        return try InterpreterRun(program).run(module_name, function_name)
+    ## Run one selected function from an analyzed HIR program.
+    pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
+        return try HirInterpreterRun(program.hir).run(module_name, function_name)
 
 # Executes one checked program directly by symbol identity.
-class InterpreterRun:
-    program: TypedProgram
+class HirInterpreterRun:
+    program: HirProgram
 
-    pub init(program: TypedProgram):
+    # Retain the immutable semantic program used for all calls in this run.
+    pub init(program: HirProgram):
         self.program = program
 
     ## Run one public, argument-free entry function to its returned value.
@@ -62,7 +67,7 @@ class InterpreterRun:
     # mark: Functions and scopes ================================================================
 
     # Call one function: a fresh frame holding the arguments, then the body.
-    func invoke(function: TypedFunction, arguments: list[Value]) -> Value:
+    func invoke(function: HirFunction, arguments: list[Value]) -> Value:
         let bindings = list[Binding]()
         var index = 0
         while index < len(function.parameters):
@@ -72,13 +77,13 @@ class InterpreterRun:
         match self.execute_scope(function.body, bindings):
             Returned(value): return value
             Next:
-                if function.result.name == "unit": return Value.Unit
+                if types_match(function.result, resolve_builtin_type(BuiltinType.unit)): return Value.Unit
                 trap("checked function `" + function.name + "` finished without returning a value")
             else: trap("loop control escaped a function")
 
     # A suite is one lexical scope: bindings made inside it are trimmed away
     # however the suite exits.
-    func execute_scope(statements: list[TypedStatement], bindings: list[Binding]) -> Execution:
+    func execute_scope(statements: list[HirStatement], bindings: list[Binding]) -> Execution:
         let outer_count = len(bindings)
         for statement in statements:
             let result = self.execute(statement, bindings)
@@ -91,21 +96,21 @@ class InterpreterRun:
         return Execution.Next
 
     # Execute one statement and report how it left.
-    func execute(statement: TypedStatement, bindings: list[Binding]) -> Execution:
+    func execute(statement: HirStatement, bindings: list[Binding]) -> Execution:
         match statement.form:
             BreakStatement: return Execution.Broke
             ContinueStatement: return Execution.Continued
             Binding(symbol, name, is_mutable, value):
                 bindings.append(Binding(symbol = symbol, value = self.evaluate(value, bindings)))
                 return Execution.Next
-            Assignment(symbol, operator, value):
+            Assignment(symbol, operation, value):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed assignment refers to an unknown binding")
                 let right = self.evaluate(value, bindings)
                 var assigned = right
-                # `value += delta` evaluates the binary operation it abbreviates.
-                if operator != "=":
-                    assigned = evaluate_binary(bindings[index].value, operator[0:len(operator) - 1], right)
+                match operation:
+                    Replace: assigned = right
+                    Combine(binary): assigned = evaluate_binary(bindings[index].value, binary, right)
                 bindings[index] = Binding(symbol = symbol, value = assigned)
                 return Execution.Next
             PrintText(value):
@@ -138,26 +143,27 @@ class InterpreterRun:
     # mark: Expressions =========================================================================
 
     # Evaluate one expression to its value.
-    func evaluate(expression: TypedExpression, bindings: list[Binding]) -> Value:
+    func evaluate(expression: HirExpression, bindings: list[Binding]) -> Value:
         match expression.form:
             Constant(value): return value
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed reference points outside its call frame")
                 return bindings[index].value
-            Unary(operator, operand):
-                return evaluate_unary(operator, self.evaluate(operand, bindings))
-            Binary(left, operator, right):
+            Unary(operation, operand):
+                return evaluate_unary(operation, self.evaluate(operand, bindings))
+            Binary(left, operation, right):
                 let left_value = self.evaluate(left, bindings)
                 # `and` and `or` short-circuit: the right side must not run
                 # when the left side already decides the answer.
-                if operator == "and":
-                    if not as_boolean(left_value): return Value.Boolean(value = false)
-                    return Value.Boolean(value = as_boolean(self.evaluate(right, bindings)))
-                if operator == "or":
-                    if as_boolean(left_value): return Value.Boolean(value = true)
-                    return Value.Boolean(value = as_boolean(self.evaluate(right, bindings)))
-                return evaluate_binary(left_value, operator, self.evaluate(right, bindings))
+                match operation:
+                    LogicalAnd:
+                        if not as_boolean(left_value): return Value.Boolean(value = false)
+                        return Value.Boolean(value = as_boolean(self.evaluate(right, bindings)))
+                    LogicalOr:
+                        if as_boolean(left_value): return Value.Boolean(value = true)
+                        return Value.Boolean(value = as_boolean(self.evaluate(right, bindings)))
+                    else: return evaluate_binary(left_value, operation, self.evaluate(right, bindings))
             Conditional(value, condition, alternative):
                 if as_boolean(self.evaluate(condition, bindings)):
                     return self.evaluate(value, bindings)
@@ -172,22 +178,25 @@ class InterpreterRun:
 
     # mark: Program lookup ======================================================================
 
-    func find_entry(module_name: str, function_name: str) -> TypedFunction!:
+    # Resolve the external `module.function` request once at the execution
+    # boundary; internal calls below use only SymbolId.
+    func find_entry(module_name: str, function_name: str) -> HirFunction!:
         for module in self.program.modules:
             if module.name == module_name:
-                for function in module.functions:
-                    if function.name == function_name: return function
+                for function in self.program.functions:
+                    if function.module.value == module.id.value and function.name == function_name: return function
                 error("interpreter: module `" + module_name + "` has no function `" + function_name + "`")
         error("interpreter: unknown module `" + module_name + "`")
 
-    func find_function(symbol: SymbolId) -> TypedFunction:
-        for module in self.program.modules:
-            for function in module.functions:
-                if function.symbol.value == symbol.value: return function
+    # Find an internal call target by its resolved program-wide symbol.
+    func find_function(symbol: SymbolId) -> HirFunction:
+        for function in self.program.functions:
+            if function.symbol.value == symbol.value: return function
         trap("typed call refers to an unknown function")
 
 # mark: Bindings ==============================================================================
 
+# Remove locals introduced after a lexical scope began.
 func trim_bindings(bindings: list[Binding], count: i64):
     while len(bindings) > count: bindings.remove(len(bindings) - 1)
 
@@ -201,81 +210,102 @@ func find_binding(bindings: list[Binding], symbol: SymbolId) -> i64:
 
 # mark: Operators =============================================================================
 
+# Extract the bool proven by HIR typing, trapping only on a compiler defect.
 func as_boolean(value: Value) -> bool:
     match value:
         Boolean(item): return item
         else: trap("typed Boolean expression contains another value")
 
-func evaluate_unary(operator: str, value: Value) -> Value:
-    match value:
-        Boolean(item):
-            if operator == "not": return Value.Boolean(value = not item)
-        Integer(item):
-            if operator == "+": return value
-            if operator == "-": return Value.Integer(value = -item)
-            if operator == "~": return Value.Integer(value = ~item)
-        Floating(item):
-            if operator == "+": return value
-            if operator == "-": return Value.Floating(value = -item)
-        else: trap("unit has no unary operators")
-    trap("typed unary expression contains an invalid operator")
+# Apply one resolved unary operation. For example, `NumericNegate(i64)` maps
+# integer 3 to -3 without consulting source `-` spelling.
+func evaluate_unary(operation: UnaryOperation, value: Value) -> Value:
+    match operation:
+        LogicalNot:
+            match value:
+                Boolean(item): return Value.Boolean(value = not item)
+                else: trap("LogicalNot received a non-boolean HIR value")
+        NumericIdentity(operand_type):
+            match value:
+                Integer(item): return value
+                Floating(item): return value
+                else: trap("NumericIdentity received a non-numeric HIR value")
+        NumericNegate(operand_type):
+            match value:
+                Integer(item): return Value.Integer(value = -item)
+                Floating(item): return Value.Floating(value = -item)
+                else: trap("NumericNegate received a non-numeric HIR value")
+        IntegerBitwiseNot(operand_type):
+            match value:
+                Integer(item): return Value.Integer(value = ~item)
+                else: trap("IntegerBitwiseNot received a non-integer HIR value")
 
 # Dispatch on the value family; the checker already guaranteed both sides
 # share it, so a mismatch here is a compiler bug, not a user error.
-func evaluate_binary(left: Value, operator: str, right: Value) -> Value:
+func evaluate_binary(left: Value, operation: BinaryOperation, right: Value) -> Value:
     match left:
         Unit:
             match right:
-                Unit:
-                    if operator == "==": return Value.Boolean(value = true)
-                    if operator == "!=": return Value.Boolean(value = false)
+                Unit: return evaluate_unit_binary(operation)
                 else: trap("typed binary expression has unequal value types")
         Boolean(left_value):
             match right:
-                Boolean(right_value):
-                    if operator == "==": return Value.Boolean(value = left_value == right_value)
-                    if operator == "!=": return Value.Boolean(value = left_value != right_value)
+                Boolean(right_value): return evaluate_boolean_binary(left_value, operation, right_value)
                 else: trap("typed binary expression has unequal value types")
         Integer(left_value):
             match right:
-                Integer(right_value): return evaluate_integer_binary(left_value, operator, right_value)
+                Integer(right_value): return evaluate_integer_binary(left_value, operation, right_value)
                 else: trap("typed binary expression has unequal value types")
         Floating(left_value):
             match right:
-                Floating(right_value): return evaluate_float_binary(left_value, operator, right_value)
+                Floating(right_value): return evaluate_float_binary(left_value, operation, right_value)
                 else: trap("typed binary expression has unequal value types")
-    trap("typed binary expression contains an invalid operator")
 
-func evaluate_integer_binary(left: i64, operator: str, right: i64) -> Value:
-    match operator:
-        "+": return Value.Integer(value = left + right)
-        "-": return Value.Integer(value = left - right)
-        "*": return Value.Integer(value = left * right)
-        "//": return Value.Integer(value = left // right)
-        "%": return Value.Integer(value = left % right)
-        "&": return Value.Integer(value = left & right)
-        "|": return Value.Integer(value = left | right)
-        "^": return Value.Integer(value = left ^ right)
-        "<<": return Value.Integer(value = left << right)
-        ">>": return Value.Integer(value = left >> right)
-        "==": return Value.Boolean(value = left == right)
-        "!=": return Value.Boolean(value = left != right)
-        "<": return Value.Boolean(value = left < right)
-        "<=": return Value.Boolean(value = left <= right)
-        ">": return Value.Boolean(value = left > right)
-        ">=": return Value.Boolean(value = left >= right)
+# Unit supports equality only; `unit == unit` is true.
+func evaluate_unit_binary(operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = true)
+        NotEqual(operand_type): return Value.Boolean(value = false)
+        else: trap("unit HIR value received a non-equality operation")
+
+# Apply resolved equality to two bool values.
+func evaluate_boolean_binary(left: bool, operation: BinaryOperation, right: bool) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        else: trap("boolean HIR values received a non-equality operation")
+
+# Apply resolved arithmetic, bitwise, equality, or ordering to integer values.
+func evaluate_integer_binary(left: i64, operation: BinaryOperation, right: i64) -> Value:
+    match operation:
+        Add(operand_type): return Value.Integer(value = left + right)
+        Subtract(operand_type): return Value.Integer(value = left - right)
+        Multiply(operand_type): return Value.Integer(value = left * right)
+        FloorDivide(operand_type): return Value.Integer(value = left // right)
+        Remainder(operand_type): return Value.Integer(value = left % right)
+        BitwiseAnd(operand_type): return Value.Integer(value = left & right)
+        BitwiseOr(operand_type): return Value.Integer(value = left | right)
+        BitwiseXor(operand_type): return Value.Integer(value = left ^ right)
+        ShiftLeft(operand_type): return Value.Integer(value = left << right)
+        ShiftRight(operand_type): return Value.Integer(value = left >> right)
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        Less(operand_type): return Value.Boolean(value = left < right)
+        LessEqual(operand_type): return Value.Boolean(value = left <= right)
+        Greater(operand_type): return Value.Boolean(value = left > right)
+        GreaterEqual(operand_type): return Value.Boolean(value = left >= right)
         else: trap("typed integer expression contains an invalid operator")
 
-func evaluate_float_binary(left: f64, operator: str, right: f64) -> Value:
-    match operator:
-        "+": return Value.Floating(value = left + right)
-        "-": return Value.Floating(value = left - right)
-        "*": return Value.Floating(value = left * right)
-        "/": return Value.Floating(value = left / right)
-        "==": return Value.Boolean(value = left == right)
-        "!=": return Value.Boolean(value = left != right)
-        "<": return Value.Boolean(value = left < right)
-        "<=": return Value.Boolean(value = left <= right)
-        ">": return Value.Boolean(value = left > right)
-        ">=": return Value.Boolean(value = left >= right)
+# Apply resolved arithmetic, equality, or ordering to floating-point values.
+func evaluate_float_binary(left: f64, operation: BinaryOperation, right: f64) -> Value:
+    match operation:
+        Add(operand_type): return Value.Floating(value = left + right)
+        Subtract(operand_type): return Value.Floating(value = left - right)
+        Multiply(operand_type): return Value.Floating(value = left * right)
+        Divide(operand_type): return Value.Floating(value = left / right)
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        Less(operand_type): return Value.Boolean(value = left < right)
+        LessEqual(operand_type): return Value.Boolean(value = left <= right)
+        Greater(operand_type): return Value.Boolean(value = left > right)
+        GreaterEqual(operand_type): return Value.Boolean(value = left >= right)
         else: trap("typed floating-point expression contains an invalid operator")

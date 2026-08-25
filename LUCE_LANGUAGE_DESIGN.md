@@ -2234,6 +2234,8 @@ source
 
 The canonical MIR makes evaluation order, copies, ARC operations, failures, traps, effects, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed, and verification runs both before and after optimization so neither lowering nor a transform can hand malformed MIR to a backend.
 
+Typed HIR is the semantic boundary before that machine representation. It keeps structured source-level control flow while replacing source spellings with program-wide `SymbolId` and `TypeId` identities, tagged operations, structured effect sets, decoded constants, and retained source spans. Type names remain only as diagnostic metadata; interpreters and lowerers never infer language meaning from them. Whole-program semantic analysis returns a distinct `AnalyzedProgram`, making it impossible for execution or MIR lowering to consume raw checker output accidentally.
+
 The reference interpreter branches after semantic analysis and executes typed HIR directly. It intentionally remains independent of MIR lowering so differential tests can expose lowering and backend defects. A separate MIR interpreter may exist for MIR debugging without replacing that semantic oracle.
 
 The compiler is written in Luce after the Stage-0 0.19 bootstrap compiler is frozen. Each self-hosting stage must reproduce the next stage's observable compiler behavior, with bootstrapping artifacts and hashes published.
