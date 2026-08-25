@@ -1,3 +1,24 @@
+#==============================================================================================
+#
+#   checker - Source trees into typed IR
+#
+#   DESCRIPTION:
+#       The semantic stage. Resolves module and lexical names, checks the
+#       implemented type rules, and decodes literal spellings — turning source
+#       trees into the typed IR every backend consumes. Anything the current
+#       slice cannot check yet fails explicitly with "not implemented yet"
+#       rather than passing unverified.
+#
+#       Checking runs in two passes: signatures are collected across every
+#       module first, so bodies can call forward and across modules; then each
+#       body is checked in order.
+#
+#       Two failure idioms, shared with the parser: `try self.fail(...)` raises
+#       mid-flow, and a match arm or function tail that cannot continue ends
+#       with `error(self.format_diagnostic(...))` directly.
+#
+#==============================================================================================
+
 from compiler.syntax import ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax
 from compiler.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, StatementSyntax
 from compiler.syntax import SuiteSyntax, TypeArgumentSyntax, TypeSyntax
@@ -6,17 +27,10 @@ from compiler.typed_ir import SymbolId, TypedArgument, TypedExpression, TypedExp
 from compiler.typed_ir import TypedFunction, TypedIfBranch, TypedModule, TypedParameter
 from compiler.typed_ir import TypedProgram, TypedStatement, TypedStatementForm, Value, ValueType
 
-# The semantic stage: resolves module and lexical names, checks the implemented
-# type rules, and decodes literal spellings — turning source trees into the
-# typed IR every backend consumes. Anything the current slice cannot check yet
-# fails explicitly with "not implemented yet" rather than passing unverified.
-#
-# Two failure idioms, shared with the parser: `try self.fail(...)` raises
-# mid-flow, and a match arm or function tail that cannot continue ends with
-# `error(self.diagnostic(...))` directly.
+# mark: Checker state =========================================================================
 
-# One parsed file with the identity supplied by its caller. The checker never
-# guesses module identity from import spelling or source contents.
+## One parsed file with the identity supplied by its caller. The checker never
+## guesses module identity from import spelling or source contents.
 pub struct SourceModule:
     pub name: str
     pub path: str
@@ -48,15 +62,15 @@ struct ModuleBindings:
     pub modules: list[ImportedModule]
     pub functions: list[ImportedFunction]
 
+# One live local: `let total = 0` puts a `total` in scope until its suite ends.
 struct LocalBinding:
     pub symbol: SymbolId
     pub name: str
     pub value_type: ValueType
     pub is_mutable: bool
 
-# Checks one program: signatures are collected across every module first, so
-# bodies can call forward and across modules; then each body is checked in
-# order. Collection is internal so callers cannot run a partial checker.
+## Checks one whole program. Collection is internal so callers cannot run a
+## partial checker; public use begins and ends at `Checker.check`.
 pub class Checker:
     sources: list[SourceModule]
     # Every function signature in the program, across all modules.
@@ -82,6 +96,9 @@ pub class Checker:
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
 
+    # mark: Checking ============================================================================
+
+    ## Check the program or stop at its first semantic problem.
     pub func check() -> TypedProgram!:
         try self.validate_module_names()
         try self.collect_function_signatures()
@@ -100,19 +117,23 @@ pub class Checker:
             modules.append(TypedModule(name = source.name, path = source.path, functions = typed_functions))
         return TypedProgram(modules = modules)
 
-    # mark: Modules and imports ---------------------------------------------
+    # mark: Modules and imports =================================================================
 
+    # Two files may not claim the same module name; the second one loses.
     func validate_module_names() -> !:
         for index in range(0, len(self.sources)):
             for previous in range(0, index):
                 if self.sources[previous].name == self.sources[index].name:
                     try self.fail_at(index, self.sources[index].syntax.span, "duplicate module `" + self.sources[index].name + "`")
 
+    # Turn one module's import lines into name bindings, checking that every
+    # imported module exists, every selected function exists and is public,
+    # and no two imports land on the same local name.
     func resolve_imports(module_index: i64) -> ModuleBindings!:
         let bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
         for imported in self.sources[module_index].syntax.imports:
             let imported_name = imported.path.dotted()
-            let imported_module = self.source_index(imported_name)
+            let imported_module = self.find_source(imported_name)
             if imported_module < 0:
                 try self.fail_at(module_index, imported.path.span, "unknown module `" + imported_name + "`")
             if imported_module == module_index:
@@ -125,7 +146,7 @@ pub class Checker:
             else:
                 for selected in imported.names:
                     try self.require_free_import_name(module_index, bindings, selected.name, selected.span)
-                    let function_index = self.function_in_module(imported_module, selected.name)
+                    let function_index = self.find_function_in_module(imported_module, selected.name)
                     if function_index < 0:
                         try self.fail_at(module_index, selected.span, "module `" + imported_name + "` has no function `" + selected.name + "`")
                     if not self.functions[function_index].is_public:
@@ -133,8 +154,9 @@ pub class Checker:
                     bindings.functions.append(ImportedFunction(name = selected.name, function_index = function_index))
         return bindings
 
+    # An imported name may not collide with a declaration or another import.
     func require_free_import_name(module_index: i64, bindings: ModuleBindings, name: str, span: SourceSpan) -> !:
-        if self.function_in_module(module_index, name) >= 0:
+        if self.find_function_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
         for imported in bindings.modules:
             if imported.name == name:
@@ -143,8 +165,10 @@ pub class Checker:
             if imported.name == name:
                 try self.fail_at(module_index, span, "duplicate imported name `" + name + "`")
 
-    # mark: Signature collection ----------------------------------------------
+    # mark: Signature collection ================================================================
 
+    # The first pass: walk every declaration in every module and record the
+    # function signatures, so bodies checked later can call in any order.
     func collect_function_signatures() -> !:
         for module_index in range(0, len(self.sources)):
             for declaration in self.sources[module_index].syntax.declarations:
@@ -162,8 +186,10 @@ pub class Checker:
                     else:
                         try self.fail_at(module_index, declaration.span, "semantic checking for `" + str(declaration.value) + "` is not implemented yet")
 
+    # Record one function's signature: resolved parameter and result types,
+    # a fresh symbol per parameter, and a fresh symbol for the function itself.
     func collect_function(module_index: i64, is_public: bool, function: FunctionSyntax, span: SourceSpan) -> !:
-        if self.function_in_module(module_index, function.name) >= 0:
+        if self.find_function_in_module(module_index, function.name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + function.name + "`")
         if len(function.generic_parameters) > 0:
             try self.fail_at(module_index, span, "generic functions are not implemented by the semantic checker yet")
@@ -176,17 +202,19 @@ pub class Checker:
             for previous in parameters:
                 if previous.name == parameter.name:
                     try self.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
-            let annotation = parameter.annotation else error(self.diagnostic_at(module_index, parameter.span, "parameter `" + parameter.name + "` requires a type"))
+            let annotation = parameter.annotation else error(self.format_diagnostic_at(module_index, parameter.span, "parameter `" + parameter.name + "` requires a type"))
             if parameter.default_value != none:
                 try self.fail_at(module_index, parameter.span, "default arguments are not implemented by the semantic checker yet")
-            parameters.append(TypedParameter(symbol = self.new_symbol(), name = parameter.name, value_type = try self.resolve_type(module_index, annotation)))
+            parameters.append(TypedParameter(symbol = self.make_symbol(), name = parameter.name, value_type = try self.resolve_type(module_index, annotation)))
 
         var result = ValueType(name = "unit")
         let result_syntax = function.result
         if result_syntax != none:
             result = try self.resolve_type(module_index, result_syntax)
-        self.functions.append(FunctionSymbol(symbol = self.new_symbol(), module_index = module_index, name = function.name, is_public = is_public, parameters = parameters, result = result, syntax = function, span = span))
+        self.functions.append(FunctionSymbol(symbol = self.make_symbol(), module_index = module_index, name = function.name, is_public = is_public, parameters = parameters, result = result, syntax = function, span = span))
 
+    # Turn a type spelling into a checked value type. A known-but-unimplemented
+    # core type earns "not implemented yet" rather than "unknown type".
     func resolve_type(module_index: i64, value: TypeSyntax) -> ValueType!:
         match value.form:
             Named(path):
@@ -198,20 +226,23 @@ pub class Checker:
             Applied(path, arguments, span):
                 if path.dotted() == "slice" and len(arguments) == 1 and is_string_type_argument(arguments[0]):
                     return ValueType(name = "slice[str]")
-                error(self.diagnostic_at(module_index, span, "applied types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "applied types are not implemented by the semantic checker yet"))
             TupleType(elements, span):
-                error(self.diagnostic_at(module_index, span, "tuple types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "tuple types are not implemented by the semantic checker yet"))
             FunctionType(parameters, result, effects, span):
-                error(self.diagnostic_at(module_index, span, "function types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "function types are not implemented by the semantic checker yet"))
             CFunctionType(parameters, result, span):
-                error(self.diagnostic_at(module_index, span, "cfunc types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "cfunc types are not implemented by the semantic checker yet"))
             OptionalType(optional_value, span):
-                error(self.diagnostic_at(module_index, span, "optional types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "optional types are not implemented by the semantic checker yet"))
             FallibleType(successful_value, span):
-                error(self.diagnostic_at(module_index, span, "fallible types are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic_at(module_index, span, "fallible types are not implemented by the semantic checker yet"))
 
-    # mark: Functions and statements ------------------------------------------
+    # mark: Functions and statements ============================================================
 
+    # The second pass, one function at a time: parameters enter scope, the body
+    # is checked statement by statement, and a non-unit function must provably
+    # return on every path.
     func check_function(function: FunctionSymbol) -> TypedFunction!:
         self.current_result = function.result
         self.current_effects = function.syntax.effects
@@ -238,6 +269,7 @@ pub class Checker:
             self.locals.remove(len(self.locals) - 1)
         return typed
 
+    # Check one statement. Each statement family owns its detailed rules below.
     func check_statement(statement: StatementSyntax) -> TypedStatement!:
         match statement.form:
             BreakStatement(span):
@@ -261,8 +293,10 @@ pub class Checker:
             WhileStatement(condition, body, span):
                 return try self.check_while(condition, body, span)
             else:
-                error(self.diagnostic(statement.span(), "semantic checking for `" + str(statement.form) + "` is not implemented yet"))
+                error(self.format_diagnostic(statement.span(), "semantic checking for `" + str(statement.form) + "` is not implemented yet"))
 
+    # Recognize a bare `print(...)` statement so it can take the special path
+    # below; anything else falls through to ordinary expression checking.
     func check_print_call(value: ExpressionSyntax) -> TypedStatement?!:
         match value.form:
             Call(callee, type_arguments, arguments, span):
@@ -287,8 +321,10 @@ pub class Checker:
                     try self.fail(token.span, "`print` expects a string literal in the current semantic slice")
                 return TypedStatement(form = TypedStatementForm.PrintText(value = try self.decode_print_text(token)), span = span)
             else:
-                error(self.diagnostic(arguments[0].span, "`print` expects a string literal in the current semantic slice"))
+                error(self.format_diagnostic(arguments[0].span, "`print` expects a string literal in the current semantic slice"))
 
+    # Turn a plain `"..."` spelling into the bytes `print` will write, decoding
+    # the handful of escapes the slice supports.
     func decode_print_text(token: Token) -> str!:
         if len(token.text) < 2 or token.text[0] != '"' or token.text[len(token.text) - 1] != '"':
             try self.fail(token.span, "prefixed and triple-quoted strings are not implemented by `print` yet")
@@ -314,6 +350,8 @@ pub class Checker:
             position += 1
         return decoded
 
+    # `let name = value` or `var name: T = value` — the annotation, when
+    # present, becomes the expected type of the initializer.
     func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> TypedStatement!:
         match pattern:
             Name(name, name_span):
@@ -322,18 +360,20 @@ pub class Checker:
                 if annotation != none:
                     expected = try self.resolve_type(self.current_module, annotation)
                 let checked = try self.check_expression(value, expected)
-                let symbol = self.new_symbol()
+                let symbol = self.make_symbol()
                 self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked.value_type, is_mutable = is_mutable))
                 return TypedStatement(form = TypedStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = checked), span = span)
             else:
-                error(self.diagnostic(span, "tuple bindings are not implemented by the semantic checker yet"))
+                error(self.format_diagnostic(span, "tuple bindings are not implemented by the semantic checker yet"))
 
+    # `name = value` and the augmented forms; only mutable local names are
+    # assignable in the current slice.
     func check_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> TypedStatement!:
         var name = ""
         match target.form:
             Name(value_name, target_span): name = value_name
             else: try self.fail(span, "member and index assignment are not implemented by the semantic checker yet")
-        let local_index = self.local_index(name)
+        let local_index = self.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
         let local = self.locals[local_index]
         if not local.is_mutable: try self.fail(span, "cannot assign to immutable binding `" + name + "`; declare it with `var`")
@@ -342,11 +382,13 @@ pub class Checker:
         # operator is checked as the binary operation it abbreviates.
         if operator != "=":
             let binary_operator = operator[0:len(operator) - 1]
-            let result = try self.binary_type(local.value_type, binary_operator, checked.value_type, span)
+            let result = try self.resolve_binary_type(local.value_type, binary_operator, checked.value_type, span)
             if result.name != local.value_type.name:
                 try self.fail(span, "assignment changes `" + name + "` from `" + local.value_type.name + "` to `" + result.name + "`")
         return TypedStatement(form = TypedStatementForm.Assignment(symbol = local.symbol, operator = operator, value = checked), span = span)
 
+    # A return must match the enclosing function's contract exactly: a value
+    # for a value-returning function, nothing for a unit function.
     func check_return(value: ExpressionSyntax?, span: SourceSpan) -> TypedStatement!:
         if value == none:
             if self.current_result.name != "unit":
@@ -357,6 +399,8 @@ pub class Checker:
         let checked = try self.check_expression(value, self.current_result)
         return TypedStatement(form = TypedStatementForm.ReturnStatement(value = checked), span = span)
 
+    # Each `if`/`elif` condition must be bool; every branch body is its own
+    # lexical scope.
     func check_if(branches: list[IfBranchSyntax], fallback: SuiteSyntax?, span: SourceSpan) -> TypedStatement!:
         let typed_branches = list[TypedIfBranch]()
         for branch in branches:
@@ -371,6 +415,7 @@ pub class Checker:
             typed_fallback = try self.check_suite(fallback.statements)
         return TypedStatement(form = TypedStatementForm.IfStatement(branches = typed_branches, fallback = typed_fallback), span = span)
 
+    # The loop depth makes `break` and `continue` valid inside the body.
     func check_while(condition: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> TypedStatement!:
         let checked_condition = try self.check_expression(condition, ValueType(name = "bool"))
         self.loop_depth += 1
@@ -378,21 +423,22 @@ pub class Checker:
         self.loop_depth -= 1
         return TypedStatement(form = TypedStatementForm.WhileStatement(condition = checked_condition, body = checked_body), span = span)
 
-    # mark: Expressions -------------------------------------------------------
+    # mark: Expressions =========================================================================
 
-    # `expected` is the type the surrounding context requires, or none where
-    # any type is welcome; every produced expression passes `require_type`.
+    # Check one expression. `expected` is the type the surrounding context
+    # requires, or none where any type is welcome; every produced expression
+    # passes `require_type` on its way out.
     func check_expression(value: ExpressionSyntax, expected: ValueType?) -> TypedExpression!:
         match value.form:
             Literal(token): return try self.check_literal(token, expected)
             Name(name, span):
-                let local_index = self.local_index(name)
+                let local_index = self.find_local(name)
                 if local_index >= 0:
                     let local = self.locals[local_index]
                     return try self.require_type(TypedExpression(value_type = local.value_type, form = TypedExpressionForm.Reference(symbol = local.symbol), span = span), expected)
-                if self.visible_function(name) >= 0:
+                if self.find_visible_function(name) >= 0:
                     try self.fail(span, "function values are not implemented by the semantic checker yet")
-                error(self.diagnostic(span, "unknown name `" + name + "`"))
+                error(self.format_diagnostic(span, "unknown name `" + name + "`"))
             Group(grouped, span): return try self.check_expression(grouped, expected)
             Unary(operator, operand, span): return try self.check_unary(operator, operand, span, expected)
             Binary(left, operator, right, span): return try self.check_binary(left, operator, right, span, expected)
@@ -405,10 +451,12 @@ pub class Checker:
             Call(callee, type_arguments, arguments, span):
                 return try self.check_call(callee, type_arguments, arguments, span, expected)
             ElseValue(optional_value, arm, span):
-                error(self.diagnostic(span, "the `else` fallback expression is not implemented by the semantic checker yet"))
+                error(self.format_diagnostic(span, "the `else` fallback expression is not implemented by the semantic checker yet"))
             else:
-                error(self.diagnostic(value.span(), "semantic checking for `" + str(value.form) + "` is not implemented yet"))
+                error(self.format_diagnostic(value.span(), "semantic checking for `" + str(value.form) + "` is not implemented yet"))
 
+    # A bare literal becomes a constant. An unsuffixed integer is i64 unless
+    # the context asks for i32, e.g. `let count: i32 = 7`.
     func check_literal(token: Token, expected: ValueType?) -> TypedExpression!:
         var value_type = ValueType(name = "unit")
         var value = Value.Unit
@@ -432,9 +480,9 @@ pub class Checker:
             value_type = ValueType(name = "bool")
             value = Value.Boolean(value = token.text == "true")
         elif token.kind == TokenKind.char_lit or token.kind == TokenKind.str_lit or token.kind == TokenKind.byte_lit:
-            error(self.diagnostic(token.span, "character, string, and byte literals are not implemented by the semantic checker yet"))
+            error(self.format_diagnostic(token.span, "character, string, and byte literals are not implemented by the semantic checker yet"))
         else:
-            error(self.diagnostic(token.span, "optional values are not implemented by the semantic checker yet"))
+            error(self.format_diagnostic(token.span, "optional values are not implemented by the semantic checker yet"))
         return try self.require_type(TypedExpression(value_type = value_type, form = TypedExpressionForm.Constant(value = value), span = token.span), expected)
 
     func check_unary(operator: str, operand: ExpressionSyntax, span: SourceSpan, expected: ValueType?) -> TypedExpression!:
@@ -447,7 +495,7 @@ pub class Checker:
         # magnitude does not fit positive i64, so negate-after-check would
         # reject the minimum. Other operands take the general path below.
         if operator == "-" and (expected == none or expected.name == "i32" or expected.name == "i64"):
-            let literal = literal_token(operand)
+            let literal = find_literal_token(operand)
             if literal != none and literal.kind == TokenKind.int_lit:
                 if literal.suffix != "" and literal.suffix != "i32" and literal.suffix != "i64":
                     try self.fail(literal.span, "integer type `" + literal.suffix + "` is not implemented by the semantic checker yet")
@@ -476,11 +524,14 @@ pub class Checker:
             operand_context = expected
         let checked_left = try self.check_expression(left, operand_context)
         let checked_right = try self.check_expression(right, checked_left.value_type)
-        let result = try self.binary_type(checked_left.value_type, operator, checked_right.value_type, span)
+        let result = try self.resolve_binary_type(checked_left.value_type, operator, checked_right.value_type, span)
         let typed = TypedExpression(value_type = result, form = TypedExpressionForm.Binary(left = checked_left, operator = operator, right = checked_right), span = span)
         return try self.require_type(typed, expected)
 
-    func binary_type(left: ValueType, operator: str, right: ValueType, span: SourceSpan) -> ValueType!:
+    # The operator table: what each binary operator accepts and what it
+    # produces. Both sides must already have the same type; there are no
+    # implicit conversions anywhere in the language.
+    func resolve_binary_type(left: ValueType, operator: str, right: ValueType, span: SourceSpan) -> ValueType!:
         if left.name != right.name:
             try self.fail(span, "`" + operator + "` has `" + left.name + "` on the left and `" + right.name + "` on the right")
         if operator == "and" or operator == "or":
@@ -502,8 +553,10 @@ pub class Checker:
         if operator == "&" or operator == "|" or operator == "^" or operator == "<<" or operator == ">>":
             if not is_integer(left.name): try self.fail(span, "`" + operator + "` requires integer operands")
             return left
-        error(self.diagnostic(span, "operator `" + operator + "` is not implemented by the semantic checker yet"))
+        error(self.format_diagnostic(span, "operator `" + operator + "` is not implemented by the semantic checker yet"))
 
+    # Check one call: the callee's effects must be allowed here, and each
+    # parameter must be supplied exactly once.
     func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: ValueType?) -> TypedExpression!:
         if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented by the semantic checker yet")
         let function_index = try self.resolve_callee(callee)
@@ -529,7 +582,7 @@ pub class Checker:
                 positional_index += 1
             else:
                 saw_named = true
-                parameter_index = parameter_named(function, label)
+                parameter_index = find_parameter(function, label)
                 if parameter_index < 0: try self.fail(argument.span, "function `" + function.name + "` has no parameter `" + label + "`")
             if parameter_index >= len(function.parameters):
                 try self.fail(argument.span, "function `" + function.name + "` accepts " + str(len(function.parameters)) + " argument(s)")
@@ -545,13 +598,15 @@ pub class Checker:
         let typed = TypedExpression(value_type = function.result, form = TypedExpressionForm.Call(function = function.symbol, arguments = typed_arguments), span = span)
         return try self.require_type(typed, expected)
 
+    # Find which function a callee spelling names: a bare `helper(...)`, or a
+    # qualified `module.helper(...)` through an imported module.
     func resolve_callee(callee: ExpressionSyntax) -> i64!:
         match callee.form:
             Name(name, span):
-                let local_index = self.local_index(name)
+                let local_index = self.find_local(name)
                 if local_index >= 0:
                     try self.fail(span, "`" + name + "` has type `" + self.locals[local_index].value_type.name + "` and is not callable")
-                let function_index = self.visible_function(name)
+                let function_index = self.find_visible_function(name)
                 if function_index < 0: try self.fail(span, "unknown function `" + name + "`")
                 return function_index
             Member(value, name, span):
@@ -559,17 +614,17 @@ pub class Checker:
                 match value.form:
                     Name(candidate, value_span): module_name = candidate
                     else: try self.fail(span, "method calls are not implemented by the semantic checker yet")
-                let imported_module = self.imported_module(module_name)
+                let imported_module = self.find_imported_module(module_name)
                 if imported_module < 0: try self.fail(span, "unknown imported module `" + module_name + "`")
-                let function_index = self.function_in_module(imported_module, name)
+                let function_index = self.find_function_in_module(imported_module, name)
                 if function_index < 0: try self.fail(span, "module `" + self.sources[imported_module].name + "` has no function `" + name + "`")
                 if not self.functions[function_index].is_public:
                     try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
                 return function_index
             else:
-                error(self.diagnostic(callee.span(), "only named functions are callable in the current semantic slice"))
+                error(self.format_diagnostic(callee.span(), "only named functions are callable in the current semantic slice"))
 
-    # mark: Literal decoding --------------------------------------------------
+    # mark: Literal decoding ====================================================================
     #
     # The tokenizer keeps every literal's exact source spelling; here that
     # spelling becomes a value, with range failures reported at the token.
@@ -598,7 +653,7 @@ pub class Checker:
         while position < text_end:
             let c = token.text[position]
             if c != '_':
-                let digit = digit_value(c)
+                let digit = decode_digit(c)
                 let minimum = -9223372036854775807 - 1
                 let numerator = minimum + digit
                 var threshold = numerator // base
@@ -616,17 +671,19 @@ pub class Checker:
         while position < text_end:
             if token.text[position] != '_': text = text + str(token.text[position])
             position += 1
-        return parse_f64(text) else error(self.diagnostic(token.span, "floating-point literal is outside `f64` range"))
+        return parse_f64(text) else error(self.format_diagnostic(token.span, "floating-point literal is outside `f64` range"))
 
-    # mark: Name lookup -------------------------------------------------------
+    # mark: Name lookup =========================================================================
 
+    # A new local may not reuse a live name or hide an import.
     func require_free_local_name(name: str, span: SourceSpan) -> !:
-        if self.local_index(name) >= 0:
+        if self.find_local(name) >= 0:
             try self.fail(span, "`" + name + "` is already bound in this scope")
-        if self.imported_function(name) >= 0 or self.imported_module(name) >= 0:
+        if self.find_imported_function(name) >= 0 or self.find_imported_module(name) >= 0:
             try self.fail(span, "local `" + name + "` cannot shadow an imported name")
 
-    func local_index(name: str) -> i64:
+    # Innermost binding first, so a suite's binding wins over an outer one.
+    func find_local(name: str) -> i64:
         var index = len(self.locals) - 1
         while index >= 0:
             if self.locals[index].name == name: return index
@@ -635,38 +692,40 @@ pub class Checker:
 
     # A bare name resolves to a selectively imported function first, then to a
     # declaration in the current module.
-    func visible_function(name: str) -> i64:
-        let imported = self.imported_function(name)
+    func find_visible_function(name: str) -> i64:
+        let imported = self.find_imported_function(name)
         if imported >= 0: return imported
-        return self.function_in_module(self.current_module, name)
+        return self.find_function_in_module(self.current_module, name)
 
-    func imported_function(name: str) -> i64:
+    func find_imported_function(name: str) -> i64:
         for imported in self.bindings.functions:
             if imported.name == name: return imported.function_index
         return -1
 
-    func imported_module(name: str) -> i64:
+    func find_imported_module(name: str) -> i64:
         for imported in self.bindings.modules:
             if imported.name == name: return imported.module_index
         return -1
 
-    func function_in_module(module_index: i64, name: str) -> i64:
+    func find_function_in_module(module_index: i64, name: str) -> i64:
         for index in range(0, len(self.functions)):
             if self.functions[index].module_index == module_index and self.functions[index].name == name: return index
         return -1
 
-    func source_index(name: str) -> i64:
+    func find_source(name: str) -> i64:
         for index in range(0, len(self.sources)):
             if self.sources[index].name == name: return index
         return -1
 
-    func new_symbol() -> SymbolId:
+    func make_symbol() -> SymbolId:
         let symbol = SymbolId(value = self.next_symbol)
         self.next_symbol += 1
         return symbol
 
-    # mark: Diagnostics -------------------------------------------------------
+    # mark: Diagnostics =========================================================================
 
+    # The one gate every checked expression passes: its type must satisfy the
+    # context that asked for it.
     func require_type(value: TypedExpression, expected: ValueType?) -> TypedExpression!:
         if expected != none:
             if value.value_type.name != expected.name:
@@ -674,21 +733,21 @@ pub class Checker:
         return value
 
     func fail(span: SourceSpan, message: str) -> !:
-        error(self.diagnostic(span, message))
+        error(self.format_diagnostic(span, message))
 
     func fail_at(module_index: i64, span: SourceSpan, message: str) -> !:
-        error(self.diagnostic_at(module_index, span, message))
+        error(self.format_diagnostic_at(module_index, span, message))
 
-    func diagnostic(span: SourceSpan, message: str) -> str:
-        return self.diagnostic_at(self.current_module, span, message)
+    func format_diagnostic(span: SourceSpan, message: str) -> str:
+        return self.format_diagnostic_at(self.current_module, span, message)
 
-    func diagnostic_at(module_index: i64, span: SourceSpan, message: str) -> str:
+    func format_diagnostic_at(module_index: i64, span: SourceSpan, message: str) -> str:
         return self.sources[module_index].path + ":" + str(span.line) + ":" + str(span.column) + ": " + message
 
 
-# mark: Type and operator tables ----------------------------------------------
+# mark: Type and operator tables ==============================================================
 
-func literal_token(value: ExpressionSyntax) -> Token?:
+func find_literal_token(value: ExpressionSyntax) -> Token?:
     match value.form:
         Literal(token): return token
         else: return none
@@ -701,7 +760,7 @@ func is_string_type_argument(argument: TypeArgumentSyntax) -> bool:
                 else: return false
         else: return false
 
-func parameter_named(function: FunctionSymbol, name: str) -> i64:
+func find_parameter(function: FunctionSymbol, name: str) -> i64:
     for index in range(0, len(function.parameters)):
         if function.parameters[index].name == name: return index
     return -1
@@ -757,7 +816,7 @@ func is_core_type_name(name: str) -> bool:
         "f16", "f32", "f64", "char", "str", "bytes", "unit", "never" => true
         else => false
 
-func digit_value(c: char) -> i64:
+func decode_digit(c: char) -> i64:
     let code = u32(c)
     if c <= '9': return i64(code - u32('0'))
     if c <= 'F': return i64(code - u32('A')) + 10
