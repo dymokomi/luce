@@ -19,13 +19,13 @@ esac
 
 # Pinned checksums, one per flavor — filled in when the release is cut.
 # bootstrap refuses to install an archive it cannot verify.
-checksum_macos_aarch64=95b60889c95456ce3ea67c79e7a9f959878e603b849b9c4564ea0b0e21383eb8
-checksum_linux_x86_64=41453748876a1c661433224aa7716e696de3346c3fb8c9a2a45f08d45508e197
+checksum_macos_aarch64=4589b5594880d9d4cd8fcbd5fbb07b225bdff0b6eeed3ac81c91b88e4113201e
+checksum_linux_x86_64=12714fa47f20acd40b1a72370ee77b40d454de9a7b9c470312f7a26d6ef779be
 
 eval "expected=\$checksum_$(printf %s "$flavor" | tr - _)"
 [ "$expected" != TBD ] || { echo "bootstrap: checksum for $flavor not pinned yet" >&2; exit 1; }
 
-archive="luce-0.20-$flavor.tar.gz"
+archive="luce-0.21-$flavor.tar.gz"
 url="https://github.com/$repo/releases/download/$release_tag/$archive"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
