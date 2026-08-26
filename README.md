@@ -1,82 +1,97 @@
 # Luce
 
-Luce is the 1.0 compiler, written in the language it is building. The
-frozen [Stage-0 0.19 toolchain](https://github.com/dymokomi/luce-stage-0)
-provides the seed compiler and differential oracle.
+Luce is a work-in-progress systems programming language. The goal is simple:
+Luce code is easy to read, its behavior is predictable, and talking to C is
+straightforward. The compiler follows the same rule. You can open a source file
+and understand what it is doing without an archaeological dig.
 
-## Mental model
+This repository is where Luce 1.0 and its compiler are being built. The compiler
+is written in Luce and is bootstrapped with a small, frozen
+[Stage-0 toolchain](https://github.com/dymokomi/luce-stage-0).
 
-```text
-source -> Tokenizer -> Parser -> Checker -> typed HIR -> SemanticAnalyzer
-                                                       |-> HirInterpreter -> value
-                                                       \-> Lowerer -> canonical MIR
-                                                                    -> MirVerifier
-                                                                    -> Optimizer
-                                                                    -> MirVerifier
-                                                                    -> ArtifactBackend -> bytes
-```
+Luce is under active development. It is not a production-ready language yet.
+The frontend understands most of the planned 1.0 source language, while the
+parts that can be type-checked, run, and compiled are growing in smaller
+end-to-end slices. Unsupported features fail with a clear diagnostic instead
+of silently doing the wrong thing.
 
-- `luce.luc` owns the command-line interface.
-- `pipeline.luc` is the visible compiler spine and composes every stage.
-- `tokenizer.luc` turns source text into layout-aware tokens.
-- `parser.luc` validates grammar and builds the source-faithful tree in
-  `syntax.luc`.
-- `checker.luc` resolves module and lexical names, checks the implemented type
-  rules, and produces `hir.luc`.
-- `hir.luc` is the semantic center: program-wide functions and symbols,
-  canonical type identities, resolved operations, and
-  source spans in one readable representation.
-- `semantic_analyzer.luc` is the permanent flow/ownership boundary; it
-  currently preserves the HIR data but returns a distinct `AnalyzedProgram`, so
-  execution and lowering cannot bypass that boundary.
-- `lowerer.luc` fixes evaluation order in the backend-independent instruction
-  stream defined by `canonical_ir.luc`.
-- `mir_verifier.luc` checks canonical MIR before and after `optimizer.luc`.
-- `backend.luc` defines separate execution and artifact boundaries.
-- `backends/interpreter.luc` executes HIR by semantic tags and resolved symbol
-  identity, independently of MIR lowering.
-- `backends/wasm.luc` directly encodes canonical instructions as WebAssembly.
-- `backends/arm64_macos.luc` directly encodes ARM64 instructions and Mach-O.
-- `tests/` is a separate Stage-0 package containing only tests.
+## Getting started
 
-The parser covers the 1.0 source surface. The executable vertical slice is
-currently `bool`, `i64`, `f64`, and `unit` functions with calls, bindings,
-assignment, basic operators, `if`, `while`, and returns. Other parsed forms fail
-explicitly until their semantic rules are implemented.
-
-The compiled slice is intentionally tiny: integer literals, `+`, `-`, `*`,
-constant `print`, and `return`. WebAssembly covers zero-argument `i64`
-functions; the direct Apple-silicon path covers the conventional
-`main(slice[str]) -> i32` entry. Unsupported lowering fails
-explicitly so both paths remain readable end to end.
-
-## Develop
+The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
+the pinned Stage-0 compiler for the current machine and verifies its checksum.
 
 ```sh
 ./bootstrap.sh
-./stage0/bin/luce-0 check src/luce.luc
+./build.sh
 ./test.sh
-mkdir -p build
-./stage0/bin/luce-0 build src/luce.luc -o build/luce
+```
+
+The compiler is now available at `build/luce`. It can check source files, run a
+function through the HIR interpreter, or build an artifact:
+
+```sh
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./build/luce build build/answer.wasm examples/compiled_core/main.luc
-./build/luce build --target arm64-macos build/hello examples/hello.luc
-./build/hello
-node -e 'const fs=require("node:fs"); WebAssembly.instantiate(fs.readFileSync("build/answer.wasm")).then(({instance}) => console.log(instance.exports["main.answer"]().toString()))'
 ```
 
-Tests import source through the local `luce` package declared in
-`tests/luce.yaml`. They test public contracts; private helpers remain private
-and are covered through the behavior that uses them. No Stage-0 test-access
-exception is required.
+Native output is also available for Apple silicon macOS and x86-64 Linux:
 
-`LUCE_LANGUAGE_DESIGN.md` is the normative 1.0 specification. Source under
-`src/` must still use the Stage-0 0.19 subset so the seed compiler can
-build it.
+```sh
+./build/luce build --target arm64-macos build/hello examples/hello.luc
+./build/luce build --target x86_64-linux build/hello examples/hello.luc
+```
 
-## Examples
+Use the target that matches the machine where the executable will run.
 
-`examples/` contains 1.0 programs ranging from `hello.luc` to multi-module
-and native-C interop examples. They are parsed as part of the test suite; see
-`examples/FEATURES.md` for complete source-surface coverage.
+## What works today
+
+- The tokenizer and parser cover most of the planned 1.0 grammar, including
+  indentation-based layout, declarations, types, control flow, patterns,
+  closures, generics, and the C boundary syntax.
+- The checker produces typed HIR with stable symbol and type identities. The
+  currently executable language slice includes functions, calls, bindings,
+  assignment, basic scalar operations, conditionals, loops, and returns.
+- The HIR interpreter is the reference implementation of language behavior for
+  the slice it supports.
+- The compiled slice lowers to a small canonical MIR and can be emitted directly
+  as WebAssembly, ARM64 Mach-O, or x86-64 ELF.
+- The test suite exercises the frontend, semantic model, interpreter, lowering,
+  MIR verification, and each artifact encoder. On a supported native host it
+  also builds and runs a smoke-test executable.
+
+The parser is intentionally ahead of the semantic checker and backends. A
+program appearing in the language tour does not necessarily mean every stage
+can execute it yet.
+
+## Where to go next
+
+- Read [the language design](LUCE_LANGUAGE_DESIGN.md) for the current 1.0
+  language. It is the specification, not a description of what happens to be
+  implemented today.
+- Read [the post-1.0 notes](LUCE_LANGUAGE_DESIGN_POST_1_0.md) for ideas that are
+  deliberately outside the current language.
+- Browse [the examples](examples/README.md) to see the source language, the
+  executable semantic slice, and the small compiled slice.
+- Open [pipeline.luc](src/compiler/pipeline.luc) for the shortest useful tour of
+  the compiler. Its `build`, `check`, and `run` functions show how the stages fit
+  together.
+- Look under [tests/compiler](tests/compiler) for precise examples of what each
+  stage currently accepts, rejects, and produces.
+
+## Finding your way around
+
+- `src/luce.luc` is the command-line program.
+- `src/compiler/tokenizer.luc`, `parser.luc`, and `syntax.luc` are the source
+  frontend.
+- `src/compiler/checker.luc` and `hir.luc` turn source syntax into resolved,
+  typed program meaning.
+- `src/compiler/semantic_analyzer.luc` is the home for flow, effect, and
+  ownership analysis as those checks are implemented.
+- `src/compiler/backends/interpreter.luc` runs typed HIR directly.
+- `src/compiler/lowerer.luc`, `canonical_ir.luc`, `mir_verifier.luc`, and
+  `optimizer.luc` form the target-independent compiled path.
+- `src/compiler/backends/` contains the WebAssembly, Mach-O, and ELF emitters.
+
+Compiler source must remain buildable by the pinned Stage-0 language subset
+until Luce can reliably build itself without that seed compiler.
