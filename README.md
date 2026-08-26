@@ -83,6 +83,7 @@ can execute it yet.
 ## Finding your way around
 
 - `src/luce.luc` is the command-line program.
+- `src/compiler/source.luc` is the shared source span and diagnostic format.
 - `src/compiler/tokenizer.luc`, `parser.luc`, and `syntax.luc` are the source
   frontend.
 - `src/compiler/checker.luc` and `hir.luc` turn source syntax into resolved,
