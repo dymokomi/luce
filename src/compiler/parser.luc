@@ -25,7 +25,8 @@ from compiler.syntax import GenericParameterSyntax, IfBranchSyntax, ImportedName
 from compiler.syntax import ImportSyntax, InterfaceSyntax
 from compiler.syntax import MapEntrySyntax, MatchStatementArmSyntax, MatchValueArmSyntax
 from compiler.syntax import ModuleSyntax, NamedTypeSyntax, NominalTypeKind, NominalTypeSyntax
-from compiler.syntax import ParameterSyntax, PathSyntax, PatternSyntax, StatementForm, StatementSyntax
+from compiler.syntax import ParameterSyntax, PathSyntax, PatternLiteralSyntax, PatternSyntax
+from compiler.syntax import StatementForm, StatementSyntax
 from compiler.syntax import SuiteStyle, SuiteSyntax, TestSyntax, TypeAliasSyntax
 from compiler.syntax import TypeArgumentSyntax, TypeForm, TypeMemberKind, TypeMemberSyntax, TypeSyntax
 import std.strings
@@ -1052,20 +1053,20 @@ pub class Parser:
         let start = self.current()
         if self.take_symbol("_"):
             return PatternSyntax.Wildcard(span = self.span_from(start))
-        if self.is_literal(self.current()):
-            let lower = self.advance()
+        if self.is_literal(self.current()) or self.at_symbol("-"):
+            let lower = try self.parse_pattern_literal()
             if self.at_symbol("..<") or self.at_symbol("..="):
                 let operator = self.advance().text
-                if not self.is_literal(self.current()):
+                if not self.is_literal(self.current()) and not self.at_symbol("-"):
                     try self.fail(self.current(), "expected a literal at the end of a pattern range")
-                let upper = self.advance()
+                let upper = try self.parse_pattern_literal()
                 return PatternSyntax.RangePattern(
                     lower = lower,
                     operator = operator,
                     upper = upper,
                     span = self.span_from(start),
                 )
-            return PatternSyntax.Literal(token = lower)
+            return PatternSyntax.Literal(value = lower)
         try self.expect_symbol(".")
         let name = (try self.expect_name("case name")).text
         let bindings = list[str]()
@@ -1077,6 +1078,24 @@ pub class Parser:
                         break
             try self.expect_symbol(")")
         return PatternSyntax.CasePattern(name = name, bindings = bindings, span = self.span_from(start))
+
+    # Read one pattern literal and preserve an optional numeric minus sign.
+    # Examples: `'a'` is unsigned syntax; `-10i32` records `10i32` plus its sign.
+    func parse_pattern_literal() -> PatternLiteralSyntax!:
+        let start = self.current()
+        let is_negative = self.take_symbol("-")
+        if is_negative:
+            let kind = self.current().kind
+            if kind != TokenKind.int_lit and kind != TokenKind.float_lit:
+                try self.fail(self.current(), "expected a numeric literal after `-` in a pattern")
+        elif not self.is_literal(self.current()):
+            try self.fail(self.current(), "expected a literal in a pattern")
+        let token = self.advance()
+        return PatternLiteralSyntax(
+            token = token,
+            is_negative = is_negative,
+            span = self.span_from(start),
+        )
 
     # mark: Types ================================================================================
 
@@ -1113,7 +1132,7 @@ pub class Parser:
             return try self.parse_c_function_type(start)
 
         if self.take_symbol("("):
-            return try self.parse_tuple_type(start)
+            return try self.parse_group_or_tuple_type(start)
 
         let path = try self.parse_path()
         var arguments = list[TypeArgumentSyntax]()
@@ -1162,10 +1181,21 @@ pub class Parser:
         try self.expect_symbol(")")
         return parameters
 
-    func parse_tuple_type(start: Token) -> TypeSyntax!:
+    # Parentheses group one type; a comma changes the same opening into a tuple.
+    # Examples: `(func() -> unit)?` is optional function, while `(i64, str)` is a tuple.
+    func parse_group_or_tuple_type(start: Token) -> TypeSyntax!:
+        let first = try self.parse_type()
+        if not self.take_symbol(","):
+            try self.expect_symbol(")")
+            return TypeSyntax(form = TypeForm.GroupedType(
+                value = first,
+                span = self.span_from(start),
+            ))
+
         let elements = list[TypeSyntax]()
-        elements.append(try self.parse_type())
-        try self.expect_symbol(",")
+        elements.append(first)
+        if self.at_symbol(")"):
+            try self.fail(self.current(), "a tuple type requires at least two elements")
         elements.append(try self.parse_type())
         while self.take_symbol(","):
             if self.at_symbol(")"):
@@ -1248,6 +1278,11 @@ pub class Parser:
                 break
             if precedence == comparison_precedence and used_comparison:
                 try self.fail(self.current(), "comparison operators cannot be chained")
+            if precedence == comparison_precedence and is_ungrouped_logical_not(left):
+                try self.fail(
+                    self.current(),
+                    "ambiguous `not` before comparison; write `not (a == b)` or `(not a) == b`",
+                )
             if precedence == range_precedence and used_range:
                 try self.fail(self.current(), "range operators cannot be chained")
             if precedence == comparison_precedence:
@@ -1508,7 +1543,11 @@ pub class Parser:
             if modifier.text != "copy":
                 try self.fail(modifier, "expected `copy` or `weak` capture")
 
-        let name = (try self.expect_name("capture name")).text
+        var name = ""
+        if is_weak and self.take_keyword("self"):
+            name = "self"
+        else:
+            name = (try self.expect_name("capture name")).text
         var value: ExpressionSyntax? = none
         if not is_weak:
             try self.expect_symbol("=")
@@ -1808,7 +1847,8 @@ pub class Parser:
         return closing_index >= 0 and self.token_at(closing_index + 1).text == "=>"
 
     # Generic-call brackets must close immediately before `(` and begin with a
-    # syntactically recognizable type (or the integer array-length argument).
+    # syntactically recognizable type. An integer first item means indexing:
+    # `values[0](argument)`, while `array[T, 4]` retains its later length item.
     func is_generic_call_ahead() -> bool:
         let closing_index = self.find_matching_symbol(self.position, "[", "]")
         if closing_index < 0 or self.token_at(closing_index + 1).text != "(":
@@ -1819,8 +1859,6 @@ pub class Parser:
         if index >= limit:
             return false
         let token = self.token_at(index)
-        if token.kind == TokenKind.int_lit:
-            return true
         if token.kind == TokenKind.keyword and token.text == "func":
             return true
         if token.kind == TokenKind.symbol and token.text == "(":
@@ -1881,6 +1919,13 @@ func span_between(start: Token, end: Token) -> SourceSpan:
         line = start.span.line,
         column = start.span.column,
     )
+
+# Recognize only a direct `not value`; parentheses deliberately hide it so
+# `(not value) == other` remains an explicit, unambiguous comparison.
+func is_ungrouped_logical_not(value: ExpressionSyntax) -> bool:
+    match value.form:
+        Unary(operator, operand, span): return operator == "not"
+        else: return false
 
 func precedence_of(operator: str) -> i64:
     return match operator:

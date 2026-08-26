@@ -117,6 +117,7 @@ Small does not mean:
 - NUL, invalid UTF-8, misleading bidirectional controls, and look-alike syntax punctuation are rejected.
 - CRLF is normalized for parsing while source spans retain correct byte/line mappings.
 - Identifiers are ASCII in epoch 1. Unicode remains fully supported inside text and comments. Unicode identifiers require a later spoofing and normalization design.
+- An identifier begins with an ASCII letter or `_` and continues with ASCII letters, digits, or `_`. The standalone `_` token remains the pattern wildcard; `_unused` is an ordinary name.
 
 ### 3.2 Indentation and lines
 
@@ -203,6 +204,7 @@ none
 ```
 
 - Underscores may separate digits but not begin/end a number or repeat.
+- Based integer prefixes use the canonical lowercase spellings `0x`, `0o`, and `0b`; uppercase `0X`, `0O`, and `0B` are rejected.
 - Context chooses the integer type; absent context, the default is `i64`.
 - A suffix names an exact built-in numeric type.
 - A literal outside the contextual type's range is a compile error.
@@ -239,6 +241,7 @@ text"""
 - Raw strings disable escapes and interpolation.
 - Triple-quoted strings use formatter-defined indentation trimming based on the closing delimiter.
 - Interpolation evaluates expressions left-to-right and uses the closed standard formatting interface. It is not a macro.
+- A field inside a triple-quoted formatted string may contain an ordinary line comment. Because `#` owns the rest of its physical line, the field's closing `}` must appear on a later line.
 - Text/character escapes are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, and Unicode scalar `\u{HEX}`. Byte literals additionally allow exactly two-digit `\xNN`; a text escape must still produce valid Unicode.
 - Formatted strings use `{{` and `}}` for literal braces. Formatting policies are ordinary calls inside the field (for example `format.hex(value)`), not an embedded mini-language.
 
@@ -719,7 +722,7 @@ Epoch 1 patterns are deliberately closed:
 
 - enum cases, with bindings for any payload;
 - `.some(value)` and `.none` for optionals;
-- Boolean and integer, character, or string literals;
+- Boolean, numeric, character, or string literals; numeric patterns may carry a leading `-`;
 - half-open `lower..<upper` and closed `lower..=upper` integer or character
   literal ranges;
 - comma-separated alternatives that share one arm body;
@@ -1433,6 +1436,7 @@ let handler = func [copy snapshot = counter, weak owner] (event: Event):
 
 - `copy name = expression` evaluates once and stores a value snapshot under `name`.
 - `weak name` weakly captures a class reference and exposes it inside as an optional.
+- `weak self` is the receiver-specific spelling of the same weak capture and is used to break a closure cycle with its owning class.
 - Capture expressions evaluate left-to-right when the closure is formed.
 
 There is no capture-by-borrow, capture-default punctuation, or ownership-transfer capture. Native callback lifetimes use generated adapters and explicit resource objects.
@@ -3005,7 +3009,9 @@ pattern_list    = pattern, { ",", pattern } ;
 pattern         = "_"
                 | literal_pattern
                 | case_pattern ;
-literal_pattern = literal, [ ( "..<" | "..=" ), literal ] ;
+literal_pattern = pattern_literal,
+                  [ ( "..<" | "..=" ), pattern_literal ] ;
+pattern_literal = literal | "-", ( INTEGER_LITERAL | FLOAT_LITERAL ) ;
 case_pattern    = ".", IDENT,
                   [ "(", [ IDENT, { ",", IDENT } ], ")" ] ;
 
