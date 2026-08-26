@@ -71,8 +71,8 @@ can execute it yet.
 - Read [the language design](docs/language/1.0.md) for the current 1.0
   language. It is the specification, not a description of what happens to be
   implemented today.
-- Read [the post-1.0 notes](docs/language/post-1.0.md) for ideas that are
-  deliberately outside the current language.
+- Read [the post-1.0 notes](docs/language/post-1.0.md) for ideas outside the
+  current language.
 - Browse [the examples](examples/README.md) to see the source language, the
   executable semantic slice, and the small compiled slice.
 - Open [pipeline.luc](src/compiler/pipeline.luc) for the shortest useful tour of

@@ -18,7 +18,7 @@ start at `main`.
 - `checkout/` is one program split across modules. From this package root,
   `checkout/catalog.luc` has the module path `checkout.catalog`; its entry point
   demonstrates both selective and aliased imports.
-- `c_api.luc` demonstrates the deliberately narrow C export surface.
+- `c_api.luc` demonstrates the narrow C export surface.
 - `c_import/` contains a real C library and the Luce boundary that consumes its
   manifest-generated raw module. See its README for the current implementation
   boundary.
