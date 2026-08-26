@@ -7,6 +7,15 @@
 #       by the parser. Logical lines become NEWLINE/INDENT/DEDENT layout tokens;
 #       blank lines and ordinary comments remain invisible.
 #
+#       Inside `()`, `[]`, and `{}` newlines are ordinary spacing, except that a
+#       `:` ending its line opens an indented suite whose layout tokens resume
+#       until the enclosing delimiter closes (a block closure, `catch` handler,
+#       or `match` expression written as an argument).
+#
+#       A formatted string is not one token: `f"a {b} c"` becomes format_start,
+#       format_text, the field's own tokens between `{` and `}`, more text, and
+#       format_end, so the parser reads each field as an ordinary expression.
+#
 #       Literal tokens keep their exact source spelling for later compiler stages.
 #       Public use begins at `Tokenizer.tokenize`; scanning rules, source movement,
 #       and diagnostics stay private below it.
@@ -26,6 +35,9 @@ pub enum TokenKind:
     str_lit
     byte_lit
     char_lit
+    format_start
+    format_text
+    format_end
     symbol
     newline
     indent
@@ -47,6 +59,20 @@ pub struct Token:
     pub suffix: str
     pub span: SourceSpan
 
+# An indentation region opened by a suite-opening `:` inside delimiters: layout
+# is live while exactly `depth` delimiters are open, and the region's block
+# dedents back to `base` when its delimiter closes.
+struct LayoutRegion:
+    depth: i64
+    base: i64
+
+# One formatted string whose field is being scanned; the location names the
+# string in diagnostics, and `is_triple` decides whether lines may be crossed.
+struct FormattedMode:
+    is_triple: bool
+    line: i64
+    column: i64
+
 ## Converts one complete source string into a layout-aware token stream.
 pub class Tokenizer:
     source: str
@@ -57,6 +83,11 @@ pub class Tokenizer:
     indent_width: i64
     open_delimiters: list[char]
     pending_layout: bool
+    layout_regions: list[LayoutRegion]
+    formatted_modes: list[FormattedMode]
+    # Where a triple-quoted field's `}"""` was swallowed by a comment, if ever.
+    commented_close_line: i64
+    commented_close_column: i64
 
     ## Create a tokenizer positioned before the first source character.
     ## Example: `Tokenizer("name")` starts at line 1, column 1 with no tokens.
@@ -69,6 +100,10 @@ pub class Tokenizer:
         self.indent_width = 0
         self.open_delimiters = list[char]()
         self.pending_layout = true
+        self.layout_regions = list[LayoutRegion]()
+        self.formatted_modes = list[FormattedMode]()
+        self.commented_close_line = 0
+        self.commented_close_column = 0
 
     # mark: Tokenization ========================================================================
 
@@ -77,7 +112,7 @@ pub class Tokenizer:
     pub func tokenize() -> list[Token]!:
         try self.validate_source()
         while not self.has_reached_end():
-            if self.pending_layout and len(self.open_delimiters) == 0:
+            if self.pending_layout and self.layout_active():
                 try self.scan_line_start()
             else:
                 try self.scan_token()
@@ -165,6 +200,11 @@ pub class Tokenizer:
     # same information that a general indentation stack would contain.
     # Example: width 0 -> 4 emits indent; width 8 -> 0 emits two dedent tokens.
     func update_indentation(width: i64) -> !:
+        if len(self.layout_regions) > 0 and width < self.layout_regions[len(self.layout_regions) - 1].base:
+            error(
+                self.format_location_at(width + 1)
+                + "a suite inside delimiters cannot dedent past the line that opened it"
+            )
         if width > self.indent_width:
             if width != self.indent_width + 4:
                 error(self.format_location_at(width + 1) + "indentation must increase by four spaces")
@@ -177,6 +217,10 @@ pub class Tokenizer:
             self.emit(TokenKind.dedent, "", width + 1)
         if width != self.indent_width:
             error(self.format_location_at(width + 1) + "dedent does not match any outer indentation")
+        # Dedenting back to the opening line closes a delimiter suite: the
+        # remaining tokens up to the delimiter are ordinary spacing-only source.
+        if len(self.layout_regions) > 0 and width == self.layout_regions[len(self.layout_regions) - 1].base:
+            self.layout_regions.remove(len(self.layout_regions) - 1)
 
     # Preserve documentation as a token; unlike an ordinary comment, it belongs
     # to the declaration or member that follows it.
@@ -188,10 +232,23 @@ pub class Tokenizer:
         self.emit(TokenKind.doc_comment, self.source[start:self.position], column)
 
     # Consume an ordinary comment but leave its physical newline for layout.
+    # Inside a triple-quoted field the comment owns the rest of the line, so an
+    # apparent `}"""` inside it is remembered for the diagnostic at EOF.
     # Example: in `name # note\n`, this stops on `\n` after consuming `# note`.
     func skip_comment():
         while not self.has_reached_end() and self.peek() != '\n' and self.peek() != '\r':
+            if len(self.formatted_modes) > 0 and self.commented_close_line == 0 and self.matches_source("}\"\"\""):
+                self.commented_close_line = self.line
+                self.commented_close_column = self.calculate_column()
             self.position += 1
+
+    # Layout is live at the top level and inside a suite opened within
+    # delimiters, but suspended by any delimiter opened deeper than that suite.
+    # Example: in `run(func ():\n    g(\n1))`, the line after `g(` is spacing.
+    func layout_active() -> bool:
+        if len(self.layout_regions) == 0:
+            return len(self.open_delimiters) == 0
+        return len(self.open_delimiters) == self.layout_regions[len(self.layout_regions) - 1].depth
 
     # mark: Tokens ==============================================================================
 
@@ -208,10 +265,12 @@ pub class Tokenizer:
             self.position += 1
             return
         if character == '#':
+            try self.require_multiline_field()
             self.skip_comment()
             return
         if character == '\n' or character == '\r':
-            if len(self.open_delimiters) == 0:
+            try self.require_multiline_field()
+            if self.layout_active():
                 self.emit(TokenKind.newline, "", column)
                 self.pending_layout = true
             self.advance_line()
@@ -256,10 +315,21 @@ pub class Tokenizer:
     # mark: Strings and characters ==============================================================
 
     # String prefixes have deliberately separate meanings: r disables escapes,
-    # f enables interpolation fields, and b selects the byte-literal token kind.
+    # f opens a formatted string whose fields are tokenized in place, and b
+    # selects the byte-literal token kind.
     # Example: `b"ABC"` emits byte_lit; `r"\n"` emits str_lit without decoding.
     func scan_string_literal(start: i64, start_line: i64, column: i64, prefix: char) -> !:
         if prefix != '\u{0}': self.position += 1
+        if prefix == 'f':
+            let is_triple = self.matches_source("\"\"\"")
+            if is_triple:
+                self.position += 3
+            else:
+                self.position += 1
+            self.emit_at(TokenKind.format_start, self.source[start:self.position], start_line, column)
+            self.formatted_modes.append(FormattedMode(is_triple = is_triple, line = start_line, column = column))
+            try self.scan_formatted_text()
+            return
 
         try self.scan_string_body(prefix, start_line, column)
         if prefix == 'b':
@@ -272,7 +342,6 @@ pub class Tokenizer:
     # Example: `"""first\nsecond"""` advances a line but stays one string body.
     func scan_string_body(prefix: char, start_line: i64, column: i64) -> !:
         let is_raw = prefix == 'r'
-        let is_formatted = prefix == 'f'
         let byte_mode = prefix == 'b'
         let is_triple = self.matches_source("\"\"\"")
         if is_triple:
@@ -291,16 +360,6 @@ pub class Tokenizer:
                 return
             if not is_raw and character == '\\':
                 try self.scan_escape(byte_mode)
-            elif is_formatted and character == '{':
-                if self.matches_source("{{"):
-                    self.position += 2
-                else:
-                    try self.scan_interpolation(is_triple, start_line, column)
-            elif is_formatted and character == '}':
-                if self.matches_source("}}"):
-                    self.position += 2
-                else:
-                    error(format_location(start_line, column) + "unescaped '}' in formatted string")
             elif character == '\n' or character == '\r':
                 if not is_triple:
                     error(format_location(start_line, column) + "unterminated string literal")
@@ -315,66 +374,72 @@ pub class Tokenizer:
 
         error(format_location(start_line, column) + "unterminated string literal")
 
-    # Interpolation stays inside one STRING token, but its balanced braces and
-    # nested quoted literals must be understood so an inner quote cannot end the
-    # outer formatted string accidentally.
-    # Example: the field in `f"{call({"x": 1})}"` ends at its outermost `}`.
-    func scan_interpolation(multiline: bool, start_line: i64, column: i64) -> !:
-        self.position += 1
-        var braces = 1
-        var commented_close_line = 0
-        var commented_close_column = 0
+    # Consume the literal text of the innermost formatted string up to its next
+    # field or closing quote. Text is emitted with its `{{`/`}}` spellings
+    # intact; a field's `{` is pushed as the delimiter `f` so its tokens are
+    # scanned by the ordinary rules and its `}` returns here.
+    # Example: `f"a {b} c"` emits format_start, text `a `, `{`, name, `}`, text ` c`, format_end.
+    func scan_formatted_text() -> !:
+        let mode = self.formatted_modes[len(self.formatted_modes) - 1]
+        let start = self.position
+        let start_line = self.line
+        let column = self.calculate_column()
         while not self.has_reached_end():
             let character = self.peek()
-            if is_string_prefix(character) and self.peek(1) == '"':
-                let nested_line = self.line
-                let nested_column = self.calculate_column()
+            if mode.is_triple and self.matches_source("\"\"\""):
+                self.emit_formatted_text(start, start_line, column)
+                let close_column = self.calculate_column()
+                self.position += 3
+                self.emit(TokenKind.format_end, "\"\"\"", close_column)
+                self.formatted_modes.remove(len(self.formatted_modes) - 1)
+                return
+            if not mode.is_triple and character == '"':
+                self.emit_formatted_text(start, start_line, column)
+                let close_column = self.calculate_column()
                 self.position += 1
-                try self.scan_string_body(character, nested_line, nested_column)
-            elif character == '"':
-                let nested_line = self.line
-                let nested_column = self.calculate_column()
-                try self.scan_string_body('\u{0}', nested_line, nested_column)
-            elif character == '\'':
-                try self.scan_character_body()
+                self.emit(TokenKind.format_end, "\"", close_column)
+                self.formatted_modes.remove(len(self.formatted_modes) - 1)
+                return
+            if character == '\\':
+                try self.scan_escape(false)
             elif character == '{':
-                braces += 1
-                self.position += 1
-            elif character == '}':
-                braces -= 1
-                self.position += 1
-                if braces == 0:
-                    return
-            elif character == '#':
-                if not multiline:
-                    error(
-                        format_location(start_line, column)
-                        + "formatted string interpolation cannot cross a line"
-                    )
-                # A comment owns the rest of its physical line. Remember an
-                # apparent field/string close so EOF can diagnose the common
-                # `# }"""` mistake at the characters that were commented out.
-                while not self.has_reached_end() and self.peek() != '\n' and self.peek() != '\r':
-                    if commented_close_line == 0 and self.matches_source("}\"\"\""):
-                        commented_close_line = self.line
-                        commented_close_column = self.calculate_column()
+                if self.matches_source("{{"):
+                    self.position += 2
+                else:
+                    self.emit_formatted_text(start, start_line, column)
+                    let brace_column = self.calculate_column()
                     self.position += 1
+                    self.open_delimiters.append('f')
+                    self.emit(TokenKind.symbol, "{", brace_column)
+                    return
+            elif character == '}':
+                if self.matches_source("}}"):
+                    self.position += 2
+                else:
+                    error(format_location(mode.line, mode.column) + "unescaped '}' in formatted string")
             elif character == '\n' or character == '\r':
-                if not multiline:
-                    error(
-                        format_location(start_line, column)
-                        + "formatted string interpolation cannot cross a line"
-                    )
+                if not mode.is_triple:
+                    error(format_location(mode.line, mode.column) + "unterminated string literal")
                 self.advance_line()
             else:
                 self.position += 1
+        error(format_location(mode.line, mode.column) + "unterminated string literal")
 
-        if commented_close_line > 0:
-            error(
-                format_location(commented_close_line, commented_close_column)
-                + "formatted string interpolation cannot close inside a comment; put `}` on a later line"
-            )
-        error(format_location(start_line, column) + "unterminated formatted string interpolation")
+    # Emit the text scanned so far as one format_text token, skipping empty runs
+    # so `f"{a}{b}"` carries no vacuous text between its fields.
+    func emit_formatted_text(start: i64, start_line: i64, column: i64):
+        if self.position > start:
+            self.emit_at(TokenKind.format_text, self.source[start:self.position], start_line, column)
+
+    # A field of a single-line formatted string ends on its own line: neither a
+    # newline nor a comment (which owns the rest of the line) may appear in it.
+    # Example: `f"{value # }"` and `f"{value\n}"` both report the string's start.
+    func require_multiline_field() -> !:
+        if len(self.formatted_modes) == 0:
+            return
+        let mode = self.formatted_modes[len(self.formatted_modes) - 1]
+        if not mode.is_triple:
+            error(format_location(mode.line, mode.column) + "formatted string interpolation cannot cross a line")
 
     # Consume a character literal body and require exactly one decoded scalar.
     # Example: `'a'` and `'\n'` succeed, while `'ab'` reports a lexical error.
@@ -536,13 +601,49 @@ pub class Tokenizer:
         let text = self.source[start:start + width]
         self.position = start + width
 
+        var closes_field = false
         if width == 1:
             let symbol = text[0]
             if symbol == '(' or symbol == '[' or symbol == '{':
                 self.open_delimiters.append(symbol)
             elif symbol == ')' or symbol == ']' or symbol == '}':
-                try self.close_delimiter(symbol, column)
+                self.finish_layout_region()
+                closes_field = try self.close_delimiter(symbol, column)
+            elif symbol == ':' and len(self.open_delimiters) > 0 and self.colon_ends_line():
+                self.layout_regions.append(LayoutRegion(
+                    depth = len(self.open_delimiters),
+                    base = self.indent_width,
+                ))
         self.emit(TokenKind.symbol, text, column)
+        if closes_field:
+            try self.scan_formatted_text()
+
+    # A `:` inside delimiters opens a suite exactly when nothing but spacing or
+    # a comment follows it on the line, which is the only place a suite can go.
+    # Example: `run(func ():` qualifies; the `:` in `run(label: 1)` does not.
+    func colon_ends_line() -> bool:
+        var offset = 0
+        while self.peek(offset) == ' ':
+            offset += 1
+        let next = self.peek(offset)
+        return next == '#' or next == '\n' or next == '\r' or next == '\u{0}'
+
+    # Close the suite still open when its delimiter closes on the suite's last
+    # line: the statement gets the newline it lacked, then every dedent to base.
+    # Example: `run(func ():\n    return 1)` emits newline and dedent before `)`.
+    func finish_layout_region():
+        if len(self.layout_regions) == 0:
+            return
+        let region = self.layout_regions[len(self.layout_regions) - 1]
+        if region.depth != len(self.open_delimiters):
+            return
+        let last = self.tokens[len(self.tokens) - 1]
+        if last.kind != TokenKind.newline:
+            self.emit(TokenKind.newline, "", self.calculate_column() - 1)
+        while self.indent_width > region.base:
+            self.indent_width -= 4
+            self.emit(TokenKind.dedent, "", self.calculate_column() - 1)
+        self.layout_regions.remove(len(self.layout_regions) - 1)
 
     # Longest-match ordering is visible here: expression/pattern ranges and
     # augmented assignments win before their shorter prefixes.
@@ -568,20 +669,30 @@ pub class Tokenizer:
         return 0
 
     # Match and remove the latest opening delimiter or report the mismatch.
+    # Returns whether the closed delimiter was a formatted string's field.
     # Example: `([ ])` closes successfully, while `(]` reports the `]` column.
-    func close_delimiter(closing: char, column: i64) -> !:
+    func close_delimiter(closing: char, column: i64) -> bool!:
         if len(self.open_delimiters) == 0:
             error(self.format_location_at(column) + "closing delimiter has no matching opener")
         let opening = self.open_delimiters[len(self.open_delimiters) - 1]
         if closing != find_closing_delimiter(opening):
             error(self.format_location_at(column) + "closing delimiter does not match its opener")
         self.open_delimiters.remove(len(self.open_delimiters) - 1)
+        return opening == 'f'
 
     # mark: Completion ==========================================================================
 
     # Complete the stream with its synthetic newline, remaining dedents, and eof.
     # Example: `if ok:\n    value` ends with newline, dedent, eof.
     func finish_tokenization() -> !:
+        if len(self.formatted_modes) > 0:
+            if self.commented_close_line > 0:
+                error(
+                    format_location(self.commented_close_line, self.commented_close_column)
+                    + "formatted string interpolation cannot close inside a comment; put `}` on a later line"
+                )
+            let mode = self.formatted_modes[len(self.formatted_modes) - 1]
+            error(format_location(mode.line, mode.column) + "unterminated formatted string interpolation")
         if len(self.open_delimiters) > 0:
             error(self.format_location_at(self.calculate_column()) + "unclosed delimiter")
 
@@ -750,7 +861,8 @@ func is_single_symbol(character: char) -> bool:
         '(', ')', '[', ']', '{', '}', '_' => true
         else => false
 
-# Return the closing delimiter paired with an opening delimiter.
+# Return the closing delimiter paired with an opening delimiter; `f` is the
+# `{` that opens a formatted string field.
 # Example: `find_closing_delimiter('[')` returns `]`.
 func find_closing_delimiter(opening: char) -> char:
     return match opening:

@@ -125,7 +125,9 @@ Small does not mean:
 - A same-line suite cannot contain a compound statement (`if`, `while`, `for`, or `match`), a nested suite such as a closure or `catch` handler, or a second statement. With no semicolons, the newline closes it unambiguously.
 - Same-line and indented suites create the same lexical scope. A following `elif` or `else` begins on its own line aligned with the original header.
 - Tabs are errors with a machine-applicable replacement.
-- Newlines terminate statements except inside `()`, `[]`, or `{}`.
+- Newlines terminate statements except inside `()`, `[]`, or `{}`, where they are ordinary spacing.
+- Inside delimiters, a `:` that ends its line (comments aside) opens an indented suite, so a block closure, `catch` handler, or `match` expression can be written as an argument or element. The suite's lines indent four spaces past the line holding the `:`; it ends when a line dedents back to that indentation or when the enclosing delimiter closes, which may follow the last statement on its line. Between the suite's end and the closing delimiter, newlines are spacing again.
+- A same-line suite written inside delimiters, as in `run(func (): return 1)`, ends where its delimiter closes; it cannot be followed by `,` and another element on the same line.
 - There is no semicolon and no backslash line continuation.
 - A trailing comma is accepted in multi-line parameter, argument, tuple, array/list, map, and case-payload lists; the formatter inserts/preserves it where it stabilizes diffs.
 - Blank lines do not affect meaning.
@@ -138,6 +140,10 @@ if cached: return result
 if image.width > maximum_width:
     let scale = maximum_width / f64(image.width)
     image.resize(scale)
+
+buffer.with_mutable_slice(func (view: mutable_slice[u8]):
+    fill(view, 0)
+)
 ```
 
 ### 3.3 Comments and documentation
@@ -153,6 +159,7 @@ pub func area(width: f64, height: f64) -> f64:
 
 - `#` begins an ordinary comment outside a string.
 - Consecutive `##` comments immediately preceding a declaration form its documentation.
+- A `##` block at the top of a file that stands apart from what follows — a blank line, an `import`, or nothing — is the module's documentation. A top-of-file block that touches the first declaration documents that declaration.
 - Documentation is non-executable. There are no doctest directives hidden in comments; fenced `luce` examples are tested by the documentation tool explicitly.
 
 ### 3.4 Naming
@@ -240,7 +247,7 @@ text"""
 - A byte literal contains byte escapes and ASCII source characters; non-ASCII source must be encoded explicitly or converted.
 - Raw strings disable escapes and interpolation.
 - Triple-quoted strings use formatter-defined indentation trimming based on the closing delimiter.
-- Interpolation evaluates expressions left-to-right and uses the closed standard formatting interface. It is not a macro.
+- Interpolation evaluates expressions left-to-right and uses the closed standard formatting interface. It is not a macro. The lexer splits a formatted string into text and fields, and each field is parsed as an ordinary expression in place; a field cannot be empty and carries no format specifier.
 - A field inside a triple-quoted formatted string may contain an ordinary line comment. Because `#` owns the rest of its physical line, the field's closing `}` must appear on a later line.
 - Text/character escapes are `\\`, `\"`, `\'`, `\n`, `\r`, `\t`, `\0`, and Unicode scalar `\u{HEX}`. Byte literals additionally allow exactly two-digit `\xNN`; a text escape must still produce valid Unicode.
 - Formatted strings use `{{` and `}}` for literal braces. Formatting policies are ordinary calls inside the field (for example `format.hex(value)`), not an embedded mini-language.
@@ -503,7 +510,7 @@ pixels[10..<20]
 - `.` accesses a member or module declaration.
 - Calls use `()`.
 - Indexing is checked in all normal profiles.
-- Slicing uses a half-open range: `[start..<end]`. `[..<end]` starts at zero and `[start..]` ends at the sequence length. There is no slice-step grammar.
+- Slicing uses a half-open range: `[start..<end]`. `[..<end]` starts at zero and `[start..]` ends at the sequence length. A slice states at least one bound. There is no slice-step grammar.
 - Negative indexing is not supported.
 - User-defined operator overloading, including indexing, is absent. Standard collection types and closed standard interfaces receive the syntax explicitly.
 
@@ -2905,6 +2912,7 @@ generic_param   = TYPE_IDENT, [ ":", interface_type, { "&", interface_type } ] ;
 parameter_list  = "(", [ parameter, { ",", parameter }, [ "," ] ], ")" ;
 parameter       = "self"
                 | IDENT, ":", type, [ "=", constant_expression ] ;
+                  (* "self" and "mutating" are accepted only on a type member *)
 result_clause   = [ "->", type ] ;
 effect_clause   = [ "uses", EFFECT_IDENT, { ",", EFFECT_IDENT } ] ;
 
@@ -3051,7 +3059,8 @@ call_expression = postfix_expr ;
 argument_list   = "(", [ argument, { ",", argument }, [ "," ] ], ")" ;
 argument        = [ IDENT, ":" ], expression ;
 index_or_slice  = expression
-                | [ expression ], "..<", [ expression ]
+                | expression, "..<", [ expression ]
+                | "..<", expression
                 | expression, ".." ;
 
 primary_expr    = literal
@@ -3110,11 +3119,17 @@ integer_type    = "u8" | "u16" | "u32" | "u64"
                 | "i8" | "i16" | "i32" | "i64" ;
 literal         = INTEGER_LITERAL | FLOAT_LITERAL | CHAR_LITERAL
                 | STRING_LITERAL | BYTE_LITERAL | "true" | "false" | "none" ;
+formatted_string
+                = FORMAT_START, { FORMAT_TEXT | "{", expression, "}" }, FORMAT_END ;
 ```
+
+`module` begins with an optional detached `##` block (section 3.3) that the parser stores as module documentation. `formatted_string` is a `primary_expr`; `FORMAT_START`, `FORMAT_TEXT`, and `FORMAT_END` are the lexer's pieces of one `f"..."` spelling (section 4.4), and the case name after `.` in `case_pattern` and `primary_expr` also admits the reserved word `none`.
 
 Parser implementation uses the explicit declaration/statement productions and a Pratt parser with section 29.4's precedence for expressions. Semantic analysis then rejects grammar-general forms that violate the narrower contracts—for example, a non-call expression statement, a non-class after `new`, a generic argument count mismatch, an open-ended range outside indexing, or `recover` outside a catch handler.
 
 `constant_expression` and `c_compatible_type` are named semantic subsets rather than separate parsers: the former is section 20.4's effect-free restricted expression set, and the latter is the fixed-representation subset validated by section 21.5. `TYPE_PATH`, `CORE_TYPE`, `EFFECT_IDENT`, and the literal tokens are lexer/parser categories with the naming and literal rules from sections 3–5.
+
+Inside delimiters the layout lexer resumes NEWLINE/INDENT/DEDENT after a `:` that ends its line (section 3.2), which is how `suite` appears within `argument_list`, `list_literal`, and their kin.
 
 In expression position, brackets immediately followed by an argument list are parsed as generic arguments when their contents form types (`decode[Header](data)`, `list[Node]()`); otherwise brackets are indexing/slicing. PascalCase type-parameter naming and core-type tokens make the common cases syntactically decisive. An actually ambiguous generated/native spelling requires qualification, and the diagnostic shows both parses rather than guessing.
 
