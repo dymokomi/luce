@@ -2,14 +2,15 @@
 
 These programs target the 1.0 language in `docs/language/1.0.md`. Every
 example is parser-checked; `semantic_core/` also passes through the current
-name-resolution, type-checking, and interpreter slice. `compiled_core/` passes
-through the handwritten WebAssembly backend, while `hello.luc` reaches the
-direct ARM64 macOS executable backend.
+name-resolution, type-checking, and interpreter slice. `compiled_core/` and
+`hello.luc` share one compiled language (integer arithmetic, `print`, and
+`return`); WebAssembly exports public functions, while native executables
+start at `main`.
 
-- `hello.luc` is the smallest runnable Apple-silicon executable module.
+- `hello.luc` is the smallest native executable; it also builds as WebAssembly.
 - `semantic_core/` is the small multi-module function-and-control-flow slice
   currently executable beyond parsing.
-- `compiled_core/` is the deliberately tiny source-to-WASM arithmetic slice.
+- `compiled_core/` is the arithmetic slice exported from a WebAssembly module.
 - `language_tour.luc` covers declarations, data modeling, functions, control
   flow, closures, failure recovery, workers, and static tests.
 - `operators_and_literals.luc` is a focused reference for the remaining value,

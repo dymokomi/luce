@@ -4,8 +4,9 @@ The target is the 1.0 source surface in `docs/language/1.0.md` §29.6.
 Every syntax-tree form accepted by the current tokenizer and parser appears in
 at least one parser-checked example. Runtime guarantees, package resolution, and
 deliberately excluded syntax are outside this parser-era coverage claim. The
-narrower `semantic_core/` fixture is checked and interpreted, `compiled_core/`
-reaches WebAssembly, and `hello.luc` reaches a runnable ARM64 Mach-O.
+narrower `semantic_core/` fixture is checked and interpreted. `compiled_core/`
+and `hello.luc` share the compiled slice: integer arithmetic, `print`, and
+`return`, encoded as WebAssembly or a native executable.
 
 | Surface | Examples |
 | --- | --- |

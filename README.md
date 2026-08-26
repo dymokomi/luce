@@ -55,8 +55,10 @@ Use the target that matches the machine where the executable will run.
   assignment, basic scalar operations, conditionals, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
-- The compiled slice lowers to a small canonical MIR and can be emitted directly
-  as WebAssembly, ARM64 Mach-O, or x86-64 ELF.
+- The compiled slice is one language — i32/i64 arithmetic, `print`, and
+  `return` — lowered to canonical MIR and encoded as WebAssembly, ARM64 Mach-O,
+  or x86-64 ELF. Native executables still start at `main`; WebAssembly exports
+  every public function.
 - The test suite exercises the frontend, semantic model, interpreter, lowering,
   MIR verification, and each artifact encoder. On a supported native host it
   also builds and runs a smoke-test executable.
