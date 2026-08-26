@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the pinned Stage-0 0.21 toolchain this repository builds with.
+# Install the Stage-0 0.21 toolchain this repository builds with.
 # Downloads the archive for this machine from the stage0 release of
 # dymokomi/luce-stage-0, verifies its checksum, and unpacks to ./stage0/.
 set -eu
@@ -17,13 +17,13 @@ case "$os-$arch" in
     *) echo "bootstrap: no stage-0 archive for $os/$arch" >&2; exit 1 ;;
 esac
 
-# Pinned checksums, one per flavor — filled in when the release is cut.
+# Checksums, one per flavor — filled in when the release is cut.
 # bootstrap refuses to install an archive it cannot verify.
 checksum_macos_aarch64=4589b5594880d9d4cd8fcbd5fbb07b225bdff0b6eeed3ac81c91b88e4113201e
 checksum_linux_x86_64=12714fa47f20acd40b1a72370ee77b40d454de9a7b9c470312f7a26d6ef779be
 
 eval "expected=\$checksum_$(printf %s "$flavor" | tr - _)"
-[ "$expected" != TBD ] || { echo "bootstrap: checksum for $flavor not pinned yet" >&2; exit 1; }
+[ "$expected" != TBD ] || { echo "bootstrap: checksum missing for $flavor" >&2; exit 1; }
 
 archive="luce-0.21-$flavor.tar.gz"
 url="https://github.com/$repo/releases/download/$release_tag/$archive"

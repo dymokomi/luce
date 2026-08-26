@@ -12,13 +12,12 @@ is written in Luce and is bootstrapped with a small, frozen
 Luce is under active development. It is not a production-ready language yet.
 The frontend understands most of the planned 1.0 source language, while the
 parts that can be type-checked, run, and compiled are growing in smaller
-end-to-end slices. Unsupported features fail with a clear diagnostic instead
-of silently doing the wrong thing.
+end-to-end slices. Unsupported features fail with a clear diagnostic.
 
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.21, the pinned seed compiler for the current machine, and verifies its
+Stage-0 0.21, the seed compiler for the current machine, and verifies its
 checksum. `./stage0` is that downloaded toolchain, not this repository's source.
 
 ```sh
@@ -97,7 +96,7 @@ can execute it yet.
   `optimizer.luc` form the target-independent compiled path.
 - `src/compiler/backends/` contains the WebAssembly, Mach-O, and ELF emitters.
 
-Compiler source must remain buildable by the pinned Stage-0 language subset
+Compiler source must remain buildable by the Stage-0 language subset
 until Luce can reliably build itself without that seed compiler.
 
 Luce is dual-licensed under Apache 2.0 and MIT. See [LICENSE](LICENSE).

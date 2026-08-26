@@ -23,4 +23,4 @@ cc -std=c11 -Wall -Wextra -Werror -fsyntax-only examples/c_import/temperature.c
 ```
 
 Once `luce bind` is implemented, this directory becomes the first end-to-end C
-import fixture rather than changing its source design.
+import fixture.

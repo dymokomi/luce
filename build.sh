@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the Luce compiler with the pinned Stage-0 toolchain.
+# Build the Luce compiler with the Stage-0 toolchain.
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

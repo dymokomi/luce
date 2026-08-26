@@ -216,7 +216,7 @@ Standard profiles are:
 - `release-fast`: optimized; may use explicitly requested unchecked library algorithms but never silently removes core memory safety;
 - `size`: optimized for artifact size.
 
-Testing is an overlay on these profiles rather than a sixth semantic mode: it adds the statically discovered test graph, harness, deterministic test context, and observability while preserving the selected profile's language rules. The default `luce test` profile is fully checked `debug`; CI may additionally select `release-safe` to expose optimization/backend defects.
+Testing is an overlay on these profiles: it adds the statically discovered test graph, harness, deterministic test context, and observability while preserving the selected profile's language rules. The default `luce test` profile is fully checked `debug`; CI may additionally select `release-safe` to expose optimization/backend defects.
 
 Profile differences cannot change overflow semantics, evaluation order, error behavior, data-race model, or public API. Unsafe speedups are named APIs or manifest decisions visible in review.
 
