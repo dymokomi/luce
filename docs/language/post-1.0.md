@@ -1,6 +1,6 @@
 # Luce Language Design — post-1.0 platform
 
-Status: design material deferred past 1.0. Companion to `LUCE_LANGUAGE_DESIGN.md`, which is the normative 1.0 language specification.
+Status: design material deferred past 1.0. Companion to [`1.0.md`](1.0.md), which is the normative 1.0 language specification.
 
 1.0 is the language: source surface, semantics, the C boundary, tests, the interpreter and one native backend, and the tooling a single command needs. Everything below is specified so the language does not paint itself into a corner, but it ships, stabilizes, and is measured after 1.0. Section numbers are kept identical to the 1.0 document so cross-references stay valid; each section here is marked "deferred" at its original position there.
 

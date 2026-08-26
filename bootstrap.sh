@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the pinned stage-0 Luce toolchain this repository builds with.
+# Install the pinned Stage-0 0.21 toolchain this repository builds with.
 # Downloads the archive for this machine from the stage0 release of
 # dymokomi/luce-stage-0, verifies its checksum, and unpacks to ./stage0/.
 set -eu

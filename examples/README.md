@@ -1,6 +1,6 @@
 # Examples
 
-These programs target the 1.0 language in `LUCE_LANGUAGE_DESIGN.md`. Every
+These programs target the 1.0 language in `docs/language/1.0.md`. Every
 example is parser-checked; `semantic_core/` also passes through the current
 name-resolution, type-checking, and interpreter slice. `compiled_core/` passes
 through the handwritten WebAssembly backend, while `hello.luc` reaches the

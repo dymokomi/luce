@@ -18,7 +18,8 @@ of silently doing the wrong thing.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-the pinned Stage-0 compiler for the current machine and verifies its checksum.
+Stage-0 0.21, the pinned seed compiler for the current machine, and verifies its
+checksum. `./stage0` is that downloaded toolchain, not this repository's source.
 
 ```sh
 ./bootstrap.sh
@@ -66,10 +67,10 @@ can execute it yet.
 
 ## Where to go next
 
-- Read [the language design](LUCE_LANGUAGE_DESIGN.md) for the current 1.0
+- Read [the language design](docs/language/1.0.md) for the current 1.0
   language. It is the specification, not a description of what happens to be
   implemented today.
-- Read [the post-1.0 notes](LUCE_LANGUAGE_DESIGN_POST_1_0.md) for ideas that are
+- Read [the post-1.0 notes](docs/language/post-1.0.md) for ideas that are
   deliberately outside the current language.
 - Browse [the examples](examples/README.md) to see the source language, the
   executable semantic slice, and the small compiled slice.
@@ -95,3 +96,5 @@ can execute it yet.
 
 Compiler source must remain buildable by the pinned Stage-0 language subset
 until Luce can reliably build itself without that seed compiler.
+
+Luce is dual-licensed under Apache 2.0 and MIT. See [LICENSE](LICENSE).
