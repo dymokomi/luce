@@ -9,8 +9,8 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `temperature.c` and `temperature.h` are the native library.
 - `../luce.toml` declares the `temperature` C binding target.
 - `temperature.raw` is generated from the header and is not checked in.
-- `temperature.luc` performs explicit `c.double` conversions and exposes the
-  `unsafe_native` boundary.
+- `temperature.luc` performs explicit `c.double` conversions and exposes a
+  safe Luce-facing function.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The C path currently stops after parsing, before FIIR generation, native

@@ -4,11 +4,7 @@
 
 Status: normative design draft for the clean-break language
 
-Language epoch: 1
-
-Bootstrap: frozen Stage-0 0.19 is only the seed and imposes no compatibility requirement
-
-Primary proving programs: the Luce compiler/tooling, LuciaOS evaluators and Views, and serious native applications
+Primary proving programs: the Luce compiler/tooling and serious native applications
 
 Scope: this document is the 1.0 language. Platform work specified but deferred past 1.0 lives in `LUCE_LANGUAGE_DESIGN_POST_1_0.md` under the same section numbers.
 
@@ -16,9 +12,9 @@ Companion documents: `LUCE_LANGUAGE_DESIGN_POST_1_0.md`, `LUCE_NEXT_BLUEPRINT.md
 
 ## 0. Executive decision
 
-Luce is a small, statically typed, native language with Python-like visual clarity, value/reference semantics, ARC-managed identity, explicit recoverable failure, explicit host effects, isolated concurrency, and first-class C/C++ coexistence.
+Luce is a small, statically typed, native language with Python-like visual clarity, value/reference semantics, ARC-managed identity, explicit recoverable failure, isolated concurrency, and first-class C/C++ coexistence.
 
-The language is not trying to be minimal by deleting facilities that real programs need. It is trying to reach the **minimum complete language**: the smallest coherent surface that can implement its own compiler, build LuciaOS components, and integrate with native libraries without compiler-only magic or widespread boilerplate.
+The language is not trying to be minimal by deleting facilities that real programs need. It is trying to reach the **minimum complete language**: the smallest coherent surface that can implement its own compiler and integrate with native libraries without compiler-only magic or widespread boilerplate.
 
 The governing test is:
 
@@ -28,15 +24,15 @@ Total complexity includes syntax, semantics, compiler implementation, runtime be
 
 The language sentence is:
 
-> **Values copy. References share identity. ARC keeps references alive. Weak edges break cycles. Resources close at the last strong release. Workers never share mutable object identity. Effects are declared. Failure is visible.**
+> **Values copy. References share identity. ARC keeps references alive. Weak edges break cycles. Resources close at the last strong release. Workers never share mutable object identity. Failure is visible.**
 
 The product sentence is:
 
-> **Python-readable native code with explicit effects, predictable resources, and compiler-guided correctness.**
+> **Python-readable native code with explicit failure, predictable resources, and compiler-guided correctness.**
 
 ## 1. The permanent complexity budget
 
-Every ordinary Luce program is built from nine concepts.
+Every ordinary Luce program is built from eight concepts.
 
 | Concept | User-facing mechanism | What it replaces |
 | --- | --- | --- |
@@ -46,7 +42,6 @@ Every ordinary Luce program is built from nine concepts.
 | Shared identity and resources | final `class`, ARC, `weak`, `deinit` | Manual retain/release/free and general lifetime syntax |
 | Absence and failure | `T?`, `T!`, `try`, `catch`, `recover`, traps | Nullability-by-default and implicit exceptions |
 | Reusable abstraction | generics and nominal `interface` | Duplication, inheritance, operator protocols, metaprogramming |
-| Host effects | `uses` | Ambient files/network/process/clock/device authority |
 | Isolated concurrency | `spawn`, `task`, `wait` | Shared heaps, locks, data races, async coloring |
 | Native coexistence | C ABI, Clang-powered C++ bridges, audited `native` code | Rewrites and unrestricted raw-pointer programming |
 
@@ -84,7 +79,7 @@ Small does not mean:
 
 ## 2. Feature disposition at a glance
 
-| Area | Epoch 1 decision |
+| Area | 1.0 decision |
 | --- | --- |
 | Layout | Four-space blocks; statement suites may stay on one line; no tabs or semicolons; canonical formatter |
 | Names | Static lexical scopes, case-sensitive, no local shadowing |
@@ -98,15 +93,14 @@ Small does not mean:
 | Collections | Reference `list`/`map`/`set`; immutable owner-retaining `slice`; stable iteration order |
 | Absence | One-layer `T?` with the three-arm `else` fallback; no force unwrap or nullable-by-default types |
 | Failure | `T!`, `try`, `catch`, `recover`, stable `Error`; no exceptions |
-| Traps | Uncatchable checked-rule/host termination with source trace |
+| Traps | Uncatchable checked-rule violation with source trace |
 | Closures | Explicit `func` literal, deterministic capture rules, snapshot/weak capture list |
 | Generics | Type parameters, nominal bounds, monomorphization, bounded instantiation |
 | Interfaces | Explicit conformance, methods only, no inheritance/defaults/associated types/casts |
-| Effects | Public `uses` sets, private inference, loader validation |
 | Concurrency | Isolated `spawn`, copied sendable value graphs, structured `task.wait()` |
 | Modules | One source file per module, explicit imports, private by default |
-| Packages | Manifest + exact lock + content identities; no ambient build scripts |
-| Testing | Static `test` declaration, ordinary safety/effects, isolated deterministic harness, complete production erasure |
+| Packages | Manifest + exact lock; no build scripts |
+| Testing | Static `test` declaration, ordinary safety, isolated deterministic harness, complete production erasure |
 | Native | Direct safe C subset; generated C++ bridges; raw pointers only in audited `native` code |
 | Backends | Interpreter, fast Luce backends, optional LLVM; identical semantics |
 
@@ -118,7 +112,7 @@ Small does not mean:
 - A UTF-8 BOM may be accepted and ignored only at byte zero.
 - NUL, invalid UTF-8, misleading bidirectional controls, and look-alike syntax punctuation are rejected.
 - CRLF is normalized for parsing while source spans retain correct byte/line mappings.
-- Identifiers are ASCII in epoch 1. Unicode remains fully supported inside text and comments. Unicode identifiers require a later spoofing and normalization design.
+- Identifiers are ASCII in 1.0. Unicode remains fully supported inside text and comments. Unicode identifiers require a later spoofing and normalization design.
 - An identifier begins with an ASCII letter or `_` and continues with ASCII letters, digits, or `_`. The standalone `_` token remains the pattern wildcard; `_unused` is an ordinary name.
 
 ### 3.2 Indentation and lines
@@ -308,7 +302,7 @@ range[u64]                   # integer range value used by `for`
 Point?                        # one-layer optional
 Image!                        # recoverably fallible Image result
 func(i64, i64) -> i64         # function value
-func(str) -> bytes! uses files
+func(str) -> bytes!
 Reader                        # interface existential
 Weak[Node]                    # storable weak handle to a class
 task[Image]                   # isolated task handle; wait is fallible
@@ -325,7 +319,7 @@ type SymbolTable = map[str, Symbol]
 
 A type alias is another spelling for exactly the same type. It does not create a domain distinction and cannot have independent methods or conformance.
 
-Epoch 1 aliases are non-generic and non-recursive. If a family deserves parameters or behavior, declare the corresponding generic struct/enum/class instead of building an alias language.
+1.0 aliases are non-generic and non-recursive. If a family deserves parameters or behavior, declare the corresponding generic struct/enum/class instead of building an alias language.
 
 For a domain distinction, use a one-field struct:
 
@@ -334,7 +328,7 @@ pub struct UserId:
     pub let value: u64
 ```
 
-Structs receive memberwise construction and structural operations when valid, so a domain type does not require a separate “newtype” feature in epoch 1.
+Structs receive memberwise construction and structural operations when valid, so a domain type does not require a separate “newtype” feature in 1.0.
 
 ### 5.5 Type inference
 
@@ -393,7 +387,7 @@ frame += 1
 - The right-hand side is fully evaluated before the destination changes.
 - Values copy according to their language semantics.
 - Class, closure, collection, task, and resource references share identity and update ARC.
-- Tuple binding destructuring evaluates its right-hand side once, then initializes names from left to right. It is allowed with `let` or `var`; epoch 1 has no general destructuring-assignment or struct pattern syntax.
+- Tuple binding destructuring evaluates its right-hand side once, then initializes names from left to right. It is allowed with `let` or `var`; 1.0 has no general destructuring-assignment or struct pattern syntax.
 
 ```luce
 let (width, height) = image.size()
@@ -434,7 +428,7 @@ Luce evaluates expressions left-to-right, including:
 - assignment right-hand sides;
 - constructor arguments.
 
-Optimization may reorder only when behavior, traps, destruction order, and declared effects remain observationally identical.
+Optimization may reorder only when behavior, traps, and destruction order remain observationally identical.
 
 ### 7.2 Arithmetic
 
@@ -553,8 +547,8 @@ let image = try render(scene, samples: 256, denoise: false)
 - Positional arguments precede named arguments.
 - Named arguments may then appear in any order.
 - A parameter may have a pure compile-time default; parameters after the first default must also have defaults.
-- A default cannot refer to another parameter, `self`, runtime state, effects, or a fallible expression; it is embedded as a typed constant at the call site.
-- There are no positional-only, named-only, variadic, splat, or keyword-dictionary parameters in epoch 1.
+- A default cannot refer to another parameter, `self`, runtime state, or a fallible expression; it is embedded as a typed constant at the call site.
+- There are no positional-only, named-only, variadic, splat, or keyword-dictionary parameters in 1.0.
 - Duplicate, unknown, or omitted required arguments are compile errors with fixes.
 
 ### 8.3 No overloads
@@ -587,9 +581,9 @@ let operation: func(i64, i64) -> i64 = add
 let result = operation(2, 3)
 ```
 
-A function type includes parameter types, result/fallibility, and effect set. Argument labels are not part of a function value's type. Function values do not overload or dynamically inspect signatures.
+A function type includes parameter types and result/fallibility. Argument labels are not part of a function value's type. Function values do not overload or dynamically inspect signatures.
 
-Function conversion keeps parameter/success types exact. A non-fallible function may lift to the corresponding fallible function type, and a function with fewer effects may lift to one permitting a superset. The reverse conversions are rejected; epoch 1 has no general parameter/result variance rules.
+Function conversion keeps parameter/success types exact. A non-fallible function may lift to the corresponding fallible function type. The reverse conversions are rejected; 1.0 has no general parameter/result variance rules.
 
 ### 8.6 Methods
 
@@ -613,7 +607,7 @@ struct Point:
 - A type function without `self` is called through the type: `Point.origin()`.
 - There is no separate `static` keyword.
 - Method names cannot overload.
-- `value.member` without `()` always names a stored field. Epoch 1 has no computed properties, setters, or user-defined subscripts; use an ordinary method whose call and possible work are visible.
+- `value.member` without `()` always names a stored field. 1.0 has no computed properties, setters, or user-defined subscripts; use an ordinary method whose call and possible work are visible.
 
 ### 8.7 Mutating value methods
 
@@ -629,11 +623,11 @@ struct Cursor:
 - The receiver binding at the call site must be `var`.
 - A mutating method may assign `var` struct fields or replace `self` with another value of the same type; a nonmutating method can do neither.
 - Classes do not use `mutating`; their identity and `var` fields already state shared mutation.
-- Epoch 1 has no general `inout` parameters. Algorithms return updated values or use a mutating receiver/reference collection. Add call-scoped `inout` only if real compiler/native workloads prove this insufficient.
+- 1.0 has no general `inout` parameters. Algorithms return updated values or use a mutating receiver/reference collection. Add call-scoped `inout` only if real compiler/native workloads prove this insufficient.
 
 ### 8.8 Recursion
 
-Recursion is allowed. Tail-call optimization is never a semantic guarantee. Standalone runtime policy and LuciaOS host profiles may impose stack/call-depth budgets; exceeding one is an uncatchable host termination with a source trace.
+Recursion is allowed. Tail-call optimization is never a semantic guarantee. The runtime may impose a stack-depth budget; exceeding it is an uncatchable trap with a source trace.
 
 ## 9. Control flow
 
@@ -727,7 +721,7 @@ func bit_value(c: char) -> u8?:
         _: return none
 ```
 
-Epoch 1 patterns are deliberately closed:
+1.0 patterns are deliberately closed:
 
 - enum cases, with bindings for any payload;
 - `.some(value)` and `.none` for optionals;
@@ -810,7 +804,7 @@ try process(handle)
 - The expression's receiver and arguments are captured when the `defer` is registered.
 - A deferred call may not `return`, `recover`, or replace an in-flight error.
 - A failure-capable cleanup must be handled inside a non-failing wrapper or performed explicitly before the successful return.
-- `defer` does not run after process abort, power loss, or an uncatchable host termination.
+- `defer` does not run after process abort, power loss, or an uncatchable trap.
 
 ARC handles ordinary memory lifetime. `defer` is for lexical operations such as unlocking a native handle or rolling back a transaction, not a substitute for object cleanup.
 
@@ -897,7 +891,7 @@ They have no named fields, methods, conformance, or one-element form. Use a stru
 let magic: array[u8, 4] = [0x4c, 0x55, 0x43, 0x45]
 ```
 
-`array[T, N]` is a fixed-size value whose length is part of its type. `N` must be a nonnegative compile-time integer. Arrays copy element-by-element, may live inline in another value, and convert explicitly to `slice[T]`. Epoch 1 has no user-defined compile-time value parameters; fixed array length is the one built-in exception.
+`array[T, N]` is a fixed-size value whose length is part of its type. `N` must be a nonnegative compile-time integer. Arrays copy element-by-element, may live inline in another value, and convert explicitly to `slice[T]`. 1.0 has no user-defined compile-time value parameters; fixed array length is the one built-in exception.
 
 ### 10.5 Enums
 
@@ -987,7 +981,7 @@ assert(first.dirty)
 
 Class assignment retains and shares the same object. `is`/`is not` test identity. `==` is not available for classes; a class that needs domain equality supplies a named `equals` method. The closed value `Equatable` protocol does not turn identity objects into values.
 
-A `let` binding prevents rebinding but does not freeze a class object. Mutation authority is stated on the class field and governed by any host/effect rules. This distinction is explained by diagnostics whenever a newcomer attempts to assign through an immutable field.
+A `let` binding prevents rebinding but does not freeze a class object. Mutation authority is stated on the class field, not on the binding. This distinction is explained by diagnostics whenever a newcomer attempts to assign through an immutable field.
 
 ### 11.3 ARC lifetime
 
@@ -1066,7 +1060,6 @@ class FileHandle:
 - It cannot fail, spawn, publish `self`, or resurrect the object.
 - Fields remain readable; calling arbitrary user code is linted because it can create reentrancy hazards.
 - Field destruction follows the body in reverse declaration order.
-- It cannot acquire ambient capability authority. A generated resource wrapper may invoke its audited non-failing release primitive using authority already embodied by the stored handle; that final release is lifetime behavior, not a new caller effect.
 
 Resource types should offer an idempotent explicit `close` for prompt error-aware shutdown and use `deinit` as the safety net. `defer handle.close()` provides lexical cleanup when required. Thus resources close at the last release without making every programmer write ownership syntax.
 
@@ -1109,7 +1102,6 @@ Programs that require bounded recovery use one of these explicit mechanisms:
 
 - reserve/check capacity through library operations that return `T!`;
 - allocate from a bounded arena or pool with a fallible API;
-- run inside a LuciaOS host budget and treat exhaustion as task/process failure;
 - stream data instead of materializing it.
 
 This is a deliberate simplicity trade: recoverable scarcity is modeled by an explicit resource object, catastrophic heap exhaustion by the host.
@@ -1217,27 +1209,13 @@ if let current = nodes.get(node_id):
 
 Generation checks prevent stale handle reuse. Closure-scoped access can provide temporary mutable views. This gives compilers and games compact storage without importing borrow annotations into every Luce API.
 
-### 12.9 Cost inspection
-
-The first-party toolchain must answer, for a source range:
-
-- which operations allocate and why;
-- value copy size and whether it was elided;
-- ARC retain/release sites and whether they were optimized;
-- interface boxing/dynamic dispatch;
-- bounds checks and whether they were removed;
-- worker-copy volume;
-- native bridge crossings.
-
-These facts are available as editor hints, structured compiler output, and an explain command. Predictable cost comes from observable tooling plus simple semantics, not from making low-level syntax mandatory everywhere.
-
 ## 13. Absence, failure, and traps
 
 Luce separates three conditions that languages often blur:
 
 1. **absence** is ordinary data, represented by `T?`;
 2. **recoverable failure** crosses a function boundary as `T!` plus `Error`;
-3. **a trap or host termination** means a violated invariant or exhausted execution environment and is not catchable.
+3. **a trap** means a violated invariant or exhausted execution environment and is not catchable.
 
 There are no nullable references, thrown objects, exception hierarchies, typed error-set algebra, or implicit error conversions.
 
@@ -1259,7 +1237,7 @@ if let found = user:
 
 Optionals are one layer: applying `?` to an optional type is rejected. If a domain genuinely distinguishes “outer absent” from “present but inner absent,” it declares an enum with names for those states. A fallible function returning an optional is written `T?!`: success carries `T?`, failure carries `Error`.
 
-Epoch 1 adopts stage-0's `else` form — one keyword, three arms, each a statement of intent at the point of absence:
+The `else` form is one keyword with three arms, each a statement of intent at the point of absence:
 
 ```luce
 let count = parse_i64(text) else 0                        # fallback value
@@ -1267,7 +1245,7 @@ let n = parse_i64(text) else trap("not a number")         # assert with a stated
 let w = create_window() else error("no window")           # absence becomes failure, in a `!` function
 ```
 
-`a else b` yields `a` when present and `b` otherwise; the arm may instead diverge through `trap(…)` or `error(…)`. The diverging arms are what keep boundary code flat: acquisition sequences (window, then surface, then device) nest under `if let` but read line by line under `else`. Ruled in 2026-08-24 on native-interop evidence, satisfying the reconsideration clause this section previously carried; stage-0 practice showed no second-expression-language effect.
+`a else b` yields `a` when present and `b` otherwise; the arm may instead diverge through `trap(…)` or `error(…)`. The diverging arms are what keep boundary code flat: acquisition sequences (window, then surface, then device) nest under `if let` but read line by line under `else`.
 
 Optional chaining and a bare force-unwrap operator remain omitted. `else trap("reason")` is the explicit spelling of an assert-unwrap — it exists precisely so an unstated `x!` never needs to.
 
@@ -1276,7 +1254,7 @@ Optional chaining and a bare force-unwrap operator remain omitted. `else trap("r
 `T!` means “returns `T` or a recoverable `Error`”:
 
 ```luce
-func load_config(path: str) -> Config! uses files:
+func load_config(path: str) -> Config!:
     let data = try files.read(path)
     return try config.parse(data)
 ```
@@ -1343,7 +1321,7 @@ let text = files.read(path) catch failure:
 Propagation preserves error code and source trace. Libraries add context only when it helps a human locate the operation:
 
 ```luce
-func read_project(path: str) -> Project! uses files:
+func read_project(path: str) -> Project!:
     let text = files.read_text(path) catch failure:
         error(failure.code, f"reading project at {path}: {failure.message}")
     return try project.parse(text)
@@ -1367,9 +1345,9 @@ The linter flags errors discarded without an explicit policy. A package may defi
 
 Traps are not recoverable errors. They produce a diagnostic with source location and stack trace, then terminate the task/process according to host policy. Turning them into catchable exceptions would allow execution after memory or program invariants were already suspect.
 
-### 13.7 Host termination
+### 13.7 Fatal termination
 
-Out-of-memory, stack/call budget exhaustion, forced cancellation, instruction-budget exhaustion, and host revocation are uncatchable host terminations. LuciaOS records them as structured task/process outcomes so supervisors can restart or report them, but user code cannot suppress them inside the affected domain.
+Out-of-memory, stack budget exhaustion, and forced cancellation terminate the process or task. They are not catchable; `defer` does not run; the runtime reports a structured outcome and a source trace.
 
 ### 13.8 Assertions
 
@@ -1402,7 +1380,7 @@ A parameter may include its type for clarity, as in
 `(value: i64) => value > 0`, but an expression lambda still requires an
 expected function type. `=>` yields from the lambda; it does not return from
 the enclosing function. The block form handles multiple statements, explicit
-capture policy, or an explicit result/effect signature:
+capture policy, or an explicit result signature:
 
 ```luce
 let double = func (value: i64) -> i64:
@@ -1410,9 +1388,9 @@ let double = func (value: i64) -> i64:
 ```
 
 Both forms use the capture rules below. Block-closure parameter and return
-rules are identical to named functions. Effects and fallibility are written
-when required by the expected type or inferred for a local closure and then
-checked at conversion.
+rules are identical to named functions. Fallibility is written when required
+by the expected type or inferred for a local closure and then checked at
+conversion.
 
 ### 14.1 Default captures
 
@@ -1431,7 +1409,7 @@ let next = func () -> i64:
     return count
 ```
 
-Creating a shared cell may allocate. The compiler's cost explanation identifies it and suggests an explicit value snapshot when sharing was accidental.
+Creating a shared cell may allocate. A diagnostic identifies it and suggests an explicit value snapshot when sharing was accidental.
 
 ### 14.2 Capture list
 
@@ -1466,7 +1444,7 @@ If a closure stored by `Controller` strongly captures that same controller, the 
 
 ### 14.4 Sendability
 
-Closures never cross worker boundaries in epoch 1, even when their captures appear copyable. The spawned function is a statically named function, and its arguments form the copied message. This restriction makes code shipment, effects, lifetime, and determinism auditable.
+Closures never cross worker boundaries in 1.0, even when their captures appear copyable. The spawned function is a statically named function, and its arguments form the copied message. This restriction makes code shipment, lifetime, and determinism auditable.
 
 ## 15. Generics
 
@@ -1515,7 +1493,7 @@ The compiler tracks every instantiation's origin, code size, check/codegen time,
 
 ### 15.4 Deliberate limits
 
-Epoch 1 has:
+1.0 has:
 
 - type parameters, but no general value/const parameters;
 - no variadic generics;
@@ -1536,8 +1514,8 @@ An interface is a nominal set of callable requirements. It contains behavior, ne
 
 ```luce
 pub interface Writer:
-    func write(self, data: slice[u8]) -> u64! uses files
-    func flush(self) -> unit! uses files
+    func write(self, data: slice[u8]) -> u64!
+    func flush(self) -> unit!
 
 pub class FileWriter implements Writer:
     # fields and implementations
@@ -1548,7 +1526,7 @@ Rules:
 - User-defined conformance is declared explicitly in the type definition with `implements`. The only exception is compiler-derived structural recognition for the closed value `Equatable`/`Hashable` protocols described in section 17.2.
 - A type may implement multiple interfaces, written `implements First, Second`.
 - Every required method is supplied directly by the type with the exact signature.
-- An implementation may be non-fallible where a requirement is fallible and may use a subset of the requirement's effects; adapters lift it safely. It may never add failure or effects hidden by the interface.
+- An implementation may be non-fallible where a requirement is fallible; adapters lift it safely. It may never add failure hidden by the interface.
 - Interfaces cannot inherit from interfaces.
 - Interfaces cannot provide default method bodies.
 - A package cannot retroactively make another package's type conform.
@@ -1560,7 +1538,7 @@ These restrictions keep conformance globally discoverable and avoid “action at
 ### 16.2 Static use
 
 ```luce
-func write_header[W: Writer](writer: W, header: Header) -> unit! uses files:
+func write_header[W: Writer](writer: W, header: Header) -> unit!:
     discard(try writer.write(header.bytes()))
 ```
 
@@ -1569,7 +1547,7 @@ A constrained generic is statically dispatched and normally monomorphized. It do
 ### 16.3 Interface values
 
 ```luce
-func active_writer() -> Writer! uses files:
+func active_writer() -> Writer!:
     return new FileWriter(...)
 ```
 
@@ -1587,7 +1565,7 @@ Native imported polymorphism may expose an explicit generated query function ret
 
 ## 17. Closed standard protocols
 
-The compiler and standard library jointly define a very small set of protocols needed by syntax. They obey ordinary interface semantics but are versioned with the language epoch.
+The compiler and standard library jointly define a very small set of protocols needed by syntax. They obey ordinary interface semantics but are versioned with the language.
 
 ### 17.1 Iteration
 
@@ -1601,7 +1579,7 @@ pub interface Iterable[T]:
 
 `for item in source` is specified as repeated `next()` calls on a private mutable iterator returned by `source.iterator()`. `mutating` requires a value iterator to update itself; a class iterator satisfies the requirement with an ordinary identity-mutating method. Implementations may receive compiler optimizations, but observable order and mutation checks remain the same.
 
-Epoch 1 uses this generic form instead of user-defined associated types. An iterable exposes one canonical element type. Alternative traversals are named adapter methods returning other iterable values.
+1.0 uses this generic form instead of user-defined associated types. An iterable exposes one canonical element type. Alternative traversals are named adapter methods returning other iterable values.
 
 ### 17.2 Equality, hashing, and ordering
 
@@ -1617,80 +1595,20 @@ The derived structural recognition is closed compiler behavior, not a retroactiv
 
 Debug formatting, user-facing display, and serialization are distinct library interfaces. String interpolation uses `Display` for public values and a diagnostic fallback only in debug tooling. It never invokes reflection over private fields in production code.
 
-The list of compiler-known protocols is closed for epoch 1. New syntax cannot secretly opt into user-defined behavior through naming conventions.
+The list of compiler-known protocols is closed for 1.0. New syntax cannot secretly opt into user-defined behavior through naming conventions.
 
-## 18. Effects and host capabilities
+## 18. Effects (removed)
 
-Effects state which host-controlled capabilities a function may use. They are not exceptions, asynchronous markers, or a general academic effect calculus.
-
-### 18.1 Declaring effects
-
-```luce
-pub func fetch_manifest(url: Url) -> Manifest! uses network, clock, log:
-    let response = try network.get(url)
-    log.debug(f"received at {clock.now()}")
-    return try manifest.parse(response.body)
-```
-
-A public function that directly or transitively uses host capability must declare its effect set with `uses`. The complete epoch 1 standard effect vocabulary is:
-
-- `files`
-- `network`
-- `clock`
-- `random`
-- `process`
-- `environment`
-- `terminal`
-- `log`
-- `graphics`
-- `audio`
-- `device`
-- `unsafe_native`
-
-Packages may define finer capability interfaces, but not new effect grammar. A host profile maps imported capability values/modules to this closed auditable vocabulary.
-
-### 18.2 Inference and checking
-
-Private function effects may be inferred, and the editor displays them. Public functions spell them so an API review sees host authority without inspecting the body.
-
-- Calling a function requires the caller to allow every callee effect.
-- Effects propagate transitively unless a host boundary explicitly supplies/contains the capability.
-- A function with no `uses` clause is pure with respect to host capabilities.
-- Local allocation, ARC, arithmetic traps, and ordinary mutation are not effects.
-- Fallibility and effects are orthogonal: a function may have either, both, or neither.
-
-Function types include their effect set:
-
-```luce
-let loader: func(str) -> bytes! uses files = files.read
-```
-
-A less-effectful function may be used where a superset is permitted, never the reverse.
-
-### 18.3 Capability access
-
-Effect names do not conjure ambient global authority. Standalone entry points receive a runtime context, while LuciaOS components import capabilities granted by their manifest/host. The surface API may feel module-like (`files.read`), but resolution is to a host-provided capability handle recorded in the component's typed environment.
-
-Tests replace capabilities with deterministic implementations without global monkey-patching. Package manifests request capabilities; the launcher shows and enforces the resulting grant set.
-
-### 18.4 Unsafe native effect
-
-Raw native operations — the pointer verbs of §21.12: loads, stores, address arithmetic, ABI casts — require `uses unsafe_native`. A safe wrapper validates invariants and exposes an ordinary effect such as `files` or no host effect at all. The compiler can therefore show exactly where memory-safety trust enters the program.
-
-**An extern call is not a raw native operation** (ruled 2026-08-24). The checked boundary of §21.16 — the `null_foreign` trap, validated text, the optional decode — is the safety story for the common shape, so calling a declared extern requires no `unsafe_native`: the trust is visible in the declaration, not gated at the call. What the call *does* carry is whatever ordinary effect its wrapper declares; the raw-memory vocabulary stays reserved for operations that actually touch memory Luce cannot check.
-
-### 18.5 Why effects remain small
-
-Epoch 1 does not model every mutation, allocation, lock, error, or I/O subtype as an effect. The purpose is adoption and host security: make externally meaningful authority reviewable. If an effect cannot be enforced or productively used by the host/toolchain, it does not belong in the language.
+Removed from the design on 2026-08-25. Luce has no effect or host-capability tracking: there is no `uses` clause, no effect set on function types, and no capability vocabulary. Host access is ordinary library calls. The section number is retained so cross-references stay stable.
 
 ## 19. Isolated concurrency
 
-Luce epoch 1 has tasks without shared-memory concurrency. A task runs a named function in an isolated worker with copied input values.
+Luce 1.0 has tasks without shared-memory concurrency. A task runs a named function in an isolated worker with copied input values.
 
 ### 19.1 Spawning and waiting
 
 ```luce
-func render_scene(scene: Scene) -> Image! uses graphics:
+func render_scene(scene: Scene) -> Image!:
     # CPU/GPU work
 
 let work: task[Image] = spawn render_scene(scene)
@@ -1699,12 +1617,12 @@ let image = try work.wait()
 
 `spawn function(arguments...)`:
 
-1. verifies that the callee is a statically named function allowed by the current host profile;
+1. verifies that the callee is a statically named function;
 2. verifies the complete argument graph is sendable;
 3. copies/serializes that graph into a new worker domain;
 4. begins execution and returns `task[T]` immediately.
 
-The spawn expression carries the named function's effect set: the parent must declare/be granted it, and the worker receives only those host capabilities. `task[T].wait()` returns `T!`. The worker's return value is copied back when it succeeds. A worker error crosses as `Error`; a trap or host termination maps to stable codes such as `task.trapped`, `task.cancelled`, or `task.resource_exhausted` with its remote trace attached as diagnostic metadata. Repeated waits on the same task return a value copy of the cached result/error.
+`task[T].wait()` returns `T!`. The worker's return value is copied back when it succeeds. A worker error crosses as `Error`; a trap maps to stable codes such as `task.trapped`, `task.cancelled`, or `task.resource_exhausted` with its remote trace attached as diagnostic metadata. Repeated waits on the same task return a value copy of the cached result/error.
 
 ### 19.2 Sendable data
 
@@ -1741,13 +1659,13 @@ A task is structured without introducing general ownership syntax:
 - `work.cancel()` requests early cancellation without detaching the child.
 - Host cancellation is cooperative at safe points, but forced budget termination remains possible and uncatchable inside the worker.
 
-There is no detached spawn in epoch 1. Long-lived services are owned by LuciaOS/process supervisors, not orphaned language tasks. The non-escaping task rule is compiler-known in the same narrow spirit as temporary mutable slices and does not create user-written lifetime parameters.
+There is no detached spawn in 1.0. Long-lived services are owned by the process, not by orphaned language tasks. The non-escaping task rule is compiler-known in the same narrow spirit as temporary mutable slices and does not create user-written lifetime parameters.
 
 ### 19.5 Deliberate omissions
 
-Epoch 1 has no `async`/`await`, futures combinator language, threads, locks, atomics, channels, actors, or shared heap. Evented I/O can be implemented by the host/runtime behind synchronous-looking fallible APIs, while CPU parallelism uses isolated workers.
+1.0 has no `async`/`await`, futures combinator language, threads, locks, atomics, channels, actors, or shared heap. Evented I/O can be implemented by the host/runtime behind synchronous-looking fallible APIs, while CPU parallelism uses isolated workers.
 
-This is intentionally conservative. Concurrency features multiply interactions with ARC, closures, native code, errors, effects, and debugging. Add a message-channel abstraction only after compiler/runtime workloads demonstrate that spawn/wait plus host event loops cannot express a required design.
+This is intentionally conservative. Concurrency features multiply interactions with ARC, closures, native code, errors, and debugging. Add a message-channel abstraction only after compiler/runtime workloads demonstrate that spawn/wait plus host event loops cannot express a required design.
 
 ## 20. Modules, packages, and visibility
 
@@ -1780,7 +1698,7 @@ let origin = Point(x: 0.0, y: 0.0)
 `import` keeps a module qualified, with an optional short module alias. `from`
 imports one or more named public declarations into the current module. Selective
 imports have no per-name alias; when names collide, import the module with an
-alias and keep the use qualified. Epoch 1 has no wildcard, relative, re-export,
+alias and keep the use qualified. 1.0 has no wildcard, relative, re-export,
 or implicit prelude imports. The small built-in type/function set is always in
 scope; everything else has a visible origin at the leading import block.
 
@@ -1806,7 +1724,7 @@ A module may contain type, type-alias, function, interface, import, test, and co
 pub let max_header_size: u64 = 16 * 1024
 ```
 
-A top-level `let` initializer is a restricted compile-time constant expression containing literals, arithmetic, tuples/fixed arrays, enum cases, memberwise construction of constant value types, and named compiler constructors such as `ErrorCode.package`. It cannot allocate dynamic storage, call arbitrary user code, fail, use effects, or depend on initialization order.
+A top-level `let` initializer is a restricted compile-time constant expression containing literals, arithmetic, tuples/fixed arrays, enum cases, memberwise construction of constant value types, and named compiler constructors such as `ErrorCode.package`. It cannot allocate dynamic storage, call arbitrary user code, fail, or depend on initialization order.
 
 Global mutable state belongs in an explicitly constructed class owned by the application/host. This removes module initialization races and makes tests independent.
 
@@ -1815,11 +1733,11 @@ Global mutable state belongs in an explicitly constructed class owned by the app
 A standalone executable exports one conventional entry function:
 
 ```luce
-pub func main(arguments: slice[str]) -> i32! uses files, environment:
+pub func main(arguments: slice[str]) -> i32!:
     return 0
 ```
 
-The compiler validates its profile-specific signature. LuciaOS components instead export manifest-declared handlers with generated typed capability inputs. There is no arbitrary top-level execution.
+The compiler validates this signature. There is no arbitrary top-level execution.
 
 ### 20.6 Package manifest
 
@@ -1846,7 +1764,7 @@ C/Objective headers --Clang--> FIIR --Luce importer--> raw module --> safe wrapp
 C++ headers ---------Clang--> FIIR --bridge generator--> C ABI thunks + raw module --> safe wrapper
 ```
 
-FIIR records declarations, layouts, calling convention, ownership, nullability, mutability, lifetimes at the boundary, exceptions, target conditions, and source provenance. The Luce type checker consumes FIIR; LLVM is not required to understand C++.
+FIIR records declarations, layouts, calling convention, ownership, nullability, mutability, lifetimes at the boundary, exceptions, target conditions, and source origin. The Luce type checker consumes FIIR; LLVM is not required to understand C++.
 
 This distinction is fundamental: Swift's C++ interop comes primarily from Clang's parser/type system/importer plus generated ABI-aware calls—not from LLVM itself. Luce can keep the same front-end model while targeting LLVM, its own backend, or both.
 
@@ -1908,7 +1826,7 @@ The generator uses this to produce:
 - explicit callbacks with lifetime tokens;
 - copied values when a foreign borrow cannot safely escape.
 
-Raw access remains available only in an `unsafe_native` function. Missing ownership facts are a generation error for safe wrappers, never a guessed convention.
+Raw access remains available only in audited `.native.luc` modules (§21.12). Missing ownership facts are a generation error for safe wrappers, never a guessed convention.
 
 ### 21.5 C export
 
@@ -1929,7 +1847,7 @@ export c enum BlendStatus as u32:
 
 `export c` accepts only a closed C-compatible subset with fixed representation. The compiler generates a header and ABI report. Fallible exported functions use generated status/result forms; classes, strings, collections, interface values, and Luce ARC never leak directly across the ABI.
 
-Exported enums spell a fixed integer representation and every numeric value; exported structs use declaration-order C layout and only C-compatible fields. Every exported struct field is inherently part of both the generated source API and native ABI, so a redundant `pub` modifier is rejected. An exported function uses a declared C calling convention, cannot unwind, and receives explicit handles/callbacks for host authority. A Luce trap at an export boundary follows the product's fatal-trap policy and is never presented to C as an ordinary error.
+Exported enums spell a fixed integer representation and every numeric value; exported structs use declaration-order C layout and only C-compatible fields. Every exported struct field is inherently part of both the generated source API and native ABI, so a redundant `pub` modifier is rejected. An exported function uses a declared C calling convention and cannot unwind. A Luce trap at an export boundary follows the product's fatal-trap policy and is never presented to C as an ordinary error.
 
 Opaque exported handles carry runtime/worker-domain affinity. The generated C API either validates that a call enters the owning domain, marshals a declared sendable request through a runtime entry queue, or rejects the operation; it never permits two foreign threads to mutate one ordinary Luce object concurrently.
 
@@ -1961,7 +1879,7 @@ Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §21.11.
 
 ### 21.12 Unsafe native source
 
-Low-level operations are confined to functions declared with the `unsafe_native` effect and normally generated into `.native.luc` modules. They may use compiler-known types:
+Low-level operations are confined to audited `.native.luc` modules, normally generated. They may use compiler-known types:
 
 - `native_ptr[T]` and `native_mut_ptr[T]`;
 - opaque native handles;
@@ -1969,7 +1887,7 @@ Low-level operations are confined to functions declared with the `unsafe_native`
 - ABI casts validated for size/alignment;
 - generated call-convention declarations.
 
-Pointer arithmetic, dereference, and foreign calls are named intrinsics rather than overloaded operators. Raw pointers cannot be stored in ordinary public safe values, captured by escaping closures, or sent to workers. Epoch 1 has no inline assembly; backend/platform intrinsics live in reviewed runtime modules.
+Pointer arithmetic, dereference, and foreign calls are named intrinsics rather than overloaded operators. Raw pointers cannot be stored in ordinary public safe values, captured by escaping closures, or sent to workers. 1.0 has no inline assembly; backend/platform intrinsics live in reviewed runtime modules.
 
 ### 21.13 Export to C++
 
@@ -1983,9 +1901,9 @@ Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §21.14.
 
 Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §21.15.
 
-### 21.16 The extern declaration surface (adopted from stage-0 0.21, ruled 2026-08-24)
+### 21.16 The extern declaration surface
 
-Generated raw modules are ordinary Luce source, so the language itself carries the boundary declaration forms — the generator emits them, and a hand-written binding (the bootstrap case, and every Tier C adapter) writes them directly. The forms, semantics proven in stage-0 0.21:
+Generated raw modules are ordinary Luce source, so the language itself carries the boundary declaration forms — the generator emits them, and a hand-written binding writes them directly. The forms, semantics proven in stage-0 0.21:
 
 ```luce
 extern type Window                    # nominal opaque handle, pointer-shaped
@@ -2004,38 +1922,38 @@ extern struct Rect:
     h: i32
 ```
 
-The governing rules, stated once (the stage-0 FFI document is the detailed contract):
+The governing rules, stated once:
 
 - **Friction sorts by frequency.** The common shape (scalars, strings, arrays, structs, null, out-parameters, handles) crosses invisibly — the declaration states the C shape and the compiler translates. The rare shape (buffers, raw reads, ownership transfer) is one visible scoped verb. The exotic shape (variadics, bitfields, by-value aggregates) is generated away by `luce bind` thunks and never appears in user code.
 - **Nothing crosses silently wrong.** A pointer-shaped handle without `?` is an enforced contract: a zero crossing traps `null_foreign` in every profile. `?` on a handle decodes C's null to `none` — an ordinary optional, no sentinel representation. A `str` result is copied immediately and UTF-8-validated; text arguments cross as NUL-terminated temporaries borrowed for the call. Integer-shaped handles carry no trap: their zero is a value.
 - **`out` parameters become extra results**, received by ordinary destructuring in declaration order after the declared return.
 - **`extern struct` is C layout, crossing by pointer** in both directions; by-value aggregates wait for generated shims (§21.17). `cfunc(params) -> R` is C's function pointer: capture-free functions and extern function names convert to it, struct fields and results of that type are callable, and the ARC-carrying trampoline is the generator's machinery, not the language's (§21.19). **`list[H]` parameters cross as C's pointer-beside-count arrays**, borrowed for the call (§21.20).
-- **`blocking` opts the call out of the effect lock** and takes on the thread-safety contract: the callee promises its own safety and may park the thread, because workers will reach it concurrently. **`extern var` binds a C global** of boundary-scalar or handle type; reads and writes are direct loads and stores of the symbol, and anything fancier is a shim (§21.18).
+- **`blocking` marks a call that may park the thread** and takes on the thread-safety contract: the callee promises its own safety and may park the thread, because workers will reach it concurrently. **`extern var` binds a C global** of boundary-scalar or handle type; reads and writes are direct loads and stores of the symbol, and anything fancier is a shim (§21.18).
 - **Visibility applies to extern declarations as to any declaration.** `pub extern` exports through the module surface — generated raw modules are ordinary Luce modules and their declarations must be reachable by the safe wrapper that imports them.
 - These declarations are the *raw* layer. FIIR, recipes, and the safe-wrapper generator (§21.1–21.15) stand above them unchanged; nothing here relaxes the ownership-recipe or unsafe-visibility rules.
 
-The finer rulings, each proven by a differential spec during the stage-0 implementation and carried forward as language law:
+The finer rulings, each proven by a differential spec:
 
 - **There is no `null` literal, ever.** Absence is `none`; C's `NULL` is a boundary encoding detail. The conversion at absence is the ordinary optional toolkit: `let w = create_window() else error(last_error())` is the whole idiom.
 - **The niche lives in the ABI, never in the type.** A nullable handle is an ordinary `{token, present}` optional with no sentinel representation, because a *present zero token* and `none` must remain distinguishable — a zero token is a value a C library may legitimately traffic in, and a sentinel lowering would make the two engines disagree on `x == none` for exactly that value. The boundary is the decoder: one comparison decodes C's 0 to `none` on the way in and encodes `none` as 0 on the way out.
-- **The zero token is constructible and inert in-language.** An uninitialized handle variable holds it, it compares, it stores; only a *boundary crossing* through a non-`?` slot traps. A nonzero integer constant is never admitted as a handle value — that would be a forged pointer, and hostile modules offering one are refused at verification.
+- **The zero token is constructible and inert in-language.** An uninitialized handle variable holds it, it compares, it stores; only a *boundary crossing* through a non-`?` slot traps. A nonzero integer constant is never admitted as a handle value; that would be a forged pointer.
 - **An empty buffer's address is C's null.** A buffer-address operation over zero elements answers the zero token — there is nothing to point at — so a callee accepting C's null-with-zero-count convention declares its pointer parameter nullable, and a bare handle slot correctly traps on the empty case. This fell out of the trap's first run against the existing test corpus and is the design working as intended, not an accommodation.
 - **Text results validate or trap.** `-> str` copies immediately — NUL-scan, copy, UTF-8 validation — and invalid text traps (`invalid_utf8`) rather than laundering the `str` contract. An API that answers arbitrary bytes is not a `str` API; it is read with the byte-copy verb. Text arguments cross as NUL-terminated temporaries **borrowed for the call only**; a callee that keeps the pointer is undefined behavior, and an API that stores its argument needs a wrapper that keeps the buffer alive (recipe territory).
 - **Reading C-owned memory is a copy, spelled once.** Three library verbs — copy `count` bytes from a token; copy-and-validate the C string at a token; take-and-dispose the *owned* C string (next bullet) — are the tier-two door for inbound memory. Copies need no borrow rules, no lifetimes, and no escape analysis. The outbound scoped-buffer form extends to dense numeric arrays, which is the door a BLAS binding walks through.
 - **The owned C string is one call.** The take verb (`take_str`) copies and validates the NUL-terminated text at a token — `null_foreign` on zero, before the disposer runs; `invalid_utf8` on bad bytes — hands the token to a `cfunc(foreign)` disposer, and answers the copy: the `LLVMPrintModuleToString` / `LLVMDisposeMessage` convention as a single expression, with the disposer slot fed directly by the extern's own name (§21.19). A `foreign?`-accepting variant was considered and deliberately not added: flow narrowing already turns a checked `foreign?` into the bare token at every use site, so the verb as written serves the `char **` out-slot convention too.
 - **The two boundary traps are unconditional.** `null_foreign` (a zero token through a bare slot, either direction) and `invalid_utf8` fire in every build profile — profiles cannot change error behavior, and each costs one comparison at a crossing that was never free. The mis-declared extern produces a trap with a trace at the exact call, never a corrupt pointer inside C.
 
-### 21.17 `extern struct`: one layout fact on an ordinary value struct (ruled 2026-08-24)
+### 21.17 `extern struct`: one layout fact on an ordinary value struct
 
 An `extern struct` is an **ordinary value struct** carrying one additional fact: its fields also have C's layout — declaration order, the target's alignment and padding, no reordering. Everything structs already do stays available: memberwise construction, field access, copies, equality, printing, zero values, methods, field defaults, and interface conformance. The C byte form is not the struct's representation; it exists **only at a boundary crossing**, where the call site packs each field at its C offset into a call-scoped slot and reads an `out` slot's bytes back field by field afterward.
 
 - **Crossing is by pointer, both directions.** A parameter of extern struct type passes the packed bytes' address as C's `const T *`, **borrowed for the call only** — a callee that retains the pointer is undefined behavior by contract. An `out` parameter passes a writable `T *`. **By-value aggregate passing and returning is refused** at the declaration, and the refusal names the out-parameter road: by-value crossing requires per-target ABI classification (the SysV eightbyte algorithm and kin), and the binding generator's C shims are the planned door. This pointer discipline covers the SDL- and Vulkan-shaped APIs completely.
-- **Layout is natural alignment**, computed once by the compiler and identical across supported targets; the stage-0 implementation pinned it against Clang on every emitted target.
-- **The field vocabulary is closed**: the boundary scalars, named handles, bare `foreign`, bare `cfunc` pointers (§21.19), and nested extern structs, inline. No `str`, no ordinary structs, no `weak`, no fixed arrays — stage-0 arrays carry runtime shape and have no C-layout form, so array fields are deferred to the binding generator — and no empty struct: C has no zero-size aggregate.
+- **Layout is natural alignment**, computed once by the compiler and identical across supported targets.
+- **The field vocabulary is closed**: the boundary scalars, named handles, bare `foreign`, bare `cfunc` pointers (§21.19), and nested extern structs, inline. No `str`, no ordinary structs, no `weak`, no fixed arrays and no empty struct: C has no zero-size aggregate.
 - **An extern struct is not nullable.** `Rect?` is refused: nullability at the boundary is pointer-shaped, and the struct is the pointee, never the pointer.
 - **A field read is not a boundary slot.** A pointer-shaped handle field read back out of an `out` struct carries no automatic trap: C's null arrives as the ordinary zero token, inert in-language exactly as §21.16 states, and the `null_foreign` trap fires where the bare-slot rules always fire — the next non-`?` crossing that uses it.
 
-### 21.18 `extern var`: C globals (ruled 2026-08-24)
+### 21.18 `extern var`: C globals
 
 `extern var name: T` binds a C global as a name in the value namespace, exactly where a file-scope constant lives; `pub` composes as on any declaration. The type vocabulary is **the boundary scalars and the handles only** — no `str`, no optionals, no aggregates — because a C global loads and stores one word, and anything fancier is a shim.
 
@@ -2044,7 +1962,7 @@ An `extern struct` is an **ordinary value struct** carrying one additional fact:
 - **No initializer.** The C side owns the value.
 - **Never folded, never dead-removed.** A C global is state the language cannot see move; every read and write is observable behavior.
 
-### 21.19 `cfunc`: the C function pointer, both directions (ruled 2026-08-24)
+### 21.19 `cfunc`: the C function pointer, both directions
 
 `cfunc(params) -> R` is C's function pointer as a Luce type. The word is **contextual, not a keyword**: `cfunc(` is recognized only in type position, and programs keep the identifier (§29.5).
 
@@ -2057,7 +1975,7 @@ An `extern struct` is an **ordinary value struct** carrying one additional fact:
 
 **The callback thread contract.** A callback runs **synchronously against the runtime of the Luce thread that handed it to C** — the `qsort`-comparator discipline. Every Luce thread, workers included, publishes its runtime context on the way into a foreign call; an invocation arriving on a thread Luce never entered stops the process, loudly. A trap inside a callback cannot unwind through the C frames above it: it reports and stops the program at the boundary rather than returning corrupt data into C. Capture-freedom does not weaken this contract — even a trivial body can trap, print, and allocate, so there is no runtime-free callback; the contract is thread identity, not body purity. Cross-thread asynchronous callbacks are deliberately deferred to the binding-generator era: the ARC-carrying trampoline and ingress-queue marshaling of §21.11 stand above this primitive, never inside it.
 
-### 21.20 Borrowed `list[H]` parameters: the pointer-beside-count shape (ruled 2026-08-24)
+### 21.20 Borrowed `list[H]` parameters: the pointer-beside-count shape
 
 C's second-most-common shape after text is "a pointer to N of these beside the N" — `LLVMFunctionType` takes an `LLVMTypeRef *` and its length, `LLVMBuildCall2` the same. An extern **parameter** may be declared `list[H]` where H is a named handle, `foreign`, or a boundary scalar, and the call site is an ordinary list — a literal will do.
 
@@ -2078,7 +1996,7 @@ The compiler owns only:
 - primitive numeric/Boolean/character types and literal rules;
 - tuples, fixed arrays, functions, optionals, structs/enums/classes;
 - `list`, `map`, `set`, `str`, `bytes`, `range`, safe `slice`, and restricted `mutable_slice` core representation/operations;
-- `T!`, `Error`/`ErrorCode`, ARC/`Weak`, tasks, interfaces/generics/effects;
+- `T!`, `Error`/`ErrorCode`, ARC/`Weak`, tasks, interfaces/generics;
 - the closed protocols required by syntax;
 - modules, native declarations, and control flow.
 
@@ -2086,19 +2004,18 @@ Even when a core type is compiler-known, most of its algorithms are ordinary ver
 
 ### 22.2 Standard library modules
 
-The epoch 1 standard library should provide at least:
+The 1.0 standard library should provide at least:
 
 - `math`, checked numeric conversion, ranges, and deterministic random interfaces;
 - Unicode text, UTF encodings, builders, parsing, and formatting;
 - immutable/mutable collection algorithms and frozen sendable collections;
-- files/paths, streams, clocks/durations, environment/process capability APIs;
-- networking primitives appropriate to host profiles;
+- files/paths, streams, clocks/durations, environment/process APIs;
+- networking primitives;
 - serialization building blocks with explicit formats;
 - arenas, pools, generational handles, and byte buffers;
 - testing, assertions, property/fuzz hooks, and benchmarks;
 - logging and structured diagnostics;
 - native resource/callback adapters;
-- LuciaOS component/runtime APIs.
 
 `frozen_list[T]`, `frozen_map[K, V]`, and `frozen_set[T]` are immutable sendable library values returned by collection `snapshot()` operations. They iterate deterministically and may use persistent/shared storage inside one worker, but transfer performs a value-graph copy.
 
@@ -2113,13 +2030,13 @@ First-party APIs follow language-wide rules:
 - quantities include units in type/name;
 - borrowing is either safe owner-retaining data or closure-scoped;
 - iteration order and allocation behavior are documented;
-- effects and thread/worker transfer behavior appear in signatures/docs.
+- thread/worker transfer behavior appears in signatures/docs.
 
 The standard library is part of the learning curve. Consistency matters more than mimicking each platform API.
 
 ### 22.4 No magical extension system
 
-Epoch 1 has no extension methods or retroactive conformances. Library algorithms are ordinary qualified functions when the type cannot own them:
+1.0 has no extension methods or retroactive conformances. Library algorithms are ordinary qualified functions when the type cannot own them:
 
 ```luce
 let encoded = json.encode(project)
@@ -2139,7 +2056,7 @@ source
 -> source syntax
 -> name/signature resolution
 -> typed HIR
--> flow/effect/ownership checking
+-> flow/ownership checking
 -> canonical MIR
 -> MIR verification
 -> optimization
@@ -2148,13 +2065,13 @@ source
 -> artifact emission
 ```
 
-The canonical MIR makes evaluation order, copies, ARC operations, failures, traps, effects, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed, and verification runs both before and after optimization so neither lowering nor a transform can hand malformed MIR to a backend.
+The canonical MIR makes evaluation order, copies, ARC operations, failures, traps, worker transfers, and native calls explicit. Optimizations operate after these semantics are fixed, and verification runs both before and after optimization so neither lowering nor a transform can hand malformed MIR to a backend.
 
-Typed HIR is the semantic boundary before that machine representation. It keeps structured source-level control flow while replacing source spellings with program-wide `SymbolId` and `TypeId` identities, tagged operations, structured effect sets, decoded constants, and retained source spans. Type names remain only as diagnostic metadata; interpreters and lowerers never infer language meaning from them. Whole-program semantic analysis returns a distinct `AnalyzedProgram`, making it impossible for execution or MIR lowering to consume raw checker output accidentally.
+Typed HIR is the semantic boundary before that machine representation. It keeps structured source-level control flow while replacing source spellings with program-wide `SymbolId` and `TypeId` identities, tagged operations, decoded constants, and retained source spans. Type names remain only as diagnostic metadata; interpreters and lowerers never infer language meaning from them. Whole-program semantic analysis returns a distinct `AnalyzedProgram`, making it impossible for execution or MIR lowering to consume raw checker output accidentally.
 
 The reference interpreter branches after semantic analysis and executes typed HIR directly. It intentionally remains independent of MIR lowering so differential tests can expose lowering and backend defects. A separate MIR interpreter may exist for MIR debugging without replacing that semantic oracle.
 
-The compiler is written in Luce after the Stage-0 0.19 bootstrap compiler is frozen. Each self-hosting stage must reproduce the next stage's observable compiler behavior, with bootstrapping artifacts and hashes published.
+The compiler is written in Luce and bootstrapped from a frozen seed compiler. Each self-hosting stage must reproduce the next stage's observable compiler behavior.
 
 ### 23.2 Backend interface
 
@@ -2169,10 +2086,9 @@ Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §23.3.
 The runtime is small and explicit enough to replace per host. It supplies:
 
 - ARC object allocation, weak-reference tables, and destruction;
-- traps, source traces, and host termination reporting;
+- traps and source traces;
 - core dynamic collection/string storage;
 - isolated worker creation, value graph transfer, cancellation, and joining;
-- capability handle resolution;
 - native bridge support and platform startup;
 - optional profiling/leak/allocation hooks.
 
@@ -2196,7 +2112,7 @@ Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §23.8.
 
 ## 24. Tooling and diagnostic contract
 
-The toolchain is part of the language design. A syntax feature is incomplete until formatting, completion, diagnostics, documentation, testing, cost inspection, and migration understand it.
+The toolchain is part of the language design. A syntax feature is incomplete until formatting, completion, diagnostics, documentation, and testing understand it.
 
 ### 24.1 Persistent compiler service
 
@@ -2217,10 +2133,8 @@ The `luce` command owns:
 - `luce package fetch/vendor/audit/publish` — reproducible ecosystem operations;
 - `luce bind` — C/C++ import and wrapper generation;
 - `luce query` — structured semantic/diagnostic/API data for editors and agents;
-- `luce explain` — type, effect, ownership, allocation, ARC, bounds, worker, and native costs;
 - `luce api diff` — source/native API compatibility;
 - `luce fix` — apply deterministic compiler suggestions;
-- `luce migrate` — epoch/version migrations;
 - `luce doctor` — verify host/target SDK, native bridge, debugger, cache, and installation health.
 
 The language server and command line use the same incremental compiler database, diagnostics, formatter, and package graph. Editor behavior must never disagree with the build because it reimplemented the language.
@@ -2232,7 +2146,7 @@ Every error contains:
 1. a one-sentence description in programmer vocabulary;
 2. the smallest primary source span;
 3. relevant secondary spans showing origins/declarations;
-4. actual versus required type/effect/ownership fact;
+4. actual versus required type/ownership fact;
 5. a concrete fix when one is mechanically safe;
 6. an optional deeper explanation and stable diagnostic code.
 
@@ -2249,11 +2163,11 @@ error[L0421]: `document` cannot be sent to a worker
    = help: pass `document.snapshot()` if `DocumentSnapshot` is sendable
 ```
 
-Diagnostics must trace generic constraints, effect propagation, import origins, and non-sendable field paths without dumping internal compiler types. “Expected X, found Y” alone is not sufficient.
+Diagnostics must trace generic constraints, import origins, and non-sendable field paths without dumping internal compiler types. “Expected X, found Y” alone is not sufficient.
 
 ### 24.4 Formatter
 
-`luce fmt` is canonical and intentionally minimally configurable. It owns indentation, line breaks, spaces, imports, and trailing delimiters. Stability across versions is a compatibility goal; format churn requires an epoch/migration rationale.
+`luce fmt` is canonical and intentionally minimally configurable. It owns indentation, line breaks, spaces, imports, and trailing delimiters. Stability across versions is a compatibility goal; format churn requires a migration rationale.
 
 A legal same-line suite remains compact only while its body is one simple statement on one physical line. The formatter expands it to the ordinary four-space form rather than wrapping after `:`; it never joins an existing indented suite automatically.
 
@@ -2270,31 +2184,30 @@ test "parser reports missing closing bracket":
         recover Document.empty()
     assert(parsed.is_empty())
 
-test "configuration reads through the granted test file system" uses files:
+test "configuration reads through the granted test file system":
     let text = try files.read_text("settings.luce")
     assert(text == "theme = dark")
 ```
 
-The complete declaration form is `test STRING_LITERAL [uses effects]: suite`. A test:
+The complete declaration form is `test STRING_LITERAL: suite`. A test:
 
 - has a nonempty description unique within its module; its stable identity is package + module + description;
 - is compiled as a hidden zero-argument `unit!` function, so `try` may propagate directly into the harness and reaching the end means pass;
-- must declare every host effect with the ordinary `uses` clause;
 - cannot be `pub`, generic, nested, parameterized, or returned from; reusable setup is an ordinary private function;
-- is checked with exactly the same typing, initialization, overflow, bounds, ARC, effect, and native-safety rules as production code.
+- is checked with exactly the same typing, initialization, overflow, bounds, ARC, and native-safety rules as production code.
 
-An unhandled `Error`, failed assertion, trap, host termination, leaked checked resource, or failed test-library expectation fails the test with its structured source trace. `return` is rejected inside a test so an accidental early pass cannot skip assertions.
+An unhandled `Error`, failed assertion, trap, leaked checked resource, or failed test-library expectation fails the test with its structured source trace. `return` is rejected inside a test so an accidental early pass cannot skip assertions.
 
 #### 24.5.1 The bounded test scope
 
 A test has useful privileges, but no safety privilege:
 
 1. An inline test belongs to its source module and may therefore access that module's private declarations and fields. It gains no access to another module's private API.
-2. The test profile exposes the `testing` standard module for equality/diff expectations, deterministic seeds, temporary resources, fake capability implementations, allocation/ARC/live-resource census, property generation, fuzz inputs, snapshots, and benchmark measurement.
-3. The runner observes the isolated test domain's error, trap, trace, output, capability log, allocation/ARC ledger, and final resource state. These observations are harness metadata, not reflection available to production code.
-4. A manifest may grant a test deterministic fake capabilities or explicitly opt a test product into real host capabilities. The source still declares them with `uses`; `test` never creates ambient files, network, clock, random, process, or `unsafe_native` authority.
+2. The test profile exposes the `testing` standard module for equality/diff expectations, deterministic seeds, temporary resources, fake host facilities, allocation/ARC/live-resource census, property generation, fuzz inputs, snapshots, and benchmark measurement.
+3. The runner observes the isolated test domain's error, trap, trace, output, allocation/ARC ledger, and final resource state. These observations are harness metadata, not reflection available to production code.
+4. Tests substitute deterministic fake implementations for host facilities (files, clock, random) through the `testing` module; `test` never creates authority the program does not already have.
 
-The scope never relaxes type checking, imports private declarations across module/package boundaries, makes traps catchable, permits mutable globals, changes production semantics, or implies `unsafe_native`. Raw native test code follows the same audited-module and manifest rules as any other raw native code.
+The scope never relaxes type checking, imports private declarations across module/package boundaries, makes traps catchable, permits mutable globals, changes production semantics, or relaxes native safety. Raw native test code follows the same audited-module rules as any other raw native code.
 
 `testing.expect_trap(function)` accepts a noncapturing function value, emits a test-only child entry, runs it in a child execution domain, and checks the domain outcome:
 
@@ -2308,7 +2221,7 @@ test "bounds violations trap":
     try testing.expect_trap(index_past_end)
 ```
 
-The function must capture nothing and exists only in the test artifact; this is a harness entry transformation, not permission for an ordinary closure to cross a worker boundary. Its effects must be a subset of the enclosing test's declared effects, and the child receives only the same test capability implementations. The trap is not caught or resumed inside Luce. This preserves the language rule that a violated invariant terminates its domain while still making safety behavior testable.
+The function must capture nothing and exists only in the test artifact; this is a harness entry transformation, not permission for an ordinary closure to cross a worker boundary. The child receives the same test fakes. The trap is not caught or resumed inside Luce. This preserves the language rule that a violated invariant terminates its domain while still making safety behavior testable.
 
 #### 24.5.2 Unit and integration boundaries
 
@@ -2350,7 +2263,7 @@ Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §24.9.
 
 ## 25. Deliberate exclusions
 
-Smallness comes more from saying “no” than from shortening keywords. The following are not merely postponed implementation tasks; they are absent from the epoch 1 language unless evidence passes section 26's gate.
+Smallness comes more from saying “no” than from shortening keywords. The following are not merely postponed implementation tasks; they are absent from the 1.0 language unless evidence passes section 26's gate.
 
 ### 25.1 Object/type-system exclusions
 
@@ -2385,7 +2298,7 @@ Repetition is first attacked through generics, functions, data tables, declarati
 - tracing garbage collection as ordinary class semantics;
 - shared-memory threads, locks, atomics, shared actors;
 - detached tasks and implicit background work;
-- async/await language coloring in epoch 1.
+- async/await language coloring in 1.0.
 
 ### 25.4 Control/error exclusions
 
@@ -2415,123 +2328,11 @@ Repetition is first attacked through generics, functions, data tables, declarati
 - leaking backend-specific pointer/IR concepts into safe APIs;
 - inline assembly in portable Luce.
 
-## 26. Feature admission and evolution
+## 26. Evolution
 
-Language evolution uses an evidence gate so “just one convenience” cannot slowly destroy the design.
+1.0 is the language specified in this document. Before 1.0, a release may change syntax or semantics, with an automatic migration where practical; from 1.0 on, source compatibility within 1.x is a promise and changes that would break it wait for a new major version.
 
-### 26.1 Admission test
-
-A proposed language feature must answer all of these:
-
-1. What important, repeated real-world task cannot be expressed clearly with current composition/library/tooling?
-2. How many concepts and interactions does the feature add?
-3. Which existing complexity does it remove?
-4. Can a diagnostic, library API, generator, manifest field, or editor action solve it instead?
-5. Is its runtime cost and failure behavior visible?
-6. How does it interact with values/classes, `T?`, `T!`, ARC, closures, generics/interfaces, effects, workers, and native code?
-7. Can it be taught before its edge cases?
-8. Can the formatter, language server, debugger, docs, migration tool, every backend, and C/C++ boundary support it completely?
-9. Is there corpus/UX/performance evidence from the compiler, standard library, LuciaOS, and external pilot packages?
-10. If admitted, what older mechanism can be removed or kept out?
-
-A feature is rejected when its benefit is mainly terseness, familiarity from another language, or theoretical completeness.
-
-### 26.2 Epoch changes
-
-Language epochs are rare, explicit package-manifest choices. Within an epoch:
-
-- parsing and type semantics remain compatible;
-- new warnings do not silently become release-breaking errors without a staged migration;
-- public runtime/native ABI versions are explicit;
-- compiler improvements may optimize but not change observable behavior.
-
-An epoch migration ships with `luce migrate`, an API/behavior report, formatter stabilization, and side-by-side documentation. Stage-0 0.19 is the frozen bootstrap seed, not a compatibility constraint on Luce Next source.
-
-### 26.3 Reconsideration candidates
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §26.3.
-
-## 27. Complete implementation sequence
-
-The compiler should be built in vertical slices that always leave one usable, testable language. Syntax breadth without diagnostics, runtime, and tools is not progress.
-
-### Phase 0 — freeze and semantic harness
-
-- Freeze Stage-0 0.19 as the bootstrap compiler; publish exact source/artifact hashes.
-- Create the Luce Next lexer/parser/typed-IR packages in the subset Stage-0 0.19 can compile.
-- Build golden syntax/diagnostic tests and differential interpreter tests.
-- Define language epoch, target description, package identity, and compiler artifact formats.
-- Treat this document's feature table and exclusions as change-controlled decisions.
-
-Exit: the bootstrap can build the new compiler skeleton reproducibly; source locations and diagnostics are stable enough for tooling.
-
-### Phase 1 — minimal executable value language
-
-- UTF-8 source/layout/comments/names and canonical formatter.
-- primitive literals/types, tuples, fixed arrays, `let`/`var`, assignments/conversions/operators.
-- functions, calls, `if`/`while`/`for` over ranges, return/break/continue/defer.
-- structs and payload-capable enums, exhaustive `match`, optionals.
-- modules/imports/public declarations/top-level constants.
-- typed interpreter and `luce check/run/test` basics, including static test discovery, implicit test fallibility, isolation, and production erasure.
-
-Exit: small deterministic command-line programs run without classes, generics, or native code.
-
-### Phase 2 — identity, failure, and core storage
-
-- ARC runtime storage; dynamic strings/bytes/UTF-8, lists/maps/sets/slices.
-- final classes, `new`/`init`/`deinit`, `Weak`, resource wrappers, cycle/leak foundations.
-- `T!`, `Error`, `ErrorCode`, `try`, expression-local `catch`/`recover`, traps/assertions.
-- standard formatting, paths/files, streams, builders, deterministic testing capabilities, and structured test reports.
-- effect declarations/inference and capability-backed standalone runtime.
-- diagnostic fixes, documentation extraction, package manifest/lockfile.
-
-Exit: useful file-processing tools can be written, packaged, tested, and documented; identity/resource lifetime is observable and needs no native escape hatch.
-
-### Phase 3 — closures and reusable abstraction
-
-- closures, capture cells/lists, direct cycle diagnostics and completed leak tooling.
-- generics, constraints, interfaces, interface values/boxing.
-- closed iteration/equality/hash/compare/display protocols.
-- generic-instantiation limits and serialized typed generic bodies.
-- allocation/ARC/copy/bounds/dynamic-dispatch explain data.
-
-Exit: compiler-sized modular applications can express callbacks and reusable algorithms; abstraction/ARC costs are visible and bounded.
-
-### Phase 4 — C foundation
-
-- FIIR schema and Clang-based C importer.
-- target layouts, raw native modules, recipe validation, wrapper generator.
-- C ABI call support in interpreter/runtime and LLVM backend.
-- owner/resource, slice, callback, status/error adapters.
-- `export c`, header generation, ABI probe/diff tests.
-
-Exit: representative libc, SQLite, image, compression, and OS APIs have small safe wrappers with reproducible bindings.
-
-### Phase 5 — self-host and LLVM production path
-
-- Port remaining compiler stages/tooling from Stage-0 0.19 constraints into Luce Next.
-- LLVM debug/release code generation, link/debug/unwind support.
-- serialized generics/typed package artifacts and declaration-level incrementality.
-- reproducible compiler bootstrap comparison and performance budgets.
-- language server, formatter, docs, test, package, cost, and API tools reach release quality.
-
-Exit: the Luce compiler builds itself and the standard library; LLVM artifacts support initial production targets.
-
-### Phase 6 — C++ bridge
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md`, Phase 6.
-
-### Phase 7 — isolated workers and LuciaOS integration
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md`, Phase 7.
-
-### Phase 8 — fast direct backends
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md`, Phase 8.
-
-### Phase 9 — adoption release
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md`, Phase 9.
+A feature enters the language only when it removes more total complexity than it adds (section 0), and it is frozen only after it is implemented in the compiler, formatter, tests, and documentation and has been used by the compiler itself or a real application. Features cut from the design are listed in section 25; nothing returns without that evidence.
 
 ## 28. Learning order
 
@@ -2544,15 +2345,14 @@ The official teaching path follows the semantic dependency graph:
 5. classes only when shared identity is actually needed;
 6. closures and explicit capture consequences;
 7. generic functions, then interfaces for abstraction;
-8. effects as visible host authority;
-9. isolated workers as copied values;
-10. native wrappers, with raw native operations last.
+8. isolated workers as copied values;
+9. native wrappers, with raw native operations last.
 
-`test` is introduced immediately after the first pure function, before classes, allocation control, effects, generics, or native code. A learner should be able to state an expectation and run `luce test` during the first hour; advanced test capabilities arrive only alongside the production concept they observe.
+`test` is introduced immediately after the first pure function, before classes, allocation control, generics, or native code. A learner should be able to state an expectation and run `luce test` during the first hour; advanced test capabilities arrive only alongside the production concept they observe.
 
 Each stage produces a useful program before adding another concept. Tutorials should not begin with package ceremony, ownership vocabulary, generic theory, or a class named `HelloWorld`.
 
-The installed/offline learning set includes a five-minute first program, task-oriented recipes, complete maintained applications, and “Lucelings” repair exercises driven by real stable diagnostics. Tracks for Python, C/C++, Zig, Rust, and Luce 0.18 explain only the unfamiliar distinctions rather than reteaching programming. Examples are compiled in release CI against the documentation's declared epoch.
+The installed/offline learning set includes a five-minute first program, task-oriented recipes, complete maintained applications, and “Lucelings” repair exercises driven by real stable diagnostics. Tracks for Python, C/C++, Zig, Rust, and Luce 0.18 explain only the unfamiliar distinctions rather than reteaching programming. Examples are compiled in release CI against the documentation's declared language version.
 
 ## 29. Compact surface reference
 
@@ -2566,7 +2366,7 @@ var name: Type = value
 pub let constant: Type = constant_value
 
 func name(parameters) -> Type:
-pub func name[T: Interface](parameters) -> Type! uses effect:
+pub func name[T: Interface](parameters) -> Type!:
 mutating func name(self, parameters):
 
 struct Name:
@@ -2575,7 +2375,6 @@ class Name:
 interface Name:
 
 test "description":
-test "description" uses effect:
 import module.path
 import module.path as alias
 from module.path import Name, function
@@ -2662,10 +2461,10 @@ suite or the indented arm list of a `match` expression.
 ```text
 and as break catch class continue defer elif else enum export extern false
 for from func if implements import in interface is let match mutating new none not or
-pub recover return self spawn struct test true try type uses var weak while
+pub recover return self spawn struct test true try type var weak while
 ```
 
-`c`, capture-list `copy`, extern-declaration `blocking`/`out`/`cfunc`, primitive/core type names, and standard effect names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a language epoch; the lexer does not reserve a large speculative list.
+`c`, capture-list `copy`, extern-declaration `blocking`/`out`/`cfunc`, and primitive/core type names are contextual words in the syntactic positions that require them. Future keywords are introduced only by a new major version; the lexer does not reserve a large speculative list.
 
 ### 29.6 Grammar skeleton
 
@@ -2695,9 +2494,9 @@ constant_decl   = "let", IDENT, [ ":", type ], "=", expression, NEWLINE ;
 type_alias      = "type", IDENT, "=", type, NEWLINE ;
 
 function_decl   = [ "mutating" ], "func", IDENT, [ generic_params ],
-                  parameter_list, result_clause, effect_clause, ":", suite ;
+                  parameter_list, result_clause, ":", suite ;
 function_sig    = [ "mutating" ], "func", IDENT, [ generic_params ],
-                  parameter_list, result_clause, effect_clause, NEWLINE ;
+                  parameter_list, result_clause, NEWLINE ;
 
 generic_params  = "[", generic_param, { ",", generic_param }, [ "," ], "]" ;
 generic_param   = TYPE_IDENT, [ ":", interface_type, { "&", interface_type } ] ;
@@ -2707,7 +2506,6 @@ parameter       = "self"
                 | IDENT, ":", type, [ "=", constant_expression ] ;
                   (* "self" and "mutating" are accepted only on a type member *)
 result_clause   = [ "->", type ] ;
-effect_clause   = [ "uses", EFFECT_IDENT, { ",", EFFECT_IDENT } ] ;
 
 implements_clause
                 = [ "implements", interface_type,
@@ -2732,7 +2530,7 @@ payload         = IDENT, ":", type ;
 interface_decl  = "interface", TYPE_IDENT, [ generic_params ], ":", NEWLINE,
                   INDENT, function_sig, { function_sig }, DEDENT ;
 
-test_decl       = "test", STRING_LITERAL, effect_clause, ":", suite ;
+test_decl       = "test", STRING_LITERAL, ":", suite ;
 
 export_c_decl   = "export", "c", ( export_c_struct
                                   | export_c_enum
@@ -2886,7 +2684,7 @@ match_expr      = "match", expression, ":", NEWLINE, INDENT,
 match_value_arm = pattern_list, "=>", expression, NEWLINE ;
 
 closure_expr    = "func", [ capture_list ], parameter_list,
-                  result_clause, effect_clause, ":", suite ;
+                  result_clause, ":", suite ;
 capture_list    = "[", capture, { ",", capture }, [ "," ], "]" ;
 capture         = "weak", IDENT
                 | "copy", IDENT, "=", expression ;
@@ -2903,7 +2701,7 @@ type_arguments  = "[", type_or_array_length,
 type_or_array_length
                 = type | INTEGER_LITERAL ;
 function_type   = "func", "(", [ type, { ",", type } ], ")",
-                  "->", type, effect_clause ;
+                  "->", type ;
 cfunc_type      = "cfunc", "(", [ type, { ",", type } ], ")",
                   "->", type ;
 
@@ -2920,7 +2718,7 @@ formatted_string
 
 Parser implementation uses the explicit declaration/statement productions and a Pratt parser with section 29.4's precedence for expressions. Semantic analysis then rejects grammar-general forms that violate the narrower contracts—for example, a non-call expression statement, a non-class after `new`, a generic argument count mismatch, an open-ended range outside indexing, or `recover` outside a catch handler.
 
-`constant_expression` and `c_compatible_type` are named semantic subsets rather than separate parsers: the former is section 20.4's effect-free restricted expression set, and the latter is the fixed-representation subset validated by section 21.5. `TYPE_PATH`, `CORE_TYPE`, `EFFECT_IDENT`, and the literal tokens are lexer/parser categories with the naming and literal rules from sections 3–5.
+`constant_expression` and `c_compatible_type` are named semantic subsets rather than separate parsers: the former is section 20.4's restricted expression set, and the latter is the fixed-representation subset validated by section 21.5. `TYPE_PATH`, `CORE_TYPE`, and the literal tokens are lexer/parser categories with the naming and literal rules from sections 3–5.
 
 Inside delimiters the layout lexer resumes NEWLINE/INDENT/DEDENT after a `:` that ends its line (section 3.2), which is how `suite` appears within `argument_list`, `list_literal`, and their kin.
 
@@ -2932,98 +2730,3 @@ immediately followed by `=>`; otherwise it begins an ordinary group or tuple.
 In type position, a parenthesized single type is grouping, never a one-element
 tuple: it exists so an optional function type can be spelled, as in
 `(func() -> unit)?` (section 14.3).
-
-## 30. Research and Luce reconciliation
-
-Deferred past 1.0 — see `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §30.
-
-## 31. The 1.0 release gate
-
-1.0 is the language, not the platform. Do not label it 1.0 merely because the parser accepts every construct; do not hold it hostage to platform work either. 1.0 is a stable adoption promise for the source language when all of these are true:
-
-- the frozen Stage-0 0.19 seed reproducibly builds the transition compiler, which builds a fixed-point self-hosted compiler;
-- the compiler and the core standard library are themselves substantial Luce programs;
-- the interpreter and one native backend pass the same behavior/trap/cleanup corpus;
-- C import/export (§21.3–21.5, §21.16–21.20) is production-proven against at least one real C library;
-- inline/private and integration/public test boundaries, deterministic isolation, expected-trap child domains, and complete production erasure have conformance coverage;
-- diagnostics and the first-hour learning path have been tested with people who did not design Luce;
-- every admitted feature has formatter, compiler, docs, tests, and interpreter-plus-native coverage;
-- at least the compiler and one standalone native application have survived real maintenance rather than demo-only development.
-
-Everything else — the language server and persistent compiler service, package publishing/provenance/audit workflows, the C++ tier, performance budgets on named hardware, additional direct backends, the debugger, and governance — is the platform gate in `LUCE_LANGUAGE_DESIGN_POST_1_0.md` §31. Until 1.0, releases may deliberately break with an automatic migration where practical. Stability is earned evidence, not a date.
-
-## 32. The sweet spot
-
-Luce Next is small because a programmer can predict it from a compact set of sentences:
-
-- Bindings are immutable unless marked `var`.
-- Values copy; final classes and mutable collections share identity through ARC.
-- `weak` breaks identity cycles; final release performs cleanup.
-- Absence is `T?`; recoverable failure is `T!`; violated invariants trap.
-- Structs and payload-capable enums model data; interfaces and generic functions model reusable behavior.
-- Host authority is visible in effects.
-- Workers receive copied immutable value graphs, never a shared heap.
-- C is imported directly and safely wrapped; C++ is flattened through generated Clang-informed bridges.
-- One toolchain formats, checks, explains, binds, builds, tests, documents, and migrates the same language.
-
-The design refuses local convenience when it creates global ambiguity. Its expressiveness comes from composition: functions over explicit data, closed enums plus exhaustive matching, generic algorithms over nominal capabilities, final identity objects at the edges, and a substantial consistent library. The result should feel high-level during ordinary work and become mechanically transparent when cost, ownership, capability, or native ABI matters.
-
-## 33. Final austerity and joy audit
-
-This is the last whole-design audit before implementation. It applies the interviews' “do more with less,” safety/performance/usability, adoption-through-coexistence, compiler-as-teacher, toolchain, and stability lessons to the complete surface rather than to isolated syntax proposals.
-
-### 33.1 Cuts made by the audit
-
-| Candidate complexity | Final decision | Net result |
-| --- | --- | --- |
-| Separate payload-free `enum` and payload-carrying `union` declarations | One payload-capable `enum` | Removes one keyword, declaration grammar, generic/layout rule family, teaching distinction, and tooling path without losing any data model. |
-| `**` exponent operator | Named checked integer power and `math.pow` APIs | Removes a precedence level and several mixed numeric/overflow rules; the uncommon operation remains clear and searchable. |
-| `=>` as shorthand for a short `match` arm | ~~The existing `:` plus a one-statement suite~~ — **later adopted (§9.6)** as the arm delimiter of the expression-valued `match` | A post-freeze revision took the expression form the audit had gated on dogfooding evidence. `=>` is not shorthand for `:`: it means "yields a value", the same role it plays in a lambda body, under a coherent `-> `/`=>`/`:` rule. |
-| Mandatory module qualification at every use | Explicit-name `from` imports alongside qualified module imports | Adds one keyword but removes repeated path noise and local forwarding shims; omitting wildcards and per-name aliases keeps origin and collision repair obvious. |
-| Long `public` visibility modifier | `pub` | Keeps exported boundaries explicit while matching concise `func` and reducing noise in modules with several intentional API declarations. |
-| `error` and `trap` as reserved syntax words | Compiler-known core calls returning `never` | Keeps exact failure semantics while shrinking the lexer/parser and making all terminators visibly call-shaped. |
-| A testing framework assembled from attributes, reflection, naming conventions, and privileged helpers | One static `test` declaration plus ordinary library/manifest facilities | Adds one high-yield keyword while removing several ecosystem mechanisms and making discovery, isolation, effects, and production erasure compiler-verifiable. |
-
-The resulting epoch 1 lexer has 43 reserved words, the ordinary data model has two named value declarations (`struct`, `enum`) plus final `class` identity, and expression precedence has 12 levels. These are budgets, not vanity metrics: any increase must identify the older concept or system complexity it removes.
-
-### 33.2 Features that survive the budget
-
-| Mechanism | Why it remains in a small language |
-| --- | --- |
-| `let` / `var`, explicit functions, narrow control flow | They make the first useful program obvious and leave little style dialect. |
-| `T?`, `T!`, and uncatchable traps | Three real computer states need three visible policies; merging them creates sentinel, exception, or recovery ambiguity. |
-| Final ARC classes plus `weak` | Shared GUI/resource identity is necessary; ARC supplies deterministic lifetime without making every ordinary function a lifetime proof. |
-| Closures with deterministic capture | Callbacks and traversal are unavoidable in the compiler, UI, and native libraries; explicit capture consequences prevent invisible shared state. |
-| Restrained generics plus nominal interfaces | Static reuse and dynamic boundaries are different needs. Keeping both, with no associated types/defaults/specialization/reflection, is less total complexity than duplication or metaprogramming. |
-| Closed host effects | LuciaOS must audit authority. A small enforced vocabulary exposes real host power without turning allocation and mutation into an academic effect calculus. |
-| Isolated `spawn` / `task.wait()` | Parallel work is needed, but copied value graphs and structured lifetime avoid the much larger language/runtime of shared heaps, locks, actors, and async coloring. |
-| C plus generated C++ bridges | Coexistence is an adoption mechanism, not syntax luxury. C is the stable boundary; Clang-informed C++ thunks prevent the C++ object model from infecting Luce. |
-| Interpreter, direct debug backends, and LLVM | One canonical semantics with swappable code generators gives fast feedback, optimization/target reach, and independence without source-language modes. |
-
-### 33.3 Clockwork invariants
-
-The implementation must preserve all of these simultaneously:
-
-1. **One obvious ordinary path.** Correct common code is the shortest code; advanced control is the code that gains explicit syntax.
-2. **One spelling, one meaning.** No overload sets, truthiness, shadowing, ambient imports, profile-dependent arithmetic, or backend-dependent semantics.
-3. **No invisible authority or failure.** Host effects appear in public signatures, recoverable failure appears as `!`, and invariant failure terminates a domain.
-4. **Costs are either obvious or inspectable.** Allocation, copies, ARC, boxing, bounds checks, generic expansion, worker transfer, and native crossings have stable `luce explain` data.
-5. **Tests are production Luce under observation.** They receive isolation and test facilities, never a weaker type/safety/effect language.
-6. **Every strict rule teaches and repairs.** A diagnostic names the cause, explains the computer rule, points to the origin, and offers a deterministic fix when one exists.
-7. **Every backend is replaceable; semantics are not.** Interpreter, LLVM, x64, and ARM64 agree on behavior, traps, errors, destruction, and native contracts.
-8. **Every adoption step is reversible.** A project can add one Luce component behind C/C++ boundaries without rewriting its build, runtime, or object model.
-9. **Stability is earned after the whole product works.** The formatter, test runner, packages, debugger, docs, binder, migration tools, and governance are part of 1.0.
-
-### 33.4 Implementation acceptance checks
-
-Before the epoch 1 surface freezes:
-
-- every reserved word, grammar production, core type, operator, declaration, and deliberate exclusion has positive and negative conformance cases;
-- every specification example and first-hour tutorial fragment is compiled in CI, and every documented diagnostic is tested structurally;
-- production artifacts prove that test descriptions, test code, test dependencies, test capabilities, and test registries were erased;
-- representative newcomers can write a pure function and test, diagnose an optional/fallible mismatch, and understand value versus class identity without external help;
-- the self-hosted compiler, LuciaOS application, standalone program, C library integration, and C++ integration exercise the same public mechanisms users receive—no compiler-only language escape hatch;
-- edit/check/test latency, memory, artifact size, allocation/ARC, and native bridge budgets are measured on named hardware and block regressions;
-- any proposed convenience that violates an invariant above is first attempted as a library API, diagnostic/fix, manifest rule, generator, or editor action.
-
-The intended feeling is not cleverness. It is inevitability: the next line is easy to predict, the compiler's objection is easy to act on, the cost can be found, the native boundary can be inspected, and a test is always one `luce test` away.

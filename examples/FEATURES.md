@@ -1,6 +1,6 @@
 # Language Feature Coverage
 
-The target is the epoch-1 source surface in `LUCE_LANGUAGE_DESIGN.md` §29.6.
+The target is the 1.0 source surface in `LUCE_LANGUAGE_DESIGN.md` §29.6.
 Every syntax-tree form accepted by the current tokenizer and parser appears in
 at least one parser-checked example. Runtime guarantees, package resolution, and
 deliberately excluded syntax are outside this parser-era coverage claim. The
@@ -33,6 +33,6 @@ reaches WebAssembly, and `hello.luc` reaches a runnable ARM64 Mach-O.
 | C import through generated raw bindings | `c_import/` |
 | C struct, enum, and function export | `c_api.luc` |
 
-Epoch 1 has no separate `union` declaration: payload enums are its closed
+1.0 has no separate `union` declaration: payload enums are its closed
 tagged unions. It also has no wildcard import; selective imports always name
 the declarations they introduce.
