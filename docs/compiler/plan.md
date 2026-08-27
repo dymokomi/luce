@@ -7,7 +7,7 @@ representation in depth; this page says what is done, what is next, what
 was decided and why, and what is deliberately deferred. Update it when a
 decision changes; do not let it drift into a wish list.
 
-Last updated: 2026-08-27.
+Last updated: 2026-08-27 (Stage-0 0.23).
 
 ## 1. Where things stand
 
@@ -21,7 +21,7 @@ Last updated: 2026-08-27.
 | WebAssembly backend | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. **Not extended on purpose** (see §4). |
 | Tests | 355 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~70 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
-| Toolchain | Stage-0 0.22 pinned in `bootstrap.sh`. Known Stage-0 defects in §7. |
+| Toolchain | Stage-0 0.23 pinned in `bootstrap.sh`. Known Stage-0 constraints in §7. |
 
 ## 2. Testing strategy (the part that must not be lost)
 
@@ -93,10 +93,10 @@ Each step is a vertical slice gated by the three-way harness plus executed wasm.
 
 ## 7. Stage-0 state and constraints
 
-The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Known Stage-0 0.22 limits, all with standalone reproductions in `build/stage0-0.22-repro.tar.gz` (also `README` there):
+The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.23 is pinned. Its remaining known constraints:
 
-- **Call depth is 128 host frames.** Both interpreters therefore cap at `frame_limit = 16` and recursion fixtures stay ≤ 12 deep. When Stage-0 raises the limit: raise both constants, restore `fib(20)`/`factorial(15)` fixtures.
-- **Use-after-free**: a temporary receiver (`Builder().make()`) whose method returns a struct literal copying a list-bearing field from `self` and initialising a later field from a call returning `T?` — the list is freed. Bind the call result or the receiver to a `let` first (`lowerer.luc` does).
+- **Call depth is 32768 host frames** (0.23; was 128 in 0.22). Both interpreters cap at `frame_limit = 2000` interpreted frames, a few host frames each.
+- Fixed in 0.23: the temporary-receiver / optional-field use-after-free (reproduction kept in `build/stage0-0.22-repro.tar.gz`; `differential_test` and `lowerer.luc` no longer work around it).
 - Reserved identifiers (`error`, `bytes`, `i8`…), single-member enum `match` arms, class fields spelled `pub name: T`, no top-level function sharing a name with a pattern binding.
 - Fixed in 0.22: errors through interface-typed calls (tested by `pipeline_test.luc`).
 - Withdrawn after checking: "`return` in a statement-form `catch` does not return" — it does.

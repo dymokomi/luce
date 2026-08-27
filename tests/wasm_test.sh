@@ -226,7 +226,7 @@ pub func fact10() -> i64: return factorial(10)
 func fib(n: i64) -> i64:
     if n < 2: return n
     return fib(n - 1) + fib(n - 2)
-pub func fib12() -> i64: return fib(12)
+pub func fib20() -> i64: return fib(20)
 func mix(a: i8, b: u16, c: i64, d: bool) -> i64:
     var total = c
     if d: total += 1
@@ -250,7 +250,7 @@ LUCE
 "$cli" build "$test_dir/calls.wasm" "$test_dir/calls.luc" >/dev/null
 calls() { expect 0 "$2" wasmtime run --invoke "calls.$1" "$test_dir/calls.wasm"; }
 calls fact10 3628800
-calls fib12 144
+calls fib20 6765
 calls mixed 66533
 calls constants 42
 calls named 123

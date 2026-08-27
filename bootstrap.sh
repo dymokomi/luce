@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the Stage-0 0.22 toolchain this repository builds with.
+# Install the Stage-0 0.23 toolchain this repository builds with.
 # Downloads the archive for this machine from the stage0 release of
 # dymokomi/luce-stage-0, verifies its checksum, and unpacks to ./stage0/.
 set -eu
@@ -19,13 +19,13 @@ esac
 
 # Checksums, one per flavor. bootstrap refuses to install an archive it
 # cannot verify.
-checksum_macos_aarch64=b6834b51f0db60a6782601a65c6080f831a6a152cc407fa99f5c41edb8795812
-checksum_linux_x86_64=02d98acd9f80de99d09c7635d9e80897e03b3b7eac5555d3816ca2d022e86029
+checksum_macos_aarch64=eb0a3c0e5cfa2b137cf06634bc907a6a0314d5d7494042cbbb86e3ba2c38713b
+checksum_linux_x86_64=e64166529c256ff20c955032bc9fd254496a43ca38caa93875c3fdc16cbcdcdf
 
 eval "expected=\$checksum_$(printf %s "$flavor" | tr - _)"
 [ "$expected" != TBD ] || { echo "bootstrap: checksum missing for $flavor" >&2; exit 1; }
 
-archive="luce-0.22-$flavor.tar.gz"
+archive="luce-0.23-$flavor.tar.gz"
 url="https://github.com/$repo/releases/download/$release_tag/$archive"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

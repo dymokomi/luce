@@ -17,7 +17,7 @@ end-to-end slices. Unsupported features fail with a clear diagnostic.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.22, the seed compiler for the current machine, and verifies its
+Stage-0 0.23, the seed compiler for the current machine, and verifies its
 checksum. `./stage0` is that downloaded toolchain, not this repository's source.
 
 ```sh
