@@ -5,9 +5,13 @@
   today" in the [top-level README](../README.md).
 - [Post-1.0 platform](language/post-1.0.md) — packages, C++, backends, and
   tooling deferred past 1.0, under the same section numbers.
-- [Canonical MIR](compiler/mir.md) — the compiler's design record for the
-  machine representation every compiled backend consumes: the decisions,
-  the instruction set, and the order of work.
+- [Compiler plan](compiler/plan.md) — where every layer stands, the
+  decisions taken (MIR shape, WebAssembly, native backends, QBE, the
+  linker, the runtime), the order of work, and the Stage-0 constraints.
+  Start here to resume work.
+- [Canonical MIR](compiler/mir.md) — the design record for the machine
+  representation every compiled backend consumes: the decisions, the
+  instruction set, and the reasons.
 
 The specification is organised from the executive decision and complexity
 budget, through source text, types, expressions, control flow, data modeling,
