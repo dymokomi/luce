@@ -54,6 +54,120 @@ printf 'pub func answer() -> i64: return (2 + 3) * 4 - 6\npub func narrow() -> i
 expect 0 "14" wasmtime run --invoke math.answer "$test_dir/math.wasm"
 expect 0 "2147483647" wasmtime run --invoke math.narrow "$test_dir/math.wasm"
 
+# Slice 3a: locals, every operator family, narrow widths, conditionals. The
+# same programs are oracle-checked in tests/compiler/differential_test.luc;
+# here the wasm bytes actually run. (wasmtime prints i32 results signed, so
+# wide unsigned values stay in the unit tests.)
+cat > "$test_dir/scalars.luc" <<'LUCE'
+pub func locals() -> i64:
+    let a = 40
+    var b = 1
+    b += 1
+    return a + b
+pub func compound() -> i64:
+    var v = 100
+    v -= 58
+    v *= 3
+    v //= 2
+    v %= 50
+    return v
+pub func bits() -> i64:
+    var v = 0b1100
+    v &= 0b1010
+    v |= 1
+    v ^= 0b1000
+    v <<= 2
+    v >>= 1
+    return v
+pub func floor_negative() -> i64: return 7 // -2
+pub func rem_negative() -> i64: return 7 % -2
+pub func floor_left() -> i64: return -7 // 2
+pub func rem_left() -> i64: return -7 % 2
+pub func rem_minimum() -> i64: return (-9223372036854775807 - 1) % -1
+pub func shift_left() -> i64: return 1 << 62
+pub func shift_right() -> i64: return -16 >> 2
+pub func bit_not() -> i64: return ~5
+pub func narrow_i8() -> i8:
+    let v: i8 = -128
+    return v + 127
+pub func narrow_u8() -> u8:
+    let v: u8 = 200
+    return v + 55
+pub func narrow_u16() -> u16:
+    let v: u16 = 65535
+    return v - 1
+pub func narrow_shift_signed() -> i8:
+    let v: i8 = 1
+    return v << 7
+pub func narrow_shift_unsigned() -> u8:
+    let v: u8 = 1
+    return v << 7
+pub func narrow_not() -> u8:
+    let v: u8 = 0
+    return ~v
+pub func conditional() -> i64:
+    let x = 5
+    return (10 if x == 5 else 20) + (1 if x != 5 else 2)
+pub func short_and() -> i64: return 1 if false and 1 // 0 == 0 else 0
+pub func short_or() -> i64: return 1 if true or 1 // 0 == 0 else 0
+pub func chars() -> i64: return 1 if 'a' < 'b' and 'z' == 'z' else 0
+pub func floats() -> i64: return 1 if 7.0 / 2.0 == 3.5 and 1.5f32 * 2.0f32 == 3.0f32 else 0
+LUCE
+"$cli" build "$test_dir/scalars.wasm" "$test_dir/scalars.luc" >/dev/null
+check() { expect 0 "$2" wasmtime run --invoke "scalars.$1" "$test_dir/scalars.wasm"; }
+check locals 42
+check compound 13
+check bits 2
+check floor_negative -4
+check rem_negative -1
+check floor_left -4
+check rem_left 1
+check rem_minimum 0
+check shift_left 4611686018427387904
+check shift_right -4
+check bit_not -6
+check narrow_i8 -1
+check narrow_u8 255
+check narrow_u16 65534
+check narrow_shift_signed -128
+check narrow_shift_unsigned 128
+check narrow_not 255
+check conditional 12
+check short_and 0
+check short_or 1
+check chars 1
+check floats 1
+
+# Every trapping program must trap under wasmtime too.
+cat > "$test_dir/traps.luc" <<'LUCE'
+pub func i8_overflow() -> i8:
+    let v: i8 = 127
+    return v + 1
+pub func u8_underflow() -> u8:
+    let v: u8 = 0
+    return v - 1
+pub func u32_overflow() -> u32:
+    let v: u32 = 4294967295
+    return v + 1
+pub func i16_negate() -> i16:
+    let v: i16 = -32768
+    return -v
+pub func divide_by_zero() -> i64: return 7 // 0
+pub func minimum_by_minus_one() -> i64: return (-9223372036854775807 - 1) // -1
+pub func shift_too_far() -> i64: return 1 << 64
+pub func shift_negative() -> i64: return 1 >> -1
+LUCE
+"$cli" build "$test_dir/traps.wasm" "$test_dir/traps.luc" >/dev/null
+for name in i8_overflow u8_underflow u32_overflow i16_negate divide_by_zero minimum_by_minus_one shift_too_far shift_negative; do
+    set +e
+    wasmtime run --invoke "traps.$name" "$test_dir/traps.wasm" >/dev/null 2>&1; status=$?
+    set -e
+    if [ "$status" = 0 ]; then
+        echo "wasm: traps.$name exited 0, expected a trap" >&2
+        exit 1
+    fi
+done
+
 # Checked arithmetic: overflow must trap (wasm `unreachable`), never wrap.
 printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
 "$cli" build "$test_dir/overflow.wasm" "$test_dir/overflow.luc" >/dev/null

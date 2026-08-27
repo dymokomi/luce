@@ -5,17 +5,23 @@
 #   DESCRIPTION:
 #       Hand-built canonical MIR in, expected module bytes out. The encoder
 #       earns trust by matching the expected module exactly for a minimal
-#       program, and by emitting the exact checked-arithmetic sequences and
-#       the WASI import/memory/data layout for the rest.
+#       program, and by emitting the exact legalization sequences and the
+#       WASI import/memory/data layout for the rest. When wasmtime is
+#       installed the modules also run, and the language's semantics —
+#       trapping overflow, floor division, canonical narrow values — are
+#       observed rather than assumed.
 #
 #==============================================================================================
 
-from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, InstructionForm
+from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, DataId, ExternId, InstructionForm
 from luce.compiler.canonical_ir import FunctionId, MirConstant, MirData, MirExtern, MirFunction, MirInstruction, MirProgram
-from luce.compiler.canonical_ir import MirRelocation, MirSignature, MirSlot, RegisterId, TypeId
+from luce.compiler.canonical_ir import MirRelocation, MirSignature, MirSlot, RegisterId, TypeId, UnaryOp
 from luce.compiler.canonical_ir import builtin_mir_type, create_empty_mir_program, find_runtime_symbol, wasm32_layout
 from luce.compiler.backends.wasm import WasmBackend
+from luce.compiler.mir_verifier import MirVerifier
 from luce.compiler.source import SourceSpan
+import std.files
+import std.os
 import std.strings
 
 # mark: Fixtures ============================================================================
@@ -262,3 +268,372 @@ pub func test_wasm_backend_refuses_what_it_cannot_encode_yet():
         assert(failure == "wasm backend does not support extern `luce_rt_alloc` yet")
         return
     trap("expected the backend to refuse an unsupported extern")
+
+# mark: Slice 3a fixtures ===================================================================
+
+# A function with slots as well as registers.
+pub func function_with_slots(name: str, result: BuiltinMirType, registers: list[TypeId], slots: list[MirSlot], body: list[MirInstruction]) -> MirFunction:
+    return MirFunction(
+        name = name,
+        convention = CallingConvention.luce,
+        signature = MirSignature(parameters = list[TypeId](), results = [scalar(result)], is_fallible = false),
+        registers = registers,
+        slots = slots,
+        body = body,
+        is_public = true,
+        span = SourceSpan(start = 0, end = 0, line = 1, column = 1),
+    )
+
+pub func unit_function(name: str, registers: list[TypeId], body: list[MirInstruction]) -> MirFunction:
+    return MirFunction(
+        name = name,
+        convention = CallingConvention.luce,
+        signature = MirSignature(parameters = list[TypeId](), results = list[TypeId](), is_fallible = false),
+        registers = registers,
+        slots = list[MirSlot](),
+        body = body,
+        is_public = true,
+        span = SourceSpan(start = 0, end = 0, line = 1, column = 1),
+    )
+
+# Two constants of one type combined by one operation and returned; the
+# program is verified so the fixture cannot drift from MIR's rules.
+pub func binary_of(operation: BinaryOp, operand: BuiltinMirType, left: i64, right: i64) -> MirProgram:
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Int(value = left))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Int(value = right))),
+        at(InstructionForm.Binary(result = register(2), operation = operation, left = register(0), right = register(1))),
+        at(InstructionForm.Return(values = [register(2)])),
+    ]
+    return verified(program_with([function("main.answer", operand, [scalar(operand), scalar(operand), scalar(operand)], body)]))
+
+# Two constants compared; the result register is `bool`.
+pub func comparison_of(operation: BinaryOp, operand: BuiltinMirType, left: i64, right: i64) -> MirProgram:
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Int(value = left))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Int(value = right))),
+        at(InstructionForm.Binary(result = register(2), operation = operation, left = register(0), right = register(1))),
+        at(InstructionForm.Return(values = [register(2)])),
+    ]
+    return verified(program_with([function("main.answer", BuiltinMirType.boolean, [scalar(operand), scalar(operand), scalar(BuiltinMirType.boolean)], body)]))
+
+pub func verified(program: MirProgram) -> MirProgram:
+    MirVerifier(program).verify() catch reason:
+        trap(reason)
+    return program
+
+# mark: Slice 3a encoding ===================================================================
+
+pub func test_wasm_backend_range_checks_narrow_arithmetic():
+    let artifact = encoded(binary_of(BinaryOp.add, BuiltinMirType.signed_i8, 100, 27))
+    let expected: list[u8] = [
+        0x20, 0x00, 0x20, 0x01, 0x6A, 0x21, 0x02,           # r2 = a + b in i32
+        0x20, 0x02, 0x41, 0x80, 0x7F, 0x48,                 # r2 < -128
+        0x04, 0x40, 0x00, 0x0B,                             # if unreachable end
+        0x20, 0x02, 0x41, 0xFF, 0x00, 0x4A,                 # r2 > 127
+        0x04, 0x40, 0x00, 0x0B,
+    ]
+    assert(contains_bytes(artifact, expected))
+    # u16 bounds are 0 and 65535.
+    let unsigned = encoded(binary_of(BinaryOp.mul, BuiltinMirType.unsigned_u16, 3, 4))
+    assert(contains_bytes(unsigned, [0x6C, 0x21, 0x02, 0x20, 0x02, 0x41, 0x00, 0x48]))
+    assert(contains_bytes(unsigned, [0x20, 0x02, 0x41, 0xFF, 0xFF, 0x03, 0x4A]))
+
+pub func test_wasm_backend_computes_u32_arithmetic_in_i64():
+    let artifact = encoded(binary_of(BinaryOp.add, BuiltinMirType.unsigned_u32, 1, 2))
+    let expected: list[u8] = [
+        0x20, 0x00, 0xAD, 0x20, 0x01, 0xAD, 0x7C,           # extend_u both; i64.add
+        0xA7, 0x21, 0x02,                                   # wrap; r2
+        0x20, 0x00, 0xAD, 0x20, 0x01, 0xAD, 0x7C,           # the i64 sum again
+        0x42, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x56,           # > 0xFFFFFFFF (unsigned)
+        0x04, 0x40, 0x00, 0x0B,
+    ]
+    assert(contains_bytes(artifact, expected))
+    # A u32 constant above the i32 maximum is written as its 32-bit pattern.
+    let high = encoded(binary_of(BinaryOp.sub, BuiltinMirType.unsigned_u32, 4294967295, 1))
+    assert(contains_bytes(high, [0x41, 0x7F, 0x21, 0x00]))
+
+pub func test_wasm_backend_traps_unsigned_64_bit_results_below_zero():
+    let artifact = encoded(binary_of(BinaryOp.sub, BuiltinMirType.unsigned_u64, 1, 2))
+    # After the i64 overflow test: r2 < 0 -> unreachable.
+    assert(contains_bytes(artifact, [0x0B, 0x20, 0x02, 0x42, 0x00, 0x53, 0x04, 0x40, 0x00, 0x0B]))
+
+pub func test_wasm_backend_floors_signed_division():
+    let artifact = encoded(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i64, 7, -2))
+    let expected: list[u8] = [
+        0x20, 0x00, 0x20, 0x01, 0x7F,                       # a / b (div_s)
+        0x20, 0x00, 0x20, 0x01, 0x81, 0x42, 0x00, 0x52,     # (a % b) != 0
+        0x20, 0x00, 0x20, 0x01, 0x85, 0x42, 0x00, 0x53,     # (a ^ b) < 0
+        0x71, 0xAD, 0x7D, 0x21, 0x02,                       # and; extend; q - adjust
+    ]
+    assert(contains_bytes(artifact, expected))
+    let remainder = encoded(binary_of(BinaryOp.rem, BuiltinMirType.signed_i32, 7, -2))
+    # r = a rem_s b; r + (b & (0 - adjust))
+    assert(contains_bytes(remainder, [0x20, 0x00, 0x20, 0x01, 0x6F, 0x21, 0x02, 0x20, 0x02, 0x20, 0x01, 0x41, 0x00]))
+    assert(contains_bytes(remainder, [0x71, 0x6B, 0x71, 0x6A, 0x21, 0x02]))
+    # Unsigned division needs no adjustment.
+    let unsigned = encoded(binary_of(BinaryOp.floor_div, BuiltinMirType.unsigned_u8, 7, 2))
+    assert(contains_bytes(unsigned, [0x20, 0x00, 0x20, 0x01, 0x6E, 0x21, 0x02, 0x20, 0x02, 0x0F]))
+
+pub func test_wasm_backend_traps_shift_counts_and_recanonicalises():
+    let artifact = encoded(binary_of(BinaryOp.shift_left, BuiltinMirType.signed_i16, 1, 3))
+    let expected: list[u8] = [
+        0x20, 0x01, 0x41, 0x10, 0x4F, 0x04, 0x40, 0x00, 0x0B,   # count >= 16 (unsigned) -> trap
+        0x20, 0x00, 0x20, 0x01, 0x74, 0xC1, 0x21, 0x02,         # shl; extend16_s; r2
+    ]
+    assert(contains_bytes(artifact, expected))
+    let unsigned = encoded(binary_of(BinaryOp.shift_left, BuiltinMirType.unsigned_u8, 1, 3))
+    assert(contains_bytes(unsigned, [0x74, 0x41, 0xFF, 0x01, 0x71, 0x21, 0x02]))
+    let logical = encoded(binary_of(BinaryOp.shift_right, BuiltinMirType.unsigned_u64, 8, 1))
+    assert(contains_bytes(logical, [0x20, 0x01, 0x42, 0xC0, 0x00, 0x5A, 0x04, 0x40, 0x00, 0x0B, 0x20, 0x00, 0x20, 0x01, 0x88]))
+    let arithmetic = encoded(binary_of(BinaryOp.shift_right, BuiltinMirType.signed_i32, -8, 1))
+    assert(contains_bytes(arithmetic, [0x20, 0x00, 0x20, 0x01, 0x75, 0x21, 0x02]))
+
+pub func test_wasm_backend_picks_comparison_signedness_and_float_opcodes():
+    assert(contains_bytes(encoded(comparison_of(BinaryOp.lt, BuiltinMirType.unsigned_u32, 1, 2)), [0x20, 0x00, 0x20, 0x01, 0x49, 0x21, 0x02]))
+    assert(contains_bytes(encoded(comparison_of(BinaryOp.ge, BuiltinMirType.signed_i64, 1, 2)), [0x20, 0x00, 0x20, 0x01, 0x59, 0x21, 0x02]))
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Float(value = 1.75))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Float(value = -0.5))),
+        at(InstructionForm.Binary(result = register(2), operation = BinaryOp.div, left = register(0), right = register(1))),
+        at(InstructionForm.Binary(result = register(3), operation = BinaryOp.lt, left = register(2), right = register(0))),
+        at(InstructionForm.Return(values = [register(3)])),
+    ]
+    let registers = [scalar(BuiltinMirType.float64), scalar(BuiltinMirType.float64), scalar(BuiltinMirType.float64), scalar(BuiltinMirType.boolean)]
+    let artifact = encoded(verified(program_with([function("main.answer", BuiltinMirType.boolean, registers, body)])))
+    # 1.75 is 0x3FFC000000000000; -0.5 is 0xBFE0000000000000.
+    assert(contains_bytes(artifact, [0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC, 0x3F, 0x21, 0x00]))
+    assert(contains_bytes(artifact, [0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0, 0xBF, 0x21, 0x01]))
+    assert(contains_bytes(artifact, [0x20, 0x00, 0x20, 0x01, 0xA3, 0x21, 0x02, 0x20, 0x02, 0x20, 0x00, 0x63, 0x21, 0x03]))
+    # f32 1.5 is 0x3FC00000; 0.1 rounds to 0x3DCCCCCD.
+    let narrow: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Float(value = 1.5))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Float(value = 0.1))),
+        at(InstructionForm.Binary(result = register(2), operation = BinaryOp.mul, left = register(0), right = register(1))),
+        at(InstructionForm.Return(values = [register(2)])),
+    ]
+    let single = encoded(verified(program_with([function("main.answer", BuiltinMirType.float32, [scalar(BuiltinMirType.float32), scalar(BuiltinMirType.float32), scalar(BuiltinMirType.float32)], narrow)])))
+    assert(contains_bytes(single, [0x43, 0x00, 0x00, 0xC0, 0x3F, 0x21, 0x00, 0x43, 0xCD, 0xCC, 0xCC, 0x3D, 0x21, 0x01, 0x20, 0x00, 0x20, 0x01, 0x94]))
+
+pub func test_wasm_backend_encodes_unary_operations():
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Int(value = 5))),
+        at(InstructionForm.Unary(result = register(1), operation = UnaryOp.neg, operand = register(0))),
+        at(InstructionForm.Unary(result = register(2), operation = UnaryOp.bit_not, operand = register(1))),
+        at(InstructionForm.Const(result = register(3), value = MirConstant.Bool(value = true))),
+        at(InstructionForm.Unary(result = register(4), operation = UnaryOp.bool_not, operand = register(3))),
+        at(InstructionForm.Return(values = [register(2)])),
+    ]
+    let registers = [scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.boolean), scalar(BuiltinMirType.boolean)]
+    let artifact = encoded(verified(program_with([function("main.answer", BuiltinMirType.signed_i64, registers, body)])))
+    # neg: trap on the minimum, then 0 - x
+    assert(contains_bytes(artifact, [0x20, 0x00, 0x42, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F, 0x51, 0x04, 0x40, 0x00, 0x0B, 0x42, 0x00, 0x20, 0x00, 0x7D, 0x21, 0x01]))
+    assert(contains_bytes(artifact, [0x20, 0x01, 0x42, 0x7F, 0x85, 0x21, 0x02]))        # bit_not: x ^ -1
+    assert(contains_bytes(artifact, [0x20, 0x03, 0x45, 0x21, 0x04]))                    # bool_not: eqz
+    # A narrow unsigned bit_not flips only its own bits.
+    let narrow: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Int(value = 5))),
+        at(InstructionForm.Unary(result = register(1), operation = UnaryOp.bit_not, operand = register(0))),
+        at(InstructionForm.Return(values = [register(1)])),
+    ]
+    let unsigned = encoded(verified(program_with([function("main.answer", BuiltinMirType.unsigned_u8, [scalar(BuiltinMirType.unsigned_u8), scalar(BuiltinMirType.unsigned_u8)], narrow)])))
+    assert(contains_bytes(unsigned, [0x20, 0x00, 0x41, 0xFF, 0x01, 0x73, 0x21, 0x01]))
+
+pub func test_wasm_backend_encodes_conversions():
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Int(value = -3))),
+        at(InstructionForm.Convert(result = register(1), operation = ConvertOp.extend, operand = register(0))),
+        at(InstructionForm.Convert(result = register(2), operation = ConvertOp.wrap, operand = register(1))),
+        at(InstructionForm.Convert(result = register(3), operation = ConvertOp.int_to_float, operand = register(1))),
+        at(InstructionForm.Convert(result = register(4), operation = ConvertOp.float_to_int, operand = register(3))),
+        at(InstructionForm.Return(values = [register(4)])),
+    ]
+    let registers = [scalar(BuiltinMirType.signed_i8), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i16), scalar(BuiltinMirType.float64), scalar(BuiltinMirType.signed_i8)]
+    let artifact = encoded(verified(program_with([function("main.answer", BuiltinMirType.signed_i8, registers, body)])))
+    assert(contains_bytes(artifact, [0x20, 0x00, 0xAC, 0x21, 0x01]))                    # extend i8 -> i64: extend_i32_s
+    assert(contains_bytes(artifact, [0x20, 0x01, 0xA7, 0xC1, 0x21, 0x02]))              # wrap i64 -> i16: wrap; extend16_s
+    assert(contains_bytes(artifact, [0x20, 0x01, 0xB9, 0x21, 0x03]))                    # i64 -> f64: convert_i64_s
+    assert(contains_bytes(artifact, [0x20, 0x03, 0xAA, 0x21, 0x04, 0x20, 0x04, 0x41, 0x80, 0x7F, 0x48]))   # trunc_f64_s then i8 range test
+
+pub func test_wasm_backend_gives_slots_a_shadow_stack_frame():
+    let slots = [MirSlot(value_type = scalar(BuiltinMirType.signed_i8), align = 1), MirSlot(value_type = scalar(BuiltinMirType.signed_i64), align = 8)]
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Alloca(result = register(0), slot = 0)),
+        at(InstructionForm.Alloca(result = register(1), slot = 1)),
+        at(InstructionForm.Const(result = register(2), value = MirConstant.Int(value = -3))),
+        at(InstructionForm.Store(value_type = scalar(BuiltinMirType.signed_i8), address = register(0), value = register(2))),
+        at(InstructionForm.Const(result = register(3), value = MirConstant.Int(value = 70000))),
+        at(InstructionForm.Store(value_type = scalar(BuiltinMirType.signed_i64), address = register(1), value = register(3))),
+        at(InstructionForm.Load(result = register(4), value_type = scalar(BuiltinMirType.signed_i8), address = register(0))),
+        at(InstructionForm.Return(values = [register(4)])),
+    ]
+    let registers = [scalar(BuiltinMirType.pointer), scalar(BuiltinMirType.pointer), scalar(BuiltinMirType.signed_i8), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i8)]
+    let artifact = encoded(verified(program_with([function_with_slots("main.answer", BuiltinMirType.signed_i8, registers, slots, body)])))
+    # A global section: one mutable i32 initialised to 65536; memory exported.
+    assert(contains_bytes(artifact, [0x06, 0x08, 0x01, 0x7F, 0x01, 0x41, 0x80, 0x80, 0x04, 0x0B]))
+    assert(contains_bytes(artifact, [0x06, 0x6D, 0x65, 0x6D, 0x6F, 0x72, 0x79, 0x02, 0x00]))
+    # Locals: i32 x3 (r0, r1, r2), i64 (r3), i32 x2 (r4 and the frame pointer r5).
+    assert(contains_bytes(artifact, [0x03, 0x03, 0x7F, 0x01, 0x7E, 0x02, 0x7F]))
+    # Prologue: the i64 slot sits at offset 8, so the frame is 16 bytes.
+    assert(contains_bytes(artifact, [0x23, 0x00, 0x41, 0x10, 0x6B, 0x22, 0x05, 0x24, 0x00]))
+    assert(contains_bytes(artifact, [0x20, 0x05, 0x41, 0x00, 0x6A, 0x21, 0x00, 0x20, 0x05, 0x41, 0x08, 0x6A, 0x21, 0x01]))
+    # store8 / store i64 / load8_s, and the epilogue before `return`.
+    assert(contains_bytes(artifact, [0x20, 0x00, 0x20, 0x02, 0x3A, 0x00, 0x00]))
+    assert(contains_bytes(artifact, [0x20, 0x01, 0x20, 0x03, 0x37, 0x03, 0x00]))
+    assert(contains_bytes(artifact, [0x20, 0x00, 0x2C, 0x00, 0x00, 0x21, 0x04]))
+    assert(contains_bytes(artifact, [0x20, 0x05, 0x41, 0x10, 0x6A, 0x24, 0x00, 0x20, 0x04, 0x0F, 0x0B]))
+
+pub func test_wasm_backend_encodes_if_with_results_and_unit_returns():
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Bool(value = true))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Int(value = 5))),
+        at(InstructionForm.Const(result = register(2), value = MirConstant.Int(value = 7))),
+        at(InstructionForm.If(
+            condition = register(0),
+            results = [register(3)],
+            then_body = [at(InstructionForm.Yield(values = [register(1)]))],
+            else_body = [at(InstructionForm.Yield(values = [register(2)]))],
+        )),
+        at(InstructionForm.Return(values = [register(3)])),
+    ]
+    let registers = [scalar(BuiltinMirType.boolean), scalar(BuiltinMirType.signed_i32), scalar(BuiltinMirType.signed_i32), scalar(BuiltinMirType.signed_i32)]
+    let artifact = encoded(verified(program_with([function("main.answer", BuiltinMirType.signed_i32, registers, body)])))
+    assert(contains_bytes(artifact, [0x20, 0x00, 0x04, 0x40, 0x20, 0x01, 0x21, 0x03, 0x05, 0x20, 0x02, 0x21, 0x03, 0x0B, 0x20, 0x03, 0x0F]))
+    let unit = encoded(verified(program_with([unit_function("main.noop", list[TypeId](), [at(InstructionForm.Return(values = list[RegisterId]()))])])))
+    assert(contains_bytes(unit, [0x60, 0x00, 0x00]))
+    assert(contains_bytes(unit, [0x03, 0x00, 0x0F, 0x0B]))
+
+pub func test_wasm_backend_output_for_the_first_slice_is_unchanged():
+    # No slots, no floats, no narrow types: the same bytes as before this
+    # slice, so the earlier exact-module test above still passes.
+    let artifact = encoded(binary_program(BinaryOp.add, BuiltinMirType.signed_i64))
+    assert(not contains_bytes(artifact, [0x06, 0x08, 0x01, 0x7F, 0x01]))
+    assert(not contains_text(artifact, "memory"))
+
+# mark: Execution under wasmtime ============================================================
+#
+# Host-gated: when `wasmtime` is on the PATH, modules are written to the
+# scratch directory and run. The exit status and stdout are read back.
+
+const scratch: str = "/private/tmp/claude-501/-Users-sedov-dev-luce/0beb9289-2e49-4d85-a565-3d192b851d5e/scratchpad/wasm_exec"
+
+pub struct RunResult:
+    pub status: i64
+    pub output: str
+
+pub func wasmtime_available() -> bool:
+    let process = os.Process("sh -c 'command -v wasmtime >/dev/null 2>&1'") catch reason:
+        return false
+    let status = process.wait() catch reason:
+        return false
+    return status == 0
+
+pub func run_module(program: MirProgram, name: str, invoke: str) -> RunResult:
+    let module_path = scratch + "/" + name + ".wasm"
+    let output_path = scratch + "/" + name + ".out"
+    let status_path = scratch + "/" + name + ".status"
+    let setup = os.Process("sh -c 'mkdir -p " + scratch + "'") catch reason:
+        trap(reason)
+    let setup_status = setup.wait() catch reason:
+        trap(reason)
+    files.write_bytes(module_path, encoded(program)) catch reason:
+        trap(reason)
+    let command = "sh -c 'wasmtime run --invoke " + invoke + " " + module_path + " > " + output_path + " 2>/dev/null; echo $? > " + status_path + "'"
+    let process = os.Process(command) catch reason:
+        trap(reason)
+    let ignored = process.wait() catch reason:
+        trap(reason)
+    let status_text = files.read(status_path) catch reason:
+        trap(reason)
+    let output = files.read(output_path) catch reason:
+        trap(reason)
+    return RunResult(status = parse_status(status_text), output = strings.trim(output))
+
+func parse_status(text: str) -> i64:
+    var value = 0
+    for c in text:
+        if c >= '0' and c <= '9': value = value * 10 + i64(u32(c) - u32('0'))
+    return value
+
+pub func test_wasm_modules_trap_on_narrow_and_unsigned_overflow():
+    if not wasmtime_available(): return
+    assert(run_module(binary_of(BinaryOp.add, BuiltinMirType.signed_i8, 127, 1), "i8_overflow", "main.answer").status != 0)
+    assert(run_module(binary_of(BinaryOp.add, BuiltinMirType.signed_i8, 100, 27), "i8_fits", "main.answer").output == "127")
+    assert(run_module(binary_of(BinaryOp.add, BuiltinMirType.unsigned_u32, 4294967295, 1), "u32_overflow", "main.answer").status != 0)
+    assert(run_module(binary_of(BinaryOp.add, BuiltinMirType.unsigned_u32, 4294967294, 1), "u32_fits", "main.answer").output == "-1")
+    assert(run_module(binary_of(BinaryOp.sub, BuiltinMirType.unsigned_u8, 0, 1), "u8_negative", "main.answer").status != 0)
+    assert(run_module(binary_of(BinaryOp.mul, BuiltinMirType.unsigned_u16, 65535, 65535), "u16_wide_product", "main.answer").status != 0)
+
+pub func test_wasm_modules_floor_divide_like_the_language():
+    if not wasmtime_available(): return
+    assert(run_module(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i64, 7, -2), "floor_div", "main.answer").output == "-4")
+    assert(run_module(binary_of(BinaryOp.rem, BuiltinMirType.signed_i64, 7, -2), "rem", "main.answer").output == "-1")
+    assert(run_module(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i32, -7, 2), "floor_div_negative", "main.answer").output == "-4")
+    assert(run_module(binary_of(BinaryOp.rem, BuiltinMirType.signed_i32, -7, 2), "rem_negative", "main.answer").output == "1")
+    assert(run_module(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i32, 8, 2), "floor_div_exact", "main.answer").output == "4")
+    assert(run_module(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i64, 1, 0), "div_zero", "main.answer").status != 0)
+    assert(run_module(binary_of(BinaryOp.floor_div, BuiltinMirType.signed_i8, -128, -1), "narrow_min_div", "main.answer").status != 0)
+
+pub func test_wasm_modules_shift_and_compare_like_the_language():
+    if not wasmtime_available(): return
+    assert(run_module(binary_of(BinaryOp.shift_left, BuiltinMirType.signed_i16, 16384, 1), "i16_shl", "main.answer").output == "-32768")
+    assert(run_module(binary_of(BinaryOp.shift_left, BuiltinMirType.unsigned_u8, 255, 1), "u8_shl", "main.answer").output == "254")
+    assert(run_module(binary_of(BinaryOp.shift_right, BuiltinMirType.signed_i32, -8, 1), "i32_shr", "main.answer").output == "-4")
+    assert(run_module(binary_of(BinaryOp.shift_left, BuiltinMirType.signed_i32, 1, 32), "shift_too_far", "main.answer").status != 0)
+    assert(run_module(comparison_of(BinaryOp.lt, BuiltinMirType.unsigned_u32, 4294967295, 1), "u32_lt", "main.answer").output == "0")
+    assert(run_module(comparison_of(BinaryOp.gt, BuiltinMirType.unsigned_u32, 4294967295, 1), "u32_gt", "main.answer").output == "1")
+
+pub func test_wasm_modules_run_slots_and_conditionals():
+    if not wasmtime_available(): return
+    let slots = [MirSlot(value_type = scalar(BuiltinMirType.signed_i8), align = 1), MirSlot(value_type = scalar(BuiltinMirType.signed_i64), align = 8)]
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Alloca(result = register(0), slot = 0)),
+        at(InstructionForm.Alloca(result = register(1), slot = 1)),
+        at(InstructionForm.Const(result = register(2), value = MirConstant.Int(value = -3))),
+        at(InstructionForm.Store(value_type = scalar(BuiltinMirType.signed_i8), address = register(0), value = register(2))),
+        at(InstructionForm.Const(result = register(3), value = MirConstant.Int(value = 70000))),
+        at(InstructionForm.Store(value_type = scalar(BuiltinMirType.signed_i64), address = register(1), value = register(3))),
+        at(InstructionForm.Load(result = register(4), value_type = scalar(BuiltinMirType.signed_i8), address = register(0))),
+        at(InstructionForm.Load(result = register(5), value_type = scalar(BuiltinMirType.signed_i64), address = register(1))),
+        at(InstructionForm.Convert(result = register(6), operation = ConvertOp.extend, operand = register(4))),
+        at(InstructionForm.Binary(result = register(7), operation = BinaryOp.add, left = register(5), right = register(6))),
+        at(InstructionForm.Return(values = [register(7)])),
+    ]
+    let registers = [scalar(BuiltinMirType.pointer), scalar(BuiltinMirType.pointer), scalar(BuiltinMirType.signed_i8), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i8), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i64), scalar(BuiltinMirType.signed_i64)]
+    let program = verified(program_with([function_with_slots("main.answer", BuiltinMirType.signed_i64, registers, slots, body)]))
+    assert(run_module(program, "slots", "main.answer").output == "69997")
+
+    let conditional: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Bool(value = false))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Int(value = 5))),
+        at(InstructionForm.Const(result = register(2), value = MirConstant.Int(value = 7))),
+        at(InstructionForm.If(
+            condition = register(0),
+            results = [register(3)],
+            then_body = [at(InstructionForm.Yield(values = [register(1)]))],
+            else_body = [at(InstructionForm.Yield(values = [register(2)]))],
+        )),
+        at(InstructionForm.Return(values = [register(3)])),
+    ]
+    let choice = verified(program_with([function("main.answer", BuiltinMirType.signed_i32, [scalar(BuiltinMirType.boolean), scalar(BuiltinMirType.signed_i32), scalar(BuiltinMirType.signed_i32), scalar(BuiltinMirType.signed_i32)], conditional)]))
+    assert(run_module(choice, "conditional", "main.answer").output == "7")
+
+pub func test_wasm_modules_compute_floats_and_conversions():
+    if not wasmtime_available(): return
+    let body: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Float(value = 1.75))),
+        at(InstructionForm.Const(result = register(1), value = MirConstant.Float(value = -0.5))),
+        at(InstructionForm.Binary(result = register(2), operation = BinaryOp.div, left = register(0), right = register(1))),
+        at(InstructionForm.Convert(result = register(3), operation = ConvertOp.float_to_int, operand = register(2))),
+        at(InstructionForm.Return(values = [register(3)])),
+    ]
+    let registers = [scalar(BuiltinMirType.float64), scalar(BuiltinMirType.float64), scalar(BuiltinMirType.float64), scalar(BuiltinMirType.signed_i64)]
+    let program = verified(program_with([function("main.answer", BuiltinMirType.signed_i64, registers, body)]))
+    assert(run_module(program, "floats", "main.answer").output == "-3")
+    let big: list[MirInstruction] = [
+        at(InstructionForm.Const(result = register(0), value = MirConstant.Float(value = 300.0))),
+        at(InstructionForm.Convert(result = register(1), operation = ConvertOp.float_to_int, operand = register(0))),
+        at(InstructionForm.Return(values = [register(1)])),
+    ]
+    let narrow = verified(program_with([function("main.answer", BuiltinMirType.signed_i8, [scalar(BuiltinMirType.float64), scalar(BuiltinMirType.signed_i8)], big)]))
+    assert(run_module(narrow, "float_to_i8_overflow", "main.answer").status != 0)

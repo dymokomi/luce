@@ -5,37 +5,47 @@
 #   DESCRIPTION:
 #       A direct WebAssembly encoder for canonical MIR. It writes the binary
 #       format itself with no assembler in between. MIR registers become wasm
-#       locals; structured MIR regions would become wasm blocks one-to-one;
-#       and each checked integer operation legalizes into the wasm arithmetic
-#       plus an explicit overflow test that ends in `unreachable`, because
-#       wasm arithmetic wraps and MIR arithmetic traps (docs/compiler/mir.md,
-#       "Meaning is fixed here").
+#       locals; MIR slots become a frame on a shadow stack in linear memory;
+#       structured MIR regions become wasm blocks one-to-one; and every
+#       checked integer operation legalizes into the wasm arithmetic plus an
+#       explicit test that ends in `unreachable`, because wasm arithmetic
+#       wraps and MIR arithmetic traps (docs/compiler/mir.md, "Meaning is
+#       fixed here"). Each legalization sequence below names the language
+#       rule it implements.
+#
+#       Narrow integers have no wasm type of their own. An i8/i16 register is
+#       an i32 local holding the value sign-extended; a u8/u16 register holds
+#       it zero-extended; u32 uses all 32 bits. Every operation that could
+#       leave a non-canonical bit pattern re-canonicalises its result, so a
+#       later comparison or store reads the right value.
 #
 #       The host contract is WASI preview 1, because every wasm runtime
 #       speaks it: a module runs under `wasmtime run` or in a browser shim
 #       without a bespoke host. The `luce_rt_write` runtime service becomes
 #       `wasi_snapshot_preview1.fd_write` on stdout through an iovec kept in
 #       the first sixteen bytes of linear memory (scratch); data items pack
-#       after that scratch area; the memory is exported as `memory` as WASI
-#       requires. A program with an entry gains a `_start` function that
-#       calls the entry and hands its exit status to `proc_exit`. Modules
-#       with no writes and no entry stay import-free and memory-free.
+#       after that scratch area; the shadow stack grows down from the top of
+#       the first page, so data and stack share 64 KiB today; the memory is
+#       exported as `memory` as WASI requires. A program with an entry gains
+#       a `_start` function that calls the entry and hands its exit status to
+#       `proc_exit`. Modules with no writes, no slots, and no entry stay
+#       import-free and memory-free.
 #
 #       Read `emit` top-down: it writes the sections in the order the binary
-#       format requires — type, import, function, memory, export, code, data —
-#       and each `encode_*` below produces one section's payload. Imports
-#       come first in wasm's single function index space, so every defined
-#       function's index is shifted by the import count; `_start`, when
-#       present, is the last defined function. The instruction encoders
-#       follow; the LEB128 helpers at the end are the only byte-level
-#       plumbing.
+#       format requires — type, import, function, memory, global, export,
+#       code, data — and each `encode_*` below produces one section's
+#       payload. Imports come first in wasm's single function index space, so
+#       every defined function's index is shifted by the import count;
+#       `_start`, when present, is the last defined function. The instruction
+#       encoders follow, grouped by family; the float-constant and LEB128
+#       helpers at the end are the only byte-level plumbing.
 #
 #==============================================================================================
 
 from compiler.backend import ArtifactBackend
-from compiler.canonical_ir import BinaryOp, InstructionForm, MirData, MirFunction, MirInstruction
-from compiler.canonical_ir import MirProgram, MirSignature, MirTypeTable, RegisterId, TypeId
-from compiler.canonical_ir import align_up, describe_mir_type, mir_type
+from compiler.canonical_ir import BinaryOp, ConvertOp, InstructionForm, MirData, MirFunction, MirInstruction
+from compiler.canonical_ir import MirProgram, MirSignature, MirTypeTable, RegisterId, TypeId, UnaryOp
+from compiler.canonical_ir import align_up, align_of, describe_mir_type, int_maximum, int_minimum, mir_type, size_of
 import std.strings
 
 # mark: WebAssembly binary format names =======================================================
@@ -44,6 +54,7 @@ const type_section: u8 = 0x01
 const import_section: u8 = 0x02
 const function_section: u8 = 0x03
 const memory_section: u8 = 0x05
+const global_section: u8 = 0x06
 const export_section: u8 = 0x07
 const code_section: u8 = 0x0A
 const data_section: u8 = 0x0B
@@ -56,6 +67,7 @@ const f64_value_type: u8 = 0x7C
 const function_import_kind: u8 = 0x00
 const function_export_kind: u8 = 0x00
 const memory_export_kind: u8 = 0x02
+const global_mutable: u8 = 0x01
 const empty_block_type: u8 = 0x40
 
 # WASI preview 1: the module name, the two services used, and the scratch
@@ -69,42 +81,146 @@ const scratch_iovec_length: i64 = 4     # iovec.buf_len: i32 byte count
 const scratch_written: i64 = 8          # where fd_write stores the count written
 const scratch_size: i64 = 16            # data items pack after this
 
+# The shadow stack: global 0 holds the stack pointer, starting at the top of
+# the single 64 KiB page and growing down. Frames are 16-byte aligned.
+const stack_pointer_global: i64 = 0
+const stack_top: i64 = 65536
+const frame_alignment: i64 = 16
+
+# Control
 const opcode_unreachable: u8 = 0x00
 const opcode_block: u8 = 0x02
 const opcode_if: u8 = 0x04
+const opcode_else: u8 = 0x05
 const opcode_end: u8 = 0x0B
 const opcode_br_if: u8 = 0x0D
 const opcode_return: u8 = 0x0F
 const opcode_call: u8 = 0x10
 const opcode_drop: u8 = 0x1A
+# Variables
 const opcode_local_get: u8 = 0x20
 const opcode_local_set: u8 = 0x21
+const opcode_local_tee: u8 = 0x22
+const opcode_global_get: u8 = 0x23
+const opcode_global_set: u8 = 0x24
+# Memory
+const opcode_i32_load: u8 = 0x28
+const opcode_i64_load: u8 = 0x29
+const opcode_f32_load: u8 = 0x2A
+const opcode_f64_load: u8 = 0x2B
+const opcode_i32_load8_s: u8 = 0x2C
+const opcode_i32_load8_u: u8 = 0x2D
+const opcode_i32_load16_s: u8 = 0x2E
+const opcode_i32_load16_u: u8 = 0x2F
 const opcode_i32_store: u8 = 0x36
+const opcode_i64_store: u8 = 0x37
+const opcode_f32_store: u8 = 0x38
+const opcode_f64_store: u8 = 0x39
+const opcode_i32_store8: u8 = 0x3A
+const opcode_i32_store16: u8 = 0x3B
+# Constants
 const opcode_i32_const: u8 = 0x41
 const opcode_i64_const: u8 = 0x42
-
+const opcode_f32_const: u8 = 0x43
+const opcode_f64_const: u8 = 0x44
+# i32 comparison
 const opcode_i32_eqz: u8 = 0x45
 const opcode_i32_eq: u8 = 0x46
 const opcode_i32_ne: u8 = 0x47
 const opcode_i32_lt_s: u8 = 0x48
+const opcode_i32_lt_u: u8 = 0x49
+const opcode_i32_gt_s: u8 = 0x4A
+const opcode_i32_gt_u: u8 = 0x4B
+const opcode_i32_le_s: u8 = 0x4C
+const opcode_i32_le_u: u8 = 0x4D
+const opcode_i32_ge_s: u8 = 0x4E
+const opcode_i32_ge_u: u8 = 0x4F
+# i64 comparison
 const opcode_i64_eqz: u8 = 0x50
 const opcode_i64_eq: u8 = 0x51
 const opcode_i64_ne: u8 = 0x52
 const opcode_i64_lt_s: u8 = 0x53
-
+const opcode_i64_lt_u: u8 = 0x54
+const opcode_i64_gt_s: u8 = 0x55
+const opcode_i64_gt_u: u8 = 0x56
+const opcode_i64_le_s: u8 = 0x57
+const opcode_i64_le_u: u8 = 0x58
+const opcode_i64_ge_s: u8 = 0x59
+const opcode_i64_ge_u: u8 = 0x5A
+# f32 and f64 comparison
+const opcode_f32_eq: u8 = 0x5B
+const opcode_f32_ne: u8 = 0x5C
+const opcode_f32_lt: u8 = 0x5D
+const opcode_f32_gt: u8 = 0x5E
+const opcode_f32_le: u8 = 0x5F
+const opcode_f32_ge: u8 = 0x60
+const opcode_f64_eq: u8 = 0x61
+const opcode_f64_ne: u8 = 0x62
+const opcode_f64_lt: u8 = 0x63
+const opcode_f64_gt: u8 = 0x64
+const opcode_f64_le: u8 = 0x65
+const opcode_f64_ge: u8 = 0x66
+# i32 arithmetic
 const opcode_i32_add: u8 = 0x6A
 const opcode_i32_sub: u8 = 0x6B
 const opcode_i32_mul: u8 = 0x6C
 const opcode_i32_div_s: u8 = 0x6D
+const opcode_i32_div_u: u8 = 0x6E
+const opcode_i32_rem_s: u8 = 0x6F
+const opcode_i32_rem_u: u8 = 0x70
 const opcode_i32_and: u8 = 0x71
+const opcode_i32_or: u8 = 0x72
 const opcode_i32_xor: u8 = 0x73
+const opcode_i32_shl: u8 = 0x74
+const opcode_i32_shr_s: u8 = 0x75
+const opcode_i32_shr_u: u8 = 0x76
+# i64 arithmetic
 const opcode_i64_add: u8 = 0x7C
 const opcode_i64_sub: u8 = 0x7D
 const opcode_i64_mul: u8 = 0x7E
 const opcode_i64_div_s: u8 = 0x7F
+const opcode_i64_div_u: u8 = 0x80
+const opcode_i64_rem_s: u8 = 0x81
+const opcode_i64_rem_u: u8 = 0x82
 const opcode_i64_and: u8 = 0x83
+const opcode_i64_or: u8 = 0x84
 const opcode_i64_xor: u8 = 0x85
+const opcode_i64_shl: u8 = 0x86
+const opcode_i64_shr_s: u8 = 0x87
+const opcode_i64_shr_u: u8 = 0x88
+# float arithmetic
+const opcode_f32_neg: u8 = 0x8C
+const opcode_f32_add: u8 = 0x92
+const opcode_f32_sub: u8 = 0x93
+const opcode_f32_mul: u8 = 0x94
+const opcode_f32_div: u8 = 0x95
+const opcode_f64_neg: u8 = 0x9A
+const opcode_f64_add: u8 = 0xA0
+const opcode_f64_sub: u8 = 0xA1
+const opcode_f64_mul: u8 = 0xA2
+const opcode_f64_div: u8 = 0xA3
+# Conversions
 const opcode_i32_wrap_i64: u8 = 0xA7
+const opcode_i32_trunc_f32_s: u8 = 0xA8
+const opcode_i32_trunc_f32_u: u8 = 0xA9
+const opcode_i32_trunc_f64_s: u8 = 0xAA
+const opcode_i32_trunc_f64_u: u8 = 0xAB
+const opcode_i64_extend_i32_s: u8 = 0xAC
+const opcode_i64_extend_i32_u: u8 = 0xAD
+const opcode_i64_trunc_f32_s: u8 = 0xAE
+const opcode_i64_trunc_f32_u: u8 = 0xAF
+const opcode_i64_trunc_f64_s: u8 = 0xB0
+const opcode_i64_trunc_f64_u: u8 = 0xB1
+const opcode_f32_convert_i32_s: u8 = 0xB2
+const opcode_f32_convert_i32_u: u8 = 0xB3
+const opcode_f32_convert_i64_s: u8 = 0xB4
+const opcode_f32_convert_i64_u: u8 = 0xB5
+const opcode_f64_convert_i32_s: u8 = 0xB7
+const opcode_f64_convert_i32_u: u8 = 0xB8
+const opcode_f64_convert_i64_s: u8 = 0xB9
+const opcode_f64_convert_i64_u: u8 = 0xBA
+const opcode_i32_extend8_s: u8 = 0xC0
+const opcode_i32_extend16_s: u8 = 0xC1
 
 # mark: The encoder ===========================================================================
 
@@ -125,6 +241,8 @@ pub class WasmBackend: ArtifactBackend:
         append_section(output, function_section, encode_function_entries(program, plan))
         if plan.has_memory:
             append_section(output, memory_section, encode_memory_entry())
+        if plan.has_stack:
+            append_section(output, global_section, encode_global_entries())
         let exports = encode_export_entries(program, plan)
         # A lone leading count byte means "no exports"; write the section only
         # when something follows the count.
@@ -152,14 +270,16 @@ struct WasmImport:
 # Everything decided before any byte is written: the type table, the
 # imports (which take the first function indices), the type index of every
 # defined function, where each data item lands in memory, whether the
-# module has a memory at all, and the `_start` wrapper when there is an
-# entry. `proc_exit_import` and `start_type` are -1 without an entry.
+# module has a memory and a shadow stack at all, and the `_start` wrapper
+# when there is an entry. `proc_exit_import` and `start_type` are -1
+# without an entry.
 struct ModulePlan:
     signatures: list[WasmSignature]
     imports: list[WasmImport]
     function_types: list[i64]
     data_offsets: list[i64]
     has_memory: bool
+    has_stack: bool
     proc_exit_import: i64
     start_type: i64
 
@@ -187,8 +307,11 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         start_type = intern_signature(signatures, WasmSignature(parameters = list[u8](), results = list[u8]()))
 
     let function_types = list[i64]()
+    var has_stack = false
     for function in program.functions:
-        function_types.append(intern_signature(signatures, try wasm_signature(program.types, function.signature)))
+        let signature = try wasm_signature(program.types, function.signature)
+        function_types.append(intern_signature(signatures, signature))
+        if len(function.slots) > 0: has_stack = true
 
     # Data items pack after the scratch area, each at its own alignment.
     let data_offsets = list[i64]()
@@ -199,14 +322,15 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         offset += len(item.bytes)
 
     # `fd_write` reads its iovec from memory, so importing it needs a memory
-    # even when the program has no data of its own.
-    let has_memory = len(program.data) > 0 or len(imports) > 0
+    # even when the program has no data of its own; so does a shadow stack.
+    let has_memory = len(program.data) > 0 or len(imports) > 0 or has_stack
     return ModulePlan(
         signatures = signatures,
         imports = imports,
         function_types = function_types,
         data_offsets = data_offsets,
         has_memory = has_memory,
+        has_stack = has_stack,
         proc_exit_import = proc_exit_import,
         start_type = start_type,
     )
@@ -298,9 +422,22 @@ func encode_function_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     return entries
 
 # One memory with a one-page (64 KiB) minimum and no maximum; it holds the
-# scratch area and the data items placed by the data section.
+# scratch area, the data items placed by the data section, and the shadow
+# stack growing down from the top.
 func encode_memory_entry() -> list[u8]:
     return [0x01, 0x00, 0x01]
+
+# One mutable i32 global — the shadow stack pointer — initialised to the top
+# of the first page with the constant expression `i32.const 65536; end`.
+func encode_global_entries() -> list[u8]:
+    let entries = list[u8]()
+    append_unsigned(entries, 1)
+    entries.append(i32_value_type)
+    entries.append(global_mutable)
+    entries.append(opcode_i32_const)
+    append_signed(entries, stack_top)
+    entries.append(opcode_end)
+    return entries
 
 # Public functions export under their canonical `module.function` name; the
 # memory exports as `memory` and the entry wrapper as `_start`, the two
@@ -329,17 +466,19 @@ func encode_export_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
         append_unsigned(entries, start_function_index(program, plan))
     return entries
 
-# One body per function: its local declarations, then its instructions.
+# One body per function: its local declarations, its frame prologue when it
+# has slots, then its instructions.
 func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
     let entries = list[u8]()
     var count = len(program.functions)
     if has_start(plan): count += 1
     append_unsigned(entries, count)
     for function in program.functions:
+        let frame = plan_frame(program.types, program, function)
         let body = list[u8]()
-        try encode_locals(program.types, function, body)
-        for instruction in function.body:
-            try encode_instruction(program, plan, function, instruction, body)
+        try encode_locals(program.types, function, frame, body)
+        encode_prologue(frame, body)
+        try encode_body(program, plan, function, frame, function.body, list[RegisterId](), false, body)
         body.append(opcode_end)
         append_unsigned(entries, len(body))
         append_all(entries, body)
@@ -380,23 +519,28 @@ func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
 #
 # Register `r{i}` is wasm local `i`. Parameters are the leading locals wasm
 # declares implicitly; the remaining registers are declared here as runs of
-# one value type, the compressed form the code section wants.
+# one value type, the compressed form the code section wants. A function
+# with slots gets one extra i32 local after the registers: the frame pointer.
 
-func encode_locals(types: MirTypeTable, function: MirFunction, body: list[u8]) -> !:
+func encode_locals(types: MirTypeTable, function: MirFunction, frame: FramePlan, body: list[u8]) -> !:
     let parameter_count = len(function.signature.parameters)
     let runs = list[u8]()
     let run_counts = list[i64]()
     for index in range(parameter_count, len(function.registers)):
         let value_type = try wasm_value_type(types, function.registers[index])
-        if len(runs) > 0 and runs[len(runs) - 1] == value_type:
-            run_counts[len(run_counts) - 1] = run_counts[len(run_counts) - 1] + 1
-        else:
-            runs.append(value_type)
-            run_counts.append(1)
+        append_local_run(runs, run_counts, value_type)
+    if frame.size > 0: append_local_run(runs, run_counts, i32_value_type)
     append_unsigned(body, len(runs))
     for index in range(0, len(runs)):
         append_unsigned(body, run_counts[index])
         body.append(runs[index])
+
+func append_local_run(runs: list[u8], run_counts: list[i64], value_type: u8):
+    if len(runs) > 0 and runs[len(runs) - 1] == value_type:
+        run_counts[len(run_counts) - 1] = run_counts[len(run_counts) - 1] + 1
+    else:
+        runs.append(value_type)
+        run_counts.append(1)
 
 func local_get(body: list[u8], register: RegisterId):
     body.append(opcode_local_get)
@@ -406,47 +550,163 @@ func local_set(body: list[u8], register: RegisterId):
     body.append(opcode_local_set)
     append_unsigned(body, register.value)
 
+func local_get_index(body: list[u8], index: i64):
+    body.append(opcode_local_get)
+    append_unsigned(body, index)
+
+# mark: The frame =============================================================================
+#
+# Slots live on a shadow stack in linear memory. A function with slots
+# reserves a 16-byte-aligned frame in its prologue — `sp -= size; fp = sp` —
+# and `Alloca slot` is `fp + offset`. Every `Return` gives the frame back:
+# `sp = fp + size`. Functions without slots touch neither.
+
+struct FramePlan:
+    slot_offsets: list[i64]
+    size: i64
+    frame_pointer_local: i64
+
+func plan_frame(types: MirTypeTable, program: MirProgram, function: MirFunction) -> FramePlan:
+    let offsets = list[i64]()
+    var offset = 0
+    for slot in function.slots:
+        var align = slot.align
+        let natural = align_of(types, program.layout, slot.value_type)
+        if natural > align: align = natural
+        offset = align_up(offset, align)
+        offsets.append(offset)
+        offset += size_of(types, program.layout, slot.value_type)
+    var size = 0
+    if len(function.slots) > 0: size = align_up(offset, frame_alignment)
+    return FramePlan(slot_offsets = offsets, size = size, frame_pointer_local = len(function.registers))
+
+# `global.get sp; i32.const size; i32.sub; local.tee fp; global.set sp`
+func encode_prologue(frame: FramePlan, body: list[u8]):
+    if frame.size == 0: return
+    body.append(opcode_global_get)
+    append_unsigned(body, stack_pointer_global)
+    append_constant(body, frame.size, false)
+    body.append(opcode_i32_sub)
+    body.append(opcode_local_tee)
+    append_unsigned(body, frame.frame_pointer_local)
+    body.append(opcode_global_set)
+    append_unsigned(body, stack_pointer_global)
+
+# `local.get fp; i32.const size; i32.add; global.set sp`
+func encode_epilogue(frame: FramePlan, body: list[u8]):
+    if frame.size == 0: return
+    local_get_index(body, frame.frame_pointer_local)
+    append_constant(body, frame.size, false)
+    body.append(opcode_i32_add)
+    body.append(opcode_global_set)
+    append_unsigned(body, stack_pointer_global)
+
+# mark: Register kinds ========================================================================
+
+# What the encoder needs to know about a register's type, decoded once.
+struct Kind:
+    value_type: u8
+    bits: i64
+    is_signed: bool
+    is_int: bool
+    is_float: bool
+    is_wide: bool
+
+func kind_of(types: MirTypeTable, id: TypeId) -> Kind!:
+    let value_type = try wasm_value_type(types, id)
+    match mir_type(types, id):
+        Int(bits, is_signed):
+            return Kind(value_type = value_type, bits = bits, is_signed = is_signed, is_int = true, is_float = false, is_wide = bits == 64)
+        Float(bits):
+            return Kind(value_type = value_type, bits = bits, is_signed = true, is_int = false, is_float = true, is_wide = bits == 64)
+        Bool:
+            return Kind(value_type = value_type, bits = 1, is_signed = false, is_int = false, is_float = false, is_wide = false)
+        else:
+            return Kind(value_type = value_type, bits = 32, is_signed = false, is_int = false, is_float = false, is_wide = false)
+
+func register_kind(types: MirTypeTable, function: MirFunction, register: RegisterId) -> Kind!:
+    return try kind_of(types, function.registers[register.value])
+
+# A narrow integer is any width below 32, plus u32, whose top bit is not
+# a sign inside its i32 local.
+func is_narrow(kind: Kind) -> bool:
+    return kind.is_int and kind.bits < 32
+
+# Bring the i32 on the stack back to the canonical form for a narrow type:
+# sign-extend i8/i16, mask u8/u16. Wider types are canonical already.
+func append_canonicalise(body: list[u8], kind: Kind):
+    if not is_narrow(kind): return
+    if kind.is_signed:
+        if kind.bits == 8: body.append(opcode_i32_extend8_s)
+        else: body.append(opcode_i32_extend16_s)
+    else:
+        append_constant(body, narrow_mask(kind), false)
+        body.append(opcode_i32_and)
+
+func narrow_mask(kind: Kind) -> i64:
+    if kind.bits == 8: return 0xFF
+    return 0xFFFF
+
 # mark: Instructions ==========================================================================
 
-func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunction, instruction: MirInstruction, body: list[u8]) -> !:
+# Encode one instruction list. `yield_targets` are the result registers of
+# the innermost `If`, which is what a `Yield` assigns; `in_region` says
+# whether a `Yield` is legal here at all.
+func encode_body(program: MirProgram, plan: ModulePlan, function: MirFunction, frame: FramePlan, instructions: list[MirInstruction], yield_targets: list[RegisterId], in_region: bool, body: list[u8]) -> !:
+    for instruction in instructions:
+        try encode_instruction(program, plan, function, frame, instruction, yield_targets, in_region, body)
+
+func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunction, frame: FramePlan, instruction: MirInstruction, yield_targets: list[RegisterId], in_region: bool, body: list[u8]) -> !:
     let types = program.types
     match instruction.form:
         Const(result, value):
-            let value_type = try wasm_value_type(types, function.registers[result.value])
+            let kind = try register_kind(types, function, result)
             match value:
                 Int(item):
-                    if value_type == i64_value_type:
-                        body.append(opcode_i64_const)
-                    else:
-                        body.append(opcode_i32_const)
-                    append_signed(body, item)
+                    # `i32.const` takes a signed immediate; a u32 above the
+                    # i32 maximum is written as the same 32-bit pattern.
+                    var immediate = item
+                    if not kind.is_wide and immediate > 2147483647: immediate -= 4294967296
+                    append_constant(body, immediate, kind.is_wide)
                 Bool(item):
-                    body.append(opcode_i32_const)
-                    if item: append_signed(body, 1)
-                    else: append_signed(body, 0)
-                Null:
-                    body.append(opcode_i32_const)
-                    append_signed(body, 0)
+                    if item: append_constant(body, 1, false)
+                    else: append_constant(body, 0, false)
+                Null: append_constant(body, 0, false)
                 Float(item):
-                    error("wasm backend does not support float constants yet")
+                    if kind.is_wide: try append_f64_constant(body, item)
+                    else: try append_f32_constant(body, item)
             local_set(body, result)
         Copy(result, source):
             local_get(body, source)
             local_set(body, result)
         Binary(result, operation, left, right):
-            let value_type = try wasm_value_type(types, function.registers[result.value])
-            let is_wide = value_type == i64_value_type
-            if operation == BinaryOp.add:
-                encode_checked_add(body, result, left, right, is_wide)
-            elif operation == BinaryOp.sub:
-                encode_checked_sub(body, result, left, right, is_wide)
-            elif operation == BinaryOp.mul:
-                encode_checked_mul(body, result, left, right, is_wide)
-            else:
-                error("wasm backend does not support `" + str(operation) + "` yet")
+            let kind = try register_kind(types, function, left)
+            try encode_binary(body, operation, kind, result, left, right)
+        Unary(result, operation, operand):
+            let kind = try register_kind(types, function, operand)
+            try encode_unary(body, operation, kind, result, operand)
+        Convert(result, operation, operand):
+            let from = try register_kind(types, function, operand)
+            let to = try register_kind(types, function, result)
+            try encode_convert(body, operation, from, to, result, operand)
+        Alloca(result, slot):
+            # `fp + offset`
+            local_get_index(body, frame.frame_pointer_local)
+            append_constant(body, frame.slot_offsets[slot], false)
+            body.append(opcode_i32_add)
+            local_set(body, result)
+        Load(result, value_type, address):
+            let kind = try kind_of(types, value_type)
+            local_get(body, address)
+            append_load(body, kind)
+            local_set(body, result)
+        Store(value_type, address, value):
+            let kind = try kind_of(types, value_type)
+            local_get(body, address)
+            local_get(body, value)
+            append_store(body, kind)
         DataAddress(result, data):
-            body.append(opcode_i32_const)
-            append_signed(body, plan.data_offsets[data.value])
+            append_constant(body, plan.data_offsets[data.value], false)
             local_set(body, result)
         CallExtern(results, external, arguments):
             var import_index = -1
@@ -454,12 +714,85 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 if plan.imports[index].external == external.value: import_index = index
             if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
             encode_write(body, import_index, arguments[0], arguments[1])
+        If(condition, results, then_body, else_body):
+            # `if` with no block type: each arm's `Yield` sets the result
+            # locals, so nothing travels on the wasm operand stack.
+            local_get(body, condition)
+            body.append(opcode_if)
+            body.append(empty_block_type)
+            try encode_body(program, plan, function, frame, then_body, results, true, body)
+            if len(else_body) > 0:
+                body.append(opcode_else)
+                try encode_body(program, plan, function, frame, else_body, results, true, body)
+            body.append(opcode_end)
+        Yield(values):
+            if not in_region: error("wasm backend found `Yield` outside a region")
+            if len(values) != len(yield_targets): error("wasm backend found `Yield` with " + str(len(values)) + " value(s) for " + str(len(yield_targets)) + " result(s)")
+            for index in range(0, len(values)):
+                local_get(body, values[index])
+                local_set(body, yield_targets[index])
         Return(values):
+            encode_epilogue(frame, body)
             for value in values:
                 local_get(body, value)
             body.append(opcode_return)
+        Trap(reason):
+            body.append(opcode_unreachable)
+        Unreachable:
+            body.append(opcode_unreachable)
+        Block(results, block_body):
+            error("wasm backend does not support `Block` yet")
+        Loop(loop_body):
+            error("wasm backend does not support `Loop` yet")
+        Br(depth, values):
+            error("wasm backend does not support `Br` yet")
+        BrIf(condition, depth, values):
+            error("wasm backend does not support `BrIf` yet")
         else:
             error("wasm backend does not support `" + str(instruction.form) + "` yet")
+
+# mark: Memory access =========================================================================
+#
+# Loads widen narrow values into their canonical i32 form on the way in
+# (`load8_s` for i8, `load8_u` for u8, ...); stores keep only the low bytes.
+# The memarg is alignment (log2 of the natural size) and offset 0.
+
+func append_load(body: list[u8], kind: Kind):
+    if kind.is_float:
+        if kind.is_wide: append_memory_op(body, opcode_f64_load, 3)
+        else: append_memory_op(body, opcode_f32_load, 2)
+    elif kind.is_int:
+        if kind.bits == 64: append_memory_op(body, opcode_i64_load, 3)
+        elif kind.bits == 32: append_memory_op(body, opcode_i32_load, 2)
+        elif kind.bits == 16:
+            if kind.is_signed: append_memory_op(body, opcode_i32_load16_s, 1)
+            else: append_memory_op(body, opcode_i32_load16_u, 1)
+        else:
+            if kind.is_signed: append_memory_op(body, opcode_i32_load8_s, 0)
+            else: append_memory_op(body, opcode_i32_load8_u, 0)
+    elif kind.bits == 1:
+        append_memory_op(body, opcode_i32_load8_u, 0)
+    else:
+        append_memory_op(body, opcode_i32_load, 2)
+
+func append_store(body: list[u8], kind: Kind):
+    if kind.is_float:
+        if kind.is_wide: append_memory_op(body, opcode_f64_store, 3)
+        else: append_memory_op(body, opcode_f32_store, 2)
+    elif kind.is_int:
+        if kind.bits == 64: append_memory_op(body, opcode_i64_store, 3)
+        elif kind.bits == 32: append_memory_op(body, opcode_i32_store, 2)
+        elif kind.bits == 16: append_memory_op(body, opcode_i32_store16, 1)
+        else: append_memory_op(body, opcode_i32_store8, 0)
+    elif kind.bits == 1:
+        append_memory_op(body, opcode_i32_store8, 0)
+    else:
+        append_memory_op(body, opcode_i32_store, 2)
+
+func append_memory_op(body: list[u8], opcode: u8, alignment: i64):
+    body.append(opcode)
+    append_unsigned(body, alignment)
+    append_unsigned(body, 0)
 
 # mark: WASI write ============================================================================
 
@@ -469,11 +802,11 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
 func encode_write(body: list[u8], import_index: i64, pointer: RegisterId, length: RegisterId):
     append_constant(body, scratch_iovec_buffer, false)
     local_get(body, pointer)
-    append_i32_store(body)
+    append_memory_op(body, opcode_i32_store, 2)
     append_constant(body, scratch_iovec_length, false)
     local_get(body, length)
     body.append(opcode_i32_wrap_i64)
-    append_i32_store(body)
+    append_memory_op(body, opcode_i32_store, 2)
     append_constant(body, wasi_stdout, false)
     append_constant(body, scratch_iovec_buffer, false)
     append_constant(body, 1, false)
@@ -482,19 +815,159 @@ func encode_write(body: list[u8], import_index: i64, pointer: RegisterId, length
     append_unsigned(body, import_index)
     body.append(opcode_drop)
 
-# `i32.store` with its memarg: alignment 2^2, offset 0 (the address is on
-# the stack already).
-func append_i32_store(body: list[u8]):
-    body.append(opcode_i32_store)
-    append_unsigned(body, 2)
-    append_unsigned(body, 0)
+# mark: Binary operations =====================================================================
+
+func encode_binary(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId) -> !:
+    if kind.is_float:
+        encode_float_binary(body, operation, kind, result, left, right)
+        return
+    if operation == BinaryOp.add or operation == BinaryOp.sub or operation == BinaryOp.mul:
+        encode_checked_arithmetic(body, operation, kind, result, left, right)
+    elif operation == BinaryOp.floor_div:
+        encode_floor_div(body, kind, result, left, right)
+    elif operation == BinaryOp.rem:
+        encode_rem(body, kind, result, left, right)
+    elif operation == BinaryOp.shift_left or operation == BinaryOp.shift_right:
+        encode_shift(body, operation, kind, result, left, right)
+    elif operation == BinaryOp.bit_and or operation == BinaryOp.bit_or or operation == BinaryOp.bit_xor:
+        local_get(body, left)
+        local_get(body, right)
+        if operation == BinaryOp.bit_and: body.append(pick(kind.is_wide, opcode_i64_and, opcode_i32_and))
+        elif operation == BinaryOp.bit_or: body.append(pick(kind.is_wide, opcode_i64_or, opcode_i32_or))
+        else: body.append(pick(kind.is_wide, opcode_i64_xor, opcode_i32_xor))
+        local_set(body, result)
+    elif operation == BinaryOp.div:
+        error("wasm backend found `div` on an integer; the verifier admits it only for floats")
+    else:
+        # Comparisons: every operand kind that reaches here (ints, bool, ptr)
+        # lives in an integer local; signedness picks the `_s`/`_u` form.
+        local_get(body, left)
+        local_get(body, right)
+        body.append(integer_comparison_opcode(operation, kind))
+        local_set(body, result)
+
+func integer_comparison_opcode(operation: BinaryOp, kind: Kind) -> u8:
+    let wide = kind.is_wide
+    if operation == BinaryOp.eq: return pick(wide, opcode_i64_eq, opcode_i32_eq)
+    if operation == BinaryOp.ne: return pick(wide, opcode_i64_ne, opcode_i32_ne)
+    if kind.is_signed:
+        if operation == BinaryOp.lt: return pick(wide, opcode_i64_lt_s, opcode_i32_lt_s)
+        if operation == BinaryOp.le: return pick(wide, opcode_i64_le_s, opcode_i32_le_s)
+        if operation == BinaryOp.gt: return pick(wide, opcode_i64_gt_s, opcode_i32_gt_s)
+        return pick(wide, opcode_i64_ge_s, opcode_i32_ge_s)
+    if operation == BinaryOp.lt: return pick(wide, opcode_i64_lt_u, opcode_i32_lt_u)
+    if operation == BinaryOp.le: return pick(wide, opcode_i64_le_u, opcode_i32_le_u)
+    if operation == BinaryOp.gt: return pick(wide, opcode_i64_gt_u, opcode_i32_gt_u)
+    return pick(wide, opcode_i64_ge_u, opcode_i32_ge_u)
+
+# Floats: wasm's IEEE operations are the language's; nothing to check.
+func encode_float_binary(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    local_get(body, left)
+    local_get(body, right)
+    if operation == BinaryOp.add: body.append(pick(wide, opcode_f64_add, opcode_f32_add))
+    elif operation == BinaryOp.sub: body.append(pick(wide, opcode_f64_sub, opcode_f32_sub))
+    elif operation == BinaryOp.mul: body.append(pick(wide, opcode_f64_mul, opcode_f32_mul))
+    elif operation == BinaryOp.div: body.append(pick(wide, opcode_f64_div, opcode_f32_div))
+    elif operation == BinaryOp.eq: body.append(pick(wide, opcode_f64_eq, opcode_f32_eq))
+    elif operation == BinaryOp.ne: body.append(pick(wide, opcode_f64_ne, opcode_f32_ne))
+    elif operation == BinaryOp.lt: body.append(pick(wide, opcode_f64_lt, opcode_f32_lt))
+    elif operation == BinaryOp.le: body.append(pick(wide, opcode_f64_le, opcode_f32_le))
+    elif operation == BinaryOp.gt: body.append(pick(wide, opcode_f64_gt, opcode_f32_gt))
+    else: body.append(pick(wide, opcode_f64_ge, opcode_f32_ge))
+    local_set(body, result)
 
 # mark: Checked arithmetic ====================================================================
 #
-# Wasm integer arithmetic wraps; MIR's traps on overflow. Each helper computes
-# the wrapped result into the result local, then tests whether the wrap
-# happened and executes `unreachable` if so. The tests use only the operands
-# and the wrapped result, so no wider type is needed.
+# Wasm integer arithmetic wraps; MIR's traps on overflow (language section
+# 7). Four shapes cover every width:
+#
+#   i32, i64   compute in the native width, then detect the wrap from the
+#              operands and the wrapped result (`encode_checked_*`);
+#   i8..u16    compute in i32, where the true result always fits, then trap
+#              if it is outside the type's range — a value in range is
+#              already canonical;
+#   u32        compute in i64, where the true result always fits, trap if it
+#              is above 0xFFFFFFFF or below zero, then wrap to i32;
+#   u64        MIR's u64 stops at the i64 maximum, so the i64 sequences
+#              apply, plus a trap on any negative result.
+
+func encode_checked_arithmetic(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    if is_narrow(kind):
+        local_get(body, left)
+        local_get(body, right)
+        body.append(narrow_arithmetic_opcode(operation))
+        local_set(body, result)
+        append_range_trap(body, result, kind)
+        return
+    if kind.bits == 32 and not kind.is_signed:
+        encode_u32_arithmetic(body, operation, result, left, right)
+        return
+    if operation == BinaryOp.add: encode_checked_add(body, result, left, right, kind.is_wide)
+    elif operation == BinaryOp.sub: encode_checked_sub(body, result, left, right, kind.is_wide)
+    else: encode_checked_mul(body, result, left, right, kind.is_wide)
+    if not kind.is_signed: append_negative_trap(body, result, true)
+
+func narrow_arithmetic_opcode(operation: BinaryOp) -> u8:
+    if operation == BinaryOp.add: return opcode_i32_add
+    if operation == BinaryOp.sub: return opcode_i32_sub
+    return opcode_i32_mul
+
+# `local.get r; i32.const min; i32.lt_s; if unreachable end` and the same
+# against the maximum with `gt_s`.
+func append_range_trap(body: list[u8], register: RegisterId, kind: Kind):
+    local_get(body, register)
+    append_constant(body, narrow_minimum(kind), false)
+    body.append(opcode_i32_lt_s)
+    append_trap_if_true(body)
+    local_get(body, register)
+    append_constant(body, narrow_maximum(kind), false)
+    body.append(opcode_i32_gt_s)
+    append_trap_if_true(body)
+
+func narrow_minimum(kind: Kind) -> i64:
+    if not kind.is_signed: return 0
+    if kind.bits == 8: return -128
+    return -32768
+
+func narrow_maximum(kind: Kind) -> i64:
+    if kind.is_signed:
+        if kind.bits == 8: return 127
+        return 32767
+    if kind.bits == 8: return 255
+    return 65535
+
+# u32: `i64.extend_i32_u` both operands, operate in i64, trap unless
+# `0 <= r <= 0xFFFFFFFF` (as an unsigned compare, one `gt_u` covers both
+# ends), then `i32.wrap_i64` into the result.
+func encode_u32_arithmetic(body: list[u8], operation: BinaryOp, result: RegisterId, left: RegisterId, right: RegisterId):
+    local_get(body, left)
+    body.append(opcode_i64_extend_i32_u)
+    local_get(body, right)
+    body.append(opcode_i64_extend_i32_u)
+    if operation == BinaryOp.add: body.append(opcode_i64_add)
+    elif operation == BinaryOp.sub: body.append(opcode_i64_sub)
+    else: body.append(opcode_i64_mul)
+    body.append(opcode_i32_wrap_i64)
+    local_set(body, result)
+    # Recompute the i64 result for the test; cheaper than a temporary local.
+    local_get(body, left)
+    body.append(opcode_i64_extend_i32_u)
+    local_get(body, right)
+    body.append(opcode_i64_extend_i32_u)
+    if operation == BinaryOp.add: body.append(opcode_i64_add)
+    elif operation == BinaryOp.sub: body.append(opcode_i64_sub)
+    else: body.append(opcode_i64_mul)
+    append_constant(body, 0xFFFFFFFF, true)
+    body.append(opcode_i64_gt_u)
+    append_trap_if_true(body)
+
+# `local.get r; const 0; lt_s; if unreachable end`
+func append_negative_trap(body: list[u8], register: RegisterId, is_wide: bool):
+    local_get(body, register)
+    append_zero(body, is_wide)
+    body.append(pick(is_wide, opcode_i64_lt_s, opcode_i32_lt_s))
+    append_trap_if_true(body)
 
 # `r = a + b` overflows exactly when both operands have the sign opposite to
 # the result's: `((a ^ r) & (b ^ r)) < 0`.
@@ -565,6 +1038,168 @@ func encode_checked_mul(body: list[u8], result: RegisterId, left: RegisterId, ri
     append_trap_if_true(body)
     body.append(opcode_end)
 
+# mark: Division ==============================================================================
+#
+# `//` is floor division and `%` its paired remainder (language section 7);
+# wasm's `div_s`/`rem_s` truncate toward zero. The signed forms compute the
+# truncated result and adjust it by one step when the remainder is non-zero
+# and the operands' signs differ. Unsigned operands need no adjustment.
+# Wasm traps on a zero divisor and on `minimum / -1`, which is exactly the
+# language rule, so no explicit test guards those; a narrow signed
+# `minimum // -1` overflows in i32 without trapping and gets a range test.
+
+# floor_div: `q = a / b; if (a % b != 0) & ((a ^ b) < 0): q -= 1`
+func encode_floor_div(body: list[u8], kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    local_get(body, left)
+    local_get(body, right)
+    if kind.is_signed: body.append(pick(wide, opcode_i64_div_s, opcode_i32_div_s))
+    else: body.append(pick(wide, opcode_i64_div_u, opcode_i32_div_u))
+    if kind.is_signed:
+        append_sign_adjustment_condition(body, kind, left, right)
+        # `q - adjust` where adjust is the i32 condition, widened for i64.
+        if wide: body.append(opcode_i64_extend_i32_u)
+        body.append(pick(wide, opcode_i64_sub, opcode_i32_sub))
+    local_set(body, result)
+    if is_narrow(kind) and kind.is_signed: append_range_trap(body, result, kind)
+
+# rem: `r = a % b; if (r != 0) & ((a ^ b) < 0): r += b`
+func encode_rem(body: list[u8], kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    local_get(body, left)
+    local_get(body, right)
+    if kind.is_signed: body.append(pick(wide, opcode_i64_rem_s, opcode_i32_rem_s))
+    else: body.append(pick(wide, opcode_i64_rem_u, opcode_i32_rem_u))
+    local_set(body, result)
+    if kind.is_signed:
+        # `r + (b & -adjust)`: adds `b` exactly when the condition holds.
+        local_get(body, result)
+        local_get(body, right)
+        append_zero(body, wide)
+        append_sign_adjustment_condition(body, kind, left, right)
+        if wide: body.append(opcode_i64_extend_i32_u)
+        body.append(pick(wide, opcode_i64_sub, opcode_i32_sub))
+        body.append(pick(wide, opcode_i64_and, opcode_i32_and))
+        body.append(pick(wide, opcode_i64_add, opcode_i32_add))
+        local_set(body, result)
+
+# Leaves the i32 `((a % b) != 0) & ((a ^ b) < 0)` on the stack.
+func append_sign_adjustment_condition(body: list[u8], kind: Kind, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(wide, opcode_i64_rem_s, opcode_i32_rem_s))
+    append_zero(body, wide)
+    body.append(pick(wide, opcode_i64_ne, opcode_i32_ne))
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(wide, opcode_i64_xor, opcode_i32_xor))
+    append_zero(body, wide)
+    body.append(pick(wide, opcode_i64_lt_s, opcode_i32_lt_s))
+    body.append(opcode_i32_and)
+
+# mark: Shifts ================================================================================
+#
+# A shift count outside the type's width traps (language section 7); wasm
+# masks it instead, so the count is tested first as an unsigned compare —
+# `count >= bits` catches negatives too. Signed right shift is arithmetic,
+# unsigned is logical; a left shift of a narrow type re-canonicalises.
+
+func encode_shift(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    local_get(body, right)
+    append_constant(body, kind.bits, wide)
+    body.append(pick(wide, opcode_i64_ge_u, opcode_i32_ge_u))
+    append_trap_if_true(body)
+    local_get(body, left)
+    local_get(body, right)
+    if operation == BinaryOp.shift_left:
+        body.append(pick(wide, opcode_i64_shl, opcode_i32_shl))
+        append_canonicalise(body, kind)
+    elif kind.is_signed:
+        body.append(pick(wide, opcode_i64_shr_s, opcode_i32_shr_s))
+    else:
+        body.append(pick(wide, opcode_i64_shr_u, opcode_i32_shr_u))
+    local_set(body, result)
+
+# mark: Unary operations ======================================================================
+
+func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, result: RegisterId, operand: RegisterId) -> !:
+    match operation:
+        bool_not:
+            local_get(body, operand)
+            body.append(opcode_i32_eqz)
+            local_set(body, result)
+        bit_not:
+            # `x ^ -1` for signed and 32/64-bit types keeps the canonical
+            # form; an unsigned narrow type flips only its own bits.
+            local_get(body, operand)
+            if is_narrow(kind) and not kind.is_signed: append_constant(body, narrow_mask(kind), false)
+            else: append_constant(body, -1, kind.is_wide)
+            body.append(pick(kind.is_wide, opcode_i64_xor, opcode_i32_xor))
+            local_set(body, result)
+        neg:
+            if kind.is_float:
+                local_get(body, operand)
+                body.append(pick(kind.is_wide, opcode_f64_neg, opcode_f32_neg))
+                local_set(body, result)
+            elif is_narrow(kind):
+                # `0 - x` fits in i32; only `-minimum` leaves the range.
+                append_zero(body, false)
+                local_get(body, operand)
+                body.append(opcode_i32_sub)
+                local_set(body, result)
+                append_range_trap(body, result, kind)
+            else:
+                # `-minimum` does not exist: trap first, then `0 - x`.
+                local_get(body, operand)
+                if kind.is_wide: append_constant(body, -9223372036854775807 - 1, true)
+                else: append_constant(body, -2147483647 - 1, false)
+                body.append(pick(kind.is_wide, opcode_i64_eq, opcode_i32_eq))
+                append_trap_if_true(body)
+                append_zero(body, kind.is_wide)
+                local_get(body, operand)
+                body.append(pick(kind.is_wide, opcode_i64_sub, opcode_i32_sub))
+                local_set(body, result)
+
+# mark: Conversions ===========================================================================
+#
+# `extend` widens by the source's signedness; within i32 a canonical narrow
+# value already is the wider value. `wrap` narrows and re-canonicalises.
+# Integer-to-float picks the convert by source width and signedness;
+# float-to-integer truncates and, as the language requires, traps when the
+# value does not fit — wasm's `trunc` does that for i32/i64 and a range test
+# does it for narrow targets.
+
+func encode_convert(body: list[u8], operation: ConvertOp, from: Kind, to: Kind, result: RegisterId, operand: RegisterId) -> !:
+    local_get(body, operand)
+    match operation:
+        extend:
+            if to.is_wide and not from.is_wide:
+                if from.is_signed: body.append(opcode_i64_extend_i32_s)
+                else: body.append(opcode_i64_extend_i32_u)
+        wrap:
+            if from.is_wide: body.append(opcode_i32_wrap_i64)
+            append_canonicalise(body, to)
+        int_to_float:
+            if to.is_wide:
+                if from.is_wide: body.append(pick(from.is_signed, opcode_f64_convert_i64_s, opcode_f64_convert_i64_u))
+                else: body.append(pick(from.is_signed, opcode_f64_convert_i32_s, opcode_f64_convert_i32_u))
+            else:
+                if from.is_wide: body.append(pick(from.is_signed, opcode_f32_convert_i64_s, opcode_f32_convert_i64_u))
+                else: body.append(pick(from.is_signed, opcode_f32_convert_i32_s, opcode_f32_convert_i32_u))
+        float_to_int:
+            if to.is_wide:
+                if from.is_wide: body.append(pick(to.is_signed, opcode_i64_trunc_f64_s, opcode_i64_trunc_f64_u))
+                else: body.append(pick(to.is_signed, opcode_i64_trunc_f32_s, opcode_i64_trunc_f32_u))
+            else:
+                if from.is_wide: body.append(pick(to.is_signed, opcode_i32_trunc_f64_s, opcode_i32_trunc_f64_u))
+                else: body.append(pick(to.is_signed, opcode_i32_trunc_f32_s, opcode_i32_trunc_f32_u))
+    local_set(body, result)
+    if operation == ConvertOp.float_to_int and is_narrow(to): append_range_trap(body, result, to)
+
+# mark: Small helpers =========================================================================
+
 # `if <condition> unreachable end`: trap when the i32 on the stack is true.
 func append_trap_if_true(body: list[u8]):
     body.append(opcode_if)
@@ -582,6 +1217,86 @@ func append_zero(body: list[u8], is_wide: bool):
 func pick(is_wide: bool, wide: u8, narrow: u8) -> u8:
     if is_wide: return wide
     return narrow
+
+# mark: Float constants =======================================================================
+#
+# Wasm wants the IEEE 754 bit pattern, little-endian, and Stage-0 offers no
+# bit cast. The pattern is rebuilt arithmetically: scale the magnitude into
+# [1, 2) by halving or doubling (each step exact), read the exponent off the
+# step count, and take the fraction times 2^52 — exact for every normal
+# double. The bytes are assembled from the mantissa and the biased exponent
+# without any 64-bit shift, so no host overflow can occur.
+
+func append_f64_constant(body: list[u8], value: f64) -> !:
+    body.append(opcode_f64_const)
+    if value == 0.0:
+        append_all(body, [0, 0, 0, 0, 0, 0, 0, 0])
+        return
+    var sign = 0
+    var magnitude = value
+    if value < 0.0:
+        sign = 1
+        magnitude = 0.0 - value
+    var exponent = 0
+    while magnitude >= 2.0:
+        magnitude = magnitude / 2.0
+        exponent += 1
+    while magnitude < 1.0:
+        magnitude = magnitude * 2.0
+        exponent -= 1
+    if exponent > 1023 or exponent < -1022:
+        error("wasm backend does not support this float constant yet")
+    let mantissa = i64((magnitude - 1.0) * 4503599627370496.0)
+    let biased = exponent + 1023
+    # bits 0..51 mantissa, 52..62 exponent, 63 sign; `low` holds bits 0..55.
+    let low = mantissa + biased * 4503599627370496
+    var index = 0
+    var rest = low
+    while index < 7:
+        body.append(u8(rest & 0xFF))
+        rest = rest >> 8
+        index += 1
+    body.append(u8(rest + sign * 128))
+
+# f32: the same decomposition, then the 52-bit fraction rounded to 23 bits
+# (ties to even, as the language's literal conversion requires), with a
+# carry into the exponent when rounding overflows the fraction.
+func append_f32_constant(body: list[u8], value: f64) -> !:
+    body.append(opcode_f32_const)
+    if value == 0.0:
+        append_all(body, [0, 0, 0, 0])
+        return
+    var sign = 0
+    var magnitude = value
+    if value < 0.0:
+        sign = 1
+        magnitude = 0.0 - value
+    var exponent = 0
+    while magnitude >= 2.0:
+        magnitude = magnitude / 2.0
+        exponent += 1
+    while magnitude < 1.0:
+        magnitude = magnitude * 2.0
+        exponent -= 1
+    let wide_mantissa = i64((magnitude - 1.0) * 4503599627370496.0)
+    var mantissa = wide_mantissa >> 29
+    let dropped = wide_mantissa & 0x1FFFFFFF
+    let half = 0x10000000
+    if dropped > half or (dropped == half and mantissa & 1 == 1):
+        mantissa += 1
+        if mantissa == 8388608:
+            mantissa = 0
+            exponent += 1
+    if exponent > 127 or exponent < -126:
+        error("wasm backend does not support this float constant yet")
+    let biased = exponent + 127
+    let bits = mantissa + biased * 8388608 + sign * 2147483648
+    var index = 0
+    var rest = bits
+    while index < 4:
+        body.append(u8(rest & 0xFF))
+        rest = rest >> 8
+        index += 1
 
 # mark: LEB128 and byte plumbing ==============================================================
 

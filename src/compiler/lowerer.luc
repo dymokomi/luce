@@ -4,21 +4,31 @@
 #
 #   DESCRIPTION:
 #       Turns analyzed typed-HIR trees into canonical MIR: every value lands
-#       in a fresh write-once register, terminal output becomes a data item
+#       in a fresh write-once register, every local lives in a stack slot
+#       reached through `Load`/`Store`, terminal output becomes a data item
 #       plus a call to the `luce_rt_write` runtime service, and a function's
 #       result is an explicit `Return`. Public use begins at `Lowerer.lower`;
 #       the walk goes program -> function -> statement -> expression, and
 #       anything outside the executable slice fails with a clear
 #       "does not support ... yet".
 #
-#       The compiled slice today: i32/i64 arithmetic, constant terminal
-#       output, and returning. The slice boundary lives here, not in canonical
-#       MIR — wider integers, comparisons, bindings, and calls all reach the
-#       lowerer as HIR and stop with "does not support ... yet" until this
-#       file emits the instruction for them. Only `main(arguments: slice[str])`
-#       carries a parameter (the 1.0 entry signature, docs/language/1.0.md
-#       §23), and the argument remains unavailable until ordinary parameters
-#       are lowered, so the MIR entry is `() -> i32`.
+#       The compiled slice today: every scalar type (all integer widths,
+#       `f32`/`f64`, `bool`, `char`), `let`/`var` locals with plain and
+#       compound assignment, every unary and binary operator including
+#       short-circuit `and`/`or` and the conditional expression, constant
+#       terminal output, and returning. The slice boundary lives here, not in
+#       canonical MIR — `if`/`while`, calls, parameters, and aggregate types
+#       all reach the lowerer as HIR and stop with "does not support ... yet"
+#       until this file emits the instructions for them. Only
+#       `main(arguments: slice[str])` carries a parameter (the 1.0 entry
+#       signature, docs/language/1.0.md §23), and the argument remains
+#       unavailable until ordinary parameters are lowered, so the MIR entry is
+#       `() -> i32`.
+#
+#       Locals take the simple form on purpose: one `Alloca` per binding in
+#       the prologue, a `Store` at the binding, a `Load` at every use. An
+#       optimizer may promote them to registers later; correctness comes
+#       first (docs/compiler/mir.md, "Registers").
 #
 #       Lowering happens for one `TargetLayout`: aggregate layouts are fixed
 #       here, which is why `build` chooses a target before this stage runs.
@@ -28,14 +38,21 @@
 from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, FunctionId
 from compiler.canonical_ir import InstructionForm, MirConstant, MirData, MirExtern, MirFunction, MirGlobal, MirInstruction
 from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSlot, MirTypeTable, RegisterId
-from compiler.canonical_ir import TargetLayout, TypeId, builtin_mir_type, create_builtin_mir_types, find_runtime_symbol
+from compiler.canonical_ir import TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
+from compiler.canonical_ir import find_runtime_symbol, size_of
 from compiler.hir import BinaryOperation, BuiltinType, HirExpression, HirFunction
-from compiler.hir import HirModule, HirProgram, HirStatement, describe_type
+from compiler.hir import HirModule, HirProgram, HirStatement, SymbolId, describe_type
 from compiler.hir import resolve_builtin_type, types_match
 import compiler.hir
 from compiler.semantic_analyzer import AnalyzedProgram
 from compiler.source import SourceSpan, format_diagnostic
 import std.strings
+
+# One local of the function being lowered: its HIR symbol and the register
+# holding its slot address.
+struct Local:
+    symbol: i64
+    address: RegisterId
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
@@ -45,8 +62,10 @@ pub class Lowerer:
     types: MirTypeTable
     externs: list[MirExtern]
     data: list[MirData]
-    # The register table of the function being lowered.
+    # The register table, slots, and live locals of the function being lowered.
     registers: list[TypeId]
+    slots: list[MirSlot]
+    locals: list[Local]
 
     ## Prepare to lower one analyzed program for one target; `lower` walks it.
     pub init(program: AnalyzedProgram, layout: TargetLayout):
@@ -56,6 +75,8 @@ pub class Lowerer:
         self.externs = list[MirExtern]()
         self.data = list[MirData]()
         self.registers = list[TypeId]()
+        self.slots = list[MirSlot]()
+        self.locals = list[Local]()
 
     # mark: Lowering ============================================================================
 
@@ -92,20 +113,46 @@ pub class Lowerer:
             try self.fail_unsupported(module, function, function.span, "parameters")
 
         self.registers = list[TypeId]()
-        let result_type = try self.mir_type_of(module, function, function.span, function.result)
+        self.slots = list[MirSlot]()
+        self.locals = list[Local]()
+        let results = list[TypeId]()
+        let returns_unit = types_match(function.result, resolve_builtin_type(BuiltinType.unit))
+        if not returns_unit:
+            results.append(try self.mir_type_of(module, function, function.span, function.result))
+
         let body = list[MirInstruction]()
+        try self.lower_prologue(module, function, body)
         for statement in function.body:
             try self.lower_statement(module, function, statement, body)
+        # A unit function may finish without `return`; MIR ends every path
+        # explicitly.
+        if returns_unit and not ends_in_return(body):
+            body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = function.span))
         return MirFunction(
             name = module.name + "." + function.name,
             convention = CallingConvention.luce,
-            signature = MirSignature(parameters = list[TypeId](), results = [result_type], is_fallible = false),
+            signature = MirSignature(parameters = list[TypeId](), results = results, is_fallible = false),
             registers = self.registers,
-            slots = list[MirSlot](),
+            slots = self.slots,
             body = body,
             is_public = function.is_public,
             span = function.span,
         )
+
+    # Every binding in the body gets its slot up front, so the address
+    # registers exist before any statement runs and a backend can size the
+    # frame from `slots` alone.
+    func lower_prologue(module: HirModule, function: HirFunction, body: list[MirInstruction]) -> !:
+        for statement in function.body:
+            match statement.form:
+                Binding(symbol, name, is_mutable, value):
+                    let slot_type = try self.mir_type_of(module, function, statement.span, value.value_type)
+                    let slot = len(self.slots)
+                    self.slots.append(MirSlot(value_type = slot_type, align = size_of(self.types, self.layout, slot_type)))
+                    let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                    body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = statement.span))
+                    self.locals.append(Local(symbol = symbol.value, address = address))
+                else: continue
 
     # Append the instructions for one HIR statement. For example, `return 7`
     # emits a constant into a fresh register and returns that register.
@@ -115,11 +162,30 @@ pub class Lowerer:
                 try self.lower_print(value, statement.span, body)
             ReturnStatement(value):
                 if value == none:
-                    try self.fail_unsupported(module, function, statement.span, "an empty return")
+                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = statement.span))
                     return
                 let returned = value
                 let register = try self.lower_expression(module, function, returned, body)
                 body.append(MirInstruction(form = InstructionForm.Return(values = [register]), span = statement.span))
+            Binding(symbol, name, is_mutable, value):
+                let local = try self.local_of(module, function, statement.span, symbol)
+                let register = try self.lower_expression(module, function, value, body)
+                let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
+                body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = local.address, value = register), span = statement.span))
+            Assignment(symbol, operation, value):
+                let local = try self.local_of(module, function, statement.span, symbol)
+                let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
+                let register = try self.lower_expression(module, function, value, body)
+                var stored = register
+                match operation:
+                    Replace: stored = register
+                    Combine(binary):
+                        let current = self.new_register(value_type)
+                        body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = local.address), span = statement.span))
+                        stored = try self.lower_binary_operation(module, function, statement.span, binary, value_type, current, register, body)
+                body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = local.address, value = stored), span = statement.span))
+            ExpressionStatement(value):
+                let discarded = try self.lower_expression(module, function, value, body)
             else:
                 try self.fail_unsupported(module, function, statement.span, "statement `" + str(statement.form) + "`")
 
@@ -144,42 +210,146 @@ pub class Lowerer:
             span = span,
         ))
 
+    # mark: Expressions =========================================================================
+
     # Lower one expression and return the register holding its value.
     # Operands are lowered left to right, so `2 + 3` defines the register for
     # 2, then 3, then their sum.
     func lower_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
+        let value_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
         match expression.form:
             Constant(value):
+                let register = self.new_register(value_type)
+                var constant = MirConstant.Null
                 match value:
-                    Integer(item):
-                        let register = self.new_register(try self.mir_type_of(module, function, expression.span, expression.value_type))
-                        body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Int(value = item)), span = expression.span))
-                        return register
-                    else: error(self.unsupported(module, function, expression.span, "constant `" + str(value) + "`"))
-            Binary(left, operation, right):
-                let left_register = try self.lower_expression(module, function, left, body)
-                let right_register = try self.lower_expression(module, function, right, body)
-                let operand_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
-                var binary_operation = BinaryOp.add
+                    Integer(item): constant = MirConstant.Int(value = item)
+                    Floating(item): constant = MirConstant.Float(value = item)
+                    Boolean(item): constant = MirConstant.Bool(value = item)
+                    Character(item): constant = MirConstant.Int(value = i64(u32(item)))
+                    else: try self.fail_unsupported(module, function, expression.span, "constant `" + str(value) + "`")
+                body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = expression.span))
+                return register
+            Reference(symbol):
+                let local = try self.local_of(module, function, expression.span, symbol)
+                let register = self.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.Load(result = register, value_type = value_type, address = local.address), span = expression.span))
+                return register
+            Unary(operation, operand):
+                let operand_register = try self.lower_expression(module, function, operand, body)
+                let register = self.new_register(value_type)
                 match operation:
-                    Add(operand): binary_operation = BinaryOp.add
-                    Subtract(operand): binary_operation = BinaryOp.sub
-                    Multiply(operand): binary_operation = BinaryOp.mul
-                    else: try self.fail_unsupported(module, function, expression.span, "operation `" + str(operation) + "`")
-                let register = self.new_register(operand_type)
+                    LogicalNot:
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bool_not, operand = operand_register), span = expression.span))
+                    NumericNegate(operand_type):
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.neg, operand = operand_register), span = expression.span))
+                    IntegerBitwiseNot(operand_type):
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bit_not, operand = operand_register), span = expression.span))
+                    NumericIdentity(operand_type):
+                        body.append(MirInstruction(form = InstructionForm.Copy(result = register, source = operand_register), span = expression.span))
+                return register
+            Binary(left, operation, right):
+                match operation:
+                    LogicalAnd: return try self.lower_short_circuit(module, function, expression, left, right, true, body)
+                    LogicalOr: return try self.lower_short_circuit(module, function, expression, left, right, false, body)
+                    else:
+                        let left_register = try self.lower_expression(module, function, left, body)
+                        let right_register = try self.lower_expression(module, function, right, body)
+                        let operand_type = try self.mir_type_of(module, function, left.span, left.value_type)
+                        return try self.lower_binary_operation(module, function, expression.span, operation, operand_type, left_register, right_register, body)
+            Conditional(value, condition, alternative):
+                let condition_register = try self.lower_expression(module, function, condition, body)
+                let result = self.new_register(value_type)
+                let then_body = list[MirInstruction]()
+                let chosen = try self.lower_expression(module, function, value, then_body)
+                then_body.append(MirInstruction(form = InstructionForm.Yield(values = [chosen]), span = expression.span))
+                let else_body = list[MirInstruction]()
+                let fallback = try self.lower_expression(module, function, alternative, else_body)
+                else_body.append(MirInstruction(form = InstructionForm.Yield(values = [fallback]), span = expression.span))
                 body.append(MirInstruction(
-                    form = InstructionForm.Binary(result = register, operation = binary_operation, left = left_register, right = right_register),
+                    form = InstructionForm.If(condition = condition_register, results = [result], then_body = then_body, else_body = else_body),
                     span = expression.span,
                 ))
-                return register
+                return result
             else:
                 error(self.unsupported(module, function, expression.span, "expression `" + str(expression.form) + "`"))
+
+    # `a and b` evaluates `b` only when `a` is true; `a or b` only when `a`
+    # is false. Both are an `If` whose unevaluated arm yields the constant
+    # that decided the answer.
+    func lower_short_circuit(module: HirModule, function: HirFunction, expression: HirExpression, left: HirExpression, right: HirExpression, is_and: bool, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let left_register = try self.lower_expression(module, function, left, body)
+        let result = self.new_register(boolean)
+        let evaluated = list[MirInstruction]()
+        let right_register = try self.lower_expression(module, function, right, evaluated)
+        evaluated.append(MirInstruction(form = InstructionForm.Yield(values = [right_register]), span = expression.span))
+        let decided = list[MirInstruction]()
+        let constant = self.new_register(boolean)
+        decided.append(MirInstruction(form = InstructionForm.Const(result = constant, value = MirConstant.Bool(value = not is_and)), span = expression.span))
+        decided.append(MirInstruction(form = InstructionForm.Yield(values = [constant]), span = expression.span))
+        if is_and:
+            body.append(MirInstruction(form = InstructionForm.If(condition = left_register, results = [result], then_body = evaluated, else_body = decided), span = expression.span))
+        else:
+            body.append(MirInstruction(form = InstructionForm.If(condition = left_register, results = [result], then_body = decided, else_body = evaluated), span = expression.span))
+        return result
+
+    # Emit one `Binary` for a resolved HIR operation on two lowered operands.
+    # Comparisons produce a `bool` register; everything else keeps the operand
+    # type.
+    func lower_binary_operation(module: HirModule, function: HirFunction, span: SourceSpan, operation: BinaryOperation, operand_type: TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        var binary_operation = BinaryOp.add
+        var is_comparison = false
+        match operation:
+            Add(item): binary_operation = BinaryOp.add
+            Subtract(item): binary_operation = BinaryOp.sub
+            Multiply(item): binary_operation = BinaryOp.mul
+            Divide(item): binary_operation = BinaryOp.div
+            FloorDivide(item): binary_operation = BinaryOp.floor_div
+            Remainder(item): binary_operation = BinaryOp.rem
+            BitwiseAnd(item): binary_operation = BinaryOp.bit_and
+            BitwiseOr(item): binary_operation = BinaryOp.bit_or
+            BitwiseXor(item): binary_operation = BinaryOp.bit_xor
+            ShiftLeft(item): binary_operation = BinaryOp.shift_left
+            ShiftRight(item): binary_operation = BinaryOp.shift_right
+            Equal(item):
+                binary_operation = BinaryOp.eq
+                is_comparison = true
+            NotEqual(item):
+                binary_operation = BinaryOp.ne
+                is_comparison = true
+            Less(item):
+                binary_operation = BinaryOp.lt
+                is_comparison = true
+            LessEqual(item):
+                binary_operation = BinaryOp.le
+                is_comparison = true
+            Greater(item):
+                binary_operation = BinaryOp.gt
+                is_comparison = true
+            GreaterEqual(item):
+                binary_operation = BinaryOp.ge
+                is_comparison = true
+            else: try self.fail_unsupported(module, function, span, "operation `" + str(operation) + "`")
+        var result_type = operand_type
+        if is_comparison: result_type = builtin_mir_type(BuiltinMirType.boolean)
+        let register = self.new_register(result_type)
+        body.append(MirInstruction(
+            form = InstructionForm.Binary(result = register, operation = binary_operation, left = left, right = right),
+            span = span,
+        ))
+        return register
 
     # mark: Tables ==============================================================================
 
     func new_register(value_type: TypeId) -> RegisterId:
         self.registers.append(value_type)
         return RegisterId(value = len(self.registers) - 1)
+
+    # The slot address of a local the prologue reserved.
+    func local_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId) -> Local!:
+        for local in self.locals:
+            if local.symbol == symbol.value: return local
+        error(self.unsupported(module, function, span, "a reference to a symbol that is not a local"))
 
     # Declare a runtime service once, with the signature the runtime table
     # fixes for it.
@@ -190,11 +360,22 @@ pub class Lowerer:
         self.externs.append(MirExtern(name = name, convention = CallingConvention.runtime, signature = symbol.signature))
         return ExternId(value = len(self.externs) - 1)
 
-    # Map a checked i32/i64 HIR type onto its canonical machine type. HIR and
-    # MIR each have a `TypeId`; the HIR one is spelled `hir.TypeId` here.
+    # Map a scalar HIR type onto its canonical machine type. HIR and MIR each
+    # have a `TypeId`; the HIR one is spelled `hir.TypeId` here. `char` is its
+    # code point in a `u32`.
     func mir_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: hir.TypeId) -> TypeId!:
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i8)): return builtin_mir_type(BuiltinMirType.signed_i8)
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i16)): return builtin_mir_type(BuiltinMirType.signed_i16)
         if types_match(value, resolve_builtin_type(BuiltinType.signed_i32)): return builtin_mir_type(BuiltinMirType.signed_i32)
         if types_match(value, resolve_builtin_type(BuiltinType.signed_i64)): return builtin_mir_type(BuiltinMirType.signed_i64)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u8)): return builtin_mir_type(BuiltinMirType.unsigned_u8)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u16)): return builtin_mir_type(BuiltinMirType.unsigned_u16)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u32)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u64)): return builtin_mir_type(BuiltinMirType.unsigned_u64)
+        if types_match(value, resolve_builtin_type(BuiltinType.float32)): return builtin_mir_type(BuiltinMirType.float32)
+        if types_match(value, resolve_builtin_type(BuiltinType.float64)): return builtin_mir_type(BuiltinMirType.float64)
+        if types_match(value, resolve_builtin_type(BuiltinType.boolean)): return builtin_mir_type(BuiltinMirType.boolean)
+        if types_match(value, resolve_builtin_type(BuiltinType.character)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
         error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
 
     # mark: Diagnostics =========================================================================
@@ -210,6 +391,12 @@ pub class Lowerer:
             span,
             "lowerer does not support " + feature + " yet in `" + module.name + "." + function.name + "`",
         )
+
+func ends_in_return(body: list[MirInstruction]) -> bool:
+    if len(body) == 0: return false
+    match body[len(body) - 1].form:
+        Return(values): return true
+        else: return false
 
 # A process starts at the one public `main` whose MIR shape is `() -> i32`.
 # Anything else leaves `entry` absent; native artifacts then report why.

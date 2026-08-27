@@ -364,7 +364,7 @@ Two consequences for the design record:
   not extended.
 - The order of work: new `canonical_ir.luc` and verifier → MIR interpreter
   and the three-way harness (both done: `tests/compiler/differential_test.luc`)
-  → the lowerer in vertical slices (scalars and locals, control flow, calls,
+  → the lowerer in vertical slices (scalars and locals — done; control flow, calls,
   enums and `match`, structs and ARC, closures and interfaces, failure and
   `defer`, collections, the C boundary, workers) → wasm encoder tracking
   each slice → native backends from MIR once it stops moving.
