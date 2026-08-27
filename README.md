@@ -115,7 +115,8 @@ topic.
 
 Read in this order; each stop hands off to the next.
 
-1. [docs/README.md](docs/README.md) introduces the two design documents.
+1. [docs/README.md](docs/README.md) introduces the design documents; the
+   [compiler plan](docs/compiler/plan.md) there is where to resume work.
    [The language design](docs/language/1.0.md) is the 1.0 specification, not a
    description of what happens to be implemented today; [the post-1.0
    notes](docs/language/post-1.0.md) hold ideas outside the current language.
