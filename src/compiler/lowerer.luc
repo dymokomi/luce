@@ -15,11 +15,12 @@
 #       The compiled slice today: every scalar type (all integer widths,
 #       `f32`/`f64`, `bool`, `char`), `let`/`var` locals with plain and
 #       compound assignment, every unary and binary operator including
-#       short-circuit `and`/`or` and the conditional expression, constant
-#       terminal output, and returning. The slice boundary lives here, not in
-#       canonical MIR — `if`/`while`, calls, parameters, and aggregate types
-#       all reach the lowerer as HIR and stop with "does not support ... yet"
-#       until this file emits the instructions for them. Only
+#       short-circuit `and`/`or` and the conditional expression, `if`/`elif`/
+#       `else`, `while` with `break` and `continue`, constant terminal output,
+#       and returning. The slice boundary lives here, not in canonical MIR —
+#       calls, parameters, and aggregate types all reach the lowerer as HIR
+#       and stop with "does not support ... yet" until this file emits the
+#       instructions for them. Only
 #       `main(arguments: slice[str])` carries a parameter (the 1.0 entry
 #       signature, docs/language/1.0.md §23), and the argument remains
 #       unavailable until ordinary parameters are lowered, so the MIR entry is
@@ -29,6 +30,13 @@
 #       the prologue, a `Store` at the binding, a `Load` at every use. An
 #       optimizer may promote them to registers later; correctness comes
 #       first (docs/compiler/mir.md, "Registers").
+#
+#       Control flow keeps the source's shape. An `if` chain is nested `If`
+#       regions; a `while` is a `Block` around a `Loop`: the loop tests its
+#       condition and branches out of the block when it fails, `continue`
+#       branches back to the loop, `break` branches out of the block. Branch
+#       depths count every region between the branch and its target, so the
+#       lowerer keeps a stack of the regions it is inside.
 #
 #       Lowering happens for one `TargetLayout`: aggregate layouts are fixed
 #       here, which is why `build` chooses a target before this stage runs.
@@ -41,9 +49,10 @@ from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSl
 from compiler.canonical_ir import TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import find_runtime_symbol, size_of
 from compiler.hir import BinaryOperation, BuiltinType, HirExpression, HirFunction
-from compiler.hir import HirModule, HirProgram, HirStatement, SymbolId, describe_type
+from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, describe_type
 from compiler.hir import resolve_builtin_type, types_match
 import compiler.hir
+from compiler.mir_verifier import terminates
 from compiler.semantic_analyzer import AnalyzedProgram
 from compiler.source import SourceSpan, format_diagnostic
 import std.strings
@@ -53,6 +62,13 @@ import std.strings
 struct Local:
     symbol: i64
     address: RegisterId
+
+# One MIR region the lowerer is currently inside, innermost last. `break`
+# targets the block wrapped around a loop; `continue` targets the loop.
+enum Region:
+    block
+    loop_body
+    if_arm
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
@@ -66,6 +82,7 @@ pub class Lowerer:
     registers: list[TypeId]
     slots: list[MirSlot]
     locals: list[Local]
+    regions: list[Region]
 
     ## Prepare to lower one analyzed program for one target; `lower` walks it.
     pub init(program: AnalyzedProgram, layout: TargetLayout):
@@ -77,6 +94,7 @@ pub class Lowerer:
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
+        self.regions = list[Region]()
 
     # mark: Lowering ============================================================================
 
@@ -115,19 +133,26 @@ pub class Lowerer:
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
+        self.regions = list[Region]()
         let results = list[TypeId]()
         let returns_unit = types_match(function.result, resolve_builtin_type(BuiltinType.unit))
         if not returns_unit:
             results.append(try self.mir_type_of(module, function, function.span, function.result))
 
         let body = list[MirInstruction]()
-        try self.lower_prologue(module, function, body)
+        try self.lower_prologue(module, function, function.body, body)
         for statement in function.body:
             try self.lower_statement(module, function, statement, body)
-        # A unit function may finish without `return`; MIR ends every path
-        # explicitly.
-        if returns_unit and not ends_in_return(body):
-            body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = function.span))
+        # MIR ends every path with a syntactic terminator. A unit function may
+        # simply finish, so it gets `Return []`. A value function whose body
+        # does not end in a terminator has already been proved by HirGenerator
+        # to return on every path (an `if` chain whose arms all return, say);
+        # the trailing `Unreachable` records that proof for the verifier.
+        if not terminates(body):
+            if returns_unit:
+                body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = function.span))
+            else:
+                body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
         return MirFunction(
             name = module.name + "." + function.name,
             convention = CallingConvention.luce,
@@ -139,11 +164,11 @@ pub class Lowerer:
             span = function.span,
         )
 
-    # Every binding in the body gets its slot up front, so the address
-    # registers exist before any statement runs and a backend can size the
-    # frame from `slots` alone.
-    func lower_prologue(module: HirModule, function: HirFunction, body: list[MirInstruction]) -> !:
-        for statement in function.body:
+    # Every binding in the body — at any nesting depth — gets its slot up
+    # front, so the address registers exist before any statement runs and a
+    # backend can size the frame from `slots` alone.
+    func lower_prologue(module: HirModule, function: HirFunction, statements: list[HirStatement], body: list[MirInstruction]) -> !:
+        for statement in statements:
             match statement.form:
                 Binding(symbol, name, is_mutable, value):
                     let slot_type = try self.mir_type_of(module, function, statement.span, value.value_type)
@@ -152,6 +177,13 @@ pub class Lowerer:
                     let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
                     body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = statement.span))
                     self.locals.append(Local(symbol = symbol.value, address = address))
+                IfStatement(branches, fallback):
+                    for branch in branches:
+                        try self.lower_prologue(module, function, branch.body, body)
+                    if fallback != none:
+                        try self.lower_prologue(module, function, fallback, body)
+                WhileStatement(condition, loop_body):
+                    try self.lower_prologue(module, function, loop_body, body)
                 else: continue
 
     # Append the instructions for one HIR statement. For example, `return 7`
@@ -186,8 +218,76 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = local.address, value = stored), span = statement.span))
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
-            else:
-                try self.fail_unsupported(module, function, statement.span, "statement `" + str(statement.form) + "`")
+            IfStatement(branches, fallback):
+                try self.lower_if(module, function, statement.span, branches, 0, fallback, body)
+            WhileStatement(condition, loop_body):
+                try self.lower_while(module, function, statement.span, condition, loop_body, body)
+            BreakStatement:
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span) + 1, values = list[RegisterId]()), span = statement.span))
+            ContinueStatement:
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span), values = list[RegisterId]()), span = statement.span))
+
+    # mark: Control flow =======================================================================
+
+    # `if a: ... elif b: ... else: ...` nests: branch `index` is one `If`
+    # whose else-arm holds the next branch, and the last else-arm is the
+    # fallback. Each arm is its own region, so registers defined inside stay
+    # inside; locals reach across through their slots.
+    func lower_if(module: HirModule, function: HirFunction, span: SourceSpan, branches: list[HirIfBranch], index: i64, fallback: list[HirStatement]?, body: list[MirInstruction]) -> !:
+        let branch = branches[index]
+        let condition = try self.lower_expression(module, function, branch.condition, body)
+        let then_body = list[MirInstruction]()
+        try self.lower_region(module, function, Region.if_arm, branch.body, then_body)
+        let else_body = list[MirInstruction]()
+        if index + 1 < len(branches):
+            self.regions.append(Region.if_arm)
+            try self.lower_if(module, function, span, branches, index + 1, fallback, else_body)
+            self.regions.remove(len(self.regions) - 1)
+        elif fallback != none:
+            try self.lower_region(module, function, Region.if_arm, fallback, else_body)
+        body.append(MirInstruction(
+            form = InstructionForm.If(condition = condition, results = list[RegisterId](), then_body = then_body, else_body = else_body),
+            span = span,
+        ))
+
+    # `while c: body` is a block around a loop. The loop re-tests `c` on
+    # every pass and leaves the block when it fails; the body's last act is a
+    # branch back to the loop. `break` is a branch to the block, `continue`
+    # a branch to the loop; both count the regions in between.
+    func lower_while(module: HirModule, function: HirFunction, span: SourceSpan, condition: HirExpression, statements: list[HirStatement], body: list[MirInstruction]) -> !:
+        let loop_body = list[MirInstruction]()
+        self.regions.append(Region.block)
+        self.regions.append(Region.loop_body)
+        let tested = try self.lower_expression(module, function, condition, loop_body)
+        let failed = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        loop_body.append(MirInstruction(form = InstructionForm.Unary(result = failed, operation = UnaryOp.bool_not, operand = tested), span = condition.span))
+        loop_body.append(MirInstruction(form = InstructionForm.BrIf(condition = failed, depth = 1, values = list[RegisterId]()), span = condition.span))
+        for statement in statements:
+            try self.lower_statement(module, function, statement, loop_body)
+        loop_body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = list[RegisterId]()), span = span))
+        self.regions.remove(len(self.regions) - 1)
+        self.regions.remove(len(self.regions) - 1)
+        let block_body = list[MirInstruction]()
+        block_body.append(MirInstruction(form = InstructionForm.Loop(body = loop_body), span = span))
+        body.append(MirInstruction(form = InstructionForm.Block(results = list[RegisterId](), body = block_body), span = span))
+
+    # Lower statements inside one new region.
+    func lower_region(module: HirModule, function: HirFunction, region: Region, statements: list[HirStatement], body: list[MirInstruction]) -> !:
+        self.regions.append(region)
+        for statement in statements:
+            try self.lower_statement(module, function, statement, body)
+        self.regions.remove(len(self.regions) - 1)
+
+    # The branch depth of the innermost enclosing loop: zero when the branch
+    # sits directly in the loop body, one more for each `If` arm in between.
+    func loop_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
+        var depth = 0
+        var index = len(self.regions) - 1
+        while index >= 0:
+            if self.regions[index] == Region.loop_body: return depth
+            depth += 1
+            index -= 1
+        error(self.unsupported(module, function, span, "`break`/`continue` outside a loop"))
 
     # Constant terminal output is a data item holding the bytes plus a
     # newline, then `luce_rt_write(address, length)`.
@@ -391,12 +491,6 @@ pub class Lowerer:
             span,
             "lowerer does not support " + feature + " yet in `" + module.name + "." + function.name + "`",
         )
-
-func ends_in_return(body: list[MirInstruction]) -> bool:
-    if len(body) == 0: return false
-    match body[len(body) - 1].form:
-        Return(values): return true
-        else: return false
 
 # A process starts at the one public `main` whose MIR shape is `() -> i32`.
 # Anything else leaves `entry` absent; native artifacts then report why.

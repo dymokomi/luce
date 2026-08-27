@@ -13,7 +13,7 @@
 
 from luce.compiler.backends.interpreter import HirInterpreter
 from luce.compiler.backends.mir_interpreter import MirInterpreter, MirValue
-from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, MirFunction, MirProgram, TypeId, UnaryOp
+from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, MirFunction, MirInstruction, MirProgram, TypeId, UnaryOp
 from luce.compiler.canonical_ir import builtin_mir_type, wasm32_layout, arm64_macos_layout
 from luce.compiler.hir import Value
 from luce.compiler.hir_gen import HirGenerator, SourceModule
@@ -405,6 +405,168 @@ pub func test_overflow_traps_on_both_executions():
     both_trap("pub func answer() -> i64:\n    let zero = 0\n    return 1 // zero\n")
     both_trap("pub func answer() -> i32:\n    let v: i32 = 1\n    return v << 32\n")
 
+# mark: Control flow ========================================================================
+
+pub func test_if_chains_lower_to_nested_if_regions():
+    let source = "pub func answer() -> i64:\n    let v = 2\n    var r = 0\n    if v == 1:\n        r = 10\n    elif v == 2:\n        r = 20\n    else:\n        r = 30\n    return r\n"
+    let function = only_function(lowered(source))
+    var found = false
+    for instruction in function.body:
+        match instruction.form:
+            If(condition, results, then_body, else_body):
+                found = true
+                assert(len(results) == 0)
+                # then: Const 10, Store; else: the `elif` condition (Load,
+                # Const, Binary eq) and the nested If.
+                assert(len(then_body) == 2)
+                assert(len(else_body) == 4)
+                match else_body[3].form:
+                    If(inner_condition, inner_results, inner_then, inner_else):
+                        assert(len(inner_then) == 2)
+                        assert(len(inner_else) == 2)
+                    else: assert(false)
+            else: continue
+    assert(found)
+    assert(agree(source) == "20")
+    assert(agree("pub func answer() -> i64:\n    let v = 1\n    var r = 0\n    if v == 1:\n        r = 10\n    elif v == 2:\n        r = 20\n    else:\n        r = 30\n    return r\n") == "10")
+    assert(agree("pub func answer() -> i64:\n    let v = 3\n    var r = 0\n    if v == 1:\n        r = 10\n    elif v == 2:\n        r = 20\n    else:\n        r = 30\n    return r\n") == "30")
+    assert(agree("pub func answer() -> i64:\n    var r = 5\n    if false:\n        r = 1\n    return r\n") == "5")
+
+pub func test_bindings_inside_arms_get_prologue_slots():
+    let source = "pub func answer() -> i64:\n    var r = 0\n    if true:\n        let inner = 7\n        r = inner\n    while r < 10:\n        let step = 1\n        r += step\n    return r\n"
+    let function = only_function(lowered(source))
+    assert(len(function.slots) == 3)
+    match function.body[0].form:
+        Alloca(result, slot): assert(slot == 0)
+        else: assert(false)
+    match function.body[2].form:
+        Alloca(result, slot): assert(slot == 2)
+        else: assert(false)
+    assert(agree(source) == "10")
+
+pub func test_while_lowers_to_a_block_around_a_loop():
+    let source = "pub func answer() -> i64:\n    var i = 0\n    while i < 3:\n        i += 1\n    return i\n"
+    let function = only_function(lowered(source))
+    var found = false
+    for instruction in function.body:
+        match instruction.form:
+            Block(results, block_body):
+                found = true
+                assert(len(results) == 0)
+                assert(len(block_body) == 1)
+                match block_body[0].form:
+                    Loop(loop_body):
+                        # condition (Load, Const, Binary), bool_not, BrIf 1, body, Br 0
+                        match loop_body[3].form:
+                            Unary(result, operation, operand): assert(operation == UnaryOp.bool_not)
+                            else: assert(false)
+                        match loop_body[4].form:
+                            BrIf(condition, depth, values):
+                                assert(depth == 1)
+                                assert(len(values) == 0)
+                            else: assert(false)
+                        match loop_body[len(loop_body) - 1].form:
+                            Br(depth, values): assert(depth == 0)
+                            else: assert(false)
+                    else: assert(false)
+            else: continue
+    assert(found)
+    assert(agree(source) == "3")
+
+pub func test_break_and_continue_count_every_region_between():
+    # `continue` directly in the loop body branches to the Loop (0); `break`
+    # to the Block (1). Inside one If arm both are one deeper.
+    let source = "pub func answer() -> i64:\n    var i = 0\n    var sum = 0\n    while true:\n        i += 1\n        if i > 10:\n            break\n        if i % 2 == 0:\n            continue\n        sum += i\n    return sum\n"
+    let function = only_function(lowered(source))
+    var break_depth = -1
+    var continue_depth = -1
+    for instruction in function.body:
+        match instruction.form:
+            Block(results, block_body):
+                match block_body[0].form:
+                    Loop(loop_body):
+                        for item in loop_body:
+                            match item.form:
+                                If(condition, if_results, then_body, else_body):
+                                    match then_body[0].form:
+                                        Br(depth, values):
+                                            if break_depth < 0: break_depth = depth
+                                            else: continue_depth = depth
+                                        else: continue
+                                else: continue
+                    else: assert(false)
+            else: continue
+    assert(break_depth == 2)
+    assert(continue_depth == 1)
+    assert(agree(source) == "25")
+    # Nested loops: break inside an if inside the inner loop leaves only the
+    # inner loop; the outer loop keeps going.
+    let nested = "pub func answer() -> i64:\n    var outer = 0\n    var count = 0\n    while outer < 3:\n        outer += 1\n        var inner = 0\n        while true:\n            inner += 1\n            if inner == 2:\n                if true:\n                    break\n            count += 1\n    return count\n"
+    var deepest = -1
+    for instruction in only_function(lowered(nested)).body:
+        match instruction.form:
+            Block(results, block_body): deepest = deepest_break(block_body)
+            else: continue
+    assert(deepest == 3)
+    assert(agree(nested) == "3")
+
+pub func test_loops_agree_with_the_oracle():
+    assert(agree("pub func answer() -> i64:\n    var n = 10\n    var sum = 0\n    var i = 1\n    while i <= n:\n        sum += i\n        i += 1\n    return sum\n") == "55")
+    assert(agree("pub func answer() -> i64:\n    var n = 5\n    while n > 0:\n        n -= 1\n    return n\n") == "0")
+    assert(agree("pub func answer() -> i64:\n    var i = 0\n    var hits = 0\n    while i < 20:\n        i += 1\n        if i % 3 != 0:\n            continue\n        if i > 15:\n            break\n        hits += 1\n    return hits\n") == "5")
+    assert(agree("pub func answer() -> i64:\n    var limit = 1\n    var steps = 0\n    while steps < limit:\n        steps += 1\n        if limit < 8:\n            limit *= 2\n    return steps\n") == "8")
+    assert(agree("pub func answer() -> i64:\n    var a = 0\n    var b = 1\n    var i = 0\n    while i < 10:\n        let next = a + b\n        a = b\n        b = next\n        i += 1\n    return a\n") == "55")
+    assert(agree("pub func answer() -> i64:\n    var i = 0\n    var total = 0\n    while i < 3:\n        var j = 0\n        while j < 4:\n            total += i * j\n            j += 1\n        i += 1\n    return total\n") == "18")
+    assert(agree("pub func answer() -> bool:\n    var i = 0\n    while i < 100:\n        i += 7\n    return i == 105\n") == "true")
+
+pub func test_early_return_from_inside_a_loop_inside_an_if():
+    let source = "pub func answer() -> i64:\n    let flag = true\n    if flag:\n        var i = 0\n        while true:\n            i += 1\n            if i == 4:\n                return i * 10\n    return -1\n"
+    assert(agree(source) == "40")
+    assert(agree("pub func answer() -> i64:\n    var i = 0\n    while i < 5:\n        if i == 3:\n            return i\n        i += 1\n    return 99\n") == "3")
+
+pub func test_function_ends_get_the_terminator_the_verifier_needs():
+    # Every arm returns: the verifier's `terminates` sees through the If
+    # chain, so nothing is appended and the If is the last instruction.
+    let all_arms = "pub func answer() -> i64:\n    let v = 1\n    if v == 1:\n        return 10\n    else:\n        return 20\n"
+    let function = only_function(lowered(all_arms))
+    match function.body[len(function.body) - 1].form:
+        If(condition, results, then_body, else_body): assert(true)
+        else: assert(false)
+    assert(agree(all_arms) == "10")
+    # A trailing return needs nothing appended.
+    let trailing = only_function(lowered("pub func answer() -> i64:\n    if true:\n        return 1\n    return 2\n"))
+    match trailing.body[len(trailing.body) - 1].form:
+        Return(values): assert(true)
+        else: assert(false)
+    # A unit function ending in a loop gets `Return []`.
+    let unit = only_function(lowered("pub func answer():\n    var i = 0\n    while i < 2:\n        i += 1\n"))
+    match unit.body[len(unit.body) - 1].form:
+        Return(values): assert(len(values) == 0)
+        else: assert(false)
+    assert(agree("pub func answer():\n    var i = 0\n    while i < 2:\n        i += 1\n") == "unit")
+
+pub func test_loops_trap_on_both_executions_when_arithmetic_overflows():
+    both_trap("pub func answer() -> i8:\n    var v: i8 = 0\n    while true:\n        v += 1\n    return v\n")
+
+# The greatest `Br` depth anywhere under a body, for nested-loop checks.
+pub func deepest_break(body: list[MirInstruction]) -> i64:
+    var deepest = -1
+    for instruction in body:
+        match instruction.form:
+            Br(depth, values):
+                if depth > deepest: deepest = depth
+            Block(results, inner): deepest = larger(deepest, deepest_break(inner))
+            Loop(inner): deepest = larger(deepest, deepest_break(inner))
+            If(condition, results, then_body, else_body):
+                deepest = larger(deepest, deepest_break(then_body))
+                deepest = larger(deepest, deepest_break(else_body))
+            else: continue
+    return deepest
+
+pub func larger(a: i64, b: i64) -> i64:
+    if a > b: return a
+    return b
+
 # mark: Diagnostics =========================================================================
 
 pub func test_unsupported_lowering_names_the_function_and_feature():
@@ -412,8 +574,6 @@ pub func test_unsupported_lowering_names_the_function_and_feature():
     assert(reason == "main.luc:1:1: lowerer does not support parameters yet in `main.identity`")
 
 pub func test_unsupported_lowering_reports_the_offending_node_span():
-    let statement_source = "pub func answer() -> i64:\n    while true:\n        return 1\n    return 0\n"
-    assert(lowering_failure(statement_source) == "main.luc:2:5: lowerer does not support statement `WhileStatement` yet in `main.answer`")
     let expression_source = "pub func answer() -> i64:\n    let pair = (1, 2)\n    return 0\n"
     assert(lowering_failure(expression_source) == "main.luc:2:5: lowerer does not support type `(i64, i64)` yet in `main.answer`")
 

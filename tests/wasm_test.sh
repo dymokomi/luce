@@ -138,6 +138,85 @@ check short_or 1
 check chars 1
 check floats 1
 
+# Slice 3b: loops, branches, early exits.
+cat > "$test_dir/flow.luc" <<'LUCE'
+pub func sum_to_ten() -> i64:
+    var total = 0
+    var i = 1
+    while i <= 10:
+        total += i
+        i += 1
+    return total
+pub func break_continue() -> i64:
+    var i = 0
+    var hits = 0
+    while true:
+        i += 1
+        if i > 100: break
+        if i % 2 == 0: continue
+        hits += 1
+    return hits
+pub func nested() -> i64:
+    var outer = 0
+    var count = 0
+    while outer < 5:
+        outer += 1
+        var inner = 0
+        while inner < 5:
+            inner += 1
+            if inner == 3: break
+            if outer == 2: continue
+            count += 1
+    return count
+pub func chain() -> i64:
+    let x = 7
+    if x < 3:
+        return 1
+    elif x < 6:
+        return 2
+    elif x < 9:
+        return 3
+    else:
+        return 4
+pub func early_return() -> i64:
+    var i = 0
+    while i < 1000:
+        if i * i > 300:
+            if i % 2 == 1:
+                return i
+        i += 1
+    return -1
+pub func fibonacci() -> i64:
+    var a = 0
+    var b = 1
+    var n = 0
+    while n < 30:
+        let next = a + b
+        a = b
+        b = next
+        n += 1
+    return a
+pub func collatz() -> i64:
+    var n = 27
+    var steps = 0
+    while n != 1:
+        if n % 2 == 0:
+            n //= 2
+        else:
+            n = 3 * n + 1
+        steps += 1
+    return steps
+LUCE
+"$cli" build "$test_dir/flow.wasm" "$test_dir/flow.luc" >/dev/null
+flow() { expect 0 "$2" wasmtime run --invoke "flow.$1" "$test_dir/flow.wasm"; }
+flow sum_to_ten 55
+flow break_continue 50
+flow nested 8
+flow chain 3
+flow early_return 19
+flow fibonacci 832040
+flow collatz 111
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:
