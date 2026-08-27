@@ -3,13 +3,31 @@
 #   parser - Tokens into source syntax
 #
 #   DESCRIPTION:
-#       Reads one token stream from top to bottom and builds the source syntax tree.
-#       The parser follows the grammar from broadest construct to smallest:
+#       Reads one token stream from top to bottom and builds the source tree
+#       defined in `syntax.luc`. The grammar it implements is the one in
+#       `docs/language/1.0.md`; section numbers in this file refer to it.
+#       The class follows the grammar from broadest construct to smallest,
+#       and the marks below are its chapters:
 #
-#       module -> declarations -> statements -> types -> expressions -> tokens
+#       Module -> Declarations -> C boundary declarations -> Declaration details
+#       -> Suites and statements -> Match patterns -> Types
+#       -> Expression precedence -> Primary expressions -> Arguments and subscripts
+#       -> Token stream and diagnostics -> Expression lookahead -> Parser tables
 #
-#       Public use begins at `Parser.parse`. Cursor movement, lookahead, spans,
-#       and diagnostics stay private at the bottom of the class.
+#       Public use begins at `Parser.parse`. Three pieces of state shape how
+#       every rule below decides where a construct ends:
+#
+#       - `in_inline_suite` is set while parsing the one-statement suite of
+#         `if ready: return value`, so the statement may end at a closing
+#         delimiter instead of a newline and may not open another suite.
+#       - `expression_limit` is a token index a slice bound must stop at, so
+#         `xs[a..<b]` parses `a` and `b` as two bounded expressions.
+#       - `expression_has_ended` combines both with the layout tokens the
+#         tokenizer emitted: an expression is over once a newline or dedent
+#         has been consumed, or the limit is reached.
+#
+#       Cursor movement, lookahead, spans, and diagnostics stay private at the
+#       bottom of the class; pure tables and predicates sit after it.
 #
 #==============================================================================================
 
@@ -34,6 +52,8 @@ from compiler.syntax import TypeArgumentSyntax, TypeForm, TypeMemberKind, TypeMe
 import std.strings
 
 # A declaration owns a body; an interface member ends after its signature.
+# `parse_type_member` uses the same distinction to reject `pub` and fields
+# inside an interface, where every member is a required signature.
 enum FunctionForm:
     definition
     signature
@@ -69,7 +89,6 @@ pub class Parser:
 
         let end = try self.expect_kind(TokenKind.eof, "end of file")
         return ModuleSyntax(
-            tokens = self.tokens,
             documentation = documentation,
             imports = imports,
             declarations = declarations,
@@ -78,7 +97,8 @@ pub class Parser:
 
     # A `##` block at the top of the file documents the module when it stands
     # apart from what follows: a blank line, an import, or nothing at all. A
-    # block touching the first declaration documents that declaration instead.
+    # block touching the first declaration documents that declaration instead;
+    # `parse_documentation` below enforces that touching rule for declarations.
     func parse_module_documentation() -> list[str]!:
         if not self.at_kind(TokenKind.doc_comment):
             return list[str]()
@@ -124,6 +144,10 @@ pub class Parser:
 
     # mark: Declarations ========================================================================
 
+    # One branch per declaration keyword, in the order section 28.1 lists
+    # them: `let`, `type`, `func`, `struct`/`class`, `enum`, `interface`,
+    # `test`, `export`, `extern`. Each branch parses its body and wraps it in
+    # a `DeclarationSyntax` carrying the shared documentation and `pub` flag.
     func parse_declaration() -> DeclarationSyntax!:
         let documentation = try self.parse_documentation()
         let start = self.current()
@@ -706,6 +730,9 @@ pub class Parser:
 
     # mark: Declaration details ================================================================
 
+    # Declaration documentation must touch the declaration it describes, so a
+    # blank line separates commentary from documentation without a marker.
+    # The module-level exception is `parse_module_documentation` above.
     func parse_documentation() -> list[str]!:
         let lines = try self.read_documentation_lines()
         if len(lines) > 0 and self.current().span.line != self.previous().span.line + 1:
@@ -1206,6 +1233,19 @@ pub class Parser:
         ), span = self.span_from(start))
 
     # mark: Expression precedence ================================================================
+    #
+    # Each layer below parses its own operators and calls the next tighter
+    # layer for operands, loosest first:
+    #
+    #   catch          `value catch failure: ...`      parse_expression
+    #   else           `optional else fallback`        parse_else_expression
+    #   if/else        `a if condition else b`         parse_conditional_expression
+    #   binary         `or` ... `*` by section 28.4    parse_binary_expression
+    #   unary          `not`, `-`, `+`, `~`, `try`     parse_unary_expression
+    #   postfix        `.member`, `(args)`, `[index]`  parse_postfix_expression
+    #
+    # Primary expressions (literals, names, groups, lambdas) follow in the
+    # next mark.
 
     func parse_expression() -> ExpressionSyntax!:
         let start = self.current()
@@ -1261,6 +1301,8 @@ pub class Parser:
     func parse_binary_expression(minimum_precedence: i64) -> ExpressionSyntax!:
         let start = self.current()
         var left = try self.parse_unary_expression()
+        # Comparisons and ranges do not chain: `a < b < c` and `a..b..c` are
+        # errors rather than Python-style chains, so one of each per level.
         var used_comparison = false
         var used_range = false
 
@@ -1660,6 +1702,10 @@ pub class Parser:
     # first — a slice operator at depth one splits the subscript into two
     # bounded expression parses, while anything else, including a
     # parenthesized `(a..<b)` range value, stays an ordinary index.
+    #
+    # Only `..<` and `..` are slice operators (`find_slice_operator`). `..=`
+    # is range-only, so `xs[a..=b]` is an ordinary index by a range value —
+    # a deliberate grammar decision, not an oversight.
     func parse_subscript(value: ExpressionSyntax, start: Token) -> ExpressionSyntax!:
         let opening_index = self.position - 1
         let closing_index = self.find_matching_symbol(opening_index, "[", "]")
@@ -1703,6 +1749,10 @@ pub class Parser:
         ), span = self.span_from(start))
 
     # mark: Token stream and diagnostics =========================================================
+    #
+    # Three verbs recur throughout the class: `at_*` peeks without moving,
+    # `take_*` consumes the token only when it matches and reports whether it
+    # did, and `expect_*` consumes or fails with a diagnostic.
 
     func current() -> Token:
         return self.token_at(self.position)
@@ -1804,6 +1854,10 @@ pub class Parser:
     func at_closing_delimiter() -> bool:
         return self.at_symbol(")") or self.at_symbol("]") or self.at_symbol("}")
 
+    # An expression ends when a nested suite has already consumed the newline
+    # or dedent that closes it (a block closure or `match` written as an
+    # argument), or when a bounded slice part reaches its limit. Every
+    # precedence layer asks this before looking for another operator.
     func expression_has_ended() -> bool:
         if self.expression_limit >= 0 and self.position == self.expression_limit:
             return true
@@ -1873,6 +1927,10 @@ pub class Parser:
             return false
         return self.looks_like_type_start(self.position + 1, closing_index)
 
+    # The only place letter case carries meaning in the parser: after a core
+    # type name, `func`, or `(`, a generic argument must start with a
+    # capitalized (possibly dotted) type name, as section 3 requires of
+    # types. Anything else means `foo[0](...)` is an index, then a call.
     func looks_like_type_start(index: i64, limit: i64) -> bool:
         if index >= limit:
             return false
@@ -1945,6 +2003,7 @@ func is_ungrouped_logical_not(value: ExpressionSyntax) -> bool:
         Unary(operator, operand): return operator == "not"
         else: return false
 
+# The binary operator table of section 28.4, loosest first.
 func precedence_of(operator: str) -> i64:
     return match operator:
         "or" => 1

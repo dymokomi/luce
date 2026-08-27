@@ -11,6 +11,15 @@
 #       NOTE: macOS refuses to load an unsigned arm64 binary, so the raw bytes
 #       from `emit` will not run until `codesign` has touched the file.
 #
+#       Read the file in the order `emit` works: `find_executable_entry`
+#       picks `main`, `emit_code` turns its instructions into machine words
+#       through the small encoders under "ARM64 encoding", and the "Mach-O
+#       encoding" section wraps those words in the container. Even a 20-byte
+#       program needs eight load commands because dyld will not start an
+#       image without a page-zero guard, a text segment, an (empty) link-edit
+#       segment, dyld-info, the dynamic linker path, a platform version, an
+#       entry point, and at least one linked library.
+#
 #==============================================================================================
 
 from compiler.backend import ArtifactBackend
@@ -32,29 +41,42 @@ const load_build_version: i64 = 0x32
 const load_main: i64 = 0x80000028
 const load_dylib: i64 = 0x0C
 
-const text_address: i64 = 0x100000000
-const code_offset: i64 = 0x1000
-const page_size: i64 = 0x4000
+const text_address: i64 = 0x100000000     # where __TEXT is mapped
+const code_offset: i64 = 0x1000            # code begins one 4 KiB header page in
+const page_size: i64 = 0x4000              # Apple silicon uses 16 KiB pages
 
-# Pre-encoded instruction words: push/pop through x0, a `ldr` of the inline
-# text address, and `svc #0x80` for a system call.
-const push_x0: i64 = 0xF81F0FE0
-const pop_x0: i64 = 0xF84107E0
-const pop_x1: i64 = 0xF84107E1
-const address_inline_text: i64 = 0x100000A1
-const supervisor_call: i64 = 0xD4001001
-const add_x0_x1: i64 = 0x8B010000
-const add_w0_w1: i64 = 0x0B010000
-const sub_x0_x1: i64 = 0xCB010000
-const sub_w0_w1: i64 = 0x4B010000
-const mul_x0_x1: i64 = 0x9B017C00
-const mul_w0_w1: i64 = 0x1B017C00
+# Darwin system-call numbers and the registers each one reads: the number
+# goes in x16, arguments in x0-x2.
+const syscall_exit: i64 = 1
+const syscall_write: i64 = 4
+const stdout: i64 = 1
+const reg_x0: i64 = 0
+const reg_x2: i64 = 2
+const reg_syscall_x16: i64 = 16
+
+# Pre-encoded instruction words, each with its assembly spelling.
+const push_x0: i64 = 0xF81F0FE0            # str x0, [sp, #-16]!
+const pop_x0: i64 = 0xF84107E0             # ldr x0, [sp], #16
+const pop_x1: i64 = 0xF84107E1             # ldr x1, [sp], #16
+const address_inline_text: i64 = 0x100000A1  # adr x1, #+20 (the text after svc and b)
+const supervisor_call: i64 = 0xD4001001    # svc #0x80
+const add_x0_x1: i64 = 0x8B010000          # add x0, x0, x1
+const add_w0_w1: i64 = 0x0B010000          # add w0, w0, w1
+const sub_x0_x1: i64 = 0xCB010000          # sub x0, x0, x1
+const sub_w0_w1: i64 = 0x4B010000          # sub w0, w0, w1
+const mul_x0_x1: i64 = 0x9B017C00          # mul x0, x0, x1
+const mul_w0_w1: i64 = 0x1B017C00          # mul w0, w0, w1
+const branch_forward: i64 = 0x14000000     # b #+(imm26 * 4)
+const movz_base: i64 = 0xD2800000          # movz xN, #imm16
+const movk_shift_16: i64 = 0xF2A00000      # movk xN, #imm16, lsl #16
+const movk_shift_32: i64 = 0xF2C00000      # movk xN, #imm16, lsl #32
+const movk_shift_48: i64 = 0xF2E00000      # movk xN, #imm16, lsl #48
 
 # mark: The encoder ===========================================================================
 
 pub class Arm64MacosBackend: ArtifactBackend:
     pub init():
-        # Stateless; stage-0 requires one statement in an empty init.
+        # Stateless; Stage-0 requires one statement in an empty init.
         return
 
     ## Encode one canonical program as the bytes of a complete Mach-O executable.
@@ -84,6 +106,10 @@ pub class Arm64MacosBackend: ArtifactBackend:
 # Values use 16-byte stack slots, keeping the platform stack aligned without a
 # register allocator. Constant strings sit inline behind a branch, so neither
 # an assembler nor a relocation table is needed for this first slice.
+#
+# The stack-depth and `Return` checks re-prove invariants `MirVerifier` has
+# already established; they are defensive, so a verifier gap can never emit
+# a malformed executable silently.
 func emit_code(function: CanonicalFunction) -> list[u8]!:
     let code = list[u8]()
     var stack_depth = 0
@@ -109,21 +135,22 @@ func emit_code(function: CanonicalFunction) -> list[u8]!:
                 # entry function's return is the process exit status.
                 if stack_depth != 1: error("arm64-macos backend: `Return` needs one value in `" + function.name + "`")
                 append_word(code, pop_x0)
-                append_move(code, 16, 1)
+                append_move(code, reg_syscall_x16, syscall_exit)
                 append_word(code, supervisor_call)
                 stack_depth = 0
                 returned = true
     if not returned: error("arm64-macos backend: `" + function.name + "` has no `Return`")
     return code
 
-# Load a typed integer into x0/w0 and push it. i32 uses two 16-bit moves;
-# i64 uses four so the full two's-complement pattern is preserved.
+# Load a typed integer into x0/w0 and push it. `movz` sets the low 16 bits
+# and each `movk` keeps the rest while inserting the next 16: i32 needs two
+# words, i64 four, so the full two's-complement pattern is preserved.
 func append_constant(code: list[u8], value: i64, value_type: CanonicalType):
-    append_move(code, 0, value & 0xFFFF)
-    append_word(code, 0xF2A00000 | ((value >> 16) & 0xFFFF) << 5)
+    append_move(code, reg_x0, value & 0xFFFF)
+    append_word(code, movk_shift_16 | ((value >> 16) & 0xFFFF) << 5)
     if value_type == CanonicalType.signed_i64:
-        append_word(code, 0xF2C00000 | ((value >> 32) & 0xFFFF) << 5)
-        append_word(code, 0xF2E00000 | ((value >> 48) & 0xFFFF) << 5)
+        append_word(code, movk_shift_32 | ((value >> 32) & 0xFFFF) << 5)
+        append_word(code, movk_shift_48 | ((value >> 48) & 0xFFFF) << 5)
     append_word(code, push_x0)
 
 # Pop right then left, apply the 32-bit or 64-bit op, push the result.
@@ -142,84 +169,96 @@ func append_print(code: list[u8], text: str) -> !:
     if len(encoded) > 0xFFFF: error("arm64-macos backend: one `print` is limited to 65535 UTF-8 bytes")
     let padded_size = (len(encoded) + 3) // 4 * 4
 
-    append_move(code, 0, 1)
+    append_move(code, reg_x0, stdout)
     append_word(code, address_inline_text)
-    append_move(code, 2, len(encoded))
-    append_move(code, 16, 4)
+    append_move(code, reg_x2, len(encoded))
+    append_move(code, reg_syscall_x16, syscall_write)
     append_word(code, supervisor_call)
-    append_word(code, 0x14000000 | (1 + padded_size // 4))
+    # `b` over the inline text: the offset counts words from this branch, so
+    # it is the padded text length plus one for the branch itself.
+    append_word(code, branch_forward | (1 + padded_size // 4))
     append_all(code, encoded)
     # Instructions are 4-byte words, so pad the inline text to the next word.
     while len(code) % 4 != 0: code.append(0)
 
 # mark: ARM64 encoding ========================================================================
 
-# `movz register, #value` — load one 16-bit immediate.
+# `movz register, #value` — load one 16-bit immediate, zeroing the rest.
 func append_move(output: list[u8], register: i64, value: i64):
-    append_word(output, 0xD2800000 | (value & 0xFFFF) << 5 | register)
+    append_word(output, movz_base | (value & 0xFFFF) << 5 | register)
 
+# ARM64 instructions are fixed 32-bit little-endian words.
 func append_word(output: list[u8], value: i64):
     append_u32(output, value)
 
 # mark: Mach-O encoding =======================================================================
 
-func append_mach_header(output: list[u8]):
-    append_u32(output, mach_header_64)
-    append_u32(output, cpu_type_arm64)
-    append_u32(output, 0)
-    append_u32(output, mach_execute)
-    append_u32(output, 8)
-    append_u32(output, 400)
-    append_u32(output, executable_flags)
-    append_u32(output, 0)
+# The eight load commands that follow total 400 bytes:
+# 3 segments (72 each) + dyld-info 48 + dylinker 32 + build-version 24
+# + main 24 + dylib 56.
+const load_command_count: i64 = 8
+const load_commands_size: i64 = 216 + 48 + 32 + 24 + 24 + 56
 
+func append_mach_header(output: list[u8]):
+    append_u32(output, mach_header_64)          # magic
+    append_u32(output, cpu_type_arm64)          # cputype
+    append_u32(output, 0)                       # cpusubtype: all
+    append_u32(output, mach_execute)            # filetype
+    append_u32(output, load_command_count)      # ncmds
+    append_u32(output, load_commands_size)      # sizeofcmds
+    append_u32(output, executable_flags)        # flags: NOUNDEFS, DYLDLINK, TWOLEVEL, PIE
+    append_u32(output, 0)                       # reserved
+
+# `protection` is a VM_PROT mask: 1 read, 2 write, 4 execute.
 func append_segment(output: list[u8], name: str, address: i64, memory_size: i64, file_offset: i64, file_size: i64, protection: i64):
     append_u32(output, load_segment_64)
-    append_u32(output, 72)
-    append_fixed(output, name, 16)
-    append_u64(output, address)
-    append_u64(output, memory_size)
-    append_u64(output, file_offset)
-    append_u64(output, file_size)
-    append_u32(output, protection)
-    append_u32(output, protection)
-    append_u32(output, 0)
-    append_u32(output, 0)
+    append_u32(output, 72)                      # cmdsize
+    append_fixed(output, name, 16)              # segname
+    append_u64(output, address)                 # vmaddr
+    append_u64(output, memory_size)             # vmsize
+    append_u64(output, file_offset)             # fileoff
+    append_u64(output, file_size)               # filesize
+    append_u32(output, protection)              # maxprot
+    append_u32(output, protection)              # initprot
+    append_u32(output, 0)                       # nsects
+    append_u32(output, 0)                       # flags
 
 # An explicit empty dyld-info command prevents modern dyld from falling back
 # to the legacy relocation tables that this relocation-free image omits.
 func append_dyld_info(output: list[u8]):
     append_u32(output, load_dyld_info_only)
-    append_u32(output, 48)
-    for field in range(0, 10): append_u32(output, 0)
+    append_u32(output, 48)                      # cmdsize
+    for field in range(0, 10): append_u32(output, 0)  # five (offset, size) pairs, all empty
 
 func append_dylinker(output: list[u8]):
     append_u32(output, load_dylinker)
-    append_u32(output, 32)
-    append_u32(output, 12)
-    append_fixed(output, "/usr/lib/dyld", 20)
+    append_u32(output, 32)                      # cmdsize
+    append_u32(output, 12)                      # name offset within the command
+    append_fixed(output, "/usr/lib/dyld", 20)   # path, padded to the cmdsize
 
 func append_build_version(output: list[u8]):
     append_u32(output, load_build_version)
-    append_u32(output, 24)
-    append_u32(output, 1)
-    append_u32(output, 0x000B0000)
-    append_u32(output, 0)
-    append_u32(output, 0)
+    append_u32(output, 24)                      # cmdsize
+    append_u32(output, 1)                       # platform: macOS
+    append_u32(output, 0x000B0000)              # minos: 11.0 (xxxx.yy.zz packed)
+    append_u32(output, 0)                       # sdk: unspecified
+    append_u32(output, 0)                       # ntools
 
 func append_main(output: list[u8]):
     append_u32(output, load_main)
-    append_u32(output, 24)
-    append_u64(output, code_offset)
-    append_u64(output, 0)
+    append_u32(output, 24)                      # cmdsize
+    append_u64(output, code_offset)             # entryoff: file offset of the first instruction
+    append_u64(output, 0)                       # stacksize: default
 
+# dyld insists on at least one linked library; libSystem is the one every
+# process has anyway.
 func append_system_library(output: list[u8]):
     append_u32(output, load_dylib)
-    append_u32(output, 56)
-    append_u32(output, 24)
-    append_u32(output, 2)
-    append_u32(output, 0)
-    append_u32(output, 0x00010000)
+    append_u32(output, 56)                      # cmdsize
+    append_u32(output, 24)                      # name offset within the command
+    append_u32(output, 2)                       # timestamp
+    append_u32(output, 0)                       # current_version
+    append_u32(output, 0x00010000)              # compatibility_version: 1.0.0
     append_fixed(output, "/usr/lib/libSystem.B.dylib", 32)
 
 # mark: Byte plumbing =========================================================================

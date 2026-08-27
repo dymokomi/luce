@@ -1,6 +1,8 @@
 #!/bin/sh
 # Exercise the `luce` command line on any host: exit statuses, usage, and
 # that every failure path prints its diagnostic instead of trapping.
+# Like the native smoke tests, it builds its own `luce` from src/ with the
+# Stage-0 compiler given as the first argument.
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -54,6 +56,6 @@ expect 1 "module \`main\` has no function \`nope\`" "$cli" run main.nope "$test_
 expect 1 "unknown module \`other\`" "$cli" run other.main "$test_dir/main.luc"
 
 expect 0 "built $test_dir/out.wasm" "$cli" build "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 1 "executable needs one public \`main\`" "$cli" build --target arm64-macos "$test_dir/out" examples/compiled_core/main.luc
+expect 1 "executable: needs one public \`main\`" "$cli" build --target arm64-macos "$test_dir/out" examples/compiled_core/main.luc
 
 echo "cli: ok"

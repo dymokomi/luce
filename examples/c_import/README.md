@@ -14,7 +14,8 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The C path currently stops after parsing, before FIIR generation, native
-binding, or linking. Until those stages land, validate the two source sides
+binding, or linking (the stages are specified in `docs/language/1.0.md`
+§21). Until those stages land, validate the two source sides
 independently:
 
 ```sh

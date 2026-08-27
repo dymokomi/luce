@@ -3,10 +3,9 @@
 The target is the 1.0 source surface in `docs/language/1.0.md` §28.6.
 Every syntax-tree form accepted by the current tokenizer and parser appears in
 at least one parser-checked example. Runtime guarantees, package resolution, and
-excluded syntax are outside this parser-era coverage claim. The
-narrower `semantic_core/` fixture is checked and interpreted. `compiled_core/`
-and `hello.luc` share the compiled slice: integer arithmetic, `print`, and
-`return`, encoded as WebAssembly or a native executable.
+excluded syntax are outside this parser-era coverage claim. Which examples
+also run or compile is defined once, under "What works today" in the
+[top-level README](../README.md).
 
 | Surface | Examples |
 | --- | --- |

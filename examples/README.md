@@ -1,11 +1,11 @@
 # Examples
 
 These programs target the 1.0 language in `docs/language/1.0.md`. Every
-example is parser-checked; `semantic_core/` also passes through the current
-name-resolution, type-checking, and interpreter slice. `compiled_core/` and
-`hello.luc` share one compiled language (integer arithmetic, `print`, and
-`return`); WebAssembly exports public functions, while native executables
-start at `main`.
+example is parser-checked; `semantic_core/` also passes through HIR
+generation and the interpreter, and `compiled_core/` and `hello.luc` compile
+to artifacts. "What works today" in the [top-level README](../README.md)
+defines those slices; each example's leading comment names the slice it
+belongs to.
 
 - `hello.luc` is the smallest native executable; it also builds as WebAssembly.
 - `semantic_core/` is the small multi-module function-and-control-flow slice
@@ -32,9 +32,12 @@ Declarations without `pub` are intentionally module-private. Build the
 
 ```sh
 ./build/luce check examples/semantic_core/math.luc examples/semantic_core/main.luc
-./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
+./build/luce run main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc   # prints 42
 ./build/luce build build/answer.wasm examples/compiled_core/main.luc
 ./build/luce build --target arm64-macos build/hello examples/hello.luc
-./build/hello
+./build/hello                                                                                 # prints Hello, world!
 ./stage0/bin/luce-0 test tests/compiler/examples_test.luc
 ```
+
+`luce.toml` in this directory declares the C binding target used by
+`c_import/`; nothing else reads it yet.

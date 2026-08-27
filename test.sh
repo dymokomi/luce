@@ -9,12 +9,20 @@ cd "$repo_root"
 # libluce_rt.a can be an older version missing symbols this compiler emits.
 unset LUCE_LIB
 
-# Prefer the fast-codegen compiler (O1 + FastISel) for the edit/test loop;
-# fall back to the shipping luce-0 when it is not installed.
+# Prefer a locally built fast-codegen compiler (O1 + FastISel) for the
+# edit/test loop; the shipped archive contains only luce-0.
 luce=./stage0/bin/luce-0-fast
 [ -x "$luce" ] || luce=./stage0/bin/luce-0
+
+# 1. Unit tests: every tests/compiler/**/*_test.luc file.
 "$luce" test
+
+# 2. Command-line contract: exit statuses, usage, and that every failure
+#    path prints its diagnostic (tests/cli_test.sh).
 ./tests/cli_test.sh ./stage0/bin/luce-0
+
+# 3. Native smoke test: build the compiler, build hello.luc for this host,
+#    and run it.
 
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     ./tests/arm64_macos_test.sh ./stage0/bin/luce-0

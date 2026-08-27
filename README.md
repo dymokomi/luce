@@ -17,7 +17,7 @@ end-to-end slices. Unsupported features fail with a clear diagnostic.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.21, the seed compiler for the current machine, and verifies its
+Stage-0 0.22, the seed compiler for the current machine, and verifies its
 checksum. `./stage0` is that downloaded toolchain, not this repository's source.
 
 ```sh
@@ -25,6 +25,8 @@ checksum. `./stage0` is that downloaded toolchain, not this repository's source.
 ./build.sh
 ./test.sh
 ```
+
+`stage0/VERSION` reports the installed toolchain version.
 
 The compiler is now available at `build/luce`. It can check source files, run a
 function through the HIR interpreter, or build an artifact:
@@ -44,7 +46,27 @@ Native output is also available for Apple silicon macOS and x86-64 Linux:
 
 Use the target that matches the machine where the executable will run.
 
+## Vocabulary
+
+A few terms recur in the source and in this README:
+
+- **Stage-0** — the frozen seed compiler in `./stage0` that builds this
+  repository. The compiler source must stay inside the language subset it
+  understands until Luce can build itself.
+- **HIR** — the High-level Intermediate Representation: source after names and
+  types have meaning (`src/compiler/hir.luc`). The interpreter runs it directly.
+- **MIR / canonical IR** — the flat, target-independent instruction stream the
+  compiled backends consume (`src/compiler/canonical_ir.luc`).
+- **Slice** — the part of the 1.0 language a stage implements today. The parser
+  covers most of 1.0; HIR generation, the interpreter, and the compiled path
+  each cover a smaller, growing slice.
+- **Artifact** — the bytes `luce build` writes: a WebAssembly module or a
+  native executable.
+
 ## What works today
+
+This section is the single description of what each stage implements; the
+examples and tests link back here rather than restating it.
 
 - The tokenizer and parser cover most of the planned 1.0 grammar, including
   indentation-based layout, declarations, types, control flow, patterns,
@@ -68,20 +90,37 @@ The parser is ahead of HIR generation and backends. A
 program appearing in the language tour does not necessarily mean every stage
 can execute it yet.
 
+## Running and adding tests
+
+`./test.sh` runs everything: the unit tests, the command-line contract, and a
+native smoke test on a supported host. To run one file:
+
+```sh
+./stage0/bin/luce-0 test tests/compiler/parser_test.luc
+```
+
+A test is a zero-argument `pub func test_*` function; Stage-0 discovers them
+by name. `tests/luce.yaml` maps the `luce.compiler.*` imports used by the tests
+onto `../src`, so tests exercise the compiler source directly. Add a new test
+next to the stage it proves, under the `# mark:` section that matches its
+topic.
+
 ## Where to go next
 
-- Read [the language design](docs/language/1.0.md) for the current 1.0
-  language. It is the specification, not a description of what happens to be
-  implemented today.
-- Read [the post-1.0 notes](docs/language/post-1.0.md) for ideas outside the
-  current language.
-- Browse [the examples](examples/README.md) to see the source language, the
-  executable semantic slice, and the small compiled slice.
-- Open [pipeline.luc](src/compiler/pipeline.luc) for the shortest useful tour of
-  the compiler. Its `build`, `check`, and `run` functions show how the stages fit
-  together.
-- Look under [tests/compiler](tests/compiler) for precise examples of what each
-  stage currently accepts, rejects, and produces.
+Read in this order; each stop hands off to the next.
+
+1. [docs/README.md](docs/README.md) introduces the two design documents.
+   [The language design](docs/language/1.0.md) is the 1.0 specification, not a
+   description of what happens to be implemented today; [the post-1.0
+   notes](docs/language/post-1.0.md) hold ideas outside the current language.
+2. [The examples](examples/README.md) show the source language, the
+   executable semantic slice, and the small compiled slice as runnable files.
+3. [pipeline.luc](src/compiler/pipeline.luc) is the shortest useful tour of
+   the compiler. Its `build`, `check`, and `run` functions show how the stages
+   fit together, and every stage file's header says where it sits.
+4. [tests/compiler](tests/compiler) holds precise examples of what each stage
+   currently accepts, rejects, and produces; each file's sections read as that
+   stage's specification.
 
 ## Finding your way around
 
@@ -98,7 +137,15 @@ can execute it yet.
   `optimizer.luc` form the target-independent compiled path.
 - `src/compiler/backends/` contains the WebAssembly, Mach-O, and ELF emitters.
 
-Compiler source must remain buildable by the Stage-0 language subset
-until Luce can reliably build itself without that seed compiler.
+## Contributing constraints
+
+- Compiler source must remain buildable by the Stage-0 language subset until
+  Luce can reliably build itself without that seed compiler. If Stage-0
+  rejects a construct, rewrite the construct rather than waiting for 1.0.
+- When Stage-0 miscompiles a construct, reproduce it in a five-line program,
+  fix Stage-0, and bump `bootstrap.sh`; do not work around it in the
+  compiler source.
+- Every stage fails with a `path:line:column:` diagnostic or a stage-prefixed
+  message for anything outside its slice; never let unsupported input trap.
 
 Luce is dual-licensed under Apache 2.0 and MIT. See [LICENSE](LICENSE).

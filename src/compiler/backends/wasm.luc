@@ -9,6 +9,14 @@
 #       imported `luce.write` plus a data payload; a host that can load the
 #       module supplies that write. Arithmetic-only modules stay import-free.
 #
+#       Read `emit` top-down: it writes the sections in the order the binary
+#       format requires — type, import, function, memory, export, code, data —
+#       and each `encode_*` below produces one section's payload. When a write
+#       import exists it is function 0 and type 0, so every defined function's
+#       index and type index shift by one; `defined_function_base` carries
+#       that shift everywhere an index is written. The LEB128 helpers at the
+#       end are the only byte-level plumbing.
+#
 #==============================================================================================
 
 from compiler.backend import ArtifactBackend
@@ -47,25 +55,30 @@ const opcode_end: u8 = 0x0B
 
 pub class WasmBackend: ArtifactBackend:
     pub init():
-        # Stateless; stage-0 requires one statement in an empty init.
+        # Stateless; Stage-0 requires one statement in an empty init.
         return
 
     ## Encode one canonical program as the bytes of a complete `.wasm` module.
     pub func emit(program: CanonicalProgram) -> list[u8]!:
         let writes = collect_writes(program)
         let type_map = collect_result_types(program)
+        let has_write = len(writes) > 0
+        let function_base = defined_function_base(has_write)
         let output = list[u8]()
+        # `\0asm`, then binary format version 1.
         append_all(output, [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
-        append_section(output, type_section, encode_type_entries(len(writes) > 0, type_map))
-        if len(writes) > 0:
+        append_section(output, type_section, encode_type_entries(has_write, type_map))
+        if has_write:
             append_section(output, import_section, encode_write_import())
-        append_section(output, function_section, encode_function_entries(program, type_map, len(writes) > 0))
-        if len(writes) > 0:
+        append_section(output, function_section, encode_function_entries(program, type_map, function_base))
+        if has_write:
             append_section(output, memory_section, encode_memory_entry())
-        let exports = encode_export_entries(program, import_function_count(len(writes) > 0))
+        let exports = encode_export_entries(program, function_base)
+        # A lone leading count byte means "no exports"; write the section only
+        # when something follows the count.
         if len(exports) > 1:
             append_section(output, export_section, exports)
-        append_section(output, code_section, encode_code_entries(program, writes, 0))
+        append_section(output, code_section, encode_code_entries(program, writes, write_function_index))
         if len(writes) > 0:
             append_section(output, data_section, encode_data_entries(writes))
         return output
@@ -110,29 +123,34 @@ func result_type_index(type_map: list[CanonicalType], result: CanonicalType) -> 
         index += 1
     return 0
 
-func import_function_count(has_write: bool) -> i64:
-    if has_write: return 1
+# Imports come before defined functions in WebAssembly's single function
+# index space, and the write import is also type 0. This one number is the
+# shift applied to every defined function's index and type index.
+const write_function_index: i64 = 0
+
+func defined_function_base(has_write: bool) -> i64:
+    if has_write: return write_function_index + 1
     return 0
 
-# Write import is type 0 when present; defined functions follow.
+# Type 0 is the write import `(i32, i32) -> ()` when present; each result
+# type in `type_map` then gets one `() -> T` entry in first-seen order.
 func encode_type_entries(has_write: bool, type_map: list[CanonicalType]) -> list[u8]:
     let entries = list[u8]()
-    var count = len(type_map)
-    if has_write: count += 1
-    append_unsigned(entries, count)
+    append_unsigned(entries, len(type_map) + defined_function_base(has_write))
     if has_write:
         entries.append(function_type_tag)
-        entries.append(0x02)
+        entries.append(0x02)                # two parameters: offset, length
         entries.append(i32_value_type)
         entries.append(i32_value_type)
-        entries.append(0x00)
+        entries.append(0x00)                # no results
     for result in type_map:
         entries.append(function_type_tag)
-        entries.append(0x00)
-        entries.append(0x01)
+        entries.append(0x00)                # no parameters
+        entries.append(0x01)                # one result
         entries.append(wasm_value_type(result))
     return entries
 
+# One import: module `luce`, name `write`, function of type 0.
 func encode_write_import() -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, 1)
@@ -142,26 +160,29 @@ func encode_write_import() -> list[u8]:
     append_unsigned(entries, 0)
     return entries
 
-func encode_function_entries(program: CanonicalProgram, type_map: list[CanonicalType], has_write: bool) -> list[u8]:
+# The function section only names each defined function's type index; the
+# bodies come later in the code section, in the same order.
+func encode_function_entries(program: CanonicalProgram, type_map: list[CanonicalType], function_base: i64) -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, len(program.functions))
-    var write_shift = 0
-    if has_write: write_shift = 1
     for function in program.functions:
-        append_unsigned(entries, result_type_index(type_map, function.result) + write_shift)
+        append_unsigned(entries, result_type_index(type_map, function.result) + function_base)
     return entries
 
+# One memory with a one-page (64 KiB) minimum and no maximum; it holds the
+# `WriteText` payloads placed by the data section.
 func encode_memory_entry() -> list[u8]:
     return [0x01, 0x00, 0x01]
 
-func encode_export_entries(program: CanonicalProgram, imported_functions: i64) -> list[u8]:
+# Public functions export under their canonical `module.function` name.
+func encode_export_entries(program: CanonicalProgram, function_base: i64) -> list[u8]:
     let entries = list[u8]()
     var export_count = 0
     for function in program.functions:
         if function.is_public: export_count += 1
     append_unsigned(entries, export_count)
 
-    var function_index = imported_functions
+    var function_index = function_base
     for function in program.functions:
         if function.is_public:
             append_name(entries, function.name)
@@ -170,14 +191,16 @@ func encode_export_entries(program: CanonicalProgram, imported_functions: i64) -
         function_index += 1
     return entries
 
+# One body per function: canonical instructions become their opcodes.
 # `write_index` is the next payload from `collect_writes`. Both functions
 # walk `program.functions` then `function.instructions` in the same order.
-func encode_code_entries(program: CanonicalProgram, writes: list[WritePayload], write_func: i64) -> list[u8]:
+func encode_code_entries(program: CanonicalProgram, writes: list[WritePayload], write_function: i64) -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, len(program.functions))
     var write_index = 0
     for function in program.functions:
         let body = list[u8]()
+        # Zero local declarations; operands live on the WASM stack.
         body.append(0x00)
         for instruction in function.instructions:
             match instruction:
@@ -195,19 +218,21 @@ func encode_code_entries(program: CanonicalProgram, writes: list[WritePayload], 
                     body.append(opcode_i32_const)
                     append_signed(body, len(payload.bytes))
                     body.append(opcode_call)
-                    append_unsigned(body, write_func)
+                    append_unsigned(body, write_function)
                 Return: body.append(opcode_return)
         body.append(opcode_end)
         append_unsigned(entries, len(body))
         append_all(entries, body)
     return entries
 
+# One active data segment per payload, each placed into memory 0 at its
+# packed offset when the module is instantiated.
 func encode_data_entries(writes: list[WritePayload]) -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, len(writes))
     for payload in writes:
-        entries.append(0x00)
-        entries.append(opcode_i32_const)
+        entries.append(0x00)                # active segment in memory 0
+        entries.append(opcode_i32_const)    # offset expression: `i32.const offset; end`
         append_signed(entries, payload.offset)
         entries.append(opcode_end)
         append_unsigned(entries, len(payload.bytes))
@@ -243,16 +268,19 @@ func wasm_multiply_opcode(value: CanonicalType) -> u8:
 
 # mark: LEB128 and byte plumbing ==============================================================
 
+# Every section is its id, its payload size, then the payload.
 func append_section(output: list[u8], section_id: u8, payload: list[u8]):
     output.append(section_id)
     append_unsigned(output, len(payload))
     append_all(output, payload)
 
+# A name is its UTF-8 length followed by the bytes.
 func append_name(output: list[u8], value: str):
     let encoded = strings.to_bytes(value)
     append_unsigned(output, len(encoded))
     append_all(output, encoded)
 
+# Unsigned LEB128: seven value bits per byte, high bit says "more follows".
 func append_unsigned(output: list[u8], number: i64):
     var value = number
     while value >= 0x80:
@@ -260,6 +288,8 @@ func append_unsigned(output: list[u8], number: i64):
         value = value >> 7
     output.append(u8(value))
 
+# Signed LEB128: same shape, but the sign lives in bit six of the last byte,
+# so an extra byte is emitted when that bit would read as the wrong sign.
 func append_signed(output: list[u8], number: i64):
     var value = number
     while true:

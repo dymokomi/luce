@@ -1,36 +1,20 @@
 # Documentation
 
-- [Luce 1.0 language](language/1.0.md) — the specification
-- [Post-1.0 platform](language/post-1.0.md) — deferred packages, C++, backends, and tooling
+- [Luce 1.0 language](language/1.0.md) — the specification. It describes the
+  whole 1.0 language; the implemented subset is listed under "What works
+  today" in the [top-level README](../README.md).
+- [Post-1.0 platform](language/post-1.0.md) — packages, C++, backends, and
+  tooling deferred past 1.0, under the same section numbers.
+- [Canonical MIR](compiler/mir.md) — the compiler's design record for the
+  machine representation every compiled backend consumes: the decisions,
+  the instruction set, and the order of work.
 
-## 1.0 contents
+The specification is organised from the executive decision and complexity
+budget, through source text, types, expressions, control flow, data modeling,
+failure, concurrency, modules, and native interoperability, to the runtime,
+tooling, exclusions, and a compact surface reference. See the headings in
+`1.0.md`; the surface reference at the end is the fastest orientation.
 
-0. Executive decision
-1. The permanent complexity budget
-2. Feature disposition at a glance
-3. Source text, layout, and names
-4. Lexical forms and literals
-5. Type system
-6. Bindings, assignment, and initialization
-7. Expressions and operators
-8. Functions and calls
-9. Control flow
-10. Value data modeling
-11. Reference identity and classes
-12. Allocation, storage, and collections
-13. Absence, failure, and traps
-14. Closures and capture
-15. Generics
-16. Interfaces and dynamic abstraction
-17. Closed standard protocols
-18. Effects (removed)
-19. Isolated concurrency
-20. Modules, packages, and visibility
-21. Native interoperability
-22. Standard library boundary
-23. Runtime, ABI, artifacts, and backends
-24. Tooling and diagnostic contract
-25. Deliberate exclusions
-26. Evolution
-27. Learning order
-28. Compact surface reference
+After the specification, [the examples](../examples/README.md) show the same
+language as runnable files, and [the tests](../tests/compiler) show what each
+compiler stage accepts today.
