@@ -14,6 +14,7 @@ unset LUCE_LIB
 luce=./stage0/bin/luce-0-fast
 [ -x "$luce" ] || luce=./stage0/bin/luce-0
 "$luce" test
+./tests/cli_test.sh ./stage0/bin/luce-0
 
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     ./tests/arm64_macos_test.sh ./stage0/bin/luce-0

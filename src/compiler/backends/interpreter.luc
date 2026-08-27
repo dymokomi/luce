@@ -10,15 +10,16 @@
 #
 #       Public use begins at `HirInterpreter.run`. Call frames, lexical scope,
 #       argument order, and control transfer stay private to one run, and
-#       evaluation trusts the checker completely: a shape the checker could not
+#       evaluation trusts HirGenerator completely: a shape it could not
 #       have produced is a trap here, never a user-facing error.
 #
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
-from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirExpression
+from compiler.hir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, HirExpression
 from compiler.hir import HirFunction, HirProgram, HirStatement, SymbolId, TypeId, UnaryOperation, Value
-from compiler.hir import resolve_builtin_type, types_match
+from compiler.hir import TypeTable, integer_bit_width, integer_maximum, integer_minimum
+from compiler.hir import is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.semantic_analyzer import AnalyzedProgram
 
 # mark: Run state =============================================================================
@@ -110,7 +111,7 @@ class HirInterpreterRun:
                 var assigned = right
                 match operation:
                     Replace: assigned = right
-                    Combine(binary): assigned = try evaluate_binary(bindings[index].value, binary, right)
+                    Combine(binary): assigned = try evaluate_binary(bindings[index].value, binary, right, self.program.types)
                 bindings[index] = Binding(symbol = symbol, value = assigned)
                 return Execution.Next
             PrintText(value):
@@ -148,10 +149,14 @@ class HirInterpreterRun:
             Constant(value): return value
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
-                if index < 0: trap("typed reference points outside its call frame")
-                return bindings[index].value
+                if index >= 0: return bindings[index].value
+                for constant in self.program.constants:
+                    if constant.symbol.value == symbol.value:
+                        # Initializers are literal trees; re-evaluating is lookup.
+                        return try self.evaluate(constant.value, list[Binding]())
+                trap("typed reference points outside its call frame")
             Unary(operation, operand):
-                return try evaluate_unary(operation, try self.evaluate(operand, bindings))
+                return try evaluate_unary(operation, try self.evaluate(operand, bindings), self.program.types)
             Binary(left, operation, right):
                 let left_value = try self.evaluate(left, bindings)
                 # `and` and `or` short-circuit: the right side must not run
@@ -163,7 +168,7 @@ class HirInterpreterRun:
                     LogicalOr:
                         if as_boolean(left_value): return Value.Boolean(value = true)
                         return Value.Boolean(value = as_boolean(try self.evaluate(right, bindings)))
-                    else: return try evaluate_binary(left_value, operation, try self.evaluate(right, bindings))
+                    else: return try evaluate_binary(left_value, operation, try self.evaluate(right, bindings), self.program.types)
             Conditional(value, condition, alternative):
                 if as_boolean(try self.evaluate(condition, bindings)):
                     return try self.evaluate(value, bindings)
@@ -175,6 +180,24 @@ class HirInterpreterRun:
                 for argument in arguments:
                     values[argument.parameter_index] = try self.evaluate(argument.value, bindings)
                 return try self.invoke(target, values)
+            Tuple(elements):
+                let items = list[BoxedValue]()
+                for element in elements:
+                    items.append(BoxedValue(value = try self.evaluate(element, bindings)))
+                return Value.Tuple(elements = items)
+            Element(value, index):
+                match try self.evaluate(value, bindings):
+                    Tuple(elements):
+                        if index < 0 or index >= len(elements): trap("tuple element index is out of range")
+                        return elements[index].value
+                    else: trap("tuple element applied to a non-tuple HIR value")
+            NoneLiteral: return Value.Absent
+            Some(value): return Value.Present(value = BoxedValue(value = try self.evaluate(value, bindings)))
+            ElseFallback(value, arm):
+                match try self.evaluate(value, bindings):
+                    Absent: return try self.evaluate(arm, bindings)
+                    Present(item): return item.value
+                    else: trap("`else` applied to a non-optional HIR value")
 
     # mark: Program lookup ======================================================================
 
@@ -218,7 +241,7 @@ func as_boolean(value: Value) -> bool:
 
 # Apply one resolved unary operation. For example, `NumericNegate(i64)` maps
 # integer 3 to -3 without consulting source `-` spelling.
-func evaluate_unary(operation: UnaryOperation, value: Value) -> Value!:
+func evaluate_unary(operation: UnaryOperation, value: Value, types: TypeTable) -> Value!:
     match operation:
         LogicalNot:
             match value:
@@ -231,7 +254,7 @@ func evaluate_unary(operation: UnaryOperation, value: Value) -> Value!:
                 else: trap("NumericIdentity received a non-numeric HIR value")
         NumericNegate(operand_type):
             match value:
-                Integer(item): return try checked_integer_result(-item, operand_type)
+                Integer(item): return try checked_integer_result(-item, operand_type, types)
                 Floating(item): return Value.Floating(value = -item)
                 else: trap("NumericNegate received a non-numeric HIR value")
         IntegerBitwiseNot(operand_type):
@@ -239,9 +262,9 @@ func evaluate_unary(operation: UnaryOperation, value: Value) -> Value!:
                 Integer(item): return Value.Integer(value = ~item)
                 else: trap("IntegerBitwiseNot received a non-integer HIR value")
 
-# Dispatch on the value family; the checker already guaranteed both sides
+# Dispatch on the value family; HirGenerator already guaranteed both sides
 # share it, so a mismatch here is a compiler bug, not a user error.
-func evaluate_binary(left: Value, operation: BinaryOperation, right: Value) -> Value!:
+func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, types: TypeTable) -> Value!:
     match left:
         Unit:
             match right:
@@ -253,11 +276,37 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value) -> V
                 else: trap("typed binary expression has unequal value types")
         Integer(left_value):
             match right:
-                Integer(right_value): return try evaluate_integer_binary(left_value, operation, right_value)
+                Integer(right_value): return try evaluate_integer_binary(left_value, operation, right_value, types)
                 else: trap("typed binary expression has unequal value types")
         Floating(left_value):
             match right:
                 Floating(right_value): return evaluate_float_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        Character(left_value):
+            match right:
+                Character(right_value): return evaluate_comparable_equality(str(left_value) == str(right_value), u32(left_value) < u32(right_value), operation)
+                else: trap("typed binary expression has unequal value types")
+        Text(left_value):
+            match right:
+                Text(right_value): return evaluate_text_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        Bytes(left_value):
+            match right:
+                Bytes(right_value): return evaluate_bytes_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        Tuple(left_value):
+            match right:
+                Tuple(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Absent:
+            match right:
+                Absent: return evaluate_optional_equality(true, operation)
+                Present(item): return evaluate_optional_equality(false, operation)
+                else: trap("typed binary expression has unequal value types")
+        Present(left_value):
+            match right:
+                Absent: return evaluate_optional_equality(false, operation)
+                Present(right_value): return try evaluate_binary(left_value.value, operation, right_value.value, types)
                 else: trap("typed binary expression has unequal value types")
 
 # Unit supports equality only; `unit == unit` is true.
@@ -275,21 +324,21 @@ func evaluate_boolean_binary(left: bool, operation: BinaryOperation, right: bool
         else: trap("boolean HIR values received a non-equality operation")
 
 # Apply resolved arithmetic, bitwise, equality, or ordering to integer values.
-func evaluate_integer_binary(left: i64, operation: BinaryOperation, right: i64) -> Value!:
+func evaluate_integer_binary(left: i64, operation: BinaryOperation, right: i64, types: TypeTable) -> Value!:
     match operation:
-        Add(operand_type): return try checked_integer_result(left + right, operand_type)
-        Subtract(operand_type): return try checked_integer_result(left - right, operand_type)
-        Multiply(operand_type): return try checked_integer_result(left * right, operand_type)
-        FloorDivide(operand_type): return try checked_integer_result(left // right, operand_type)
-        Remainder(operand_type): return try checked_integer_result(left % right, operand_type)
+        Add(operand_type): return try checked_integer_result(left + right, operand_type, types)
+        Subtract(operand_type): return try checked_integer_result(left - right, operand_type, types)
+        Multiply(operand_type): return try checked_integer_result(left * right, operand_type, types)
+        FloorDivide(operand_type): return try checked_integer_result(left // right, operand_type, types)
+        Remainder(operand_type): return try checked_integer_result(left % right, operand_type, types)
         BitwiseAnd(operand_type): return Value.Integer(value = left & right)
         BitwiseOr(operand_type): return Value.Integer(value = left | right)
         BitwiseXor(operand_type): return Value.Integer(value = left ^ right)
         ShiftLeft(operand_type):
-            try require_valid_shift(right, operand_type)
-            return Value.Integer(value = normalize_shift_left(left, right, operand_type))
+            try require_valid_shift(right, operand_type, types)
+            return Value.Integer(value = normalize_shift_left(left, right, operand_type, types))
         ShiftRight(operand_type):
-            try require_valid_shift(right, operand_type)
+            try require_valid_shift(right, operand_type, types)
             return Value.Integer(value = left >> right)
         Equal(operand_type): return Value.Boolean(value = left == right)
         NotEqual(operand_type): return Value.Boolean(value = left != right)
@@ -301,30 +350,92 @@ func evaluate_integer_binary(left: i64, operation: BinaryOperation, right: i64) 
 
 # Enforce the fixed width carried by HIR after a checked arithmetic operation.
 # For example, `2147483647i32 + 1i32` reports overflow.
-func checked_integer_result(value: i64, operand_type: TypeId) -> Value!:
-    if types_match(operand_type, resolve_builtin_type(BuiltinType.signed_i32)):
-        if value < -2147483647 - 1 or value > 2147483647:
-            error("interpreter: i32 arithmetic overflow")
+func checked_integer_result(value: i64, operand_type: TypeId, types: TypeTable) -> Value!:
+    if value < integer_minimum(types, operand_type) or value > integer_maximum(types, operand_type):
+        error("interpreter: integer arithmetic overflow")
     return Value.Integer(value = value)
 
 # Reject a shift count outside the resolved operand width before stage-0 can
 # apply its host-width behavior. For example, i32 counts must be in 0..<32.
-func require_valid_shift(count: i64, operand_type: TypeId) -> !:
-    var width = 64
-    if types_match(operand_type, resolve_builtin_type(BuiltinType.signed_i32)):
-        width = 32
+func require_valid_shift(count: i64, operand_type: TypeId, types: TypeTable) -> !:
+    let width = integer_bit_width(types, operand_type)
+    if width == 0: trap("shift applied to a non-integer HIR type")
     if count < 0 or count >= width:
         error("interpreter: shift count is outside integer width")
 
-# Model fixed-width i32 left shift while values are physically stored as i64.
+# Model fixed-width left shift while values are physically stored as i64.
 # `1i32 << 31i32`, for example, has the signed i32 value -2147483648.
-func normalize_shift_left(value: i64, count: i64, operand_type: TypeId) -> i64:
+func normalize_shift_left(value: i64, count: i64, operand_type: TypeId, types: TypeTable) -> i64:
     let shifted = value << count
-    if not types_match(operand_type, resolve_builtin_type(BuiltinType.signed_i32)):
-        return shifted
-    let bits = shifted & 4294967295
-    if bits > 2147483647: return bits - 4294967296
+    let width = integer_bit_width(types, operand_type)
+    if width == 0 or width == 64: return shifted
+    let mask = (1 << width) - 1
+    let bits = shifted & mask
+    if is_unsigned_integer_type(types, operand_type): return bits
+    let sign = 1 << (width - 1)
+    if bits >= sign: return bits - (mask + 1)
     return bits
+
+func evaluate_comparable_equality(equal: bool, less: bool, operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = equal)
+        NotEqual(operand_type): return Value.Boolean(value = not equal)
+        Less(operand_type): return Value.Boolean(value = less)
+        LessEqual(operand_type): return Value.Boolean(value = less or equal)
+        Greater(operand_type): return Value.Boolean(value = not less and not equal)
+        GreaterEqual(operand_type): return Value.Boolean(value = not less)
+        else: trap("ordered HIR values received a non-comparison operation")
+
+func evaluate_text_binary(left: str, operation: BinaryOperation, right: str) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        else: trap("string HIR values received a non-equality operation")
+
+func evaluate_bytes_binary(left: list[u8], operation: BinaryOperation, right: list[u8]) -> Value:
+    if len(left) != len(right):
+        match operation:
+            Equal(operand_type): return Value.Boolean(value = false)
+            NotEqual(operand_type): return Value.Boolean(value = true)
+            else: trap("bytes HIR values received a non-equality operation")
+    var index = 0
+    while index < len(left):
+        if left[index] != right[index]:
+            match operation:
+                Equal(operand_type): return Value.Boolean(value = false)
+                NotEqual(operand_type): return Value.Boolean(value = true)
+                else: trap("bytes HIR values received a non-equality operation")
+        index += 1
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = true)
+        NotEqual(operand_type): return Value.Boolean(value = false)
+        else: trap("bytes HIR values received a non-equality operation")
+
+func evaluate_tuple_binary(left: list[BoxedValue], operation: BinaryOperation, right: list[BoxedValue], types: TypeTable) -> Value!:
+    if len(left) != len(right): trap("typed tuples have unequal length")
+    var index = 0
+    while index < len(left):
+        # Equality does not read `operand_type`; the values already share a type.
+        let compared = try evaluate_binary(left[index].value, BinaryOperation.Equal(operand_type = TypeId(value = 0)), right[index].value, types)
+        match compared:
+            Boolean(equal):
+                if not equal:
+                    match operation:
+                        Equal(operand_type): return Value.Boolean(value = false)
+                        NotEqual(operand_type): return Value.Boolean(value = true)
+                        else: trap("tuple HIR values received a non-equality operation")
+            else: trap("tuple equality produced a non-boolean HIR value")
+        index += 1
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = true)
+        NotEqual(operand_type): return Value.Boolean(value = false)
+        else: trap("tuple HIR values received a non-equality operation")
+
+func evaluate_optional_equality(both_absent_or_equal: bool, operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = both_absent_or_equal)
+        NotEqual(operand_type): return Value.Boolean(value = not both_absent_or_equal)
+        else: trap("optional HIR values received a non-equality operation")
 
 # Apply resolved arithmetic, equality, or ordering to floating-point values.
 func evaluate_float_binary(left: f64, operation: BinaryOperation, right: f64) -> Value:

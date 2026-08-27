@@ -49,9 +49,10 @@ Use the target that matches the machine where the executable will run.
 - The tokenizer and parser cover most of the planned 1.0 grammar, including
   indentation-based layout, declarations, types, control flow, patterns,
   closures, generics, and the C boundary syntax.
-- The checker produces typed HIR with stable symbol and type identities. The
+- HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, bindings,
-  assignment, basic scalar operations, conditionals, loops, and returns.
+  assignment, scalars, strings, tuples, optionals, constants, type aliases,
+  conditionals, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - The compiled slice is one language — i32/i64 arithmetic, `print`, and
@@ -59,10 +60,11 @@ Use the target that matches the machine where the executable will run.
   or x86-64 ELF. Native executables still start at `main`; WebAssembly exports
   every public function.
 - The test suite exercises the frontend, semantic model, interpreter, lowering,
-  MIR verification, and each artifact encoder. On a supported native host it
-  also builds and runs a smoke-test executable.
+  MIR verification, each artifact encoder, and the command line's exit
+  statuses and diagnostics. On a supported native host it also builds and
+  runs a smoke-test executable.
 
-The parser is intentionally ahead of the semantic checker and backends. A
+The parser is ahead of HIR generation and backends. A
 program appearing in the language tour does not necessarily mean every stage
 can execute it yet.
 
@@ -87,10 +89,10 @@ can execute it yet.
 - `src/compiler/source.luc` is the shared source span and diagnostic format.
 - `src/compiler/tokenizer.luc`, `parser.luc`, and `syntax.luc` are the source
   frontend.
-- `src/compiler/checker.luc` and `hir.luc` turn source syntax into resolved,
+- `src/compiler/hir_gen.luc` and `hir.luc` turn source syntax into resolved,
   typed program meaning.
-- `src/compiler/semantic_analyzer.luc` is the home for flow, effect, and
-  ownership analysis as those checks are implemented.
+- `src/compiler/semantic_analyzer.luc` is the home for flow and ownership
+  analysis as those checks are implemented.
 - `src/compiler/backends/interpreter.luc` runs typed HIR directly.
 - `src/compiler/lowerer.luc`, `canonical_ir.luc`, `mir_verifier.luc`, and
   `optimizer.luc` form the target-independent compiled path.

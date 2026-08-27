@@ -32,5 +32,5 @@
 24. Tooling and diagnostic contract
 25. Deliberate exclusions
 26. Evolution
-28. Learning order
-29. Compact surface reference
+27. Learning order
+28. Compact surface reference

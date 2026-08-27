@@ -1,22 +1,23 @@
 #==============================================================================================
 #
-#   checker - Source syntax into typed HIR
+#   hir_gen - Source syntax into typed HIR
 #
 #   DESCRIPTION:
-#       The semantic stage. Resolves module and lexical names, checks the
-#       implemented type rules, and decodes literal spellings — turning source
-#       trees into typed HIR. The semantic analyzer and reference interpreter
-#       consume that HIR directly; the lowerer turns it into canonical MIR for
-#       compiled backends. Anything the current slice cannot check yet fails
-#       explicitly with "not implemented yet".
+#       Turns source trees into typed HIR: resolves module and lexical names,
+#       checks the implemented type rules, and decodes literal spellings. The
+#       semantic analyzer and reference interpreter consume that HIR directly;
+#       the lowerer turns it into canonical MIR for compiled backends.
+#       Anything the current slice cannot generate yet fails with
+#       "not implemented yet".
 #
-#       Checking runs in two passes: signatures are collected across every
+#       Generation runs in two passes: signatures are collected across every
 #       module first, so bodies can call forward and across modules; then each
-#       body is checked in order. Topics inside this file — and the split to
-#       make when a section grows — are modules and imports, signatures,
-#       functions and statements, expressions, literal decoding, and name
-#       lookup. Language-defined type spellings live in `core_types.luc`; the
-#       names this slice can actually check live in `builtin_type_id`.
+#       body is generated in order. Topics inside this file — and the split to
+#       make when a section grows — are modules and imports, aliases,
+#       constants, signatures, functions and statements, expressions, literal
+#       decoding, and name lookup. Language-defined type spellings live in
+#       `core_types.luc`; the names this slice can actually generate live in
+#       `builtin_type_id`.
 #
 #       Two failure idioms, shared with the parser: `try self.fail(...)` raises
 #       mid-flow, and a match arm or function tail that cannot continue ends
@@ -26,22 +27,22 @@
 
 from compiler.core_types import is_core_type_name
 from compiler.source import SourceSpan, format_diagnostic
-from compiler.syntax import ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax
+from compiler.syntax import ArgumentSyntax, BindingPatternSyntax, ConstantSyntax, ExpressionSyntax
 from compiler.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, StatementSyntax
-from compiler.syntax import SuiteSyntax, TypeArgumentSyntax, TypeSyntax
+from compiler.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.tokenizer import Token, TokenKind
 from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType
-from compiler.hir import HirArgument, HirExpression, HirExpressionForm, HirFunction, HirIfBranch
+from compiler.hir import HirArgument, HirConstant, HirExpression, HirExpressionForm, HirFunction, HirIfBranch
 from compiler.hir import HirModule, HirParameter, HirProgram, HirStatement, HirStatementForm
-from compiler.hir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeId, TypeTable
+from compiler.hir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir import UnaryOperation, Value, create_builtin_type_table
-from compiler.hir import describe_type, is_floating_type
-from compiler.hir import is_integer_type, is_numeric_type, is_ordered_type
-from compiler.hir import resolve_builtin_type, types_match
+from compiler.hir import describe_type, integer_maximum, integer_minimum
+from compiler.hir import is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
+from compiler.hir import is_unsigned_integer_type, resolve_builtin_type, type_forms_match, types_match
 
-# mark: Checker state =========================================================================
+# mark: HirGenerator state ====================================================================
 
-## One parsed file with the identity supplied by its caller. The checker never
+## One parsed file with the identity supplied by its caller. This stage never
 ## guesses module identity from import spelling or source contents.
 pub struct SourceModule:
     pub name: str
@@ -81,7 +82,27 @@ struct LocalBinding:
     pub value_type: TypeId
     pub is_mutable: bool
 
-# The checker resolves source operator spelling and result typing together, so
+# One module-level `type Name = T` waiting to be resolved, or already resolved.
+struct CollectedAlias:
+    module_index: i64
+    name: str
+    is_public: bool
+    syntax: TypeAliasSyntax
+    span: SourceSpan
+    resolved: TypeId?
+
+# One module-level constant. `typed` is filled after signatures exist.
+struct CollectedConstant:
+    symbol: SymbolId
+    module_index: i64
+    name: str
+    is_public: bool
+    annotation: TypeSyntax?
+    value: ExpressionSyntax
+    span: SourceSpan
+    typed: HirExpression?
+
+# This stage resolves source operator spelling and result typing together, so
 # no later HIR consumer needs to repeat either half of the operator table.
 struct ResolvedBinary:
     pub operation: BinaryOperation
@@ -93,12 +114,18 @@ struct CheckedBinaryOperands:
     pub left: HirExpression
     pub right: HirExpression
 
-## Checks one whole program. Collection is internal so callers cannot run a
-## partial checker; public use begins and ends at `Checker.check`.
-pub class Checker:
+## Generates typed HIR for one whole program. Collection is internal so
+## callers cannot run a partial generation; public use begins and ends at
+## `HirGenerator.generate`.
+pub class HirGenerator:
     sources: list[SourceModule]
     types: TypeTable
     symbols: list[HirSymbol]
+    aliases: list[CollectedAlias]
+    constants: list[CollectedConstant]
+    alias_stack: list[str]
+    constant_stack: list[str]
+    module_bindings: list[ModuleBindings]
     # Every function signature in the program, across all modules.
     functions: list[FunctionSymbol]
     next_symbol: i64
@@ -114,6 +141,11 @@ pub class Checker:
         self.sources = sources
         self.types = create_builtin_type_table()
         self.symbols = list[HirSymbol]()
+        self.aliases = list[CollectedAlias]()
+        self.constants = list[CollectedConstant]()
+        self.alias_stack = list[str]()
+        self.constant_stack = list[str]()
+        self.module_bindings = list[ModuleBindings]()
         self.functions = list[FunctionSymbol]()
         self.next_symbol = 0
         self.current_module = 0
@@ -122,13 +154,16 @@ pub class Checker:
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
 
-    # mark: Checking ============================================================================
+    # mark: Generation ==========================================================================
 
-    ## Check the program or stop at its first semantic problem.
-    pub func check() -> HirProgram!:
+    ## Generate typed HIR or stop at the first semantic problem.
+    pub func generate() -> HirProgram!:
         try self.validate_module_names()
         try self.validate_mutating_placements()
-        try self.collect_function_signatures()
+        try self.collect_declarations()
+        try self.collect_module_bindings()
+        try self.resolve_aliases()
+        try self.check_constants()
 
         let modules = list[HirModule]()
         for module_index in range(0, len(self.sources)):
@@ -137,14 +172,23 @@ pub class Checker:
 
         let hir_functions = list[HirFunction]()
         for module_index in range(0, len(self.sources)):
-            self.current_module = module_index
-            self.bindings = try self.resolve_imports(module_index)
-
+            self.enter_module(module_index)
             for function in self.functions:
                 if function.module_index == module_index:
                     hir_functions.append(try self.check_function(function))
 
-        return HirProgram(types = self.types, symbols = self.symbols, modules = modules, functions = hir_functions)
+        let hir_constants = list[HirConstant]()
+        for constant in self.constants:
+            let typed = constant.typed else trap("constant was not typed")
+            hir_constants.append(HirConstant(
+                symbol = constant.symbol,
+                module = ModuleId(value = constant.module_index),
+                name = constant.name,
+                is_public = constant.is_public,
+                value = typed,
+            ))
+
+        return HirProgram(types = self.types, symbols = self.symbols, modules = modules, constants = hir_constants, functions = hir_functions)
 
     # mark: Modules and imports =================================================================
 
@@ -207,6 +251,10 @@ pub class Checker:
     func require_free_import_name(module_index: i64, bindings: ModuleBindings, name: str, span: SourceSpan) -> !:
         if self.find_function_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.find_constant_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.find_alias_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
         for imported in bindings.modules:
             if imported.name == name:
                 try self.fail_at(module_index, span, "duplicate imported name `" + name + "`")
@@ -216,32 +264,159 @@ pub class Checker:
 
     # mark: Signature collection ================================================================
 
-    # The first pass: walk every declaration in every module and record the
-    # function signatures, so bodies checked later can call in any order.
-    func collect_function_signatures() -> !:
+    # The first pass: record aliases, constants, and function signatures so
+    # later bodies can see every module-level name.
+    func collect_declarations() -> !:
         for module_index in range(0, len(self.sources)):
             for declaration in self.sources[module_index].syntax.declarations:
                 match declaration.value:
+                    Constant(constant):
+                        try self.collect_constant(module_index, declaration.is_public, constant, declaration.span)
+                    TypeAlias(type_alias):
+                        try self.collect_alias(module_index, declaration.is_public, type_alias, declaration.span)
                     Function(function):
                         try self.collect_function(module_index, declaration.is_public, function, declaration.span)
+                    NominalType(nominal):
+                        if nominal.kind == NominalTypeKind.class_type:
+                            try self.fail_at(module_index, declaration.span, "class types are not implemented yet")
+                        try self.fail_at(module_index, declaration.span, "struct types are not implemented yet")
+                    Enumeration(enumeration):
+                        try self.fail_at(module_index, declaration.span, "enum types are not implemented yet")
+                    InterfaceType(interface_type):
+                        try self.fail_at(module_index, declaration.span, "interfaces are not implemented yet")
+                    TestDeclaration(test_declaration):
+                        try self.fail_at(module_index, declaration.span, "test declarations are not implemented yet")
+                    ExportStruct(export_struct):
+                        try self.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
+                    ExportEnum(export_enum):
+                        try self.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
+                    ExportFunction(export_function):
+                        try self.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
                     ExternType(extern_type):
-                        try self.fail_at(module_index, declaration.span, "extern type declarations are not implemented by the semantic checker yet")
+                        try self.fail_at(module_index, declaration.span, "extern type declarations are not implemented yet")
                     ExternFunction(extern_function):
-                        try self.fail_at(module_index, declaration.span, "extern function declarations are not implemented by the semantic checker yet")
+                        try self.fail_at(module_index, declaration.span, "extern function declarations are not implemented yet")
                     ExternVariable(extern_variable):
-                        try self.fail_at(module_index, declaration.span, "extern variable declarations are not implemented by the semantic checker yet")
+                        try self.fail_at(module_index, declaration.span, "extern variable declarations are not implemented yet")
                     ExternStruct(extern_struct):
-                        try self.fail_at(module_index, declaration.span, "extern struct declarations are not implemented by the semantic checker yet")
-                    else:
-                        try self.fail_at(module_index, declaration.span, "semantic checking for `" + str(declaration.value) + "` is not implemented yet")
+                        try self.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
+
+    func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, type_alias.name, span)
+        self.aliases.append(CollectedAlias(
+            module_index = module_index,
+            name = type_alias.name,
+            is_public = is_public,
+            syntax = type_alias,
+            span = span,
+            resolved = none,
+        ))
+
+    func collect_constant(module_index: i64, is_public: bool, constant: ConstantSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, constant.name, span)
+        let placeholder = resolve_builtin_type(BuiltinType.unit)
+        let symbol = self.make_symbol(constant.name, SymbolKind.constant, placeholder)
+        self.constants.append(CollectedConstant(
+            symbol = symbol,
+            module_index = module_index,
+            name = constant.name,
+            is_public = is_public,
+            annotation = constant.annotation,
+            value = constant.value,
+            span = span,
+            typed = none,
+        ))
+
+    func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
+        if self.find_function_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_alias_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_constant_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+
+    func collect_module_bindings() -> !:
+        for module_index in range(0, len(self.sources)):
+            self.module_bindings.append(try self.resolve_imports(module_index))
+
+    func enter_module(module_index: i64):
+        self.current_module = module_index
+        self.bindings = self.module_bindings[module_index]
+
+    func resolve_aliases() -> !:
+        for index in range(0, len(self.aliases)):
+            try self.resolve_alias(index)
+
+    func resolve_alias(index: i64) -> TypeId!:
+        let item = self.aliases[index]
+        let already = item.resolved
+        if already != none: return already
+        let key = str(item.module_index) + "." + item.name
+        for previous in self.alias_stack:
+            if previous == key:
+                try self.fail_at(item.module_index, item.span, "type alias `" + item.name + "` is recursive")
+        self.alias_stack.append(key)
+        self.current_module = item.module_index
+        let resolved = try self.resolve_type(item.module_index, item.syntax.value)
+        self.alias_stack.remove(len(self.alias_stack) - 1)
+        self.aliases[index] = CollectedAlias(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            syntax = item.syntax,
+            span = item.span,
+            resolved = resolved,
+        )
+        return resolved
+
+    func check_constants() -> !:
+        for index in range(0, len(self.constants)):
+            try self.resolve_constant(index)
+
+    # Type one constant's initializer, resolving other constants as needed.
+    # Cycles (`let a = a`, or `let a = b` / `let b = a`) fail as recursion.
+    func resolve_constant(index: i64) -> !:
+        let item = self.constants[index]
+        if item.typed != none: return
+        let key = str(item.module_index) + "." + item.name
+        for previous in self.constant_stack:
+            if previous == key:
+                try self.fail_at(item.module_index, item.span, "constant `" + item.name + "` is recursive")
+        self.constant_stack.append(key)
+        let saved_module = self.current_module
+        let saved_bindings = self.bindings
+        self.enter_module(item.module_index)
+        var expected: TypeId? = none
+        let annotation = item.annotation
+        if annotation != none:
+            expected = try self.resolve_type(item.module_index, annotation)
+        let typed = try self.check_expression(item.value, expected)
+        self.constant_stack.remove(len(self.constant_stack) - 1)
+        self.current_module = saved_module
+        self.bindings = saved_bindings
+        self.symbols[item.symbol.value] = HirSymbol(
+            id = item.symbol,
+            name = item.name,
+            kind = SymbolKind.constant,
+            value_type = typed.value_type,
+        )
+        self.constants[index] = CollectedConstant(
+            symbol = item.symbol,
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            annotation = item.annotation,
+            value = item.value,
+            span = item.span,
+            typed = typed,
+        )
 
     # Record one function's signature: resolved parameter and result types,
     # a fresh symbol per parameter, and a fresh symbol for the function itself.
     func collect_function(module_index: i64, is_public: bool, function: FunctionSyntax, span: SourceSpan) -> !:
-        if self.find_function_in_module(module_index, function.name) >= 0:
-            try self.fail_at(module_index, span, "duplicate declaration `" + function.name + "`")
+        try self.require_free_module_name(module_index, function.name, span)
         if len(function.generic_parameters) > 0:
-            try self.fail_at(module_index, span, "generic functions are not implemented by the semantic checker yet")
+            try self.fail_at(module_index, span, "generic functions are not implemented yet")
 
         let parameters = list[HirParameter]()
         for parameter in function.parameters:
@@ -254,7 +429,7 @@ pub class Checker:
                 "parameter `" + parameter.name + "` requires a type",
             ))
             if parameter.default_value != none:
-                try self.fail_at(module_index, parameter.span, "default arguments are not implemented by the semantic checker yet")
+                try self.fail_at(module_index, parameter.span, "default arguments are not implemented yet")
             let parameter_type = try self.resolve_type(module_index, annotation)
             let parameter_symbol = self.make_symbol(parameter.name, SymbolKind.parameter, parameter_type)
             parameters.append(HirParameter(symbol = parameter_symbol, name = parameter.name, value_type = parameter_type))
@@ -280,29 +455,43 @@ pub class Checker:
     func resolve_type(module_index: i64, value: TypeSyntax) -> TypeId!:
         match value.form:
             Named(path):
-                if len(path.parts) != 1 or not is_core_type_name(path.parts[0]):
+                if len(path.parts) != 1:
                     try self.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
-                return builtin_type_id(path.parts[0]) else error(self.diagnostic_at(
-                    module_index,
-                    path.span,
-                    "type `" + path.parts[0] + "` is not implemented by the semantic checker yet",
-                ))
+                let name = path.parts[0]
+                let alias_index = self.find_alias_in_module(module_index, name)
+                if alias_index >= 0: return try self.resolve_alias(alias_index)
+                let builtin = builtin_type_id(name)
+                if builtin != none: return builtin
+                if is_core_type_name(name):
+                    error(self.diagnostic_at(module_index, path.span, "type `" + name + "` is not implemented yet"))
+                error(self.diagnostic_at(module_index, path.span, "unknown type `" + path.dotted() + "`"))
             Applied(path, arguments):
-                if path.dotted() == "slice" and len(arguments) == 1 and is_string_type_argument(arguments[0]):
-                    return resolve_builtin_type(BuiltinType.string_slice)
-                error(self.diagnostic_at(module_index, value.span, "applied types are not implemented by the semantic checker yet"))
+                if path.dotted() == "slice" and len(arguments) == 1:
+                    match arguments[0]:
+                        TypeArgument(element):
+                            let inner = try self.resolve_type(module_index, element)
+                            return self.intern_slice(inner)
+                        else:
+                            error(self.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
+                error(self.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
             GroupedType(grouped):
                 return try self.resolve_type(module_index, grouped)
             TupleType(elements):
-                error(self.diagnostic_at(module_index, value.span, "tuple types are not implemented by the semantic checker yet"))
+                let parts = list[TypeId]()
+                for element in elements:
+                    parts.append(try self.resolve_type(module_index, element))
+                return self.intern_tuple(parts)
             FunctionType(parameters, result):
-                error(self.diagnostic_at(module_index, value.span, "function types are not implemented by the semantic checker yet"))
+                let parts = list[TypeId]()
+                for parameter in parameters:
+                    parts.append(try self.resolve_type(module_index, parameter))
+                return self.intern_function_type(parts, try self.resolve_type(module_index, result))
             CFunctionType(parameters, result):
-                error(self.diagnostic_at(module_index, value.span, "cfunc types are not implemented by the semantic checker yet"))
+                error(self.diagnostic_at(module_index, value.span, "cfunc types are not implemented yet"))
             OptionalType(optional_value):
-                error(self.diagnostic_at(module_index, value.span, "optional types are not implemented by the semantic checker yet"))
+                return self.intern_optional(try self.resolve_type(module_index, optional_value))
             FallibleType(successful_value):
-                error(self.diagnostic_at(module_index, value.span, "fallible types are not implemented by the semantic checker yet"))
+                return self.intern_fallible(try self.resolve_type(module_index, successful_value))
 
     # mark: Functions and statements ============================================================
 
@@ -338,36 +527,43 @@ pub class Checker:
         let outer_count = len(self.locals)
         let typed = list[HirStatement]()
         for statement in statements:
-            typed.append(try self.check_statement(statement))
+            for item in try self.check_statement(statement):
+                typed.append(item)
         while len(self.locals) > outer_count:
             self.locals.remove(len(self.locals) - 1)
         return typed
 
     # Check one statement. Each statement family owns its detailed rules below.
-    func check_statement(statement: StatementSyntax) -> HirStatement!:
+    func check_statement(statement: StatementSyntax) -> list[HirStatement]!:
         match statement.form:
             BreakStatement:
                 if self.loop_depth == 0: try self.fail(statement.span, "`break` is only valid inside a loop")
-                return HirStatement(form = HirStatementForm.BreakStatement, span = statement.span)
+                return [HirStatement(form = HirStatementForm.BreakStatement, span = statement.span)]
             ContinueStatement:
                 if self.loop_depth == 0: try self.fail(statement.span, "`continue` is only valid inside a loop")
-                return HirStatement(form = HirStatementForm.ContinueStatement, span = statement.span)
+                return [HirStatement(form = HirStatementForm.ContinueStatement, span = statement.span)]
             Binding(is_mutable, pattern, annotation, value):
                 return try self.check_binding(is_mutable, pattern, annotation, value, statement.span)
             Assignment(target, operator, value):
-                return try self.check_assignment(target, operator, value, statement.span)
+                return [try self.check_assignment(target, operator, value, statement.span)]
             ReturnStatement(value):
-                return try self.check_return(value, statement.span)
+                return [try self.check_return(value, statement.span)]
             ExpressionStatement(value):
                 let printed = try self.check_print_call(value)
-                if printed != none: return printed
-                return HirStatement(form = HirStatementForm.ExpressionStatement(value = try self.check_expression(value, none)), span = statement.span)
+                if printed != none: return [printed]
+                return [HirStatement(form = HirStatementForm.ExpressionStatement(value = try self.check_expression(value, none)), span = statement.span)]
             IfStatement(branches, fallback):
-                return try self.check_if(branches, fallback, statement.span)
+                return [try self.check_if(branches, fallback, statement.span)]
             WhileStatement(condition, body):
-                return try self.check_while(condition, body, statement.span)
-            else:
-                error(self.diagnostic(statement.span, "semantic checking for `" + str(statement.form) + "` is not implemented yet"))
+                return [try self.check_while(condition, body, statement.span)]
+            DeferStatement(value):
+                error(self.diagnostic(statement.span, "`defer` is not implemented yet"))
+            RecoverStatement(value):
+                error(self.diagnostic(statement.span, "`recover` is not implemented yet"))
+            ForStatement(name, iterable, body):
+                error(self.diagnostic(statement.span, "`for` is not implemented yet"))
+            MatchStatement(subject, arms):
+                error(self.diagnostic(statement.span, "`match` is not implemented yet"))
 
     # Recognize a bare `print(...)` statement so it can take the special path
     # below; anything else falls through to ordinary expression checking.
@@ -381,9 +577,9 @@ pub class Checker:
                     else: return none
             else: return none
 
-    # `print` is the first terminal operation in the executable slice. Keeping
-    # it as a typed statement makes the output and the constant bytes explicit
-    # without pretending arbitrary strings are implemented yet.
+    # `print` is the first terminal operation in the executable slice. Compiled
+    # backends lower `PrintText` to constant bytes, so the argument is a string
+    # literal even though `str` values exist as HIR.
     func check_print(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan) -> HirStatement!:
         if len(type_arguments) > 0 or len(arguments) != 1 or arguments[0].label != none:
             try self.fail(span, "`print` expects one positional string")
@@ -424,7 +620,7 @@ pub class Checker:
 
     # `let name = value` or `var name: T = value` — the annotation, when
     # present, becomes the expected type of the initializer.
-    func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> HirStatement!:
+    func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> list[HirStatement]!:
         match pattern:
             Name(name, name_span):
                 try self.require_free_local_name(name, name_span)
@@ -434,9 +630,40 @@ pub class Checker:
                 let checked = try self.check_expression(value, expected)
                 let symbol = self.make_symbol(name, SymbolKind.local, checked.value_type)
                 self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked.value_type, is_mutable = is_mutable))
-                return HirStatement(form = HirStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = checked), span = span)
-            else:
-                error(self.diagnostic(span, "tuple bindings are not implemented by the semantic checker yet"))
+                return [HirStatement(form = HirStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = checked), span = span)]
+            TupleNames(names, pattern_span):
+                # Duplicate names report at the binding statement; the pattern
+                # stores names without per-name spans.
+                var expected: TypeId? = none
+                if annotation != none:
+                    expected = try self.resolve_type(self.current_module, annotation)
+                let checked = try self.check_expression(value, expected)
+                let elements = self.tuple_elements(checked.value_type) else error(self.diagnostic(span, "tuple binding requires a tuple value, found `" + self.describe_type(checked.value_type) + "`"))
+                if len(names) != len(elements):
+                    try self.fail(span, "tuple binding has " + str(len(names)) + " name(s), value has " + str(len(elements)))
+                let tuple_symbol = self.make_symbol("_tuple", SymbolKind.local, checked.value_type)
+                let statements = list[HirStatement]()
+                statements.append(HirStatement(form = HirStatementForm.Binding(symbol = tuple_symbol, name = "_tuple", is_mutable = false, value = checked), span = span))
+                var index = 0
+                while index < len(names):
+                    let name = names[index].text
+                    try self.require_free_local_name(name, names[index].span)
+                    let element_type = elements[index]
+                    let symbol = self.make_symbol(name, SymbolKind.local, element_type)
+                    self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = is_mutable))
+                    let tuple_ref = HirExpression(
+                        value_type = checked.value_type,
+                        form = HirExpressionForm.Reference(symbol = tuple_symbol),
+                        span = span,
+                    )
+                    let element = HirExpression(
+                        value_type = element_type,
+                        form = HirExpressionForm.Element(value = tuple_ref, index = index),
+                        span = span,
+                    )
+                    statements.append(HirStatement(form = HirStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = element), span = names[index].span))
+                    index += 1
+                return statements
 
     # `name = value` and the augmented forms; only mutable local names are
     # assignable in the current slice.
@@ -444,7 +671,7 @@ pub class Checker:
         var name = ""
         match target.form:
             Name(value_name): name = value_name
-            else: try self.fail(span, "member and index assignment are not implemented by the semantic checker yet")
+            else: try self.fail(span, "member and index assignment are not implemented yet")
         let local_index = self.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
         let local = self.locals[local_index]
@@ -486,7 +713,7 @@ pub class Checker:
                     let checked = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
                     typed_branches.append(HirIfBranch(condition = checked, body = try self.check_suite(branch.body.statements)))
                 else:
-                    try self.fail(branch.span, "conditional bindings are not implemented by the semantic checker yet")
+                    try self.fail(branch.span, "conditional bindings are not implemented yet")
         var typed_fallback: list[HirStatement]? = none
         if fallback != none:
             typed_fallback = try self.check_suite(fallback.statements)
@@ -518,10 +745,23 @@ pub class Checker:
                         span = value.span,
                     )
                     return try self.require_type(reference, expected)
+                let constant_index = self.find_constant_in_module(self.current_module, name)
+                if constant_index >= 0:
+                    try self.resolve_constant(constant_index)
+                    let constant = self.constants[constant_index]
+                    let typed = constant.typed else trap("constant was not typed")
+                    let reference = HirExpression(
+                        value_type = typed.value_type,
+                        form = HirExpressionForm.Reference(symbol = constant.symbol),
+                        span = value.span,
+                    )
+                    return try self.require_type(reference, expected)
                 if self.find_visible_function(name) >= 0:
-                    try self.fail(value.span, "function values are not implemented by the semantic checker yet")
+                    try self.fail(value.span, "function values are not implemented yet")
                 error(self.diagnostic(value.span, "unknown name `" + name + "`"))
             Group(grouped): return try self.check_expression(grouped, expected)
+            TupleValue(elements):
+                return try self.check_tuple(elements, value.span, expected)
             Unary(operator, operand): return try self.check_unary(operator, operand, value.span, expected)
             Binary(left, operator, right): return try self.check_binary(left, operator, right, value.span, expected)
             Conditional(selected, condition, alternative):
@@ -541,39 +781,86 @@ pub class Checker:
             Call(callee, type_arguments, arguments):
                 return try self.check_call(callee, type_arguments, arguments, value.span, expected)
             ElseValue(optional_value, arm):
-                error(self.diagnostic(value.span, "the `else` fallback expression is not implemented by the semantic checker yet"))
-            else:
-                error(self.diagnostic(value.span, "semantic checking for `" + str(value.form) + "` is not implemented yet"))
+                return try self.check_else(optional_value, arm, value.span, expected)
+            FormattedString(start, parts):
+                error(self.diagnostic(value.span, "formatted strings are not implemented yet"))
+            CaseValue(name, arguments):
+                error(self.diagnostic(value.span, "enum cases are not implemented yet"))
+            ListValue(elements):
+                error(self.diagnostic(value.span, "list literals are not implemented yet"))
+            MapValue(entries):
+                error(self.diagnostic(value.span, "map literals are not implemented yet"))
+            Member(member_value, name):
+                error(self.diagnostic(value.span, "field access is not implemented yet"))
+            Index(indexed, subscript):
+                error(self.diagnostic(value.span, "indexing is not implemented yet"))
+            Slice(sliced, start, operator, end):
+                error(self.diagnostic(value.span, "slicing is not implemented yet"))
+            Lambda(parameters, body):
+                error(self.diagnostic(value.span, "lambdas are not implemented yet"))
+            Closure(captures, parameters, result, body):
+                error(self.diagnostic(value.span, "closures are not implemented yet"))
+            MatchValue(subject, arms):
+                error(self.diagnostic(value.span, "`match` is not implemented yet"))
+            NewValue(value_type, arguments):
+                error(self.diagnostic(value.span, "`new` is not implemented yet"))
+            SpawnValue(function, arguments):
+                error(self.diagnostic(value.span, "`spawn` is not implemented yet"))
+            CatchValue(caught, failure_name, body):
+                error(self.diagnostic(value.span, "`catch` is not implemented yet"))
 
     # A bare literal becomes a constant. An unsuffixed integer is i64 unless
-    # the context asks for i32, e.g. `let count: i32 = 7`.
+    # the context asks for another integer width, e.g. `let count: i32 = 7`.
     func check_literal(token: Token, expected: TypeId?) -> HirExpression!:
         var value_type = resolve_builtin_type(BuiltinType.unit)
         var value = Value.Unit
         if token.kind == TokenKind.int_lit:
-            if token.suffix != "" and token.suffix != "i32" and token.suffix != "i64":
-                try self.fail(token.span, "integer type `" + token.suffix + "` is not implemented by the semantic checker yet")
-            var integer_type = resolve_builtin_type(BuiltinType.signed_i64)
-            if token.suffix == "i32" or (token.suffix == "" and expected != none and types_match(expected, resolve_builtin_type(BuiltinType.signed_i32))):
-                integer_type = resolve_builtin_type(BuiltinType.signed_i32)
+            let integer_type = try self.integer_literal_type(token, expected)
             let integer = try self.decode_integer(token)
-            if types_match(integer_type, resolve_builtin_type(BuiltinType.signed_i32)) and integer > 2147483647:
-                try self.fail(token.span, "integer literal is outside `i32` range")
+            try self.require_integer_range(token.span, integer, integer_type)
             value_type = integer_type
             value = Value.Integer(value = integer)
         elif token.kind == TokenKind.float_lit:
-            if token.suffix != "" and token.suffix != "f64":
-                try self.fail(token.span, "float type `" + token.suffix + "` is not implemented by the semantic checker yet")
-            value_type = resolve_builtin_type(BuiltinType.float64)
+            if token.suffix == "f32":
+                value_type = resolve_builtin_type(BuiltinType.float32)
+            elif token.suffix == "" or token.suffix == "f64":
+                value_type = resolve_builtin_type(BuiltinType.float64)
+            else:
+                try self.fail(token.span, "float type `" + token.suffix + "` is not implemented yet")
             value = Value.Floating(value = try self.decode_float(token))
         elif token.text == "true" or token.text == "false":
             value_type = resolve_builtin_type(BuiltinType.boolean)
             value = Value.Boolean(value = token.text == "true")
-        elif token.kind == TokenKind.char_lit or token.kind == TokenKind.str_lit or token.kind == TokenKind.byte_lit:
-            error(self.diagnostic(token.span, "character, string, and byte literals are not implemented by the semantic checker yet"))
+        elif token.text == "none":
+            let needed = expected else error(self.diagnostic(token.span, "`none` needs an optional type from context"))
+            if self.optional_inner(needed) == none:
+                try self.fail(token.span, "expected `" + self.describe_type(needed) + "`, found `none`")
+            return HirExpression(value_type = needed, form = HirExpressionForm.NoneLiteral, span = token.span)
+        elif token.kind == TokenKind.char_lit:
+            value_type = resolve_builtin_type(BuiltinType.character)
+            value = Value.Character(value = try self.decode_character(token))
+        elif token.kind == TokenKind.str_lit:
+            value_type = resolve_builtin_type(BuiltinType.string)
+            value = Value.Text(value = try self.decode_print_text(token))
+        elif token.kind == TokenKind.byte_lit:
+            value_type = resolve_builtin_type(BuiltinType.byte_string)
+            value = Value.Bytes(value = try self.decode_bytes(token))
         else:
-            error(self.diagnostic(token.span, "optional values are not implemented by the semantic checker yet"))
+            error(self.diagnostic(token.span, "this literal is not implemented yet"))
         return try self.require_type(HirExpression(value_type = value_type, form = HirExpressionForm.Constant(value = value), span = token.span), expected)
+
+    func integer_literal_type(token: Token, expected: TypeId?) -> TypeId!:
+        if token.suffix != "":
+            let suffix_type = builtin_type_id(token.suffix) else error(self.diagnostic(token.span, "integer type `" + token.suffix + "` is not implemented yet"))
+            if not is_integer_type(self.types, suffix_type):
+                try self.fail(token.span, "integer type `" + token.suffix + "` is not implemented yet")
+            return suffix_type
+        if expected != none and is_integer_type(self.types, expected): return expected
+        return resolve_builtin_type(BuiltinType.signed_i64)
+
+    func require_integer_range(span: SourceSpan, value: i64, value_type: TypeId) -> !:
+        if value < integer_minimum(self.types, value_type) or value > integer_maximum(self.types, value_type):
+            try self.fail(span, "integer literal is outside `" + self.describe_type(value_type) + "` range")
 
     func check_unary(operator: str, operand: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> HirExpression!:
         if operator == "not":
@@ -585,40 +872,38 @@ pub class Checker:
                 span = span,
             )
             return try self.require_type(expression, expected)
-        if operator == "try": try self.fail(span, "fallible calls are not implemented by the semantic checker yet")
+        if operator == "try": try self.fail(span, "fallible calls are not implemented yet")
 
         # `-9223372036854775808` must fold as one negative literal: its
         # magnitude does not fit positive i64, so negate-after-check would
         # reject the minimum. Other operands take the general path below.
-        if operator == "-" and (expected == none or is_integer_type(expected)):
+        if operator == "-" and expected != none and is_unsigned_integer_type(self.types, expected):
+            try self.fail(span, "`-` is invalid for `" + self.describe_type(expected) + "`")
+        if operator == "-" and (expected == none or is_integer_type(self.types, expected)):
             let literal = find_literal_token(operand)
             if literal != none and literal.kind == TokenKind.int_lit:
-                if literal.suffix != "" and literal.suffix != "i32" and literal.suffix != "i64":
-                    try self.fail(literal.span, "integer type `" + literal.suffix + "` is not implemented by the semantic checker yet")
-                var integer_type = resolve_builtin_type(BuiltinType.signed_i64)
-                if literal.suffix == "i32" or (
-                    literal.suffix == "" and expected != none
-                    and types_match(expected, resolve_builtin_type(BuiltinType.signed_i32))
-                ):
-                    integer_type = resolve_builtin_type(BuiltinType.signed_i32)
+                let integer_type = try self.integer_literal_type(literal, expected)
+                if is_unsigned_integer_type(self.types, integer_type):
+                    try self.fail(span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
                 let integer = try self.decode_negative_integer(literal)
-                if types_match(integer_type, resolve_builtin_type(BuiltinType.signed_i32)) and integer < -2147483647 - 1:
-                    try self.fail(literal.span, "integer literal is outside `i32` range")
+                try self.require_integer_range(literal.span, integer, integer_type)
                 let value = Value.Integer(value = integer)
                 return try self.require_type(HirExpression(value_type = integer_type, form = HirExpressionForm.Constant(value = value), span = span), expected)
 
         let checked = try self.check_expression(operand, expected)
         var operation = UnaryOperation.NumericIdentity(operand_type = checked.value_type)
         if operator == "~":
-            if not is_integer_type(checked.value_type):
+            if not is_integer_type(self.types, checked.value_type):
                 try self.fail(span, "`~` requires an integer, found `" + self.describe_type(checked.value_type) + "`")
             operation = UnaryOperation.IntegerBitwiseNot(operand_type = checked.value_type)
         elif operator == "+" or operator == "-":
-            if not is_numeric_type(checked.value_type):
+            if not is_numeric_type(self.types, checked.value_type):
                 try self.fail(span, "`" + operator + "` requires a number, found `" + self.describe_type(checked.value_type) + "`")
+            if operator == "-" and is_unsigned_integer_type(self.types, checked.value_type):
+                try self.fail(span, "`-` is invalid for `" + self.describe_type(checked.value_type) + "`")
             if operator == "-": operation = UnaryOperation.NumericNegate(operand_type = checked.value_type)
         else:
-            error(self.diagnostic(span, "operator `" + operator + "` is not implemented by the semantic checker yet"))
+            error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
         let expression = HirExpression(
             value_type = checked.value_type,
             form = HirExpressionForm.Unary(operation = operation, operand = checked),
@@ -670,35 +955,35 @@ pub class Checker:
         if operator == "==": return ResolvedBinary(operation = BinaryOperation.Equal(operand_type = left), result = boolean_type)
         if operator == "!=": return ResolvedBinary(operation = BinaryOperation.NotEqual(operand_type = left), result = boolean_type)
         if operator == "<" or operator == "<=" or operator == ">" or operator == ">=":
-            if not is_ordered_type(left): try self.fail(span, "`" + operator + "` does not order `" + self.describe_type(left) + "`")
+            if not is_ordered_type(self.types, left): try self.fail(span, "`" + operator + "` does not order `" + self.describe_type(left) + "`")
             if operator == "<": return ResolvedBinary(operation = BinaryOperation.Less(operand_type = left), result = boolean_type)
             if operator == "<=": return ResolvedBinary(operation = BinaryOperation.LessEqual(operand_type = left), result = boolean_type)
             if operator == ">": return ResolvedBinary(operation = BinaryOperation.Greater(operand_type = left), result = boolean_type)
             return ResolvedBinary(operation = BinaryOperation.GreaterEqual(operand_type = left), result = boolean_type)
         if operator == "/":
-            if not is_floating_type(left): try self.fail(span, "`/` requires floating-point operands")
+            if not is_floating_type(self.types, left): try self.fail(span, "`/` requires floating-point operands")
             return ResolvedBinary(operation = BinaryOperation.Divide(operand_type = left), result = left)
         if operator == "//" or operator == "%":
-            if not is_integer_type(left): try self.fail(span, "`" + operator + "` requires integer operands")
+            if not is_integer_type(self.types, left): try self.fail(span, "`" + operator + "` requires integer operands")
             if operator == "//": return ResolvedBinary(operation = BinaryOperation.FloorDivide(operand_type = left), result = left)
             return ResolvedBinary(operation = BinaryOperation.Remainder(operand_type = left), result = left)
         if operator == "+" or operator == "-" or operator == "*":
-            if not is_numeric_type(left): try self.fail(span, "`" + operator + "` requires numeric operands")
+            if not is_numeric_type(self.types, left): try self.fail(span, "`" + operator + "` requires numeric operands")
             if operator == "+": return ResolvedBinary(operation = BinaryOperation.Add(operand_type = left), result = left)
             if operator == "-": return ResolvedBinary(operation = BinaryOperation.Subtract(operand_type = left), result = left)
             return ResolvedBinary(operation = BinaryOperation.Multiply(operand_type = left), result = left)
         if operator == "&" or operator == "|" or operator == "^" or operator == "<<" or operator == ">>":
-            if not is_integer_type(left): try self.fail(span, "`" + operator + "` requires integer operands")
+            if not is_integer_type(self.types, left): try self.fail(span, "`" + operator + "` requires integer operands")
             if operator == "&": return ResolvedBinary(operation = BinaryOperation.BitwiseAnd(operand_type = left), result = left)
             if operator == "|": return ResolvedBinary(operation = BinaryOperation.BitwiseOr(operand_type = left), result = left)
             if operator == "^": return ResolvedBinary(operation = BinaryOperation.BitwiseXor(operand_type = left), result = left)
             if operator == "<<": return ResolvedBinary(operation = BinaryOperation.ShiftLeft(operand_type = left), result = left)
             return ResolvedBinary(operation = BinaryOperation.ShiftRight(operand_type = left), result = left)
-        error(self.diagnostic(span, "operator `" + operator + "` is not implemented by the semantic checker yet"))
+        error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
 
     # Check one call: each parameter must be supplied once.
     func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
-        if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented by the semantic checker yet")
+        if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented yet")
         let function_index = try self.resolve_callee(callee)
         let function = self.functions[function_index]
 
@@ -754,7 +1039,7 @@ pub class Checker:
                 var module_name = ""
                 match value.form:
                     Name(candidate): module_name = candidate
-                    else: try self.fail(callee.span, "method calls are not implemented by the semantic checker yet")
+                    else: try self.fail(callee.span, "method calls are not implemented yet")
                 let imported_module = self.find_imported_module(module_name)
                 if imported_module < 0: try self.fail(callee.span, "unknown imported module `" + module_name + "`")
                 let function_index = self.find_function_in_module(imported_module, name)
@@ -765,6 +1050,40 @@ pub class Checker:
             else:
                 error(self.diagnostic(callee.span, "only named functions are callable in the current semantic slice"))
 
+    func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
+        var expected_parts: list[TypeId]? = none
+        if expected != none:
+            expected_parts = self.tuple_elements(expected)
+            if expected_parts != none and len(expected_parts) != len(elements):
+                try self.fail(span, "tuple has " + str(len(elements)) + " element(s), expected `" + self.describe_type(expected) + "`")
+        let checked = list[HirExpression]()
+        var index = 0
+        for element in elements:
+            var part_expected: TypeId? = none
+            if expected_parts != none:
+                part_expected = expected_parts[index]
+            checked.append(try self.check_expression(element, part_expected))
+            index += 1
+        let parts = list[TypeId]()
+        for item in checked:
+            parts.append(item.value_type)
+        let tuple_type = self.intern_tuple(parts)
+        return try self.require_type(
+            HirExpression(value_type = tuple_type, form = HirExpressionForm.Tuple(elements = checked), span = span),
+            expected,
+        )
+
+    func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+        let checked_optional = try self.check_expression(optional_value, none)
+        let inner = self.optional_inner(checked_optional.value_type) else error(self.diagnostic(span, "`else` requires an optional value, found `" + self.describe_type(checked_optional.value_type) + "`"))
+        let checked_arm = try self.check_expression(arm, inner)
+        let typed = HirExpression(
+            value_type = inner,
+            form = HirExpressionForm.ElseFallback(value = checked_optional, arm = checked_arm),
+            span = span,
+        )
+        return try self.require_type(typed, expected)
+
     # mark: Literal decoding ====================================================================
     #
     # The tokenizer keeps every literal's exact source spelling; here that
@@ -773,7 +1092,7 @@ pub class Checker:
     func decode_integer(token: Token) -> i64!:
         let value = try self.decode_negative_integer(token)
         if value == -9223372036854775807 - 1:
-            try self.fail(token.span, "integer literal is outside `i64` range")
+            try self.fail(token.span, "integer literal is outside the representable integer range")
         return -value
 
     # Accumulating below zero leaves room for the minimum signed magnitude,
@@ -800,7 +1119,7 @@ pub class Checker:
                 var threshold = numerator // base
                 if numerator % base != 0: threshold += 1
                 if value < threshold:
-                    try self.fail(token.span, "integer literal is outside `i64` range")
+                    try self.fail(token.span, "integer literal is outside the representable integer range")
                 value = value * base - digit
             position += 1
         return value
@@ -813,6 +1132,32 @@ pub class Checker:
             if token.text[position] != '_': text = text + str(token.text[position])
             position += 1
         return parse_f64(text) else error(self.diagnostic(token.span, "floating-point literal is outside `f64` range"))
+
+    func decode_character(token: Token) -> char!:
+        if len(token.text) < 3 or token.text[0] != '\'':
+            try self.fail(token.span, "malformed character literal")
+        if token.text[1] != '\\':
+            if len(token.text) != 3: try self.fail(token.span, "character literal must contain one character")
+            return token.text[1]
+        if len(token.text) < 4: try self.fail(token.span, "incomplete character escape")
+        match token.text[2]:
+            'n': return '\n'
+            'r': return '\r'
+            't': return '\t'
+            '\\': return '\\'
+            '\'': return '\''
+            '0': return char(0)
+            else: error(self.diagnostic(token.span, "this character escape is not implemented yet"))
+
+    func decode_bytes(token: Token) -> list[u8]!:
+        if len(token.text) < 3 or token.text[0] != 'b':
+            try self.fail(token.span, "malformed byte literal")
+        let inner = Token(kind = TokenKind.str_lit, text = token.text[1:], suffix = "", span = token.span)
+        let decoded = try self.decode_print_text(inner)
+        let payload = list[u8]()
+        for c in decoded:
+            payload.append(u8(u32(c)))
+        return payload
 
     # mark: Name lookup =========================================================================
 
@@ -853,6 +1198,64 @@ pub class Checker:
             if self.functions[index].module_index == module_index and self.functions[index].name == name: return index
         return -1
 
+    func find_alias_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.aliases)):
+            if self.aliases[index].module_index == module_index and self.aliases[index].name == name: return index
+        return -1
+
+    func find_constant_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.constants)):
+            if self.constants[index].module_index == module_index and self.constants[index].name == name: return index
+        return -1
+
+    # Intern by `TypeForm`. The diagnostic `name` is stored for messages; two
+    # forms that describe the same structure share one TypeId.
+    func intern_named(name: str, form: TypeForm) -> TypeId:
+        for existing in self.types.definitions:
+            if type_forms_match(existing.form, form): return existing.id
+        let id = TypeId(value = len(self.types.definitions))
+        self.types.definitions.append(TypeDefinition(id = id, name = name, form = form))
+        return id
+
+    func intern_optional(inner: TypeId) -> TypeId:
+        return self.intern_named(self.describe_type(inner) + "?", TypeForm.Optional(value = inner))
+
+    func intern_fallible(inner: TypeId) -> TypeId:
+        return self.intern_named(self.describe_type(inner) + "!", TypeForm.Fallible(value = inner))
+
+    func intern_slice(inner: TypeId) -> TypeId:
+        return self.intern_named("slice[" + self.describe_type(inner) + "]", TypeForm.Slice(element = inner))
+
+    func intern_tuple(elements: list[TypeId]) -> TypeId:
+        var name = "("
+        var index = 0
+        for element in elements:
+            if index > 0: name = name + ", "
+            name = name + self.describe_type(element)
+            index += 1
+        return self.intern_named(name + ")", TypeForm.Tuple(elements = elements))
+
+    func intern_function_type(parameters: list[TypeId], result: TypeId) -> TypeId:
+        var name = "func("
+        var index = 0
+        for parameter in parameters:
+            if index > 0: name = name + ", "
+            name = name + self.describe_type(parameter)
+            index += 1
+        return self.intern_named(name + ") -> " + self.describe_type(result), TypeForm.Function(parameters = parameters, result = result))
+
+    func optional_inner(value: TypeId) -> TypeId?:
+        if value.value < 0 or value.value >= len(self.types.definitions): return none
+        match self.types.definitions[value.value].form:
+            Optional(inner): return inner
+            else: return none
+
+    func tuple_elements(value: TypeId) -> list[TypeId]?:
+        if value.value < 0 or value.value >= len(self.types.definitions): return none
+        match self.types.definitions[value.value].form:
+            Tuple(elements): return elements
+            else: return none
+
     func find_source(name: str) -> i64:
         for index in range(0, len(self.sources)):
             if self.sources[index].name == name: return index
@@ -871,10 +1274,16 @@ pub class Checker:
     # The one gate every checked expression passes: its type must satisfy the
     # context that asked for it.
     func require_type(value: HirExpression, expected: TypeId?) -> HirExpression!:
-        if expected != none:
-            if not types_match(value.value_type, expected):
-                try self.fail(value.span, "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(value.value_type) + "`")
-        return value
+        if expected == none: return value
+        if types_match(value.value_type, expected): return value
+        let inner = self.optional_inner(expected)
+        if inner != none and types_match(value.value_type, inner):
+            return HirExpression(
+                value_type = expected,
+                form = HirExpressionForm.Some(value = value),
+                span = value.span,
+            )
+        error(self.diagnostic(value.span, "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(value.value_type) + "`"))
 
     # Render a TypeId only when producing a diagnostic. Semantic decisions use
     # identity and type forms, never this human-readable spelling.
@@ -912,14 +1321,6 @@ func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
             return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
         else: return false
 
-func is_string_type_argument(argument: TypeArgumentSyntax) -> bool:
-    match argument:
-        TypeArgument(value):
-            match value.form:
-                Named(path): return path.dotted() == "str"
-                else: return false
-        else: return false
-
 func find_parameter(function: FunctionSymbol, name: str) -> i64:
     for index in range(0, len(function.parameters)):
         if function.parameters[index].name == name: return index
@@ -953,10 +1354,19 @@ func builtin_type_id(name: str) -> TypeId?:
     return match name:
         "unit" => resolve_builtin_type(BuiltinType.unit)
         "bool" => resolve_builtin_type(BuiltinType.boolean)
+        "i8" => resolve_builtin_type(BuiltinType.signed_i8)
+        "i16" => resolve_builtin_type(BuiltinType.signed_i16)
         "i32" => resolve_builtin_type(BuiltinType.signed_i32)
         "i64" => resolve_builtin_type(BuiltinType.signed_i64)
+        "u8" => resolve_builtin_type(BuiltinType.unsigned_u8)
+        "u16" => resolve_builtin_type(BuiltinType.unsigned_u16)
+        "u32" => resolve_builtin_type(BuiltinType.unsigned_u32)
+        "u64" => resolve_builtin_type(BuiltinType.unsigned_u64)
+        "f32" => resolve_builtin_type(BuiltinType.float32)
         "f64" => resolve_builtin_type(BuiltinType.float64)
+        "char" => resolve_builtin_type(BuiltinType.character)
         "str" => resolve_builtin_type(BuiltinType.string)
+        "bytes" => resolve_builtin_type(BuiltinType.byte_string)
         else => none
 
 func decode_digit(c: char) -> i64:
