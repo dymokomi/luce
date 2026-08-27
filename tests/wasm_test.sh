@@ -217,6 +217,57 @@ flow early_return 19
 flow fibonacci 832040
 flow collatz 111
 
+# Slice 3c: parameters, calls, recursion, constants, and a two-module build.
+cat > "$test_dir/calls.luc" <<'LUCE'
+func factorial(n: i64) -> i64:
+    if n <= 1: return 1
+    return n * factorial(n - 1)
+pub func fact10() -> i64: return factorial(10)
+func fib(n: i64) -> i64:
+    if n < 2: return n
+    return fib(n - 1) + fib(n - 2)
+pub func fib12() -> i64: return fib(12)
+func mix(a: i8, b: u16, c: i64, d: bool) -> i64:
+    var total = c
+    if d: total += 1
+    if a < 0: total -= 3
+    if b == 65535: total += 65535
+    return total
+pub func mixed() -> i64: return mix(-3, 65535, 1000, true) + mix(5, 1, 0, false)
+let base = 40
+let extra: i64 = base + 1
+pub func constants() -> i64: return extra + 1
+func pick(first: i64, second: i64, third: i64) -> i64: return first * 100 + second * 10 + third
+pub func named() -> i64: return pick(third: 3, first: 1, second: 2)
+func ackermann(m: i64, n: i64) -> i64:
+    if m == 0: return n + 1
+    if n == 0: return ackermann(m - 1, 1)
+    return ackermann(m - 1, ackermann(m, n - 1))
+pub func ack() -> i64: return ackermann(2, 3)
+func forever(n: i64) -> i64: return forever(n + 1) + 1
+pub func overflow_stack() -> i64: return forever(0)
+LUCE
+"$cli" build "$test_dir/calls.wasm" "$test_dir/calls.luc" >/dev/null
+calls() { expect 0 "$2" wasmtime run --invoke "calls.$1" "$test_dir/calls.wasm"; }
+calls fact10 3628800
+calls fib12 144
+calls mixed 66533
+calls constants 42
+calls named 123
+calls ack 9
+set +e
+wasmtime run --invoke calls.overflow_stack "$test_dir/calls.wasm" >/dev/null 2>&1; status=$?
+set -e
+if [ "$status" = 0 ]; then
+    echo "wasm: unbounded recursion exited 0, expected a trap" >&2
+    exit 1
+fi
+
+printf 'pub let scale = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\n' > "$test_dir/math.luc"
+printf 'import math\nfrom math import nudge\npub func answer() -> i64: return math.double(20) + nudge(1)\n' > "$test_dir/main.luc"
+"$cli" build "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
+expect 0 "42" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:

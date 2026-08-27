@@ -27,12 +27,17 @@ import std.strings
 # Run one fixture through tokenizer, parser, and HirGenerator; a broken fixture
 # traps loudly.
 pub func checked(source: str) -> AnalyzedProgram:
+    return checked_modules([source_module("main", source)])
+
+pub func source_module(name: str, source: str) -> SourceModule:
     let tokens = Tokenizer(source).tokenize() catch reason:
         trap(reason)
     let syntax_tree = Parser(tokens).parse() catch reason:
         trap(reason)
-    let module_value = SourceModule(name = "main", path = "main.luc", syntax = syntax_tree)
-    let hir = HirGenerator([module_value]).generate() catch reason:
+    return SourceModule(name = name, path = name + ".luc", syntax = syntax_tree)
+
+pub func checked_modules(modules: list[SourceModule]) -> AnalyzedProgram:
+    let hir = HirGenerator(modules).generate() catch reason:
         trap(reason)
     let analyzed = SemanticAnalyzer(hir).analyze() catch reason:
         trap(reason)
@@ -71,10 +76,16 @@ pub func render_mir(values: list[MirValue]) -> str:
 
 # The decisive check: the oracle and the MIR interpreter agree on `answer`.
 pub func agree(source: str) -> str:
-    let program = checked(source)
+    return agree_modules([source_module("main", source)])
+
+pub func agree_modules(modules: list[SourceModule]) -> str:
+    let program = checked_modules(modules)
     let oracle = HirInterpreter().run(program, "main", "answer") catch reason:
         trap(reason)
-    let mir = lowered(source)
+    let mir = Lowerer(program, wasm32_layout()).lower() catch reason:
+        trap(reason)
+    MirVerifier(mir).verify() catch reason:
+        trap(reason)
     let results = MirInterpreter(mir).run("main.answer", list[MirValue]()) catch reason:
         trap(reason)
     assert(oracle.render() == render_mir(results))
@@ -570,8 +581,8 @@ pub func larger(a: i64, b: i64) -> i64:
 # mark: Diagnostics =========================================================================
 
 pub func test_unsupported_lowering_names_the_function_and_feature():
-    let reason = lowering_failure("func identity(value: i64) -> i64: return value\n")
-    assert(reason == "main.luc:1:1: lowerer does not support parameters yet in `main.identity`")
+    let reason = lowering_failure("func identity(value: (i64, i64)) -> i64: return 1\n")
+    assert(reason == "main.luc:1:1: lowerer does not support type `(i64, i64)` yet in `main.identity`")
 
 pub func test_unsupported_lowering_reports_the_offending_node_span():
     let expression_source = "pub func answer() -> i64:\n    let pair = (1, 2)\n    return 0\n"
@@ -580,3 +591,124 @@ pub func test_unsupported_lowering_reports_the_offending_node_span():
 pub func test_unsupported_types_stop_at_the_lowerer():
     let reason = lowering_failure("pub func answer() -> str: return \"x\"\n")
     assert(reason == "main.luc:1:1: lowerer does not support type `str` yet in `main.answer`")
+
+# mark: Calls, parameters, and constants ===================================================
+
+pub func test_parameters_are_the_leading_typed_registers():
+    let program = lowered("func add(left: i64, right: i32, flag: bool) -> i64: return left\n")
+    let function = only_function(program)
+    assert(len(function.signature.parameters) == 3)
+    assert(is_type(function.signature.parameters[0], BuiltinMirType.signed_i64))
+    assert(is_type(function.signature.parameters[1], BuiltinMirType.signed_i32))
+    assert(is_type(function.signature.parameters[2], BuiltinMirType.boolean))
+    assert(is_type(function.registers[0], BuiltinMirType.signed_i64))
+    assert(is_type(function.registers[1], BuiltinMirType.signed_i32))
+    assert(is_type(function.registers[2], BuiltinMirType.boolean))
+    assert(len(function.slots) == 0)
+    # `return left` is the parameter register itself: no Load, no Copy.
+    assert(len(function.body) == 1)
+    match function.body[0].form:
+        Return(values): assert(values[0].value == 0)
+        else: assert(false)
+
+pub func test_entry_keeps_its_signature_without_parameters():
+    let program = lowered("pub func main(arguments: slice[str]) -> i32: return 0\n")
+    let function = only_function(program)
+    assert(len(function.signature.parameters) == 0)
+    assert(len(function.registers) == 1)
+
+pub func test_calls_place_arguments_by_parameter_index_in_source_order():
+    let source = "func pair(first: i64, second: i64) -> i64: return first * 10 + second\npub func answer() -> i64: return pair(second: 2, first: 1)\n"
+    let program = lowered(source)
+    assert(len(program.functions) == 2)
+    let caller = program.functions[1]
+    # Registers: r0 = 2 (written first), r1 = 1, r2 = call result.
+    match caller.body[0].form:
+        Const(result, value):
+            assert(result.value == 0)
+            match value:
+                Int(item): assert(item == 2)
+                else: assert(false)
+        else: assert(false)
+    match caller.body[2].form:
+        Call(results, function, arguments):
+            assert(function.value == 0)
+            assert(len(arguments) == 2)
+            assert(arguments[0].value == 1)
+            assert(arguments[1].value == 0)
+            assert(len(results) == 1)
+            assert(is_type(caller.registers[results[0].value], BuiltinMirType.signed_i64))
+        else: assert(false)
+    assert(agree(source) == "12")
+
+pub func test_unit_callees_are_called_without_results():
+    let source = "func work(): return\npub func answer() -> i64:\n    work()\n    return 4\n"
+    let program = lowered(source)
+    match program.functions[1].body[0].form:
+        Call(results, function, arguments):
+            assert(len(results) == 0)
+            assert(len(arguments) == 0)
+        else: assert(false)
+    assert(agree(source) == "4")
+
+pub func test_module_constants_are_inlined_at_each_use():
+    let source = "let base: i64 = 40\nlet extra = 2\npub func answer() -> i64: return base + extra + base\n"
+    let program = lowered(source)
+    let function = only_function(program)
+    var constants = 0
+    for instruction in function.body:
+        match instruction.form:
+            Const(result, value): constants += 1
+            else: continue
+    assert(constants == 3)
+    assert(len(function.slots) == 0)
+    assert(agree(source) == "82")
+
+pub func test_forward_and_cross_module_calls_map_to_function_ids():
+    let modules = [
+        source_module("math", "pub func double(value: i64) -> i64: return value * 2\npub func square(value: i64) -> i64: return value * value\n"),
+        source_module("main", "import math\nfrom math import square\npub func answer() -> i64: return math.double(later(3)) + square(4)\nfunc later(value: i64) -> i64: return value + 1\n"),
+    ]
+    let program = Lowerer(checked_modules(modules), wasm32_layout()).lower() catch reason:
+        trap(reason)
+    MirVerifier(program).verify() catch reason:
+        trap(reason)
+    assert(program.functions[0].name == "math.double")
+    assert(program.functions[1].name == "math.square")
+    assert(program.functions[2].name == "main.answer")
+    assert(program.functions[3].name == "main.later")
+    var targets = list[i64]()
+    for instruction in program.functions[2].body:
+        match instruction.form:
+            Call(results, function, arguments): targets.append(function.value)
+            else: continue
+    assert(len(targets) == 3)
+    assert(targets[0] == 3)
+    assert(targets[1] == 0)
+    assert(targets[2] == 1)
+    assert(agree_modules(modules) == "24")
+
+pub func test_recursion_agrees_with_the_oracle():
+    let factorial = "func factorial(n: i64) -> i64:\n    if n <= 1: return 1\n    return n * factorial(n - 1)\npub func answer() -> i64: return factorial(10)\n"
+    assert(agree(factorial) == "3628800")
+    let fibonacci = "func fib(n: i64) -> i64:\n    if n < 2: return n\n    return fib(n - 1) + fib(n - 2)\npub func answer() -> i64: return fib(12)\n"
+    assert(agree(fibonacci) == "144")
+    let mutual = "func is_even(n: i64) -> bool:\n    if n == 0: return true\n    return is_odd(n - 1)\nfunc is_odd(n: i64) -> bool:\n    if n == 0: return false\n    return is_even(n - 1)\npub func answer() -> i64: return (1 if is_even(10) else 0) + (10 if is_odd(7) else 0)\n"
+    assert(agree(mutual) == "11")
+
+pub func test_mixed_width_parameters_and_calls_in_conditions_agree():
+    let mixed = "func mix(a: i8, b: u16, c: i64, d: f64) -> i64:\n    return c + (1 if a < 0 else 0) + (10 if b > 100 else 0) + (100 if d > 0.5 else 0)\npub func answer() -> i64: return mix(-3, 500, 1000, 0.75)\n"
+    assert(agree(mixed) == "1111")
+    let condition = "func limit(n: i64) -> i64: return n * 3\npub func answer() -> i64:\n    var i = 0\n    var total = 0\n    while i < limit(4):\n        total += i\n        i += 1\n    return total\n"
+    assert(agree(condition) == "66")
+
+pub func test_unit_calls_for_effect_write_output_through_mir():
+    let source = "func greet():\n    print(\"hi\")\nfunc twice():\n    greet()\n    greet()\npub func answer() -> i64:\n    twice()\n    return 1\n"
+    assert(agree(source) == "1")
+    let interpreter = MirInterpreter(lowered(source))
+    let results = interpreter.run("main.answer", list[MirValue]()) catch reason:
+        trap(reason)
+    assert(interpreter.output == "hi\nhi\n")
+
+pub func test_overflow_inside_a_callee_traps_on_both_executions():
+    both_trap("func bump(v: i8) -> i8: return v + 1\npub func answer() -> i8: return bump(127)\n")

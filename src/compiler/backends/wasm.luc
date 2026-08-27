@@ -24,21 +24,31 @@
 #       without a bespoke host. The `luce_rt_write` runtime service becomes
 #       `wasi_snapshot_preview1.fd_write` on stdout through an iovec kept in
 #       the first sixteen bytes of linear memory (scratch); data items pack
-#       after that scratch area; the shadow stack grows down from the top of
-#       the first page, so data and stack share 64 KiB today; the memory is
-#       exported as `memory` as WASI requires. A program with an entry gains
-#       a `_start` function that calls the entry and hands its exit status to
-#       `proc_exit`. Modules with no writes, no slots, and no entry stay
-#       import-free and memory-free.
+#       after that scratch area; the memory is exported as `memory` as WASI
+#       requires. A program with an entry gains a `_start` function that
+#       calls the entry and hands its exit status to `proc_exit`. Modules
+#       with no writes, no slots, and no entry stay import-free and
+#       memory-free.
+#
+#       A module with slots gets a shadow stack: the memory grows to sixteen
+#       pages (1 MiB) and the stack pointer starts at its top, growing down
+#       toward the data. Every prologue traps when the new frame would dip
+#       below the end of the data area, so runaway recursion is a trap, not
+#       silent corruption of data.
+#
+#       Calls are direct: a MIR `Call` pushes its arguments and uses wasm's
+#       `call` with the callee's index. MIR parameter registers `r0..rN-1`
+#       are exactly wasm's parameter locals `0..N-1`, so registers map onto
+#       locals without renumbering; only the remaining registers are declared.
 #
 #       Read `emit` top-down: it writes the sections in the order the binary
 #       format requires — type, import, function, memory, global, export,
 #       code, data — and each `encode_*` below produces one section's
-#       payload. Imports come first in wasm's single function index space, so
-#       every defined function's index is shifted by the import count;
-#       `_start`, when present, is the last defined function. The instruction
-#       encoders follow, grouped by family; the float-constant and LEB128
-#       helpers at the end are the only byte-level plumbing.
+#       payload. The function index space is: imports first (in extern order,
+#       then `proc_exit`), then every defined MIR function in program order,
+#       then `_start` when present. The instruction encoders follow, grouped
+#       by family; the float-constant and LEB128 helpers at the end are the
+#       only byte-level plumbing.
 #
 #==============================================================================================
 
@@ -82,9 +92,12 @@ const scratch_written: i64 = 8          # where fd_write stores the count writte
 const scratch_size: i64 = 16            # data items pack after this
 
 # The shadow stack: global 0 holds the stack pointer, starting at the top of
-# the single 64 KiB page and growing down. Frames are 16-byte aligned.
+# a sixteen-page memory and growing down toward the data. Frames are
+# 16-byte aligned. A memory without a stack stays one page.
 const stack_pointer_global: i64 = 0
-const stack_top: i64 = 65536
+const page_size: i64 = 65536
+const stack_pages: i64 = 16
+const stack_top: i64 = 1048576
 const frame_alignment: i64 = 16
 
 # Control
@@ -242,7 +255,7 @@ pub class WasmBackend: ArtifactBackend:
             append_section(output, import_section, encode_import_entries(plan))
         append_section(output, function_section, encode_function_entries(program, plan))
         if plan.has_memory:
-            append_section(output, memory_section, encode_memory_entry())
+            append_section(output, memory_section, encode_memory_entry(plan))
         if plan.has_stack:
             append_section(output, global_section, encode_global_entries())
         let exports = encode_export_entries(program, plan)
@@ -280,6 +293,9 @@ struct ModulePlan:
     imports: list[WasmImport]
     function_types: list[i64]
     data_offsets: list[i64]
+    # First byte past the data items, rounded to a frame boundary: the
+    # lowest address the shadow stack may reach.
+    data_end: i64
     has_memory: bool
     has_stack: bool
     proc_exit_import: i64
@@ -322,6 +338,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         offset = align_up(offset, item.align)
         data_offsets.append(offset)
         offset += len(item.bytes)
+    let data_end = align_up(offset, frame_alignment)
 
     # `fd_write` reads its iovec from memory, so importing it needs a memory
     # even when the program has no data of its own; so does a shadow stack.
@@ -331,6 +348,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         imports = imports,
         function_types = function_types,
         data_offsets = data_offsets,
+        data_end = data_end,
         has_memory = has_memory,
         has_stack = has_stack,
         proc_exit_import = proc_exit_import,
@@ -423,14 +441,20 @@ func encode_function_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     if has_start(plan): append_unsigned(entries, plan.start_type)
     return entries
 
-# One memory with a one-page (64 KiB) minimum and no maximum; it holds the
-# scratch area, the data items placed by the data section, and the shadow
-# stack growing down from the top.
-func encode_memory_entry() -> list[u8]:
-    return [0x01, 0x00, 0x01]
+# One memory with no maximum. It holds the scratch area and the data items
+# placed by the data section; with a shadow stack it grows to sixteen pages
+# so the stack has room above the data, otherwise one page (64 KiB) is
+# enough.
+func encode_memory_entry(plan: ModulePlan) -> list[u8]:
+    let entries = list[u8]()
+    append_unsigned(entries, 1)
+    entries.append(0x00)
+    if plan.has_stack: append_unsigned(entries, stack_pages)
+    else: append_unsigned(entries, 1)
+    return entries
 
 # One mutable i32 global — the shadow stack pointer — initialised to the top
-# of the first page with the constant expression `i32.const 65536; end`.
+# of the stack pages with the constant expression `i32.const top; end`.
 func encode_global_entries() -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, 1)
@@ -479,7 +503,7 @@ func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
         let frame = plan_frame(program.types, program, function)
         let body = list[u8]()
         try encode_locals(program.types, function, frame, body)
-        encode_prologue(frame, body)
+        encode_prologue(frame, plan, body)
         try encode_body(program, plan, function, frame, function.body, list[Region](), body)
         # MIR only needs every path to terminate; wasm also needs the
         # function's result on the stack at its final `end`. A body whose
@@ -596,8 +620,11 @@ func plan_frame(types: MirTypeTable, program: MirProgram, function: MirFunction)
     if len(function.slots) > 0: size = align_up(offset, frame_alignment)
     return FramePlan(slot_offsets = offsets, size = size, frame_pointer_local = len(function.registers))
 
-# `global.get sp; i32.const size; i32.sub; local.tee fp; global.set sp`
-func encode_prologue(frame: FramePlan, body: list[u8]):
+# `global.get sp; i32.const size; i32.sub; local.tee fp; global.set sp`,
+# then the overflow guard: `local.get fp; i32.const data_end; i32.lt_u; if
+# unreachable end`. The stack grows down toward the data, so a frame whose
+# base would fall below the data's end is a stack overflow and traps.
+func encode_prologue(frame: FramePlan, plan: ModulePlan, body: list[u8]):
     if frame.size == 0: return
     body.append(opcode_global_get)
     append_unsigned(body, stack_pointer_global)
@@ -607,6 +634,10 @@ func encode_prologue(frame: FramePlan, body: list[u8]):
     append_unsigned(body, frame.frame_pointer_local)
     body.append(opcode_global_set)
     append_unsigned(body, stack_pointer_global)
+    local_get_index(body, frame.frame_pointer_local)
+    append_constant(body, plan.data_end, false)
+    body.append(opcode_i32_lt_u)
+    append_trap_if_true(body)
 
 # `local.get fp; i32.const size; i32.add; global.set sp`
 func encode_epilogue(frame: FramePlan, body: list[u8]):
@@ -749,6 +780,15 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
         DataAddress(result, data):
             append_constant(body, plan.data_offsets[data.value], false)
             local_set(body, result)
+        Call(results, target, arguments):
+            # Direct call: arguments in order, the callee's index in the
+            # function index space, then the single result into its local.
+            for argument in arguments:
+                local_get(body, argument)
+            body.append(opcode_call)
+            append_unsigned(body, defined_function_index(plan, target.value))
+            for result in results:
+                local_set(body, result)
         CallExtern(results, external, arguments):
             var import_index = -1
             for index in range(0, len(plan.imports)):

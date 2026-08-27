@@ -16,15 +16,21 @@
 #       `f32`/`f64`, `bool`, `char`), `let`/`var` locals with plain and
 #       compound assignment, every unary and binary operator including
 #       short-circuit `and`/`or` and the conditional expression, `if`/`elif`/
-#       `else`, `while` with `break` and `continue`, constant terminal output,
-#       and returning. The slice boundary lives here, not in canonical MIR —
-#       calls, parameters, and aggregate types all reach the lowerer as HIR
-#       and stop with "does not support ... yet" until this file emits the
-#       instructions for them. Only
-#       `main(arguments: slice[str])` carries a parameter (the 1.0 entry
-#       signature, docs/language/1.0.md §23), and the argument remains
-#       unavailable until ordinary parameters are lowered, so the MIR entry is
-#       `() -> i32`.
+#       `else`, `while` with `break` and `continue`, functions with scalar
+#       parameters and direct calls between them across modules, module
+#       constants, constant terminal output, and returning. The slice
+#       boundary lives here, not in canonical MIR — aggregate types, strings,
+#       optionals, and failure all reach the lowerer as HIR and stop with
+#       "does not support ... yet" until this file emits the instructions
+#       for them. `main(arguments: slice[str])` is the 1.0 entry signature
+#       (docs/language/1.0.md §23); its argument is dropped until slices
+#       exist, so the MIR entry is `() -> i32`.
+#
+#       Parameters are the leading registers of a function (`r0..rN-1`), as
+#       canonical MIR requires; a parameter is immutable in Luce, so a
+#       reference to it is the register itself. A module constant is a scalar
+#       literal tree today and is lowered inline at each use; once constants
+#       can hold aggregates, a `MirGlobal` becomes the right home.
 #
 #       Locals take the simple form on purpose: one `Alloca` per binding in
 #       the prologue, a `Store` at the binding, a `Load` at every use. An
@@ -48,7 +54,7 @@ from compiler.canonical_ir import InstructionForm, MirConstant, MirData, MirExte
 from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.canonical_ir import TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import find_runtime_symbol, size_of
-from compiler.hir import BinaryOperation, BuiltinType, HirExpression, HirFunction
+from compiler.hir import BinaryOperation, BuiltinType, HirArgument, HirConstant, HirExpression, HirFunction
 from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, describe_type
 from compiler.hir import resolve_builtin_type, types_match
 import compiler.hir
@@ -78,10 +84,12 @@ pub class Lowerer:
     types: MirTypeTable
     externs: list[MirExtern]
     data: list[MirData]
-    # The register table, slots, and live locals of the function being lowered.
+    # The register table, slots, live locals, and parameter registers of the
+    # function being lowered.
     registers: list[TypeId]
     slots: list[MirSlot]
     locals: list[Local]
+    parameters: list[Local]
     regions: list[Region]
 
     ## Prepare to lower one analyzed program for one target; `lower` walks it.
@@ -94,6 +102,7 @@ pub class Lowerer:
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
+        self.parameters = list[Local]()
         self.regions = list[Region]()
 
     # mark: Lowering ============================================================================
@@ -120,20 +129,25 @@ pub class Lowerer:
 
     # Lower one function body. The canonical name is `module.function` so
     # artifacts stay unambiguous across modules. `main` keeps the entry
-    # signature from the header note above; every other parameter list must
-    # be empty until parameters are lowered.
+    # signature from the header note above; every other function's parameters
+    # become its leading registers.
     func lower_function(module: HirModule, function: HirFunction) -> MirFunction!:
         let string_slice = resolve_builtin_type(BuiltinType.string_slice)
         let is_entry = function.name == "main" and len(function.parameters) == 1 and types_match(function.parameters[0].value_type, string_slice)
         if function.name == "main" and not is_entry:
             try self.fail_unsupported(module, function, function.span, "entry parameters other than `(arguments: slice[str])`")
-        if function.name != "main" and len(function.parameters) > 0:
-            try self.fail_unsupported(module, function, function.span, "parameters")
 
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
+        self.parameters = list[Local]()
         self.regions = list[Region]()
+        let parameter_types = list[TypeId]()
+        if not is_entry:
+            for parameter in function.parameters:
+                let parameter_type = try self.mir_type_of(module, function, function.span, parameter.value_type)
+                parameter_types.append(parameter_type)
+                self.parameters.append(Local(symbol = parameter.symbol.value, address = self.new_register(parameter_type)))
         let results = list[TypeId]()
         let returns_unit = types_match(function.result, resolve_builtin_type(BuiltinType.unit))
         if not returns_unit:
@@ -156,7 +170,7 @@ pub class Lowerer:
         return MirFunction(
             name = module.name + "." + function.name,
             convention = CallingConvention.luce,
-            signature = MirSignature(parameters = list[TypeId](), results = results, is_fallible = false),
+            signature = MirSignature(parameters = parameter_types, results = results, is_fallible = false),
             registers = self.registers,
             slots = self.slots,
             body = body,
@@ -316,6 +330,14 @@ pub class Lowerer:
     # Operands are lowered left to right, so `2 + 3` defines the register for
     # 2, then 3, then their sum.
     func lower_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
+        # A call may produce `unit`, which has no machine type; every other
+        # expression form has a scalar type or is refused below.
+        match expression.form:
+            Call(callee, arguments):
+                return try self.lower_call(module, function, expression, callee, arguments, body)
+            else: return try self.lower_typed_expression(module, function, expression, body)
+
+    func lower_typed_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
         let value_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
         match expression.form:
             Constant(value):
@@ -330,6 +352,11 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = expression.span))
                 return register
             Reference(symbol):
+                for parameter in self.parameters:
+                    if parameter.symbol == symbol.value: return parameter.address
+                let constant = self.constant_of(symbol)
+                if constant != none:
+                    return try self.lower_expression(module, function, constant.value, body)
                 let local = try self.local_of(module, function, expression.span, symbol)
                 let register = self.new_register(value_type)
                 body.append(MirInstruction(form = InstructionForm.Load(result = register, value_type = value_type, address = local.address), span = expression.span))
@@ -372,6 +399,28 @@ pub class Lowerer:
                 return result
             else:
                 error(self.unsupported(module, function, expression.span, "expression `" + str(expression.form) + "`"))
+
+    # Arguments are lowered in the order they were written, then placed by
+    # the parameter index HIR resolved for each (named arguments may be
+    # written in any order). The callee is a `FunctionId`, its index in
+    # `program.functions`, which is the same index in the MIR program.
+    func lower_call(module: HirModule, function: HirFunction, expression: HirExpression, callee: SymbolId, arguments: list[HirArgument], body: list[MirInstruction]) -> RegisterId!:
+        let target = self.function_index_of(callee)
+        if target < 0: try self.fail_unsupported(module, function, expression.span, "a call to a symbol that is not a function")
+        let called = self.program.functions[target]
+        let placed = list[RegisterId]()
+        for parameter in called.parameters: placed.append(RegisterId(value = -1))
+        for argument in arguments:
+            placed[argument.parameter_index] = try self.lower_expression(module, function, argument.value, body)
+        let results = list[RegisterId]()
+        if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
+            results.append(self.new_register(try self.mir_type_of(module, function, expression.span, called.result)))
+        body.append(MirInstruction(
+            form = InstructionForm.Call(results = results, function = FunctionId(value = target), arguments = placed),
+            span = expression.span,
+        ))
+        if len(results) == 0: return RegisterId(value = -1)
+        return results[0]
 
     # `a and b` evaluates `b` only when `a` is true; `a or b` only when `a`
     # is false. Both are an `If` whose unevaluated arm yields the constant
@@ -444,6 +493,18 @@ pub class Lowerer:
     func new_register(value_type: TypeId) -> RegisterId:
         self.registers.append(value_type)
         return RegisterId(value = len(self.registers) - 1)
+
+    # The HIR function a call symbol names, as its index in `program.functions`.
+    func function_index_of(symbol: SymbolId) -> i64:
+        for index in range(0, len(self.program.functions)):
+            if self.program.functions[index].symbol.value == symbol.value: return index
+        return -1
+
+    # The module constant a reference names, if any.
+    func constant_of(symbol: SymbolId) -> HirConstant?:
+        for constant in self.program.constants:
+            if constant.symbol.value == symbol.value: return constant
+        return none
 
     # The slot address of a local the prologue reserved.
     func local_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId) -> Local!:
