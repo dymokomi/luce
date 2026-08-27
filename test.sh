@@ -21,6 +21,9 @@ luce=./stage0/bin/luce-0-fast
 #    path prints its diagnostic (tests/cli_test.sh).
 ./tests/cli_test.sh ./stage0/bin/luce-0
 
+# WebAssembly execution under wasmtime, when it is installed.
+./tests/wasm_test.sh ./stage0/bin/luce-0
+
 # 3. Native smoke test: build the compiler, build hello.luc for this host,
 #    and run it.
 

@@ -9,17 +9,26 @@
 #       and each checked integer operation legalizes into the wasm arithmetic
 #       plus an explicit overflow test that ends in `unreachable`, because
 #       wasm arithmetic wraps and MIR arithmetic traps (docs/compiler/mir.md,
-#       "Meaning is fixed here"). The `luce_rt_write` runtime service becomes
-#       an imported `luce.write`; data items land in linear memory at packed
-#       offsets. Arithmetic-only modules stay import-free and memory-free.
+#       "Meaning is fixed here").
+#
+#       The host contract is WASI preview 1, because every wasm runtime
+#       speaks it: a module runs under `wasmtime run` or in a browser shim
+#       without a bespoke host. The `luce_rt_write` runtime service becomes
+#       `wasi_snapshot_preview1.fd_write` on stdout through an iovec kept in
+#       the first sixteen bytes of linear memory (scratch); data items pack
+#       after that scratch area; the memory is exported as `memory` as WASI
+#       requires. A program with an entry gains a `_start` function that
+#       calls the entry and hands its exit status to `proc_exit`. Modules
+#       with no writes and no entry stay import-free and memory-free.
 #
 #       Read `emit` top-down: it writes the sections in the order the binary
 #       format requires — type, import, function, memory, export, code, data —
 #       and each `encode_*` below produces one section's payload. Imports
 #       come first in wasm's single function index space, so every defined
-#       function's index is shifted by the import count. The instruction
-#       encoders follow; the LEB128 helpers at the end are the only
-#       byte-level plumbing.
+#       function's index is shifted by the import count; `_start`, when
+#       present, is the last defined function. The instruction encoders
+#       follow; the LEB128 helpers at the end are the only byte-level
+#       plumbing.
 #
 #==============================================================================================
 
@@ -46,7 +55,19 @@ const f32_value_type: u8 = 0x7D
 const f64_value_type: u8 = 0x7C
 const function_import_kind: u8 = 0x00
 const function_export_kind: u8 = 0x00
+const memory_export_kind: u8 = 0x02
 const empty_block_type: u8 = 0x40
+
+# WASI preview 1: the module name, the two services used, and the scratch
+# area at the start of memory that `fd_write` reads its iovec from.
+const wasi_module: str = "wasi_snapshot_preview1"
+const wasi_fd_write: str = "fd_write"
+const wasi_proc_exit: str = "proc_exit"
+const wasi_stdout: i64 = 1
+const scratch_iovec_buffer: i64 = 0     # iovec.buf: i32 offset of the bytes
+const scratch_iovec_length: i64 = 4     # iovec.buf_len: i32 byte count
+const scratch_written: i64 = 8          # where fd_write stores the count written
+const scratch_size: i64 = 16            # data items pack after this
 
 const opcode_unreachable: u8 = 0x00
 const opcode_block: u8 = 0x02
@@ -55,8 +76,10 @@ const opcode_end: u8 = 0x0B
 const opcode_br_if: u8 = 0x0D
 const opcode_return: u8 = 0x0F
 const opcode_call: u8 = 0x10
+const opcode_drop: u8 = 0x1A
 const opcode_local_get: u8 = 0x20
 const opcode_local_set: u8 = 0x21
+const opcode_i32_store: u8 = 0x36
 const opcode_i32_const: u8 = 0x41
 const opcode_i64_const: u8 = 0x42
 
@@ -100,7 +123,7 @@ pub class WasmBackend: ArtifactBackend:
         if len(plan.imports) > 0:
             append_section(output, import_section, encode_import_entries(plan))
         append_section(output, function_section, encode_function_entries(program, plan))
-        if len(plan.data_offsets) > 0:
+        if plan.has_memory:
             append_section(output, memory_section, encode_memory_entry())
         let exports = encode_export_entries(program, plan)
         # A lone leading count byte means "no exports"; write the section only
@@ -108,7 +131,7 @@ pub class WasmBackend: ArtifactBackend:
         if len(exports) > 1:
             append_section(output, export_section, exports)
         append_section(output, code_section, try encode_code_entries(program, plan))
-        if len(plan.data_offsets) > 0:
+        if len(program.data) > 0:
             append_section(output, data_section, encode_data_entries(program, plan))
         return output
 
@@ -128,38 +151,65 @@ struct WasmImport:
 
 # Everything decided before any byte is written: the type table, the
 # imports (which take the first function indices), the type index of every
-# defined function, and where each data item lands in memory.
+# defined function, where each data item lands in memory, whether the
+# module has a memory at all, and the `_start` wrapper when there is an
+# entry. `proc_exit_import` and `start_type` are -1 without an entry.
 struct ModulePlan:
     signatures: list[WasmSignature]
     imports: list[WasmImport]
     function_types: list[i64]
     data_offsets: list[i64]
+    has_memory: bool
+    proc_exit_import: i64
+    start_type: i64
 
 func plan_module(program: MirProgram) -> ModulePlan!:
     let signatures = list[WasmSignature]()
     let imports = list[WasmImport]()
     for index in range(0, len(program.externs)):
         let external = program.externs[index]
-        # The only runtime service the slice needs. Its wasm shape takes
-        # (offset, length) as i32s; the call site wraps MIR's i64 length.
+        # The only runtime service the slice needs. WASI's `fd_write` takes
+        # (fd, iovs, iovs_len, nwritten) and returns an errno.
         if external.name != "luce_rt_write":
             error("wasm backend does not support extern `" + external.name + "` yet")
-        let type_index = intern_signature(signatures, WasmSignature(parameters = [i32_value_type, i32_value_type], results = list[u8]()))
-        imports.append(WasmImport(external = index, module_name = "luce", field_name = "write", type_index = type_index))
+        let type_index = intern_signature(signatures, WasmSignature(parameters = [i32_value_type, i32_value_type, i32_value_type, i32_value_type], results = [i32_value_type]))
+        imports.append(WasmImport(external = index, module_name = wasi_module, field_name = wasi_fd_write, type_index = type_index))
+
+    # An entry gets `_start`, which needs `proc_exit(i32)` to report the
+    # exit status. The import is not tied to a MIR extern.
+    var proc_exit_import = -1
+    var start_type = -1
+    let entry = program.entry
+    if entry != none:
+        let exit_type = intern_signature(signatures, WasmSignature(parameters = [i32_value_type], results = list[u8]()))
+        proc_exit_import = len(imports)
+        imports.append(WasmImport(external = -1, module_name = wasi_module, field_name = wasi_proc_exit, type_index = exit_type))
+        start_type = intern_signature(signatures, WasmSignature(parameters = list[u8](), results = list[u8]()))
 
     let function_types = list[i64]()
     for function in program.functions:
         function_types.append(intern_signature(signatures, try wasm_signature(program.types, function.signature)))
 
-    # Data items pack from offset zero, each at its own alignment.
+    # Data items pack after the scratch area, each at its own alignment.
     let data_offsets = list[i64]()
-    var offset = 0
+    var offset = scratch_size
     for item in program.data:
         offset = align_up(offset, item.align)
         data_offsets.append(offset)
         offset += len(item.bytes)
 
-    return ModulePlan(signatures = signatures, imports = imports, function_types = function_types, data_offsets = data_offsets)
+    # `fd_write` reads its iovec from memory, so importing it needs a memory
+    # even when the program has no data of its own.
+    let has_memory = len(program.data) > 0 or len(imports) > 0
+    return ModulePlan(
+        signatures = signatures,
+        imports = imports,
+        function_types = function_types,
+        data_offsets = data_offsets,
+        has_memory = has_memory,
+        proc_exit_import = proc_exit_import,
+        start_type = start_type,
+    )
 
 func intern_signature(signatures: list[WasmSignature], signature: WasmSignature) -> i64:
     for index in range(0, len(signatures)):
@@ -203,6 +253,13 @@ func wasm_value_type(types: MirTypeTable, id: TypeId) -> u8!:
 func defined_function_index(plan: ModulePlan, function: i64) -> i64:
     return len(plan.imports) + function
 
+# `_start`, when present, is defined after every MIR function.
+func has_start(plan: ModulePlan) -> bool:
+    return plan.start_type >= 0
+
+func start_function_index(program: MirProgram, plan: ModulePlan) -> i64:
+    return defined_function_index(plan, len(program.functions))
+
 # mark: Sections ==============================================================================
 
 # One `0x60` entry per distinct signature: parameter types, then result types.
@@ -232,22 +289,29 @@ func encode_import_entries(plan: ModulePlan) -> list[u8]:
 # bodies come later in the code section, in the same order.
 func encode_function_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
-    append_unsigned(entries, len(program.functions))
+    var count = len(program.functions)
+    if has_start(plan): count += 1
+    append_unsigned(entries, count)
     for type_index in plan.function_types:
         append_unsigned(entries, type_index)
+    if has_start(plan): append_unsigned(entries, plan.start_type)
     return entries
 
 # One memory with a one-page (64 KiB) minimum and no maximum; it holds the
-# data items placed by the data section.
+# scratch area and the data items placed by the data section.
 func encode_memory_entry() -> list[u8]:
     return [0x01, 0x00, 0x01]
 
-# Public functions export under their canonical `module.function` name.
+# Public functions export under their canonical `module.function` name; the
+# memory exports as `memory` and the entry wrapper as `_start`, the two
+# names WASI looks for.
 func encode_export_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
     var export_count = 0
     for function in program.functions:
         if function.is_public: export_count += 1
+    if plan.has_memory: export_count += 1
+    if has_start(plan): export_count += 1
     append_unsigned(entries, export_count)
     for index in range(0, len(program.functions)):
         let function = program.functions[index]
@@ -255,12 +319,22 @@ func encode_export_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
             append_name(entries, function.name)
             entries.append(function_export_kind)
             append_unsigned(entries, defined_function_index(plan, index))
+    if plan.has_memory:
+        append_name(entries, "memory")
+        entries.append(memory_export_kind)
+        append_unsigned(entries, 0)
+    if has_start(plan):
+        append_name(entries, "_start")
+        entries.append(function_export_kind)
+        append_unsigned(entries, start_function_index(program, plan))
     return entries
 
 # One body per function: its local declarations, then its instructions.
 func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
     let entries = list[u8]()
-    append_unsigned(entries, len(program.functions))
+    var count = len(program.functions)
+    if has_start(plan): count += 1
+    append_unsigned(entries, count)
     for function in program.functions:
         let body = list[u8]()
         try encode_locals(program.types, function, body)
@@ -269,7 +343,23 @@ func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
         body.append(opcode_end)
         append_unsigned(entries, len(body))
         append_all(entries, body)
+    if has_start(plan):
+        let body = encode_start_body(program, plan)
+        append_unsigned(entries, len(body))
+        append_all(entries, body)
     return entries
+
+# `_start`: no locals; call the entry, hand its i32 to `proc_exit`.
+func encode_start_body(program: MirProgram, plan: ModulePlan) -> list[u8]:
+    let entry = program.entry else trap("wasm `_start` planned without an entry")
+    let body = list[u8]()
+    append_unsigned(body, 0)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, entry.value))
+    body.append(opcode_call)
+    append_unsigned(body, plan.proc_exit_import)
+    body.append(opcode_end)
+    return body
 
 # One active data segment per item, placed into memory 0 at its packed offset
 # when the module is instantiated.
@@ -359,23 +449,45 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             append_signed(body, plan.data_offsets[data.value])
             local_set(body, result)
         CallExtern(results, external, arguments):
-            # The one supported service: `luce_rt_write(ptr, i64)` calls the
-            # `luce.write(i32, i32)` import, wrapping the length.
             var import_index = -1
             for index in range(0, len(plan.imports)):
                 if plan.imports[index].external == external.value: import_index = index
             if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
-            local_get(body, arguments[0])
-            local_get(body, arguments[1])
-            body.append(opcode_i32_wrap_i64)
-            body.append(opcode_call)
-            append_unsigned(body, import_index)
+            encode_write(body, import_index, arguments[0], arguments[1])
         Return(values):
             for value in values:
                 local_get(body, value)
             body.append(opcode_return)
         else:
             error("wasm backend does not support `" + str(instruction.form) + "` yet")
+
+# mark: WASI write ============================================================================
+
+# `luce_rt_write(ptr, i64 len)` as `fd_write(stdout, iovs, 1, nwritten)`:
+# fill the scratch iovec with the pointer and the wrapped length, call, and
+# drop the errno — a failed write to stdout has nowhere to be reported.
+func encode_write(body: list[u8], import_index: i64, pointer: RegisterId, length: RegisterId):
+    append_constant(body, scratch_iovec_buffer, false)
+    local_get(body, pointer)
+    append_i32_store(body)
+    append_constant(body, scratch_iovec_length, false)
+    local_get(body, length)
+    body.append(opcode_i32_wrap_i64)
+    append_i32_store(body)
+    append_constant(body, wasi_stdout, false)
+    append_constant(body, scratch_iovec_buffer, false)
+    append_constant(body, 1, false)
+    append_constant(body, scratch_written, false)
+    body.append(opcode_call)
+    append_unsigned(body, import_index)
+    body.append(opcode_drop)
+
+# `i32.store` with its memarg: alignment 2^2, offset 0 (the address is on
+# the stack already).
+func append_i32_store(body: list[u8]):
+    body.append(opcode_i32_store)
+    append_unsigned(body, 2)
+    append_unsigned(body, 0)
 
 # mark: Checked arithmetic ====================================================================
 #

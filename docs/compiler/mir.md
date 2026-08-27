@@ -354,7 +354,10 @@ Two consequences for the design record:
 ### What comes next
 
 - **wasm** maps one-to-one: regions to `block`/`loop`/`if`, registers to
-  locals, externs to imports; it legalizes checked arithmetic.
+  locals, externs to imports; it legalizes checked arithmetic. Its host
+  contract is WASI preview 1 — `luce_rt_write` becomes `fd_write`, an
+  entry gains `_start` and `proc_exit` — so a module runs under any wasm
+  runtime with no bespoke host.
 - **arm64 and x86-64** will emit an object file and call the system
   linker — the only way `extern` C functions and `libluce_rt` link. The
   current direct executable writers stay as a no-dependency path and are
