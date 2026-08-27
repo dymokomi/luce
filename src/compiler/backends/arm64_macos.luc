@@ -1,10 +1,10 @@
 #==============================================================================================
 #
-#   arm64_macos - Canonical instructions into an Apple-silicon executable
+#   arm64_macos - Canonical MIR into an Apple-silicon executable
 #
 #   DESCRIPTION:
-#       A direct Apple-silicon executable encoder for the first native slice.
-#       It writes ARM64 instructions and the complete unsigned Mach-O container
+#       A direct Apple-silicon executable encoder for the native slice. It
+#       writes ARM64 instructions and the complete unsigned Mach-O container
 #       itself; the command-line driver applies the host-required ad-hoc
 #       signature after the bytes reach their final path.
 #
@@ -12,18 +12,27 @@
 #       from `emit` will not run until `codesign` has touched the file.
 #
 #       Read the file in the order `emit` works: `find_executable_entry`
-#       picks `main`, `emit_code` turns its instructions into machine words
-#       through the small encoders under "ARM64 encoding", and the "Mach-O
-#       encoding" section wraps those words in the container. Even a 20-byte
-#       program needs eight load commands because dyld will not start an
-#       image without a page-zero guard, a text segment, an (empty) link-edit
-#       segment, dyld-info, the dynamic linker path, a platform version, an
-#       entry point, and at least one linked library.
+#       picks `main`, `layout_data` places every constant data item at the
+#       start of the code page (so its absolute address is known before any
+#       instruction is written), `emit_code` turns the entry's MIR into
+#       machine words through the small encoders under "ARM64 encoding", and
+#       the "Mach-O encoding" section wraps everything in the container. Even
+#       a 20-byte program needs eight load commands because dyld will not
+#       start an image without a page-zero guard, a text segment, an (empty)
+#       link-edit segment, dyld-info, the dynamic linker path, a platform
+#       version, an entry point, and at least one linked library.
+#
+#       MIR registers live in fixed 16-byte frame slots below `sp`; every
+#       instruction loads its operands into x0/x1, computes, and stores the
+#       result back. Integer arithmetic is checked: an overflow reaches a
+#       `brk #0` and the process dies with SIGTRAP, which is what the
+#       language means by "traps".
 #
 #==============================================================================================
 
 from compiler.backend import ArtifactBackend
-from compiler.canonical_ir import CanonicalFunction, CanonicalProgram, CanonicalType
+from compiler.canonical_ir import BinaryOp, BuiltinMirType, InstructionForm, MirConstant, MirData, MirFunction
+from compiler.canonical_ir import MirInstruction, MirProgram, RegisterId, TypeId, align_up, builtin_mir_type
 from compiler.executable import find_executable_entry
 import std.strings
 
@@ -42,7 +51,7 @@ const load_main: i64 = 0x80000028
 const load_dylib: i64 = 0x0C
 
 const text_address: i64 = 0x100000000     # where __TEXT is mapped
-const code_offset: i64 = 0x1000            # code begins one 4 KiB header page in
+const code_offset: i64 = 0x1000            # data, then code, begin one 4 KiB header page in
 const page_size: i64 = 0x4000              # Apple silicon uses 16 KiB pages
 
 # Darwin system-call numbers and the registers each one reads: the number
@@ -51,22 +60,35 @@ const syscall_exit: i64 = 1
 const syscall_write: i64 = 4
 const stdout: i64 = 1
 const reg_x0: i64 = 0
+const reg_x1: i64 = 1
 const reg_x2: i64 = 2
 const reg_syscall_x16: i64 = 16
+const reg_sp: i64 = 31
+
+# Each MIR register owns a 16-byte slot, keeping `sp` 16-byte aligned as the
+# ABI requires without a register allocator. `sub sp` takes a 12-bit
+# immediate, which bounds the frame.
+const slot_size: i64 = 16
+const frame_limit: i64 = 4080
 
 # Pre-encoded instruction words, each with its assembly spelling.
-const push_x0: i64 = 0xF81F0FE0            # str x0, [sp, #-16]!
-const pop_x0: i64 = 0xF84107E0             # ldr x0, [sp], #16
-const pop_x1: i64 = 0xF84107E1             # ldr x1, [sp], #16
-const address_inline_text: i64 = 0x100000A1  # adr x1, #+20 (the text after svc and b)
 const supervisor_call: i64 = 0xD4001001    # svc #0x80
-const add_x0_x1: i64 = 0x8B010000          # add x0, x0, x1
-const add_w0_w1: i64 = 0x0B010000          # add w0, w0, w1
-const sub_x0_x1: i64 = 0xCB010000          # sub x0, x0, x1
-const sub_w0_w1: i64 = 0x4B010000          # sub w0, w0, w1
+const breakpoint: i64 = 0xD4200000         # brk #0 — the overflow trap
+const adr_base: i64 = 0x10000000           # adr xD, #imm21
+const sub_sp_base: i64 = 0xD10003FF        # sub sp, sp, #imm12
+const str_x_base: i64 = 0xF9000000         # str xT, [xN, #imm12 * 8]
+const ldr_x_base: i64 = 0xF9400000         # ldr xT, [xN, #imm12 * 8]
+const adds_x0_x1: i64 = 0xAB010000         # adds x0, x0, x1
+const adds_w0_w1: i64 = 0x2B010000         # adds w0, w0, w1
+const subs_x0_x1: i64 = 0xEB010000         # subs x0, x0, x1
+const subs_w0_w1: i64 = 0x6B010000         # subs w0, w0, w1
 const mul_x0_x1: i64 = 0x9B017C00          # mul x0, x0, x1
-const mul_w0_w1: i64 = 0x1B017C00          # mul w0, w0, w1
-const branch_forward: i64 = 0x14000000     # b #+(imm26 * 4)
+const smulh_x2_x0_x1: i64 = 0x9B417C02     # smulh x2, x0, x1 (high 64 bits of the product)
+const smull_x0_w0_w1: i64 = 0x9B217C00     # smull x0, w0, w1 (full 64-bit product of two i32)
+const cmp_x2_x0_asr_63: i64 = 0xEB80FC5F   # cmp x2, x0, asr #63
+const cmp_x0_w0_sxtw: i64 = 0xEB20C01F     # cmp x0, w0, sxtw
+const branch_vc_skip: i64 = 0x54000047     # b.vc #+8 (over the brk)
+const branch_eq_skip: i64 = 0x54000040     # b.eq #+8 (over the brk)
 const movz_base: i64 = 0xD2800000          # movz xN, #imm16
 const movk_shift_16: i64 = 0xF2A00000      # movk xN, #imm16, lsl #16
 const movk_shift_32: i64 = 0xF2C00000      # movk xN, #imm16, lsl #32
@@ -80,10 +102,12 @@ pub class Arm64MacosBackend: ArtifactBackend:
         return
 
     ## Encode one canonical program as the bytes of a complete Mach-O executable.
-    pub func emit(program: CanonicalProgram) -> list[u8]!:
+    pub func emit(program: MirProgram) -> list[u8]!:
         let entry = try find_executable_entry(program)
-        let code = try emit_code(entry)
-        if code_offset + len(code) > page_size:
+        let data = try layout_data(program)
+        let entry_offset = code_offset + len(data.packed)
+        let code = try emit_code(program, entry, data)
+        if entry_offset + len(code) > page_size:
             error("arm64-macos backend: the executable slice is limited to one 16 KiB page")
 
         let output = list[u8]()
@@ -94,98 +118,153 @@ pub class Arm64MacosBackend: ArtifactBackend:
         append_dyld_info(output)
         append_dylinker(output)
         append_build_version(output)
-        append_main(output)
+        append_main(output, entry_offset)
         append_system_library(output)
         pad_to(output, code_offset)
+        append_all(output, data.packed)
         append_all(output, code)
         pad_to(output, page_size)
         return output
 
+# mark: Data layout ===========================================================================
+
+# Every `MirData` item packed at the start of the code page, each at its
+# alignment, plus each item's file offset. The image is position-independent
+# (dyld slides it), so code reaches data with a PC-relative `adr`, never an
+# absolute address; placing data before code keeps every offset known while
+# the instructions are written.
+struct PlacedData:
+    packed: list[u8]
+    offsets: list[i64]
+
+func layout_data(program: MirProgram) -> PlacedData!:
+    let packed = list[u8]()
+    let offsets = list[i64]()
+    for item in program.data:
+        if len(item.relocations) > 0:
+            error("arm64-macos backend does not support data relocations yet (`" + item.name + "`)")
+        while len(packed) % item.align != 0: packed.append(0)
+        offsets.append(code_offset + len(packed))
+        append_all(packed, item.bytes)
+    # Code must start on a 4-byte instruction boundary.
+    while len(packed) % 4 != 0: packed.append(0)
+    return PlacedData(packed = packed, offsets = offsets)
+
 # mark: Code emission =========================================================================
 
-# Values use 16-byte stack slots, keeping the platform stack aligned without a
-# register allocator. Constant strings sit inline behind a branch, so neither
-# an assembler nor a relocation table is needed for this first slice.
-#
-# The stack-depth and `Return` checks re-prove invariants `MirVerifier` has
-# already established; they are defensive, so a verifier gap can never emit
-# a malformed executable silently.
-func emit_code(function: CanonicalFunction) -> list[u8]!:
+# Only the entry function is emitted in this slice, and only the straight-line
+# instructions the lowerer produces today; every other form fails by name.
+func emit_code(program: MirProgram, function: MirFunction, data: PlacedData) -> list[u8]!:
+    let frame = align_up(len(function.registers) * slot_size, 16)
+    if frame > frame_limit:
+        error("arm64-macos backend: `" + function.name + "` uses more than " + str(frame_limit // slot_size) + " registers")
     let code = list[u8]()
-    var stack_depth = 0
-    var returned = false
-    for instruction in function.instructions:
-        if returned: error("arm64-macos backend: instruction follows `Return` in `" + function.name + "`")
-        match instruction:
-            Constant(value, value_type):
-                append_constant(code, value, value_type)
-                stack_depth += 1
-            Add(operand_type):
-                append_binary(code, add_w0_w1, add_x0_x1, operand_type)
-                stack_depth -= 1
-            Subtract(operand_type):
-                append_binary(code, sub_w0_w1, sub_x0_x1, operand_type)
-                stack_depth -= 1
-            Multiply(operand_type):
-                append_binary(code, mul_w0_w1, mul_x0_x1, operand_type)
-                stack_depth -= 1
-            WriteText(value): try append_print(code, value)
-            Return:
-                # Pop the value into x0 and make the `exit` system call; the
-                # entry function's return is the process exit status.
-                if stack_depth != 1: error("arm64-macos backend: `Return` needs one value in `" + function.name + "`")
-                append_word(code, pop_x0)
+    if frame > 0: append_word(code, sub_sp_base | frame << 10)   # sub sp, sp, #frame
+    let i64_type = builtin_mir_type(BuiltinMirType.signed_i64)
+
+    for instruction in function.body:
+        match instruction.form:
+            Const(result, value):
+                match value:
+                    Int(item): append_move_wide(code, reg_x0, item)
+                    Null: append_move_wide(code, reg_x0, 0)
+                    Bool(item):
+                        if item: append_move_wide(code, reg_x0, 1)
+                        else: append_move_wide(code, reg_x0, 0)
+                    else: error("arm64-macos backend does not support float constants yet in `" + function.name + "`")
+                append_store(code, reg_x0, result)
+            Binary(result, operation, left, right):
+                append_load(code, reg_x0, left)
+                append_load(code, reg_x1, right)
+                let wide = function.registers[left.value].value == i64_type.value
+                if operation == BinaryOp.add:
+                    if wide: append_word(code, adds_x0_x1)
+                    else: append_word(code, adds_w0_w1)
+                    append_overflow_trap(code)
+                elif operation == BinaryOp.sub:
+                    if wide: append_word(code, subs_x0_x1)
+                    else: append_word(code, subs_w0_w1)
+                    append_overflow_trap(code)
+                elif operation == BinaryOp.mul:
+                    append_checked_multiply(code, wide)
+                else:
+                    error("arm64-macos backend does not support `" + str(operation) + "` yet in `" + function.name + "`")
+                append_store(code, reg_x0, result)
+            DataAddress(result, item):
+                # `adr` measures from this instruction, which sits at
+                # `entry_offset + len(code)` in the file.
+                let here = code_offset + len(data.packed) + len(code)
+                append_adr(code, reg_x0, data.offsets[item.value] - here)
+                append_store(code, reg_x0, result)
+            CallExtern(results, external, arguments):
+                let name = program.externs[external.value].name
+                if name != "luce_rt_write":
+                    error("arm64-macos backend does not support extern `" + name + "` yet")
+                # write(stdout, pointer, length): x0 = 1, x1 = bytes, x2 = length.
+                append_load(code, reg_x1, arguments[0])
+                append_load(code, reg_x2, arguments[1])
+                append_move(code, reg_x0, stdout)
+                append_move(code, reg_syscall_x16, syscall_write)
+                append_word(code, supervisor_call)
+            Return(values):
+                # The entry function's return is the process exit status:
+                # x0 = value, then the `exit` system call.
+                append_load(code, reg_x0, values[0])
                 append_move(code, reg_syscall_x16, syscall_exit)
                 append_word(code, supervisor_call)
-                stack_depth = 0
-                returned = true
-    if not returned: error("arm64-macos backend: `" + function.name + "` has no `Return`")
+            else:
+                error("arm64-macos backend does not support `" + str(instruction.form) + "` yet in `" + function.name + "`")
     return code
 
-# Load a typed integer into x0/w0 and push it. `movz` sets the low 16 bits
-# and each `movk` keeps the rest while inserting the next 16: i32 needs two
-# words, i64 four, so the full two's-complement pattern is preserved.
-func append_constant(code: list[u8], value: i64, value_type: CanonicalType):
-    append_move(code, reg_x0, value & 0xFFFF)
-    append_word(code, movk_shift_16 | ((value >> 16) & 0xFFFF) << 5)
-    if value_type == CanonicalType.signed_i64:
-        append_word(code, movk_shift_32 | ((value >> 32) & 0xFFFF) << 5)
-        append_word(code, movk_shift_48 | ((value >> 48) & 0xFFFF) << 5)
-    append_word(code, push_x0)
+# `b.vc` steps over the `brk` when the last flag-setting operation did not
+# overflow; otherwise the breakpoint fires and the process dies with SIGTRAP.
+func append_overflow_trap(code: list[u8]):
+    append_word(code, branch_vc_skip)
+    append_word(code, breakpoint)
 
-# Pop right then left, apply the 32-bit or 64-bit op, push the result.
-func append_binary(code: list[u8], op32: i64, op64: i64, operand_type: CanonicalType):
-    append_word(code, pop_x1)
-    append_word(code, pop_x0)
-    match operand_type:
-        signed_i32: append_word(code, op32)
-        signed_i64: append_word(code, op64)
-    append_word(code, push_x0)
-
-# A `write(stdout, text, length)` system call whose text lives inline right
-# behind a branch that jumps over it.
-func append_print(code: list[u8], text: str) -> !:
-    let encoded = strings.to_bytes(text + "\n")
-    if len(encoded) > 0xFFFF: error("arm64-macos backend: one `print` is limited to 65535 UTF-8 bytes")
-    let padded_size = (len(encoded) + 3) // 4 * 4
-
-    append_move(code, reg_x0, stdout)
-    append_word(code, address_inline_text)
-    append_move(code, reg_x2, len(encoded))
-    append_move(code, reg_syscall_x16, syscall_write)
-    append_word(code, supervisor_call)
-    # `b` over the inline text: the offset counts words from this branch, so
-    # it is the padded text length plus one for the branch itself.
-    append_word(code, branch_forward | (1 + padded_size // 4))
-    append_all(code, encoded)
-    # Instructions are 4-byte words, so pad the inline text to the next word.
-    while len(code) % 4 != 0: code.append(0)
+# Multiplication sets no overflow flag, so the check compares against the
+# full product. i64: `smulh` yields the high 64 bits of the 128-bit product,
+# which must equal the sign extension of the low 64 (`x0 asr #63`). i32:
+# `smull` yields the exact 64-bit product, which must equal its own low 32
+# bits sign-extended (`w0 sxtw`).
+func append_checked_multiply(code: list[u8], wide: bool):
+    if wide:
+        append_word(code, smulh_x2_x0_x1)
+        append_word(code, mul_x0_x1)
+        append_word(code, cmp_x2_x0_asr_63)
+    else:
+        append_word(code, smull_x0_w0_w1)
+        append_word(code, cmp_x0_w0_sxtw)
+    append_word(code, branch_eq_skip)
+    append_word(code, breakpoint)
 
 # mark: ARM64 encoding ========================================================================
 
 # `movz register, #value` — load one 16-bit immediate, zeroing the rest.
 func append_move(output: list[u8], register: i64, value: i64):
     append_word(output, movz_base | (value & 0xFFFF) << 5 | register)
+
+# Load a full 64-bit pattern: `movz` sets the low 16 bits and each `movk`
+# inserts the next 16 while keeping the rest.
+func append_move_wide(output: list[u8], register: i64, value: i64):
+    append_move(output, register, value & 0xFFFF)
+    append_word(output, movk_shift_16 | ((value >> 16) & 0xFFFF) << 5 | register)
+    append_word(output, movk_shift_32 | ((value >> 32) & 0xFFFF) << 5 | register)
+    append_word(output, movk_shift_48 | ((value >> 48) & 0xFFFF) << 5 | register)
+
+# `adr xD, #offset` — a PC-relative address; the 21-bit signed offset is
+# split into immlo (bits 30:29) and immhi (bits 23:5).
+func append_adr(output: list[u8], register: i64, offset: i64):
+    let immediate = offset & 0x1FFFFF
+    append_word(output, adr_base | (immediate & 3) << 29 | (immediate >> 2) << 5 | register)
+
+# `str xT, [sp, #slot * 16]` — the immediate is scaled by 8.
+func append_store(output: list[u8], register: i64, target: RegisterId):
+    append_word(output, str_x_base | (target.value * slot_size // 8) << 10 | reg_sp << 5 | register)
+
+# `ldr xT, [sp, #slot * 16]`
+func append_load(output: list[u8], register: i64, source: RegisterId):
+    append_word(output, ldr_x_base | (source.value * slot_size // 8) << 10 | reg_sp << 5 | register)
 
 # ARM64 instructions are fixed 32-bit little-endian words.
 func append_word(output: list[u8], value: i64):
@@ -244,10 +323,10 @@ func append_build_version(output: list[u8]):
     append_u32(output, 0)                       # sdk: unspecified
     append_u32(output, 0)                       # ntools
 
-func append_main(output: list[u8]):
+func append_main(output: list[u8], entry_offset: i64):
     append_u32(output, load_main)
     append_u32(output, 24)                      # cmdsize
-    append_u64(output, code_offset)             # entryoff: file offset of the first instruction
+    append_u64(output, entry_offset)            # entryoff: file offset of the first instruction
     append_u64(output, 0)                       # stacksize: default
 
 # dyld insists on at least one linked library; libSystem is the one every

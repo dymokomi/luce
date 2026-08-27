@@ -1,102 +1,559 @@
 #==============================================================================================
 #
-#   mir_verifier - Structural and type checks for canonical MIR
+#   mir_verifier - Proves the rules every backend may assume
 #
 #   DESCRIPTION:
-#       Proves the invariants every optimizer and compiled backend may rely on.
-#       Verification belongs to canonical MIR, not to a particular target, so
-#       the same malformed program fails before WASM, ARM64, or x86-64 sees it.
+#       Runs on canonical MIR before and after optimization. A backend that
+#       receives a verified program checks nothing: registers are defined once
+#       and before use with the type they were declared with, operands match
+#       their instruction, branch depths are in range, every region's results
+#       are supplied on every exit, struct and enum layouts agree with the
+#       target, fallible functions end each path in `Return` or `Raise`, C
+#       signatures carry only C-representable types, runtime symbols carry
+#       their known signatures, and relocations point at real items.
 #
-#       The current MIR is a typed stack instruction stream. The verifier
-#       simulates that stack, checks arithmetic operands, requires one return
-#       value of the declared type, and rejects missing or trailing returns.
-#       As canonical MIR gains blocks, values, and control-flow edges, their
-#       dominance and type rules will grow here.
-#
-#       Example:
-#
-#       Constant(2, i64), Constant(3, i64), Add(i64), Return  -> valid `i64`
-#       Constant(2, i32), Constant(3, i64), Add(i64), Return  -> type error
+#       The walk mirrors the program's own shape: the type table, then each
+#       extern, global, and data item, then each function's body region by
+#       region. A region is checked on a copy of the "defined so far" set, so
+#       a register defined inside an `If` arm is not visible after the `If`
+#       unless the region names it as a result.
 #
 #==============================================================================================
 
-from compiler.canonical_ir import CanonicalFunction, CanonicalProgram, CanonicalType, describe_canonical_type
+from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, DataId
+from compiler.canonical_ir import FunctionId, GlobalId, InstructionForm, MirConstant, MirData, MirExtern
+from compiler.canonical_ir import MirFunction, MirGlobal, MirInstruction, MirProgram, MirSignature, MirType
+from compiler.canonical_ir import MirTypeTable, RegisterId, RelocationTarget, SwitchCase, TypeId
+from compiler.canonical_ir import align_up, bits_of, builtin_mir_type, describe_mir_type, describe_signature
+from compiler.canonical_ir import find_runtime_symbol, int_maximum, int_minimum, is_bool_type, is_float_type
+from compiler.canonical_ir import is_int_type, is_numeric_mir_type, is_ptr_type, is_signed_int_type, make_enum_type, make_struct_type
+from compiler.canonical_ir import mir_type, mir_types_match, signatures_match, size_of, align_of
 
-## Verifies one complete canonical program before it crosses a pipeline
-## boundary. Calling `verify` again after optimization checks that transforms
-## preserved the same invariants.
+# One enclosing region while a body is walked: what a `Br` to it must supply.
+struct Region:
+    results: list[TypeId]
+    is_loop: bool
+
+## Verifies one complete canonical program.
 pub class MirVerifier:
-    program: CanonicalProgram
+    program: MirProgram
+    # The function being walked, for diagnostics and register types.
+    function_name: str
+    registers: list[TypeId]
 
-    ## Prepare to verify one canonical program without changing it.
-    pub init(program: CanonicalProgram):
+    pub init(program: MirProgram):
         self.program = program
+        self.function_name = ""
+        self.registers = list[TypeId]()
 
-    # mark: Verification =======================================================================
+    # mark: Program =============================================================================
 
-    ## Verify function identities and every function instruction stream.
+    ## Verify the whole program, or stop at the first violated rule.
     pub func verify() -> !:
+        try self.verify_types()
+        for external in self.program.externs:
+            try self.verify_extern(external)
+        for global in self.program.globals:
+            try self.verify_global(global)
+        for item in self.program.data:
+            try self.verify_data(item)
         try self.verify_unique_function_names()
         for function in self.program.functions:
             try self.verify_function(function)
+        try self.verify_entry()
 
-    # A canonical name identifies one function in the whole program;
-    # for example, two functions named `math.sum` would make backend exports
-    # and future call targets ambiguous.
+    # Every aggregate's stored layout must be what the target layout computes.
+    func verify_types() -> !:
+        let types = self.program.types
+        for index in range(0, len(types.definitions)):
+            let id = TypeId(value = index)
+            match types.definitions[index]:
+                Struct(fields, size, align):
+                    let field_types = list[TypeId]()
+                    for field in fields:
+                        if field.value_type.value < 0 or field.value_type.value >= index:
+                            try self.fail_program("type " + str(index) + " refers to a type defined at or after it")
+                        field_types.append(field.value_type)
+                    let expected = make_struct_type(types, self.program.layout, field_types)
+                    if not mir_types_match(types.definitions[index], expected):
+                        try self.fail_program("struct type " + str(index) + " has a layout other than the target's: " + describe_mir_type(types, id))
+                Enum(tag, cases, size, align):
+                    if not is_int_type(types, tag): try self.fail_program("enum type " + str(index) + " has a non-integer tag")
+                    for case_type in cases:
+                        if case_type.value < 0 or case_type.value >= index:
+                            try self.fail_program("type " + str(index) + " refers to a type defined at or after it")
+                    let expected = make_enum_type(types, self.program.layout, tag, cases)
+                    if not mir_types_match(types.definitions[index], expected):
+                        try self.fail_program("enum type " + str(index) + " has a layout other than the target's: " + describe_mir_type(types, id))
+                Array(element, count):
+                    if element.value < 0 or element.value >= index: try self.fail_program("array type " + str(index) + " refers to a type defined at or after it")
+                    if count < 0: try self.fail_program("array type " + str(index) + " has a negative count")
+                Func(signature):
+                    try self.verify_signature_types(signature, "function type " + str(index))
+                else: continue
+
+    func verify_signature_types(signature: MirSignature, what: str) -> !:
+        for parameter in signature.parameters:
+            try self.require_type_id(parameter, what)
+        for result in signature.results:
+            try self.require_type_id(result, what)
+        if signature.is_fallible:
+            if len(signature.results) == 0 or not is_ptr_type(self.program.types, signature.results[len(signature.results) - 1]):
+                try self.fail_program(what + " is fallible but its last result is not the `ptr` error slot")
+            if len(signature.results) > 2: try self.fail_program(what + " has more than one value result")
+        elif len(signature.results) > 1:
+            try self.fail_program(what + " has more than one result")
+
+    # A runtime extern must be a known service with its known signature; a C
+    # extern must be C-representable.
+    func verify_extern(external: MirExtern) -> !:
+        try self.verify_signature_types(external.signature, "extern `" + external.name + "`")
+        match external.convention:
+            runtime:
+                let known = find_runtime_symbol(external.name) else error("MIR verifier: extern `" + external.name + "` is not a runtime service")
+                if not signatures_match(known.signature, external.signature):
+                    try self.fail_program("runtime extern `" + external.name + "` has signature " + describe_signature(self.program.types, external.signature) + ", expected " + describe_signature(self.program.types, known.signature))
+            c:
+                try self.require_c_signature(external.signature, "extern `" + external.name + "`")
+            luce:
+                try self.fail_program("extern `" + external.name + "` uses the `luce` convention; externs are C or runtime symbols")
+
+    func verify_global(global: MirGlobal) -> !:
+        try self.require_type_id(global.value_type, "global `" + global.name + "`")
+        let initial = global.initial
+        if initial != none:
+            if initial.value < 0 or initial.value >= len(self.program.data):
+                try self.fail_program("global `" + global.name + "` is initialised from data item " + str(initial.value) + ", which does not exist")
+
+    # Relocations must land inside the bytes and point at existing items.
+    func verify_data(item: MirData) -> !:
+        if item.align < 1: try self.fail_program("data `" + item.name + "` has alignment " + str(item.align))
+        for relocation in item.relocations:
+            if relocation.offset < 0 or relocation.offset + self.program.layout.pointer_size > len(item.bytes):
+                try self.fail_program("data `" + item.name + "` has a relocation outside its bytes at offset " + str(relocation.offset))
+            match relocation.target:
+                Function(id):
+                    if id.value < 0 or id.value >= len(self.program.functions): try self.fail_program("data `" + item.name + "` relocates to function " + str(id.value) + ", which does not exist")
+                Data(id):
+                    if id.value < 0 or id.value >= len(self.program.data): try self.fail_program("data `" + item.name + "` relocates to data " + str(id.value) + ", which does not exist")
+                Global(id):
+                    if id.value < 0 or id.value >= len(self.program.globals): try self.fail_program("data `" + item.name + "` relocates to global " + str(id.value) + ", which does not exist")
+
+    # A canonical name identifies one function in the whole program.
     func verify_unique_function_names() -> !:
         for index in range(0, len(self.program.functions)):
             let function = self.program.functions[index]
             for previous in range(0, index):
                 if self.program.functions[previous].name == function.name:
-                    error("MIR verifier: duplicate function `" + function.name + "`")
+                    try self.fail_program("duplicate function `" + function.name + "`")
 
-    # Simulate one function's value stack from its first instruction through
-    # its return. `WriteText` is an effect and leaves the value stack alone.
-    func verify_function(function: CanonicalFunction) -> !:
-        let value_stack = list[CanonicalType]()
-        var returned = false
-        for instruction in function.instructions:
-            if returned:
-                try self.fail(function, "instruction follows `Return`")
+    # A process entry takes nothing and returns the `i32` exit status.
+    func verify_entry() -> !:
+        let entry = self.program.entry
+        if entry == none: return
+        if entry.value < 0 or entry.value >= len(self.program.functions):
+            try self.fail_program("entry names function " + str(entry.value) + ", which does not exist")
+        let function = self.program.functions[entry.value]
+        let i32_type = builtin_mir_type(BuiltinMirType.signed_i32)
+        let expected = MirSignature(parameters = list[TypeId](), results = [i32_type], is_fallible = false)
+        if not signatures_match(function.signature, expected):
+            try self.fail_program("entry `" + function.name + "` must be `() -> i32`, found " + describe_signature(self.program.types, function.signature))
 
-            match instruction:
-                Constant(value, value_type): value_stack.append(value_type)
-                Add(operand_type): try self.verify_binary(function, value_stack, "Add", operand_type)
-                Subtract(operand_type): try self.verify_binary(function, value_stack, "Subtract", operand_type)
-                Multiply(operand_type): try self.verify_binary(function, value_stack, "Multiply", operand_type)
-                WriteText(value): continue
-                Return:
-                    try self.verify_return(function, value_stack)
-                    returned = true
+    # mark: Functions ===========================================================================
 
-        if not returned:
-            try self.fail(function, "missing `Return`")
+    func verify_function(function: MirFunction) -> !:
+        self.function_name = function.name
+        self.registers = function.registers
+        try self.verify_signature_types(function.signature, "function `" + function.name + "`")
+        if function.convention == CallingConvention.c:
+            try self.require_c_signature(function.signature, "function `" + function.name + "`")
+        if function.convention == CallingConvention.runtime:
+            try self.fail("uses the `runtime` convention, which belongs to externs")
 
-    # Pop two operands of `operand_type` and push that type. For example,
-    # `[i64, i64] Add(i64)` becomes `[i64]`; `[i32, i64]` is invalid.
-    func verify_binary(function: CanonicalFunction, value_stack: list[CanonicalType], operation: str, operand_type: CanonicalType) -> !:
-        let expected = describe_canonical_type(operand_type)
-        if len(value_stack) < 2:
-            try self.fail(function, "`" + operation + "` needs two `" + expected + "` operands")
-        let right = value_stack[len(value_stack) - 1]
-        let left = value_stack[len(value_stack) - 2]
-        if left != operand_type or right != operand_type:
-            try self.fail(function, "`" + operation + "` needs two `" + expected + "` operands, found `" + describe_canonical_type(left) + "` and `" + describe_canonical_type(right) + "`")
-        value_stack.remove(len(value_stack) - 1)
-        value_stack.remove(len(value_stack) - 1)
-        value_stack.append(operand_type)
+        for register_type in function.registers:
+            try self.require_type_id(register_type, "function `" + function.name + "`")
+        for slot in function.slots:
+            try self.require_type_id(slot.value_type, "function `" + function.name + "`")
+            if slot.align < 1: try self.fail("has a slot with alignment " + str(slot.align))
 
-    # A return consumes one value of the function's declared type.
-    # For example, an `i32` function must reach `Return` with stack `[i32]`.
-    func verify_return(function: CanonicalFunction, value_stack: list[CanonicalType]) -> !:
-        if len(value_stack) != 1:
-            try self.fail(function, "`Return` needs one value, found " + str(len(value_stack)))
-        let returned_type = value_stack[len(value_stack) - 1]
-        if returned_type != function.result:
-            try self.fail(function, "`Return` has `" + describe_canonical_type(returned_type) + "`, expected `" + describe_canonical_type(function.result) + "`")
-        value_stack.remove(len(value_stack) - 1)
+        # Parameters are the leading registers, in signature order.
+        let defined = list[bool]()
+        for index in range(0, len(function.registers)):
+            defined.append(index < len(function.signature.parameters))
+        if len(function.signature.parameters) > len(function.registers):
+            try self.fail("declares fewer registers than parameters")
+        for index in range(0, len(function.signature.parameters)):
+            if function.registers[index].value != function.signature.parameters[index].value:
+                try self.fail("register r" + str(index) + " must have its parameter's type")
 
-    # Prefix every invariant failure with the stage and canonical function, so
-    # a diagnostic still identifies its origin after source syntax is gone.
-    func fail(function: CanonicalFunction, message: str) -> !:
-        error("MIR verifier: `" + function.name + "`: " + message)
+        try self.verify_body(function, function.body, defined, list[Region]())
+        if not terminates(function.body):
+            try self.fail("can fall off the end of its body; end every path with `Return`, `Raise`, `Trap`, or `Unreachable`")
+
+    # mark: Bodies ==============================================================================
+
+    # Walk one instruction list. `defined` is mutated for straight-line
+    # definitions; regions are walked on copies so their internals stay local.
+    func verify_body(function: MirFunction, body: list[MirInstruction], defined: list[bool], regions: list[Region]) -> !:
+        for instruction in body:
+            try self.verify_instruction(function, instruction, defined, regions)
+
+    func verify_instruction(function: MirFunction, instruction: MirInstruction, defined: list[bool], regions: list[Region]) -> !:
+        let types = self.program.types
+        match instruction.form:
+            Const(result, value):
+                let result_type = try self.result_type(result, defined)
+                match value:
+                    Int(item):
+                        if not is_int_type(types, result_type): try self.fail_at(instruction, "integer constant into `" + describe_mir_type(types, result_type) + "` register")
+                        if item < int_minimum(types, result_type) or item > int_maximum(types, result_type):
+                            try self.fail_at(instruction, "constant " + str(item) + " is outside `" + describe_mir_type(types, result_type) + "`")
+                    Float(item):
+                        if not is_float_type(types, result_type): try self.fail_at(instruction, "float constant into `" + describe_mir_type(types, result_type) + "` register")
+                    Bool(item):
+                        if not is_bool_type(types, result_type): try self.fail_at(instruction, "bool constant into `" + describe_mir_type(types, result_type) + "` register")
+                    Null:
+                        if not is_ptr_type(types, result_type): try self.fail_at(instruction, "null into `" + describe_mir_type(types, result_type) + "` register")
+                self.define(result, defined)
+            Copy(result, source):
+                let source_type = try self.operand_type(instruction, source, defined)
+                let result_type = try self.result_type(result, defined)
+                try self.require_same(instruction, result_type, source_type, "`Copy`")
+                self.define(result, defined)
+            Binary(result, operation, left, right):
+                let left_type = try self.operand_type(instruction, left, defined)
+                let right_type = try self.operand_type(instruction, right, defined)
+                let result_type = try self.result_type(result, defined)
+                try self.require_same(instruction, left_type, right_type, "`" + str(operation) + "` operands")
+                try self.verify_binary(instruction, operation, left_type, result_type)
+                self.define(result, defined)
+            Unary(result, operation, operand):
+                let operand_type = try self.operand_type(instruction, operand, defined)
+                let result_type = try self.result_type(result, defined)
+                try self.require_same(instruction, result_type, operand_type, "`" + str(operation) + "`")
+                match operation:
+                    neg:
+                        if not is_float_type(types, operand_type) and not is_signed_int_type(types, operand_type):
+                            try self.fail_at(instruction, "`neg` needs a signed integer or float, found `" + describe_mir_type(types, operand_type) + "`")
+                    bit_not:
+                        if not is_int_type(types, operand_type): try self.fail_at(instruction, "`bit_not` needs an integer, found `" + describe_mir_type(types, operand_type) + "`")
+                    bool_not:
+                        if not is_bool_type(types, operand_type): try self.fail_at(instruction, "`bool_not` needs `bool`, found `" + describe_mir_type(types, operand_type) + "`")
+                self.define(result, defined)
+            Convert(result, operation, operand):
+                let operand_type = try self.operand_type(instruction, operand, defined)
+                let result_type = try self.result_type(result, defined)
+                match operation:
+                    extend:
+                        if not is_int_type(types, operand_type) or not is_int_type(types, result_type) or bits_of(types, result_type) <= bits_of(types, operand_type):
+                            try self.fail_at(instruction, "`extend` must widen an integer, found `" + describe_mir_type(types, operand_type) + "` to `" + describe_mir_type(types, result_type) + "`")
+                    wrap:
+                        if not is_int_type(types, operand_type) or not is_int_type(types, result_type) or bits_of(types, result_type) >= bits_of(types, operand_type):
+                            try self.fail_at(instruction, "`wrap` must narrow an integer, found `" + describe_mir_type(types, operand_type) + "` to `" + describe_mir_type(types, result_type) + "`")
+                    int_to_float:
+                        if not is_int_type(types, operand_type) or not is_float_type(types, result_type):
+                            try self.fail_at(instruction, "`int_to_float` needs an integer operand and a float result")
+                    float_to_int:
+                        if not is_float_type(types, operand_type) or not is_int_type(types, result_type):
+                            try self.fail_at(instruction, "`float_to_int` needs a float operand and an integer result")
+                self.define(result, defined)
+            Alloca(result, slot):
+                if slot < 0 or slot >= len(function.slots): try self.fail_at(instruction, "`Alloca` names slot " + str(slot) + ", which does not exist")
+                try self.require_ptr_result(instruction, result, defined, "`Alloca`")
+                self.define(result, defined)
+            Load(result, value_type, address):
+                try self.require_type_id(value_type, "`Load`")
+                try self.require_ptr_operand(instruction, address, defined, "`Load` address")
+                let result_type = try self.result_type(result, defined)
+                try self.require_same(instruction, result_type, value_type, "`Load`")
+                try self.require_register_sized(instruction, value_type, "`Load`")
+                self.define(result, defined)
+            Store(value_type, address, value):
+                try self.require_type_id(value_type, "`Store`")
+                try self.require_ptr_operand(instruction, address, defined, "`Store` address")
+                let stored_type = try self.operand_type(instruction, value, defined)
+                try self.require_same(instruction, stored_type, value_type, "`Store`")
+                try self.require_register_sized(instruction, value_type, "`Store`")
+            FieldAddress(result, struct_type, base, field):
+                try self.require_type_id(struct_type, "`FieldAddress`")
+                match mir_type(types, struct_type):
+                    Struct(fields, size, align):
+                        if field < 0 or field >= len(fields): try self.fail_at(instruction, "`FieldAddress` names field " + str(field) + " of a struct with " + str(len(fields)) + " field(s)")
+                    else: try self.fail_at(instruction, "`FieldAddress` needs a struct type, found `" + describe_mir_type(types, struct_type) + "`")
+                try self.require_ptr_operand(instruction, base, defined, "`FieldAddress` base")
+                try self.require_ptr_result(instruction, result, defined, "`FieldAddress`")
+                self.define(result, defined)
+            ElementAddress(result, element_type, base, index):
+                try self.require_type_id(element_type, "`ElementAddress`")
+                try self.require_ptr_operand(instruction, base, defined, "`ElementAddress` base")
+                let index_type = try self.operand_type(instruction, index, defined)
+                if not is_int_type(types, index_type): try self.fail_at(instruction, "`ElementAddress` index must be an integer, found `" + describe_mir_type(types, index_type) + "`")
+                try self.require_ptr_result(instruction, result, defined, "`ElementAddress`")
+                self.define(result, defined)
+            Memcpy(destination, source, value_type):
+                try self.require_type_id(value_type, "`Memcpy`")
+                try self.require_ptr_operand(instruction, destination, defined, "`Memcpy` destination")
+                try self.require_ptr_operand(instruction, source, defined, "`Memcpy` source")
+            DataAddress(result, data):
+                if data.value < 0 or data.value >= len(self.program.data): try self.fail_at(instruction, "`DataAddress` names data " + str(data.value) + ", which does not exist")
+                try self.require_ptr_result(instruction, result, defined, "`DataAddress`")
+                self.define(result, defined)
+            GlobalAddress(result, global):
+                if global.value < 0 or global.value >= len(self.program.globals): try self.fail_at(instruction, "`GlobalAddress` names global " + str(global.value) + ", which does not exist")
+                try self.require_ptr_result(instruction, result, defined, "`GlobalAddress`")
+                self.define(result, defined)
+            FunctionAddress(result, target):
+                if target.value < 0 or target.value >= len(self.program.functions): try self.fail_at(instruction, "`FunctionAddress` names function " + str(target.value) + ", which does not exist")
+                try self.require_ptr_result(instruction, result, defined, "`FunctionAddress`")
+                self.define(result, defined)
+            Call(results, target, arguments):
+                if target.value < 0 or target.value >= len(self.program.functions): try self.fail_at(instruction, "`Call` names function " + str(target.value) + ", which does not exist")
+                try self.verify_call(instruction, self.program.functions[target.value].signature, results, arguments, defined)
+            CallExtern(results, external, arguments):
+                if external.value < 0 or external.value >= len(self.program.externs): try self.fail_at(instruction, "`CallExtern` names extern " + str(external.value) + ", which does not exist")
+                try self.verify_call(instruction, self.program.externs[external.value].signature, results, arguments, defined)
+            CallIndirect(results, signature, target, arguments):
+                try self.verify_signature_types(signature, "`CallIndirect` signature")
+                try self.require_ptr_operand(instruction, target, defined, "`CallIndirect` target")
+                try self.verify_call(instruction, signature, results, arguments, defined)
+            Block(results, body):
+                let result_types = try self.region_result_types(instruction, results, defined)
+                let inner = copy_defined(defined)
+                let inner_regions = push_region(regions, Region(results = result_types, is_loop = false))
+                try self.verify_body(function, body, inner, inner_regions)
+                if len(results) > 0 and not leaves_region(body):
+                    try self.fail_at(instruction, "`Block` with results can fall off its end; supply them with `Yield` or `Br`")
+                for result in results: self.define(result, defined)
+            Loop(body):
+                # Falling off the end of a `Loop` leaves it, as in WebAssembly;
+                # only a branch to it repeats.
+                let inner = copy_defined(defined)
+                let inner_regions = push_region(regions, Region(results = list[TypeId](), is_loop = true))
+                try self.verify_body(function, body, inner, inner_regions)
+            If(condition, results, then_body, else_body):
+                let condition_type = try self.operand_type(instruction, condition, defined)
+                if not is_bool_type(types, condition_type): try self.fail_at(instruction, "`If` condition must be `bool`, found `" + describe_mir_type(types, condition_type) + "`")
+                let result_types = try self.region_result_types(instruction, results, defined)
+                let inner_regions = push_region(regions, Region(results = result_types, is_loop = false))
+                try self.verify_body(function, then_body, copy_defined(defined), inner_regions)
+                try self.verify_body(function, else_body, copy_defined(defined), inner_regions)
+                if len(results) > 0:
+                    if not leaves_region(then_body) or not leaves_region(else_body):
+                        try self.fail_at(instruction, "`If` with results must supply them on both arms with `Yield` or `Br`")
+                for result in results: self.define(result, defined)
+            Switch(tag, cases, default_body):
+                let tag_type = try self.operand_type(instruction, tag, defined)
+                if not is_int_type(types, tag_type): try self.fail_at(instruction, "`Switch` tag must be an integer, found `" + describe_mir_type(types, tag_type) + "`")
+                let inner_regions = push_region(regions, Region(results = list[TypeId](), is_loop = false))
+                for index in range(0, len(cases)):
+                    for previous in range(0, index):
+                        if cases[previous].value == cases[index].value: try self.fail_at(instruction, "`Switch` repeats case " + str(cases[index].value))
+                    try self.verify_body(function, cases[index].body, copy_defined(defined), inner_regions)
+                try self.verify_body(function, default_body, copy_defined(defined), inner_regions)
+            Br(depth, values):
+                try self.verify_branch(instruction, depth, values, defined, regions)
+            BrIf(condition, depth, values):
+                let condition_type = try self.operand_type(instruction, condition, defined)
+                if not is_bool_type(types, condition_type): try self.fail_at(instruction, "`BrIf` condition must be `bool`, found `" + describe_mir_type(types, condition_type) + "`")
+                try self.verify_branch(instruction, depth, values, defined, regions)
+            Yield(values):
+                if len(regions) == 0: try self.fail_at(instruction, "`Yield` outside any region; use `Return`")
+                let region = regions[len(regions) - 1]
+                if region.is_loop and len(values) > 0: try self.fail_at(instruction, "`Yield` cannot carry values out of a `Loop`")
+                try self.verify_values(instruction, values, region.results, defined, "`Yield`")
+            Return(values):
+                try self.verify_values(instruction, values, function.signature.results, defined, "`Return`")
+            Raise(failure):
+                if not function.signature.is_fallible: try self.fail_at(instruction, "`Raise` in a function that cannot fail")
+                try self.require_ptr_operand(instruction, failure, defined, "`Raise` error")
+            Trap(reason): return
+            Unreachable: return
+
+    # mark: Instruction rules ===================================================================
+
+    func verify_binary(instruction: MirInstruction, operation: BinaryOp, operand_type: TypeId, result_type: TypeId) -> !:
+        let types = self.program.types
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let name = "`" + str(operation) + "`"
+        if is_arithmetic(operation):
+            if not is_numeric_mir_type(types, operand_type): try self.fail_at(instruction, name + " needs numeric operands, found `" + describe_mir_type(types, operand_type) + "`")
+            try self.require_same(instruction, result_type, operand_type, name + " result")
+        elif operation == BinaryOp.div:
+            if not is_float_type(types, operand_type): try self.fail_at(instruction, "`div` needs float operands; integers use `floor_div`")
+            try self.require_same(instruction, result_type, operand_type, "`div` result")
+        elif is_integer_only(operation):
+            if not is_int_type(types, operand_type): try self.fail_at(instruction, name + " needs integer operands, found `" + describe_mir_type(types, operand_type) + "`")
+            try self.require_same(instruction, result_type, operand_type, name + " result")
+        elif operation == BinaryOp.eq or operation == BinaryOp.ne:
+            if not is_numeric_mir_type(types, operand_type) and not is_bool_type(types, operand_type) and not is_ptr_type(types, operand_type):
+                try self.fail_at(instruction, name + " cannot compare `" + describe_mir_type(types, operand_type) + "`")
+            try self.require_same(instruction, result_type, boolean, name + " result")
+        else:
+            if not is_numeric_mir_type(types, operand_type): try self.fail_at(instruction, name + " needs numeric operands, found `" + describe_mir_type(types, operand_type) + "`")
+            try self.require_same(instruction, result_type, boolean, name + " result")
+
+    func verify_call(instruction: MirInstruction, signature: MirSignature, results: list[RegisterId], arguments: list[RegisterId], defined: list[bool]) -> !:
+        if len(arguments) != len(signature.parameters):
+            try self.fail_at(instruction, "call passes " + str(len(arguments)) + " argument(s) to a signature with " + str(len(signature.parameters)))
+        for index in range(0, len(arguments)):
+            let argument_type = try self.operand_type(instruction, arguments[index], defined)
+            try self.require_same(instruction, argument_type, signature.parameters[index], "argument " + str(index))
+        if len(results) != len(signature.results):
+            try self.fail_at(instruction, "call defines " + str(len(results)) + " result(s) for a signature with " + str(len(signature.results)))
+        for index in range(0, len(results)):
+            let result_type = try self.result_type(results[index], defined)
+            try self.require_same(instruction, result_type, signature.results[index], "result " + str(index))
+        for result in results: self.define(result, defined)
+
+    func verify_branch(instruction: MirInstruction, depth: i64, values: list[RegisterId], defined: list[bool], regions: list[Region]) -> !:
+        if depth < 0 or depth >= len(regions): try self.fail_at(instruction, "branch depth " + str(depth) + " with " + str(len(regions)) + " enclosing region(s)")
+        let region = regions[len(regions) - 1 - depth]
+        if region.is_loop:
+            if len(values) > 0: try self.fail_at(instruction, "a branch to a `Loop` restarts it and carries no values")
+            return
+        try self.verify_values(instruction, values, region.results, defined, "branch")
+
+    func verify_values(instruction: MirInstruction, values: list[RegisterId], expected: list[TypeId], defined: list[bool], what: str) -> !:
+        if len(values) != len(expected):
+            try self.fail_at(instruction, what + " supplies " + str(len(values)) + " value(s), expected " + str(len(expected)))
+        for index in range(0, len(values)):
+            let value_type = try self.operand_type(instruction, values[index], defined)
+            try self.require_same(instruction, value_type, expected[index], what + " value " + str(index))
+
+    # A region's results are registers it defines; they must be fresh here.
+    func region_result_types(instruction: MirInstruction, results: list[RegisterId], defined: list[bool]) -> list[TypeId]!:
+        let result_types = list[TypeId]()
+        for result in results:
+            result_types.append(try self.result_type(result, defined))
+        return result_types
+
+    # mark: Register and type helpers ===========================================================
+
+    func operand_type(instruction: MirInstruction, register: RegisterId, defined: list[bool]) -> TypeId!:
+        if register.value < 0 or register.value >= len(self.registers):
+            try self.fail_at(instruction, "uses r" + str(register.value) + ", which is not declared")
+        if not defined[register.value]:
+            try self.fail_at(instruction, "uses r" + str(register.value) + " before it is defined")
+        return self.registers[register.value]
+
+    func result_type(register: RegisterId, defined: list[bool]) -> TypeId!:
+        if register.value < 0 or register.value >= len(self.registers):
+            try self.fail("defines r" + str(register.value) + ", which is not declared")
+        if defined[register.value]:
+            try self.fail("defines r" + str(register.value) + " twice")
+        return self.registers[register.value]
+
+    func define(register: RegisterId, defined: list[bool]):
+        defined[register.value] = true
+
+    func require_ptr_operand(instruction: MirInstruction, register: RegisterId, defined: list[bool], what: str) -> !:
+        let found = try self.operand_type(instruction, register, defined)
+        if not is_ptr_type(self.program.types, found):
+            try self.fail_at(instruction, what + " must be `ptr`, found `" + describe_mir_type(self.program.types, found) + "`")
+
+    func require_ptr_result(instruction: MirInstruction, register: RegisterId, defined: list[bool], what: str) -> !:
+        let found = try self.result_type(register, defined)
+        if not is_ptr_type(self.program.types, found):
+            try self.fail_at(instruction, what + " result must be `ptr`, found `" + describe_mir_type(self.program.types, found) + "`")
+
+    func require_same(instruction: MirInstruction, found: TypeId, expected: TypeId, what: str) -> !:
+        if found.value != expected.value:
+            try self.fail_at(instruction, what + " has `" + describe_mir_type(self.program.types, found) + "`, expected `" + describe_mir_type(self.program.types, expected) + "`")
+
+    # Only scalars and pointers travel through registers; aggregates move
+    # with `Memcpy`.
+    func require_register_sized(instruction: MirInstruction, value_type: TypeId, what: str) -> !:
+        match mir_type(self.program.types, value_type):
+            Struct(fields, size, align): try self.fail_at(instruction, what + " of a struct; aggregates move with `Memcpy`")
+            Array(element, count): try self.fail_at(instruction, what + " of an array; aggregates move with `Memcpy`")
+            Enum(tag, cases, size, align): try self.fail_at(instruction, what + " of an enum; aggregates move with `Memcpy`")
+            else: return
+
+    func require_type_id(id: TypeId, what: str) -> !:
+        if id.value < 0 or id.value >= len(self.program.types.definitions):
+            try self.fail_program(what + " names type " + str(id.value) + ", which does not exist")
+
+    # The C boundary admits scalars, pointers, and structs of those, never
+    # failure.
+    func require_c_signature(signature: MirSignature, what: str) -> !:
+        if signature.is_fallible: try self.fail_program(what + " uses the `c` convention and cannot be fallible")
+        for parameter in signature.parameters:
+            if not self.is_c_representable(parameter): try self.fail_program(what + " passes `" + describe_mir_type(self.program.types, parameter) + "` across the C boundary")
+        for result in signature.results:
+            if not self.is_c_representable(result): try self.fail_program(what + " returns `" + describe_mir_type(self.program.types, result) + "` across the C boundary")
+
+    func is_c_representable(id: TypeId) -> bool:
+        match mir_type(self.program.types, id):
+            Struct(fields, size, align):
+                for field in fields:
+                    if not self.is_c_representable(field.value_type): return false
+                return true
+            Array(element, count): return self.is_c_representable(element)
+            Enum(tag, cases, size, align): return false
+            Func(signature): return false
+            else: return true
+
+    # mark: Diagnostics =========================================================================
+
+    func fail_program(message: str) -> !:
+        error("MIR verifier: " + message)
+
+    func fail(message: str) -> !:
+        error("MIR verifier: `" + self.function_name + "` " + message)
+
+    func fail_at(instruction: MirInstruction, message: str) -> !:
+        error("MIR verifier: `" + self.function_name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + message)
+
+# mark: Structural helpers =====================================================================
+
+func is_arithmetic(operation: BinaryOp) -> bool:
+    return operation == BinaryOp.add or operation == BinaryOp.sub or operation == BinaryOp.mul
+
+func is_integer_only(operation: BinaryOp) -> bool:
+    return (
+        operation == BinaryOp.floor_div or operation == BinaryOp.rem
+        or operation == BinaryOp.bit_and or operation == BinaryOp.bit_or or operation == BinaryOp.bit_xor
+        or operation == BinaryOp.shift_left or operation == BinaryOp.shift_right
+    )
+
+func copy_defined(defined: list[bool]) -> list[bool]:
+    let copied = list[bool]()
+    for item in defined: copied.append(item)
+    return copied
+
+func push_region(regions: list[Region], region: Region) -> list[Region]:
+    let pushed = list[Region]()
+    for item in regions: pushed.append(item)
+    pushed.append(region)
+    return pushed
+
+# A body terminates when control cannot fall off its end: it ends in a
+# diverging instruction, or in an `If`/`Switch` whose every arm terminates.
+pub func terminates(body: list[MirInstruction]) -> bool:
+    if len(body) == 0: return false
+    match body[len(body) - 1].form:
+        Return(values): return true
+        Raise(failure): return true
+        Trap(reason): return true
+        Unreachable: return true
+        If(condition, results, then_body, else_body): return terminates(then_body) and terminates(else_body)
+        Switch(tag, cases, default_body):
+            for item in cases:
+                if not terminates(item.body): return false
+            return terminates(default_body)
+        else: return false
+
+# A region body leaves its region explicitly when it ends in a branch, a
+# yield, or a diverging instruction.
+pub func leaves_region(body: list[MirInstruction]) -> bool:
+    if len(body) == 0: return false
+    match body[len(body) - 1].form:
+        Br(depth, values): return true
+        BrIf(condition, depth, values): return false
+        Yield(values): return true
+        If(condition, results, then_body, else_body): return leaves_region(then_body) and leaves_region(else_body)
+        Switch(tag, cases, default_body):
+            for item in cases:
+                if not leaves_region(item.body): return false
+            return leaves_region(default_body)
+        else: return terminates(body)

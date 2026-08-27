@@ -1,66 +1,602 @@
 #==============================================================================================
 #
-#   canonical_ir - The backend-independent machine representation
+#   canonical_ir - The machine representation every compiled backend consumes
 #
 #   DESCRIPTION:
-#       Canonical MIR is the compiler's target-independent machine
-#       representation: what semantic typed HIR lowers into, what verification
-#       and optimization operate on, and the one shape every compiled backend
-#       consumes. Evaluation order is explicit: operands are pushed before the
-#       instruction that consumes them, like a stack machine. `2 + 3` becomes:
+#       Canonical MIR is the program as a machine sees it: typed write-once
+#       registers, explicit memory, structured control flow, and calls to a
+#       named runtime. The lowerer produces it from typed HIR; the verifier
+#       proves its rules; the optimizer transforms it; every compiled backend
+#       translates it and never reinterprets it. The design and the reasons
+#       behind each decision are in `docs/compiler/mir.md`; this file is the
+#       code that follows from that page, in the same order:
 #
-#       Constant(2, i64)
-#       Constant(3, i64)
-#       Add(i64)
+#       target layout -> types -> identities -> instructions -> functions,
+#       externs, globals, data -> the program -> the runtime symbol table
 #
-#       The instruction set is one language. Backends legalize it to a target;
-#       they do not keep a private dialect. Integer widths live on the
-#       instruction as `CanonicalType` so i8/u32 can join later without a new
-#       opcode family. `WriteText` is a host effect: native backends turn it
-#       into a write syscall, WebAssembly into an imported write. Process
-#       entry (`main` -> i32) is an artifact convention, not a second IR.
-#
-#       The instruction set grows with the executable slice; today that means
-#       integer arithmetic, constant terminal output, and returning. This flat
-#       stack form is the first MIR slice, not a commitment to stay stack-based:
-#       explicit values, basic blocks, branches, calls, and memory operations
-#       belong here as the language becomes executable enough to need them.
+#       Three rules shape everything here. A register is written once, so its
+#       type is fixed at its definition. Anything with more than one part
+#       lives in memory, addressed through `Ptr`. Control flow is a nest of
+#       regions (`Block`, `Loop`, `If`, `Switch`) left by depth-relative
+#       branches, never a jump to a label.
 #
 #==============================================================================================
 
-## The machine types canonical MIR can name today. Names are not identity;
-## backends and the verifier compare these tags, not diagnostic spellings.
-pub enum CanonicalType:
+from compiler.source import SourceSpan
+
+# mark: Target layout ==========================================================================
+
+## What a target dictates about memory: pointer width and the alignment
+## ceiling. Struct and enum layouts are computed from this once, in the
+## lowerer, and stored in the type table so every backend agrees with the
+## platform's C compiler.
+pub struct TargetLayout:
+    pub name: str
+    pub pointer_size: i64
+    pub pointer_align: i64
+    pub max_align: i64
+
+pub func wasm32_layout() -> TargetLayout:
+    return TargetLayout(name = "wasm32", pointer_size = 4, pointer_align = 4, max_align = 16)
+
+pub func arm64_macos_layout() -> TargetLayout:
+    return TargetLayout(name = "arm64-macos", pointer_size = 8, pointer_align = 8, max_align = 16)
+
+pub func x86_64_linux_layout() -> TargetLayout:
+    return TargetLayout(name = "x86_64-linux", pointer_size = 8, pointer_align = 8, max_align = 16)
+
+# mark: Types ==================================================================================
+
+## The identity of one type in `MirTypeTable.definitions`.
+pub struct TypeId:
+    pub value: i64
+
+## One struct field: its type and the byte offset the layout gave it.
+pub struct MirField:
+    pub value_type: TypeId
+    pub offset: i64
+
+## A function's shape as a caller sees it. A fallible function's last result
+## is the error slot, a `Ptr` that is null on success.
+pub struct MirSignature:
+    pub parameters: list[TypeId]
+    pub results: list[TypeId]
+    pub is_fallible: bool
+
+## The machine types. Scalars and `Ptr` live in registers; `Struct`, `Array`,
+## and `Enum` live in memory and carry their computed layout.
+pub union MirType:
+    Int(bits: i64, is_signed: bool)
+    Float(bits: i64)
+    Bool
+    Ptr
+    Struct(fields: list[MirField], size: i64, align: i64)
+    Array(element: TypeId, count: i64)
+    Enum(tag: TypeId, cases: list[TypeId], size: i64, align: i64)
+    Func(signature: MirSignature)
+
+## Every type a program uses. Scalars occupy fixed leading slots (see
+## `BuiltinMirType`); the lowerer interns aggregates after them.
+pub struct MirTypeTable:
+    pub definitions: list[MirType]
+
+## The scalar types with stable identities, in table order.
+pub enum BuiltinMirType:
+    signed_i8
+    signed_i16
     signed_i32
     signed_i64
+    unsigned_u8
+    unsigned_u16
+    unsigned_u32
+    unsigned_u64
+    float32
+    float64
+    boolean
+    pointer
 
-## One canonical operation. Constants push a typed value; arithmetic pops two
-## operands of `operand_type` and pushes the result; `WriteText` is an effect;
-## `Return` pops the final value and leaves the function.
-pub union CanonicalInstruction:
-    Constant(value: i64, value_type: CanonicalType)
-    Add(operand_type: CanonicalType)
-    Subtract(operand_type: CanonicalType)
-    Multiply(operand_type: CanonicalType)
-    WriteText(value: str)
-    Return
-
-## One lowered function, named `module.function` so artifacts stay unambiguous
-## across modules.
-pub struct CanonicalFunction:
-    pub name: str
-    pub is_public: bool
-    pub result: CanonicalType
-    pub instructions: list[CanonicalInstruction]
-
-## Diagnostic spelling of one canonical type. Semantic decisions compare the
-## `CanonicalType` tag; this string is only for messages.
-pub func describe_canonical_type(value: CanonicalType) -> str:
+pub func builtin_mir_type(value: BuiltinMirType) -> TypeId:
     return match value:
-        signed_i32 => "i32"
-        signed_i64 => "i64"
+        signed_i8 => TypeId(value = 0)
+        signed_i16 => TypeId(value = 1)
+        signed_i32 => TypeId(value = 2)
+        signed_i64 => TypeId(value = 3)
+        unsigned_u8 => TypeId(value = 4)
+        unsigned_u16 => TypeId(value = 5)
+        unsigned_u32 => TypeId(value = 6)
+        unsigned_u64 => TypeId(value = 7)
+        float32 => TypeId(value = 8)
+        float64 => TypeId(value = 9)
+        boolean => TypeId(value = 10)
+        pointer => TypeId(value = 11)
 
-## The canonical machine representation of one whole program. Verification and
-## optimization consume and return this value before a target backend sees it.
-pub struct CanonicalProgram:
-    pub functions: list[CanonicalFunction]
+## The type table every program starts from: the twelve scalars.
+pub func create_builtin_mir_types() -> MirTypeTable:
+    let definitions = list[MirType]()
+    definitions.append(MirType.Int(bits = 8, is_signed = true))
+    definitions.append(MirType.Int(bits = 16, is_signed = true))
+    definitions.append(MirType.Int(bits = 32, is_signed = true))
+    definitions.append(MirType.Int(bits = 64, is_signed = true))
+    definitions.append(MirType.Int(bits = 8, is_signed = false))
+    definitions.append(MirType.Int(bits = 16, is_signed = false))
+    definitions.append(MirType.Int(bits = 32, is_signed = false))
+    definitions.append(MirType.Int(bits = 64, is_signed = false))
+    definitions.append(MirType.Float(bits = 32))
+    definitions.append(MirType.Float(bits = 64))
+    definitions.append(MirType.Bool)
+    definitions.append(MirType.Ptr)
+    return MirTypeTable(definitions = definitions)
+
+## Look one type up; an identity outside the table is a compiler bug.
+pub func mir_type(types: MirTypeTable, id: TypeId) -> MirType:
+    if id.value < 0 or id.value >= len(types.definitions): trap("MIR type identity is outside the type table")
+    return types.definitions[id.value]
+
+## Add a type unless a structurally identical one exists; return its identity.
+pub func intern_mir_type(types: MirTypeTable, value: MirType) -> TypeId:
+    for index in range(0, len(types.definitions)):
+        if mir_types_match(types.definitions[index], value): return TypeId(value = index)
+    types.definitions.append(value)
+    return TypeId(value = len(types.definitions) - 1)
+
+## Structural equality of two type definitions.
+pub func mir_types_match(left: MirType, right: MirType) -> bool:
+    match left:
+        Int(bits, is_signed):
+            match right:
+                Int(other_bits, other_signed): return bits == other_bits and is_signed == other_signed
+                else: return false
+        Float(bits):
+            match right:
+                Float(other_bits): return bits == other_bits
+                else: return false
+        Bool:
+            match right:
+                Bool: return true
+                else: return false
+        Ptr:
+            match right:
+                Ptr: return true
+                else: return false
+        Struct(fields, size, align):
+            match right:
+                Struct(other_fields, other_size, other_align):
+                    if len(fields) != len(other_fields) or size != other_size or align != other_align: return false
+                    for index in range(0, len(fields)):
+                        if fields[index].value_type.value != other_fields[index].value_type.value: return false
+                        if fields[index].offset != other_fields[index].offset: return false
+                    return true
+                else: return false
+        Array(element, count):
+            match right:
+                Array(other_element, other_count): return element.value == other_element.value and count == other_count
+                else: return false
+        Enum(tag, cases, size, align):
+            match right:
+                Enum(other_tag, other_cases, other_size, other_align):
+                    if tag.value != other_tag.value or len(cases) != len(other_cases) or size != other_size or align != other_align: return false
+                    for index in range(0, len(cases)):
+                        if cases[index].value != other_cases[index].value: return false
+                    return true
+                else: return false
+        Func(signature):
+            match right:
+                Func(other_signature): return signatures_match(signature, other_signature)
+                else: return false
+
+pub func signatures_match(left: MirSignature, right: MirSignature) -> bool:
+    if left.is_fallible != right.is_fallible: return false
+    if len(left.parameters) != len(right.parameters) or len(left.results) != len(right.results): return false
+    for index in range(0, len(left.parameters)):
+        if left.parameters[index].value != right.parameters[index].value: return false
+    for index in range(0, len(left.results)):
+        if left.results[index].value != right.results[index].value: return false
+    return true
+
+# mark: Layout =================================================================================
+#
+# Sizes and alignments follow the C rules every supported target shares:
+# scalars are naturally aligned, a struct is aligned to its widest field and
+# padded to a multiple of that, an enum is a tag followed by the widest case
+# at the widest case's alignment.
+
+pub func size_of(types: MirTypeTable, layout: TargetLayout, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Int(bits, is_signed): return bits // 8
+        Float(bits): return bits // 8
+        Bool: return 1
+        Ptr: return layout.pointer_size
+        Struct(fields, size, align): return size
+        Array(element, count): return size_of(types, layout, element) * count
+        Enum(tag, cases, size, align): return size
+        Func(signature): return layout.pointer_size
+
+pub func align_of(types: MirTypeTable, layout: TargetLayout, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Int(bits, is_signed): return bits // 8
+        Float(bits): return bits // 8
+        Bool: return 1
+        Ptr: return layout.pointer_align
+        Struct(fields, size, align): return align
+        Array(element, count): return align_of(types, layout, element)
+        Enum(tag, cases, size, align): return align
+        Func(signature): return layout.pointer_align
+
+## Round `value` up to a multiple of `align`.
+pub func align_up(value: i64, align: i64) -> i64:
+    if align <= 1: return value
+    return (value + align - 1) // align * align
+
+## Lay out a struct from its field types in declaration order.
+pub func make_struct_type(types: MirTypeTable, layout: TargetLayout, field_types: list[TypeId]) -> MirType:
+    let fields = list[MirField]()
+    var offset = 0
+    var align = 1
+    for field_type in field_types:
+        let field_align = align_of(types, layout, field_type)
+        offset = align_up(offset, field_align)
+        fields.append(MirField(value_type = field_type, offset = offset))
+        offset += size_of(types, layout, field_type)
+        if field_align > align: align = field_align
+    return MirType.Struct(fields = fields, size = align_up(offset, align), align = align)
+
+## Lay out an enum: the tag first, then the widest case payload at the
+## widest payload alignment.
+pub func make_enum_type(types: MirTypeTable, layout: TargetLayout, tag: TypeId, cases: list[TypeId]) -> MirType:
+    var align = align_of(types, layout, tag)
+    var payload_size = 0
+    for case_type in cases:
+        let case_align = align_of(types, layout, case_type)
+        if case_align > align: align = case_align
+        let case_size = size_of(types, layout, case_type)
+        if case_size > payload_size: payload_size = case_size
+    let payload_offset = align_up(size_of(types, layout, tag), align)
+    return MirType.Enum(tag = tag, cases = cases, size = align_up(payload_offset + payload_size, align), align = align)
+
+## Where an enum's payload starts, for the lowerer and the interpreter.
+pub func enum_payload_offset(types: MirTypeTable, layout: TargetLayout, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Enum(tag, cases, size, align): return align_up(size_of(types, layout, tag), align)
+        else: trap("enum payload offset requested for a non-enum type")
+
+# mark: Type predicates ========================================================================
+
+pub func is_int_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Int(bits, is_signed): return true
+        else: return false
+
+pub func is_signed_int_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Int(bits, is_signed): return is_signed
+        else: return false
+
+pub func is_float_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Float(bits): return true
+        else: return false
+
+pub func is_bool_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Bool: return true
+        else: return false
+
+pub func is_ptr_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Ptr: return true
+        else: return false
+
+pub func is_numeric_mir_type(types: MirTypeTable, id: TypeId) -> bool:
+    return is_int_type(types, id) or is_float_type(types, id)
+
+## Bit width of an integer or float type; 0 for anything else.
+pub func bits_of(types: MirTypeTable, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Int(bits, is_signed): return bits
+        Float(bits): return bits
+        else: return 0
+
+## Inclusive bounds of an integer type. `u64` stops at the `i64` maximum
+## because every MIR integer value travels as an `i64` today.
+pub func int_minimum(types: MirTypeTable, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Int(bits, is_signed):
+            if not is_signed: return 0
+            if bits == 8: return -128
+            if bits == 16: return -32768
+            if bits == 32: return -2147483647 - 1
+            return -9223372036854775807 - 1
+        else: return 0
+
+pub func int_maximum(types: MirTypeTable, id: TypeId) -> i64:
+    match mir_type(types, id):
+        Int(bits, is_signed):
+            if is_signed:
+                if bits == 8: return 127
+                if bits == 16: return 32767
+                if bits == 32: return 2147483647
+                return 9223372036854775807
+            if bits == 8: return 255
+            if bits == 16: return 65535
+            if bits == 32: return 4294967295
+            return 9223372036854775807
+        else: return 0
+
+## Diagnostic spelling of a type. Semantic decisions compare identities and
+## inspect `MirType`; this string is for messages.
+pub func describe_mir_type(types: MirTypeTable, id: TypeId) -> str:
+    match mir_type(types, id):
+        Int(bits, is_signed):
+            if is_signed: return "i" + str(bits)
+            return "u" + str(bits)
+        Float(bits): return "f" + str(bits)
+        Bool: return "bool"
+        Ptr: return "ptr"
+        Struct(fields, size, align):
+            var text = "{"
+            for index in range(0, len(fields)):
+                if index > 0: text = text + ", "
+                text = text + describe_mir_type(types, fields[index].value_type) + " @" + str(fields[index].offset)
+            return text + "}"
+        Array(element, count): return "[" + describe_mir_type(types, element) + "; " + str(count) + "]"
+        Enum(tag, cases, size, align):
+            var text = "enum(" + describe_mir_type(types, tag)
+            for case_type in cases:
+                text = text + " | " + describe_mir_type(types, case_type)
+            return text + ")"
+        Func(signature): return "func" + describe_signature(types, signature)
+
+pub func describe_signature(types: MirTypeTable, signature: MirSignature) -> str:
+    var text = "("
+    for index in range(0, len(signature.parameters)):
+        if index > 0: text = text + ", "
+        text = text + describe_mir_type(types, signature.parameters[index])
+    text = text + ") -> ("
+    for index in range(0, len(signature.results)):
+        if index > 0: text = text + ", "
+        text = text + describe_mir_type(types, signature.results[index])
+    text = text + ")"
+    if signature.is_fallible: text = text + "!"
+    return text
+
+# mark: Identities =============================================================================
+#
+# Everything a program contains is numbered. Names survive only for artifacts
+# and diagnostics; an instruction never resolves a string.
+
+pub struct RegisterId:
+    pub value: i64
+
+pub struct FunctionId:
+    pub value: i64
+
+pub struct ExternId:
+    pub value: i64
+
+pub struct GlobalId:
+    pub value: i64
+
+pub struct DataId:
+    pub value: i64
+
+# mark: Instructions ===========================================================================
+
+## A literal placed in a register. `Null` is the absent `Ptr`.
+pub union MirConstant:
+    Int(value: i64)
+    Float(value: f64)
+    Bool(value: bool)
+    Null
+
+## Two-operand operations. Integer arithmetic is checked: overflow, a zero
+## divisor, `minimum // -1`, and an out-of-range shift count all trap
+## (language section 7). `div` is floating-point only; `floor_div` and `rem`
+## are integer floor division and its paired remainder.
+pub enum BinaryOp:
+    add
+    sub
+    mul
+    div
+    floor_div
+    rem
+    bit_and
+    bit_or
+    bit_xor
+    shift_left
+    shift_right
+    eq
+    ne
+    lt
+    le
+    gt
+    ge
+
+pub enum UnaryOp:
+    neg
+    bit_not
+    bool_not
+
+## Width and representation changes, always explicit. `wrap` is the only
+## non-trapping narrowing and is emitted only where the language allows
+## truncation; `float_to_int` traps when the value does not fit.
+pub enum ConvertOp:
+    extend
+    wrap
+    int_to_float
+    float_to_int
+
+## One `Switch` arm: the tag value it matches and the region it runs.
+pub struct SwitchCase:
+    pub value: i64
+    pub body: list[MirInstruction]
+
+## One instruction with its source location. The class supplies the
+## reference indirection regions need to nest.
+pub class MirInstruction:
+    pub form: InstructionForm
+    pub span: SourceSpan
+
+    pub init(form: InstructionForm, span: SourceSpan):
+        self.form = form
+        self.span = span
+
+## Every instruction. `result` registers are defined by the instruction;
+## every other register operand must already be defined. Regions (`Block`,
+## `Loop`, `If`, `Switch`) nest; `Br` and `BrIf` name an enclosing region by
+## depth, zero being the innermost, and `Yield` leaves the innermost region
+## normally. A region's `results` are the registers it defines for the code
+## after it, supplied by every `Br`/`Yield` that leaves it.
+pub union InstructionForm:
+    Const(result: RegisterId, value: MirConstant)
+    Copy(result: RegisterId, source: RegisterId)
+    Binary(result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId)
+    Unary(result: RegisterId, operation: UnaryOp, operand: RegisterId)
+    Convert(result: RegisterId, operation: ConvertOp, operand: RegisterId)
+    Alloca(result: RegisterId, slot: i64)
+    Load(result: RegisterId, value_type: TypeId, address: RegisterId)
+    Store(value_type: TypeId, address: RegisterId, value: RegisterId)
+    FieldAddress(result: RegisterId, struct_type: TypeId, base: RegisterId, field: i64)
+    ElementAddress(result: RegisterId, element_type: TypeId, base: RegisterId, index: RegisterId)
+    Memcpy(destination: RegisterId, source: RegisterId, value_type: TypeId)
+    DataAddress(result: RegisterId, data: DataId)
+    GlobalAddress(result: RegisterId, global: GlobalId)
+    FunctionAddress(result: RegisterId, function: FunctionId)
+    Call(results: list[RegisterId], function: FunctionId, arguments: list[RegisterId])
+    CallExtern(results: list[RegisterId], external: ExternId, arguments: list[RegisterId])
+    CallIndirect(results: list[RegisterId], signature: MirSignature, target: RegisterId, arguments: list[RegisterId])
+    Block(results: list[RegisterId], body: list[MirInstruction])
+    Loop(body: list[MirInstruction])
+    If(condition: RegisterId, results: list[RegisterId], then_body: list[MirInstruction], else_body: list[MirInstruction])
+    Switch(tag: RegisterId, cases: list[SwitchCase], default_body: list[MirInstruction])
+    Br(depth: i64, values: list[RegisterId])
+    BrIf(condition: RegisterId, depth: i64, values: list[RegisterId])
+    Yield(values: list[RegisterId])
+    Return(values: list[RegisterId])
+    Raise(failure: RegisterId)
+    Trap(reason: str)
+    Unreachable
+
+# mark: Functions, externs, globals, data ======================================================
+
+## How parameters and results travel. `luce` is the compiler's own
+## convention; `c` marks exports and callbacks and admits only
+## C-representable types; `runtime` names a `luce_rt_*` service.
+pub enum CallingConvention:
+    luce
+    c
+    runtime
+
+## One stack slot reserved by `Alloca`.
+pub struct MirSlot:
+    pub value_type: TypeId
+    pub align: i64
+
+## One defined function. `registers[i]` is the type of `r{i}`; parameters
+## occupy the first registers in order.
+pub struct MirFunction:
+    pub name: str
+    pub convention: CallingConvention
+    pub signature: MirSignature
+    pub registers: list[TypeId]
+    pub slots: list[MirSlot]
+    pub body: list[MirInstruction]
+    pub is_public: bool
+    pub span: SourceSpan
+
+## A symbol the artifact binds from outside: a C function or a runtime service.
+pub struct MirExtern:
+    pub name: str
+    pub convention: CallingConvention
+    pub signature: MirSignature
+
+## Module-level mutable state, optionally initialised from a data item.
+pub struct MirGlobal:
+    pub name: str
+    pub value_type: TypeId
+    pub initial: DataId?
+    pub is_mutable: bool
+
+## What a relocation patches into constant data.
+pub union RelocationTarget:
+    Function(id: FunctionId)
+    Data(id: DataId)
+    Global(id: GlobalId)
+
+## "At `offset`, write the address of `target`" — resolved by the artifact.
+pub struct MirRelocation:
+    pub offset: i64
+    pub target: RelocationTarget
+
+## Constant bytes: string literals, witness tables, jump tables.
+pub struct MirData:
+    pub name: str
+    pub bytes: list[u8]
+    pub align: i64
+    pub relocations: list[MirRelocation]
+
+# mark: The program ============================================================================
+
+## One whole program, lowered for one target layout. `entry` names the
+## function a process starts in; a library or wasm module leaves it absent.
+pub struct MirProgram:
+    pub layout: TargetLayout
+    pub types: MirTypeTable
+    pub externs: list[MirExtern]
+    pub globals: list[MirGlobal]
+    pub data: list[MirData]
+    pub functions: list[MirFunction]
+    pub entry: FunctionId?
+
+## A valid empty program for tests and tools.
+pub func create_empty_mir_program(layout: TargetLayout) -> MirProgram:
+    return MirProgram(
+        layout = layout,
+        types = create_builtin_mir_types(),
+        externs = list[MirExtern](),
+        globals = list[MirGlobal](),
+        data = list[MirData](),
+        functions = list[MirFunction](),
+        entry = none,
+    )
+
+pub func find_mir_function(program: MirProgram, name: str) -> i64:
+    for index in range(0, len(program.functions)):
+        if program.functions[index].name == name: return index
+    return -1
+
+pub func find_mir_extern(program: MirProgram, name: str) -> i64:
+    for index in range(0, len(program.externs)):
+        if program.externs[index].name == name: return index
+    return -1
+
+# mark: The runtime ============================================================================
+#
+# The services the language needs at run time (language section 23.4) are
+# calls to these symbols, never instructions. The lowerer declares the ones a
+# program uses as `runtime`-convention externs; the verifier checks each
+# against this table; each backend binds them its own way.
+
+pub struct RuntimeSymbol:
+    pub name: str
+    pub signature: MirSignature
+
+pub func runtime_symbols() -> list[RuntimeSymbol]:
+    let ptr = builtin_mir_type(BuiltinMirType.pointer)
+    let i64_type = builtin_mir_type(BuiltinMirType.signed_i64)
+    let none_results = list[TypeId]()
+    let symbols = list[RuntimeSymbol]()
+    symbols.append(RuntimeSymbol(name = "luce_rt_write", signature = MirSignature(parameters = [ptr, i64_type], results = none_results, is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_trap", signature = MirSignature(parameters = [ptr, i64_type], results = none_results, is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_alloc", signature = MirSignature(parameters = [i64_type, i64_type], results = [ptr], is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_retain", signature = MirSignature(parameters = [ptr], results = none_results, is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_release", signature = MirSignature(parameters = [ptr], results = none_results, is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_weak_make", signature = MirSignature(parameters = [ptr], results = [ptr], is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_weak_get", signature = MirSignature(parameters = [ptr], results = [ptr], is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_error_make", signature = MirSignature(parameters = [i64_type, ptr, i64_type], results = [ptr], is_fallible = false)))
+    symbols.append(RuntimeSymbol(name = "luce_rt_error_code", signature = MirSignature(parameters = [ptr], results = [i64_type], is_fallible = false)))
+    return symbols
+
+pub func find_runtime_symbol(name: str) -> RuntimeSymbol?:
+    for symbol in runtime_symbols():
+        if symbol.name == name: return symbol
+    return none

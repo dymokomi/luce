@@ -1,26 +1,32 @@
 #==============================================================================================
 #
-#   wasm - Canonical instructions into a WebAssembly module
+#   wasm - Canonical MIR into a WebAssembly module
 #
 #   DESCRIPTION:
 #       A direct WebAssembly encoder for canonical MIR. It writes the binary
-#       format itself with no assembler in between. Integer ops map onto WASM
-#       opcodes because both are stack machines. `WriteText` legalizes to an
-#       imported `luce.write` plus a data payload; a host that can load the
-#       module supplies that write. Arithmetic-only modules stay import-free.
+#       format itself with no assembler in between. MIR registers become wasm
+#       locals; structured MIR regions would become wasm blocks one-to-one;
+#       and each checked integer operation legalizes into the wasm arithmetic
+#       plus an explicit overflow test that ends in `unreachable`, because
+#       wasm arithmetic wraps and MIR arithmetic traps (docs/compiler/mir.md,
+#       "Meaning is fixed here"). The `luce_rt_write` runtime service becomes
+#       an imported `luce.write`; data items land in linear memory at packed
+#       offsets. Arithmetic-only modules stay import-free and memory-free.
 #
 #       Read `emit` top-down: it writes the sections in the order the binary
 #       format requires — type, import, function, memory, export, code, data —
-#       and each `encode_*` below produces one section's payload. When a write
-#       import exists it is function 0 and type 0, so every defined function's
-#       index and type index shift by one; `defined_function_base` carries
-#       that shift everywhere an index is written. The LEB128 helpers at the
-#       end are the only byte-level plumbing.
+#       and each `encode_*` below produces one section's payload. Imports
+#       come first in wasm's single function index space, so every defined
+#       function's index is shifted by the import count. The instruction
+#       encoders follow; the LEB128 helpers at the end are the only
+#       byte-level plumbing.
 #
 #==============================================================================================
 
 from compiler.backend import ArtifactBackend
-from compiler.canonical_ir import CanonicalFunction, CanonicalInstruction, CanonicalProgram, CanonicalType
+from compiler.canonical_ir import BinaryOp, InstructionForm, MirData, MirFunction, MirInstruction
+from compiler.canonical_ir import MirProgram, MirSignature, MirTypeTable, RegisterId, TypeId
+from compiler.canonical_ir import align_up, describe_mir_type, mir_type
 import std.strings
 
 # mark: WebAssembly binary format names =======================================================
@@ -36,20 +42,46 @@ const data_section: u8 = 0x0B
 const function_type_tag: u8 = 0x60
 const i32_value_type: u8 = 0x7F
 const i64_value_type: u8 = 0x7E
+const f32_value_type: u8 = 0x7D
+const f64_value_type: u8 = 0x7C
 const function_import_kind: u8 = 0x00
 const function_export_kind: u8 = 0x00
+const empty_block_type: u8 = 0x40
 
-const opcode_i32_const: u8 = 0x41
-const opcode_i32_add: u8 = 0x6A
-const opcode_i32_subtract: u8 = 0x6B
-const opcode_i32_multiply: u8 = 0x6C
-const opcode_i64_const: u8 = 0x42
-const opcode_i64_add: u8 = 0x7C
-const opcode_i64_subtract: u8 = 0x7D
-const opcode_i64_multiply: u8 = 0x7E
-const opcode_call: u8 = 0x10
-const opcode_return: u8 = 0x0F
+const opcode_unreachable: u8 = 0x00
+const opcode_block: u8 = 0x02
+const opcode_if: u8 = 0x04
 const opcode_end: u8 = 0x0B
+const opcode_br_if: u8 = 0x0D
+const opcode_return: u8 = 0x0F
+const opcode_call: u8 = 0x10
+const opcode_local_get: u8 = 0x20
+const opcode_local_set: u8 = 0x21
+const opcode_i32_const: u8 = 0x41
+const opcode_i64_const: u8 = 0x42
+
+const opcode_i32_eqz: u8 = 0x45
+const opcode_i32_eq: u8 = 0x46
+const opcode_i32_ne: u8 = 0x47
+const opcode_i32_lt_s: u8 = 0x48
+const opcode_i64_eqz: u8 = 0x50
+const opcode_i64_eq: u8 = 0x51
+const opcode_i64_ne: u8 = 0x52
+const opcode_i64_lt_s: u8 = 0x53
+
+const opcode_i32_add: u8 = 0x6A
+const opcode_i32_sub: u8 = 0x6B
+const opcode_i32_mul: u8 = 0x6C
+const opcode_i32_div_s: u8 = 0x6D
+const opcode_i32_and: u8 = 0x71
+const opcode_i32_xor: u8 = 0x73
+const opcode_i64_add: u8 = 0x7C
+const opcode_i64_sub: u8 = 0x7D
+const opcode_i64_mul: u8 = 0x7E
+const opcode_i64_div_s: u8 = 0x7F
+const opcode_i64_and: u8 = 0x83
+const opcode_i64_xor: u8 = 0x85
+const opcode_i32_wrap_i64: u8 = 0xA7
 
 # mark: The encoder ===========================================================================
 
@@ -59,212 +91,385 @@ pub class WasmBackend: ArtifactBackend:
         return
 
     ## Encode one canonical program as the bytes of a complete `.wasm` module.
-    pub func emit(program: CanonicalProgram) -> list[u8]!:
-        let writes = collect_writes(program)
-        let type_map = collect_result_types(program)
-        let has_write = len(writes) > 0
-        let function_base = defined_function_base(has_write)
+    pub func emit(program: MirProgram) -> list[u8]!:
+        let plan = try plan_module(program)
         let output = list[u8]()
         # `\0asm`, then binary format version 1.
         append_all(output, [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
-        append_section(output, type_section, encode_type_entries(has_write, type_map))
-        if has_write:
-            append_section(output, import_section, encode_write_import())
-        append_section(output, function_section, encode_function_entries(program, type_map, function_base))
-        if has_write:
+        append_section(output, type_section, encode_type_entries(plan))
+        if len(plan.imports) > 0:
+            append_section(output, import_section, encode_import_entries(plan))
+        append_section(output, function_section, encode_function_entries(program, plan))
+        if len(plan.data_offsets) > 0:
             append_section(output, memory_section, encode_memory_entry())
-        let exports = encode_export_entries(program, function_base)
+        let exports = encode_export_entries(program, plan)
         # A lone leading count byte means "no exports"; write the section only
         # when something follows the count.
         if len(exports) > 1:
             append_section(output, export_section, exports)
-        append_section(output, code_section, encode_code_entries(program, writes, write_function_index))
-        if len(writes) > 0:
-            append_section(output, data_section, encode_data_entries(writes))
+        append_section(output, code_section, try encode_code_entries(program, plan))
+        if len(plan.data_offsets) > 0:
+            append_section(output, data_section, encode_data_entries(program, plan))
         return output
 
 # mark: Module layout =========================================================================
 
-# One string payload per `WriteText`, packed from offset zero.
-struct WritePayload:
-    offset: i64
-    bytes: list[u8]
+# One wasm function type: parameter and result value types.
+struct WasmSignature:
+    parameters: list[u8]
+    results: list[u8]
 
-# Walk functions then instructions in program order. `encode_code_entries`
-# must use the same walk: `write_index` is the position in this list.
-func collect_writes(program: CanonicalProgram) -> list[WritePayload]:
-    let writes = list[WritePayload]()
+# One import: which runtime extern it binds, and its wasm type index.
+struct WasmImport:
+    external: i64
+    module_name: str
+    field_name: str
+    type_index: i64
+
+# Everything decided before any byte is written: the type table, the
+# imports (which take the first function indices), the type index of every
+# defined function, and where each data item lands in memory.
+struct ModulePlan:
+    signatures: list[WasmSignature]
+    imports: list[WasmImport]
+    function_types: list[i64]
+    data_offsets: list[i64]
+
+func plan_module(program: MirProgram) -> ModulePlan!:
+    let signatures = list[WasmSignature]()
+    let imports = list[WasmImport]()
+    for index in range(0, len(program.externs)):
+        let external = program.externs[index]
+        # The only runtime service the slice needs. Its wasm shape takes
+        # (offset, length) as i32s; the call site wraps MIR's i64 length.
+        if external.name != "luce_rt_write":
+            error("wasm backend does not support extern `" + external.name + "` yet")
+        let type_index = intern_signature(signatures, WasmSignature(parameters = [i32_value_type, i32_value_type], results = list[u8]()))
+        imports.append(WasmImport(external = index, module_name = "luce", field_name = "write", type_index = type_index))
+
+    let function_types = list[i64]()
+    for function in program.functions:
+        function_types.append(intern_signature(signatures, try wasm_signature(program.types, function.signature)))
+
+    # Data items pack from offset zero, each at its own alignment.
+    let data_offsets = list[i64]()
     var offset = 0
-    for function in program.functions:
-        for instruction in function.instructions:
-            match instruction:
-                WriteText(value):
-                    let encoded = strings.to_bytes(value + "\n")
-                    writes.append(WritePayload(offset = offset, bytes = encoded))
-                    offset += len(encoded)
-                else: continue
-    return writes
+    for item in program.data:
+        offset = align_up(offset, item.align)
+        data_offsets.append(offset)
+        offset += len(item.bytes)
 
-# Result types in first-seen order, so an i64-only module still has a single
-# type index zero and keeps the previous arithmetic encoding.
-func collect_result_types(program: CanonicalProgram) -> list[CanonicalType]:
-    let types = list[CanonicalType]()
-    for function in program.functions:
-        var seen = false
-        for existing in types:
-            if existing == function.result: seen = true
-        if not seen: types.append(function.result)
-    return types
+    return ModulePlan(signatures = signatures, imports = imports, function_types = function_types, data_offsets = data_offsets)
 
-func result_type_index(type_map: list[CanonicalType], result: CanonicalType) -> i64:
-    var index = 0
-    for existing in type_map:
-        if existing == result: return index
-        index += 1
-    return 0
+func intern_signature(signatures: list[WasmSignature], signature: WasmSignature) -> i64:
+    for index in range(0, len(signatures)):
+        if wasm_signatures_match(signatures[index], signature): return index
+    signatures.append(signature)
+    return len(signatures) - 1
 
-# Imports come before defined functions in WebAssembly's single function
-# index space, and the write import is also type 0. This one number is the
-# shift applied to every defined function's index and type index.
-const write_function_index: i64 = 0
+func wasm_signatures_match(left: WasmSignature, right: WasmSignature) -> bool:
+    if len(left.parameters) != len(right.parameters) or len(left.results) != len(right.results): return false
+    for index in range(0, len(left.parameters)):
+        if left.parameters[index] != right.parameters[index]: return false
+    for index in range(0, len(left.results)):
+        if left.results[index] != right.results[index]: return false
+    return true
 
-func defined_function_base(has_write: bool) -> i64:
-    if has_write: return write_function_index + 1
-    return 0
+func wasm_signature(types: MirTypeTable, signature: MirSignature) -> WasmSignature!:
+    let parameters = list[u8]()
+    for parameter in signature.parameters:
+        parameters.append(try wasm_value_type(types, parameter))
+    let results = list[u8]()
+    for result in signature.results:
+        results.append(try wasm_value_type(types, result))
+    return WasmSignature(parameters = parameters, results = results)
 
-# Type 0 is the write import `(i32, i32) -> ()` when present; each result
-# type in `type_map` then gets one `() -> T` entry in first-seen order.
-func encode_type_entries(has_write: bool, type_map: list[CanonicalType]) -> list[u8]:
+# Every register-sized MIR type has one wasm value type: integers up to 32
+# bits and `bool` are i32, 64-bit integers are i64, floats keep their width,
+# and a pointer is an i32 offset into the module's single memory.
+func wasm_value_type(types: MirTypeTable, id: TypeId) -> u8!:
+    match mir_type(types, id):
+        Int(bits, is_signed):
+            if bits <= 32: return i32_value_type
+            return i64_value_type
+        Float(bits):
+            if bits == 32: return f32_value_type
+            return f64_value_type
+        Bool: return i32_value_type
+        Ptr: return i32_value_type
+        else: error("wasm backend cannot place `" + describe_mir_type(types, id) + "` in a register")
+
+# Defined functions follow the imports in the function index space.
+func defined_function_index(plan: ModulePlan, function: i64) -> i64:
+    return len(plan.imports) + function
+
+# mark: Sections ==============================================================================
+
+# One `0x60` entry per distinct signature: parameter types, then result types.
+func encode_type_entries(plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
-    append_unsigned(entries, len(type_map) + defined_function_base(has_write))
-    if has_write:
+    append_unsigned(entries, len(plan.signatures))
+    for signature in plan.signatures:
         entries.append(function_type_tag)
-        entries.append(0x02)                # two parameters: offset, length
-        entries.append(i32_value_type)
-        entries.append(i32_value_type)
-        entries.append(0x00)                # no results
-    for result in type_map:
-        entries.append(function_type_tag)
-        entries.append(0x00)                # no parameters
-        entries.append(0x01)                # one result
-        entries.append(wasm_value_type(result))
+        append_unsigned(entries, len(signature.parameters))
+        append_all(entries, signature.parameters)
+        append_unsigned(entries, len(signature.results))
+        append_all(entries, signature.results)
     return entries
 
-# One import: module `luce`, name `write`, function of type 0.
-func encode_write_import() -> list[u8]:
+# Each import names its module and field and the function type it has.
+func encode_import_entries(plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
-    append_unsigned(entries, 1)
-    append_name(entries, "luce")
-    append_name(entries, "write")
-    entries.append(function_import_kind)
-    append_unsigned(entries, 0)
+    append_unsigned(entries, len(plan.imports))
+    for item in plan.imports:
+        append_name(entries, item.module_name)
+        append_name(entries, item.field_name)
+        entries.append(function_import_kind)
+        append_unsigned(entries, item.type_index)
     return entries
 
 # The function section only names each defined function's type index; the
 # bodies come later in the code section, in the same order.
-func encode_function_entries(program: CanonicalProgram, type_map: list[CanonicalType], function_base: i64) -> list[u8]:
+func encode_function_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, len(program.functions))
-    for function in program.functions:
-        append_unsigned(entries, result_type_index(type_map, function.result) + function_base)
+    for type_index in plan.function_types:
+        append_unsigned(entries, type_index)
     return entries
 
 # One memory with a one-page (64 KiB) minimum and no maximum; it holds the
-# `WriteText` payloads placed by the data section.
+# data items placed by the data section.
 func encode_memory_entry() -> list[u8]:
     return [0x01, 0x00, 0x01]
 
 # Public functions export under their canonical `module.function` name.
-func encode_export_entries(program: CanonicalProgram, function_base: i64) -> list[u8]:
+func encode_export_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
     var export_count = 0
     for function in program.functions:
         if function.is_public: export_count += 1
     append_unsigned(entries, export_count)
-
-    var function_index = function_base
-    for function in program.functions:
+    for index in range(0, len(program.functions)):
+        let function = program.functions[index]
         if function.is_public:
             append_name(entries, function.name)
             entries.append(function_export_kind)
-            append_unsigned(entries, function_index)
-        function_index += 1
+            append_unsigned(entries, defined_function_index(plan, index))
     return entries
 
-# One body per function: canonical instructions become their opcodes.
-# `write_index` is the next payload from `collect_writes`. Both functions
-# walk `program.functions` then `function.instructions` in the same order.
-func encode_code_entries(program: CanonicalProgram, writes: list[WritePayload], write_function: i64) -> list[u8]:
+# One body per function: its local declarations, then its instructions.
+func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
     let entries = list[u8]()
     append_unsigned(entries, len(program.functions))
-    var write_index = 0
     for function in program.functions:
         let body = list[u8]()
-        # Zero local declarations; operands live on the WASM stack.
-        body.append(0x00)
-        for instruction in function.instructions:
-            match instruction:
-                Constant(value, value_type):
-                    body.append(wasm_const_opcode(value_type))
-                    append_signed(body, value)
-                Add(operand_type): body.append(wasm_add_opcode(operand_type))
-                Subtract(operand_type): body.append(wasm_subtract_opcode(operand_type))
-                Multiply(operand_type): body.append(wasm_multiply_opcode(operand_type))
-                WriteText(value):
-                    let payload = writes[write_index]
-                    write_index += 1
-                    body.append(opcode_i32_const)
-                    append_signed(body, payload.offset)
-                    body.append(opcode_i32_const)
-                    append_signed(body, len(payload.bytes))
-                    body.append(opcode_call)
-                    append_unsigned(body, write_function)
-                Return: body.append(opcode_return)
+        try encode_locals(program.types, function, body)
+        for instruction in function.body:
+            try encode_instruction(program, plan, function, instruction, body)
         body.append(opcode_end)
         append_unsigned(entries, len(body))
         append_all(entries, body)
     return entries
 
-# One active data segment per payload, each placed into memory 0 at its
-# packed offset when the module is instantiated.
-func encode_data_entries(writes: list[WritePayload]) -> list[u8]:
+# One active data segment per item, placed into memory 0 at its packed offset
+# when the module is instantiated.
+func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
-    append_unsigned(entries, len(writes))
-    for payload in writes:
+    append_unsigned(entries, len(program.data))
+    for index in range(0, len(program.data)):
+        let item = program.data[index]
         entries.append(0x00)                # active segment in memory 0
         entries.append(opcode_i32_const)    # offset expression: `i32.const offset; end`
-        append_signed(entries, payload.offset)
+        append_signed(entries, plan.data_offsets[index])
         entries.append(opcode_end)
-        append_unsigned(entries, len(payload.bytes))
-        append_all(entries, payload.bytes)
+        append_unsigned(entries, len(item.bytes))
+        append_all(entries, item.bytes)
     return entries
 
-# mark: Opcode tables =========================================================================
+# mark: Registers as locals ===================================================================
+#
+# Register `r{i}` is wasm local `i`. Parameters are the leading locals wasm
+# declares implicitly; the remaining registers are declared here as runs of
+# one value type, the compressed form the code section wants.
 
-func wasm_value_type(value: CanonicalType) -> u8:
-    return match value:
-        signed_i32 => i32_value_type
-        signed_i64 => i64_value_type
+func encode_locals(types: MirTypeTable, function: MirFunction, body: list[u8]) -> !:
+    let parameter_count = len(function.signature.parameters)
+    let runs = list[u8]()
+    let run_counts = list[i64]()
+    for index in range(parameter_count, len(function.registers)):
+        let value_type = try wasm_value_type(types, function.registers[index])
+        if len(runs) > 0 and runs[len(runs) - 1] == value_type:
+            run_counts[len(run_counts) - 1] = run_counts[len(run_counts) - 1] + 1
+        else:
+            runs.append(value_type)
+            run_counts.append(1)
+    append_unsigned(body, len(runs))
+    for index in range(0, len(runs)):
+        append_unsigned(body, run_counts[index])
+        body.append(runs[index])
 
-func wasm_const_opcode(value: CanonicalType) -> u8:
-    return match value:
-        signed_i32 => opcode_i32_const
-        signed_i64 => opcode_i64_const
+func local_get(body: list[u8], register: RegisterId):
+    body.append(opcode_local_get)
+    append_unsigned(body, register.value)
 
-func wasm_add_opcode(value: CanonicalType) -> u8:
-    return match value:
-        signed_i32 => opcode_i32_add
-        signed_i64 => opcode_i64_add
+func local_set(body: list[u8], register: RegisterId):
+    body.append(opcode_local_set)
+    append_unsigned(body, register.value)
 
-func wasm_subtract_opcode(value: CanonicalType) -> u8:
-    return match value:
-        signed_i32 => opcode_i32_subtract
-        signed_i64 => opcode_i64_subtract
+# mark: Instructions ==========================================================================
 
-func wasm_multiply_opcode(value: CanonicalType) -> u8:
-    return match value:
-        signed_i32 => opcode_i32_multiply
-        signed_i64 => opcode_i64_multiply
+func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunction, instruction: MirInstruction, body: list[u8]) -> !:
+    let types = program.types
+    match instruction.form:
+        Const(result, value):
+            let value_type = try wasm_value_type(types, function.registers[result.value])
+            match value:
+                Int(item):
+                    if value_type == i64_value_type:
+                        body.append(opcode_i64_const)
+                    else:
+                        body.append(opcode_i32_const)
+                    append_signed(body, item)
+                Bool(item):
+                    body.append(opcode_i32_const)
+                    if item: append_signed(body, 1)
+                    else: append_signed(body, 0)
+                Null:
+                    body.append(opcode_i32_const)
+                    append_signed(body, 0)
+                Float(item):
+                    error("wasm backend does not support float constants yet")
+            local_set(body, result)
+        Copy(result, source):
+            local_get(body, source)
+            local_set(body, result)
+        Binary(result, operation, left, right):
+            let value_type = try wasm_value_type(types, function.registers[result.value])
+            let is_wide = value_type == i64_value_type
+            if operation == BinaryOp.add:
+                encode_checked_add(body, result, left, right, is_wide)
+            elif operation == BinaryOp.sub:
+                encode_checked_sub(body, result, left, right, is_wide)
+            elif operation == BinaryOp.mul:
+                encode_checked_mul(body, result, left, right, is_wide)
+            else:
+                error("wasm backend does not support `" + str(operation) + "` yet")
+        DataAddress(result, data):
+            body.append(opcode_i32_const)
+            append_signed(body, plan.data_offsets[data.value])
+            local_set(body, result)
+        CallExtern(results, external, arguments):
+            # The one supported service: `luce_rt_write(ptr, i64)` calls the
+            # `luce.write(i32, i32)` import, wrapping the length.
+            var import_index = -1
+            for index in range(0, len(plan.imports)):
+                if plan.imports[index].external == external.value: import_index = index
+            if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
+            local_get(body, arguments[0])
+            local_get(body, arguments[1])
+            body.append(opcode_i32_wrap_i64)
+            body.append(opcode_call)
+            append_unsigned(body, import_index)
+        Return(values):
+            for value in values:
+                local_get(body, value)
+            body.append(opcode_return)
+        else:
+            error("wasm backend does not support `" + str(instruction.form) + "` yet")
+
+# mark: Checked arithmetic ====================================================================
+#
+# Wasm integer arithmetic wraps; MIR's traps on overflow. Each helper computes
+# the wrapped result into the result local, then tests whether the wrap
+# happened and executes `unreachable` if so. The tests use only the operands
+# and the wrapped result, so no wider type is needed.
+
+# `r = a + b` overflows exactly when both operands have the sign opposite to
+# the result's: `((a ^ r) & (b ^ r)) < 0`.
+func encode_checked_add(body: list[u8], result: RegisterId, left: RegisterId, right: RegisterId, is_wide: bool):
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_add, opcode_i32_add))
+    local_set(body, result)
+    local_get(body, left)
+    local_get(body, result)
+    body.append(pick(is_wide, opcode_i64_xor, opcode_i32_xor))
+    local_get(body, right)
+    local_get(body, result)
+    body.append(pick(is_wide, opcode_i64_xor, opcode_i32_xor))
+    body.append(pick(is_wide, opcode_i64_and, opcode_i32_and))
+    append_zero(body, is_wide)
+    body.append(pick(is_wide, opcode_i64_lt_s, opcode_i32_lt_s))
+    append_trap_if_true(body)
+
+# `r = a - b` overflows exactly when the operands differ in sign and the
+# result's sign differs from `a`'s: `((a ^ b) & (a ^ r)) < 0`.
+func encode_checked_sub(body: list[u8], result: RegisterId, left: RegisterId, right: RegisterId, is_wide: bool):
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_sub, opcode_i32_sub))
+    local_set(body, result)
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_xor, opcode_i32_xor))
+    local_get(body, left)
+    local_get(body, result)
+    body.append(pick(is_wide, opcode_i64_xor, opcode_i32_xor))
+    body.append(pick(is_wide, opcode_i64_and, opcode_i32_and))
+    append_zero(body, is_wide)
+    body.append(pick(is_wide, opcode_i64_lt_s, opcode_i32_lt_s))
+    append_trap_if_true(body)
+
+# `r = a * b` overflowed when `b != 0` and `r / b != a`, or when `a == -1`
+# and `b` is the minimum (whose negation does not exist). The checks sit in
+# a block that `b == 0` skips, since dividing by zero would itself trap.
+# When `r / b` is `minimum / -1` the division traps too — that case is an
+# overflow as well, so either trap is the right answer.
+func encode_checked_mul(body: list[u8], result: RegisterId, left: RegisterId, right: RegisterId, is_wide: bool):
+    local_get(body, left)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_mul, opcode_i32_mul))
+    local_set(body, result)
+    body.append(opcode_block)
+    body.append(empty_block_type)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_eqz, opcode_i32_eqz))
+    body.append(opcode_br_if)
+    append_unsigned(body, 0)
+    local_get(body, result)
+    local_get(body, right)
+    body.append(pick(is_wide, opcode_i64_div_s, opcode_i32_div_s))
+    local_get(body, left)
+    body.append(pick(is_wide, opcode_i64_ne, opcode_i32_ne))
+    append_trap_if_true(body)
+    local_get(body, left)
+    append_constant(body, -1, is_wide)
+    body.append(pick(is_wide, opcode_i64_eq, opcode_i32_eq))
+    local_get(body, right)
+    if is_wide: append_constant(body, -9223372036854775807 - 1, true)
+    else: append_constant(body, -2147483647 - 1, false)
+    body.append(pick(is_wide, opcode_i64_eq, opcode_i32_eq))
+    body.append(opcode_i32_and)
+    append_trap_if_true(body)
+    body.append(opcode_end)
+
+# `if <condition> unreachable end`: trap when the i32 on the stack is true.
+func append_trap_if_true(body: list[u8]):
+    body.append(opcode_if)
+    body.append(empty_block_type)
+    body.append(opcode_unreachable)
+    body.append(opcode_end)
+
+func append_constant(body: list[u8], value: i64, is_wide: bool):
+    body.append(pick(is_wide, opcode_i64_const, opcode_i32_const))
+    append_signed(body, value)
+
+func append_zero(body: list[u8], is_wide: bool):
+    append_constant(body, 0, is_wide)
+
+func pick(is_wide: bool, wide: u8, narrow: u8) -> u8:
+    if is_wide: return wide
+    return narrow
 
 # mark: LEB128 and byte plumbing ==============================================================
 

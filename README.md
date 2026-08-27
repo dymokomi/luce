@@ -77,13 +77,19 @@ examples and tests link back here rather than restating it.
   conditionals, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
-- The compiled slice is one language — i32/i64 arithmetic, `print`, and
-  `return` — lowered to canonical MIR and encoded as WebAssembly, ARM64 Mach-O,
-  or x86-64 ELF. Native executables still start at `main`; WebAssembly exports
-  every public function.
-- The test suite exercises the frontend, semantic model, interpreter, lowering,
-  MIR verification, each artifact encoder, and the command line's exit
-  statuses and diagnostics. On a supported native host it also builds and
+- Canonical MIR is designed for the whole language (typed registers,
+  explicit memory with target layout, structured control flow, calls to a
+  named runtime, failure as data — see [docs/compiler/mir.md](docs/compiler/mir.md))
+  and has a verifier and its own interpreter covering every instruction.
+- The compiled slice is one language — checked i32/i64 arithmetic, `print`,
+  and `return` — lowered to canonical MIR and encoded as WebAssembly, ARM64
+  Mach-O, or x86-64 ELF. Native executables start at `main`; WebAssembly
+  exports every public function.
+- The test suite exercises the frontend, semantic model, both interpreters,
+  lowering, MIR verification, each artifact encoder, the command line's exit
+  statuses and diagnostics, and runs every fixture through the HIR
+  interpreter, the MIR interpreter, and each encoder to prove they agree. On
+  a supported native host it also builds and
   runs a smoke-test executable.
 
 The parser is ahead of HIR generation and backends. A

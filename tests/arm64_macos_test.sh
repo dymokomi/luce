@@ -26,4 +26,17 @@ if [ "$output" != "Hello, world!" ]; then
     exit 1
 fi
 
-echo "arm64-macos hello: ok"
+# Integer overflow must trap (language section 7): the image dies by signal
+# rather than returning a wrapped value. SIGTRAP on arm64, SIGILL on x86-64.
+printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
+"$test_dir/luce" build --target arm64-macos "$test_dir/overflow" "$test_dir/overflow.luc"
+set +e
+{ "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2>/dev/null
+set -e
+status=$(cat "$test_dir/overflow.status")
+if [ "$status" != 133 ]; then
+    echo "expected the overflow to trap with status 133, found: $status" >&2
+    exit 1
+fi
+
+echo "arm64-macos hello and overflow trap: ok"

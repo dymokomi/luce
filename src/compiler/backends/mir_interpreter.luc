@@ -1,0 +1,582 @@
+#==============================================================================================
+#
+#   mir_interpreter - Executes canonical MIR directly
+#
+#   DESCRIPTION:
+#       The second oracle. The HIR interpreter defines what a program means;
+#       this one executes the lowerer's output, so the two together locate a
+#       defect in either the lowerer or a backend without any target runtime.
+#       It is also the constant folder's engine: language section 7 requires
+#       folding to use runtime semantics, and sharing this code makes that so.
+#
+#       Public use begins at `MirInterpreter.run`. Memory is one flat byte
+#       array with a bump allocator that never frees (a test program is
+#       short-lived); address 0 is reserved so a null pointer is 0. Data items
+#       are copied in at load with their relocations patched, globals get
+#       storage initialised from their data, and every call frame allocates
+#       its `Alloca` slots on entry. A function's address, for `FunctionAddress`
+#       and `CallIndirect`, is `function_address_base + index`.
+#
+#       Every integer operation is checked against the register's type before
+#       the host computes it, so overflow, a zero divisor, `minimum // -1`, and
+#       an out-of-range shift count trap here exactly as the language says
+#       (section 7) and never reach Stage-0's own trap. Two representation
+#       shortcuts: `f32` values are stored as `f64`, and floats in memory live
+#       in a side table keyed by address because Stage-0 offers no float-to-
+#       bits conversion; a `Load` of a float address never written reads 0.0.
+#
+#       The walk is: `run` -> `call` (one frame) -> `execute_body` -> one
+#       instruction. Control flow returns a `Flow` value that regions consume.
+#
+#==============================================================================================
+
+from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, InstructionForm
+from compiler.canonical_ir import MirConstant, MirFunction, MirInstruction, MirProgram, MirSignature, MirType
+from compiler.canonical_ir import RegisterId, RelocationTarget, TypeId, UnaryOp
+from compiler.canonical_ir import align_up, bits_of, builtin_mir_type, find_mir_function, int_maximum
+from compiler.canonical_ir import int_minimum, is_bool_type, is_float_type, is_int_type, is_ptr_type
+from compiler.canonical_ir import is_signed_int_type, mir_type, size_of, align_of
+import std.strings
+
+# mark: Values and flow ========================================================================
+
+## One register's contents. Integers of every width travel as `i64`; `Ptr`
+## is a byte offset into the interpreter's memory.
+pub union MirValue:
+    Int(value: i64)
+    Float(value: f64)
+    Bool(value: bool)
+    Ptr(value: i64)
+
+## `FunctionAddress` yields `function_address_base + index`.
+pub const function_address_base: i64 = 0x1000000
+
+# How a body finished: fell through, branched out `depth` regions carrying
+# values, yielded the innermost region's values, or left the function.
+union Flow:
+    Next
+    Branch(depth: i64, values: list[MirValue])
+    Yielded(values: list[MirValue])
+    Returned(values: list[MirValue])
+    Raised(failure: i64)
+
+# A float stored in memory; see the header for why these are not bytes.
+struct FloatCell:
+    address: i64
+    value: f64
+
+# One call: its registers and the addresses of its slots.
+class Frame:
+    pub function: MirFunction
+    pub registers: list[MirValue]
+    pub slots: list[i64]
+
+    pub init(function: MirFunction, registers: list[MirValue], slots: list[i64]):
+        self.function = function
+        self.registers = registers
+        self.slots = slots
+
+const i64_maximum: i64 = 9223372036854775807
+const i64_minimum: i64 = -9223372036854775807 - 1
+
+# mark: The interpreter ========================================================================
+
+## Executes functions of one verified MIR program.
+pub class MirInterpreter:
+    program: MirProgram
+    memory: list[u8]
+    float_cells: list[FloatCell]
+    data_addresses: list[i64]
+    global_addresses: list[i64]
+    is_loaded: bool
+    ## Everything `luce_rt_write` has written, in order.
+    pub output: str
+
+    ## Prepare to run one program; memory is laid out on the first `run`.
+    pub init(program: MirProgram):
+        self.program = program
+        self.memory = list[u8]()
+        self.float_cells = list[FloatCell]()
+        self.data_addresses = list[i64]()
+        self.global_addresses = list[i64]()
+        self.is_loaded = false
+        self.output = ""
+
+    ## Run one function by name and return its results; a fallible function's
+    ## error slot is the last result, `Ptr(0)` on success.
+    pub func run(function_name: str, arguments: list[MirValue]) -> list[MirValue]!:
+        if not self.is_loaded: self.load_program()
+        let index = find_mir_function(self.program, function_name)
+        if index < 0: error("mir interpreter: unknown function `" + function_name + "`")
+        return try self.call(index, arguments)
+
+    # Lay out data and globals once. Address 0 is null; nothing lives there.
+    func load_program():
+        self.is_loaded = true
+        let program = self.program
+        self.memory.append(0)
+        for item in program.data:
+            let address = self.allocate(len(item.bytes), item.align)
+            for index in range(0, len(item.bytes)):
+                self.memory[address + index] = item.bytes[index]
+            self.data_addresses.append(address)
+        for global in program.globals:
+            let size = size_of(program.types, program.layout, global.value_type)
+            self.global_addresses.append(self.allocate(size, align_of(program.types, program.layout, global.value_type)))
+        # Relocations and initialisers can name items laid out later, so they
+        # are patched only once every address is known.
+        for index in range(0, len(program.data)):
+            for relocation in program.data[index].relocations:
+                var target = 0
+                match relocation.target:
+                    Function(id): target = function_address_base + id.value
+                    Data(id): target = self.data_addresses[id.value]
+                    Global(id): target = self.global_addresses[id.value]
+                self.write_int(self.data_addresses[index] + relocation.offset, program.layout.pointer_size, target)
+        for index in range(0, len(program.globals)):
+            let initial = program.globals[index].initial
+            if initial != none:
+                let size = size_of(program.types, program.layout, program.globals[index].value_type)
+                let source = self.data_addresses[initial.value]
+                for offset in range(0, size):
+                    self.memory[self.global_addresses[index] + offset] = self.memory[source + offset]
+
+    # mark: Calls ===============================================================================
+
+    # One call frame: parameters land in the leading registers, slots are
+    # allocated, the body runs, and the flow it ends with becomes results.
+    func call(index: i64, arguments: list[MirValue]) -> list[MirValue]!:
+        let function = self.program.functions[index]
+        if len(arguments) != len(function.signature.parameters):
+            error("mir interpreter: `" + function.name + "` takes " + str(len(function.signature.parameters)) + " argument(s), got " + str(len(arguments)))
+        let registers = list[MirValue]()
+        for register_type in function.registers:
+            registers.append(self.default_value(register_type))
+        for position in range(0, len(arguments)):
+            registers[position] = arguments[position]
+        let slots = list[i64]()
+        for slot in function.slots:
+            slots.append(self.allocate(size_of(self.program.types, self.program.layout, slot.value_type), slot.align))
+        let frame = Frame(function = function, registers = registers, slots = slots)
+        match try self.execute_body(frame, function.body):
+            Returned(values): return values
+            Raised(failure):
+                # An error leaves the value results at their defaults and the
+                # error slot pointing at the error record.
+                let results = list[MirValue]()
+                for position in range(0, len(function.signature.results) - 1):
+                    results.append(self.default_value(function.signature.results[position]))
+                results.append(MirValue.Ptr(value = failure))
+                return results
+            else: trap("verified MIR function fell off its end")
+
+    func default_value(id: TypeId) -> MirValue:
+        let types = self.program.types
+        if is_float_type(types, id): return MirValue.Float(value = 0.0)
+        if is_bool_type(types, id): return MirValue.Bool(value = false)
+        if is_ptr_type(types, id): return MirValue.Ptr(value = 0)
+        return MirValue.Int(value = 0)
+
+    # mark: Bodies and regions ==================================================================
+
+    func execute_body(frame: Frame, body: list[MirInstruction]) -> Flow!:
+        for instruction in body:
+            let flow = try self.execute(frame, instruction)
+            match flow:
+                Next: continue
+                else: return flow
+        return Flow.Next
+
+    # A region that has ended: bind its results from a `Yield` or a `Br` to
+    # it, pass an outer branch on with one less depth, or propagate a
+    # function exit. `Loop` is the only region that can run its body again.
+    func finish_region(frame: Frame, results: list[RegisterId], flow: Flow) -> Flow:
+        match flow:
+            Next: return Flow.Next
+            Yielded(values):
+                self.bind(frame, results, values)
+                return Flow.Next
+            Branch(depth, values):
+                if depth == 0:
+                    self.bind(frame, results, values)
+                    return Flow.Next
+                return Flow.Branch(depth = depth - 1, values = values)
+            else: return flow
+
+    func bind(frame: Frame, results: list[RegisterId], values: list[MirValue]):
+        for position in range(0, len(results)):
+            frame.registers[results[position].value] = values[position]
+
+    func execute_loop(frame: Frame, body: list[MirInstruction]) -> Flow!:
+        while true:
+            match try self.execute_body(frame, body):
+                Next: return Flow.Next
+                Yielded(values): return Flow.Next
+                Branch(depth, values):
+                    if depth == 0: continue
+                    return Flow.Branch(depth = depth - 1, values = values)
+                Returned(values): return Flow.Returned(values = values)
+                Raised(failure): return Flow.Raised(failure = failure)
+
+    # mark: Instructions ========================================================================
+
+    func execute(frame: Frame, instruction: MirInstruction) -> Flow!:
+        let types = self.program.types
+        match instruction.form:
+            Const(result, value):
+                match value:
+                    Int(item): frame.registers[result.value] = MirValue.Int(value = item)
+                    Float(item): frame.registers[result.value] = MirValue.Float(value = item)
+                    Bool(item): frame.registers[result.value] = MirValue.Bool(value = item)
+                    Null: frame.registers[result.value] = MirValue.Ptr(value = 0)
+            Copy(result, source):
+                frame.registers[result.value] = frame.registers[source.value]
+            Binary(result, operation, left, right):
+                frame.registers[result.value] = try self.evaluate_binary(operation, frame.function.registers[left.value], frame.registers[left.value], frame.registers[right.value])
+            Unary(result, operation, operand):
+                frame.registers[result.value] = try self.evaluate_unary(operation, frame.function.registers[operand.value], frame.registers[operand.value])
+            Convert(result, operation, operand):
+                frame.registers[result.value] = try self.evaluate_convert(operation, frame.function.registers[operand.value], frame.function.registers[result.value], frame.registers[operand.value])
+            Alloca(result, slot):
+                frame.registers[result.value] = MirValue.Ptr(value = frame.slots[slot])
+            Load(result, value_type, address):
+                frame.registers[result.value] = self.load(value_type, ptr_of(frame.registers[address.value]))
+            Store(value_type, address, value):
+                self.store(value_type, ptr_of(frame.registers[address.value]), frame.registers[value.value])
+            FieldAddress(result, struct_type, base, field):
+                match mir_type(types, struct_type):
+                    Struct(fields, size, align):
+                        frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + fields[field].offset)
+                    else: trap("verified FieldAddress on a non-struct type")
+            ElementAddress(result, element_type, base, index):
+                let stride = size_of(types, self.program.layout, element_type)
+                frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + int_of(frame.registers[index.value]) * stride)
+            Memcpy(destination, source, value_type):
+                let size = size_of(types, self.program.layout, value_type)
+                let to = ptr_of(frame.registers[destination.value])
+                let from = ptr_of(frame.registers[source.value])
+                for offset in range(0, size):
+                    self.memory[to + offset] = self.memory[from + offset]
+                    self.copy_float_cell(from + offset, to + offset)
+            DataAddress(result, data):
+                frame.registers[result.value] = MirValue.Ptr(value = self.data_addresses[data.value])
+            GlobalAddress(result, global):
+                frame.registers[result.value] = MirValue.Ptr(value = self.global_addresses[global.value])
+            FunctionAddress(result, function):
+                frame.registers[result.value] = MirValue.Ptr(value = function_address_base + function.value)
+            Call(results, function, arguments):
+                let values = try self.call(function.value, self.collect(frame, arguments))
+                self.bind(frame, results, values)
+            CallExtern(results, external, arguments):
+                let values = try self.call_extern(self.program.externs[external.value].name, self.collect(frame, arguments))
+                self.bind(frame, results, values)
+            CallIndirect(results, signature, target, arguments):
+                let address = ptr_of(frame.registers[target.value])
+                let index = address - function_address_base
+                if index < 0 or index >= len(self.program.functions):
+                    error("mir interpreter: trap: indirect call through " + str(address) + ", which is not a function address")
+                let values = try self.call(index, self.collect(frame, arguments))
+                self.bind(frame, results, values)
+            Block(results, body):
+                return self.finish_region(frame, results, try self.execute_body(frame, body))
+            Loop(body):
+                return self.finish_region(frame, list[RegisterId](), try self.execute_loop(frame, body))
+            If(condition, results, then_body, else_body):
+                if bool_of(frame.registers[condition.value]):
+                    return self.finish_region(frame, results, try self.execute_body(frame, then_body))
+                return self.finish_region(frame, results, try self.execute_body(frame, else_body))
+            Switch(tag, cases, default_body):
+                let selected = int_of(frame.registers[tag.value])
+                for item in cases:
+                    if item.value == selected:
+                        return self.finish_region(frame, list[RegisterId](), try self.execute_body(frame, item.body))
+                return self.finish_region(frame, list[RegisterId](), try self.execute_body(frame, default_body))
+            Br(depth, values):
+                return Flow.Branch(depth = depth, values = self.collect(frame, values))
+            BrIf(condition, depth, values):
+                if bool_of(frame.registers[condition.value]):
+                    return Flow.Branch(depth = depth, values = self.collect(frame, values))
+            Yield(values):
+                return Flow.Yielded(values = self.collect(frame, values))
+            Return(values):
+                return Flow.Returned(values = self.collect(frame, values))
+            Raise(failure):
+                return Flow.Raised(failure = ptr_of(frame.registers[failure.value]))
+            Trap(reason):
+                error("mir interpreter: trap: " + reason)
+            Unreachable:
+                trap("verified MIR reached `Unreachable`")
+        return Flow.Next
+
+    func collect(frame: Frame, registers: list[RegisterId]) -> list[MirValue]:
+        let values = list[MirValue]()
+        for register in registers:
+            values.append(frame.registers[register.value])
+        return values
+
+    # mark: Arithmetic ==========================================================================
+    #
+    # `operand_type` is the register type both operands share; integer results
+    # must land inside its bounds. Stage-0 traps on its own `i64` overflow, so
+    # each operation is checked before it is computed.
+
+    func evaluate_binary(operation: BinaryOp, operand_type: TypeId, left: MirValue, right: MirValue) -> MirValue!:
+        let types = self.program.types
+        if is_float_type(types, operand_type):
+            return try evaluate_float_binary(operation, float_of(left), float_of(right))
+        if is_bool_type(types, operand_type):
+            if operation == BinaryOp.eq: return MirValue.Bool(value = bool_of(left) == bool_of(right))
+            if operation == BinaryOp.ne: return MirValue.Bool(value = bool_of(left) != bool_of(right))
+            trap("verified bool operands reached a non-equality operation")
+        if is_ptr_type(types, operand_type):
+            if operation == BinaryOp.eq: return MirValue.Bool(value = ptr_of(left) == ptr_of(right))
+            if operation == BinaryOp.ne: return MirValue.Bool(value = ptr_of(left) != ptr_of(right))
+            trap("verified ptr operands reached a non-equality operation")
+        return try self.evaluate_int_binary(operation, operand_type, int_of(left), int_of(right))
+
+    func evaluate_int_binary(operation: BinaryOp, operand_type: TypeId, left: i64, right: i64) -> MirValue!:
+        let types = self.program.types
+        let minimum = int_minimum(types, operand_type)
+        let maximum = int_maximum(types, operand_type)
+        let bits = bits_of(types, operand_type)
+        if operation == BinaryOp.eq: return MirValue.Bool(value = left == right)
+        if operation == BinaryOp.ne: return MirValue.Bool(value = left != right)
+        if operation == BinaryOp.lt: return MirValue.Bool(value = left < right)
+        if operation == BinaryOp.le: return MirValue.Bool(value = left <= right)
+        if operation == BinaryOp.gt: return MirValue.Bool(value = left > right)
+        if operation == BinaryOp.ge: return MirValue.Bool(value = left >= right)
+        if operation == BinaryOp.add:
+            if (right > 0 and left > maximum - right) or (right < 0 and left < minimum - right):
+                try trap_overflow()
+            return MirValue.Int(value = left + right)
+        if operation == BinaryOp.sub:
+            if (right < 0 and left > maximum + right) or (right > 0 and left < minimum + right):
+                try trap_overflow()
+            return MirValue.Int(value = left - right)
+        if operation == BinaryOp.mul:
+            let product = try checked_multiply(left, right)
+            if product < minimum or product > maximum: try trap_overflow()
+            return MirValue.Int(value = product)
+        if operation == BinaryOp.floor_div or operation == BinaryOp.rem:
+            if right == 0: error("mir interpreter: trap: division by zero")
+            if left == minimum and right == -1: try trap_overflow()
+            if operation == BinaryOp.floor_div: return MirValue.Int(value = left // right)
+            return MirValue.Int(value = left % right)
+        if operation == BinaryOp.bit_and: return MirValue.Int(value = left & right)
+        if operation == BinaryOp.bit_or: return MirValue.Int(value = left | right)
+        if operation == BinaryOp.bit_xor: return MirValue.Int(value = left ^ right)
+        if operation == BinaryOp.shift_left:
+            if right < 0 or right >= bits: error("mir interpreter: trap: shift count is outside integer width")
+            # `left << right` fits iff minimum <= left * 2^right <= maximum.
+            if right > 0 and (left > (maximum >> right) or left < (minimum >> right)): try trap_overflow()
+            return MirValue.Int(value = left << right)
+        if operation == BinaryOp.shift_right:
+            if right < 0 or right >= bits: error("mir interpreter: trap: shift count is outside integer width")
+            # Unsigned values are non-negative here, so `>>` is logical for
+            # them and arithmetic for signed values, as the language requires.
+            return MirValue.Int(value = left >> right)
+        if operation == BinaryOp.div: trap("verified integer operands reached `div`")
+        trap("unhandled integer operation")
+
+    func evaluate_unary(operation: UnaryOp, operand_type: TypeId, operand: MirValue) -> MirValue!:
+        let types = self.program.types
+        match operation:
+            neg:
+                if is_float_type(types, operand_type): return MirValue.Float(value = 0.0 - float_of(operand))
+                let value = int_of(operand)
+                if value == int_minimum(types, operand_type): try trap_overflow()
+                return MirValue.Int(value = 0 - value)
+            bit_not:
+                let value = int_of(operand)
+                if is_signed_int_type(types, operand_type): return MirValue.Int(value = ~value)
+                return MirValue.Int(value = int_maximum(types, operand_type) - value)
+            bool_not:
+                return MirValue.Bool(value = not bool_of(operand))
+
+    func evaluate_convert(operation: ConvertOp, operand_type: TypeId, result_type: TypeId, operand: MirValue) -> MirValue!:
+        let types = self.program.types
+        match operation:
+            extend:
+                return MirValue.Int(value = int_of(operand))
+            wrap:
+                # Keep the low `bits` and reinterpret them in the target's sign.
+                let bits = bits_of(types, result_type)
+                let mask = (1 << bits) - 1
+                var value = int_of(operand) & mask
+                if is_signed_int_type(types, result_type) and value >= (1 << (bits - 1)):
+                    value = value - (1 << bits)
+                return MirValue.Int(value = value)
+            int_to_float:
+                return MirValue.Float(value = f64(int_of(operand)))
+            float_to_int:
+                let value = float_of(operand)
+                if value != value: error("mir interpreter: trap: float to integer conversion of NaN")
+                if value < f64(int_minimum(types, result_type)) or value >= f64(int_maximum(types, result_type)) + 1.0:
+                    error("mir interpreter: trap: float to integer conversion is outside the integer range")
+                return MirValue.Int(value = i64(value))
+
+    # mark: Memory ==============================================================================
+
+    func allocate(size: i64, align: i64) -> i64:
+        let address = align_up(len(self.memory), align)
+        while len(self.memory) < address + size:
+            self.memory.append(0)
+        if size == 0: self.memory.append(0)
+        return address
+
+    func load(value_type: TypeId, address: i64) -> MirValue:
+        let types = self.program.types
+        if is_float_type(types, value_type):
+            for cell in self.float_cells:
+                if cell.address == address: return MirValue.Float(value = cell.value)
+            return MirValue.Float(value = 0.0)
+        if is_bool_type(types, value_type): return MirValue.Bool(value = self.memory[address] != 0)
+        if is_ptr_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.program.layout.pointer_size, false))
+        return MirValue.Int(value = self.read_int(address, bits_of(types, value_type) // 8, is_signed_int_type(types, value_type)))
+
+    func store(value_type: TypeId, address: i64, value: MirValue):
+        let types = self.program.types
+        if is_float_type(types, value_type):
+            self.set_float_cell(address, float_of(value))
+            return
+        if is_bool_type(types, value_type):
+            if bool_of(value): self.memory[address] = u8(1)
+            else: self.memory[address] = u8(0)
+            return
+        if is_ptr_type(types, value_type):
+            self.write_int(address, self.program.layout.pointer_size, ptr_of(value))
+            return
+        self.write_int(address, bits_of(types, value_type) // 8, int_of(value))
+
+    # Little-endian, sign-extending on request. A negative value's two's
+    # complement bytes are produced by adding 2^64 conceptually, one byte at a
+    # time, without ever forming a value Stage-0 would reject.
+    func write_int(address: i64, size: i64, value: i64):
+        var remaining = value
+        for offset in range(0, size):
+            let low = remaining % 256
+            self.memory[address + offset] = u8(low)
+            remaining = (remaining - low) // 256
+
+    func read_int(address: i64, size: i64, is_signed: bool) -> i64:
+        # The top byte is folded in as a signed digit so eight bytes never
+        # form a value Stage-0 cannot hold; narrower reads sign-extend after.
+        var top = i64(self.memory[address + size - 1])
+        if (is_signed or size == 8) and top >= 128: top = top - 256
+        var value = top
+        var position = size - 2
+        while position >= 0:
+            value = value * 256 + i64(self.memory[address + position])
+            position -= 1
+        return value
+
+    func set_float_cell(address: i64, value: f64):
+        for index in range(0, len(self.float_cells)):
+            if self.float_cells[index].address == address:
+                self.float_cells[index] = FloatCell(address = address, value = value)
+                return
+        self.float_cells.append(FloatCell(address = address, value = value))
+
+    func copy_float_cell(from: i64, to: i64):
+        for cell in self.float_cells:
+            if cell.address == from:
+                self.set_float_cell(to, cell.value)
+                return
+
+    # mark: The runtime =========================================================================
+    #
+    # The services a program may call by name. Anything the interpreter does
+    # not provide is reported, never trapped, so a test sees which one.
+
+    func call_extern(name: str, arguments: list[MirValue]) -> list[MirValue]!:
+        let none_results = list[MirValue]()
+        if name == "luce_rt_write":
+            self.output = self.output + self.text_at(ptr_of(arguments[0]), int_of(arguments[1]))
+            return none_results
+        if name == "luce_rt_trap":
+            error("mir interpreter: trap: " + self.text_at(ptr_of(arguments[0]), int_of(arguments[1])))
+        if name == "luce_rt_alloc":
+            return [MirValue.Ptr(value = self.allocate(int_of(arguments[0]), int_of(arguments[1])))]
+        if name == "luce_rt_retain" or name == "luce_rt_release":
+            return none_results
+        if name == "luce_rt_weak_make" or name == "luce_rt_weak_get":
+            return [arguments[0]]
+        if name == "luce_rt_error_make":
+            # Three 8-byte fields: code, message address, message length.
+            let record = self.allocate(24, 8)
+            self.write_int(record, 8, int_of(arguments[0]))
+            self.write_int(record + 8, 8, ptr_of(arguments[1]))
+            self.write_int(record + 16, 8, int_of(arguments[2]))
+            return [MirValue.Ptr(value = record)]
+        if name == "luce_rt_error_code":
+            return [MirValue.Int(value = self.read_int(ptr_of(arguments[0]), 8, true))]
+        error("mir interpreter: extern `" + name + "` is not available")
+
+    ## The message of an error record made by `luce_rt_error_make`.
+    pub func error_message(record: i64) -> str:
+        return self.text_at(self.read_int(record + 8, 8, false), self.read_int(record + 16, 8, true))
+
+    func text_at(address: i64, length: i64) -> str:
+        let payload = list[u8]()
+        for offset in range(0, length):
+            payload.append(self.memory[address + offset])
+        return strings.from_bytes(payload) else "<invalid utf-8>"
+
+# mark: Value helpers ==========================================================================
+
+pub func int_of(value: MirValue) -> i64:
+    match value:
+        Int(item): return item
+        else: trap("verified MIR register holds a non-integer where an integer was expected")
+
+pub func float_of(value: MirValue) -> f64:
+    match value:
+        Float(item): return item
+        else: trap("verified MIR register holds a non-float where a float was expected")
+
+pub func bool_of(value: MirValue) -> bool:
+    match value:
+        Bool(item): return item
+        else: trap("verified MIR register holds a non-bool where a bool was expected")
+
+pub func ptr_of(value: MirValue) -> i64:
+    match value:
+        Ptr(item): return item
+        else: trap("verified MIR register holds a non-pointer where a pointer was expected")
+
+func trap_overflow() -> !:
+    error("mir interpreter: trap: integer overflow")
+
+# Multiply two `i64` values, reporting overflow instead of letting Stage-0
+# trap. Magnitudes are compared against `maximum // |b|`; the one product
+# that exceeds `maximum` yet fits is exactly `minimum`.
+func checked_multiply(left: i64, right: i64) -> i64!:
+    if left == 0 or right == 0: return 0
+    if left == 1: return right
+    if right == 1: return left
+    if left == i64_minimum or right == i64_minimum: try trap_overflow()
+    let negative = (left < 0) != (right < 0)
+    var left_magnitude = left
+    if left_magnitude < 0: left_magnitude = 0 - left_magnitude
+    var right_magnitude = right
+    if right_magnitude < 0: right_magnitude = 0 - right_magnitude
+    let limit = i64_maximum // right_magnitude
+    if left_magnitude > limit:
+        # The product is at least 2^63; only minimum itself is representable.
+        let divides_exactly = i64_maximum % right_magnitude == right_magnitude - 1
+        if negative and divides_exactly and left_magnitude == limit + 1: return i64_minimum
+        try trap_overflow()
+    return left * right
+
+func evaluate_float_binary(operation: BinaryOp, left: f64, right: f64) -> MirValue!:
+    if operation == BinaryOp.add: return MirValue.Float(value = left + right)
+    if operation == BinaryOp.sub: return MirValue.Float(value = left - right)
+    if operation == BinaryOp.mul: return MirValue.Float(value = left * right)
+    if operation == BinaryOp.div: return MirValue.Float(value = left / right)
+    if operation == BinaryOp.eq: return MirValue.Bool(value = left == right)
+    if operation == BinaryOp.ne: return MirValue.Bool(value = left != right)
+    if operation == BinaryOp.lt: return MirValue.Bool(value = left < right)
+    if operation == BinaryOp.le: return MirValue.Bool(value = left <= right)
+    if operation == BinaryOp.gt: return MirValue.Bool(value = left > right)
+    if operation == BinaryOp.ge: return MirValue.Bool(value = left >= right)
+    trap("verified float operands reached an integer-only operation")

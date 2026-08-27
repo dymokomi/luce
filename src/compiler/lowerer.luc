@@ -3,56 +3,87 @@
 #   lowerer - Typed HIR into canonical MIR
 #
 #   DESCRIPTION:
-#       Flattens analyzed typed-HIR expression trees into the ordered canonical
-#       instruction stream, making evaluation order explicit for compiled
-#       backends.
-#       Public use begins at `Lowerer.lower`; the walk goes program -> function
-#       -> statement -> expression, and anything outside the executable slice
-#       fails with a clear "does not support ... yet".
+#       Turns analyzed typed-HIR trees into canonical MIR: every value lands
+#       in a fresh write-once register, terminal output becomes a data item
+#       plus a call to the `luce_rt_write` runtime service, and a function's
+#       result is an explicit `Return`. Public use begins at `Lowerer.lower`;
+#       the walk goes program -> function -> statement -> expression, and
+#       anything outside the executable slice fails with a clear
+#       "does not support ... yet".
 #
 #       The compiled slice today: i32/i64 arithmetic, constant terminal
-#       output, and returning. That is one language: every compiled backend
-#       encodes it. The slice boundary lives here, not in canonical MIR —
-#       wider integers, comparisons, bindings, and calls all reach the
-#       lowerer as HIR and stop with "does not support ... yet" until an
-#       instruction exists for them. Only `main(arguments: slice[str])`
+#       output, and returning. The slice boundary lives here, not in canonical
+#       MIR — wider integers, comparisons, bindings, and calls all reach the
+#       lowerer as HIR and stop with "does not support ... yet" until this
+#       file emits the instruction for them. Only `main(arguments: slice[str])`
 #       carries a parameter (the 1.0 entry signature, docs/language/1.0.md
 #       §23), and the argument remains unavailable until ordinary parameters
-#       are lowered.
+#       are lowered, so the MIR entry is `() -> i32`.
+#
+#       Lowering happens for one `TargetLayout`: aggregate layouts are fixed
+#       here, which is why `build` chooses a target before this stage runs.
 #
 #==============================================================================================
 
-from compiler.canonical_ir import CanonicalFunction, CanonicalInstruction, CanonicalProgram, CanonicalType
+from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, FunctionId
+from compiler.canonical_ir import InstructionForm, MirConstant, MirData, MirExtern, MirFunction, MirGlobal, MirInstruction
+from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSlot, MirTypeTable, RegisterId
+from compiler.canonical_ir import TargetLayout, TypeId, builtin_mir_type, create_builtin_mir_types, find_runtime_symbol
 from compiler.hir import BinaryOperation, BuiltinType, HirExpression, HirFunction
-from compiler.hir import HirModule, HirProgram, HirStatement, TypeId, describe_type
+from compiler.hir import HirModule, HirProgram, HirStatement, describe_type
 from compiler.hir import resolve_builtin_type, types_match
+import compiler.hir
 from compiler.semantic_analyzer import AnalyzedProgram
 from compiler.source import SourceSpan, format_diagnostic
+import std.strings
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     program: HirProgram
+    layout: TargetLayout
+    # Program-wide tables the lowered functions refer to by identity.
+    types: MirTypeTable
+    externs: list[MirExtern]
+    data: list[MirData]
+    # The register table of the function being lowered.
+    registers: list[TypeId]
 
-    ## Prepare to lower one analyzed program; `lower` performs the actual walk.
-    pub init(program: AnalyzedProgram):
+    ## Prepare to lower one analyzed program for one target; `lower` walks it.
+    pub init(program: AnalyzedProgram, layout: TargetLayout):
         self.program = program.hir
+        self.layout = layout
+        self.types = create_builtin_mir_types()
+        self.externs = list[MirExtern]()
+        self.data = list[MirData]()
+        self.registers = list[TypeId]()
 
     # mark: Lowering ============================================================================
 
     ## Lower every function in every module, or stop at the first construct
     ## the executable slice cannot express yet.
-    pub func lower() -> CanonicalProgram!:
-        let functions = list[CanonicalFunction]()
+    pub func lower() -> MirProgram!:
+        let functions = list[MirFunction]()
         for function in self.program.functions:
             let module = self.program.modules[function.module.value]
             functions.append(try self.lower_function(module, function))
-        return CanonicalProgram(functions = functions)
+        # Bound to a local first: Stage-0 0.22 corrupts a sibling list when a
+        # call returning `T?` is written directly as a struct-literal field.
+        let entry = find_entry(functions)
+        return MirProgram(
+            layout = self.layout,
+            types = self.types,
+            externs = self.externs,
+            globals = list[MirGlobal](),
+            data = self.data,
+            functions = functions,
+            entry = entry,
+        )
 
-    # Lower one function body into a flat instruction list. The canonical name
-    # is `module.function` so artifacts stay unambiguous across modules.
-    # `main` keeps the entry signature from the header note above; every
-    # other parameter list must be empty until parameters are lowered.
-    func lower_function(module: HirModule, function: HirFunction) -> CanonicalFunction!:
+    # Lower one function body. The canonical name is `module.function` so
+    # artifacts stay unambiguous across modules. `main` keeps the entry
+    # signature from the header note above; every other parameter list must
+    # be empty until parameters are lowered.
+    func lower_function(module: HirModule, function: HirFunction) -> MirFunction!:
         let string_slice = resolve_builtin_type(BuiltinType.string_slice)
         let is_entry = function.name == "main" and len(function.parameters) == 1 and types_match(function.parameters[0].value_type, string_slice)
         if function.name == "main" and not is_entry:
@@ -60,80 +91,137 @@ pub class Lowerer:
         if function.name != "main" and len(function.parameters) > 0:
             try self.fail_unsupported(module, function, function.span, "parameters")
 
-        let instructions = list[CanonicalInstruction]()
+        self.registers = list[TypeId]()
+        let result_type = try self.mir_type_of(module, function, function.span, function.result)
+        let body = list[MirInstruction]()
         for statement in function.body:
-            try self.lower_statement(module, function, statement, instructions)
-        return CanonicalFunction(
+            try self.lower_statement(module, function, statement, body)
+        return MirFunction(
             name = module.name + "." + function.name,
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = list[TypeId](), results = [result_type], is_fallible = false),
+            registers = self.registers,
+            slots = list[MirSlot](),
+            body = body,
             is_public = function.is_public,
-            result = try self.canonical_type_of(module, function, function.span, function.result),
-            instructions = instructions,
+            span = function.span,
         )
 
-    # Append the canonical instructions for one HIR statement. For example,
-    # `return 7` emits its constant followed by `Return`.
-    func lower_statement(module: HirModule, function: HirFunction, statement: HirStatement, instructions: list[CanonicalInstruction]) -> !:
+    # Append the instructions for one HIR statement. For example, `return 7`
+    # emits a constant into a fresh register and returns that register.
+    func lower_statement(module: HirModule, function: HirFunction, statement: HirStatement, body: list[MirInstruction]) -> !:
         match statement.form:
-            PrintText(value): instructions.append(CanonicalInstruction.WriteText(value = value))
+            PrintText(value):
+                try self.lower_print(value, statement.span, body)
             ReturnStatement(value):
                 if value == none:
                     try self.fail_unsupported(module, function, statement.span, "an empty return")
                     return
                 let returned = value
-                try self.lower_expression(module, function, returned, instructions)
-                instructions.append(CanonicalInstruction.Return)
+                let register = try self.lower_expression(module, function, returned, body)
+                body.append(MirInstruction(form = InstructionForm.Return(values = [register]), span = statement.span))
             else:
                 try self.fail_unsupported(module, function, statement.span, "statement `" + str(statement.form) + "`")
 
-    # Operands first, operator last — the canonical stream is a stack machine,
-    # so `2 + 3` lowers to push 2, push 3, add.
-    func lower_expression(module: HirModule, function: HirFunction, expression: HirExpression, instructions: list[CanonicalInstruction]) -> !:
+    # Constant terminal output is a data item holding the bytes plus a
+    # newline, then `luce_rt_write(address, length)`.
+    func lower_print(text: str, span: SourceSpan, body: list[MirInstruction]) -> !:
+        let payload = strings.to_bytes(text + "\n")
+        let data_id = DataId(value = len(self.data))
+        self.data.append(MirData(
+            name = "text" + str(data_id.value),
+            bytes = payload,
+            align = 1,
+            relocations = list[MirRelocation](),
+        ))
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.DataAddress(result = address, data = data_id), span = span))
+        let length = self.new_register(builtin_mir_type(BuiltinMirType.signed_i64))
+        body.append(MirInstruction(form = InstructionForm.Const(result = length, value = MirConstant.Int(value = len(payload))), span = span))
+        let write = try self.runtime_extern("luce_rt_write")
+        body.append(MirInstruction(
+            form = InstructionForm.CallExtern(results = list[RegisterId](), external = write, arguments = [address, length]),
+            span = span,
+        ))
+
+    # Lower one expression and return the register holding its value.
+    # Operands are lowered left to right, so `2 + 3` defines the register for
+    # 2, then 3, then their sum.
+    func lower_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
         match expression.form:
             Constant(value):
                 match value:
                     Integer(item):
-                        instructions.append(CanonicalInstruction.Constant(
-                            value = item,
-                            value_type = try self.canonical_type_of(module, function, expression.span, expression.value_type),
-                        ))
-                    else: try self.fail_unsupported(module, function, expression.span, "constant `" + str(value) + "`")
+                        let register = self.new_register(try self.mir_type_of(module, function, expression.span, expression.value_type))
+                        body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Int(value = item)), span = expression.span))
+                        return register
+                    else: error(self.unsupported(module, function, expression.span, "constant `" + str(value) + "`"))
             Binary(left, operation, right):
-                try self.lower_expression(module, function, left, instructions)
-                try self.lower_expression(module, function, right, instructions)
-                let operand_type = try self.canonical_type_of(module, function, expression.span, expression.value_type)
+                let left_register = try self.lower_expression(module, function, left, body)
+                let right_register = try self.lower_expression(module, function, right, body)
+                let operand_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
+                var binary_operation = BinaryOp.add
                 match operation:
-                    Add(operand): instructions.append(CanonicalInstruction.Add(operand_type = operand_type))
-                    Subtract(operand): instructions.append(CanonicalInstruction.Subtract(operand_type = operand_type))
-                    Multiply(operand): instructions.append(CanonicalInstruction.Multiply(operand_type = operand_type))
+                    Add(operand): binary_operation = BinaryOp.add
+                    Subtract(operand): binary_operation = BinaryOp.sub
+                    Multiply(operand): binary_operation = BinaryOp.mul
                     else: try self.fail_unsupported(module, function, expression.span, "operation `" + str(operation) + "`")
+                let register = self.new_register(operand_type)
+                body.append(MirInstruction(
+                    form = InstructionForm.Binary(result = register, operation = binary_operation, left = left_register, right = right_register),
+                    span = expression.span,
+                ))
+                return register
             else:
-                try self.fail_unsupported(module, function, expression.span, "expression `" + str(expression.form) + "`")
+                error(self.unsupported(module, function, expression.span, "expression `" + str(expression.form) + "`"))
+
+    # mark: Tables ==============================================================================
+
+    func new_register(value_type: TypeId) -> RegisterId:
+        self.registers.append(value_type)
+        return RegisterId(value = len(self.registers) - 1)
+
+    # Declare a runtime service once, with the signature the runtime table
+    # fixes for it.
+    func runtime_extern(name: str) -> ExternId!:
+        for index in range(0, len(self.externs)):
+            if self.externs[index].name == name: return ExternId(value = index)
+        let symbol = find_runtime_symbol(name) else error("lowerer: `" + name + "` is not a runtime service")
+        self.externs.append(MirExtern(name = name, convention = CallingConvention.runtime, signature = symbol.signature))
+        return ExternId(value = len(self.externs) - 1)
+
+    # Map a checked i32/i64 HIR type onto its canonical machine type. HIR and
+    # MIR each have a `TypeId`; the HIR one is spelled `hir.TypeId` here.
+    func mir_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: hir.TypeId) -> TypeId!:
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i32)): return builtin_mir_type(BuiltinMirType.signed_i32)
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i64)): return builtin_mir_type(BuiltinMirType.signed_i64)
+        error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
 
     # mark: Diagnostics =========================================================================
 
     # Fail at the unsupported node while still naming its enclosing function.
     # Example: a binding on line 2 reports line 2, not the function's line 1.
     func fail_unsupported(module: HirModule, function: HirFunction, span: SourceSpan, feature: str) -> !:
-        error(
-            format_diagnostic(
-                module.path,
-                span,
-                "lowerer does not support " + feature + " yet in `"
-                + module.name + "." + function.name + "`",
-            )
+        error(self.unsupported(module, function, span, feature))
+
+    func unsupported(module: HirModule, function: HirFunction, span: SourceSpan, feature: str) -> str:
+        return format_diagnostic(
+            module.path,
+            span,
+            "lowerer does not support " + feature + " yet in `" + module.name + "." + function.name + "`",
         )
 
-    # Map a checked i32/i64 type onto the canonical machine type.
-    func canonical_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: TypeId) -> CanonicalType!:
-        let i32_type = resolve_builtin_type(BuiltinType.signed_i32)
-        let i64_type = resolve_builtin_type(BuiltinType.signed_i64)
-        if types_match(value, i32_type): return CanonicalType.signed_i32
-        if types_match(value, i64_type): return CanonicalType.signed_i64
-        error(
-            format_diagnostic(
-                module.path,
-                span,
-                "lowerer does not support type `" + describe_type(self.program.types, value) + "` yet in `"
-                + module.name + "." + function.name + "`",
-            )
-        )
+# A process starts at the one public `main` whose MIR shape is `() -> i32`.
+# Anything else leaves `entry` absent; native artifacts then report why.
+func find_entry(functions: list[MirFunction]) -> FunctionId?:
+    let i32_type = builtin_mir_type(BuiltinMirType.signed_i32)
+    var found = -1
+    for index in range(0, len(functions)):
+        let function = functions[index]
+        if not function.is_public or not strings.ends_with(function.name, ".main"): continue
+        if len(function.signature.parameters) != 0 or len(function.signature.results) != 1: continue
+        if function.signature.results[0].value != i32_type.value: continue
+        if found >= 0: return none
+        found = index
+    if found < 0: return none
+    return FunctionId(value = found)
