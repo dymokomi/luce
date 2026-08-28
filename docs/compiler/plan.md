@@ -109,3 +109,37 @@ Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm i
 - `README.md` → `docs/README.md` → `1.0.md` (spec, not status) → `examples/` → `tests/` is the reading order; the README's "What works today" is the single definition of the implemented slice.
 - Diagnostics: `path:line:column: message` from the front end, a stage prefix (`interpreter:`, `MIR verifier:`, `executable:`, `<target> backend …`) from later stages; unsupported input never traps.
 - Errors from every stage reach the CLI as text with exit 1; usage errors exit 2 (`tests/cli_test.sh` pins this).
+
+## 9. Why the language matters — the proving program and the decision gates
+
+Recorded 2026-08-27 after reading `docs/vision.md`, `docs/language/1.0-gap-audit.md`, kinogaki.com (Prism, Realms, Core, Seams, Versioning, Schema) and the Sweeney/Fridman transcript (Verse, correctness, concurrency, UE6).
+
+**The pain point Luce solves.** Kinogaki already is the durable, federated world: Prism gives path-addressed typed elements, `diff` as a document, `overlay`/`merge` with conflicts reported by path, O(1) structure-sharing snapshots, an event log, and opt-in schemas; Realms give `kino://user@realm/path`, signed immutable commit chains, grants and capability tokens, store-and-forward sync, and sibling versions on conflict. What it lacks is a language: the core is C++, application logic is Python across a C ABI, and nobody — person or agent — can contribute *code* to a document safely. Luce is that language, at every level of the stack, and a program's contact with the world is **a Prism snapshot in and a Prism diff out**. Sweeney's four unsolved problems map onto that one shape without Verse's mechanisms:
+
+| Sweeney's pain | Luce + Prism mechanism |
+|---|---|
+| Ordinary people write code that cannot break anything | a behavior receives an immutable snapshot and returns a diff; the runtime validates it against the schema and applies or drops it; rollback is free; run in wasm and it cannot touch anything else |
+| Concurrency nobody writes by hand | workers get snapshots and emit diffs; `merge` reports conflicts and losers rerun — the transaction at document granularity, no STM in the language |
+| A world that never shuts down, code from many authors | `luce api diff` on code, Prism schema diff on data, provenance on Realm commits |
+| Security is the language's job | ARC, checked slices, traps for the systems layer that replaces C++; own toolchain keeps Kinogaki's zero-dependency property |
+
+"Feels like the language, not a library" gets a concrete form: the compiler generates typed views over Prism schemas the way spec §21 generates C bindings, so a schema-typed assignment is checked at compile time and lowers to a patch. One mechanism, no new syntax.
+
+**What this changes.** Not the order in §6 and not MIR (every gap-audit item is additive to the IR). It changes the *proving program*: the first real Luce application is a behavior on a Prism document, called through Kinogaki's C ABI natively and loaded as a wasm module in the browser build. That makes `extern`/C import and native rung 1 concretely valuable right after composites and structs, and it is the earliest demonstration of "safe by construction" to a non-programmer.
+
+**Decision gates (must be settled in the spec before the feature lands in `hir_gen`).**
+
+| Gate | Before | Source |
+|---|---|---|
+| Fallible iteration protocol (item / end / error, propagation visible at the loop) | `for` | gap audit §6, vision |
+| Owned (non-copyable, consuming) values — state transitions and destruction on every exit | classes / ARC | gap audit §3 |
+| Closure capture: keep closures, decide explicit capture vs §14.1 implicit shared cell by the both-ways corpus test (the compiler itself is a closure-free corpus) | closures | Sweeney research §9, vision |
+| Const-generic grammar `[T, const n: u64]` reserved in the parser | generics | gap audit §5 |
+| `hir_gen` keeps doc comments, parameter names and defaults (needed by `luce api diff` and `luce describe`) | structs / methods | gap audit §10 |
+
+**Standing rules.**
+
+- Effects stay removed (spec §18). Authority is a capability *value* from the platform; operational facts (allocates, blocks, native, deterministic) are compiler-internal summaries and never appear in function types.
+- Narrow integers stay MIR types: volatile device access in the system profile needs exact widths. This closes the `mir.md` open question.
+- The system profile (atomics, orderings, volatile, fences, interrupt ABIs) is additive to `Load`/`Store`/`CallingConvention` when OS work starts; not before.
+- Phases 2–6 of `vision.md` are platform work above the language and wait for Phase 1's gate. Their prototypes should reuse Prism `diff`/`overlay`/`EventLog` and Realm commits rather than reinvent snapshot/patch/intent.

@@ -1,5 +1,13 @@
 # Documentation
 
+- [Vision: From Machine Control to Human Intent](vision.md) — the directional
+  proposal for how Luce can connect safe native execution, durable information,
+  human-scale behaviors, AI-assisted authoring, and federation, with staged
+  experiments and continuation gates.
+- [Luce 1.0 language-gap audit](language/1.0-gap-audit.md) — the proposed
+  language and compiler capabilities required by the wider operating-system
+  vision, why each crosses the library boundary, and where each decision enters
+  the implementation roadmap.
 - [Luce 1.0 language](language/1.0.md) — the specification. It describes the
   whole 1.0 language; the implemented subset is listed under "What works
   today" in the [top-level README](../README.md).
