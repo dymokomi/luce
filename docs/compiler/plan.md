@@ -112,34 +112,52 @@ Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm i
 
 ## 9. Why the language matters — the proving program and the decision gates
 
-Recorded 2026-08-27 after reading `docs/vision.md`, `docs/language/1.0-gap-audit.md`, kinogaki.com (Prism, Realms, Core, Seams, Versioning, Schema) and the Sweeney/Fridman transcript (Verse, correctness, concurrency, UE6).
+Recorded 2026-08-27 after reading `docs/vision.md`, `docs/language/1.0-gap-audit.md`, kinogaki.com, the Sweeney/Fridman transcript (Verse, correctness, concurrency, UE6), and the three predecessor repositories in `~/dev` (`prism`, `kinogaki`, `luciaos_v1`; read by subagents, nothing built or run).
 
-**The pain point Luce solves.** Kinogaki already is the durable, federated world: Prism gives path-addressed typed elements, `diff` as a document, `overlay`/`merge` with conflicts reported by path, O(1) structure-sharing snapshots, an event log, and opt-in schemas; Realms give `kino://user@realm/path`, signed immutable commit chains, grants and capability tokens, store-and-forward sync, and sibling versions on conflict. What it lacks is a language: the core is C++, application logic is Python across a C ABI, and nobody — person or agent — can contribute *code* to a document safely. Luce is that language, at every level of the stack, and a program's contact with the world is **a Prism snapshot in and a Prism diff out**. Sweeney's four unsolved problems map onto that one shape without Verse's mechanisms:
+### 9.1 Where this came from
 
-| Sweeney's pain | Luce + Prism mechanism |
-|---|---|
-| Ordinary people write code that cannot break anything | a behavior receives an immutable snapshot and returns a diff; the runtime validates it against the schema and applies or drops it; rollback is free; run in wasm and it cannot touch anything else |
-| Concurrency nobody writes by hand | workers get snapshots and emit diffs; `merge` reports conflicts and losers rerun — the transaction at document granularity, no STM in the language |
-| A world that never shuts down, code from many authors | `luce api diff` on code, Prism schema diff on data, provenance on Realm commits |
-| Security is the language's job | ARC, checked slices, traps for the systems layer that replaces C++; own toolchain keeps Kinogaki's zero-dependency property |
+Four repositories, one lineage, each stopped at a planning boundary rather than a bug:
 
-"Feels like the language, not a library" gets a concrete form: the compiler generates typed views over Prism schemas the way spec §21 generates C bindings, so a schema-typed assignment is checked at compile time and lowers to a patch. One mechanism, no new syntax.
+| Repo | Dates | What it is | Why it ended |
+|---|---|---|---|
+| `prism` | 2026-06-13 → 06-19 | SwiftUI/Metal spectral raytracer that grew a USD-shaped Stage/Prim/Path model, rewrote it in C++, then dropped Swift entirely ("three live representations" of the scene; `PRISMCORE_CPP_PLAN.md`) | core extracted into kinogaki |
+| `kinogaki` | 06-20 → 07-12 | The C++20 platform: Prism core (Value = dtype+shape+flat buffer, `Compose.h` diff/overlay/merge/conflicts/renames, `Schema.h`, `EventLog.h`, `Query.h`, codecs), UI, platform, storage journal, crypto, auth, ai/MCP, wasm guest host; ~120k LOC, ~5k test assertions, 22 nested repos | last commits are `planning/`; `APP_PLATFORM.md` frozen "next critic is implementation" |
+| `luciaos_v1` | 07-13 → 07-24 | Same core generalised into an OS: terminal / realm / documents; programs are `app` elements holding sealed wasm; run document in, out document out; signed journal with one acceptance rule; ~98k LOC, ~1.2k tests, no Python | last commit is `planning/REALM.md` with zero implementing commits; `BOOTSTRAP.md` already names "Lucia language as the authoring layer; compiler itself as a command document" |
+| `luce` | 08-21 → | the language | — |
 
-**What this changes.** Not the order in §6 and not MIR (every gap-audit item is additive to the IR). It changes the *proving program*: the first real Luce application is a behavior on a Prism document, called through Kinogaki's C ABI natively and loaded as a wasm module in the browser build. That makes `extern`/C import and native rung 1 concretely valuable right after composites and structs, and it is the earliest demonstration of "safe by construction" to a non-programmer.
+Correction to the earlier draft of this section: the durable world is **not** on paper. Diff/overlay/merge/schema/event log, the signed journal and acceptance rule, store-and-forward sync with rebase-and-replay, per-reader sealing, and wasm guest confinement all exist with tests. What is paper: `kino://` addresses (zero hits in code), cross-realm capability links, sibling-version conflicts, fuel metering and kill-switch ("wasm3 CANNOT interrupt a pure compute loop"), the kernel/process table, and the whole authoring ladder. `APP_PLATFORM.md` explicitly rejected a bespoke VM in favour of wasm — Luce is consistent with that: a language that *compiles to* wasm, not a new instruction substrate.
+
+### 9.2 The pain point, from the code rather than the vision
+
+1. **The guest seam is the worst code in the lineage, and it is the exact place ordinary people would write.** `kinogaki-os/tests/fixtures/echo_guest.c` and `luciaos_v1/software/terminal/commands/lucia_guest.h` + 11 seed commands: freestanding C, `-nostdlib`, a bump allocator that never frees, `.prisma` requests as string literals and replies parsed by substring search into fixed `char[512]`/`[8192]`/`[65536]` buffers; `grep.c` supports 4 roots because that is an array size. The guest ABI is tiny and frozen: imports `lucia_call(ptr,len) -> i64 (ptr<<32|len)`, `lucia_log`, `lucia_yield`; exports `lucia_alloc`, `lucia_main`; one tool namespace `lucia:os/doc` with verbs open/list/find/put/mkdir/rm/move/connect/disconnect. **The guest has no typed property access at all** — `put(path, text)` is the only write; the rich typed vocabulary (`set_property(path, name, value, dtype)`, `define_element`, validate, commit) lives only in the trusted in-process MCP tools (`kinogaki-ai/src/DocTools.cpp`), which already do copy → mutate → `applyAuto` → roll back on refusal.
+2. **Errors die at every seam.** `capiTry` swallows everything to NULL/false/NaN; `os::Abi` collapses every failure to `unavailable` (deliberate anti-oracle, but a guest cannot tell "denied" from "you passed garbage"); core mixes `optional`, thrown `invalid_argument`, and stringly `Committed{id,error}` (419 `optional`, 0 `expected`). Silent swallowing is the most repeated theme in the issue tracker.
+3. **Serialization and tables by hand, everywhere.** ~2.1k LOC of text/binary/package codecs plus LZSS and f16 bit-twiddling; 110 `case Type::` arms for a 10-variant `Value`; every value type re-encoded at the C, ctypes, JSON-schema, and MCP layers; enums kept in three copies; verb tables in three copies (`Shell.cpp` dispatch + `mut[]` + help + completion); the same worker-thread + queue + main-drain shape written three times; every shader three times.
+4. **Borrowed pointers documented, not enforced.** The C ABI hands back `const char*` from two process-wide `thread_local` strings (call any two getters and the first dangles); query results are borrowed `const Element*` "invalidated by the owner's lifetime"; COW correctness rests on `use_count()!=1`. Zero memory-safety bugs were filed — the code is careful — but it is careful by convention.
+5. **One source for wasm and native is not achievable in C++.** `#if __EMSCRIPTEN__` swaps whole class internals; `webstubs.cpp` exists only to `abort()` in link-reachable dead paths because the build cannot say "this build has no Shell"; 18 packages × 2 hand-maintained build systems + emscripten.
+6. **The named OS blocker is a compiler job.** `OS_ARCHITECTURE.md` stalls the kernel on per-instruction fuel and preemption that wasm3 cannot provide. A backend that inserts fuel checks at loop back-edges and calls makes any engine preemptible; `wasmtime` also has native fuel/epochs.
+
+Sweeney's four pains map onto this concretely: a behavior that receives a snapshot and returns a diff cannot break anything (1, with `Compose::diff`/`Schema::validate` finally reachable from the guest); workers get O(1) snapshots and emit diffs, `merge` reports conflicts — the transaction at document granularity with no STM; live upgrade is `luce api diff` on code plus schema diff on data over signed commits; and safety for the C++ replacement is the language's job.
+
+### 9.3 What this changes
+
+Not the order in §6 and not MIR (every gap-audit item is additive to the IR; failure-as-data is exactly the error model the seams lack). It fixes the **proving program precisely**: rewrite the seed guest commands (`echo_guest.c`, `lucia_guest.h` and the 11 seeds) in Luce, compiled to wasm32, running unmodified under the existing `WasmHost` ABI (`lucia_alloc`/`lucia_main`/`lucia_call`). That needs, in order: milestone 4 (strings/bytes as values), structs/enums/`match`, `extern` import/export with the wasm namespace, a freestanding allocator in `libluce_rt`, and the first real library — Prism text encode/decode in Luce. It replaces a real user of the platform within the existing plan order and before native rung 1; it is also the first place "safe by construction" can be shown to a non-programmer. The typed vocabulary follows: `luce describe` output (gap audit §10) drives generated Prism encoders and schema-typed views, which is the concrete form of "feels like the language, not a library".
 
 **Decision gates (must be settled in the spec before the feature lands in `hir_gen`).**
 
-| Gate | Before | Source |
+| Gate | Before | Evidence from the lineage |
 |---|---|---|
-| Fallible iteration protocol (item / end / error, propagation visible at the loop) | `for` | gap audit §6, vision |
-| Owned (non-copyable, consuming) values — state transitions and destruction on every exit | classes / ARC | gap audit §3 |
-| Closure capture: keep closures, decide explicit capture vs §14.1 implicit shared cell by the both-ways corpus test (the compiler itself is a closure-free corpus) | closures | Sweeney research §9, vision |
-| Const-generic grammar `[T, const n: u64]` reserved in the parser | generics | gap audit §5 |
-| `hir_gen` keeps doc comments, parameter names and defaults (needed by `luce api diff` and `luce describe`) | structs / methods | gap audit §10 |
+| Fallible iteration protocol (item / end / error, propagation visible at the loop) | `for` | query results, journal folds, directory/list verbs all have three outcomes |
+| Owned (non-copyable, consuming) values — state transitions, destruction on every exit | classes / ARC | keys wiped in destructors (`crypto_wipe`), guest handles, journal lock fd |
+| Scoped values generalised from `mutable_slice`/`task` | closures | borrowed `const Element*`, `thread_local const char*`, `PrimHandle` |
+| Closure capture: explicit vs §14.1 implicit shared cell, by the both-ways corpus test | closures | the compiler and all three C++ repos are closure-light corpora |
+| Const-generic grammar `[T, const n: u64]` reserved in the parser | generics | `Spectrum` = 32 inline floats, `Float3`, fixed guest buffers |
+| `hir_gen` keeps doc comments, parameter names, defaults | structs / methods | needed for `luce describe`, derived Prism codecs, `luce api diff` |
+| Fuel/preemption as a backend option (checks at back-edges and calls) | wasm backend, when guests run | the single named kernel blocker |
 
 **Standing rules.**
 
-- Effects stay removed (spec §18). Authority is a capability *value* from the platform; operational facts (allocates, blocks, native, deterministic) are compiler-internal summaries and never appear in function types.
-- Narrow integers stay MIR types: volatile device access in the system profile needs exact widths. This closes the `mir.md` open question.
-- The system profile (atomics, orderings, volatile, fences, interrupt ABIs) is additive to `Load`/`Store`/`CallingConvention` when OS work starts; not before.
-- Phases 2–6 of `vision.md` are platform work above the language and wait for Phase 1's gate. Their prototypes should reuse Prism `diff`/`overlay`/`EventLog` and Realm commits rather than reinvent snapshot/patch/intent.
+- Effects stay removed (spec §18). Authority is a capability *value* from the platform (the acceptance rule and `Guest::inScope` already are that); operational facts are compiler-internal summaries, never in function types.
+- Narrow integers stay MIR types (Prism `DType` has i8…u64/f16; C ABI needs exact widths). Closes the `mir.md` open question.
+- The system profile (atomics, volatile, interrupt ABIs, drivers) is **demoted**: `luciaos_v1` declares bare metal a non-goal and contains zero atomics/volatile; Linux/macOS are the substrate. Runtime needs (one writer thread, queue/future) stay in `libluce_rt` via C interop until measured otherwise.
+- One source for wasm and native, with a module system that can *exclude* code rather than stub it, is a language requirement, not a build-script problem.
+- Phases 2–6 of `vision.md` reuse Prism `Compose`/`EventLog` and the journal rather than reinvent snapshot/patch/intent; "patch" and "proposal" as a guest-facing API do not exist yet anywhere and are the first thing the Luce guest library should provide.
