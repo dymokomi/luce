@@ -29,6 +29,18 @@ struct Binding:
     pub symbol: SymbolId
     pub value: Value
 
+# A mutable place: a binding and the field indices from it to the value.
+# `cursor.position` is the binding of `cursor` and the path `[0]`.
+struct Place:
+    pub symbol: SymbolId
+    pub path: list[i64]
+
+# What one call produced, plus the receiver's final value so a mutating
+# method's writes to `self` can be copied back into the caller's place.
+struct Invocation:
+    pub value: Value
+    pub receiver: Value
+
 # How one statement left: fall through to the next, return a value, or unwind
 # to the enclosing loop.
 union Execution:
@@ -82,6 +94,11 @@ class HirInterpreterRun:
 
     # Call one function: a fresh frame holding the arguments, then the body.
     func invoke(function: HirFunction, arguments: list[Value]) -> Value!:
+        return (try self.call(function, arguments)).value
+
+    # The parameters outlive the body's scope, so after the body runs the
+    # frame still holds `self` as the method left it.
+    func call(function: HirFunction, arguments: list[Value]) -> Invocation!:
         if self.depth >= frame_limit: error("interpreter: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
         let bindings = list[Binding]()
         var index = 0
@@ -94,10 +111,12 @@ class HirInterpreterRun:
             self.depth -= 1
             error(reason)
         self.depth -= 1
+        var receiver = Value.Unit
+        if len(bindings) > 0: receiver = bindings[0].value
         match outcome:
-            Returned(value): return value
+            Returned(value): return Invocation(value = value, receiver = receiver)
             Next:
-                if types_match(function.result, resolve_builtin_type(BuiltinType.unit)): return Value.Unit
+                if types_match(function.result, resolve_builtin_type(BuiltinType.unit)): return Invocation(value = Value.Unit, receiver = receiver)
                 trap("checked function `" + function.name + "` finished without returning a value")
             else: trap("loop control escaped a function")
 
@@ -132,6 +151,16 @@ class HirInterpreterRun:
                     Replace: assigned = right
                     Combine(binary): assigned = try evaluate_binary(bindings[index].value, binary, right, self.program.types)
                 bindings[index] = Binding(symbol = symbol, value = assigned)
+                return Execution.Next
+            FieldAssignment(symbol, path, operation, value):
+                let index = find_binding(bindings, symbol)
+                if index < 0: trap("typed field assignment refers to an unknown binding")
+                let right = try self.evaluate(value, bindings)
+                var assigned = right
+                match operation:
+                    Replace: assigned = right
+                    Combine(binary): assigned = try evaluate_binary(value_at_path(bindings[index].value, path, 0), binary, right, self.program.types)
+                bindings[index] = Binding(symbol = symbol, value = value_with_path(bindings[index].value, path, 0, assigned))
                 return Execution.Next
             PrintText(value):
                 print(value)
@@ -203,7 +232,25 @@ class HirInterpreterRun:
                 for parameter in target.parameters: values.append(Value.Unit)
                 for argument in arguments:
                     values[argument.parameter_index] = try self.evaluate(argument.value, bindings)
-                return try self.invoke(target, values)
+                let invocation = try self.call(target, values)
+                # A mutating method changed its copy of `self`; the caller's
+                # place receives that copy (HirGenerator proved it is a place).
+                let receiver = target.receiver
+                if receiver != none and receiver.is_mutating:
+                    let place = place_of(arguments[0].value) else trap("mutating call on a value that is not a place")
+                    let index = find_binding(bindings, place.symbol)
+                    if index < 0: trap("mutating call refers to an unknown binding")
+                    bindings[index] = Binding(symbol = place.symbol, value = value_with_path(bindings[index].value, place.path, 0, invocation.receiver))
+                return invocation.value
+            StructValue(struct_index, fields):
+                let items = list[BoxedValue]()
+                for field in fields:
+                    items.append(BoxedValue(value = try self.evaluate(field, bindings)))
+                return Value.Record(fields = items)
+            FieldAccess(record, field):
+                match try self.evaluate(record, bindings):
+                    Record(fields): return fields[field].value
+                    else: trap("field access applied to a non-struct HIR value")
             Tuple(elements):
                 let items = list[BoxedValue]()
                 for element in elements:
@@ -242,6 +289,41 @@ class HirInterpreterRun:
         trap("typed call refers to an unknown function")
 
 # mark: Bindings ==============================================================================
+
+# The place an expression names: a reference, or fields reached from one.
+func place_of(value: HirExpression) -> Place?:
+    match value.form:
+        Reference(symbol): return Place(symbol = symbol, path = list[i64]())
+        FieldAccess(inner, field):
+            let base = place_of(inner)
+            if base == none: return none
+            let path = list[i64]()
+            for step in base.path: path.append(step)
+            path.append(field)
+            return Place(symbol = base.symbol, path = path)
+        else: return none
+
+# The value `path` steps into `value`, from `start`.
+func value_at_path(value: Value, path: list[i64], start: i64) -> Value:
+    if start >= len(path): return value
+    match value:
+        Record(fields): return value_at_path(fields[path[start]].value, path, start + 1)
+        else: trap("field path applied to a non-struct HIR value")
+
+# `value` with the field at `path` replaced by `replacement`; structs are
+# values, so the enclosing records are rebuilt along the path.
+func value_with_path(value: Value, path: list[i64], start: i64, replacement: Value) -> Value:
+    if start >= len(path): return replacement
+    match value:
+        Record(fields):
+            let rebuilt = list[BoxedValue]()
+            for index in range(0, len(fields)):
+                if index == path[start]:
+                    rebuilt.append(BoxedValue(value = value_with_path(fields[index].value, path, start + 1, replacement)))
+                else:
+                    rebuilt.append(fields[index])
+            return Value.Record(fields = rebuilt)
+        else: trap("field path applied to a non-struct HIR value")
 
 # Remove locals introduced after a lexical scope began.
 func trim_bindings(bindings: list[Binding], count: i64):
@@ -326,6 +408,10 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         Tuple(left_value):
             match right:
                 Tuple(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Record(left_fields):
+            match right:
+                Record(right_fields): return try evaluate_tuple_binary(left_fields, operation, right_fields, types)
                 else: trap("typed binary expression has unequal value types")
         Absent:
             match right:

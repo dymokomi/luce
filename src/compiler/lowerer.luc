@@ -17,9 +17,10 @@
 #       compound assignment, every unary and binary operator including
 #       short-circuit `and`/`or` and the conditional expression, `if`/`elif`/
 #       `else`, `while` with `break` and `continue`, functions with direct
-#       calls between them across modules, module constants, tuples,
-#       optionals, `str` and `bytes` values with equality, terminal output of
-#       a literal or a `str` value, and returning. The slice boundary lives
+#       calls between them across modules, module constants, parameter
+#       defaults, tuples, optionals, `str` and `bytes` values with equality,
+#       structs with fields, methods, `mutating` methods and type functions,
+#       terminal output of a literal or a `str` value, and returning. The slice boundary lives
 #       here, not in canonical MIR — failure, classes, and collections reach
 #       the lowerer as HIR and stop with "does not support ... yet" until this
 #       file emits the instructions for them. `main(arguments: slice[str])`
@@ -35,12 +36,16 @@
 #       `return`. A tuple is a struct of its elements; an optional is an enum
 #       with a `u8` tag (0 absent, 1 present) and the payload after it; `str`
 #       and `bytes` are `{pointer, i64 length}` whose bytes are a data item
-#       for a literal. A function returning an aggregate takes a hidden
-#       leading `pointer` parameter — the caller's slot for the result — and
-#       returns nothing; an aggregate parameter is passed as a pointer, which
-#       is safe because parameters are immutable. Layout comes from the
-#       `TargetLayout`, so the MIR of a tuple-heavy program differs between
-#       wasm32 and arm64 exactly where offsets differ.
+#       for a literal; a struct is the same `Struct` as a tuple of its field
+#       types (the name lives only in HIR). A function returning an aggregate
+#       takes a hidden leading `pointer` parameter — the caller's slot for the
+#       result — and returns nothing; an aggregate parameter is passed as a
+#       pointer. The callee never writes through that pointer, with one
+#       deliberate exception: a `mutating` method's `self`, whose stores land
+#       in the caller's `var` slot — that is what `mutating` means, and
+#       HirGenerator has already proved the receiver is a mutable place.
+#       Layout comes from the `TargetLayout`, so the MIR of a tuple-heavy
+#       program differs between wasm32 and arm64 exactly where offsets differ.
 #
 #       Parameters are the leading registers of a function (`r0..rN-1`), as
 #       canonical MIR requires; a parameter is immutable in Luce, so a
@@ -70,8 +75,8 @@ from compiler.canonical_ir import InstructionForm, MirConstant, MirData, MirExte
 from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.canonical_ir import MirType, TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import align_of, enum_payload_offset, find_runtime_symbol, intern_mir_type, make_enum_type
-from compiler.canonical_ir import make_struct_type, mir_type, size_of
-from compiler.hir import BinaryOperation, BuiltinType, HirArgument, HirConstant, HirExpression, HirFunction
+from compiler.canonical_ir import is_ptr_type, make_struct_type, mir_type, size_of
+from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirArgument, HirConstant, HirExpression, HirFunction
 from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, TypeForm, describe_type
 from compiler.hir import resolve_builtin_type, types_match
 import compiler.hir
@@ -153,6 +158,9 @@ pub class Lowerer:
     # artifacts stay unambiguous across modules. `main` keeps the entry
     # signature from the header note above; every other function's parameters
     # become its leading registers.
+    # A method is named `module.Struct.method`; `self` is its first parameter
+    # and, being an aggregate, arrives as a pointer — which is exactly what a
+    # `mutating` method needs: its stores land in the caller's slot.
     func lower_function(module: HirModule, function: HirFunction) -> MirFunction!:
         let string_slice = resolve_builtin_type(BuiltinType.string_slice)
         let is_entry = function.name == "main" and len(function.parameters) == 1 and types_match(function.parameters[0].value_type, string_slice)
@@ -196,8 +204,11 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = function.span))
             else:
                 body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
+        var name = module.name + "." + function.name
+        let receiver = function.receiver
+        if receiver != none: name = module.name + "." + self.program.structs[receiver.struct_index].name + "." + function.name
         return MirFunction(
-            name = module.name + "." + function.name,
+            name = name,
             convention = CallingConvention.luce,
             signature = MirSignature(parameters = parameter_types, results = results, is_fallible = false),
             registers = self.registers,
@@ -256,17 +267,19 @@ pub class Lowerer:
                 let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
                 self.store_value(value_type, local.address, register, statement.span, body)
             Assignment(symbol, operation, value):
-                let local = try self.local_of(module, function, statement.span, symbol)
+                let address = try self.address_of(module, function, statement.span, symbol)
                 let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
-                let register = try self.lower_expression(module, function, value, body)
-                var stored = register
-                match operation:
-                    Replace: stored = register
-                    Combine(binary):
-                        let current = self.new_register(value_type)
-                        body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = local.address), span = statement.span))
-                        stored = try self.lower_binary_operation(module, function, statement.span, binary, value_type, current, register, body)
-                self.store_value(value_type, local.address, stored, statement.span, body)
+                try self.lower_store(module, function, statement.span, value_type, address, operation, value, body)
+            FieldAssignment(symbol, path, operation, value):
+                # Walk the path through HIR field types to reach the place.
+                var address = try self.address_of(module, function, statement.span, symbol)
+                var place_type = self.program.symbols[symbol.value].value_type
+                for field in path:
+                    let struct_type = try self.mir_type_of(module, function, statement.span, place_type)
+                    address = self.field_address(struct_type, address, field, statement.span, body)
+                    place_type = self.hir_field_type(place_type, field)
+                let value_type = try self.mir_type_of(module, function, statement.span, place_type)
+                try self.lower_store(module, function, statement.span, value_type, address, operation, value, body)
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
             IfStatement(branches, fallback):
@@ -277,6 +290,34 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span) + 1, values = list[RegisterId]()), span = statement.span))
             ContinueStatement:
                 body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span), values = list[RegisterId]()), span = statement.span))
+
+    # Store a value, or combine it with what the place holds, at an address.
+    func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: HirExpression, body: list[MirInstruction]) -> !:
+        let register = try self.lower_expression(module, function, value, body)
+        var stored = register
+        match operation:
+            Replace: stored = register
+            Combine(binary):
+                let current = self.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = address), span = span))
+                stored = try self.lower_binary_operation(module, function, span, binary, value_type, current, register, body)
+        self.store_value(value_type, address, stored, span, body)
+
+    # The address a mutable binding lives at: a local's slot, or — for `self`
+    # in a mutating method — the pointer the caller passed.
+    func address_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId) -> RegisterId!:
+        for parameter in self.parameters:
+            if parameter.symbol == symbol.value:
+                if is_ptr_type(self.types, self.registers[parameter.address.value]): return parameter.address
+                try self.fail_unsupported(module, function, span, "assignment to a scalar parameter")
+        let local = try self.local_of(module, function, span, symbol)
+        return local.address
+
+    # The HIR type of field `field` of a struct-typed HIR value.
+    func hir_field_type(value_type: hir.TypeId, field: i64) -> hir.TypeId:
+        match self.program.types.definitions[value_type.value].form:
+            Struct(index): return self.program.structs[index].fields[field].value_type
+            else: trap("field of a non-struct HIR type")
 
     # mark: Control flow =======================================================================
 
@@ -430,6 +471,19 @@ pub class Lowerer:
                 let base = try self.lower_expression(module, function, tuple_value, body)
                 let tuple_type = try self.mir_type_of(module, function, tuple_value.span, tuple_value.value_type)
                 let field = self.field_address(tuple_type, base, index, expression.span, body)
+                return self.load_value(value_type, field, expression.span, body)
+            StructValue(struct_index, fields):
+                let temp = self.new_temp(value_type, expression.span, body)
+                for index in range(0, len(fields)):
+                    let element = try self.lower_expression(module, function, fields[index], body)
+                    let element_type = try self.mir_type_of(module, function, fields[index].span, fields[index].value_type)
+                    let field = self.field_address(value_type, temp, index, expression.span, body)
+                    self.store_value(element_type, field, element, expression.span, body)
+                return temp
+            FieldAccess(record, field_index):
+                let base = try self.lower_expression(module, function, record, body)
+                let struct_type = try self.mir_type_of(module, function, record.span, record.value_type)
+                let field = self.field_address(struct_type, base, field_index, expression.span, body)
                 return self.load_value(value_type, field, expression.span, body)
             NoneLiteral:
                 let temp = self.new_temp(value_type, expression.span, body)
@@ -734,6 +788,17 @@ pub class Lowerer:
                     let right_value = self.load_value(element_type, right_field, span, body)
                     so_far = try self.lower_and_then(module, function, span, so_far, elements[index], left_value, right_value, body)
                 return so_far
+            Struct(index):
+                var so_far = self.bool_constant(true, span, body)
+                let fields = self.program.structs[index].fields
+                for field_index in range(0, len(fields)):
+                    let left_field = self.field_address(mir_value_type, left, field_index, span, body)
+                    let right_field = self.field_address(mir_value_type, right, field_index, span, body)
+                    let element_type = try self.mir_type_of(module, function, span, fields[field_index].value_type)
+                    let left_value = self.load_value(element_type, left_field, span, body)
+                    let right_value = self.load_value(element_type, right_field, span, body)
+                    so_far = try self.lower_and_then(module, function, span, so_far, fields[field_index].value_type, left_value, right_value, body)
+                return so_far
             Optional(inner):
                 # Tags equal, and when both are present, payloads equal.
                 let left_present = self.load_present(left, span, body)
@@ -888,6 +953,11 @@ pub class Lowerer:
                 let field_types = list[TypeId]()
                 for element in elements:
                     field_types.append(try self.mir_type_of(module, function, span, element))
+                return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
+            Struct(index):
+                let field_types = list[TypeId]()
+                for field in self.program.structs[index].fields:
+                    field_types.append(try self.mir_type_of(module, function, span, field.value_type))
                 return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
             Optional(inner):
                 let absent = intern_mir_type(self.types, make_struct_type(self.types, self.layout, list[TypeId]()))

@@ -263,10 +263,102 @@ if [ "$status" = 0 ]; then
     exit 1
 fi
 
-printf 'pub let scale = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\n' > "$test_dir/math.luc"
-printf 'import math\nfrom math import nudge\npub func answer() -> i64: return math.double(20) + nudge(1)\n' > "$test_dir/main.luc"
+printf 'pub let scale = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\npub struct Pair:\n    pub let a: i64\n    pub let b: i64\n    pub func sum(self) -> i64: return self.a + self.b\n' > "$test_dir/math.luc"
+printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a: 1, b: 2)\n    return math.double(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
 "$cli" build "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
-expect 0 "42" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
+expect 0 "45" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
+
+# Structs and methods: construction with defaults, field places, mutating
+# methods writing through the caller's slot, type functions.
+cat > "$test_dir/structs.luc" <<'LUCE'
+struct Point:
+    let x: i64
+    let y: i64
+pub func fields() -> i64:
+    let p = Point(x: 3, y: 4)
+    return p.x * 10 + p.y
+struct Style:
+    let width: i64 = 7
+    let depth: i64
+pub func defaults() -> i64:
+    let s = Style(depth: 2)
+    let t = Style(1, 2)
+    return s.width * 10 + s.depth + t.width * 100
+struct Cursor:
+    var position: i64
+pub func field_assignment() -> i64:
+    var c = Cursor(position: 1)
+    c.position = 5
+    c.position += 10
+    return c.position
+struct Counter:
+    var count: i64
+    func origin() -> Counter: return Counter(count: 100)
+    func doubled(self) -> i64: return self.count * 2
+    mutating func bump(self, by: i64): self.count += by
+pub func methods() -> i64:
+    var c = Counter.origin()
+    c.bump(by: 5)
+    c.bump(1)
+    return c.doubled()
+struct Inner:
+    var value: i64
+    mutating func set(self, v: i64): self.value = v
+struct Outer:
+    var inner: Inner
+    let tag: i64
+pub func nested() -> i64:
+    var o = Outer(inner: Inner(value: 1), tag: 3)
+    o.inner.value = 20
+    o.inner.set(o.inner.value + 1)
+    return o.inner.value + o.tag
+struct P:
+    let x: i64
+    let y: i64
+func find(flag: bool) -> P?:
+    if flag: return P(x: 1, y: 2)
+    return none
+pub func equality() -> i64:
+    let a = P(x: 1, y: 2)
+    let b = find(true) else P(x: 0, y: 0)
+    let c = find(false) else P(x: 0, y: 0)
+    var n = 0
+    if a == b: n += 1
+    if a != c: n += 10
+    let (p, q) = (a, c)
+    if p == a and q == c: n += 100
+    return n
+struct V:
+    var x: i64
+    var y: i64
+    func sum(self) -> i64: return self.x + self.y
+    func plus(self, other: V) -> V: return V(x: self.x + other.x, y: self.y + other.y)
+    mutating func reset(self): self = V(x: 0, y: 0)
+    mutating func add(self, other: V): self = self.plus(other)
+func total(v: V) -> i64: return v.sum()
+pub func self_replacement() -> i64:
+    var v = V(x: 1, y: 2)
+    v.add(V(x: 10, y: 20))
+    let t = total(v)
+    v.reset()
+    return t * 10 + v.sum()
+func scale(value: i64, factor: i64 = 3, offset: i64 = -1) -> i64: return value * factor + offset
+pub func parameter_defaults() -> i64: return scale(2) + scale(2, 10) + scale(2, offset: 5)
+LUCE
+"$cli" build "$test_dir/structs.wasm" "$test_dir/structs.luc" >/dev/null
+structs() { expect 0 "$2" wasmtime run --invoke "structs.$1" "$test_dir/structs.wasm"; }
+structs fields 34
+structs defaults 172
+structs field_assignment 15
+structs methods 212
+structs nested 24
+structs equality 111
+structs self_replacement 330
+structs parameter_defaults 35
+
+printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name: "luce", count: 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
+"$cli" build "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
+expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
 # Milestone 4: tuples, optionals, strings and bytes as values, print of a value.
 cat > "$test_dir/composites.luc" <<'LUCE'

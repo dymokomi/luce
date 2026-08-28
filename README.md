@@ -72,8 +72,9 @@ examples and tests link back here rather than restating it.
   indentation-based layout, declarations, types, control flow, patterns,
   closures, generics, and the C boundary syntax.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
-  currently executable language slice includes functions, calls, bindings,
-  assignment, scalars, strings, tuples, optionals, constants, type aliases,
+  currently executable language slice includes functions, calls, parameter
+  defaults, bindings, assignment, scalars, strings, tuples, optionals,
+  structs with methods and `mutating`, constants, type aliases,
   conditionals, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
@@ -83,8 +84,9 @@ examples and tests link back here rather than restating it.
   and has a verifier and its own interpreter covering every instruction.
 - The compiled slice — every scalar type with checked arithmetic, locals,
   every operator, `if`/`while`, functions and calls across modules, module
-  constants, tuples, optionals, `str`/`bytes` values with equality, and
-  `print` of a literal or a `str` value — is lowered to canonical MIR and
+  constants, tuples, optionals, structs and methods, `str`/`bytes` values
+  with equality, and `print` of a literal or a `str` value — is lowered to
+  canonical MIR and
   encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
   Mach-O and x86-64 ELF writers still cover only the original slice (checked
   i32/i64 arithmetic, `print` of a literal, `return`); see

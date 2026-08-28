@@ -28,12 +28,12 @@
 from compiler.core_types import is_core_type_name
 from compiler.source import SourceSpan, format_diagnostic
 from compiler.syntax import ArgumentSyntax, BindingPatternSyntax, ConstantSyntax, ExpressionSyntax
-from compiler.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, StatementSyntax
+from compiler.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, NominalTypeSyntax, StatementSyntax
 from compiler.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.tokenizer import Token, TokenKind
 from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType
 from compiler.hir import HirArgument, HirConstant, HirExpression, HirExpressionForm, HirFunction, HirIfBranch
-from compiler.hir import HirModule, HirParameter, HirProgram, HirStatement, HirStatementForm
+from compiler.hir import HirField, HirModule, HirParameter, HirProgram, HirReceiver, HirStatement, HirStatementForm, HirStruct
 from compiler.hir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir import describe_type, integer_maximum, integer_minimum
@@ -56,10 +56,32 @@ struct FunctionSymbol:
     pub module_index: i64
     pub name: str
     pub is_public: bool
+    pub documentation: list[str]
+    pub receiver: HirReceiver?
     pub parameters: list[HirParameter]
     pub result: TypeId
     pub syntax: FunctionSyntax
     pub span: SourceSpan
+
+# One declared struct: its name and type identity exist before any field is
+# resolved, so fields and methods anywhere may name any struct.
+struct CollectedStruct:
+    pub module_index: i64
+    pub name: str
+    pub is_public: bool
+    pub documentation: list[str]
+    pub type_id: TypeId
+    pub fields: list[HirField]
+    pub syntax: NominalTypeSyntax
+    pub span: SourceSpan
+
+# What a callee spelling resolved to: a function (with the receiver value
+# when it is a method call), or a struct whose memberwise initializer is
+# being called.
+struct ResolvedCallee:
+    pub function_index: i64
+    pub receiver: HirExpression?
+    pub struct_index: i64
 
 struct ImportedModule:
     pub name: str
@@ -126,13 +148,16 @@ pub class HirGenerator:
     alias_stack: list[str]
     constant_stack: list[str]
     module_bindings: list[ModuleBindings]
-    # Every function signature in the program, across all modules.
+    # Every function signature in the program, across all modules; methods
+    # are here too, distinguished by `receiver`.
     functions: list[FunctionSymbol]
+    structs: list[CollectedStruct]
     next_symbol: i64
     # The module, function contract, import bindings, live local bindings, and
     # loop depth of whatever is being checked right now.
     current_module: i64
     current_result: TypeId
+    current_receiver: HirReceiver?
     bindings: ModuleBindings
     locals: list[LocalBinding]
     loop_depth: i64
@@ -147,9 +172,11 @@ pub class HirGenerator:
         self.constant_stack = list[str]()
         self.module_bindings = list[ModuleBindings]()
         self.functions = list[FunctionSymbol]()
+        self.structs = list[CollectedStruct]()
         self.next_symbol = 0
         self.current_module = 0
         self.current_result = resolve_builtin_type(BuiltinType.unit)
+        self.current_receiver = none
         self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
@@ -168,7 +195,7 @@ pub class HirGenerator:
         let modules = list[HirModule]()
         for module_index in range(0, len(self.sources)):
             let source = self.sources[module_index]
-            modules.append(HirModule(id = ModuleId(value = module_index), name = source.name, path = source.path))
+            modules.append(HirModule(id = ModuleId(value = module_index), name = source.name, path = source.path, documentation = source.syntax.documentation))
 
         let hir_functions = list[HirFunction]()
         for module_index in range(0, len(self.sources)):
@@ -188,7 +215,18 @@ pub class HirGenerator:
                 value = typed,
             ))
 
-        return HirProgram(types = self.types, symbols = self.symbols, modules = modules, constants = hir_constants, functions = hir_functions)
+        let hir_structs = list[HirStruct]()
+        for item in self.structs:
+            hir_structs.append(HirStruct(
+                module = ModuleId(value = item.module_index),
+                name = item.name,
+                is_public = item.is_public,
+                documentation = item.documentation,
+                fields = item.fields,
+                span = item.span,
+            ))
+
+        return HirProgram(types = self.types, symbols = self.symbols, modules = modules, constants = hir_constants, structs = hir_structs, functions = hir_functions)
 
     # mark: Modules and imports =================================================================
 
@@ -267,6 +305,16 @@ pub class HirGenerator:
     # The first pass: record aliases, constants, and function signatures so
     # later bodies can see every module-level name.
     func collect_declarations() -> !:
+        # Struct names first, so a field or signature anywhere may name a
+        # struct declared later or in another module.
+        for module_index in range(0, len(self.sources)):
+            for declaration in self.sources[module_index].syntax.declarations:
+                match declaration.value:
+                    NominalType(nominal):
+                        if nominal.kind == NominalTypeKind.class_type:
+                            try self.fail_at(module_index, declaration.span, "class types are not implemented yet")
+                        try self.collect_struct_name(module_index, declaration.is_public, declaration.documentation, nominal, declaration.span)
+                    else: continue
         for module_index in range(0, len(self.sources)):
             for declaration in self.sources[module_index].syntax.declarations:
                 match declaration.value:
@@ -275,11 +323,9 @@ pub class HirGenerator:
                     TypeAlias(type_alias):
                         try self.collect_alias(module_index, declaration.is_public, type_alias, declaration.span)
                     Function(function):
-                        try self.collect_function(module_index, declaration.is_public, function, declaration.span)
+                        try self.collect_function(module_index, declaration.is_public, declaration.documentation, none, function, declaration.span)
                     NominalType(nominal):
-                        if nominal.kind == NominalTypeKind.class_type:
-                            try self.fail_at(module_index, declaration.span, "class types are not implemented yet")
-                        try self.fail_at(module_index, declaration.span, "struct types are not implemented yet")
+                        try self.collect_struct_members(module_index, nominal)
                     Enumeration(enumeration):
                         try self.fail_at(module_index, declaration.span, "enum types are not implemented yet")
                     InterfaceType(interface_type):
@@ -329,6 +375,8 @@ pub class HirGenerator:
 
     func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
         if self.find_function_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_struct_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
         if self.find_alias_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
@@ -413,48 +461,216 @@ pub class HirGenerator:
 
     # Record one function's signature: resolved parameter and result types,
     # a fresh symbol per parameter, and a fresh symbol for the function itself.
-    func collect_function(module_index: i64, is_public: bool, function: FunctionSyntax, span: SourceSpan) -> !:
-        try self.require_free_module_name(module_index, function.name, span)
+    # A method passes its struct as `receiver`; `self` then takes the struct's
+    # type, and every following parameter is ordinary. A default is checked
+    # once here as a constant expression and embedded at each call site that
+    # omits the argument.
+    func collect_function(module_index: i64, is_public: bool, documentation: list[str], receiver: HirReceiver?, function: FunctionSyntax, span: SourceSpan) -> !:
+        if receiver == none: try self.require_free_module_name(module_index, function.name, span)
         if len(function.generic_parameters) > 0:
             try self.fail_at(module_index, span, "generic functions are not implemented yet")
 
         let parameters = list[HirParameter]()
+        var has_self = false
+        var saw_default = false
         for parameter in function.parameters:
             for previous in parameters:
                 if previous.name == parameter.name:
                     try self.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
-            let annotation = parameter.annotation else error(self.diagnostic_at(
-                module_index,
-                parameter.span,
-                "parameter `" + parameter.name + "` requires a type",
-            ))
-            if parameter.default_value != none:
-                try self.fail_at(module_index, parameter.span, "default arguments are not implemented yet")
-            let parameter_type = try self.resolve_type(module_index, annotation)
+            var parameter_type = resolve_builtin_type(BuiltinType.unit)
+            if parameter.name == "self":
+                let owner = receiver else error(self.diagnostic_at(module_index, parameter.span, "`self` is the receiver of a method; only a type member declares it"))
+                if len(parameters) > 0: try self.fail_at(module_index, parameter.span, "`self` must be the first parameter")
+                parameter_type = self.structs[owner.struct_index].type_id
+                has_self = true
+            else:
+                let annotation = parameter.annotation else error(self.diagnostic_at(
+                    module_index,
+                    parameter.span,
+                    "parameter `" + parameter.name + "` requires a type",
+                ))
+                parameter_type = try self.resolve_type(module_index, annotation)
+            var default_value: HirExpression? = none
+            let default_syntax = parameter.default_value
+            if default_syntax != none:
+                default_value = try self.check_constant_expression(module_index, default_syntax, parameter_type, "default of parameter `" + parameter.name + "`")
+                saw_default = true
+            elif saw_default:
+                try self.fail_at(module_index, parameter.span, "parameter `" + parameter.name + "` follows a parameter with a default and needs one too")
             let parameter_symbol = self.make_symbol(parameter.name, SymbolKind.parameter, parameter_type)
-            parameters.append(HirParameter(symbol = parameter_symbol, name = parameter.name, value_type = parameter_type))
+            parameters.append(HirParameter(symbol = parameter_symbol, name = parameter.name, value_type = parameter_type, default_value = default_value))
 
         var result = resolve_builtin_type(BuiltinType.unit)
         let result_syntax = function.result
         if result_syntax != none:
             result = try self.resolve_type(module_index, result_syntax)
+        var checked_receiver: HirReceiver? = none
+        if receiver != none:
+            if function.is_mutating and not has_self:
+                try self.fail_at(module_index, span, "`mutating` requires a `self` parameter")
+            checked_receiver = HirReceiver(struct_index = receiver.struct_index, has_self = has_self, is_mutating = function.is_mutating)
         let function_symbol = self.make_symbol(function.name, SymbolKind.function, result)
         self.functions.append(FunctionSymbol(
             symbol = function_symbol,
             module_index = module_index,
             name = function.name,
             is_public = is_public,
+            documentation = documentation,
+            receiver = checked_receiver,
             parameters = parameters,
             result = result,
             syntax = function,
             span = span,
         ))
 
+    # A field default or parameter default: checked in an empty scope, so it
+    # cannot name a local or `self`, and required to be a literal tree
+    # (optionally wrapped, grouped, or negated) so it is embeddable anywhere.
+    func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> HirExpression!:
+        let saved_module = self.current_module
+        let saved_bindings = self.bindings
+        let saved_locals = self.locals
+        # Signatures are collected before import bindings exist; a default
+        # may not name imports then, and sees an empty binding set.
+        self.current_module = module_index
+        self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
+        if module_index < len(self.module_bindings): self.enter_module(module_index)
+        self.locals = list[LocalBinding]()
+        let checked = try self.check_expression(value, expected)
+        self.locals = saved_locals
+        self.current_module = saved_module
+        self.bindings = saved_bindings
+        if not is_constant_expression(checked):
+            try self.fail_at(module_index, value.span, what + " must be a constant expression")
+        return checked
+
+    # mark: Structs =============================================================================
+
+    func collect_struct_name(module_index: i64, is_public: bool, documentation: list[str], nominal: NominalTypeSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, nominal.name, span)
+        if len(nominal.generic_parameters) > 0:
+            try self.fail_at(module_index, span, "generic structs are not implemented yet")
+        if len(nominal.interfaces) > 0:
+            try self.fail_at(module_index, span, "interfaces are not implemented yet")
+        let index = len(self.structs)
+        let type_id = self.intern_named(nominal.name, TypeForm.Struct(index = index))
+        self.structs.append(CollectedStruct(
+            module_index = module_index,
+            name = nominal.name,
+            is_public = is_public,
+            documentation = documentation,
+            type_id = type_id,
+            fields = list[HirField](),
+            syntax = nominal,
+            span = span,
+        ))
+
+    # Fields are resolved in declaration order and methods are collected as
+    # functions with a receiver. A struct may not contain itself by value.
+    func collect_struct_members(module_index: i64, nominal: NominalTypeSyntax) -> !:
+        let struct_index = self.find_struct_in_module(module_index, nominal.name)
+        let fields = list[HirField]()
+        for member in nominal.members:
+            match member.value:
+                Field(field):
+                    for previous in fields:
+                        if previous.name == field.name:
+                            try self.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
+                    if field.is_weak: try self.fail_at(module_index, field.span, "`weak` fields belong to classes, not structs")
+                    let field_type = try self.resolve_type(module_index, field.value_type)
+                    var default_value: HirExpression? = none
+                    let default_syntax = field.default_value
+                    if default_syntax != none:
+                        default_value = try self.check_constant_expression(module_index, default_syntax, field_type, "default of field `" + field.name + "`")
+                    fields.append(HirField(
+                        name = field.name,
+                        value_type = field_type,
+                        is_mutable = field.is_mutable,
+                        is_public = member.is_public,
+                        documentation = member.documentation,
+                        default_value = default_value,
+                    ))
+                Function(function):
+                    if function.name == "init":
+                        try self.fail_at(module_index, member.span, "custom initializers are not implemented yet")
+                    if self.find_method(struct_index, function.name) >= 0:
+                        try self.fail_at(module_index, member.span, "duplicate method `" + function.name + "` in `" + nominal.name + "`")
+                    for field in fields:
+                        if field.name == function.name:
+                            try self.fail_at(module_index, member.span, "`" + function.name + "` is both a field and a method of `" + nominal.name + "`")
+                    let receiver = HirReceiver(struct_index = struct_index, has_self = false, is_mutating = function.is_mutating)
+                    try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, member.span)
+        let item = self.structs[struct_index]
+        self.structs[struct_index] = CollectedStruct(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            documentation = item.documentation,
+            type_id = item.type_id,
+            fields = fields,
+            syntax = item.syntax,
+            span = item.span,
+        )
+        for field in fields:
+            if self.contains_struct(field.value_type, struct_index):
+                try self.fail_at(module_index, item.span, "struct `" + item.name + "` contains itself through field `" + field.name + "`; use a class or a collection for recursive data")
+
+    # Does a value of `value_type` store a `target` struct inline? Follows
+    # tuples, optionals, and other structs, whose fields were resolved
+    # earlier or are being resolved now (an empty field list is a struct
+    # still being collected, which cannot be the target).
+    func contains_struct(value_type: TypeId, target: i64) -> bool:
+        match self.types.definitions[value_type.value].form:
+            Struct(index):
+                if index == target: return true
+                for field in self.structs[index].fields:
+                    if self.contains_struct(field.value_type, target): return true
+                return false
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_struct(element, target): return true
+                return false
+            Optional(inner): return self.contains_struct(inner, target)
+            else: return false
+
+    func find_struct_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.structs)):
+            if self.structs[index].module_index == module_index and self.structs[index].name == name: return index
+        return -1
+
+    func find_method(struct_index: i64, name: str) -> i64:
+        for index in range(0, len(self.functions)):
+            let receiver = self.functions[index].receiver
+            if receiver == none: continue
+            if receiver.struct_index == struct_index and self.functions[index].name == name: return index
+        return -1
+
+    func struct_of(value_type: TypeId) -> i64:
+        if value_type.value < 0 or value_type.value >= len(self.types.definitions): return -1
+        match self.types.definitions[value_type.value].form:
+            Struct(index): return index
+            else: return -1
+
+    func find_field(struct_index: i64, name: str) -> i64:
+        let fields = self.structs[struct_index].fields
+        for index in range(0, len(fields)):
+            if fields[index].name == name: return index
+        return -1
+
     # Turn a type spelling into a checked value type. A known-but-unimplemented
     # core type earns "not implemented yet".
     func resolve_type(module_index: i64, value: TypeSyntax) -> TypeId!:
         match value.form:
             Named(path):
+                if len(path.parts) == 2:
+                    # `module.Struct` through an imported module.
+                    let imported = self.find_imported_module_of(module_index, path.parts[0])
+                    if imported < 0: try self.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
+                    let foreign = self.find_struct_in_module(imported, path.parts[1])
+                    if foreign < 0: try self.fail_at(module_index, path.span, "module `" + self.sources[imported].name + "` has no type `" + path.parts[1] + "`")
+                    if not self.structs[foreign].is_public:
+                        try self.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.sources[imported].name + "`")
+                    return self.structs[foreign].type_id
                 if len(path.parts) != 1:
                     try self.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
                 let name = path.parts[0]
@@ -462,6 +678,8 @@ pub class HirGenerator:
                 if alias_index >= 0: return try self.resolve_alias(alias_index)
                 let builtin = builtin_type_id(name)
                 if builtin != none: return builtin
+                let struct_index = self.find_struct_in_module(module_index, name)
+                if struct_index >= 0: return self.structs[struct_index].type_id
                 if is_core_type_name(name):
                     error(self.diagnostic_at(module_index, path.span, "type `" + name + "` is not implemented yet"))
                 error(self.diagnostic_at(module_index, path.span, "unknown type `" + path.dotted() + "`"))
@@ -500,12 +718,18 @@ pub class HirGenerator:
     # return on every path.
     func check_function(function: FunctionSymbol) -> HirFunction!:
         self.current_result = function.result
+        self.current_receiver = function.receiver
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
 
+        # `self` is assignable only in a mutating method (spec §8.7).
+        var self_is_mutable = false
+        let receiver = function.receiver
+        if receiver != none: self_is_mutable = receiver.is_mutating
         for parameter in function.parameters:
             try self.require_free_local_name(parameter.name, function.span)
-            self.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = false))
+            let is_mutable = parameter.name == "self" and self_is_mutable
+            self.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = is_mutable))
 
         let body_syntax = function.syntax.body else trap("function definition has no body")
         let body = try self.check_suite(body_syntax.statements)
@@ -516,6 +740,8 @@ pub class HirGenerator:
             module = ModuleId(value = function.module_index),
             name = function.name,
             is_public = function.is_public,
+            documentation = function.documentation,
+            receiver = function.receiver,
             parameters = function.parameters,
             result = function.result,
             body = body,
@@ -673,11 +899,14 @@ pub class HirGenerator:
         var name = ""
         match target.form:
             Name(value_name): name = value_name
-            else: try self.fail(span, "member and index assignment are not implemented yet")
+            Member(member_value, field_name): return try self.check_field_assignment(member_value, field_name, operator, value, span)
+            else: try self.fail(span, "index assignment is not implemented yet")
         let local_index = self.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
         let local = self.locals[local_index]
-        if not local.is_mutable: try self.fail(span, "cannot assign to immutable binding `" + name + "`; declare it with `var`")
+        if not local.is_mutable:
+            if name == "self": try self.fail(span, "cannot assign to `self` in a non-mutating method; declare the method `mutating`")
+            try self.fail(span, "cannot assign to immutable binding `" + name + "`; declare it with `var`")
         let checked = try self.check_expression(value, local.value_type)
         # `value += delta` must leave `value` its own type, so the compound
         # operator is checked as the binary operation it abbreviates.
@@ -692,6 +921,55 @@ pub class HirGenerator:
                 )
             operation = AssignmentOperation.Combine(operation = resolved.operation)
         return HirStatement(form = HirStatementForm.Assignment(symbol = local.symbol, operation = operation, value = checked), span = span)
+
+    # `root.a.b = value`: the root is a mutable local (or `self` in a mutating
+    # method), every field on the way is `var`, and the path is recorded as
+    # field indices so no consumer repeats the name resolution.
+    func check_field_assignment(member_value: ExpressionSyntax, field_name: str, operator: str, value: ExpressionSyntax, span: SourceSpan) -> HirStatement!:
+        # Walk down to the root name, collecting field names outermost last.
+        let names = [field_name]
+        var current = member_value
+        var root_name = ""
+        while true:
+            match current.form:
+                Name(candidate):
+                    root_name = candidate
+                    break
+                Member(inner, inner_name):
+                    names.append(inner_name)
+                    current = inner
+                Group(grouped): current = grouped
+                else: try self.fail(span, "assignment needs a named place; `" + field_name + "` here is a field of a temporary value")
+        let local_index = self.find_local(root_name)
+        if local_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
+        let local = self.locals[local_index]
+        if not local.is_mutable:
+            if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
+            try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
+        let path = list[i64]()
+        var place_type = local.value_type
+        var index = len(names) - 1
+        while index >= 0:
+            let struct_index = self.struct_of(place_type)
+            if struct_index < 0: try self.fail(span, "`" + self.describe_type(place_type) + "` has no field `" + names[index] + "`")
+            let field_index = self.find_field(struct_index, names[index])
+            if field_index < 0: try self.fail(span, "struct `" + self.structs[struct_index].name + "` has no field `" + names[index] + "`")
+            let field = self.structs[struct_index].fields[field_index]
+            if not field.is_public and self.structs[struct_index].module_index != self.current_module:
+                try self.fail(span, "field `" + names[index] + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
+            if not field.is_mutable: try self.fail(span, "cannot assign to `let` field `" + names[index] + "`; declare it with `var`")
+            path.append(field_index)
+            place_type = field.value_type
+            index -= 1
+        let checked = try self.check_expression(value, place_type)
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(place_type, binary_operator, checked.value_type, span)
+            if not types_match(resolved.result, place_type):
+                try self.fail(span, "assignment changes `" + field_name + "` from `" + self.describe_type(place_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        return HirStatement(form = HirStatementForm.FieldAssignment(symbol = local.symbol, path = path, operation = operation, value = checked), span = span)
 
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
@@ -760,6 +1038,8 @@ pub class HirGenerator:
                     return try self.require_type(reference, expected)
                 if self.find_visible_function(name) >= 0:
                     try self.fail(value.span, "function values are not implemented yet")
+                if self.find_struct_in_module(self.current_module, name) >= 0:
+                    try self.fail(value.span, "`" + name + "` is a type; construct a value with `" + name + "(...)` or call a type function with `" + name + ".name(...)`")
                 error(self.diagnostic(value.span, "unknown name `" + name + "`"))
             Group(grouped): return try self.check_expression(grouped, expected)
             TupleValue(elements):
@@ -793,7 +1073,7 @@ pub class HirGenerator:
             MapValue(entries):
                 error(self.diagnostic(value.span, "map literals are not implemented yet"))
             Member(member_value, name):
-                error(self.diagnostic(value.span, "field access is not implemented yet"))
+                return try self.check_field_access(member_value, name, value.span, expected)
             Index(indexed, subscript):
                 error(self.diagnostic(value.span, "indexing is not implemented yet"))
             Slice(sliced, start, operator, end):
@@ -986,16 +1266,27 @@ pub class HirGenerator:
     # Check one call: each parameter must be supplied once.
     func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
         if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented yet")
-        let function_index = try self.resolve_callee(callee)
-        let function = self.functions[function_index]
+        let resolved = try self.resolve_callee(callee)
+        if resolved.struct_index >= 0:
+            return try self.check_struct_value(resolved.struct_index, arguments, span, expected)
+        let function = self.functions[resolved.function_index]
 
         # Positional arguments fill parameters left to right; named arguments
-        # then land anywhere, but each parameter is supplied once.
+        # then land anywhere, but each parameter is supplied once. A method
+        # call's receiver is argument 0, and must be a mutable place when the
+        # method is `mutating`.
         let assigned = list[bool]()
         for parameter in function.parameters: assigned.append(false)
         let typed_arguments = list[HirArgument]()
         var positional_index = 0
         var saw_named = false
+        let receiver_value = resolved.receiver
+        if receiver_value != none:
+            let method = function.receiver else trap("a receiver was resolved for a function without one")
+            if method.is_mutating: try self.require_mutable_place(receiver_value, callee.span)
+            typed_arguments.append(HirArgument(parameter_index = 0, value = receiver_value))
+            assigned[0] = true
+            positional_index = 1
 
         for argument in arguments:
             var parameter_index = -1
@@ -1017,8 +1308,12 @@ pub class HirGenerator:
             typed_arguments.append(HirArgument(parameter_index = parameter_index, value = checked))
 
         for parameter_index in range(0, len(function.parameters)):
-            if not assigned[parameter_index]:
-                try self.fail(span, "call to `" + function.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
+            if assigned[parameter_index]: continue
+            let default_value = function.parameters[parameter_index].default_value
+            if default_value != none:
+                typed_arguments.append(HirArgument(parameter_index = parameter_index, value = default_value))
+                continue
+            try self.fail(span, "call to `" + function.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
         let typed = HirExpression(
             value_type = function.result,
             form = HirExpressionForm.Call(function = function.symbol, arguments = typed_arguments),
@@ -1026,31 +1321,204 @@ pub class HirGenerator:
         )
         return try self.require_type(typed, expected)
 
+    # `Point(x: 1.0, y: 2.0)`: the synthesized memberwise initializer. Fields
+    # fill like parameters and defaults cover omissions. From another module
+    # the struct and every field *given* must be public; a private field may
+    # still be omitted when it has a default.
+    func check_struct_value(struct_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
+        let item = self.structs[struct_index]
+        let foreign = item.module_index != self.current_module
+        if foreign and not item.is_public:
+            try self.fail(span, "`" + item.name + "` is private to module `" + self.sources[item.module_index].name + "`")
+        # Given values by field position; `supplied` says which are real.
+        let values = list[HirExpression]()
+        let supplied = list[bool]()
+        for field in item.fields:
+            values.append(HirExpression(value_type = field.value_type, form = HirExpressionForm.NoneLiteral, span = span))
+            supplied.append(false)
+        var positional_index = 0
+        var saw_named = false
+        for argument in arguments:
+            var field_index = -1
+            let label = argument.label
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                field_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                field_index = self.find_field(struct_index, label)
+                if field_index < 0: try self.fail(argument.span, "struct `" + item.name + "` has no field `" + label + "`")
+            if field_index >= len(item.fields):
+                try self.fail(argument.span, "struct `" + item.name + "` has " + str(len(item.fields)) + " field(s)")
+            let field = item.fields[field_index]
+            if supplied[field_index]:
+                try self.fail(argument.span, "field `" + field.name + "` is supplied more than once")
+            if foreign and not field.is_public:
+                try self.fail(argument.span, "field `" + field.name + "` is private to module `" + self.sources[item.module_index].name + "`")
+            values[field_index] = try self.check_expression(argument.value, field.value_type)
+            supplied[field_index] = true
+        let fields = list[HirExpression]()
+        for field_index in range(0, len(item.fields)):
+            let field = item.fields[field_index]
+            if supplied[field_index]:
+                fields.append(values[field_index])
+                continue
+            # A private field with a default is not *required*, so it does
+            # not make the initializer private (spec §10.1).
+            let default_value = field.default_value else error(self.diagnostic(span, "construction of `" + item.name + "` is missing field `" + field.name + "`"))
+            fields.append(default_value)
+        let typed = HirExpression(
+            value_type = item.type_id,
+            form = HirExpressionForm.StructValue(struct_index = struct_index, fields = fields),
+            span = span,
+        )
+        return try self.require_type(typed, expected)
+
+    # `value.field`: the value must be a struct with that field, visible here.
+    func check_field_access(member_value: ExpressionSyntax, name: str, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+        var root_name = ""
+        match member_value.form:
+            Name(candidate): root_name = candidate
+            else: root_name = ""
+        if root_name != "" and self.find_local(root_name) < 0:
+            if self.find_imported_module(root_name) >= 0:
+                try self.fail(span, "module members other than functions are not implemented yet")
+            if self.find_struct_in_module(self.current_module, root_name) >= 0:
+                try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
+        let checked = try self.check_expression(member_value, none)
+        let struct_index = self.struct_of(checked.value_type)
+        if struct_index < 0:
+            try self.fail(span, "`" + self.describe_type(checked.value_type) + "` has no field `" + name + "`")
+        let field_index = self.find_field(struct_index, name)
+        if field_index < 0:
+            if self.find_method(struct_index, name) >= 0:
+                try self.fail(span, "`" + name + "` is a method of `" + self.structs[struct_index].name + "`; call it with `(...)`")
+            try self.fail(span, "struct `" + self.structs[struct_index].name + "` has no field `" + name + "`")
+        let field = self.structs[struct_index].fields[field_index]
+        if not field.is_public and self.structs[struct_index].module_index != self.current_module:
+            try self.fail(span, "field `" + name + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
+        let typed = HirExpression(
+            value_type = field.value_type,
+            form = HirExpressionForm.FieldAccess(value = checked, field = field_index),
+            span = span,
+        )
+        return try self.require_type(typed, expected)
+
+    # A mutating method needs somewhere to write: a `var` local, `self` in a
+    # mutating method, or a `var` field reached through such a place.
+    func require_mutable_place(value: HirExpression, span: SourceSpan) -> !:
+        match value.form:
+            Reference(symbol):
+                for local in self.locals:
+                    if local.symbol.value == symbol.value:
+                        if local.is_mutable: return
+                        try self.fail(span, "mutating method needs a `var` receiver; `" + local.name + "` is immutable")
+                try self.fail(span, "mutating method needs a `var` receiver")
+            FieldAccess(inner, field):
+                let struct_index = self.struct_of(inner.value_type)
+                let stored = self.structs[struct_index].fields[field]
+                if not stored.is_mutable:
+                    try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
+                try self.require_mutable_place(inner, span)
+            else: try self.fail(span, "mutating method needs a `var` receiver, not a temporary value")
+
     # Find which function a callee spelling names: a bare `helper(...)`, or a
     # qualified `module.helper(...)` through an imported module.
-    func resolve_callee(callee: ExpressionSyntax) -> i64!:
+    # `helper(...)`, `module.helper(...)`, `Point(...)`, `Point.origin(...)`,
+    # `module.Point(...)`, `module.Point.origin(...)`, or `value.method(...)`.
+    func resolve_callee(callee: ExpressionSyntax) -> ResolvedCallee!:
         match callee.form:
             Name(name):
                 let local_index = self.find_local(name)
                 if local_index >= 0:
                     try self.fail(callee.span, "`" + name + "` has type `" + self.describe_type(self.locals[local_index].value_type) + "` and is not callable")
                 let function_index = self.find_visible_function(name)
-                if function_index < 0: try self.fail(callee.span, "unknown function `" + name + "`")
-                return function_index
+                if function_index >= 0: return ResolvedCallee(function_index = function_index, receiver = none, struct_index = -1)
+                let struct_index = self.find_struct_in_module(self.current_module, name)
+                if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = none, struct_index = struct_index)
+                error(self.diagnostic(callee.span, "unknown function `" + name + "`"))
             Member(value, name):
-                var module_name = ""
-                match value.form:
-                    Name(candidate): module_name = candidate
-                    else: try self.fail(callee.span, "method calls are not implemented yet")
-                let imported_module = self.find_imported_module(module_name)
-                if imported_module < 0: try self.fail(callee.span, "unknown imported module `" + module_name + "`")
-                let function_index = self.find_function_in_module(imported_module, name)
-                if function_index < 0: try self.fail(callee.span, "module `" + self.sources[imported_module].name + "` has no function `" + name + "`")
-                if not self.functions[function_index].is_public:
-                    try self.fail(callee.span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
-                return function_index
+                let named = try self.resolve_named_callee(value, name, callee.span)
+                if named != none: return named
+                let receiver = try self.check_expression(value, none)
+                let struct_index = self.struct_of(receiver.value_type)
+                if struct_index < 0:
+                    try self.fail(callee.span, "`" + self.describe_type(receiver.value_type) + "` has no method `" + name + "`")
+                let method_index = self.find_method(struct_index, name)
+                if method_index < 0:
+                    if self.find_field(struct_index, name) >= 0:
+                        try self.fail(callee.span, "`" + name + "` is a field of `" + self.structs[struct_index].name + "`, not a method")
+                    try self.fail(callee.span, "struct `" + self.structs[struct_index].name + "` has no method `" + name + "`")
+                let method = self.functions[method_index]
+                let method_receiver = method.receiver else trap("method without a receiver")
+                if not method_receiver.has_self:
+                    try self.fail(callee.span, "`" + name + "` is a type function; call it as `" + self.structs[struct_index].name + "." + name + "(...)`")
+                try self.require_method_visible(method_index, struct_index, callee.span)
+                return ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1)
             else:
                 error(self.diagnostic(callee.span, "only named functions are callable in the current semantic slice"))
+
+    # The spellings whose head is a module or type name rather than a value:
+    # `module.f`, `module.Type`, `Type.f`, `module.Type.f`. Absent when the
+    # head is a value, so the caller treats the call as a method call.
+    func resolve_named_callee(value: ExpressionSyntax, name: str, span: SourceSpan) -> ResolvedCallee?!:
+        var head = ""
+        var type_name = ""
+        var is_two_level = false
+        match value.form:
+            Name(candidate): head = candidate
+            Member(inner, inner_name):
+                match inner.form:
+                    Name(module_name):
+                        head = module_name
+                        type_name = inner_name
+                        is_two_level = true
+                    else: head = ""
+            else: head = ""
+        if head == "" or self.find_local(head) >= 0: return none
+        if not is_two_level:
+            let imported_module = self.find_imported_module(head)
+            if imported_module >= 0: return try self.resolve_module_member_callee(imported_module, name, span)
+            let struct_index = self.find_struct_in_module(self.current_module, head)
+            if struct_index >= 0: return try self.resolve_type_function(struct_index, name, span)
+            return none
+        let imported_module = self.find_imported_module(head)
+        if imported_module < 0: return none
+        let struct_index = self.find_struct_in_module(imported_module, type_name)
+        if struct_index < 0: return none
+        if not self.structs[struct_index].is_public:
+            try self.fail(span, "`" + type_name + "` is private to module `" + self.sources[imported_module].name + "`")
+        return try self.resolve_type_function(struct_index, name, span)
+
+    func resolve_module_member_callee(imported_module: i64, name: str, span: SourceSpan) -> ResolvedCallee!:
+        let function_index = self.find_function_in_module(imported_module, name)
+        if function_index >= 0:
+            if not self.functions[function_index].is_public:
+                try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
+            return ResolvedCallee(function_index = function_index, receiver = none, struct_index = -1)
+        let struct_index = self.find_struct_in_module(imported_module, name)
+        if struct_index >= 0:
+            if not self.structs[struct_index].is_public:
+                try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
+            return ResolvedCallee(function_index = -1, receiver = none, struct_index = struct_index)
+        error(self.diagnostic(span, "module `" + self.sources[imported_module].name + "` has no function `" + name + "`"))
+
+    # `Type.function(...)`: a method without `self`.
+    func resolve_type_function(struct_index: i64, name: str, span: SourceSpan) -> ResolvedCallee!:
+        let method_index = self.find_method(struct_index, name)
+        if method_index < 0:
+            try self.fail(span, "struct `" + self.structs[struct_index].name + "` has no type function `" + name + "`")
+        let receiver = self.functions[method_index].receiver else trap("method without a receiver")
+        if receiver.has_self:
+            try self.fail(span, "`" + name + "` takes `self`; call it through a `" + self.structs[struct_index].name + "` value")
+        try self.require_method_visible(method_index, struct_index, span)
+        return ResolvedCallee(function_index = method_index, receiver = none, struct_index = -1)
+
+    func require_method_visible(method_index: i64, struct_index: i64, span: SourceSpan) -> !:
+        let owner_module = self.structs[struct_index].module_index
+        if owner_module != self.current_module and not self.functions[method_index].is_public:
+            try self.fail(span, "`" + self.functions[method_index].name + "` is private to module `" + self.sources[owner_module].name + "`")
 
     func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
         var expected_parts: list[TypeId]? = none
@@ -1195,8 +1663,18 @@ pub class HirGenerator:
             if imported.name == name: return imported.module_index
         return -1
 
+    # The same lookup for a module other than the one being checked, used
+    # while signatures are collected before any body is entered.
+    func find_imported_module_of(module_index: i64, name: str) -> i64:
+        if module_index < len(self.module_bindings):
+            for imported in self.module_bindings[module_index].modules:
+                if imported.name == name: return imported.module_index
+        return -1
+
+    # Free functions only; methods are reached through `find_method`.
     func find_function_in_module(module_index: i64, name: str) -> i64:
         for index in range(0, len(self.functions)):
+            if self.functions[index].receiver != none: continue
             if self.functions[index].module_index == module_index and self.functions[index].name == name: return index
         return -1
 
@@ -1321,6 +1799,29 @@ func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
         Group(grouped): return is_contextual_integer_expression(grouped)
         Unary(operator, operand):
             return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
+        else: return false
+
+# A literal tree: constants, tuples and optionals of constants, and unary or
+# binary operators over them. Constant references are allowed because a
+# module constant is itself such a tree.
+func is_constant_expression(value: HirExpression) -> bool:
+    match value.form:
+        Constant(item): return true
+        NoneLiteral: return true
+        Some(inner): return is_constant_expression(inner)
+        Tuple(elements):
+            for element in elements:
+                if not is_constant_expression(element): return false
+            return true
+        StructValue(struct_index, fields):
+            for field in fields:
+                if not is_constant_expression(field): return false
+            return true
+        Unary(operation, operand): return is_constant_expression(operand)
+        Binary(left, operation, right): return is_constant_expression(left) and is_constant_expression(right)
+        Conditional(chosen, condition, alternative):
+            return is_constant_expression(chosen) and is_constant_expression(condition) and is_constant_expression(alternative)
+        Reference(symbol): return true
         else: return false
 
 func find_parameter(function: FunctionSymbol, name: str) -> i64:
