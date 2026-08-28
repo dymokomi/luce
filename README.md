@@ -74,7 +74,8 @@ examples and tests link back here rather than restating it.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, parameter
   defaults, bindings, assignment, scalars, strings, tuples, optionals,
-  structs with methods and `mutating`, constants, type aliases,
+  structs and enums with methods and `mutating`, exhaustive `match`,
+  constants, type aliases,
   conditionals, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
@@ -84,7 +85,7 @@ examples and tests link back here rather than restating it.
   and has a verifier and its own interpreter covering every instruction.
 - The compiled slice — every scalar type with checked arithmetic, locals,
   every operator, `if`/`while`, functions and calls across modules, module
-  constants, tuples, optionals, structs and methods, `str`/`bytes` values
+  constants, tuples, optionals, structs, enums and `match`, methods, `str`/`bytes` values
   with equality, and `print` of a literal or a `str` value — is lowered to
   canonical MIR and
   encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
