@@ -528,10 +528,10 @@ inline in the body's list, so a body is one contiguous allocation rather than
 a tree of heap objects. The `End` of an `If` with results is where those
 registers become defined; a `Yield` or `Br` into a region is the only way to
 supply them, and the verifier rejects an arm that falls off without doing so.
-Operand lists (`results`, `arguments`, `values`) are the one remaining
-per-instruction heap object; they are few (calls and branches) and sit behind
-constructors, so moving them into a per-function operand array is a
-contained follow-up.
+Operand lists (`results`, `arguments`, `values`) are `RegisterRun`s — a start
+and count into the function's `operands` array — so an instruction is a
+fixed-size value and a body is two contiguous arrays: instructions and
+operands.
 
 ### Runtime symbols
 
