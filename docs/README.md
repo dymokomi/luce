@@ -13,10 +13,10 @@
   today" in the [top-level README](../README.md).
 - [Post-1.0 platform](language/post-1.0.md) — packages, C++, backends, and
   tooling deferred past 1.0, under the same section numbers.
-- [Compiler plan](compiler/plan.md) — where every layer stands, the
-  decisions taken (MIR shape, WebAssembly, native backends, QBE, the
-  linker, the runtime), the order of work, and the Stage-0 constraints.
-  Start here to resume work.
+- [Compiler plan](compiler/plan.md) — the decisions and what is next;
+  its pair [Compiler record](compiler/done.md) says what exists, what each
+  milestone proved, the bugs the harness caught, and where the project came
+  from.
 - [Canonical MIR](compiler/mir.md) — the design record for the machine
   representation every compiled backend consumes: the decisions, the
   instruction set, and the reasons.

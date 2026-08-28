@@ -90,7 +90,7 @@ examples and tests link back here rather than restating it.
   encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
   Mach-O and x86-64 ELF writers still cover only the original slice (checked
   i32/i64 arithmetic, `print` of a literal, `return`); see
-  `docs/compiler/plan.md` §4 for why. Native executables start at `main`;
+  `docs/compiler/plan.md` §3 for why. Native executables start at `main`;
   WebAssembly exports every public function.
 - The test suite exercises the frontend, semantic model, both interpreters,
   lowering, MIR verification, each artifact encoder, the command line's exit
@@ -123,7 +123,8 @@ topic.
 Read in this order; each stop hands off to the next.
 
 1. [docs/README.md](docs/README.md) introduces the design documents; the
-   [compiler plan](docs/compiler/plan.md) there is where to resume work.
+   [compiler plan](docs/compiler/plan.md) is where to resume work, and its pair
+   [done.md](docs/compiler/done.md) is where to check what exists.
    [The language design](docs/language/1.0.md) is the 1.0 specification, not a
    description of what happens to be implemented today; [the post-1.0
    notes](docs/language/post-1.0.md) hold ideas outside the current language.
