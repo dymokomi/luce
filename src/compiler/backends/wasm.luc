@@ -508,7 +508,7 @@ func encode_code_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
         let body = list[u8]()
         try encode_locals(program.types, function, frame, body)
         encode_prologue(frame, plan, body)
-        try encode_body(program, plan, function, frame, function.body, list[Region](), body)
+        try encode_body(program, plan, function, frame, function.body, body)
         # MIR only needs every path to terminate; wasm also needs the
         # function's result on the stack at its final `end`. A body whose
         # last instruction is an `If` with returning arms leaves the stack
@@ -712,25 +712,55 @@ struct Region:
     results: list[RegisterId]
     is_loop: bool
 
-func push_region(regions: list[Region], region: Region) -> list[Region]:
-    let pushed = list[Region]()
-    for item in regions: pushed.append(item)
-    pushed.append(region)
-    return pushed
-
-# Encode one instruction list. `regions` is the stack of enclosing regions,
-# innermost last. A `Yield` that ends an arm falls through to the arm's
-# `end`; one in the middle branches to it.
-func encode_body(program: MirProgram, plan: ModulePlan, function: MirFunction, frame: FramePlan, instructions: list[MirInstruction], regions: list[Region], body: list[u8]) -> !:
+# Encode one flat body. The MIR region instructions map one-to-one onto
+# wasm's: `Block`/`Loop`/`If` open, `Else` separates, `End` closes. Region
+# results travel through locals, so every wasm block has the empty type. A
+# `Yield` that ends an arm falls through to the arm's `else`/`end`; one in
+# the middle branches to it.
+func encode_body(program: MirProgram, plan: ModulePlan, function: MirFunction, frame: FramePlan, instructions: list[MirInstruction], body: list[u8]) -> !:
+    let regions = list[Region]()
     for index in range(0, len(instructions)):
         let instruction = instructions[index]
-        try encode_instruction(program, plan, function, frame, instruction, regions, body)
         match instruction.form:
+            Block(results):
+                body.append(opcode_block)
+                body.append(empty_block_type)
+                regions.append(Region(results = results, is_loop = false))
+            Loop:
+                # A branch to a `loop` label restarts it; falling off its end
+                # leaves it, in wasm exactly as in MIR.
+                body.append(opcode_loop)
+                body.append(empty_block_type)
+                regions.append(Region(results = list[RegisterId](), is_loop = true))
+            If(condition, results):
+                local_get(body, condition)
+                body.append(opcode_if)
+                body.append(empty_block_type)
+                regions.append(Region(results = results, is_loop = false))
+            Else:
+                body.append(opcode_else)
+            End:
+                body.append(opcode_end)
+                regions.remove(len(regions) - 1)
+            Switch(tag): error("wasm backend does not support `Switch` yet")
+            Case(value): error("wasm backend does not support `Switch` yet")
+            Default: error("wasm backend does not support `Switch` yet")
             Yield(values):
-                if index < len(instructions) - 1:
+                let target = try region_at(regions, 0)
+                if target.is_loop: error("wasm backend does not support `Yield` inside a `Loop`")
+                try set_region_results(body, target, values, "`Yield`")
+                if not next_closes_arm(instructions, index):
                     body.append(opcode_br)
                     append_unsigned(body, 0)
-            else: continue
+            else: try encode_instruction(program, plan, function, frame, instruction, regions, body)
+
+# Is the instruction after `index` the `Else` or `End` of the current arm?
+func next_closes_arm(instructions: list[MirInstruction], index: i64) -> bool:
+    if index + 1 >= len(instructions): return false
+    match instructions[index + 1].form:
+        Else: return true
+        End: return true
+        else: return false
 
 func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunction, frame: FramePlan, instruction: MirInstruction, regions: list[Region], body: list[u8]) -> !:
     let types = program.types
@@ -827,33 +857,6 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 if plan.imports[index].external == i64(external.value): import_index = index
             if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
             encode_write(body, import_index, arguments[0], arguments[1])
-        If(condition, results, then_body, else_body):
-            # `if` with no block type: each arm's `Yield` sets the result
-            # locals, so nothing travels on the wasm operand stack.
-            local_get(body, condition)
-            body.append(opcode_if)
-            body.append(empty_block_type)
-            let inner = push_region(regions, Region(results = results, is_loop = false))
-            try encode_body(program, plan, function, frame, then_body, inner, body)
-            if len(else_body) > 0:
-                body.append(opcode_else)
-                try encode_body(program, plan, function, frame, else_body, inner, body)
-            body.append(opcode_end)
-        Block(results, block_body):
-            # `block` with no block type; results travel through locals.
-            body.append(opcode_block)
-            body.append(empty_block_type)
-            let inner = push_region(regions, Region(results = results, is_loop = false))
-            try encode_body(program, plan, function, frame, block_body, inner, body)
-            body.append(opcode_end)
-        Loop(loop_body):
-            # A branch to a `loop` label restarts it; falling off its end
-            # leaves it, in wasm exactly as in MIR.
-            body.append(opcode_loop)
-            body.append(empty_block_type)
-            let inner = push_region(regions, Region(results = list[RegisterId](), is_loop = true))
-            try encode_body(program, plan, function, frame, loop_body, inner, body)
-            body.append(opcode_end)
         Br(depth, values):
             let target = try region_at(regions, depth)
             try set_region_results(body, target, values, "`Br`")
@@ -875,14 +878,6 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 body.append(opcode_br)
                 append_unsigned(body, depth + 1)
                 body.append(opcode_end)
-        Yield(values):
-            # The lowerer never yields out of a `Loop`: a loop has no results
-            # and is left by falling off its end or by a `Br` to an enclosing
-            # `Block`. The `br 0` for a mid-arm `Yield` is added by
-            # `encode_body`, which knows whether the arm continues.
-            let target = try region_at(regions, 0)
-            if target.is_loop: error("wasm backend does not support `Yield` inside a `Loop`")
-            try set_region_results(body, target, values, "`Yield`")
         Return(values):
             encode_epilogue(frame, body)
             for value in values:

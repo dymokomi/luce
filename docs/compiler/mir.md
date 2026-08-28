@@ -124,11 +124,17 @@ func sum_to(r0: i64) -> i64
 ```
 
 Notice what is *not* here: no labels, no `goto`, no jump to an address.
-Control flow in MIR is **structured**. `Block` and `Loop` are nested
-regions; `Br 0` means "branch to the innermost enclosing region" and
-`BrIf r7, 1` means "if `r7`, branch to the one outside that". Branching to
-a `Loop` restarts it; branching to a `Block` leaves it. `If` and `Switch`
-(for `match`) nest the same way. That is the whole control-flow vocabulary.
+Control flow in MIR is **structured**. `Block` and `Loop` open regions that
+their matching `End` closes; `Br 0` means "branch to the innermost enclosing
+region" and `BrIf r7, 1` means "if `r7`, branch to the one outside that".
+Branching to a `Loop` restarts it; branching to a `Block` leaves it. `If`
+(with an `Else` between its arms) and `Switch` (with a `Case` before each
+arm and a `Default`) nest the same way. That is the whole control-flow
+vocabulary — and the listing above *is* the representation: a function body
+is one flat list of instructions in which `Block`, `Loop`, `If`, `Switch`,
+`Else`, `Case`, `Default`, and `End` are ordinary entries. Nothing nests in
+memory; nesting is a property of the sequence, exactly as in a WebAssembly
+function body.
 
 A region can also *produce* values — the conditional expression
 `a if flag else b` is an `If` whose two arms each end in `Yield` with their
@@ -498,21 +504,34 @@ CallExtern(ExternId, args)                   -> results
 CallIndirect(signature, target, args)        -> results
 ```
 
-**Control flow**
+**Control flow** — a body is one flat instruction list; these open,
+separate, and close regions in that list:
 
 ```
-Block(results, body)              Br to it exits it; `results` are the registers it defines
-Loop(body)                        Br to it restarts it; a Loop has no results
-If(condition, results, then, else)
-Switch(tag, cases, default)       dense tags become a jump table
+Block(results)  ... End           Br to it exits it; `results` are the registers it defines
+Loop  ... End                     Br to it restarts it; a Loop has no results; falling off its End leaves it
+If(condition, results)  ... Else  ... End     Else may be absent when there are no results
+Switch(tag)  Case(v) ...  Case(v) ...  Default ...  End     falling off an arm leaves the Switch; Default is required
 Br(depth, values)                 leave region `depth`, supplying its results
 BrIf(condition, depth, values)
-Yield(values)                     leave the innermost region normally, supplying its results
+Yield(values)                     leave the innermost region normally, supplying its results (a Br 0 that reads as an exit)
 Return(values)
 Raise(failure)                    Return with an absent value and a present error
 Trap(reason)                      unconditional; runs no deferred code
 Unreachable                       after a diverging call; verifier-only
 ```
+
+The flat encoding is a shape decision, not a convenience: every consumer —
+verifier, interpreter, each backend — walks a function as one linear pass
+with a small region stack, and a `MirInstruction` is a plain value stored
+inline in the body's list, so a body is one contiguous allocation rather than
+a tree of heap objects. The `End` of an `If` with results is where those
+registers become defined; a `Yield` or `Br` into a region is the only way to
+supply them, and the verifier rejects an arm that falls off without doing so.
+Operand lists (`results`, `arguments`, `values`) are the one remaining
+per-instruction heap object; they are few (calls and branches) and sit behind
+constructors, so moving them into a per-function operand array is a
+contained follow-up.
 
 ### Runtime symbols
 

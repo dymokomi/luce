@@ -51,14 +51,27 @@ pub union MirValue:
 ## `FunctionAddress` yields `function_address_base + index`.
 pub const function_address_base: i64 = 0x1000000
 
-# How a body finished: fell through, branched out `depth` regions carrying
-# values, yielded the innermost region's values, or left the function.
+# How a body finished: fell off its end, or left the function.
 union Flow:
     Next
-    Branch(depth: i64, values: list[MirValue])
-    Yielded(values: list[MirValue])
     Returned(values: list[MirValue])
     Raised(failure: i64)
+
+# Where the parts of every region sit in a flat body, computed once per
+# call: `end_of[i]` is the `End` matching an opener or arm separator at `i`,
+# and `next_arm[i]` is the next `Else`/`Case`/`Default` of the same region.
+struct RegionPlan:
+    end_of: list[i64]
+    next_arm: list[i64]
+
+# One region control is currently inside. A branch to a loop returns to
+# `start + 1`; a branch to anything else binds `results` and continues at
+# `end + 1`.
+struct RunRegion:
+    is_loop: bool
+    start: i64
+    end: i64
+    results: list[RegisterId]
 
 # A float stored in memory; see the header for why these are not bytes.
 struct FloatCell:
@@ -167,7 +180,7 @@ pub class MirInterpreter:
         let frame = Frame(function = function, registers = registers, slots = slots)
         if self.depth >= frame_limit: error("mir interpreter: trap: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
         self.depth += 1
-        let outcome = self.execute_body(frame, function.body) catch reason:
+        let outcome = self.execute_body(frame, function.body, plan_regions(function.body)) catch reason:
             self.depth -= 1
             error(reason)
         self.depth -= 1
@@ -192,48 +205,85 @@ pub class MirInterpreter:
 
     # mark: Bodies and regions ==================================================================
 
-    func execute_body(frame: Frame, body: list[MirInstruction]) -> Flow!:
-        for instruction in body:
-            let flow = try self.execute(frame, instruction)
-            match flow:
-                Next: continue
-                else: return flow
+    # Run a flat body from its first instruction. Openers push a region,
+    # arm separators reached by falling off an arm leave the region, `End`
+    # pops it, and branches jump through the plan; everything else is a
+    # straight-line instruction.
+    func execute_body(frame: Frame, body: list[MirInstruction], plan: RegionPlan) -> Flow!:
+        let regions = list[RunRegion]()
+        var pc = 0
+        while pc < len(body):
+            let instruction = body[pc]
+            match instruction.form:
+                Block(results):
+                    regions.append(RunRegion(is_loop = false, start = pc, end = plan.end_of[pc], results = results))
+                    pc += 1
+                Loop:
+                    regions.append(RunRegion(is_loop = true, start = pc, end = plan.end_of[pc], results = list[RegisterId]()))
+                    pc += 1
+                If(condition, results):
+                    regions.append(RunRegion(is_loop = false, start = pc, end = plan.end_of[pc], results = results))
+                    if bool_of(frame.registers[i64(condition.value)]):
+                        pc += 1
+                    elif plan.next_arm[pc] >= 0:
+                        pc = plan.next_arm[pc] + 1
+                    else:
+                        regions.remove(len(regions) - 1)
+                        pc = plan.end_of[pc] + 1
+                Else:
+                    regions.remove(len(regions) - 1)
+                    pc = plan.end_of[pc] + 1
+                Switch(tag):
+                    regions.append(RunRegion(is_loop = false, start = pc, end = plan.end_of[pc], results = list[RegisterId]()))
+                    pc = select_arm(body, plan, pc, int_of(frame.registers[i64(tag.value)]))
+                Case(value):
+                    regions.remove(len(regions) - 1)
+                    pc = plan.end_of[pc] + 1
+                Default:
+                    regions.remove(len(regions) - 1)
+                    pc = plan.end_of[pc] + 1
+                End:
+                    regions.remove(len(regions) - 1)
+                    pc += 1
+                Br(depth, values):
+                    pc = self.branch(frame, regions, depth, self.collect(frame, values))
+                BrIf(condition, depth, values):
+                    if bool_of(frame.registers[i64(condition.value)]):
+                        pc = self.branch(frame, regions, depth, self.collect(frame, values))
+                    else:
+                        pc += 1
+                Yield(values):
+                    pc = self.branch(frame, regions, 0, self.collect(frame, values))
+                Return(values):
+                    return Flow.Returned(values = self.collect(frame, values))
+                Raise(failure):
+                    return Flow.Raised(failure = ptr_of(frame.registers[i64(failure.value)]))
+                else:
+                    try self.execute(frame, instruction)
+                    pc += 1
         return Flow.Next
 
-    # A region that has ended: bind its results from a `Yield` or a `Br` to
-    # it, pass an outer branch on with one less depth, or propagate a
-    # function exit. `Loop` is the only region that can run its body again.
-    func finish_region(frame: Frame, results: list[RegisterId], flow: Flow) -> Flow:
-        match flow:
-            Next: return Flow.Next
-            Yielded(values):
-                self.bind(frame, results, values)
-                return Flow.Next
-            Branch(depth, values):
-                if depth == 0:
-                    self.bind(frame, results, values)
-                    return Flow.Next
-                return Flow.Branch(depth = depth - 1, values = values)
-            else: return flow
+    # Leave `depth` regions: a loop target restarts and stays open; any other
+    # target receives the values and is left.
+    func branch(frame: Frame, regions: list[RunRegion], depth: i64, values: list[MirValue]) -> i64:
+        let target = regions[len(regions) - 1 - depth]
+        if target.is_loop:
+            let keep_loop = len(regions) - depth
+            while len(regions) > keep_loop: regions.remove(len(regions) - 1)
+            return target.start + 1
+        self.bind(frame, target.results, values)
+        let keep = len(regions) - 1 - depth
+        while len(regions) > keep: regions.remove(len(regions) - 1)
+        return target.end + 1
 
     func bind(frame: Frame, results: list[RegisterId], values: list[MirValue]):
         for position in range(0, len(results)):
             frame.registers[i64(results[position].value)] = values[position]
 
-    func execute_loop(frame: Frame, body: list[MirInstruction]) -> Flow!:
-        while true:
-            match try self.execute_body(frame, body):
-                Next: return Flow.Next
-                Yielded(values): return Flow.Next
-                Branch(depth, values):
-                    if depth == 0: continue
-                    return Flow.Branch(depth = depth - 1, values = values)
-                Returned(values): return Flow.Returned(values = values)
-                Raised(failure): return Flow.Raised(failure = failure)
-
     # mark: Instructions ========================================================================
 
-    func execute(frame: Frame, instruction: MirInstruction) -> Flow!:
+    # One straight-line instruction; control flow never reaches here.
+    func execute(frame: Frame, instruction: MirInstruction) -> !:
         let types = self.program.types
         match instruction.form:
             Const(result, value):
@@ -290,39 +340,11 @@ pub class MirInterpreter:
                     error("mir interpreter: trap: indirect call through " + str(address) + ", which is not a function address")
                 let values = try self.call(index, self.collect(frame, arguments))
                 self.bind(frame, results, values)
-            Block(results, body):
-                return self.finish_region(frame, results, try self.execute_body(frame, body))
-            Loop(body):
-                # `execute_loop` already consumes the loop's own depth; a
-                # second `finish_region` here would swallow a branch carrying
-                # values to the enclosing block.
-                return try self.execute_loop(frame, body)
-            If(condition, results, then_body, else_body):
-                if bool_of(frame.registers[i64(condition.value)]):
-                    return self.finish_region(frame, results, try self.execute_body(frame, then_body))
-                return self.finish_region(frame, results, try self.execute_body(frame, else_body))
-            Switch(tag, cases, default_body):
-                let selected = int_of(frame.registers[i64(tag.value)])
-                for item in cases:
-                    if item.value == selected:
-                        return self.finish_region(frame, list[RegisterId](), try self.execute_body(frame, item.body))
-                return self.finish_region(frame, list[RegisterId](), try self.execute_body(frame, default_body))
-            Br(depth, values):
-                return Flow.Branch(depth = depth, values = self.collect(frame, values))
-            BrIf(condition, depth, values):
-                if bool_of(frame.registers[i64(condition.value)]):
-                    return Flow.Branch(depth = depth, values = self.collect(frame, values))
-            Yield(values):
-                return Flow.Yielded(values = self.collect(frame, values))
-            Return(values):
-                return Flow.Returned(values = self.collect(frame, values))
-            Raise(failure):
-                return Flow.Raised(failure = ptr_of(frame.registers[i64(failure.value)]))
             Trap(reason):
                 error("mir interpreter: trap: " + reason)
             Unreachable:
                 trap("verified MIR reached `Unreachable`")
-        return Flow.Next
+            else: trap("control-flow instruction reached the straight-line interpreter")
 
     func collect(frame: Frame, registers: list[RegisterId]) -> list[MirValue]:
         let values = list[MirValue]()
@@ -539,6 +561,53 @@ pub class MirInterpreter:
         for offset in range(0, length):
             payload.append(self.memory[address + offset])
         return strings.from_bytes(payload) else "<invalid utf-8>"
+
+# mark: Region plans ===========================================================================
+
+# One pass with a stack of open regions: every opener and separator is
+# remembered until the `End` that closes them.
+func plan_regions(body: list[MirInstruction]) -> RegionPlan:
+    let end_of = list[i64]()
+    let next_arm = list[i64]()
+    for instruction in body:
+        end_of.append(-1)
+        next_arm.append(-1)
+    let open_groups = list[list[i64]]()
+    for index in range(0, len(body)):
+        match body[index].form:
+            Block(results): open_groups.append([index])
+            Loop: open_groups.append([index])
+            If(condition, results): open_groups.append([index])
+            Switch(tag): open_groups.append([index])
+            Else: extend_group(open_groups, next_arm, index)
+            Case(value): extend_group(open_groups, next_arm, index)
+            Default: extend_group(open_groups, next_arm, index)
+            End:
+                let group = open_groups[len(open_groups) - 1]
+                open_groups.remove(len(open_groups) - 1)
+                for member in group: end_of[member] = index
+            else: continue
+    return RegionPlan(end_of = end_of, next_arm = next_arm)
+
+func extend_group(open_groups: list[list[i64]], next_arm: list[i64], index: i64):
+    let group = open_groups[len(open_groups) - 1]
+    next_arm[group[len(group) - 1]] = index
+    group.append(index)
+
+# The first instruction of the `Switch` arm for `selected`: the matching
+# `Case`, else the `Default` (the verifier requires one).
+func select_arm(body: list[MirInstruction], plan: RegionPlan, opener: i64, selected: i64) -> i64:
+    var arm = plan.next_arm[opener]
+    var fallback = -1
+    while arm >= 0:
+        match body[arm].form:
+            Case(value):
+                if value == selected: return arm + 1
+            Default: fallback = arm
+            else: trap("switch arm plan names a non-arm instruction")
+        arm = plan.next_arm[arm]
+    if fallback < 0: trap("verified Switch without a Default")
+    return fallback + 1
 
 # mark: Value helpers ==========================================================================
 

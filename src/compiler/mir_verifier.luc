@@ -13,26 +13,65 @@
 #       their known signatures, and relocations point at real items.
 #
 #       The walk mirrors the program's own shape: the type table, then each
-#       extern, global, and data item, then each function's body region by
-#       region. A region is checked on a copy of the "defined so far" set, so
-#       a register defined inside an `If` arm is not visible after the `If`
-#       unless the region names it as a result.
+#       extern, global, and data item, then each function's body in one
+#       linear pass. A body is a flat list in which `Block`/`Loop`/`If`/
+#       `Switch` open a region, `Else`/`Case`/`Default` start a new arm, and
+#       `End` closes it; the verifier keeps a stack of open regions, and each
+#       arm is checked on a copy of the "defined so far" set taken at the
+#       opener, so a register defined inside an `If` arm is not visible after
+#       the `End` unless the region names it as a result.
 #
 #==============================================================================================
 
 from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, DataId
 from compiler.canonical_ir import FunctionId, GlobalId, InstructionForm, MirConstant, MirData, MirExtern
 from compiler.canonical_ir import MirFunction, MirGlobal, MirInstruction, MirProgram, MirSignature, MirType
-from compiler.canonical_ir import MirTypeTable, RegisterId, RelocationTarget, SwitchCase, TypeId
+from compiler.canonical_ir import MirTypeTable, RegisterId, RelocationTarget, TypeId
 from compiler.canonical_ir import align_up, bits_of, builtin_mir_type, describe_mir_type, describe_signature
 from compiler.canonical_ir import find_runtime_symbol, int_maximum, int_minimum, is_bool_type, is_float_type
 from compiler.canonical_ir import is_int_type, is_numeric_mir_type, is_ptr_type, is_signed_int_type, make_enum_type, make_struct_type
 from compiler.canonical_ir import mir_type, mir_types_match, signatures_match, size_of, align_of
 
 # One enclosing region while a body is walked: what a `Br` to it must supply.
-struct Region:
-    results: list[TypeId]
-    is_loop: bool
+# One open region while a body is walked. `defined_before` is the copy of
+# the defined set every arm starts from; the `arms_*` flags accumulate what
+# every completed arm proved; `last_*` describe the instruction just seen in
+# the current arm.
+class Region:
+    pub kind: RegionKind
+    pub results: list[RegisterId]
+    pub result_types: list[TypeId]
+    pub defined_before: list[bool]
+    pub arms_leave: bool
+    pub arms_terminate: bool
+    pub last_leaves: bool
+    pub last_terminates: bool
+    pub seen_else: bool
+    pub seen_default: bool
+    pub expecting_arm: bool
+    pub case_values: list[i64]
+
+    pub init(kind: RegionKind, results: list[RegisterId], result_types: list[TypeId], defined_before: list[bool]):
+        self.kind = kind
+        self.results = results
+        self.result_types = result_types
+        self.defined_before = defined_before
+        self.arms_leave = true
+        self.arms_terminate = true
+        self.last_leaves = false
+        self.last_terminates = false
+        self.seen_else = false
+        self.seen_default = false
+        self.expecting_arm = false
+        self.case_values = list[i64]()
+
+enum RegionKind:
+    block
+    loop_body
+    if_region
+    switch_region
+    # The function body itself, so the same flags serve the end-of-function check.
+    function_body
 
 ## Verifies one complete canonical program.
 pub class MirVerifier:
@@ -186,20 +225,32 @@ pub class MirVerifier:
             if function.registers[index].value != function.signature.parameters[index].value:
                 try self.fail("register r" + str(index) + " must have its parameter's type")
 
-        try self.verify_body(function, function.body, defined, list[Region]())
-        if not terminates(function.body):
+        let root = Region(kind = RegionKind.function_body, results = list[RegisterId](), result_types = list[TypeId](), defined_before = copy_defined(defined))
+        let regions = [root]
+        for instruction in function.body:
+            try self.verify_instruction(function, instruction, defined, regions)
+        if len(regions) != 1:
+            try self.fail("has " + str(len(regions) - 1) + " region(s) without an `End`")
+        if not root.last_terminates:
             try self.fail("can fall off the end of its body; end every path with `Return`, `Raise`, `Trap`, or `Unreachable`")
 
     # mark: Bodies ==============================================================================
 
-    # Walk one instruction list. `defined` is mutated for straight-line
-    # definitions; regions are walked on copies so their internals stay local.
-    func verify_body(function: MirFunction, body: list[MirInstruction], defined: list[bool], regions: list[Region]) -> !:
-        for instruction in body:
-            try self.verify_instruction(function, instruction, defined, regions)
-
+    # Check one instruction of the flat body. Openers push a region, arm
+    # separators restore the defined set the region started from, `End`
+    # pops and defines the region's results; everything else is a straight-
+    # line definition or use.
     func verify_instruction(function: MirFunction, instruction: MirInstruction, defined: list[bool], regions: list[Region]) -> !:
         let types = self.program.types
+        let current = regions[len(regions) - 1]
+        if current.expecting_arm:
+            match instruction.form:
+                Case(value): current.expecting_arm = false
+                Default: current.expecting_arm = false
+                else: try self.fail_at(instruction, "`Switch` must be followed by `Case` or `Default`")
+        # Every instruction below either sets these itself or is straight-line.
+        var leaves = false
+        var terminates_here = false
         match instruction.form:
             Const(result, value):
                 let result_type = try self.result_type(result, defined)
@@ -316,58 +367,101 @@ pub class MirVerifier:
                 try self.verify_signature_types(signature, "`CallIndirect` signature")
                 try self.require_ptr_operand(instruction, target, defined, "`CallIndirect` target")
                 try self.verify_call(instruction, signature, results, arguments, defined)
-            Block(results, body):
+            Block(results):
                 let result_types = try self.region_result_types(instruction, results, defined)
-                let inner = copy_defined(defined)
-                let inner_regions = push_region(regions, Region(results = result_types, is_loop = false))
-                try self.verify_body(function, body, inner, inner_regions)
-                if len(results) > 0 and not leaves_region(body):
-                    try self.fail_at(instruction, "`Block` with results can fall off its end; supply them with `Yield` or `Br`")
-                for result in results: self.define(result, defined)
-            Loop(body):
-                # Falling off the end of a `Loop` leaves it, as in WebAssembly;
-                # only a branch to it repeats.
-                let inner = copy_defined(defined)
-                let inner_regions = push_region(regions, Region(results = list[TypeId](), is_loop = true))
-                try self.verify_body(function, body, inner, inner_regions)
-            If(condition, results, then_body, else_body):
+                regions.append(Region(kind = RegionKind.block, results = results, result_types = result_types, defined_before = copy_defined(defined)))
+            Loop:
+                regions.append(Region(kind = RegionKind.loop_body, results = list[RegisterId](), result_types = list[TypeId](), defined_before = copy_defined(defined)))
+            If(condition, results):
                 let condition_type = try self.operand_type(instruction, condition, defined)
                 if not is_bool_type(types, condition_type): try self.fail_at(instruction, "`If` condition must be `bool`, found `" + describe_mir_type(types, condition_type) + "`")
                 let result_types = try self.region_result_types(instruction, results, defined)
-                let inner_regions = push_region(regions, Region(results = result_types, is_loop = false))
-                try self.verify_body(function, then_body, copy_defined(defined), inner_regions)
-                try self.verify_body(function, else_body, copy_defined(defined), inner_regions)
-                if len(results) > 0:
-                    if not leaves_region(then_body) or not leaves_region(else_body):
-                        try self.fail_at(instruction, "`If` with results must supply them on both arms with `Yield` or `Br`")
-                for result in results: self.define(result, defined)
-            Switch(tag, cases, default_body):
+                regions.append(Region(kind = RegionKind.if_region, results = results, result_types = result_types, defined_before = copy_defined(defined)))
+            Else:
+                if current.kind != RegionKind.if_region or current.seen_else:
+                    try self.fail_at(instruction, "`Else` outside an `If`, or a second `Else`")
+                current.seen_else = true
+                self.finish_arm(current, defined)
+            Switch(tag):
                 let tag_type = try self.operand_type(instruction, tag, defined)
                 if not is_int_type(types, tag_type): try self.fail_at(instruction, "`Switch` tag must be an integer, found `" + describe_mir_type(types, tag_type) + "`")
-                let inner_regions = push_region(regions, Region(results = list[TypeId](), is_loop = false))
-                for index in range(0, len(cases)):
-                    for previous in range(0, index):
-                        if cases[previous].value == cases[index].value: try self.fail_at(instruction, "`Switch` repeats case " + str(cases[index].value))
-                    try self.verify_body(function, cases[index].body, copy_defined(defined), inner_regions)
-                try self.verify_body(function, default_body, copy_defined(defined), inner_regions)
+                let opened = Region(kind = RegionKind.switch_region, results = list[RegisterId](), result_types = list[TypeId](), defined_before = copy_defined(defined))
+                opened.expecting_arm = true
+                regions.append(opened)
+            Case(value):
+                if current.kind != RegionKind.switch_region: try self.fail_at(instruction, "`Case` outside a `Switch`")
+                if current.seen_default: try self.fail_at(instruction, "`Case` after `Default`")
+                for previous in current.case_values:
+                    if previous == value: try self.fail_at(instruction, "`Switch` repeats case " + str(value))
+                if len(current.case_values) > 0: self.finish_arm(current, defined)
+                current.case_values.append(value)
+            Default:
+                if current.kind != RegionKind.switch_region: try self.fail_at(instruction, "`Default` outside a `Switch`")
+                if current.seen_default: try self.fail_at(instruction, "a second `Default`")
+                if len(current.case_values) > 0: self.finish_arm(current, defined)
+                current.seen_default = true
+            End:
+                if current.kind == RegionKind.function_body: try self.fail_at(instruction, "`End` without an open region")
+                self.finish_arm(current, defined)
+                var region_leaves = current.arms_leave
+                var region_terminates = current.arms_terminate
+                if current.kind == RegionKind.if_region and not current.seen_else:
+                    if len(current.results) > 0: try self.fail_at(instruction, "`If` with results must supply them on both arms with `Yield` or `Br`")
+                    # The missing else-arm falls through.
+                    region_leaves = false
+                    region_terminates = false
+                if current.kind == RegionKind.switch_region and not current.seen_default:
+                    try self.fail_at(instruction, "`Switch` needs a `Default` arm")
+                if current.kind == RegionKind.block or current.kind == RegionKind.loop_body:
+                    # A branch to a Block lands after it; a Loop is left by falling off.
+                    region_terminates = false
+                if len(current.results) > 0 and not region_leaves:
+                    try self.fail_at(instruction, "`Block` with results can fall off its end; supply them with `Yield` or `Br`")
+                regions.remove(len(regions) - 1)
+                for result in current.results: self.define(result, defined)
+                leaves = region_leaves
+                terminates_here = region_terminates
             Br(depth, values):
                 try self.verify_branch(instruction, depth, values, defined, regions)
+                leaves = true
             BrIf(condition, depth, values):
                 let condition_type = try self.operand_type(instruction, condition, defined)
                 if not is_bool_type(types, condition_type): try self.fail_at(instruction, "`BrIf` condition must be `bool`, found `" + describe_mir_type(types, condition_type) + "`")
                 try self.verify_branch(instruction, depth, values, defined, regions)
             Yield(values):
-                if len(regions) == 0: try self.fail_at(instruction, "`Yield` outside any region; use `Return`")
-                let region = regions[len(regions) - 1]
-                if region.is_loop and len(values) > 0: try self.fail_at(instruction, "`Yield` cannot carry values out of a `Loop`")
-                try self.verify_values(instruction, values, region.results, defined, "`Yield`")
+                if current.kind == RegionKind.function_body: try self.fail_at(instruction, "`Yield` outside any region; use `Return`")
+                if current.kind == RegionKind.loop_body: try self.fail_at(instruction, "`Yield` inside a `Loop`; a loop has no results, leave it with `Br`")
+                leaves = true
+                try self.verify_values(instruction, values, current.result_types, defined, "`Yield`")
             Return(values):
                 try self.verify_values(instruction, values, function.signature.results, defined, "`Return`")
+                leaves = true
+                terminates_here = true
             Raise(failure):
                 if not function.signature.is_fallible: try self.fail_at(instruction, "`Raise` in a function that cannot fail")
                 try self.require_ptr_operand(instruction, failure, defined, "`Raise` error")
-            Trap(reason): return
-            Unreachable: return
+                leaves = true
+                terminates_here = true
+            Trap(reason):
+                leaves = true
+                terminates_here = true
+            Unreachable:
+                leaves = true
+                terminates_here = true
+        # Record what this instruction proved for the arm it sits in (after
+        # an `End`, that is the enclosing region's arm).
+        let top = regions[len(regions) - 1]
+        top.last_leaves = leaves
+        top.last_terminates = terminates_here
+
+    # An arm has ended: fold its flags into the region's, and start the next
+    # arm from the defined set the region opened with.
+    func finish_arm(region: Region, defined: list[bool]):
+        region.arms_leave = region.arms_leave and region.last_leaves
+        region.arms_terminate = region.arms_terminate and region.last_terminates
+        for index in range(0, len(defined)): defined[index] = region.defined_before[index]
+        region.last_leaves = false
+        region.last_terminates = false
 
     # mark: Instruction rules ===================================================================
 
@@ -405,13 +499,14 @@ pub class MirVerifier:
             try self.require_same(instruction, result_type, signature.results[index], "result " + str(index))
         for result in results: self.define(result, defined)
 
+    # `regions[0]` is the function body itself, which no branch may name.
     func verify_branch(instruction: MirInstruction, depth: i64, values: list[RegisterId], defined: list[bool], regions: list[Region]) -> !:
-        if depth < 0 or depth >= len(regions): try self.fail_at(instruction, "branch depth " + str(depth) + " with " + str(len(regions)) + " enclosing region(s)")
+        if depth < 0 or depth >= len(regions) - 1: try self.fail_at(instruction, "branch depth " + str(depth) + " with " + str(len(regions) - 1) + " enclosing region(s)")
         let region = regions[len(regions) - 1 - depth]
-        if region.is_loop:
+        if region.kind == RegionKind.loop_body:
             if len(values) > 0: try self.fail_at(instruction, "a branch to a `Loop` restarts it and carries no values")
             return
-        try self.verify_values(instruction, values, region.results, defined, "branch")
+        try self.verify_values(instruction, values, region.result_types, defined, "branch")
 
     func verify_values(instruction: MirInstruction, values: list[RegisterId], expected: list[TypeId], defined: list[bool], what: str) -> !:
         if len(values) != len(expected):
@@ -521,42 +616,45 @@ func copy_defined(defined: list[bool]) -> list[bool]:
     for item in defined: copied.append(item)
     return copied
 
-func push_region(regions: list[Region], region: Region) -> list[Region]:
-    let pushed = list[Region]()
-    for item in regions: pushed.append(item)
-    pushed.append(region)
-    return pushed
-
-# A body terminates when control cannot fall off its end: it ends in a
-# diverging instruction, or in an `If`/`Switch` whose every arm terminates.
+# A body terminates when control cannot fall off its end: every path ends
+# in `Return`, `Raise`, `Trap`, or `Unreachable`. The same arm bookkeeping
+# as the verifier, without the type checks, so the lowerer can ask before
+# it appends a trailing `Return` or `Unreachable`.
 pub func terminates(body: list[MirInstruction]) -> bool:
-    if len(body) == 0: return false
-    match body[len(body) - 1].form:
-        Return(values): return true
-        Raise(failure): return true
-        Trap(reason): return true
-        Unreachable: return true
-        If(condition, results, then_body, else_body): return terminates(then_body) and terminates(else_body)
-        Switch(tag, cases, default_body):
-            for item in cases:
-                if not terminates(item.body): return false
-            return terminates(default_body)
-        else: return false
+    let no_defined = list[bool]()
+    let root = Region(kind = RegionKind.function_body, results = list[RegisterId](), result_types = list[TypeId](), defined_before = no_defined)
+    let regions = [root]
+    for instruction in body:
+        let current = regions[len(regions) - 1]
+        var terminates_here = false
+        match instruction.form:
+            Block(results): regions.append(Region(kind = RegionKind.block, results = results, result_types = list[TypeId](), defined_before = no_defined))
+            Loop: regions.append(Region(kind = RegionKind.loop_body, results = list[RegisterId](), result_types = list[TypeId](), defined_before = no_defined))
+            If(condition, results): regions.append(Region(kind = RegionKind.if_region, results = results, result_types = list[TypeId](), defined_before = no_defined))
+            Switch(tag): regions.append(Region(kind = RegionKind.switch_region, results = list[RegisterId](), result_types = list[TypeId](), defined_before = no_defined))
+            Else:
+                current.seen_else = true
+                fold_arm(current)
+            Case(value):
+                if len(current.case_values) > 0: fold_arm(current)
+                current.case_values.append(value)
+            Default:
+                if len(current.case_values) > 0: fold_arm(current)
+                current.seen_default = true
+            End:
+                fold_arm(current)
+                terminates_here = current.arms_terminate
+                if current.kind == RegionKind.if_region and not current.seen_else: terminates_here = false
+                if current.kind == RegionKind.block or current.kind == RegionKind.loop_body: terminates_here = false
+                regions.remove(len(regions) - 1)
+            Return(values): terminates_here = true
+            Raise(failure): terminates_here = true
+            Trap(reason): terminates_here = true
+            Unreachable: terminates_here = true
+            else: terminates_here = false
+        regions[len(regions) - 1].last_terminates = terminates_here
+    return root.last_terminates
 
-# A region body leaves its region explicitly when it ends in a branch, a
-# yield, or a diverging instruction. A `Loop` whose body always branches
-# never falls off its end either: control leaves it only through a branch to
-# an enclosing region, which carries that region's values.
-pub func leaves_region(body: list[MirInstruction]) -> bool:
-    if len(body) == 0: return false
-    match body[len(body) - 1].form:
-        Br(depth, values): return true
-        BrIf(condition, depth, values): return false
-        Yield(values): return true
-        Loop(loop_body): return leaves_region(loop_body)
-        If(condition, results, then_body, else_body): return leaves_region(then_body) and leaves_region(else_body)
-        Switch(tag, cases, default_body):
-            for item in cases:
-                if not leaves_region(item.body): return false
-            return leaves_region(default_body)
-        else: return terminates(body)
+func fold_arm(region: Region):
+    region.arms_terminate = region.arms_terminate and region.last_terminates
+    region.last_terminates = false
