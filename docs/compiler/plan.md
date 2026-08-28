@@ -76,7 +76,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 ### Proving program 1 — the guest
 
-- [ ] **Enums and `match`**: payloads inline, exhaustiveness, `Switch` lowering (first real use of `Switch` in MIR), bindings.
+- [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [ ] **`for` and ranges.** *Gate: fallible iteration protocol.*
 - [ ] **`defer`, `try`/`catch`, `Error`**: failure-as-data ABI, `defer` duplicated onto every exit, `catch` forms; custom struct `init` rides on this.
 - [ ] **`extern` import/export** with wasm namespaces (`kino`/`lucia` imports, `lucia_alloc`/`lucia_main` exports); C signatures verified by the MIR verifier.
