@@ -104,7 +104,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [ ] Compiler builds itself under the Stage-0-subset rule; one pinned prior compiler kept forever for bootstrapping; bootstrap reproducibility checked in CI.
 - [ ] **Measure first**: lines per second of the compiler compiling itself, before any layout work. Stage-0's codegen and ARC dominate until then, so layout changes are invisible before this point.
-- [ ] **Data-oriented layout, in this order, each behind the measurement**: (1) ids and spans to `u32` (`TypeId`, `SymbolId`, `RegisterId`, `FunctionId`, `DataId`, `SourceSpan` start/end; line/column derived) — deferred from 2026-08-28 because Stage-0 indexes lists with `i64` only and has no `u32`↔`i64` mixing, which would cost ~180 conversions of noise today; (2) tiny tokens (`kind: u8, start: u32`, text recomputed); (3) MIR flattened to a linear instruction array with region-end markers — the wasm encoding, which also makes the verifier and backends single passes; (4) HIR/AST as flat node tables with an extra-data array, only if (1)–(3) leave it as the bottleneck. Generic structure-of-arrays is a library/tooling question (hand-written for the hot tables, or generated from `luce describe`), never a reason to add compile-time execution.
+- [ ] **Data-oriented layout, in this order, each behind the measurement**: (1) ~~ids to `u32`~~ done 2026-08-28 (`done.md` §2); spans to `u32` start/end with line/column derived, together with (2) tiny tokens (`kind: u8, start: u32`, text recomputed); (3) MIR flattened to a linear instruction array with region-end markers — the wasm encoding, which also makes the verifier and backends single passes; (4) HIR/AST as flat node tables with an extra-data array, only if (1)–(3) leave it as the bottleneck. Generic structure-of-arrays is a library/tooling question (hand-written for the hot tables, or generated from `luce describe`), never a reason to add compile-time execution.
 - [ ] Generated programs and fuzzing as release gates (not yet built; do not claim them).
 - [ ] Language freeze after the compiler and one host slice depend on every feature.
 
@@ -129,7 +129,7 @@ Gates — settle in `1.0.md` before the feature lands in `hir_gen`:
 
 Standing rules:
 
-- **Indices, not pointers, across stages.** Every program-wide table (`types`, `symbols`, `structs`, `functions`, `data`, registers, slots) is addressed by an integer id into a flat list; no stage hands another a pointer graph. New tables follow this. (Tree *nodes* are still ARC classes today — see the layout items in §5.)
+- **Indices, not pointers, across stages.** Every program-wide table (`types`, `symbols`, `structs`, `functions`, `data`, registers, slots) is addressed by a `u32` id into a flat list; no stage hands another a pointer graph. New tables follow this. Under Stage-0 an id is widened at the index (`items[i64(id.value)]`) because lists index with `i64` only; that noise disappears when the compiler self-hosts. (Tree *nodes* are still ARC classes today — see the layout items in §5.)
 - One source for wasm and native, with a module system that can *exclude* code rather than stub it, is a language requirement.
 - `assert` traps in every build and its condition is effect-free; checks are removed only by proof.
 - Never claim testing that is not running.
