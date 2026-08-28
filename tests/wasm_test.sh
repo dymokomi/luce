@@ -268,6 +268,115 @@ printf 'import math\nfrom math import nudge\npub func answer() -> i64: return ma
 "$cli" build "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
 expect 0 "42" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
 
+# Milestone 4: tuples, optionals, strings and bytes as values, print of a value.
+cat > "$test_dir/composites.luc" <<'LUCE'
+func pair() -> (i64, i64): return (3, 4)
+pub func destructure() -> i64:
+    let (a, b) = pair()
+    return a * 10 + b
+pub func nested() -> i64:
+    let t = ((1, 2), (3, (4, 5)))
+    let (x, y) = t
+    let (p, q) = y
+    let (r, s) = q
+    let (m, n) = x
+    return m + n + p + r + s
+pub func tuple_equality() -> i64:
+    let a = (1, true, 2.5)
+    let b = (1, true, 2.5)
+    let c = (1, false, 2.5)
+    var n = 0
+    if a == b: n += 1
+    if a != c: n += 10
+    if a == c: n += 100
+    return n
+func sum(p: (i64, i64)) -> i64:
+    let (a, b) = p
+    return a + b
+pub func tuple_parameter() -> i64: return sum((20, 22))
+pub func tuple_reassign() -> i64:
+    var t = (1, 2)
+    let (a, b) = t
+    t = (b, a)
+    let (c, d) = t
+    return c * 10 + d
+func maybe(flag: bool) -> i64?:
+    if flag: return 7
+    return none
+pub func optional_else() -> i64: return (maybe(true) else 0) * 10 + (maybe(false) else 3)
+pub func optional_equality() -> i64:
+    let a: i64? = 5
+    let b: i64? = 5
+    let c: i64? = none
+    let d: i64? = none
+    var n = 0
+    if a == b: n += 1
+    if a != c: n += 10
+    if c == d: n += 100
+    return n
+func find(flag: bool) -> (i64, i64)?:
+    if flag: return (1, 2)
+    return none
+pub func optional_tuple() -> i64:
+    let (a, b) = find(true) else (9, 9)
+    let (c, d) = find(false) else (9, 9)
+    return a + b + c + d
+pub func optional_loop() -> i64:
+    var best: i64? = none
+    var i = 0
+    while i < 5:
+        if i == 3: best = i
+        i += 1
+    return best else -1
+pub func string_equality() -> i64:
+    let a = "hello"
+    let b = "hello"
+    let c = "help"
+    let d = "hell"
+    var n = 0
+    if a == b: n += 1
+    if a != c: n += 10
+    if a == d: n += 100
+    if "" == "": n += 1000
+    return n
+func pick(flag: bool) -> str:
+    if flag: return "yes"
+    return "no"
+func is_yes(s: str) -> bool: return s == "yes"
+pub func string_values() -> i64: return (1 if is_yes(pick(true)) else 0) + (2 if is_yes(pick(false)) else 0)
+pub func bytes_equality() -> i64:
+    let a = b"ab"
+    let c = b"ab"
+    let d = b"ac"
+    return (1 if a == c else 0) + (2 if a == d else 0)
+pub func string_in_tuple() -> i64:
+    let a = ("x", 1)
+    let b = ("x", 1)
+    let c = ("y", 1)
+    return (1 if a == b else 0) + (2 if a == c else 0)
+LUCE
+"$cli" build "$test_dir/composites.wasm" "$test_dir/composites.luc" >/dev/null
+composite() { expect 0 "$2" wasmtime run --invoke "composites.$1" "$test_dir/composites.wasm"; }
+composite destructure 34
+composite nested 15
+composite tuple_equality 11
+composite tuple_parameter 42
+composite tuple_reassign 21
+composite optional_else 73
+composite optional_equality 111
+composite optional_tuple 21
+composite optional_loop 3
+composite string_equality 1011
+composite string_values 1
+composite bytes_equality 1
+composite string_in_tuple 1
+
+printf 'func pick() -> str: return "yes"\npub func main(arguments: slice[str]) -> i32:\n    let greeting = "hi there"\n    print(greeting)\n    print(pick())\n    print("done")\n    return 0\n' > "$test_dir/print_value.luc"
+"$cli" build "$test_dir/print_value.wasm" "$test_dir/print_value.luc" >/dev/null
+expect 0 "hi there
+yes
+done" wasmtime run "$test_dir/print_value.wasm"
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:

@@ -81,10 +81,15 @@ examples and tests link back here rather than restating it.
   explicit memory with target layout, structured control flow, calls to a
   named runtime, failure as data — see [docs/compiler/mir.md](docs/compiler/mir.md))
   and has a verifier and its own interpreter covering every instruction.
-- The compiled slice is one language — checked i32/i64 arithmetic, `print`,
-  and `return` — lowered to canonical MIR and encoded as WebAssembly, ARM64
-  Mach-O, or x86-64 ELF. Native executables start at `main`; WebAssembly
-  exports every public function.
+- The compiled slice — every scalar type with checked arithmetic, locals,
+  every operator, `if`/`while`, functions and calls across modules, module
+  constants, tuples, optionals, `str`/`bytes` values with equality, and
+  `print` of a literal or a `str` value — is lowered to canonical MIR and
+  encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
+  Mach-O and x86-64 ELF writers still cover only the original slice (checked
+  i32/i64 arithmetic, `print` of a literal, `return`); see
+  `docs/compiler/plan.md` §4 for why. Native executables start at `main`;
+  WebAssembly exports every public function.
 - The test suite exercises the frontend, semantic model, both interpreters,
   lowering, MIR verification, each artifact encoder, the command line's exit
   statuses and diagnostics, and runs every fixture through the HIR

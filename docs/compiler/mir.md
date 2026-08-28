@@ -404,11 +404,19 @@ each is bound (wasm import versus linker symbol).
 | `Func(signature)` | what a function pointer points at |
 
 How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
-unsigned)`; `str`, `bytes`, `list`, `map`, `set` → `Ptr` to runtime storage;
-`T?` → two-case `Enum`, or a null niche when `T` is a reference; a `T!`
-result → two registers, never a type; tuples → anonymous `Struct`; class
-references and `weak` → `Ptr` managed by the runtime; interface values → a
-two-`Ptr` `Struct`.
+unsigned)`; `str` and `bytes` → a `{Ptr, Int(64)}` `Struct` (address and
+length; a literal's bytes are a data item); `list`, `map`, `set` → `Ptr` to
+runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
+references is still open); a `T!` result → two registers, never a type;
+tuples → anonymous `Struct`; class references and `weak` → `Ptr` managed by
+the runtime; interface values → a two-`Ptr` `Struct`.
+
+Aggregates never sit in a register. The lowerer's protocol: a register of
+aggregate type holds the value's *address* (a slot, a field, a parameter's
+pointer), copies are explicit `Memcpy`s, a function returning an aggregate
+takes a hidden leading `Ptr` parameter for the caller's result slot and
+returns nothing, and an aggregate parameter is passed by pointer (safe
+because parameters are immutable).
 
 ### Functions, externs, globals, data
 

@@ -13,7 +13,7 @@
 
 from luce.compiler.backends.interpreter import HirInterpreter
 from luce.compiler.backends.mir_interpreter import MirInterpreter, MirValue
-from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, MirFunction, MirInstruction, MirProgram, TypeId, UnaryOp
+from luce.compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, MirFunction, MirInstruction, MirProgram, TargetLayout, TypeId, UnaryOp
 from luce.compiler.canonical_ir import builtin_mir_type, wasm32_layout, arm64_macos_layout
 from luce.compiler.hir import Value
 from luce.compiler.hir_gen import HirGenerator, SourceModule
@@ -45,7 +45,10 @@ pub func checked_modules(modules: list[SourceModule]) -> AnalyzedProgram:
 
 # Lower one fixture for wasm32 and prove the verifier accepts the result.
 pub func lowered(source: str) -> MirProgram:
-    let program = Lowerer(checked(source), wasm32_layout()).lower() catch reason:
+    return lowered_for(source, wasm32_layout())
+
+pub func lowered_for(source: str, layout: TargetLayout) -> MirProgram:
+    let program = Lowerer(checked(source), layout).lower() catch reason:
         trap(reason)
     MirVerifier(program).verify() catch reason:
         trap(reason)
@@ -581,16 +584,16 @@ pub func larger(a: i64, b: i64) -> i64:
 # mark: Diagnostics =========================================================================
 
 pub func test_unsupported_lowering_names_the_function_and_feature():
-    let reason = lowering_failure("func identity(value: (i64, i64)) -> i64: return 1\n")
-    assert(reason == "main.luc:1:1: lowerer does not support type `(i64, i64)` yet in `main.identity`")
+    let reason = lowering_failure("func count(items: slice[str]) -> i64: return 1\n")
+    assert(reason == "main.luc:1:1: lowerer does not support type `slice[str]` yet in `main.count`")
 
 pub func test_unsupported_lowering_reports_the_offending_node_span():
-    let expression_source = "pub func answer() -> i64:\n    let pair = (1, 2)\n    return 0\n"
-    assert(lowering_failure(expression_source) == "main.luc:2:5: lowerer does not support type `(i64, i64)` yet in `main.answer`")
+    let expression_source = "pub func main(arguments: slice[str]) -> i32:\n    let items = arguments\n    return 0\n"
+    assert(lowering_failure(expression_source) == "main.luc:2:5: lowerer does not support type `slice[str]` yet in `main.main`")
 
 pub func test_unsupported_types_stop_at_the_lowerer():
-    let reason = lowering_failure("pub func answer() -> str: return \"x\"\n")
-    assert(reason == "main.luc:1:1: lowerer does not support type `str` yet in `main.answer`")
+    let reason = lowering_failure("func first(items: slice[str]) -> slice[str]: return items\n")
+    assert(reason == "main.luc:1:1: lowerer does not support type `slice[str]` yet in `main.first`")
 
 # mark: Calls, parameters, and constants ===================================================
 
@@ -712,3 +715,84 @@ pub func test_unit_calls_for_effect_write_output_through_mir():
 
 pub func test_overflow_inside_a_callee_traps_on_both_executions():
     both_trap("func bump(v: i8) -> i8: return v + 1\npub func answer() -> i8: return bump(127)\n")
+
+# mark: Aggregates ==========================================================================
+
+pub func test_aggregate_results_use_a_hidden_pointer_parameter():
+    let program = lowered("func pair() -> (i64, i64): return (3, 4)\n")
+    let function = only_function(program)
+    assert(len(function.signature.parameters) == 1)
+    assert(is_type(function.signature.parameters[0], BuiltinMirType.pointer))
+    assert(len(function.signature.results) == 0)
+    # The body ends by copying the tuple into the caller's slot and returning nothing.
+    let last = function.body[len(function.body) - 1]
+    match last.form:
+        Return(values): assert(len(values) == 0)
+        else: assert(false)
+    match function.body[len(function.body) - 2].form:
+        Memcpy(destination, source, value_type):
+            assert(destination.value == 0)
+            match program.types.definitions[value_type.value]:
+                Struct(fields, size, align):
+                    assert(len(fields) == 2)
+                    assert(size == 16)
+                else: assert(false)
+        else: assert(false)
+
+pub func test_aggregate_callers_pass_their_slot_first():
+    let program = lowered("func pair() -> (i64, i64): return (3, 4)\npub func answer() -> i64:\n    let (a, b) = pair()\n    return a + b\n")
+    let caller = program.functions[1]
+    var calls = 0
+    for instruction in caller.body:
+        match instruction.form:
+            Call(results, function, arguments):
+                calls += 1
+                assert(len(results) == 0)
+                assert(len(arguments) == 1)
+                assert(is_type(caller.registers[arguments[0].value], BuiltinMirType.pointer))
+            else: continue
+    assert(calls == 1)
+
+pub func test_optionals_are_tagged_enums_with_the_payload_after_the_tag():
+    let program = lowered("func maybe() -> i64?: return none\n")
+    let function = only_function(program)
+    # A hidden pointer parameter, since an optional is an aggregate.
+    assert(is_type(function.signature.parameters[0], BuiltinMirType.pointer))
+    let slot_type = function.slots[0].value_type
+    match program.types.definitions[slot_type.value]:
+        Enum(tag, cases, size, align):
+            assert(is_type(tag, BuiltinMirType.unsigned_u8))
+            assert(len(cases) == 2)
+            assert(align == 8)
+            assert(size == 16)
+        else: assert(false)
+
+pub func test_strings_are_pointer_and_length_from_a_data_item():
+    let program = lowered("pub func answer() -> i64:\n    let s = \"abc\"\n    print(s)\n    return 0\n")
+    let function = only_function(program)
+    assert(len(program.data) == 2)
+    assert(len(program.data[0].bytes) == 3)
+    assert(len(program.data[1].bytes) == 1)
+    var writes = 0
+    for instruction in function.body:
+        match instruction.form:
+            CallExtern(results, external, arguments): writes += 1
+            else: continue
+    assert(writes == 2)
+    match program.types.definitions[function.slots[0].value_type.value]:
+        Struct(fields, size, align):
+            assert(len(fields) == 2)
+            assert(is_type(fields[0].value_type, BuiltinMirType.pointer))
+            assert(is_type(fields[1].value_type, BuiltinMirType.signed_i64))
+        else: assert(false)
+
+pub func test_string_layout_follows_the_target():
+    let source = "pub func answer() -> i64:\n    let s = \"abc\"\n    return 0\n"
+    let wasm = lowered_for(source, wasm32_layout())
+    let native = lowered_for(source, arm64_macos_layout())
+    match wasm.types.definitions[only_function(wasm).slots[0].value_type.value]:
+        Struct(fields, size, align): assert(fields[1].offset == 8 and size == 16)
+        else: assert(false)
+    match native.types.definitions[only_function(native).slots[0].value_type.value]:
+        Struct(fields, size, align): assert(fields[1].offset == 8 and size == 16)
+        else: assert(false)

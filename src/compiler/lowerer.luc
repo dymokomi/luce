@@ -16,15 +16,31 @@
 #       `f32`/`f64`, `bool`, `char`), `let`/`var` locals with plain and
 #       compound assignment, every unary and binary operator including
 #       short-circuit `and`/`or` and the conditional expression, `if`/`elif`/
-#       `else`, `while` with `break` and `continue`, functions with scalar
-#       parameters and direct calls between them across modules, module
-#       constants, constant terminal output, and returning. The slice
-#       boundary lives here, not in canonical MIR — aggregate types, strings,
-#       optionals, and failure all reach the lowerer as HIR and stop with
-#       "does not support ... yet" until this file emits the instructions
-#       for them. `main(arguments: slice[str])` is the 1.0 entry signature
-#       (docs/language/1.0.md §23); its argument is dropped until slices
-#       exist, so the MIR entry is `() -> i32`.
+#       `else`, `while` with `break` and `continue`, functions with direct
+#       calls between them across modules, module constants, tuples,
+#       optionals, `str` and `bytes` values with equality, terminal output of
+#       a literal or a `str` value, and returning. The slice boundary lives
+#       here, not in canonical MIR — failure, classes, and collections reach
+#       the lowerer as HIR and stop with "does not support ... yet" until this
+#       file emits the instructions for them. `main(arguments: slice[str])`
+#       is the 1.0 entry signature (docs/language/1.0.md §23); its argument
+#       is dropped until slices exist, so the MIR entry is `() -> i32`.
+#
+#       Aggregates — tuples, optionals, `str`, `bytes` — never sit in a
+#       register. A value of aggregate type lives in memory, and the register
+#       an expression of that type produces holds its *address*: a temporary
+#       slot the expression filled, a local's slot, a field inside another
+#       aggregate, or a parameter's pointer. Copies are explicit `Memcpy`s at
+#       a binding, an assignment, a tuple element, a `some` payload, or a
+#       `return`. A tuple is a struct of its elements; an optional is an enum
+#       with a `u8` tag (0 absent, 1 present) and the payload after it; `str`
+#       and `bytes` are `{pointer, i64 length}` whose bytes are a data item
+#       for a literal. A function returning an aggregate takes a hidden
+#       leading `pointer` parameter — the caller's slot for the result — and
+#       returns nothing; an aggregate parameter is passed as a pointer, which
+#       is safe because parameters are immutable. Layout comes from the
+#       `TargetLayout`, so the MIR of a tuple-heavy program differs between
+#       wasm32 and arm64 exactly where offsets differ.
 #
 #       Parameters are the leading registers of a function (`r0..rN-1`), as
 #       canonical MIR requires; a parameter is immutable in Luce, so a
@@ -52,10 +68,11 @@
 from compiler.canonical_ir import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, FunctionId
 from compiler.canonical_ir import InstructionForm, MirConstant, MirData, MirExtern, MirFunction, MirGlobal, MirInstruction
 from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSlot, MirTypeTable, RegisterId
-from compiler.canonical_ir import TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
-from compiler.canonical_ir import find_runtime_symbol, size_of
+from compiler.canonical_ir import MirType, TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
+from compiler.canonical_ir import align_of, enum_payload_offset, find_runtime_symbol, intern_mir_type, make_enum_type
+from compiler.canonical_ir import make_struct_type, mir_type, size_of
 from compiler.hir import BinaryOperation, BuiltinType, HirArgument, HirConstant, HirExpression, HirFunction
-from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, describe_type
+from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, TypeForm, describe_type
 from compiler.hir import resolve_builtin_type, types_match
 import compiler.hir
 from compiler.mir_verifier import terminates
@@ -91,6 +108,11 @@ pub class Lowerer:
     locals: list[Local]
     parameters: list[Local]
     regions: list[Region]
+    # The hidden result pointer of a function returning an aggregate (`-1`
+    # when the function returns a scalar or nothing), and the data item
+    # holding the newline `print` writes after a value (`-1` until first use).
+    result_slot: i64
+    newline_data: i64
 
     ## Prepare to lower one analyzed program for one target; `lower` walks it.
     pub init(program: AnalyzedProgram, layout: TargetLayout):
@@ -104,6 +126,8 @@ pub class Lowerer:
         self.locals = list[Local]()
         self.parameters = list[Local]()
         self.regions = list[Region]()
+        self.result_slot = -1
+        self.newline_data = -1
 
     # mark: Lowering ============================================================================
 
@@ -140,16 +164,23 @@ pub class Lowerer:
         self.locals = list[Local]()
         self.parameters = list[Local]()
         self.regions = list[Region]()
+        self.result_slot = -1
         let parameter_types = list[TypeId]()
-        if not is_entry:
-            for parameter in function.parameters:
-                let parameter_type = try self.mir_type_of(module, function, function.span, parameter.value_type)
-                parameter_types.append(parameter_type)
-                self.parameters.append(Local(symbol = parameter.symbol.value, address = self.new_register(parameter_type)))
         let results = list[TypeId]()
         let returns_unit = types_match(function.result, resolve_builtin_type(BuiltinType.unit))
         if not returns_unit:
-            results.append(try self.mir_type_of(module, function, function.span, function.result))
+            let result_type = try self.mir_type_of(module, function, function.span, function.result)
+            if self.is_aggregate(result_type):
+                let pointer = builtin_mir_type(BuiltinMirType.pointer)
+                parameter_types.append(pointer)
+                self.result_slot = self.new_register(pointer).value
+            else:
+                results.append(result_type)
+        if not is_entry:
+            for parameter in function.parameters:
+                let parameter_type = self.register_type_for(try self.mir_type_of(module, function, function.span, parameter.value_type))
+                parameter_types.append(parameter_type)
+                self.parameters.append(Local(symbol = parameter.symbol.value, address = self.new_register(parameter_type)))
 
         let body = list[MirInstruction]()
         try self.lower_prologue(module, function, function.body, body)
@@ -185,7 +216,7 @@ pub class Lowerer:
                 Binding(symbol, name, is_mutable, value):
                     let slot_type = try self.mir_type_of(module, function, statement.span, value.value_type)
                     let slot = len(self.slots)
-                    self.slots.append(MirSlot(value_type = slot_type, align = size_of(self.types, self.layout, slot_type)))
+                    self.slots.append(MirSlot(value_type = slot_type, align = align_of(self.types, self.layout, slot_type)))
                     let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
                     body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = statement.span))
                     self.locals.append(Local(symbol = symbol.value, address = address))
@@ -204,18 +235,26 @@ pub class Lowerer:
         match statement.form:
             PrintText(value):
                 try self.lower_print(value, statement.span, body)
+            PrintValue(value):
+                try self.lower_print_value(module, function, value, statement.span, body)
             ReturnStatement(value):
                 if value == none:
                     body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = statement.span))
                     return
                 let returned = value
                 let register = try self.lower_expression(module, function, returned, body)
+                if self.result_slot >= 0:
+                    # The caller owns the result's memory; fill it and return nothing.
+                    let value_type = try self.mir_type_of(module, function, statement.span, returned.value_type)
+                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = self.result_slot), source = register, value_type = value_type), span = statement.span))
+                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = statement.span))
+                    return
                 body.append(MirInstruction(form = InstructionForm.Return(values = [register]), span = statement.span))
             Binding(symbol, name, is_mutable, value):
                 let local = try self.local_of(module, function, statement.span, symbol)
                 let register = try self.lower_expression(module, function, value, body)
                 let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
-                body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = local.address, value = register), span = statement.span))
+                self.store_value(value_type, local.address, register, statement.span, body)
             Assignment(symbol, operation, value):
                 let local = try self.local_of(module, function, statement.span, symbol)
                 let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
@@ -227,7 +266,7 @@ pub class Lowerer:
                         let current = self.new_register(value_type)
                         body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = local.address), span = statement.span))
                         stored = try self.lower_binary_operation(module, function, statement.span, binary, value_type, current, register, body)
-                body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = local.address, value = stored), span = statement.span))
+                self.store_value(value_type, local.address, stored, statement.span, body)
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
             IfStatement(branches, fallback):
@@ -322,6 +361,25 @@ pub class Lowerer:
             span = span,
         ))
 
+    # `print(value)` for a `str` value: write its bytes, then a newline.
+    func lower_print_value(module: HirModule, function: HirFunction, value: HirExpression, span: SourceSpan, body: list[MirInstruction]) -> !:
+        let text = try self.lower_expression(module, function, value, body)
+        let text_type = try self.mir_type_of(module, function, span, value.value_type)
+        let pointer = try self.load_field(text_type, text, 0, span, body)
+        let length = try self.load_field(text_type, text, 1, span, body)
+        let write = try self.runtime_extern("luce_rt_write")
+        body.append(MirInstruction(form = InstructionForm.CallExtern(results = list[RegisterId](), external = write, arguments = [pointer, length]), span = span))
+        if self.newline_data < 0: self.newline_data = self.add_data("newline", strings.to_bytes("\n"))
+        let newline = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.DataAddress(result = newline, data = DataId(value = self.newline_data)), span = span))
+        let one = self.new_register(builtin_mir_type(BuiltinMirType.signed_i64))
+        body.append(MirInstruction(form = InstructionForm.Const(result = one, value = MirConstant.Int(value = 1)), span = span))
+        body.append(MirInstruction(form = InstructionForm.CallExtern(results = list[RegisterId](), external = write, arguments = [newline, one]), span = span))
+
+    func add_data(prefix: str, payload: list[u8]) -> i64:
+        self.data.append(MirData(name = prefix + str(len(self.data)), bytes = payload, align = 1, relocations = list[MirRelocation]()))
+        return len(self.data) - 1
+
     # mark: Expressions =========================================================================
 
     # Lower one expression and return the register holding its value.
@@ -339,14 +397,16 @@ pub class Lowerer:
         let value_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
         match expression.form:
             Constant(value):
-                let register = self.new_register(value_type)
                 var constant = MirConstant.Null
                 match value:
                     Integer(item): constant = MirConstant.Int(value = item)
                     Floating(item): constant = MirConstant.Float(value = item)
                     Boolean(item): constant = MirConstant.Bool(value = item)
                     Character(item): constant = MirConstant.Int(value = i64(u32(item)))
+                    Text(item): return try self.lower_byte_constant(value_type, strings.to_bytes(item), expression.span, body)
+                    Bytes(item): return try self.lower_byte_constant(value_type, item, expression.span, body)
                     else: try self.fail_unsupported(module, function, expression.span, "constant `" + str(value) + "`")
+                let register = self.new_register(value_type)
                 body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = expression.span))
                 return register
             Reference(symbol):
@@ -356,9 +416,49 @@ pub class Lowerer:
                 if constant != none:
                     return try self.lower_expression(module, function, constant.value, body)
                 let local = try self.local_of(module, function, expression.span, symbol)
-                let register = self.new_register(value_type)
-                body.append(MirInstruction(form = InstructionForm.Load(result = register, value_type = value_type, address = local.address), span = expression.span))
-                return register
+                return self.load_value(value_type, local.address, expression.span, body)
+            Tuple(elements):
+                # Fill a fresh slot field by field; the slot's address is the value.
+                let temp = self.new_temp(value_type, expression.span, body)
+                for index in range(0, len(elements)):
+                    let element = try self.lower_expression(module, function, elements[index], body)
+                    let element_type = try self.mir_type_of(module, function, elements[index].span, elements[index].value_type)
+                    let field = self.field_address(value_type, temp, index, expression.span, body)
+                    self.store_value(element_type, field, element, expression.span, body)
+                return temp
+            Element(tuple_value, index):
+                let base = try self.lower_expression(module, function, tuple_value, body)
+                let tuple_type = try self.mir_type_of(module, function, tuple_value.span, tuple_value.value_type)
+                let field = self.field_address(tuple_type, base, index, expression.span, body)
+                return self.load_value(value_type, field, expression.span, body)
+            NoneLiteral:
+                let temp = self.new_temp(value_type, expression.span, body)
+                self.store_tag(temp, 0, expression.span, body)
+                return temp
+            Some(inner):
+                let temp = self.new_temp(value_type, expression.span, body)
+                self.store_tag(temp, 1, expression.span, body)
+                let payload = try self.lower_expression(module, function, inner, body)
+                let payload_type = try self.mir_type_of(module, function, inner.span, inner.value_type)
+                let payload_address = self.payload_address(value_type, temp, expression.span, body)
+                self.store_value(payload_type, payload_address, payload, expression.span, body)
+                return temp
+            ElseFallback(optional_value, arm):
+                # `If(tag == 1)`: the present arm yields the payload, the
+                # absent arm evaluates and yields the fallback.
+                let optional = try self.lower_expression(module, function, optional_value, body)
+                let optional_type = try self.mir_type_of(module, function, optional_value.span, optional_value.value_type)
+                let present = self.load_present(optional, expression.span, body)
+                let result = self.new_register(self.register_type_for(value_type))
+                let then_body = list[MirInstruction]()
+                let payload_address = self.payload_address(optional_type, optional, expression.span, then_body)
+                let payload = self.load_value(value_type, payload_address, expression.span, then_body)
+                then_body.append(MirInstruction(form = InstructionForm.Yield(values = [payload]), span = expression.span))
+                let else_body = list[MirInstruction]()
+                let fallback = try self.lower_expression(module, function, arm, else_body)
+                else_body.append(MirInstruction(form = InstructionForm.Yield(values = [fallback]), span = expression.span))
+                body.append(MirInstruction(form = InstructionForm.If(condition = present, results = [result], then_body = then_body, else_body = else_body), span = expression.span))
+                return result
             Unary(operation, operand):
                 let operand_register = try self.lower_expression(module, function, operand, body)
                 let register = self.new_register(value_type)
@@ -380,10 +480,12 @@ pub class Lowerer:
                         let left_register = try self.lower_expression(module, function, left, body)
                         let right_register = try self.lower_expression(module, function, right, body)
                         let operand_type = try self.mir_type_of(module, function, left.span, left.value_type)
+                        if self.is_aggregate(operand_type):
+                            return try self.lower_aggregate_comparison(module, function, expression.span, operation, left.value_type, left_register, right_register, body)
                         return try self.lower_binary_operation(module, function, expression.span, operation, operand_type, left_register, right_register, body)
             Conditional(value, condition, alternative):
                 let condition_register = try self.lower_expression(module, function, condition, body)
-                let result = self.new_register(value_type)
+                let result = self.new_register(self.register_type_for(value_type))
                 let then_body = list[MirInstruction]()
                 let chosen = try self.lower_expression(module, function, value, then_body)
                 then_body.append(MirInstruction(form = InstructionForm.Yield(values = [chosen]), span = expression.span))
@@ -412,7 +514,16 @@ pub class Lowerer:
             placed[argument.parameter_index] = try self.lower_expression(module, function, argument.value, body)
         let results = list[RegisterId]()
         if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
-            results.append(self.new_register(try self.mir_type_of(module, function, expression.span, called.result)))
+            let result_type = try self.mir_type_of(module, function, expression.span, called.result)
+            if self.is_aggregate(result_type):
+                # The callee fills the caller's slot through its hidden first
+                # parameter, so the slot's address leads the arguments.
+                let result_temp = self.new_temp(result_type, expression.span, body)
+                let with_slot = [result_temp]
+                for argument in placed: with_slot.append(argument)
+                body.append(MirInstruction(form = InstructionForm.Call(results = results, function = FunctionId(value = target), arguments = with_slot), span = expression.span))
+                return result_temp
+            results.append(self.new_register(result_type))
         body.append(MirInstruction(
             form = InstructionForm.Call(results = results, function = FunctionId(value = target), arguments = placed),
             span = expression.span,
@@ -486,6 +597,239 @@ pub class Lowerer:
         ))
         return register
 
+    # mark: Aggregates ==========================================================================
+    #
+    # The helpers below implement the memory protocol described in the header:
+    # a register of aggregate type is an address, copies are `Memcpy`, and
+    # scalars inside an aggregate are reached through `FieldAddress`.
+
+    func is_aggregate(value_type: TypeId) -> bool:
+        match mir_type(self.types, value_type):
+            Struct(fields, size, align): return true
+            Enum(tag, cases, size, align): return true
+            Array(element, count): return true
+            else: return false
+
+    # The type of the register holding a value of `value_type`.
+    func register_type_for(value_type: TypeId) -> TypeId:
+        if self.is_aggregate(value_type): return builtin_mir_type(BuiltinMirType.pointer)
+        return value_type
+
+    # A fresh slot for a temporary aggregate, allocated where it is needed;
+    # the backend sizes the frame from `slots` regardless of where the
+    # `Alloca` sits.
+    func new_temp(value_type: TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let slot = len(self.slots)
+        self.slots.append(MirSlot(value_type = value_type, align = align_of(self.types, self.layout, value_type)))
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = span))
+        return address
+
+    # Put a value at an address: `Memcpy` for an aggregate, `Store` otherwise.
+    func store_value(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        if self.is_aggregate(value_type):
+            body.append(MirInstruction(form = InstructionForm.Memcpy(destination = address, source = value, value_type = value_type), span = span))
+        else:
+            body.append(MirInstruction(form = InstructionForm.Store(value_type = value_type, address = address, value = value), span = span))
+
+    # Read a value at an address: the address itself for an aggregate (no
+    # copy until it is stored somewhere), a `Load` otherwise.
+    func load_value(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if self.is_aggregate(value_type): return address
+        let register = self.new_register(value_type)
+        body.append(MirInstruction(form = InstructionForm.Load(result = register, value_type = value_type, address = address), span = span))
+        return register
+
+    func field_address(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.FieldAddress(result = address, struct_type = struct_type, base = base, field = field), span = span))
+        return address
+
+    # The scalar field `field` of the struct at `base`, loaded.
+    func load_field(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        match mir_type(self.types, struct_type):
+            Struct(fields, size, align):
+                return self.load_value(fields[field].value_type, self.field_address(struct_type, base, field, span, body), span, body)
+            else: error("lowerer: field of a non-struct type")
+
+    # An optional's payload sits `enum_payload_offset` bytes after its tag;
+    # the offset is a byte count, so it is an `ElementAddress` with a `u8`
+    # stride.
+    func payload_address(enum_type: TypeId, base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let offset = self.new_register(builtin_mir_type(BuiltinMirType.signed_i64))
+        body.append(MirInstruction(form = InstructionForm.Const(result = offset, value = MirConstant.Int(value = enum_payload_offset(self.types, self.layout, enum_type))), span = span))
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ElementAddress(result = address, element_type = builtin_mir_type(BuiltinMirType.unsigned_u8), base = base, index = offset), span = span))
+        return address
+
+    func store_tag(base: RegisterId, tag: i64, span: SourceSpan, body: list[MirInstruction]):
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let value = self.new_register(byte_type)
+        body.append(MirInstruction(form = InstructionForm.Const(result = value, value = MirConstant.Int(value = tag)), span = span))
+        body.append(MirInstruction(form = InstructionForm.Store(value_type = byte_type, address = base, value = value), span = span))
+
+    # `tag == 1` as a bool register.
+    func load_present(base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let tag = self.new_register(byte_type)
+        body.append(MirInstruction(form = InstructionForm.Load(result = tag, value_type = byte_type, address = base), span = span))
+        let one = self.new_register(byte_type)
+        body.append(MirInstruction(form = InstructionForm.Const(result = one, value = MirConstant.Int(value = 1)), span = span))
+        let present = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = present, operation = BinaryOp.eq, left = tag, right = one), span = span))
+        return present
+
+    # A `str` or `bytes` literal: its bytes become a data item and the value
+    # is a fresh `{pointer, length}` slot.
+    func lower_byte_constant(value_type: TypeId, payload: list[u8], span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let data_id = self.add_data("bytes", payload)
+        let temp = self.new_temp(value_type, span, body)
+        let pointer = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.DataAddress(result = pointer, data = DataId(value = data_id)), span = span))
+        let pointer_field = self.field_address(value_type, temp, 0, span, body)
+        body.append(MirInstruction(form = InstructionForm.Store(value_type = builtin_mir_type(BuiltinMirType.pointer), address = pointer_field, value = pointer), span = span))
+        let length = self.new_register(builtin_mir_type(BuiltinMirType.signed_i64))
+        body.append(MirInstruction(form = InstructionForm.Const(result = length, value = MirConstant.Int(value = len(payload))), span = span))
+        let length_field = self.field_address(value_type, temp, 1, span, body)
+        body.append(MirInstruction(form = InstructionForm.Store(value_type = builtin_mir_type(BuiltinMirType.signed_i64), address = length_field, value = length), span = span))
+        return temp
+
+    func bool_constant(value: bool, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let register = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Bool(value = value)), span = span))
+        return register
+
+    # mark: Aggregate equality ==================================================================
+    #
+    # Aggregates support `==` and `!=` only. Equality is structural and short-
+    # circuits: `If(so_far, then: next test, else: false)`, so an unequal
+    # tuple element or length stops the comparison there.
+
+    func lower_aggregate_comparison(module: HirModule, function: HirFunction, span: SourceSpan, operation: BinaryOperation, operand_type: hir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        var negate = false
+        match operation:
+            Equal(item): negate = false
+            NotEqual(item): negate = true
+            else: try self.fail_unsupported(module, function, span, "operation `" + str(operation) + "` on `" + describe_type(self.program.types, operand_type) + "`")
+        let equal = try self.lower_equality(module, function, span, operand_type, left, right, body)
+        if not negate: return equal
+        let unequal = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Unary(result = unequal, operation = UnaryOp.bool_not, operand = equal), span = span))
+        return unequal
+
+    # `left == right` for any HIR type, given registers under the aggregate
+    # protocol (addresses for aggregates, values for scalars).
+    func lower_equality(module: HirModule, function: HirFunction, span: SourceSpan, value_type: hir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let mir_value_type = try self.mir_type_of(module, function, span, value_type)
+        if not self.is_aggregate(mir_value_type):
+            return try self.lower_binary_operation(module, function, span, BinaryOperation.Equal(operand_type = value_type), mir_value_type, left, right, body)
+        match self.program.types.definitions[value_type.value].form:
+            Tuple(elements):
+                var so_far = self.bool_constant(true, span, body)
+                for index in range(0, len(elements)):
+                    let left_field = self.field_address(mir_value_type, left, index, span, body)
+                    let right_field = self.field_address(mir_value_type, right, index, span, body)
+                    let element_type = try self.mir_type_of(module, function, span, elements[index])
+                    let left_value = self.load_value(element_type, left_field, span, body)
+                    let right_value = self.load_value(element_type, right_field, span, body)
+                    so_far = try self.lower_and_then(module, function, span, so_far, elements[index], left_value, right_value, body)
+                return so_far
+            Optional(inner):
+                # Tags equal, and when both are present, payloads equal.
+                let left_present = self.load_present(left, span, body)
+                let right_present = self.load_present(right, span, body)
+                let tags_equal = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = tags_equal, operation = BinaryOp.eq, left = left_present, right = right_present), span = span))
+                let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                let then_body = list[MirInstruction]()
+                let inner_type = try self.mir_type_of(module, function, span, inner)
+                let left_payload = self.load_value(inner_type, self.payload_address(mir_value_type, left, span, then_body), span, then_body)
+                let right_payload = self.load_value(inner_type, self.payload_address(mir_value_type, right, span, then_body), span, then_body)
+                let payloads_equal = try self.lower_equality(module, function, span, inner, left_payload, right_payload, then_body)
+                then_body.append(MirInstruction(form = InstructionForm.Yield(values = [payloads_equal]), span = span))
+                let else_body = list[MirInstruction]()
+                let absent = self.bool_constant(true, span, else_body)
+                else_body.append(MirInstruction(form = InstructionForm.Yield(values = [absent]), span = span))
+                let both_present = list[MirInstruction]()
+                let compared = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                both_present.append(MirInstruction(form = InstructionForm.If(condition = left_present, results = [compared], then_body = then_body, else_body = else_body), span = span))
+                both_present.append(MirInstruction(form = InstructionForm.Yield(values = [compared]), span = span))
+                let unequal_tags = list[MirInstruction]()
+                let no = self.bool_constant(false, span, unequal_tags)
+                unequal_tags.append(MirInstruction(form = InstructionForm.Yield(values = [no]), span = span))
+                body.append(MirInstruction(form = InstructionForm.If(condition = tags_equal, results = [result], then_body = both_present, else_body = unequal_tags), span = span))
+                return result
+            String: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
+            Bytes: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
+            else: error(self.unsupported(module, function, span, "equality on `" + describe_type(self.program.types, value_type) + "`"))
+
+    # `so_far and left == right`, evaluated only when `so_far` holds.
+    func lower_and_then(module: HirModule, function: HirFunction, span: SourceSpan, so_far: RegisterId, value_type: hir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        let then_body = list[MirInstruction]()
+        let equal = try self.lower_equality(module, function, span, value_type, left, right, then_body)
+        then_body.append(MirInstruction(form = InstructionForm.Yield(values = [equal]), span = span))
+        let else_body = list[MirInstruction]()
+        let no = self.bool_constant(false, span, else_body)
+        else_body.append(MirInstruction(form = InstructionForm.Yield(values = [no]), span = span))
+        body.append(MirInstruction(form = InstructionForm.If(condition = so_far, results = [result], then_body = then_body, else_body = else_body), span = span))
+        return result
+
+    # Same length, then the same bytes: a counter in a slot drives a loop
+    # that leaves its block with `false` at the first mismatch and `true`
+    # when the counter reaches the length.
+    func lower_bytes_equality(text_type: TypeId, left: RegisterId, right: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let i64_type = builtin_mir_type(BuiltinMirType.signed_i64)
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let left_length = try self.load_field(text_type, left, 1, span, body)
+        let right_length = try self.load_field(text_type, right, 1, span, body)
+        let same_length = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = same_length, operation = BinaryOp.eq, left = left_length, right = right_length), span = span))
+        let result = self.new_register(boolean)
+
+        let then_body = list[MirInstruction]()
+        let left_bytes = try self.load_field(text_type, left, 0, span, then_body)
+        let right_bytes = try self.load_field(text_type, right, 0, span, then_body)
+        let counter = self.new_temp(i64_type, span, then_body)
+        let zero = self.new_register(i64_type)
+        then_body.append(MirInstruction(form = InstructionForm.Const(result = zero, value = MirConstant.Int(value = 0)), span = span))
+        then_body.append(MirInstruction(form = InstructionForm.Store(value_type = i64_type, address = counter, value = zero), span = span))
+        let loop_body = list[MirInstruction]()
+        let index = self.new_register(i64_type)
+        loop_body.append(MirInstruction(form = InstructionForm.Load(result = index, value_type = i64_type, address = counter), span = span))
+        let done = self.new_register(boolean)
+        loop_body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = left_length), span = span))
+        let yes = self.bool_constant(true, span, loop_body)
+        loop_body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = [yes]), span = span))
+        let left_address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        loop_body.append(MirInstruction(form = InstructionForm.ElementAddress(result = left_address, element_type = byte_type, base = left_bytes, index = index), span = span))
+        let right_address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        loop_body.append(MirInstruction(form = InstructionForm.ElementAddress(result = right_address, element_type = byte_type, base = right_bytes, index = index), span = span))
+        let left_byte = self.load_value(byte_type, left_address, span, loop_body)
+        let right_byte = self.load_value(byte_type, right_address, span, loop_body)
+        let differ = self.new_register(boolean)
+        loop_body.append(MirInstruction(form = InstructionForm.Binary(result = differ, operation = BinaryOp.ne, left = left_byte, right = right_byte), span = span))
+        let no = self.bool_constant(false, span, loop_body)
+        loop_body.append(MirInstruction(form = InstructionForm.BrIf(condition = differ, depth = 1, values = [no]), span = span))
+        let one = self.new_register(i64_type)
+        loop_body.append(MirInstruction(form = InstructionForm.Const(result = one, value = MirConstant.Int(value = 1)), span = span))
+        let next = self.new_register(i64_type)
+        loop_body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = one), span = span))
+        loop_body.append(MirInstruction(form = InstructionForm.Store(value_type = i64_type, address = counter, value = next), span = span))
+        loop_body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = list[RegisterId]()), span = span))
+        let compared = self.new_register(boolean)
+        let block_body = list[MirInstruction]()
+        block_body.append(MirInstruction(form = InstructionForm.Loop(body = loop_body), span = span))
+        then_body.append(MirInstruction(form = InstructionForm.Block(results = [compared], body = block_body), span = span))
+        then_body.append(MirInstruction(form = InstructionForm.Yield(values = [compared]), span = span))
+
+        let else_body = list[MirInstruction]()
+        let shorter = self.bool_constant(false, span, else_body)
+        else_body.append(MirInstruction(form = InstructionForm.Yield(values = [shorter]), span = span))
+        body.append(MirInstruction(form = InstructionForm.If(condition = same_length, results = [result], then_body = then_body, else_body = else_body), span = span))
+        return result
+
     # mark: Tables ==============================================================================
 
     func new_register(value_type: TypeId) -> RegisterId:
@@ -535,7 +879,26 @@ pub class Lowerer:
         if types_match(value, resolve_builtin_type(BuiltinType.float64)): return builtin_mir_type(BuiltinMirType.float64)
         if types_match(value, resolve_builtin_type(BuiltinType.boolean)): return builtin_mir_type(BuiltinMirType.boolean)
         if types_match(value, resolve_builtin_type(BuiltinType.character)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
-        error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
+        # Composites are interned structurally, so two `(i64, bool)` tuples
+        # share one MIR type and the verifier sees each layout once.
+        match self.program.types.definitions[value.value].form:
+            String: return self.byte_string_type()
+            Bytes: return self.byte_string_type()
+            Tuple(elements):
+                let field_types = list[TypeId]()
+                for element in elements:
+                    field_types.append(try self.mir_type_of(module, function, span, element))
+                return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
+            Optional(inner):
+                let absent = intern_mir_type(self.types, make_struct_type(self.types, self.layout, list[TypeId]()))
+                let present = try self.mir_type_of(module, function, span, inner)
+                return intern_mir_type(self.types, make_enum_type(self.types, self.layout, builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
+            else: error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
+
+    # `str` and `bytes` share one shape: a pointer to the bytes and their count.
+    func byte_string_type() -> TypeId:
+        let fields = [builtin_mir_type(BuiltinMirType.pointer), builtin_mir_type(BuiltinMirType.signed_i64)]
+        return intern_mir_type(self.types, make_struct_type(self.types, self.layout, fields))
 
     # mark: Diagnostics =========================================================================
 

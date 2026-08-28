@@ -17,10 +17,10 @@ Last updated: 2026-08-27 (Stage-0 0.23).
 | HIR generation (`hir_gen.luc`) | Functions, calls, parameters, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, module constants, type aliases, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal. **Not yet**: structs, classes, enums, `match`, `for`, closures, interfaces, generics, `defer`, `try`/`catch`, method calls, field access, lists/maps/sets, formatted strings, extern/export. Each fails with "not implemented yet" and a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes everything HIR generation produces. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`canonical_ir.luc`) | Designed for the whole language (see `mir.md`); verifier (`mir_verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction. |
-| Lowerer (`lowerer.luc`) | Slices 3a–3c done: scalars and locals, control flow, calls/parameters/constants. Not yet: tuples, optionals, strings as values, and everything HIR does not generate. |
+| Lowerer (`lowerer.luc`) | Slices 3a–3c and milestone 4 done: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, `print` of a value. Not yet: everything HIR does not generate. |
 | WebAssembly backend | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. **Not extended on purpose** (see §4). |
-| Tests | 355 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~70 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
+| Tests | 362 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~90 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
 | Toolchain | Stage-0 0.23 pinned in `bootstrap.sh`. Known Stage-0 constraints in §7. |
 
 ## 2. Testing strategy (the part that must not be lost)
@@ -37,7 +37,8 @@ When two agree and one differs, the stage between them is wrong. Every
 lowerer slice adds fixtures to `differential_test.luc` *and* the same
 programs to `tests/wasm_test.sh`, plus programs that must trap on all
 three. This triangle found five real bugs during slices 3a–3c, four of them
-in the "reference" implementations. Keep it.
+in the "reference" implementations, and milestone 4 found a sixth (in the
+MIR interpreter's loop exits). Keep it.
 
 Rules: a spec semantics question (overflow, `//`, shifts, `~` on unsigned)
 is settled by reading `1.0.md` §7, implemented in the HIR interpreter first,
@@ -54,7 +55,7 @@ choose semantics.
 - **Semantics fixed in MIR**: `Add` means checked add; `floor_div`/`rem` are floor semantics; shifts trap on count, drop bits shifted out.
 - **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
 - **`Yield`** was added during implementation: with write-once registers, a region that produces values needs every exit to supply them explicitly (`Br`/`BrIf` carry values; `Yield` is the normal exit). It is the structured phi.
-- **Open questions**: narrow integers as MIR types (current) vs normalized to i32/i64 with widths only at struct fields and C signatures (what wasm and QBE want) — decide when the native pass starts; optionals of references as null niche (plan) vs uniform enum; fallible ABI per backend (wasm multi-value, QBE out-pointer/aggregate — never a global).
+- **Open questions**: narrow integers as MIR types (current) vs normalized to i32/i64 with widths only at struct fields and C signatures (what wasm and QBE want) — decide when the native pass starts; optionals are a uniform `u8`-tagged enum today, a null niche for references is still open; fallible ABI per backend (wasm multi-value, QBE out-pointer/aggregate — never a global).
 
 ## 4. Native backends, QBE, and the linker — the decisions
 
@@ -100,7 +101,7 @@ Each item is a vertical slice gated by the three-way harness (§2) plus executed
 
 Target: the seed guest commands (`echo_guest.c`, `lucia_guest.h` + 11 seeds) rewritten in Luce, compiled to wasm32, running unmodified under the existing `WasmHost` ABI (imports `lucia_call(ptr,len) -> i64`, `lucia_log`, `lucia_yield`; exports `lucia_alloc`, `lucia_main`).
 
-- [ ] **Milestone 4 — composites the HIR already has.** Tuples as anonymous structs in slots (`FieldAddress`, `Memcpy`); optionals as two-case enums with tag + `Switch` (null niche for references later); `str`/`bytes` as values (pointer + length) and `print` of a variable through `luce_rt_write`. Lowerer, MIR interpreter, wasm; fixtures in `differential_test.luc` and `wasm_test.sh`. First real use of aggregate layout everywhere.
+- [x] **Milestone 4 — composites the HIR already has.** Tuples as anonymous structs in slots (`FieldAddress`, `Memcpy`); optionals as `u8`-tagged two-case enums (payload after the tag; null niche for references later); `str`/`bytes` as `{pointer, i64 length}` with structural equality (inline byte loop); `print` of a `str` value. Aggregate protocol: a register of aggregate type holds an address, copies are `Memcpy`, aggregate results go through a hidden leading pointer parameter, aggregate parameters are passed by pointer (`lowerer.luc` header). Found and fixed a MIR-interpreter bug (a `Loop` consumed a branch depth twice, dropping values carried out of the loop).
 - [ ] **Structs and methods** in `hir_gen` → lowerer → wasm: fields, `init`, mutating value methods, struct update. *Gate: `hir_gen` keeps doc comments, parameter names, defaults.*
 - [ ] **Enums and `match`**: payloads inline, exhaustiveness, `Switch` lowering, bindings.
 - [ ] **`for` and ranges.** *Gate: fallible iteration protocol (item / end / error) decided in the spec first.*
