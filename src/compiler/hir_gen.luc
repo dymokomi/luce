@@ -32,8 +32,8 @@ from compiler.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, Nomina
 from compiler.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.tokenizer import Token, TokenKind
 from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType
-from compiler.hir import HirArgument, HirConstant, HirExpression, HirExpressionForm, HirFunction, HirIfBranch
-from compiler.hir import HirField, HirModule, HirParameter, HirProgram, HirReceiver, HirStatement, HirStatementForm, HirStruct
+from compiler.hir import HirConstant, HirFunction, HirNode, HirNodeForm, NodeId, Operands, no_node
+from compiler.hir import HirField, HirModule, HirParameter, HirProgram, HirReceiver, HirStruct
 from compiler.hir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir import describe_type, integer_maximum, integer_minimum
@@ -80,7 +80,8 @@ struct CollectedStruct:
 # being called.
 struct ResolvedCallee:
     pub function_index: i64
-    pub receiver: HirExpression?
+    # `no_node` unless this is a method call on a value.
+    pub receiver: NodeId
     pub struct_index: i64
 
 struct ImportedModule:
@@ -122,7 +123,8 @@ struct CollectedConstant:
     annotation: TypeSyntax?
     value: ExpressionSyntax
     span: SourceSpan
-    typed: HirExpression?
+    # `no_node` until the constant's initializer has been checked.
+    typed: NodeId
 
 # This stage resolves source operator spelling and result typing together, so
 # no later HIR consumer needs to repeat either half of the operator table.
@@ -133,8 +135,8 @@ struct ResolvedBinary:
 # The two checked operands retain source order even when contextual literal
 # typing needs to learn the right operand's type first.
 struct CheckedBinaryOperands:
-    pub left: HirExpression
-    pub right: HirExpression
+    pub left: NodeId
+    pub right: NodeId
 
 ## Generates typed HIR for one whole program. Collection is internal so
 ## callers cannot run a partial generation; public use begins and ends at
@@ -161,6 +163,13 @@ pub class HirGenerator:
     bindings: ModuleBindings
     locals: list[LocalBinding]
     loop_depth: i64
+    # The node table under construction (see `hir.luc`): children are pushed
+    # before their parents, so every `NodeId` a form names already exists.
+    nodes: list[HirNode]
+    node_types: list[TypeId]
+    node_spans: list[SourceSpan]
+    extra: list[u32]
+    values: list[Value]
 
     pub init(sources: list[SourceModule]):
         self.sources = sources
@@ -180,6 +189,42 @@ pub class HirGenerator:
         self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
+        self.nodes = list[HirNode]()
+        self.node_types = list[TypeId]()
+        self.node_spans = list[SourceSpan]()
+        self.extra = list[u32]()
+        self.values = list[Value]()
+
+    # mark: Node table ==========================================================================
+
+    func push_node(form: HirNodeForm, value_type: TypeId, span: SourceSpan) -> NodeId:
+        self.nodes.append(HirNode(form = form))
+        self.node_types.append(value_type)
+        self.node_spans.append(span)
+        return NodeId(value = u32(len(self.nodes) - 1))
+
+    # A statement has no value; its type slot holds `unit`.
+    func push_statement(form: HirNodeForm, span: SourceSpan) -> NodeId:
+        return self.push_node(form, resolve_builtin_type(BuiltinType.unit), span)
+
+    func push_run(entries: list[u32]) -> Operands:
+        let start = len(self.extra)
+        for entry in entries: self.extra.append(entry)
+        return Operands(start = u32(start), count = u32(len(entries)))
+
+    func push_nodes(ids: list[NodeId]) -> Operands:
+        let entries = list[u32]()
+        for id in ids: entries.append(id.value)
+        return self.push_run(entries)
+
+    func node_form(id: NodeId) -> HirNodeForm:
+        return self.nodes[i64(id.value)].form
+
+    func type_of(id: NodeId) -> TypeId:
+        return self.node_types[i64(id.value)]
+
+    func span_of(id: NodeId) -> SourceSpan:
+        return self.node_spans[i64(id.value)]
 
     # mark: Generation ==========================================================================
 
@@ -206,13 +251,13 @@ pub class HirGenerator:
 
         let hir_constants = list[HirConstant]()
         for constant in self.constants:
-            let typed = constant.typed else trap("constant was not typed")
+            if constant.typed.value == no_node: trap("constant was not typed")
             hir_constants.append(HirConstant(
                 symbol = constant.symbol,
                 module = ModuleId(value = u32(constant.module_index)),
                 name = constant.name,
                 is_public = constant.is_public,
-                value = typed,
+                value = constant.typed,
             ))
 
         let hir_structs = list[HirStruct]()
@@ -226,7 +271,19 @@ pub class HirGenerator:
                 span = item.span,
             ))
 
-        return HirProgram(types = self.types, symbols = self.symbols, modules = modules, constants = hir_constants, structs = hir_structs, functions = hir_functions)
+        return HirProgram(
+            types = self.types,
+            symbols = self.symbols,
+            modules = modules,
+            constants = hir_constants,
+            structs = hir_structs,
+            functions = hir_functions,
+            nodes = self.nodes,
+            node_types = self.node_types,
+            node_spans = self.node_spans,
+            extra = self.extra,
+            values = self.values,
+        )
 
     # mark: Modules and imports =================================================================
 
@@ -370,7 +427,7 @@ pub class HirGenerator:
             annotation = constant.annotation,
             value = constant.value,
             span = span,
-            typed = none,
+            typed = NodeId(value = no_node),
         ))
 
     func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
@@ -425,7 +482,7 @@ pub class HirGenerator:
     # Cycles (`let a = a`, or `let a = b` / `let b = a`) fail as recursion.
     func resolve_constant(index: i64) -> !:
         let item = self.constants[index]
-        if item.typed != none: return
+        if item.typed.value != no_node: return
         let key = str(item.module_index) + "." + item.name
         for previous in self.constant_stack:
             if previous == key:
@@ -446,7 +503,7 @@ pub class HirGenerator:
             id = item.symbol,
             name = item.name,
             kind = SymbolKind.constant,
-            value_type = typed.value_type,
+            value_type = self.type_of(typed),
         )
         self.constants[index] = CollectedConstant(
             symbol = item.symbol,
@@ -490,7 +547,7 @@ pub class HirGenerator:
                     "parameter `" + parameter.name + "` requires a type",
                 ))
                 parameter_type = try self.resolve_type(module_index, annotation)
-            var default_value: HirExpression? = none
+            var default_value = NodeId(value = no_node)
             let default_syntax = parameter.default_value
             if default_syntax != none:
                 default_value = try self.check_constant_expression(module_index, default_syntax, parameter_type, "default of parameter `" + parameter.name + "`")
@@ -526,7 +583,7 @@ pub class HirGenerator:
     # A field default or parameter default: checked in an empty scope, so it
     # cannot name a local or `self`, and required to be a literal tree
     # (optionally wrapped, grouped, or negated) so it is embeddable anywhere.
-    func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> HirExpression!:
+    func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> NodeId!:
         let saved_module = self.current_module
         let saved_bindings = self.bindings
         let saved_locals = self.locals
@@ -540,7 +597,7 @@ pub class HirGenerator:
         self.locals = saved_locals
         self.current_module = saved_module
         self.bindings = saved_bindings
-        if not is_constant_expression(checked):
+        if not self.is_constant_expression(checked):
             try self.fail_at(module_index, value.span, what + " must be a constant expression")
         return checked
 
@@ -578,7 +635,7 @@ pub class HirGenerator:
                             try self.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
                     if field.is_weak: try self.fail_at(module_index, field.span, "`weak` fields belong to classes, not structs")
                     let field_type = try self.resolve_type(module_index, field.value_type)
-                    var default_value: HirExpression? = none
+                    var default_value = NodeId(value = no_node)
                     let default_syntax = field.default_value
                     if default_syntax != none:
                         default_value = try self.check_constant_expression(module_index, default_syntax, field_type, "default of field `" + field.name + "`")
@@ -733,7 +790,7 @@ pub class HirGenerator:
 
         let body_syntax = function.syntax.body else trap("function definition has no body")
         let body = try self.check_suite(body_syntax.statements)
-        if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)) and not statements_return(body):
+        if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(body):
             try self.fail(function.span, "function `" + function.name + "` may finish without returning `" + self.describe_type(function.result) + "`")
         return HirFunction(
             symbol = function.symbol,
@@ -744,14 +801,14 @@ pub class HirGenerator:
             receiver = function.receiver,
             parameters = function.parameters,
             result = function.result,
-            body = body,
+            body = self.push_nodes(body),
             span = function.span,
         )
 
     # A suite is one lexical scope: bindings made inside it end with it.
-    func check_suite(statements: list[StatementSyntax]) -> list[HirStatement]!:
+    func check_suite(statements: list[StatementSyntax]) -> list[NodeId]!:
         let outer_count = len(self.locals)
-        let typed = list[HirStatement]()
+        let typed = list[NodeId]()
         for statement in statements:
             for item in try self.check_statement(statement):
                 typed.append(item)
@@ -760,14 +817,14 @@ pub class HirGenerator:
         return typed
 
     # Check one statement. Each statement family owns its detailed rules below.
-    func check_statement(statement: StatementSyntax) -> list[HirStatement]!:
+    func check_statement(statement: StatementSyntax) -> list[NodeId]!:
         match statement.form:
             BreakStatement:
                 if self.loop_depth == 0: try self.fail(statement.span, "`break` is only valid inside a loop")
-                return [HirStatement(form = HirStatementForm.BreakStatement, span = statement.span)]
+                return [self.push_statement(HirNodeForm.BreakStatement, statement.span)]
             ContinueStatement:
                 if self.loop_depth == 0: try self.fail(statement.span, "`continue` is only valid inside a loop")
-                return [HirStatement(form = HirStatementForm.ContinueStatement, span = statement.span)]
+                return [self.push_statement(HirNodeForm.ContinueStatement, statement.span)]
             Binding(is_mutable, pattern, annotation, value):
                 return try self.check_binding(is_mutable, pattern, annotation, value, statement.span)
             Assignment(target, operator, value):
@@ -777,7 +834,8 @@ pub class HirGenerator:
             ExpressionStatement(value):
                 let printed = try self.check_print_call(value)
                 if printed != none: return [printed]
-                return [HirStatement(form = HirStatementForm.ExpressionStatement(value = try self.check_expression(value, none)), span = statement.span)]
+                let checked = try self.check_expression(value, none)
+                return [self.push_statement(HirNodeForm.ExpressionStatement(value = checked), statement.span)]
             IfStatement(branches, fallback):
                 return [try self.check_if(branches, fallback, statement.span)]
             WhileStatement(condition, body):
@@ -793,7 +851,7 @@ pub class HirGenerator:
 
     # Recognize a bare `print(...)` statement so it can take the special path
     # below; anything else falls through to ordinary expression checking.
-    func check_print_call(value: ExpressionSyntax) -> HirStatement?!:
+    func check_print_call(value: ExpressionSyntax) -> NodeId?!:
         match value.form:
             Call(callee, type_arguments, arguments):
                 match callee.form:
@@ -806,7 +864,7 @@ pub class HirGenerator:
     # `print` is the first terminal operation in the executable slice. A
     # string literal becomes `PrintText`, whose bytes are known now; any other
     # `str` expression becomes `PrintValue` and is written at run time.
-    func check_print(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan) -> HirStatement!:
+    func check_print(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan) -> NodeId!:
         if len(type_arguments) > 0 or len(arguments) != 1 or arguments[0].label != none:
             try self.fail(span, "`print` expects one positional string")
         var literal: Token? = none
@@ -815,9 +873,10 @@ pub class HirGenerator:
                 if token.kind == TokenKind.str_lit: literal = token
             else: literal = none
         if literal != none:
-            return HirStatement(form = HirStatementForm.PrintText(value = try self.decode_print_text(literal)), span = span)
+            let text = try self.decode_print_text(literal)
+            return self.push_statement(HirNodeForm.PrintText(value = text), span)
         let printed = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.string))
-        return HirStatement(form = HirStatementForm.PrintValue(value = printed), span = span)
+        return self.push_statement(HirNodeForm.PrintValue(value = printed), span)
 
     # Turn a plain `"..."` spelling into the bytes `print` will write, decoding
     # the handful of escapes the slice supports.
@@ -848,7 +907,7 @@ pub class HirGenerator:
 
     # `let name = value` or `var name: T = value` — the annotation, when
     # present, becomes the expected type of the initializer.
-    func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> list[HirStatement]!:
+    func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> list[NodeId]!:
         match pattern:
             Name(name, name_span):
                 try self.require_free_local_name(name, name_span)
@@ -856,9 +915,10 @@ pub class HirGenerator:
                 if annotation != none:
                     expected = try self.resolve_type(self.current_module, annotation)
                 let checked = try self.check_expression(value, expected)
-                let symbol = self.make_symbol(name, SymbolKind.local, checked.value_type)
-                self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked.value_type, is_mutable = is_mutable))
-                return [HirStatement(form = HirStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = checked), span = span)]
+                let checked_type = self.type_of(checked)
+                let symbol = self.make_symbol(name, SymbolKind.local, checked_type)
+                self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked_type, is_mutable = is_mutable))
+                return [self.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = checked), span)]
             TupleNames(names, pattern_span):
                 # Duplicate names report at the binding statement; the pattern
                 # stores names without per-name spans.
@@ -866,12 +926,13 @@ pub class HirGenerator:
                 if annotation != none:
                     expected = try self.resolve_type(self.current_module, annotation)
                 let checked = try self.check_expression(value, expected)
-                let elements = self.tuple_elements(checked.value_type) else error(self.diagnostic(span, "tuple binding requires a tuple value, found `" + self.describe_type(checked.value_type) + "`"))
+                let checked_type = self.type_of(checked)
+                let elements = self.tuple_elements(checked_type) else error(self.diagnostic(span, "tuple binding requires a tuple value, found `" + self.describe_type(checked_type) + "`"))
                 if len(names) != len(elements):
                     try self.fail(span, "tuple binding has " + str(len(names)) + " name(s), value has " + str(len(elements)))
-                let tuple_symbol = self.make_symbol("_tuple", SymbolKind.local, checked.value_type)
-                let statements = list[HirStatement]()
-                statements.append(HirStatement(form = HirStatementForm.Binding(symbol = tuple_symbol, name = "_tuple", is_mutable = false, value = checked), span = span))
+                let tuple_symbol = self.make_symbol("_tuple", SymbolKind.local, checked_type)
+                let statements = list[NodeId]()
+                statements.append(self.push_statement(HirNodeForm.Binding(symbol = tuple_symbol, is_mutable = false, value = checked), span))
                 var index = 0
                 while index < len(names):
                     let name = names[index].text
@@ -879,23 +940,15 @@ pub class HirGenerator:
                     let element_type = elements[index]
                     let symbol = self.make_symbol(name, SymbolKind.local, element_type)
                     self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = is_mutable))
-                    let tuple_ref = HirExpression(
-                        value_type = checked.value_type,
-                        form = HirExpressionForm.Reference(symbol = tuple_symbol),
-                        span = span,
-                    )
-                    let element = HirExpression(
-                        value_type = element_type,
-                        form = HirExpressionForm.Element(value = tuple_ref, index = index),
-                        span = span,
-                    )
-                    statements.append(HirStatement(form = HirStatementForm.Binding(symbol = symbol, name = name, is_mutable = is_mutable, value = element), span = names[index].span))
+                    let tuple_ref = self.push_node(HirNodeForm.Reference(symbol = tuple_symbol), checked_type, span)
+                    let element = self.push_node(HirNodeForm.Element(value = tuple_ref, index = index), element_type, span)
+                    statements.append(self.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = element), names[index].span))
                     index += 1
                 return statements
 
     # `name = value` and the augmented forms; only mutable local names are
     # assignable in the current slice.
-    func check_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> HirStatement!:
+    func check_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         var name = ""
         match target.form:
             Name(value_name): name = value_name
@@ -913,19 +966,19 @@ pub class HirGenerator:
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
             let binary_operator = operator[0:len(operator) - 1]
-            let resolved = try self.resolve_binary_operation(local.value_type, binary_operator, checked.value_type, span)
+            let resolved = try self.resolve_binary_operation(local.value_type, binary_operator, self.type_of(checked), span)
             if not types_match(resolved.result, local.value_type):
                 try self.fail(
                     span,
                     "assignment changes `" + name + "` from `" + self.describe_type(local.value_type) + "` to `" + self.describe_type(resolved.result) + "`",
                 )
             operation = AssignmentOperation.Combine(operation = resolved.operation)
-        return HirStatement(form = HirStatementForm.Assignment(symbol = local.symbol, operation = operation, value = checked), span = span)
+        return self.push_statement(HirNodeForm.Assignment(symbol = local.symbol, operation = operation, value = checked), span)
 
     # `root.a.b = value`: the root is a mutable local (or `self` in a mutating
     # method), every field on the way is `var`, and the path is recorded as
     # field indices so no consumer repeats the name resolution.
-    func check_field_assignment(member_value: ExpressionSyntax, field_name: str, operator: str, value: ExpressionSyntax, span: SourceSpan) -> HirStatement!:
+    func check_field_assignment(member_value: ExpressionSyntax, field_name: str, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         # Walk down to the root name, collecting field names outermost last.
         let names = [field_name]
         var current = member_value
@@ -946,7 +999,7 @@ pub class HirGenerator:
         if not local.is_mutable:
             if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
             try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
-        let path = list[i64]()
+        let path = list[u32]()
         var place_type = local.value_type
         var index = len(names) - 1
         while index >= 0:
@@ -958,83 +1011,81 @@ pub class HirGenerator:
             if not field.is_public and self.structs[struct_index].module_index != self.current_module:
                 try self.fail(span, "field `" + names[index] + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
             if not field.is_mutable: try self.fail(span, "cannot assign to `let` field `" + names[index] + "`; declare it with `var`")
-            path.append(field_index)
+            path.append(u32(field_index))
             place_type = field.value_type
             index -= 1
         let checked = try self.check_expression(value, place_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
             let binary_operator = operator[0:len(operator) - 1]
-            let resolved = try self.resolve_binary_operation(place_type, binary_operator, checked.value_type, span)
+            let resolved = try self.resolve_binary_operation(place_type, binary_operator, self.type_of(checked), span)
             if not types_match(resolved.result, place_type):
                 try self.fail(span, "assignment changes `" + field_name + "` from `" + self.describe_type(place_type) + "` to `" + self.describe_type(resolved.result) + "`")
             operation = AssignmentOperation.Combine(operation = resolved.operation)
-        return HirStatement(form = HirStatementForm.FieldAssignment(symbol = local.symbol, path = path, operation = operation, value = checked), span = span)
+        return self.push_statement(HirNodeForm.FieldAssignment(symbol = local.symbol, path = self.push_run(path), operation = operation, value = checked), span)
 
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
-    func check_return(value: ExpressionSyntax?, span: SourceSpan) -> HirStatement!:
+    func check_return(value: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
         if value == none:
             if not types_match(self.current_result, resolve_builtin_type(BuiltinType.unit)):
                 try self.fail(span, "return requires a `" + self.describe_type(self.current_result) + "` value")
-            return HirStatement(form = HirStatementForm.ReturnStatement(value = none), span = span)
+            return self.push_statement(HirNodeForm.ReturnStatement(value = NodeId(value = no_node)), span)
         if types_match(self.current_result, resolve_builtin_type(BuiltinType.unit)):
             try self.fail(span, "a `unit` function cannot return a value")
         let checked = try self.check_expression(value, self.current_result)
-        return HirStatement(form = HirStatementForm.ReturnStatement(value = checked), span = span)
+        return self.push_statement(HirNodeForm.ReturnStatement(value = checked), span)
 
     # Each `if`/`elif` condition must be bool; every branch body is its own
     # lexical scope.
-    func check_if(branches: list[IfBranchSyntax], fallback: SuiteSyntax?, span: SourceSpan) -> HirStatement!:
-        let typed_branches = list[HirIfBranch]()
+    func check_if(branches: list[IfBranchSyntax], fallback: SuiteSyntax?, span: SourceSpan) -> NodeId!:
+        # One triple per branch: condition node, body run start, body run count.
+        let triples = list[u32]()
         for branch in branches:
             match branch.condition.form:
                 Expression(condition):
                     let checked = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
-                    typed_branches.append(HirIfBranch(condition = checked, body = try self.check_suite(branch.body.statements)))
+                    let body = self.push_nodes(try self.check_suite(branch.body.statements))
+                    triples.append(checked.value)
+                    triples.append(body.start)
+                    triples.append(body.count)
                 else:
                     try self.fail(branch.span, "conditional bindings are not implemented yet")
-        var typed_fallback: list[HirStatement]? = none
+        var has_fallback = false
+        var typed_fallback = Operands(start = 0, count = 0)
         if fallback != none:
-            typed_fallback = try self.check_suite(fallback.statements)
-        return HirStatement(form = HirStatementForm.IfStatement(branches = typed_branches, fallback = typed_fallback), span = span)
+            has_fallback = true
+            typed_fallback = self.push_nodes(try self.check_suite(fallback.statements))
+        return self.push_statement(HirNodeForm.IfStatement(branches = self.push_run(triples), has_fallback = has_fallback, fallback = typed_fallback), span)
 
     # The loop depth makes `break` and `continue` valid inside the body.
-    func check_while(condition: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> HirStatement!:
+    func check_while(condition: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
         let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
         self.loop_depth += 1
         let checked_body = try self.check_suite(body.statements)
         self.loop_depth -= 1
-        return HirStatement(form = HirStatementForm.WhileStatement(condition = checked_condition, body = checked_body), span = span)
+        return self.push_statement(HirNodeForm.WhileStatement(condition = checked_condition, body = self.push_nodes(checked_body)), span)
 
     # mark: Expressions =========================================================================
 
     # Check one expression. `expected` is the type the surrounding context
     # requires, or none where any type is welcome; every produced expression
     # passes `require_type` on its way out.
-    func check_expression(value: ExpressionSyntax, expected: TypeId?) -> HirExpression!:
+    func check_expression(value: ExpressionSyntax, expected: TypeId?) -> NodeId!:
         match value.form:
             Literal(token): return try self.check_literal(token, expected)
             Name(name):
                 let local_index = self.find_local(name)
                 if local_index >= 0:
                     let local = self.locals[local_index]
-                    let reference = HirExpression(
-                        value_type = local.value_type,
-                        form = HirExpressionForm.Reference(symbol = local.symbol),
-                        span = value.span,
-                    )
+                    let reference = self.push_node(HirNodeForm.Reference(symbol = local.symbol), local.value_type, value.span)
                     return try self.require_type(reference, expected)
                 let constant_index = self.find_constant_in_module(self.current_module, name)
                 if constant_index >= 0:
                     try self.resolve_constant(constant_index)
                     let constant = self.constants[constant_index]
-                    let typed = constant.typed else trap("constant was not typed")
-                    let reference = HirExpression(
-                        value_type = typed.value_type,
-                        form = HirExpressionForm.Reference(symbol = constant.symbol),
-                        span = value.span,
-                    )
+                    if constant.typed.value == no_node: trap("constant was not typed")
+                    let reference = self.push_node(HirNodeForm.Reference(symbol = constant.symbol), self.type_of(constant.typed), value.span)
                     return try self.require_type(reference, expected)
                 if self.find_visible_function(name) >= 0:
                     try self.fail(value.span, "function values are not implemented yet")
@@ -1049,15 +1100,11 @@ pub class HirGenerator:
             Conditional(selected, condition, alternative):
                 let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
                 let checked_value = try self.check_expression(selected, expected)
-                let checked_alternative = try self.check_expression(alternative, checked_value.value_type)
-                let typed = HirExpression(
-                    value_type = checked_value.value_type,
-                    form = HirExpressionForm.Conditional(
-                        value = checked_value,
-                        condition = checked_condition,
-                        alternative = checked_alternative,
-                    ),
-                    span = value.span,
+                let checked_alternative = try self.check_expression(alternative, self.type_of(checked_value))
+                let typed = self.push_node(
+                    HirNodeForm.Conditional(value = checked_value, condition = checked_condition, alternative = checked_alternative),
+                    self.type_of(checked_value),
+                    value.span,
                 )
                 return try self.require_type(typed, expected)
             Call(callee, type_arguments, arguments):
@@ -1093,7 +1140,7 @@ pub class HirGenerator:
 
     # A bare literal becomes a constant. An unsuffixed integer is i64 unless
     # the context asks for another integer width, e.g. `let count: i32 = 7`.
-    func check_literal(token: Token, expected: TypeId?) -> HirExpression!:
+    func check_literal(token: Token, expected: TypeId?) -> NodeId!:
         var value_type = resolve_builtin_type(BuiltinType.unit)
         var value = Value.Unit
         if token.kind == TokenKind.int_lit:
@@ -1117,7 +1164,7 @@ pub class HirGenerator:
             let needed = expected else error(self.diagnostic(token.span, "`none` needs an optional type from context"))
             if self.optional_inner(needed) == none:
                 try self.fail(token.span, "expected `" + self.describe_type(needed) + "`, found `none`")
-            return HirExpression(value_type = needed, form = HirExpressionForm.NoneLiteral, span = token.span)
+            return self.push_node(HirNodeForm.NoneLiteral, needed, token.span)
         elif token.kind == TokenKind.char_lit:
             value_type = resolve_builtin_type(BuiltinType.character)
             value = Value.Character(value = try self.decode_character(token))
@@ -1129,7 +1176,7 @@ pub class HirGenerator:
             value = Value.Bytes(value = try self.decode_bytes(token))
         else:
             error(self.diagnostic(token.span, "this literal is not implemented yet"))
-        return try self.require_type(HirExpression(value_type = value_type, form = HirExpressionForm.Constant(value = value), span = token.span), expected)
+        return try self.require_type(self.push_constant(value, value_type, token.span), expected)
 
     func integer_literal_type(token: Token, expected: TypeId?) -> TypeId!:
         if token.suffix != "":
@@ -1144,15 +1191,11 @@ pub class HirGenerator:
         if value < integer_minimum(self.types, value_type) or value > integer_maximum(self.types, value_type):
             try self.fail(span, "integer literal is outside `" + self.describe_type(value_type) + "` range")
 
-    func check_unary(operator: str, operand: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_unary(operator: str, operand: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         if operator == "not":
             let boolean_type = resolve_builtin_type(BuiltinType.boolean)
             let checked = try self.check_expression(operand, boolean_type)
-            let expression = HirExpression(
-                value_type = boolean_type,
-                form = HirExpressionForm.Unary(operation = UnaryOperation.LogicalNot, operand = checked),
-                span = span,
-            )
+            let expression = self.push_node(HirNodeForm.Unary(operation = UnaryOperation.LogicalNot, operand = checked), boolean_type, span)
             return try self.require_type(expression, expected)
         if operator == "try": try self.fail(span, "fallible calls are not implemented yet")
 
@@ -1170,30 +1213,27 @@ pub class HirGenerator:
                 let integer = try self.decode_negative_integer(literal)
                 try self.require_integer_range(literal.span, integer, integer_type)
                 let value = Value.Integer(value = integer)
-                return try self.require_type(HirExpression(value_type = integer_type, form = HirExpressionForm.Constant(value = value), span = span), expected)
+                return try self.require_type(self.push_constant(value, integer_type, span), expected)
 
         let checked = try self.check_expression(operand, expected)
-        var operation = UnaryOperation.NumericIdentity(operand_type = checked.value_type)
+        let checked_type = self.type_of(checked)
+        var operation = UnaryOperation.NumericIdentity(operand_type = checked_type)
         if operator == "~":
-            if not is_integer_type(self.types, checked.value_type):
-                try self.fail(span, "`~` requires an integer, found `" + self.describe_type(checked.value_type) + "`")
-            operation = UnaryOperation.IntegerBitwiseNot(operand_type = checked.value_type)
+            if not is_integer_type(self.types, checked_type):
+                try self.fail(span, "`~` requires an integer, found `" + self.describe_type(checked_type) + "`")
+            operation = UnaryOperation.IntegerBitwiseNot(operand_type = checked_type)
         elif operator == "+" or operator == "-":
-            if not is_numeric_type(self.types, checked.value_type):
-                try self.fail(span, "`" + operator + "` requires a number, found `" + self.describe_type(checked.value_type) + "`")
-            if operator == "-" and is_unsigned_integer_type(self.types, checked.value_type):
-                try self.fail(span, "`-` is invalid for `" + self.describe_type(checked.value_type) + "`")
-            if operator == "-": operation = UnaryOperation.NumericNegate(operand_type = checked.value_type)
+            if not is_numeric_type(self.types, checked_type):
+                try self.fail(span, "`" + operator + "` requires a number, found `" + self.describe_type(checked_type) + "`")
+            if operator == "-" and is_unsigned_integer_type(self.types, checked_type):
+                try self.fail(span, "`-` is invalid for `" + self.describe_type(checked_type) + "`")
+            if operator == "-": operation = UnaryOperation.NumericNegate(operand_type = checked_type)
         else:
             error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
-        let expression = HirExpression(
-            value_type = checked.value_type,
-            form = HirExpressionForm.Unary(operation = operation, operand = checked),
-            span = span,
-        )
+        let expression = self.push_node(HirNodeForm.Unary(operation = operation, operand = checked), checked_type, span)
         return try self.require_type(expression, expected)
 
-    func check_binary(left: ExpressionSyntax, operator: str, right: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_binary(left: ExpressionSyntax, operator: str, right: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         # An arithmetic result has its operands' type, so the expected type
         # reaches down into the operands; comparisons produce bool, so it
         # must not.
@@ -1202,12 +1242,8 @@ pub class HirGenerator:
             operand_context = expected
 
         let operands = try self.check_binary_operands(left, right, operand_context)
-        let resolved = try self.resolve_binary_operation(operands.left.value_type, operator, operands.right.value_type, span)
-        let typed = HirExpression(
-            value_type = resolved.result,
-            form = HirExpressionForm.Binary(left = operands.left, operation = resolved.operation, right = operands.right),
-            span = span,
-        )
+        let resolved = try self.resolve_binary_operation(self.type_of(operands.left), operator, self.type_of(operands.right), span)
+        let typed = self.push_node(HirNodeForm.Binary(left = operands.left, operation = resolved.operation, right = operands.right), resolved.result, span)
         return try self.require_type(typed, expected)
 
     # Give an unsuffixed integer literal context from either neighbor. For
@@ -1216,11 +1252,11 @@ pub class HirGenerator:
     func check_binary_operands(left: ExpressionSyntax, right: ExpressionSyntax, context: TypeId?) -> CheckedBinaryOperands!:
         if context == none and is_contextual_integer_expression(left) and not is_contextual_integer_expression(right):
             let checked_right = try self.check_expression(right, none)
-            let checked_left = try self.check_expression(left, checked_right.value_type)
+            let checked_left = try self.check_expression(left, self.type_of(checked_right))
             return CheckedBinaryOperands(left = checked_left, right = checked_right)
 
         let checked_left = try self.check_expression(left, context)
-        let checked_right = try self.check_expression(right, checked_left.value_type)
+        let checked_right = try self.check_expression(right, self.type_of(checked_left))
         return CheckedBinaryOperands(left = checked_left, right = checked_right)
 
     # The operator table: what each binary operator accepts and what it
@@ -1264,7 +1300,7 @@ pub class HirGenerator:
         error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
 
     # Check one call: each parameter must be supplied once.
-    func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented yet")
         let resolved = try self.resolve_callee(callee)
         if resolved.struct_index >= 0:
@@ -1277,14 +1313,16 @@ pub class HirGenerator:
         # method is `mutating`.
         let assigned = list[bool]()
         for parameter in function.parameters: assigned.append(false)
-        let typed_arguments = list[HirArgument]()
+        # Pairs of (parameter index, argument node), in source order.
+        let typed_arguments = list[u32]()
         var positional_index = 0
         var saw_named = false
         let receiver_value = resolved.receiver
-        if receiver_value != none:
+        if receiver_value.value != no_node:
             let method = function.receiver else trap("a receiver was resolved for a function without one")
             if method.is_mutating: try self.require_mutable_place(receiver_value, callee.span)
-            typed_arguments.append(HirArgument(parameter_index = 0, value = receiver_value))
+            typed_arguments.append(0)
+            typed_arguments.append(receiver_value.value)
             assigned[0] = true
             positional_index = 1
 
@@ -1305,36 +1343,34 @@ pub class HirGenerator:
                 try self.fail(argument.span, "parameter `" + function.parameters[parameter_index].name + "` is supplied more than once")
             assigned[parameter_index] = true
             let checked = try self.check_expression(argument.value, function.parameters[parameter_index].value_type)
-            typed_arguments.append(HirArgument(parameter_index = parameter_index, value = checked))
+            typed_arguments.append(u32(parameter_index))
+            typed_arguments.append(checked.value)
 
         for parameter_index in range(0, len(function.parameters)):
             if assigned[parameter_index]: continue
             let default_value = function.parameters[parameter_index].default_value
-            if default_value != none:
-                typed_arguments.append(HirArgument(parameter_index = parameter_index, value = default_value))
+            if default_value.value != no_node:
+                typed_arguments.append(u32(parameter_index))
+                typed_arguments.append(default_value.value)
                 continue
             try self.fail(span, "call to `" + function.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
-        let typed = HirExpression(
-            value_type = function.result,
-            form = HirExpressionForm.Call(function = function.symbol, arguments = typed_arguments),
-            span = span,
-        )
+        let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.push_run(typed_arguments)), function.result, span)
         return try self.require_type(typed, expected)
 
     # `Point(x: 1.0, y: 2.0)`: the synthesized memberwise initializer. Fields
     # fill like parameters and defaults cover omissions. From another module
     # the struct and every field *given* must be public; a private field may
     # still be omitted when it has a default.
-    func check_struct_value(struct_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_struct_value(struct_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         let item = self.structs[struct_index]
         let foreign = item.module_index != self.current_module
         if foreign and not item.is_public:
             try self.fail(span, "`" + item.name + "` is private to module `" + self.sources[item.module_index].name + "`")
         # Given values by field position; `supplied` says which are real.
-        let values = list[HirExpression]()
+        let values = list[NodeId]()
         let supplied = list[bool]()
         for field in item.fields:
-            values.append(HirExpression(value_type = field.value_type, form = HirExpressionForm.NoneLiteral, span = span))
+            values.append(NodeId(value = no_node))
             supplied.append(false)
         var positional_index = 0
         var saw_named = false
@@ -1358,7 +1394,7 @@ pub class HirGenerator:
                 try self.fail(argument.span, "field `" + field.name + "` is private to module `" + self.sources[item.module_index].name + "`")
             values[field_index] = try self.check_expression(argument.value, field.value_type)
             supplied[field_index] = true
-        let fields = list[HirExpression]()
+        let fields = list[NodeId]()
         for field_index in range(0, len(item.fields)):
             let field = item.fields[field_index]
             if supplied[field_index]:
@@ -1366,17 +1402,14 @@ pub class HirGenerator:
                 continue
             # A private field with a default is not *required*, so it does
             # not make the initializer private (spec §10.1).
-            let default_value = field.default_value else error(self.diagnostic(span, "construction of `" + item.name + "` is missing field `" + field.name + "`"))
-            fields.append(default_value)
-        let typed = HirExpression(
-            value_type = item.type_id,
-            form = HirExpressionForm.StructValue(struct_index = struct_index, fields = fields),
-            span = span,
-        )
+            if field.default_value.value == no_node:
+                try self.fail(span, "construction of `" + item.name + "` is missing field `" + field.name + "`")
+            fields.append(field.default_value)
+        let typed = self.push_node(HirNodeForm.StructValue(struct_index = struct_index, fields = self.push_nodes(fields)), item.type_id, span)
         return try self.require_type(typed, expected)
 
     # `value.field`: the value must be a struct with that field, visible here.
-    func check_field_access(member_value: ExpressionSyntax, name: str, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_field_access(member_value: ExpressionSyntax, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
         var root_name = ""
         match member_value.form:
             Name(candidate): root_name = candidate
@@ -1387,9 +1420,9 @@ pub class HirGenerator:
             if self.find_struct_in_module(self.current_module, root_name) >= 0:
                 try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
         let checked = try self.check_expression(member_value, none)
-        let struct_index = self.struct_of(checked.value_type)
+        let struct_index = self.struct_of(self.type_of(checked))
         if struct_index < 0:
-            try self.fail(span, "`" + self.describe_type(checked.value_type) + "` has no field `" + name + "`")
+            try self.fail(span, "`" + self.describe_type(self.type_of(checked)) + "` has no field `" + name + "`")
         let field_index = self.find_field(struct_index, name)
         if field_index < 0:
             if self.find_method(struct_index, name) >= 0:
@@ -1398,17 +1431,13 @@ pub class HirGenerator:
         let field = self.structs[struct_index].fields[field_index]
         if not field.is_public and self.structs[struct_index].module_index != self.current_module:
             try self.fail(span, "field `" + name + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
-        let typed = HirExpression(
-            value_type = field.value_type,
-            form = HirExpressionForm.FieldAccess(value = checked, field = field_index),
-            span = span,
-        )
+        let typed = self.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
         return try self.require_type(typed, expected)
 
     # A mutating method needs somewhere to write: a `var` local, `self` in a
     # mutating method, or a `var` field reached through such a place.
-    func require_mutable_place(value: HirExpression, span: SourceSpan) -> !:
-        match value.form:
+    func require_mutable_place(value: NodeId, span: SourceSpan) -> !:
+        match self.node_form(value):
             Reference(symbol):
                 for local in self.locals:
                     if local.symbol.value == symbol.value:
@@ -1416,7 +1445,7 @@ pub class HirGenerator:
                         try self.fail(span, "mutating method needs a `var` receiver; `" + local.name + "` is immutable")
                 try self.fail(span, "mutating method needs a `var` receiver")
             FieldAccess(inner, field):
-                let struct_index = self.struct_of(inner.value_type)
+                let struct_index = self.struct_of(self.type_of(inner))
                 let stored = self.structs[struct_index].fields[field]
                 if not stored.is_mutable:
                     try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
@@ -1434,17 +1463,17 @@ pub class HirGenerator:
                 if local_index >= 0:
                     try self.fail(callee.span, "`" + name + "` has type `" + self.describe_type(self.locals[local_index].value_type) + "` and is not callable")
                 let function_index = self.find_visible_function(name)
-                if function_index >= 0: return ResolvedCallee(function_index = function_index, receiver = none, struct_index = -1)
+                if function_index >= 0: return ResolvedCallee(function_index = function_index, receiver = NodeId(value = no_node), struct_index = -1)
                 let struct_index = self.find_struct_in_module(self.current_module, name)
-                if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = none, struct_index = struct_index)
+                if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index)
                 error(self.diagnostic(callee.span, "unknown function `" + name + "`"))
             Member(value, name):
                 let named = try self.resolve_named_callee(value, name, callee.span)
                 if named != none: return named
                 let receiver = try self.check_expression(value, none)
-                let struct_index = self.struct_of(receiver.value_type)
+                let struct_index = self.struct_of(self.type_of(receiver))
                 if struct_index < 0:
-                    try self.fail(callee.span, "`" + self.describe_type(receiver.value_type) + "` has no method `" + name + "`")
+                    try self.fail(callee.span, "`" + self.describe_type(self.type_of(receiver)) + "` has no method `" + name + "`")
                 let method_index = self.find_method(struct_index, name)
                 if method_index < 0:
                     if self.find_field(struct_index, name) >= 0:
@@ -1496,12 +1525,12 @@ pub class HirGenerator:
         if function_index >= 0:
             if not self.functions[function_index].is_public:
                 try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
-            return ResolvedCallee(function_index = function_index, receiver = none, struct_index = -1)
+            return ResolvedCallee(function_index = function_index, receiver = NodeId(value = no_node), struct_index = -1)
         let struct_index = self.find_struct_in_module(imported_module, name)
         if struct_index >= 0:
             if not self.structs[struct_index].is_public:
                 try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
-            return ResolvedCallee(function_index = -1, receiver = none, struct_index = struct_index)
+            return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index)
         error(self.diagnostic(span, "module `" + self.sources[imported_module].name + "` has no function `" + name + "`"))
 
     # `Type.function(...)`: a method without `self`.
@@ -1513,20 +1542,20 @@ pub class HirGenerator:
         if receiver.has_self:
             try self.fail(span, "`" + name + "` takes `self`; call it through a `" + self.structs[struct_index].name + "` value")
         try self.require_method_visible(method_index, struct_index, span)
-        return ResolvedCallee(function_index = method_index, receiver = none, struct_index = -1)
+        return ResolvedCallee(function_index = method_index, receiver = NodeId(value = no_node), struct_index = -1)
 
     func require_method_visible(method_index: i64, struct_index: i64, span: SourceSpan) -> !:
         let owner_module = self.structs[struct_index].module_index
         if owner_module != self.current_module and not self.functions[method_index].is_public:
             try self.fail(span, "`" + self.functions[method_index].name + "` is private to module `" + self.sources[owner_module].name + "`")
 
-    func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         var expected_parts: list[TypeId]? = none
         if expected != none:
             expected_parts = self.tuple_elements(expected)
             if expected_parts != none and len(expected_parts) != len(elements):
                 try self.fail(span, "tuple has " + str(len(elements)) + " element(s), expected `" + self.describe_type(expected) + "`")
-        let checked = list[HirExpression]()
+        let checked = list[NodeId]()
         var index = 0
         for element in elements:
             var part_expected: TypeId? = none
@@ -1536,22 +1565,15 @@ pub class HirGenerator:
             index += 1
         let parts = list[TypeId]()
         for item in checked:
-            parts.append(item.value_type)
+            parts.append(self.type_of(item))
         let tuple_type = self.intern_tuple(parts)
-        return try self.require_type(
-            HirExpression(value_type = tuple_type, form = HirExpressionForm.Tuple(elements = checked), span = span),
-            expected,
-        )
+        return try self.require_type(self.push_node(HirNodeForm.Tuple(elements = self.push_nodes(checked)), tuple_type, span), expected)
 
-    func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> HirExpression!:
+    func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let checked_optional = try self.check_expression(optional_value, none)
-        let inner = self.optional_inner(checked_optional.value_type) else error(self.diagnostic(span, "`else` requires an optional value, found `" + self.describe_type(checked_optional.value_type) + "`"))
+        let inner = self.optional_inner(self.type_of(checked_optional)) else error(self.diagnostic(span, "`else` requires an optional value, found `" + self.describe_type(self.type_of(checked_optional)) + "`"))
         let checked_arm = try self.check_expression(arm, inner)
-        let typed = HirExpression(
-            value_type = inner,
-            form = HirExpressionForm.ElseFallback(value = checked_optional, arm = checked_arm),
-            span = span,
-        )
+        let typed = self.push_node(HirNodeForm.ElseFallback(value = checked_optional, arm = checked_arm), inner, span)
         return try self.require_type(typed, expected)
 
     # mark: Literal decoding ====================================================================
@@ -1753,17 +1775,63 @@ pub class HirGenerator:
 
     # The one gate every checked expression passes: its type must satisfy the
     # context that asked for it.
-    func require_type(value: HirExpression, expected: TypeId?) -> HirExpression!:
+    func require_type(value: NodeId, expected: TypeId?) -> NodeId!:
         if expected == none: return value
-        if types_match(value.value_type, expected): return value
+        let found = self.type_of(value)
+        if types_match(found, expected): return value
         let inner = self.optional_inner(expected)
-        if inner != none and types_match(value.value_type, inner):
-            return HirExpression(
-                value_type = expected,
-                form = HirExpressionForm.Some(value = value),
-                span = value.span,
-            )
-        error(self.diagnostic(value.span, "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(value.value_type) + "`"))
+        if inner != none and types_match(found, inner):
+            return self.push_node(HirNodeForm.Some(value = value), expected, self.span_of(value))
+        error(self.diagnostic(self.span_of(value), "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(found) + "`"))
+
+    # A literal: its value goes into the value table, the node names it.
+    func push_constant(value: Value, value_type: TypeId, span: SourceSpan) -> NodeId:
+        self.values.append(value)
+        return self.push_node(HirNodeForm.Constant(value = u32(len(self.values) - 1)), value_type, span)
+
+    # A literal tree: constants, tuples and optionals of constants, and unary
+    # or binary operators over them. Constant references are allowed because
+    # a module constant is itself such a tree.
+    func is_constant_expression(id: NodeId) -> bool:
+        match self.node_form(id):
+            Constant(item): return true
+            NoneLiteral: return true
+            Some(inner): return self.is_constant_expression(inner)
+            Tuple(elements): return self.run_is_constant(elements)
+            StructValue(struct_index, fields): return self.run_is_constant(fields)
+            Unary(operation, operand): return self.is_constant_expression(operand)
+            Binary(left, operation, right): return self.is_constant_expression(left) and self.is_constant_expression(right)
+            Conditional(chosen, condition, alternative):
+                return self.is_constant_expression(chosen) and self.is_constant_expression(condition) and self.is_constant_expression(alternative)
+            Reference(symbol): return true
+            else: return false
+
+    func run_is_constant(run: Operands) -> bool:
+        for index in range(0, i64(run.count)):
+            if not self.is_constant_expression(NodeId(value = self.extra[i64(run.start) + index])): return false
+        return true
+
+    # Conservative: a suite definitely returns only when a statement is a
+    # `return`, or an `if` with an `else` whose every arm definitely returns.
+    func statements_return(statements: list[NodeId]) -> bool:
+        for statement in statements:
+            match self.node_form(statement):
+                ReturnStatement(value): return true
+                IfStatement(branches, has_fallback, fallback):
+                    if has_fallback:
+                        var every_branch_returns = true
+                        for branch in range(0, i64(branches.count) // 3):
+                            let body = Operands(start = self.extra[i64(branches.start) + branch * 3 + 1], count = self.extra[i64(branches.start) + branch * 3 + 2])
+                            if not self.statements_return(self.run_nodes(body)): every_branch_returns = false
+                        if every_branch_returns and self.statements_return(self.run_nodes(fallback)): return true
+                else: continue
+        return false
+
+    func run_nodes(run: Operands) -> list[NodeId]:
+        let ids = list[NodeId]()
+        for index in range(0, i64(run.count)):
+            ids.append(NodeId(value = self.extra[i64(run.start) + index]))
+        return ids
 
     # Render a TypeId only when producing a diagnostic. Semantic decisions use
     # identity and type forms, never this human-readable spelling.
@@ -1801,48 +1869,10 @@ func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
             return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
         else: return false
 
-# A literal tree: constants, tuples and optionals of constants, and unary or
-# binary operators over them. Constant references are allowed because a
-# module constant is itself such a tree.
-func is_constant_expression(value: HirExpression) -> bool:
-    match value.form:
-        Constant(item): return true
-        NoneLiteral: return true
-        Some(inner): return is_constant_expression(inner)
-        Tuple(elements):
-            for element in elements:
-                if not is_constant_expression(element): return false
-            return true
-        StructValue(struct_index, fields):
-            for field in fields:
-                if not is_constant_expression(field): return false
-            return true
-        Unary(operation, operand): return is_constant_expression(operand)
-        Binary(left, operation, right): return is_constant_expression(left) and is_constant_expression(right)
-        Conditional(chosen, condition, alternative):
-            return is_constant_expression(chosen) and is_constant_expression(condition) and is_constant_expression(alternative)
-        Reference(symbol): return true
-        else: return false
-
 func find_parameter(function: FunctionSymbol, name: str) -> i64:
     for index in range(0, len(function.parameters)):
         if function.parameters[index].name == name: return index
     return -1
-
-# Conservative: a function definitely returns only when its statement list
-# reaches a `return`, or an `if` whose every branch and fallback do.
-func statements_return(statements: list[HirStatement]) -> bool:
-    for statement in statements:
-        match statement.form:
-            ReturnStatement(value): return true
-            IfStatement(branches, fallback):
-                if fallback != none:
-                    var every_branch_returns = true
-                    for branch in branches:
-                        if not statements_return(branch.body): every_branch_returns = false
-                    if every_branch_returns and statements_return(fallback): return true
-            else: continue
-    return false
 
 func is_arithmetic_operator(operator: str) -> bool:
     return match operator:

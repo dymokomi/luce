@@ -78,9 +78,9 @@ from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSl
 from compiler.canonical_ir import MirType, TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import align_of, enum_payload_offset, find_runtime_symbol, intern_mir_type, make_enum_type
 from compiler.canonical_ir import is_ptr_type, make_struct_type, mir_type, no_register, size_of
-from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirArgument, HirConstant, HirExpression, HirFunction
-from compiler.hir import HirIfBranch, HirModule, HirProgram, HirStatement, SymbolId, TypeForm, describe_type
-from compiler.hir import resolve_builtin_type, types_match
+from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm
+from compiler.hir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
+from compiler.hir import entry_at, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 import compiler.hir
 from compiler.mir_verifier import terminates
 from compiler.semantic_analyzer import AnalyzedProgram
@@ -194,8 +194,8 @@ pub class Lowerer:
 
         let body = list[MirInstruction]()
         try self.lower_prologue(module, function, function.body, body)
-        for statement in function.body:
-            try self.lower_statement(module, function, statement, body)
+        for position in range(0, i64(function.body.count)):
+            try self.lower_statement(module, function, node_at(self.program, function.body, position), body)
         # MIR ends every path with a syntactic terminator. A unit function may
         # simply finish, so it gets `Return []`. A value function whose body
         # does not end in a terminator has already been proved by HirGenerator
@@ -223,78 +223,88 @@ pub class Lowerer:
     # Every binding in the body — at any nesting depth — gets its slot up
     # front, so the address registers exist before any statement runs and a
     # backend can size the frame from `slots` alone.
-    func lower_prologue(module: HirModule, function: HirFunction, statements: list[HirStatement], body: list[MirInstruction]) -> !:
-        for statement in statements:
-            match statement.form:
-                Binding(symbol, name, is_mutable, value):
-                    let slot_type = try self.mir_type_of(module, function, statement.span, value.value_type)
+    func lower_prologue(module: HirModule, function: HirFunction, statements: Operands, body: list[MirInstruction]) -> !:
+        for position in range(0, i64(statements.count)):
+            let statement = node_at(self.program, statements, position)
+            let span = node_span(self.program, statement)
+            match node_form(self.program, statement):
+                Binding(symbol, is_mutable, value):
+                    let slot_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
                     let slot = len(self.slots)
                     self.slots.append(MirSlot(value_type = slot_type, align = align_of(self.types, self.layout, slot_type)))
                     let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                    body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = statement.span))
+                    body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = span))
                     self.locals.append(Local(symbol = symbol.value, address = address))
-                IfStatement(branches, fallback):
-                    for branch in branches:
-                        try self.lower_prologue(module, function, branch.body, body)
-                    if fallback != none:
-                        try self.lower_prologue(module, function, fallback, body)
+                IfStatement(branches, has_fallback, fallback):
+                    for branch in range(0, i64(branches.count) // 3):
+                        try self.lower_prologue(module, function, self.branch_body(branches, branch), body)
+                    if has_fallback: try self.lower_prologue(module, function, fallback, body)
                 WhileStatement(condition, loop_body):
                     try self.lower_prologue(module, function, loop_body, body)
                 else: continue
 
+    # Branch `index` of an `IfStatement`: the triple's condition and body run.
+    func branch_condition(branches: Operands, index: i64) -> NodeId:
+        return NodeId(value = u32(entry_at(self.program, branches, index * 3)))
+
+    func branch_body(branches: Operands, index: i64) -> Operands:
+        return Operands(start = u32(entry_at(self.program, branches, index * 3 + 1)), count = u32(entry_at(self.program, branches, index * 3 + 2)))
+
     # Append the instructions for one HIR statement. For example, `return 7`
     # emits a constant into a fresh register and returns that register.
-    func lower_statement(module: HirModule, function: HirFunction, statement: HirStatement, body: list[MirInstruction]) -> !:
-        match statement.form:
+    func lower_statement(module: HirModule, function: HirFunction, statement: NodeId, body: list[MirInstruction]) -> !:
+        let span = node_span(self.program, statement)
+        match node_form(self.program, statement):
             PrintText(value):
-                try self.lower_print(value, statement.span, body)
+                try self.lower_print(value, span, body)
             PrintValue(value):
-                try self.lower_print_value(module, function, value, statement.span, body)
+                try self.lower_print_value(module, function, value, span, body)
             ReturnStatement(value):
-                if value == none:
-                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = statement.span))
+                if value.value == no_node:
+                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = span))
                     return
-                let returned = value
-                let register = try self.lower_expression(module, function, returned, body)
+                let register = try self.lower_expression(module, function, value, body)
                 if self.result_slot >= 0:
                     # The caller owns the result's memory; fill it and return nothing.
-                    let value_type = try self.mir_type_of(module, function, statement.span, returned.value_type)
-                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.result_slot)), source = register, value_type = value_type), span = statement.span))
-                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = statement.span))
+                    let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
+                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.result_slot)), source = register, value_type = value_type), span = span))
+                    body.append(MirInstruction(form = InstructionForm.Return(values = list[RegisterId]()), span = span))
                     return
-                body.append(MirInstruction(form = InstructionForm.Return(values = [register]), span = statement.span))
-            Binding(symbol, name, is_mutable, value):
-                let local = try self.local_of(module, function, statement.span, symbol)
+                body.append(MirInstruction(form = InstructionForm.Return(values = [register]), span = span))
+            Binding(symbol, is_mutable, value):
+                let local = try self.local_of(module, function, span, symbol)
                 let register = try self.lower_expression(module, function, value, body)
-                let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
-                self.store_value(value_type, local.address, register, statement.span, body)
+                let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
+                self.store_value(value_type, local.address, register, span, body)
             Assignment(symbol, operation, value):
-                let address = try self.address_of(module, function, statement.span, symbol)
-                let value_type = try self.mir_type_of(module, function, statement.span, value.value_type)
-                try self.lower_store(module, function, statement.span, value_type, address, operation, value, body)
+                let address = try self.address_of(module, function, span, symbol)
+                let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
+                try self.lower_store(module, function, span, value_type, address, operation, value, body)
             FieldAssignment(symbol, path, operation, value):
                 # Walk the path through HIR field types to reach the place.
-                var address = try self.address_of(module, function, statement.span, symbol)
+                var address = try self.address_of(module, function, span, symbol)
                 var place_type = self.program.symbols[i64(symbol.value)].value_type
-                for field in path:
-                    let struct_type = try self.mir_type_of(module, function, statement.span, place_type)
-                    address = self.field_address(struct_type, address, field, statement.span, body)
+                for position in range(0, i64(path.count)):
+                    let field = entry_at(self.program, path, position)
+                    let struct_type = try self.mir_type_of(module, function, span, place_type)
+                    address = self.field_address(struct_type, address, field, span, body)
                     place_type = self.hir_field_type(place_type, field)
-                let value_type = try self.mir_type_of(module, function, statement.span, place_type)
-                try self.lower_store(module, function, statement.span, value_type, address, operation, value, body)
+                let value_type = try self.mir_type_of(module, function, span, place_type)
+                try self.lower_store(module, function, span, value_type, address, operation, value, body)
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
-            IfStatement(branches, fallback):
-                try self.lower_if(module, function, statement.span, branches, 0, fallback, body)
+            IfStatement(branches, has_fallback, fallback):
+                try self.lower_if(module, function, span, branches, 0, has_fallback, fallback, body)
             WhileStatement(condition, loop_body):
-                try self.lower_while(module, function, statement.span, condition, loop_body, body)
+                try self.lower_while(module, function, span, condition, loop_body, body)
             BreakStatement:
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span) + 1, values = list[RegisterId]()), span = statement.span))
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, span) + 1, values = list[RegisterId]()), span = span))
             ContinueStatement:
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, statement.span), values = list[RegisterId]()), span = statement.span))
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, span), values = list[RegisterId]()), span = span))
+            else: try self.fail_unsupported(module, function, span, "an expression node where a statement was expected")
 
     # Store a value, or combine it with what the place holds, at an address.
-    func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: HirExpression, body: list[MirInstruction]) -> !:
+    func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
         let register = try self.lower_expression(module, function, value, body)
         var stored = register
         match operation:
@@ -342,17 +352,16 @@ pub class Lowerer:
     # whose else-arm holds the next branch, and the last else-arm is the
     # fallback. Each arm is its own region, so registers defined inside stay
     # inside; locals reach across through their slots.
-    func lower_if(module: HirModule, function: HirFunction, span: SourceSpan, branches: list[HirIfBranch], index: i64, fallback: list[HirStatement]?, body: list[MirInstruction]) -> !:
-        let branch = branches[index]
-        let condition = try self.lower_expression(module, function, branch.condition, body)
+    func lower_if(module: HirModule, function: HirFunction, span: SourceSpan, branches: Operands, index: i64, has_fallback: bool, fallback: Operands, body: list[MirInstruction]) -> !:
+        let condition = try self.lower_expression(module, function, self.branch_condition(branches, index), body)
         self.open_if(condition, list[RegisterId](), span, body)
-        try self.lower_region(module, function, Region.if_arm, branch.body, body)
-        if index + 1 < len(branches):
+        try self.lower_region(module, function, Region.if_arm, self.branch_body(branches, index), body)
+        if index + 1 < i64(branches.count) // 3:
             self.emit_else(span, body)
             self.regions.append(Region.if_arm)
-            try self.lower_if(module, function, span, branches, index + 1, fallback, body)
+            try self.lower_if(module, function, span, branches, index + 1, has_fallback, fallback, body)
             self.regions.remove(len(self.regions) - 1)
-        elif fallback != none:
+        elif has_fallback:
             self.emit_else(span, body)
             try self.lower_region(module, function, Region.if_arm, fallback, body)
         self.emit_end(span, body)
@@ -361,17 +370,18 @@ pub class Lowerer:
     # every pass and leaves the block when it fails; the body's last act is a
     # branch back to the loop. `break` is a branch to the block, `continue`
     # a branch to the loop; both count the regions in between.
-    func lower_while(module: HirModule, function: HirFunction, span: SourceSpan, condition: HirExpression, statements: list[HirStatement], body: list[MirInstruction]) -> !:
+    func lower_while(module: HirModule, function: HirFunction, span: SourceSpan, condition: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
         body.append(MirInstruction(form = InstructionForm.Block(results = list[RegisterId]()), span = span))
         body.append(MirInstruction(form = InstructionForm.Loop, span = span))
         self.regions.append(Region.block)
         self.regions.append(Region.loop_body)
         let tested = try self.lower_expression(module, function, condition, body)
         let failed = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
-        body.append(MirInstruction(form = InstructionForm.Unary(result = failed, operation = UnaryOp.bool_not, operand = tested), span = condition.span))
-        body.append(MirInstruction(form = InstructionForm.BrIf(condition = failed, depth = 1, values = list[RegisterId]()), span = condition.span))
-        for statement in statements:
-            try self.lower_statement(module, function, statement, body)
+        let condition_span = node_span(self.program, condition)
+        body.append(MirInstruction(form = InstructionForm.Unary(result = failed, operation = UnaryOp.bool_not, operand = tested), span = condition_span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = failed, depth = 1, values = list[RegisterId]()), span = condition_span))
+        for position in range(0, i64(statements.count)):
+            try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = list[RegisterId]()), span = span))
         self.regions.remove(len(self.regions) - 1)
         self.regions.remove(len(self.regions) - 1)
@@ -379,10 +389,10 @@ pub class Lowerer:
         self.emit_end(span, body)
 
     # Lower statements inside one new region.
-    func lower_region(module: HirModule, function: HirFunction, region: Region, statements: list[HirStatement], body: list[MirInstruction]) -> !:
+    func lower_region(module: HirModule, function: HirFunction, region: Region, statements: Operands, body: list[MirInstruction]) -> !:
         self.regions.append(region)
-        for statement in statements:
-            try self.lower_statement(module, function, statement, body)
+        for position in range(0, i64(statements.count)):
+            try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         self.regions.remove(len(self.regions) - 1)
 
     # The branch depth of the innermost enclosing loop: zero when the branch
@@ -418,9 +428,9 @@ pub class Lowerer:
         ))
 
     # `print(value)` for a `str` value: write its bytes, then a newline.
-    func lower_print_value(module: HirModule, function: HirFunction, value: HirExpression, span: SourceSpan, body: list[MirInstruction]) -> !:
+    func lower_print_value(module: HirModule, function: HirFunction, value: NodeId, span: SourceSpan, body: list[MirInstruction]) -> !:
         let text = try self.lower_expression(module, function, value, body)
-        let text_type = try self.mir_type_of(module, function, span, value.value_type)
+        let text_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
         let pointer = try self.load_field(text_type, text, 0, span, body)
         let length = try self.load_field(text_type, text, 1, span, body)
         let write = try self.runtime_extern("luce_rt_write")
@@ -441,29 +451,30 @@ pub class Lowerer:
     # Lower one expression and return the register holding its value.
     # Operands are lowered left to right, so `2 + 3` defines the register for
     # 2, then 3, then their sum.
-    func lower_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
+    func lower_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
         # A call may produce `unit`, which has no machine type; every other
         # expression form has a scalar type or is refused below.
-        match expression.form:
+        match node_form(self.program, expression):
             Call(callee, arguments):
                 return try self.lower_call(module, function, expression, callee, arguments, body)
             else: return try self.lower_typed_expression(module, function, expression, body)
 
-    func lower_typed_expression(module: HirModule, function: HirFunction, expression: HirExpression, body: list[MirInstruction]) -> RegisterId!:
-        let value_type = try self.mir_type_of(module, function, expression.span, expression.value_type)
-        match expression.form:
-            Constant(value):
+    func lower_typed_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let value_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
+        match node_form(self.program, expression):
+            Constant(index):
                 var constant = MirConstant.Null
-                match value:
+                match self.program.values[i64(index)]:
                     Integer(item): constant = MirConstant.Int(value = item)
                     Floating(item): constant = MirConstant.Float(value = item)
                     Boolean(item): constant = MirConstant.Bool(value = item)
                     Character(item): constant = MirConstant.Int(value = i64(u32(item)))
-                    Text(item): return try self.lower_byte_constant(value_type, strings.to_bytes(item), expression.span, body)
-                    Bytes(item): return try self.lower_byte_constant(value_type, item, expression.span, body)
-                    else: try self.fail_unsupported(module, function, expression.span, "constant `" + str(value) + "`")
+                    Text(item): return try self.lower_byte_constant(value_type, strings.to_bytes(item), span, body)
+                    Bytes(item): return try self.lower_byte_constant(value_type, item, span, body)
+                    else: try self.fail_unsupported(module, function, span, "constant `" + str(self.program.values[i64(index)]) + "`")
                 let register = self.new_register(value_type)
-                body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = expression.span))
+                body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = span))
                 return register
             Reference(symbol):
                 for parameter in self.parameters:
@@ -471,75 +482,77 @@ pub class Lowerer:
                 let constant = self.constant_of(symbol)
                 if constant != none:
                     return try self.lower_expression(module, function, constant.value, body)
-                let local = try self.local_of(module, function, expression.span, symbol)
-                return self.load_value(value_type, local.address, expression.span, body)
+                let local = try self.local_of(module, function, span, symbol)
+                return self.load_value(value_type, local.address, span, body)
             Tuple(elements):
                 # Fill a fresh slot field by field; the slot's address is the value.
-                let temp = self.new_temp(value_type, expression.span, body)
-                for index in range(0, len(elements)):
-                    let element = try self.lower_expression(module, function, elements[index], body)
-                    let element_type = try self.mir_type_of(module, function, elements[index].span, elements[index].value_type)
-                    let field = self.field_address(value_type, temp, index, expression.span, body)
-                    self.store_value(element_type, field, element, expression.span, body)
+                let temp = self.new_temp(value_type, span, body)
+                for index in range(0, i64(elements.count)):
+                    let element_node = node_at(self.program, elements, index)
+                    let element = try self.lower_expression(module, function, element_node, body)
+                    let element_type = try self.mir_type_of(module, function, node_span(self.program, element_node), node_type(self.program, element_node))
+                    let field = self.field_address(value_type, temp, index, span, body)
+                    self.store_value(element_type, field, element, span, body)
                 return temp
             Element(tuple_value, index):
                 let base = try self.lower_expression(module, function, tuple_value, body)
-                let tuple_type = try self.mir_type_of(module, function, tuple_value.span, tuple_value.value_type)
-                let field = self.field_address(tuple_type, base, index, expression.span, body)
-                return self.load_value(value_type, field, expression.span, body)
+                let tuple_type = try self.mir_type_of(module, function, node_span(self.program, tuple_value), node_type(self.program, tuple_value))
+                let field = self.field_address(tuple_type, base, index, span, body)
+                return self.load_value(value_type, field, span, body)
             StructValue(struct_index, fields):
-                let temp = self.new_temp(value_type, expression.span, body)
-                for index in range(0, len(fields)):
-                    let element = try self.lower_expression(module, function, fields[index], body)
-                    let element_type = try self.mir_type_of(module, function, fields[index].span, fields[index].value_type)
-                    let field = self.field_address(value_type, temp, index, expression.span, body)
-                    self.store_value(element_type, field, element, expression.span, body)
+                let temp = self.new_temp(value_type, span, body)
+                for index in range(0, i64(fields.count)):
+                    let field_node = node_at(self.program, fields, index)
+                    let element = try self.lower_expression(module, function, field_node, body)
+                    let element_type = try self.mir_type_of(module, function, node_span(self.program, field_node), node_type(self.program, field_node))
+                    let field = self.field_address(value_type, temp, index, span, body)
+                    self.store_value(element_type, field, element, span, body)
                 return temp
             FieldAccess(record, field_index):
                 let base = try self.lower_expression(module, function, record, body)
-                let struct_type = try self.mir_type_of(module, function, record.span, record.value_type)
-                let field = self.field_address(struct_type, base, field_index, expression.span, body)
-                return self.load_value(value_type, field, expression.span, body)
+                let struct_type = try self.mir_type_of(module, function, node_span(self.program, record), node_type(self.program, record))
+                let field = self.field_address(struct_type, base, field_index, span, body)
+                return self.load_value(value_type, field, span, body)
             NoneLiteral:
-                let temp = self.new_temp(value_type, expression.span, body)
-                self.store_tag(temp, 0, expression.span, body)
+                let temp = self.new_temp(value_type, span, body)
+                self.store_tag(temp, 0, span, body)
                 return temp
             Some(inner):
-                let temp = self.new_temp(value_type, expression.span, body)
-                self.store_tag(temp, 1, expression.span, body)
+                let temp = self.new_temp(value_type, span, body)
+                self.store_tag(temp, 1, span, body)
                 let payload = try self.lower_expression(module, function, inner, body)
-                let payload_type = try self.mir_type_of(module, function, inner.span, inner.value_type)
-                let payload_address = self.payload_address(value_type, temp, expression.span, body)
-                self.store_value(payload_type, payload_address, payload, expression.span, body)
+                let payload_type = try self.mir_type_of(module, function, node_span(self.program, inner), node_type(self.program, inner))
+                let payload_address = self.payload_address(value_type, temp, span, body)
+                self.store_value(payload_type, payload_address, payload, span, body)
                 return temp
             ElseFallback(optional_value, arm):
                 # `If(tag == 1)`: the present arm yields the payload, the
                 # absent arm evaluates and yields the fallback.
                 let optional = try self.lower_expression(module, function, optional_value, body)
-                let optional_type = try self.mir_type_of(module, function, optional_value.span, optional_value.value_type)
-                let present = self.load_present(optional, expression.span, body)
+                let optional_type = try self.mir_type_of(module, function, node_span(self.program, optional_value), node_type(self.program, optional_value))
+                let present = self.load_present(optional, span, body)
                 let result = self.new_register(self.register_type_for(value_type))
-                self.open_if(present, [result], expression.span, body)
-                let payload_address = self.payload_address(optional_type, optional, expression.span, body)
-                let payload = self.load_value(value_type, payload_address, expression.span, body)
-                self.emit_yield(payload, expression.span, body)
-                self.emit_else(expression.span, body)
+                self.open_if(present, [result], span, body)
+                let payload_address = self.payload_address(optional_type, optional, span, body)
+                let payload = self.load_value(value_type, payload_address, span, body)
+                self.emit_yield(payload, span, body)
+                self.emit_else(span, body)
                 let fallback = try self.lower_expression(module, function, arm, body)
-                self.emit_yield(fallback, expression.span, body)
-                self.emit_end(expression.span, body)
+                self.emit_yield(fallback, span, body)
+                self.emit_end(span, body)
                 return result
             Unary(operation, operand):
                 let operand_register = try self.lower_expression(module, function, operand, body)
                 let register = self.new_register(value_type)
                 match operation:
                     LogicalNot:
-                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bool_not, operand = operand_register), span = expression.span))
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bool_not, operand = operand_register), span = span))
                     NumericNegate(operand_type):
-                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.neg, operand = operand_register), span = expression.span))
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.neg, operand = operand_register), span = span))
                     IntegerBitwiseNot(operand_type):
-                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bit_not, operand = operand_register), span = expression.span))
+                        body.append(MirInstruction(form = InstructionForm.Unary(result = register, operation = UnaryOp.bit_not, operand = operand_register), span = span))
                     NumericIdentity(operand_type):
-                        body.append(MirInstruction(form = InstructionForm.Copy(result = register, source = operand_register), span = expression.span))
+                        body.append(MirInstruction(form = InstructionForm.Copy(result = register, source = operand_register), span = span))
                 return register
             Binary(left, operation, right):
                 match operation:
@@ -548,51 +561,56 @@ pub class Lowerer:
                     else:
                         let left_register = try self.lower_expression(module, function, left, body)
                         let right_register = try self.lower_expression(module, function, right, body)
-                        let operand_type = try self.mir_type_of(module, function, left.span, left.value_type)
+                        let left_type = node_type(self.program, left)
+                        let operand_type = try self.mir_type_of(module, function, node_span(self.program, left), left_type)
                         if self.is_aggregate(operand_type):
-                            return try self.lower_aggregate_comparison(module, function, expression.span, operation, left.value_type, left_register, right_register, body)
-                        return try self.lower_binary_operation(module, function, expression.span, operation, operand_type, left_register, right_register, body)
+                            return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                        return try self.lower_binary_operation(module, function, span, operation, operand_type, left_register, right_register, body)
             Conditional(value, condition, alternative):
                 let condition_register = try self.lower_expression(module, function, condition, body)
                 let result = self.new_register(self.register_type_for(value_type))
-                self.open_if(condition_register, [result], expression.span, body)
+                self.open_if(condition_register, [result], span, body)
                 let chosen = try self.lower_expression(module, function, value, body)
-                self.emit_yield(chosen, expression.span, body)
-                self.emit_else(expression.span, body)
+                self.emit_yield(chosen, span, body)
+                self.emit_else(span, body)
                 let fallback = try self.lower_expression(module, function, alternative, body)
-                self.emit_yield(fallback, expression.span, body)
-                self.emit_end(expression.span, body)
+                self.emit_yield(fallback, span, body)
+                self.emit_end(span, body)
                 return result
             else:
-                error(self.unsupported(module, function, expression.span, "expression `" + str(expression.form) + "`"))
+                error(self.unsupported(module, function, span, "expression `" + str(node_form(self.program, expression)) + "`"))
 
     # Arguments are lowered in the order they were written, then placed by
     # the parameter index HIR resolved for each (named arguments may be
     # written in any order). The callee is a `FunctionId`, its index in
     # `program.functions`, which is the same index in the MIR program.
-    func lower_call(module: HirModule, function: HirFunction, expression: HirExpression, callee: SymbolId, arguments: list[HirArgument], body: list[MirInstruction]) -> RegisterId!:
+    func lower_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
         let target = self.function_index_of(callee)
-        if target < 0: try self.fail_unsupported(module, function, expression.span, "a call to a symbol that is not a function")
+        if target < 0: try self.fail_unsupported(module, function, span, "a call to a symbol that is not a function")
         let called = self.program.functions[target]
         let placed = list[RegisterId]()
         for parameter in called.parameters: placed.append(RegisterId(value = no_register))
-        for argument in arguments:
-            placed[argument.parameter_index] = try self.lower_expression(module, function, argument.value, body)
+        # Arguments are pairs: parameter index, then the argument node.
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            placed[parameter_index] = try self.lower_expression(module, function, argument, body)
         let results = list[RegisterId]()
         if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
-            let result_type = try self.mir_type_of(module, function, expression.span, called.result)
+            let result_type = try self.mir_type_of(module, function, span, called.result)
             if self.is_aggregate(result_type):
                 # The callee fills the caller's slot through its hidden first
                 # parameter, so the slot's address leads the arguments.
-                let result_temp = self.new_temp(result_type, expression.span, body)
+                let result_temp = self.new_temp(result_type, span, body)
                 let with_slot = [result_temp]
                 for argument in placed: with_slot.append(argument)
-                body.append(MirInstruction(form = InstructionForm.Call(results = results, function = FunctionId(value = u32(target)), arguments = with_slot), span = expression.span))
+                body.append(MirInstruction(form = InstructionForm.Call(results = results, function = FunctionId(value = u32(target)), arguments = with_slot), span = span))
                 return result_temp
             results.append(self.new_register(result_type))
         body.append(MirInstruction(
             form = InstructionForm.Call(results = results, function = FunctionId(value = u32(target)), arguments = placed),
-            span = expression.span,
+            span = span,
         ))
         if len(results) == 0: return RegisterId(value = no_register)
         return results[0]
@@ -600,25 +618,26 @@ pub class Lowerer:
     # `a and b` evaluates `b` only when `a` is true; `a or b` only when `a`
     # is false. Both are an `If` whose unevaluated arm yields the constant
     # that decided the answer.
-    func lower_short_circuit(module: HirModule, function: HirFunction, expression: HirExpression, left: HirExpression, right: HirExpression, is_and: bool, body: list[MirInstruction]) -> RegisterId!:
+    func lower_short_circuit(module: HirModule, function: HirFunction, expression: NodeId, left: NodeId, right: NodeId, is_and: bool, body: list[MirInstruction]) -> RegisterId!:
         let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let expression_span = node_span(self.program, expression)
         let left_register = try self.lower_expression(module, function, left, body)
         let result = self.new_register(boolean)
-        self.open_if(left_register, [result], expression.span, body)
+        self.open_if(left_register, [result], expression_span, body)
         # `and`: the left decided only when false; `or`: only when true.
         if is_and:
             let right_register = try self.lower_expression(module, function, right, body)
-            self.emit_yield(right_register, expression.span, body)
-            self.emit_else(expression.span, body)
-            let decided = self.bool_constant(false, expression.span, body)
-            self.emit_yield(decided, expression.span, body)
+            self.emit_yield(right_register, expression_span, body)
+            self.emit_else(expression_span, body)
+            let decided = self.bool_constant(false, expression_span, body)
+            self.emit_yield(decided, expression_span, body)
         else:
-            let decided = self.bool_constant(true, expression.span, body)
-            self.emit_yield(decided, expression.span, body)
-            self.emit_else(expression.span, body)
+            let decided = self.bool_constant(true, expression_span, body)
+            self.emit_yield(decided, expression_span, body)
+            self.emit_else(expression_span, body)
             let right_register = try self.lower_expression(module, function, right, body)
-            self.emit_yield(right_register, expression.span, body)
-        self.emit_end(expression.span, body)
+            self.emit_yield(right_register, expression_span, body)
+        self.emit_end(expression_span, body)
         return result
 
     # Emit one `Binary` for a resolved HIR operation on two lowered operands.
