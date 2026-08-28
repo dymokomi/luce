@@ -78,7 +78,7 @@ from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSl
 from compiler.canonical_ir import MirType, TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import align_of, enum_payload_offset, find_runtime_symbol, intern_mir_type, make_enum_type
 from compiler.canonical_ir import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers, size_of
-from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm
+from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm, Value
 from compiler.hir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir import entry_at, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 import compiler.hir
@@ -212,7 +212,7 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
         var name = module.name + "." + function.name
         let receiver = function.receiver
-        if receiver != none: name = module.name + "." + self.program.structs[receiver.struct_index].name + "." + function.name
+        if receiver != none: name = module.name + "." + describe_type(self.program.types, receiver.owner) + "." + function.name
         return MirFunction(
             name = name,
             convention = CallingConvention.luce,
@@ -232,6 +232,8 @@ pub class Lowerer:
         for position in range(0, i64(statements.count)):
             let statement = node_at(self.program, statements, position)
             let span = node_span(self.program, statement)
+            # Pattern bindings inside any `match` the statement contains.
+            try self.lower_prologue_node(module, function, statement, body)
             match node_form(self.program, statement):
                 Binding(symbol, is_mutable, value):
                     let slot_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
@@ -247,6 +249,73 @@ pub class Lowerer:
                 WhileStatement(condition, loop_body):
                     try self.lower_prologue(module, function, loop_body, body)
                 else: continue
+
+    # A `match` may sit anywhere an expression can and binds payloads in its
+    # arms, so slots for pattern bindings are found by walking expressions.
+    func lower_prologue_node(module: HirModule, function: HirFunction, node: NodeId, body: list[MirInstruction]) -> !:
+        let span = node_span(self.program, node)
+        match node_form(self.program, node):
+            Match(subject, arms, has_result):
+                try self.lower_prologue_node(module, function, subject, body)
+                for position in range(0, i64(arms.count)):
+                    let arm = node_at(self.program, arms, position)
+                    match node_form(self.program, arm):
+                        MatchArm(patterns, statements, value):
+                            for pattern_position in range(0, i64(patterns.count)):
+                                match node_form(self.program, node_at(self.program, patterns, pattern_position)):
+                                    PatternCase(case_index, bindings):
+                                        for binding in range(0, i64(bindings.count)):
+                                            let symbol = SymbolId(value = u32(entry_at(self.program, bindings, binding)))
+                                            try self.reserve_slot(module, function, symbol, span, body)
+                                    else: continue
+                            try self.lower_prologue(module, function, statements, body)
+                            if value.value != no_node: try self.lower_prologue_node(module, function, value, body)
+                        else: continue
+            Binding(symbol, is_mutable, value): try self.lower_prologue_node(module, function, value, body)
+            Assignment(symbol, operation, value): try self.lower_prologue_node(module, function, value, body)
+            FieldAssignment(symbol, path, operation, value): try self.lower_prologue_node(module, function, value, body)
+            PrintValue(value): try self.lower_prologue_node(module, function, value, body)
+            ReturnStatement(value):
+                if value.value != no_node: try self.lower_prologue_node(module, function, value, body)
+            ExpressionStatement(value): try self.lower_prologue_node(module, function, value, body)
+            IfStatement(branches, has_fallback, fallback):
+                for branch in range(0, i64(branches.count) // 3):
+                    try self.lower_prologue_node(module, function, self.branch_condition(branches, branch), body)
+            WhileStatement(condition, loop_body): try self.lower_prologue_node(module, function, condition, body)
+            Unary(operation, operand): try self.lower_prologue_node(module, function, operand, body)
+            Binary(left, operation, right):
+                try self.lower_prologue_node(module, function, left, body)
+                try self.lower_prologue_node(module, function, right, body)
+            Conditional(value, condition, alternative):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, condition, body)
+                try self.lower_prologue_node(module, function, alternative, body)
+            Call(callee, arguments):
+                for pair in range(0, i64(arguments.count) // 2):
+                    try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
+            Tuple(elements): try self.lower_prologue_run(module, function, elements, body)
+            Element(value, index): try self.lower_prologue_node(module, function, value, body)
+            StructValue(struct_index, fields): try self.lower_prologue_run(module, function, fields, body)
+            EnumValue(enum_index, case_index, payload): try self.lower_prologue_run(module, function, payload, body)
+            FieldAccess(value, field): try self.lower_prologue_node(module, function, value, body)
+            Some(value): try self.lower_prologue_node(module, function, value, body)
+            ElseFallback(value, arm):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, arm, body)
+            else: return
+
+    func lower_prologue_run(module: HirModule, function: HirFunction, run: Operands, body: list[MirInstruction]) -> !:
+        for position in range(0, i64(run.count)):
+            try self.lower_prologue_node(module, function, node_at(self.program, run, position), body)
+
+    # One slot for a binding introduced by a pattern; its type is the symbol's.
+    func reserve_slot(module: HirModule, function: HirFunction, symbol: SymbolId, span: SourceSpan, body: list[MirInstruction]) -> !:
+        let slot_type = try self.mir_type_of(module, function, span, self.program.symbols[i64(symbol.value)].value_type)
+        let slot = len(self.slots)
+        self.slots.append(MirSlot(value_type = slot_type, align = align_of(self.types, self.layout, slot_type)))
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = span))
+        self.locals.append(Local(symbol = symbol.value, address = address))
 
     # Branch `index` of an `IfStatement`: the triple's condition and body run.
     func branch_condition(branches: Operands, index: i64) -> NodeId:
@@ -302,6 +371,8 @@ pub class Lowerer:
                 try self.lower_if(module, function, span, branches, 0, has_fallback, fallback, body)
             WhileStatement(condition, loop_body):
                 try self.lower_while(module, function, span, condition, loop_body, body)
+            Match(subject, arms, has_result):
+                let discarded = try self.lower_match(module, function, statement, subject, arms, false, body)
             BreakStatement:
                 body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, span) + 1, values = no_registers()), span = span))
             ContinueStatement:
@@ -530,6 +601,22 @@ pub class Lowerer:
                 let payload_address = self.payload_address(value_type, temp, span, body)
                 self.store_value(payload_type, payload_address, payload, span, body)
                 return temp
+            EnumValue(enum_index, case_index, payload):
+                # Tag first, then the case's payload struct after it.
+                let temp = self.new_temp(value_type, span, body)
+                self.store_tag(temp, case_index, span, body)
+                if payload.count > 0:
+                    let case_type = self.case_struct_type(value_type, case_index)
+                    let payload_base = self.payload_address(value_type, temp, span, body)
+                    for index in range(0, i64(payload.count)):
+                        let field_node = node_at(self.program, payload, index)
+                        let element = try self.lower_expression(module, function, field_node, body)
+                        let element_type = try self.mir_type_of(module, function, node_span(self.program, field_node), node_type(self.program, field_node))
+                        let field = self.field_address(case_type, payload_base, index, span, body)
+                        self.store_value(element_type, field, element, span, body)
+                return temp
+            Match(subject, arms, has_result):
+                return try self.lower_match(module, function, expression, subject, arms, true, body)
             ElseFallback(optional_value, arm):
                 # `If(tag == 1)`: the present arm yields the payload, the
                 # absent arm evaluates and yields the fallback.
@@ -691,6 +778,223 @@ pub class Lowerer:
         ))
         return register
 
+    # mark: Match ===============================================================================
+    #
+    # A `match` is an `If` chain testing the subject once per alternative,
+    # innermost-last, so arms are tried in source order. An arm whose
+    # alternatives bind payloads gets its body once per alternative (each
+    # alternative's payload lives in a different case struct). The expression
+    # form wraps the chain in a `Block` with the result register and every arm
+    # branches to it with its value; the last `Else` traps, since HirGenerator
+    # proved the arms exhaustive. `Switch` is left for the native backends'
+    # jump tables.
+    func lower_match(module: HirModule, function: HirFunction, node: NodeId, subject: NodeId, arms: Operands, has_result: bool, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, node)
+        let subject_type = node_type(self.program, subject)
+        let selected = try self.lower_expression(module, function, subject, body)
+        var result = RegisterId(value = no_register)
+        var block_depth = len(self.regions)
+        if has_result:
+            result = self.new_register(self.register_type_for(try self.mir_type_of(module, function, span, node_type(self.program, node))))
+            body.append(MirInstruction(form = InstructionForm.Block(results = self.operands.run([result])), span = span))
+            self.regions.append(Region.block)
+        var open_arms = 0
+        var closed = false
+        for position in range(0, i64(arms.count)):
+            if closed: break
+            let arm = node_at(self.program, arms, position)
+            match node_form(self.program, arm):
+                MatchArm(patterns, statements, value):
+                    let binds = self.arm_binds(patterns)
+                    # Each `If` stays on the region stack after its `Else`: the
+                    # next arm is emitted inside that else-arm, so branch depths
+                    # (to the result block, or `break`/`continue` past it) count it.
+                    if binds:
+                        # One `If` per alternative, each with its own copy of the body.
+                        for alternative in range(0, i64(patterns.count)):
+                            let pattern = node_at(self.program, patterns, alternative)
+                            let test = try self.lower_pattern_test(module, function, pattern, selected, subject_type, body)
+                            self.open_if(test, list[RegisterId](), span, body)
+                            self.regions.append(Region.if_arm)
+                            try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
+                            try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                            self.emit_else(span, body)
+                            open_arms += 1
+                    elif self.arm_is_wildcard(patterns):
+                        try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                        closed = true
+                    else:
+                        var test = try self.lower_pattern_test(module, function, node_at(self.program, patterns, 0), selected, subject_type, body)
+                        for alternative in range(1, i64(patterns.count)):
+                            let next = try self.lower_pattern_test(module, function, node_at(self.program, patterns, alternative), selected, subject_type, body)
+                            test = self.lower_or(test, next, span, body)
+                        self.open_if(test, list[RegisterId](), span, body)
+                        self.regions.append(Region.if_arm)
+                        try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                        self.emit_else(span, body)
+                        open_arms += 1
+                else: try self.fail_unsupported(module, function, span, "a match arm that is not a `MatchArm` node")
+        if not closed:
+            body.append(MirInstruction(form = InstructionForm.Trap(reason = "unreachable match arm"), span = span))
+        for arm in range(0, open_arms):
+            self.regions.remove(len(self.regions) - 1)
+            self.emit_end(span, body)
+        if has_result:
+            self.regions.remove(len(self.regions) - 1)
+            self.emit_end(span, body)
+        return result
+
+    # An arm's body: its statements, or its value branched to the match's
+    # result block through every region opened since.
+    func lower_arm_body(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, has_result: bool, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
+        if not has_result:
+            for position in range(0, i64(statements.count)):
+                try self.lower_statement(module, function, node_at(self.program, statements, position), body)
+            return
+        let register = try self.lower_expression(module, function, value, body)
+        let depth = len(self.regions) - 1 - block_depth
+        body.append(MirInstruction(form = InstructionForm.Br(depth = depth, values = self.operands.run([register])), span = span))
+
+    func arm_binds(patterns: Operands) -> bool:
+        for position in range(0, i64(patterns.count)):
+            match node_form(self.program, node_at(self.program, patterns, position)):
+                PatternCase(case_index, bindings):
+                    if bindings.count > 0: return true
+                else: continue
+        return false
+
+    func arm_is_wildcard(patterns: Operands) -> bool:
+        if patterns.count != 1: return false
+        match node_form(self.program, node_at(self.program, patterns, 0)):
+            PatternWildcard: return true
+            else: return false
+
+    # `a or b` / `a and b` over two already-computed tests, as an `If` with a
+    # result (bool has no bitwise operators in MIR).
+    func lower_or(left: RegisterId, right: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(left, [result], span, body)
+        self.emit_yield(self.bool_constant(true, span, body), span, body)
+        self.emit_else(span, body)
+        self.emit_yield(right, span, body)
+        self.emit_end(span, body)
+        return result
+
+    func lower_and(left: RegisterId, right: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(left, [result], span, body)
+        self.emit_yield(right, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(self.bool_constant(false, span, body), span, body)
+        self.emit_end(span, body)
+        return result
+
+    # A bool register: does the subject match this pattern?
+    func lower_pattern_test(module: HirModule, function: HirFunction, pattern: NodeId, selected: RegisterId, subject_type: hir.TypeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, pattern)
+        match node_form(self.program, pattern):
+            PatternWildcard: return self.bool_constant(true, span, body)
+            PatternLiteral(value):
+                let literal = try self.lower_value_constant(module, function, self.program.values[i64(value)], subject_type, span, body)
+                return try self.lower_equality(module, function, span, subject_type, selected, literal, body)
+            PatternRange(lower, upper, inclusive):
+                let operand_type = try self.mir_type_of(module, function, span, subject_type)
+                let low = try self.lower_value_constant(module, function, self.program.values[i64(lower)], subject_type, span, body)
+                let high = try self.lower_value_constant(module, function, self.program.values[i64(upper)], subject_type, span, body)
+                let above = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = above, operation = BinaryOp.ge, left = selected, right = low), span = span))
+                let below = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                var upper_test = BinaryOp.lt
+                if inclusive: upper_test = BinaryOp.le
+                body.append(MirInstruction(form = InstructionForm.Binary(result = below, operation = upper_test, left = selected, right = high), span = span))
+                return self.lower_and(above, below, span, body)
+            PatternCase(case_index, bindings):
+                let tag = self.load_tag(selected, span, body)
+                let wanted = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u8))
+                body.append(MirInstruction(form = InstructionForm.Const(result = wanted, value = MirConstant.Int(value = case_index)), span = span))
+                let same = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = same, operation = BinaryOp.eq, left = tag, right = wanted), span = span))
+                return same
+            else: error(self.unsupported(module, function, span, "a pattern that is not a pattern node"))
+
+    # After a case test succeeds: copy each payload field into its binding's slot.
+    func lower_pattern_bindings(module: HirModule, function: HirFunction, pattern: NodeId, selected: RegisterId, subject_type: hir.TypeId, body: list[MirInstruction]) -> !:
+        let span = node_span(self.program, pattern)
+        match node_form(self.program, pattern):
+            PatternCase(case_index, bindings):
+                if bindings.count == 0: return
+                let enum_type = try self.mir_type_of(module, function, span, subject_type)
+                let payload_base = self.payload_address(enum_type, selected, span, body)
+                match self.program.types.definitions[i64(subject_type.value)].form:
+                    Optional(inner):
+                        # `.some(value)`: the payload is the value itself.
+                        let inner_type = try self.mir_type_of(module, function, span, inner)
+                        let symbol = SymbolId(value = u32(entry_at(self.program, bindings, 0)))
+                        let local = try self.local_of(module, function, span, symbol)
+                        self.store_value(inner_type, local.address, self.load_value(inner_type, payload_base, span, body), span, body)
+                    Enum(enum_index):
+                        let case_type = self.case_struct_type(enum_type, case_index)
+                        let fields = self.program.enums[enum_index].cases[case_index].payload
+                        for index in range(0, i64(bindings.count)):
+                            let symbol = SymbolId(value = u32(entry_at(self.program, bindings, index)))
+                            let local = try self.local_of(module, function, span, symbol)
+                            let field_type = try self.mir_type_of(module, function, span, fields[index].value_type)
+                            let field = self.field_address(case_type, payload_base, index, span, body)
+                            self.store_value(field_type, local.address, self.load_value(field_type, field, span, body), span, body)
+                    else: try self.fail_unsupported(module, function, span, "payload bindings on `" + describe_type(self.program.types, subject_type) + "`")
+            else: return
+
+    # A pattern's literal as a register of the subject's type.
+    func lower_value_constant(module: HirModule, function: HirFunction, value: Value, subject_type: hir.TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let value_type = try self.mir_type_of(module, function, span, subject_type)
+        var constant = MirConstant.Null
+        match value:
+            Integer(item): constant = MirConstant.Int(value = item)
+            Floating(item): constant = MirConstant.Float(value = item)
+            Boolean(item): constant = MirConstant.Bool(value = item)
+            Character(item): constant = MirConstant.Int(value = i64(u32(item)))
+            Text(item): return try self.lower_byte_constant(value_type, strings.to_bytes(item), span, body)
+            Bytes(item): return try self.lower_byte_constant(value_type, item, span, body)
+            else: try self.fail_unsupported(module, function, span, "pattern literal `" + str(value) + "`")
+        let register = self.new_register(value_type)
+        body.append(MirInstruction(form = InstructionForm.Const(result = register, value = constant), span = span))
+        return register
+
+    # The payload struct of one enum case, from the enum's MIR type.
+    func case_struct_type(enum_type: TypeId, case_index: i64) -> TypeId:
+        match mir_type(self.types, enum_type):
+            Enum(tag, cases, size, align): return cases[case_index]
+            else: trap("case struct of a non-enum MIR type")
+
+    # `payload_cases[position..]` compared in turn: `If(tag == case)` compares
+    # that case's fields, its else-arm tries the next; past the last, two
+    # values with equal tags and no payload are equal.
+    func lower_enum_case_chain(module: HirModule, function: HirFunction, span: SourceSpan, enum_index: i64, enum_type: TypeId, left: RegisterId, right: RegisterId, left_tag: RegisterId, payload_cases: list[i64], position: i64, body: list[MirInstruction]) -> RegisterId!:
+        if position >= len(payload_cases): return self.bool_constant(true, span, body)
+        let case_index = payload_cases[position]
+        let wanted = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u8))
+        body.append(MirInstruction(form = InstructionForm.Const(result = wanted, value = MirConstant.Int(value = case_index)), span = span))
+        let is_case = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = is_case, operation = BinaryOp.eq, left = left_tag, right = wanted), span = span))
+        let compared = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(is_case, [compared], span, body)
+        let case_type = self.case_struct_type(enum_type, case_index)
+        let left_payload = self.payload_address(enum_type, left, span, body)
+        let right_payload = self.payload_address(enum_type, right, span, body)
+        let fields = self.program.enums[enum_index].cases[case_index].payload
+        var so_far = self.bool_constant(true, span, body)
+        for field_index in range(0, len(fields)):
+            let element_type = try self.mir_type_of(module, function, span, fields[field_index].value_type)
+            let left_value = self.load_value(element_type, self.field_address(case_type, left_payload, field_index, span, body), span, body)
+            let right_value = self.load_value(element_type, self.field_address(case_type, right_payload, field_index, span, body), span, body)
+            so_far = try self.lower_and_then(module, function, span, so_far, fields[field_index].value_type, left_value, right_value, body)
+        self.emit_yield(so_far, span, body)
+        self.emit_else(span, body)
+        let rest = try self.lower_enum_case_chain(module, function, span, enum_index, enum_type, left, right, left_tag, payload_cases, position + 1, body)
+        self.emit_yield(rest, span, body)
+        self.emit_end(span, body)
+        return compared
+
     # mark: Aggregates ==========================================================================
     #
     # The helpers below implement the memory protocol described in the header:
@@ -762,11 +1066,16 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.Const(result = value, value = MirConstant.Int(value = tag)), span = span))
         body.append(MirInstruction(form = InstructionForm.Store(value_type = byte_type, address = base, value = value), span = span))
 
-    # `tag == 1` as a bool register.
-    func load_present(base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+    func load_tag(base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
         let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
         let tag = self.new_register(byte_type)
         body.append(MirInstruction(form = InstructionForm.Load(result = tag, value_type = byte_type, address = base), span = span))
+        return tag
+
+    # `tag == 1` as a bool register.
+    func load_present(base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let tag = self.load_tag(base, span, body)
         let one = self.new_register(byte_type)
         body.append(MirInstruction(form = InstructionForm.Const(result = one, value = MirConstant.Int(value = 1)), span = span))
         let present = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
@@ -866,6 +1175,24 @@ pub class Lowerer:
                 return result
             String: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
             Bytes: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
+            Enum(index):
+                # Same tag, then the same payload for that case.
+                let left_tag = self.load_tag(left, span, body)
+                let right_tag = self.load_tag(right, span, body)
+                let tags_equal = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = tags_equal, operation = BinaryOp.eq, left = left_tag, right = right_tag), span = span))
+                let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                self.open_if(tags_equal, [result], span, body)
+                let payload_cases = list[i64]()
+                for case_index in range(0, len(self.program.enums[index].cases)):
+                    if len(self.program.enums[index].cases[case_index].payload) > 0: payload_cases.append(case_index)
+                let compared = try self.lower_enum_case_chain(module, function, span, index, mir_value_type, left, right, left_tag, payload_cases, 0, body)
+                self.emit_yield(compared, span, body)
+                self.emit_else(span, body)
+                let different = self.bool_constant(false, span, body)
+                self.emit_yield(different, span, body)
+                self.emit_end(span, body)
+                return result
             else: error(self.unsupported(module, function, span, "equality on `" + describe_type(self.program.types, value_type) + "`"))
 
     # `so_far and left == right`, evaluated only when `so_far` holds.
@@ -997,6 +1324,17 @@ pub class Lowerer:
                 for field in self.program.structs[index].fields:
                     field_types.append(try self.mir_type_of(module, function, span, field.value_type))
                 return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
+            Enum(index):
+                # One payload struct per case, in case order; the tag is a `u8`.
+                if len(self.program.enums[index].cases) > 256:
+                    try self.fail_unsupported(module, function, span, "enums with more than 256 cases")
+                let case_types = list[TypeId]()
+                for case_value in self.program.enums[index].cases:
+                    let field_types = list[TypeId]()
+                    for field in case_value.payload:
+                        field_types.append(try self.mir_type_of(module, function, span, field.value_type))
+                    case_types.append(intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types)))
+                return intern_mir_type(self.types, make_enum_type(self.types, self.layout, builtin_mir_type(BuiltinMirType.unsigned_u8), case_types))
             Optional(inner):
                 let absent = intern_mir_type(self.types, make_struct_type(self.types, self.layout, list[TypeId]()))
                 let present = try self.mir_type_of(module, function, span, inner)

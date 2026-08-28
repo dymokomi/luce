@@ -469,6 +469,190 @@ expect 0 "hi there
 yes
 done" wasmtime run "$test_dir/print_value.wasm"
 
+# Enums and `match`: the same programs as the enum fixtures in
+# tests/compiler/differential_test.luc, executed.
+cat > "$test_dir/enum_directions.luc" <<'LUCE'
+enum Direction:
+    north
+    east
+    south
+    west
+func turn(d: Direction) -> i64:
+    match d:
+        .north: return 1
+        .east: return 2
+        .south, .west: return 3
+pub func answer() -> i64: return turn(Direction.north) * 100 + turn(.east) * 10 + turn(Direction.west)
+LUCE
+"$cli" build "$test_dir/enum_directions.wasm" "$test_dir/enum_directions.luc" >/dev/null
+expect 0 "123" wasmtime run --invoke enum_directions.answer "$test_dir/enum_directions.wasm"
+
+cat > "$test_dir/enum_commands.luc" <<'LUCE'
+enum Command:
+    open(path: i64)
+    resize(width: i64, height: i64)
+    quit
+func size(c: Command) -> i64:
+    return match c:
+        .open(path) => path
+        .resize(width, height) => width * height
+        .quit => -1
+pub func answer() -> i64: return size(Command.open(path: 7)) + size(Command.resize(3, 4)) + size(.quit)
+LUCE
+"$cli" build "$test_dir/enum_commands.wasm" "$test_dir/enum_commands.luc" >/dev/null
+expect 0 "18" wasmtime run --invoke enum_commands.answer "$test_dir/enum_commands.wasm"
+
+cat > "$test_dir/enum_moves.luc" <<'LUCE'
+enum Move:
+    left(steps: i64)
+    right(steps: i64)
+    stop
+func amount(m: Move) -> i64:
+    match m:
+        .left(steps), .right(steps): return steps
+        .stop: return 0
+pub func answer() -> i64: return amount(.left(5)) + amount(Move.right(steps: 6)) + amount(.stop)
+LUCE
+"$cli" build "$test_dir/enum_moves.wasm" "$test_dir/enum_moves.luc" >/dev/null
+expect 0 "11" wasmtime run --invoke enum_moves.answer "$test_dir/enum_moves.wasm"
+
+cat > "$test_dir/enum_shapes.luc" <<'LUCE'
+enum Shape:
+    circle(radius: i64)
+    square(side: i64)
+    dot
+func find(flag: bool) -> Shape?:
+    if flag: return .circle(3)
+    return none
+pub func answer() -> i64:
+    let a = Shape.circle(3)
+    let b = find(true) else .dot
+    let c = find(false) else .dot
+    var n = 0
+    if a == b: n += 1
+    if a != c: n += 10
+    if c == Shape.dot: n += 100
+    if Shape.square(2) != Shape.square(3): n += 1000
+    return n
+LUCE
+"$cli" build "$test_dir/enum_shapes.wasm" "$test_dir/enum_shapes.luc" >/dev/null
+expect 0 "1111" wasmtime run --invoke enum_shapes.answer "$test_dir/enum_shapes.wasm"
+
+cat > "$test_dir/enum_scalars.luc" <<'LUCE'
+func classify(v: i64) -> i64:
+    match v:
+        0: return 0
+        1, 2: return 1
+        3..<10: return 2
+        10..=20: return 3
+        -5..=-1: return 4
+        _: return 5
+func opt(v: i64?) -> i64:
+    match v:
+        .some(x): return x * 2
+        .none: return -1
+func flag(b: bool) -> i64:
+    match b:
+        true: return 1
+        false: return 0
+func letter(c: char) -> i64:
+    return match c:
+        'a'..='z' => 1
+        '0'..='9' => 2
+        _ => 3
+func word(s: str) -> i64:
+    return match s:
+        "yes" => 1
+        "no" => 0
+        _ => -1
+pub func answer() -> i64:
+    return classify(0) + classify(2) * 10 + classify(7) * 100 + classify(15) * 1000 + classify(-3) * 10000 + classify(99) * 100000 + opt(4) + opt(none) + flag(true) + letter('q') + letter('5') + letter('!') + word("yes") + word("maybe")
+LUCE
+"$cli" build "$test_dir/enum_scalars.wasm" "$test_dir/enum_scalars.luc" >/dev/null
+expect 0 "543224" wasmtime run --invoke enum_scalars.answer "$test_dir/enum_scalars.wasm"
+
+cat > "$test_dir/enum_lights.luc" <<'LUCE'
+enum Light:
+    red
+    green
+    func next(self) -> Light:
+        match self:
+            .red: return .green
+            .green: return .red
+    func start() -> Light: return .red
+pub func answer() -> i64:
+    var l = Light.start()
+    var i = 0
+    var greens = 0
+    while i < 7:
+        i += 1
+        l = l.next()
+        match l:
+            .green:
+                greens += 1
+                continue
+            .red:
+                if i == 6: break
+    return greens * 10 + i
+LUCE
+"$cli" build "$test_dir/enum_lights.wasm" "$test_dir/enum_lights.luc" >/dev/null
+expect 0 "36" wasmtime run --invoke enum_lights.answer "$test_dir/enum_lights.wasm"
+
+cat > "$test_dir/enum_toggle.luc" <<'LUCE'
+enum Light:
+    red
+    green
+    mutating func toggle(self):
+        match self:
+            .red: self = .green
+            .green: self = .red
+pub func answer() -> i64:
+    var l = Light.red
+    l.toggle()
+    l.toggle()
+    l.toggle()
+    return match l:
+        .red => 0
+        .green => 1
+LUCE
+"$cli" build "$test_dir/enum_toggle.wasm" "$test_dir/enum_toggle.luc" >/dev/null
+expect 0 "1" wasmtime run --invoke enum_toggle.answer "$test_dir/enum_toggle.wasm"
+
+cat > "$test_dir/enum_pairs.luc" <<'LUCE'
+enum Pair:
+    two(a: i64, b: i64)
+    one(a: i64)
+func split(p: Pair) -> (i64, i64):
+    return match p:
+        .two(a, b) => (a, b)
+        .one(a) => (a, 0)
+pub func answer() -> i64:
+    let (x, y) = split(.two(4, 5))
+    let (z, w) = split(Pair.one(9))
+    return x * 1000 + y * 100 + z * 10 + w
+LUCE
+"$cli" build "$test_dir/enum_pairs.wasm" "$test_dir/enum_pairs.luc" >/dev/null
+expect 0 "4590" wasmtime run --invoke enum_pairs.answer "$test_dir/enum_pairs.wasm"
+
+cat > "$test_dir/enum_boxes.luc" <<'LUCE'
+struct Box:
+    var state: i64?
+pub func answer() -> i64:
+    var b = Box(state: none)
+    var total = 0
+    var i = 0
+    while i < 4:
+        let bonus = match b.state:
+            .some(v) => v
+            .none => 100
+        total += bonus
+        b.state = i
+        i += 1
+    return total
+LUCE
+"$cli" build "$test_dir/enum_boxes.wasm" "$test_dir/enum_boxes.luc" >/dev/null
+expect 0 "103" wasmtime run --invoke enum_boxes.answer "$test_dir/enum_boxes.wasm"
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:
