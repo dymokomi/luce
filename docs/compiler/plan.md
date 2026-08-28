@@ -80,17 +80,64 @@ choose semantics.
 - Exactly one wasm structured instruction per MIR region, so MIR branch depth equals wasm label depth (invariant stated in the file).
 - Float constants are assembled into IEEE bit patterns arithmetically (Stage-0 has no bit casts).
 
-## 6. Order of work from here
+## 6. Order of work — the checklist
 
-1. **Lowerer milestone 4 — composites the HIR already has**: tuples (anonymous structs in slots, `FieldAddress`, `Memcpy`), optionals (two-case enums with tag + `Switch`, or the null niche for references), `str`/`bytes` as values and `print` of a variable (string representation through the runtime). First real use of aggregate layout on both interpreters and wasm.
-2. **Grow HIR generation**, each feature landing on the lowerer once composites settle: structs and methods, enums and `match`, `for` and ranges, `defer`, `try`/`catch` and `Error`, classes with ARC (this is where `SemanticAnalyzer` starts producing ownership facts), closures, interfaces, generics (monomorphization), lists/maps/sets and strings via the runtime, formatted strings, `spawn`/tasks, extern/export.
-3. **Runtime `libluce_rt`** in Luce alongside step 2, first through the MIR interpreter's stub runtime, then compiled.
-4. **Native rung 1** (dyld imports + signing) once `extern` exists in HIR — required: the host (terminal, realm, `WasmHost`) is native Luce linked against libSystem/Cocoa/Metal and libc/OpenSSL (§9.3).
-5. **`docs/compiler/native.md`** and the arm64 QBE-shaped pass once MIR stops moving; then x86-64.
-5b. **Wasm engine in Luce** (decoder + interpreter with fuel, beside the encoder) as the host's core library, differential-tested against `wasmtime`; needs classes/ARC, collections, workers.
-6. Self-hosting follows from 2–5 plus the Stage-0-subset rule; one pinned prior compiler is kept forever for bootstrapping.
+Each item is a vertical slice gated by the three-way harness (§2) plus executed wasm; tick it only when `./test.sh` is green and the commit is in. Spec gates from §9 are listed where they block an item; settle them in `1.0.md` *before* the feature lands in `hir_gen`.
 
-Each step is a vertical slice gated by the three-way harness plus executed wasm. Commit after every green step with a short message.
+### Done
+
+- [x] Tokenizer, parser, syntax tree for the whole 1.0 surface, with per-form tests.
+- [x] HIR generation for scalars, locals, control flow, calls, constants, tuples, optionals, `str`/`bytes`/`char` literals, `print` of a literal.
+- [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 2000`).
+- [x] Canonical MIR contract, verifier, MIR interpreter (`mir.md`).
+- [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
+- [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
+- [x] Native rung 0 (arm64 Mach-O, x86-64 ELF) for the original slice only.
+- [x] Stage-0 0.23 pinned; deep-recursion fixtures restored.
+- [x] Decision record: `vision.md`, gap audit, lineage evidence, proving programs (§9).
+
+### Proving program 1 — the guest in Luce (wasm)
+
+Target: the seed guest commands (`echo_guest.c`, `lucia_guest.h` + 11 seeds) rewritten in Luce, compiled to wasm32, running unmodified under the existing `WasmHost` ABI (imports `lucia_call(ptr,len) -> i64`, `lucia_log`, `lucia_yield`; exports `lucia_alloc`, `lucia_main`).
+
+- [ ] **Milestone 4 — composites the HIR already has.** Tuples as anonymous structs in slots (`FieldAddress`, `Memcpy`); optionals as two-case enums with tag + `Switch` (null niche for references later); `str`/`bytes` as values (pointer + length) and `print` of a variable through `luce_rt_write`. Lowerer, MIR interpreter, wasm; fixtures in `differential_test.luc` and `wasm_test.sh`. First real use of aggregate layout everywhere.
+- [ ] **Structs and methods** in `hir_gen` → lowerer → wasm: fields, `init`, mutating value methods, struct update. *Gate: `hir_gen` keeps doc comments, parameter names, defaults.*
+- [ ] **Enums and `match`**: payloads inline, exhaustiveness, `Switch` lowering, bindings.
+- [ ] **`for` and ranges.** *Gate: fallible iteration protocol (item / end / error) decided in the spec first.*
+- [ ] **`defer`, `try`/`catch`, `Error`**: failure-as-data ABI, `defer` duplicated onto every exit, `catch` forms.
+- [ ] **`extern` import/export** with wasm namespaces (`kino`/`lucia` imports, `lucia_alloc`/`lucia_main` exports); C signatures verified by the MIR verifier.
+- [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
+- [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
+- [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
+- [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.
+
+### Proving program 2 — the host in Luce (native)
+
+Target: terminal, realm, storage, crypto, network and `WasmHost` in Luce as real executables on macOS (libSystem, Cocoa/Metal via dyld) and Linux (libc/OpenSSL), with the wasm engine as a Luce library.
+
+- [ ] **Classes with ARC, weak references, `deinit`** — `SemanticAnalyzer` starts producing ownership facts. *Gates: owned/consuming values specified; scoped values generalised from `mutable_slice`/`task`.*
+- [ ] **Closures.** *Gate: capture rule (explicit vs §14.1 shared cell) decided by the both-ways corpus test.*
+- [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization). *Gate: const-generic grammar reserved in the parser.*
+- [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
+- [ ] **`docs/compiler/native.md`**: QBE read, pass pipeline mapped onto MIR, `.s`-vs-`.o` decision, Apple arm64 ABI notes.
+- [ ] **arm64 QBE-shaped pass** (SSA, slot promotion, ABI, isel, spill, regalloc, own encoders) as a fourth column in the harness; then **x86-64**.
+- [ ] **Native rung 1**: Mach-O dyld imports of libSystem and frameworks, stubs/GOT, bind info, own ad-hoc code signature; ELF static with raw syscalls. Required for the host.
+- [ ] **C import (FIIR)** from headers via Clang, for Cocoa/Metal, OpenSSL/Monocypher, wasm3 during transition.
+- [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
+- [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
+- [ ] **`luce api diff`** and **`luce describe`** as compiler products (source, runtime contract, C ABI, schema, descriptor dimensions).
+- [ ] **Fuel/preemption as a wasm backend option** (when guests need it and the engine is not ours).
+
+### Self-hosting
+
+- [ ] Compiler builds itself under the Stage-0-subset rule; one pinned prior compiler kept forever for bootstrapping; bootstrap reproducibility checked in CI.
+- [ ] Language freeze after the compiler and one host slice depend on every feature.
+
+### Deferred by decision (do not start without new evidence)
+
+- System profile (atomics, volatile, interrupt ABIs, drivers): bare metal is a non-goal; runtime threading stays in `libluce_rt` via C interop.
+- Effects / `uses` clauses: removed (spec §18).
+- Native rung 3 (foreign `.a` linker), transactional heap, general effect rows, dependent types, macros, reflection.
 
 ## 7. Stage-0 state and constraints
 
