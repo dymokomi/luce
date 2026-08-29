@@ -8,7 +8,7 @@ so. Pairs with `plan.md` §8 (Stage-0 constraints and the measured numbers) and
 
 A language is comfortable for both systems work and application work when
 running out of stack is an *error* and not a *crash*. Everything below serves
-one sentence, which belongs in the spec beside the other traps (§13.4):
+one sentence, now normative in the spec beside the other traps (§13.6):
 
 > A program that recurses without bound fails with a reported trap that names
 > the limit. A source file nested deeper than the compiler accepts fails with
