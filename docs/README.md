@@ -17,6 +17,9 @@
   its pair [Compiler record](compiler/done.md) says what exists, what each
   milestone proved, the bugs the harness caught, and where the project came
   from.
+- [Recursion and stacks](compiler/recursion.md) — the promise that running
+  out of stack is an error and not a crash, what other compilers do, and the
+  phased work to get there.
 - [Canonical MIR](compiler/mir.md) — the design record for the machine
   representation every compiled backend consumes: the decisions, the
   instruction set, and the reasons.
