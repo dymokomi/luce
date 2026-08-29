@@ -238,7 +238,7 @@ let base = 40
 let extra: i64 = base + 1
 pub func constants() -> i64: return extra + 1
 func pick(first: i64, second: i64, third: i64) -> i64: return first * 100 + second * 10 + third
-pub func named() -> i64: return pick(third: 3, first: 1, second: 2)
+pub func named() -> i64: return pick(third = 3, first = 1, second = 2)
 func ackermann(m: i64, n: i64) -> i64:
     if m == 0: return n + 1
     if n == 0: return ackermann(m - 1, 1)
@@ -264,7 +264,7 @@ if [ "$status" = 0 ]; then
 fi
 
 printf 'pub let scale = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\npub struct Pair:\n    pub let a: i64\n    pub let b: i64\n    pub func sum(self) -> i64: return self.a + self.b\n' > "$test_dir/math.luc"
-printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a: 1, b: 2)\n    return math.double(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
+printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a = 1, b = 2)\n    return math.double(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
 "$cli" build "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
 expect 0 "45" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
 
@@ -275,30 +275,30 @@ struct Point:
     let x: i64
     let y: i64
 pub func fields() -> i64:
-    let p = Point(x: 3, y: 4)
+    let p = Point(x = 3, y = 4)
     return p.x * 10 + p.y
 struct Style:
     let width: i64 = 7
     let depth: i64
 pub func defaults() -> i64:
-    let s = Style(depth: 2)
+    let s = Style(depth = 2)
     let t = Style(1, 2)
     return s.width * 10 + s.depth + t.width * 100
 struct Cursor:
     var position: i64
 pub func field_assignment() -> i64:
-    var c = Cursor(position: 1)
+    var c = Cursor(position = 1)
     c.position = 5
     c.position += 10
     return c.position
 struct Counter:
     var count: i64
-    func origin() -> Counter: return Counter(count: 100)
+    func origin() -> Counter: return Counter(count = 100)
     func doubled(self) -> i64: return self.count * 2
     mutating func bump(self, by: i64): self.count += by
 pub func methods() -> i64:
     var c = Counter.origin()
-    c.bump(by: 5)
+    c.bump(by = 5)
     c.bump(1)
     return c.doubled()
 struct Inner:
@@ -308,7 +308,7 @@ struct Outer:
     var inner: Inner
     let tag: i64
 pub func nested() -> i64:
-    var o = Outer(inner: Inner(value: 1), tag: 3)
+    var o = Outer(inner = Inner(value = 1), tag = 3)
     o.inner.value = 20
     o.inner.set(o.inner.value + 1)
     return o.inner.value + o.tag
@@ -316,12 +316,12 @@ struct P:
     let x: i64
     let y: i64
 func find(flag: bool) -> P?:
-    if flag: return P(x: 1, y: 2)
+    if flag: return P(x = 1, y = 2)
     return none
 pub func equality() -> i64:
-    let a = P(x: 1, y: 2)
-    let b = find(true) else P(x: 0, y: 0)
-    let c = find(false) else P(x: 0, y: 0)
+    let a = P(x = 1, y = 2)
+    let b = find(true) else P(x = 0, y = 0)
+    let c = find(false) else P(x = 0, y = 0)
     var n = 0
     if a == b: n += 1
     if a != c: n += 10
@@ -332,18 +332,18 @@ struct V:
     var x: i64
     var y: i64
     func sum(self) -> i64: return self.x + self.y
-    func plus(self, other: V) -> V: return V(x: self.x + other.x, y: self.y + other.y)
-    mutating func reset(self): self = V(x: 0, y: 0)
+    func plus(self, other: V) -> V: return V(x = self.x + other.x, y = self.y + other.y)
+    mutating func reset(self): self = V(x = 0, y = 0)
     mutating func add(self, other: V): self = self.plus(other)
 func total(v: V) -> i64: return v.sum()
 pub func self_replacement() -> i64:
-    var v = V(x: 1, y: 2)
-    v.add(V(x: 10, y: 20))
+    var v = V(x = 1, y = 2)
+    v.add(V(x = 10, y = 20))
     let t = total(v)
     v.reset()
     return t * 10 + v.sum()
 func scale(value: i64, factor: i64 = 3, offset: i64 = -1) -> i64: return value * factor + offset
-pub func parameter_defaults() -> i64: return scale(2) + scale(2, 10) + scale(2, offset: 5)
+pub func parameter_defaults() -> i64: return scale(2) + scale(2, 10) + scale(2, offset = 5)
 LUCE
 "$cli" build "$test_dir/structs.wasm" "$test_dir/structs.luc" >/dev/null
 structs() { expect 0 "$2" wasmtime run --invoke "structs.$1" "$test_dir/structs.wasm"; }
@@ -356,7 +356,7 @@ structs equality 111
 structs self_replacement 330
 structs parameter_defaults 35
 
-printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name: "luce", count: 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
+printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name = "luce", count = 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
 "$cli" build "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
 expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
@@ -497,7 +497,7 @@ func size(c: Command) -> i64:
         .open(path) => path
         .resize(width, height) => width * height
         .quit => -1
-pub func answer() -> i64: return size(Command.open(path: 7)) + size(Command.resize(3, 4)) + size(.quit)
+pub func answer() -> i64: return size(Command.open(path = 7)) + size(Command.resize(3, 4)) + size(.quit)
 LUCE
 "$cli" build "$test_dir/enum_commands.wasm" "$test_dir/enum_commands.luc" >/dev/null
 expect 0 "18" wasmtime run --invoke enum_commands.answer "$test_dir/enum_commands.wasm"
@@ -511,7 +511,7 @@ func amount(m: Move) -> i64:
     match m:
         .left(steps), .right(steps): return steps
         .stop: return 0
-pub func answer() -> i64: return amount(.left(5)) + amount(Move.right(steps: 6)) + amount(.stop)
+pub func answer() -> i64: return amount(.left(5)) + amount(Move.right(steps = 6)) + amount(.stop)
 LUCE
 "$cli" build "$test_dir/enum_moves.wasm" "$test_dir/enum_moves.luc" >/dev/null
 expect 0 "11" wasmtime run --invoke enum_moves.answer "$test_dir/enum_moves.wasm"
@@ -638,7 +638,7 @@ cat > "$test_dir/enum_boxes.luc" <<'LUCE'
 struct Box:
     var state: i64?
 pub func answer() -> i64:
-    var b = Box(state: none)
+    var b = Box(state = none)
     var total = 0
     var i = 0
     while i < 4:
