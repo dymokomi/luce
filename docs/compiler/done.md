@@ -27,7 +27,7 @@ Last updated: 2026-08-29 (Stage-0 0.25).
 
 - [x] Tokenizer, parser, syntax tree for the whole 1.0 surface, with per-form tests.
 - [x] HIR generation for scalars, locals, control flow, calls, constants, tuples, optionals, `str`/`bytes`/`char` literals, `print` of a literal.
-- [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 4000`, measured — `plan.md` §8.1).
+- [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 2000`, measured rather than inherited — `plan.md` §8.1).
 - [x] Canonical MIR contract, verifier, MIR interpreter (`mir.md`).
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
