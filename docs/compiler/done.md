@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-28 (Stage-0 0.23).
+Last updated: 2026-08-29 (Stage-0 0.25).
 
 ## 1. Where things stand
 
@@ -21,13 +21,13 @@ Last updated: 2026-08-28 (Stage-0 0.23).
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
 | Tests | 370 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~110 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
-| Toolchain | Stage-0 0.23 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
+| Toolchain | Stage-0 0.25 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
 
 ## 2. Done, in order
 
 - [x] Tokenizer, parser, syntax tree for the whole 1.0 surface, with per-form tests.
 - [x] HIR generation for scalars, locals, control flow, calls, constants, tuples, optionals, `str`/`bytes`/`char` literals, `print` of a literal.
-- [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 2000`).
+- [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 4000`, measured — `plan.md` §8.1).
 - [x] Canonical MIR contract, verifier, MIR interpreter (`mir.md`).
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
@@ -91,4 +91,8 @@ The proving programs (`plan.md` §4): first the seed guest commands rewritten in
 
 - 0.20: errors through interface-typed calls silently trapped — worked around in the pipeline, reported, fixed in 0.22; regression test `test_backend_errors_cross_the_interface_boundary`.
 - 0.22: call depth 128 host frames; temporary-receiver / optional-field use-after-free — reproductions bundled in `build/stage0-0.22-repro.tar.gz`, fixed in 0.23; depth raised to 32768.
+- 0.25: the batch we asked for landed — `pass`, multi-member match arms, file-scope `let`, `never`, `let`/`var` fields, `list[T?]`, 1,000,000 frames on 512 MiB, cached `luce test` artifacts. There is no 0.24: it was published and reverted the same day, and 0.25 folds it in.
+- 0.25 adoption, in commits: `bootstrap on stage-0 0.25`, `fields say let or var` (480 fields, 440 immutable and 40 mutable — the compiler found every mutation), `empty arms say pass` (21 arms that said `continue` and meant nothing), `drop the parallel supplied lists`, `interpreter depth from a measured stack budget`.
+- Bare `pub name: T` fields are accepted for 0.25 only and read as `var`, which is why the field migration was not deferred.
+- 0.25's depth/stack pairing does not hold for compiler-shaped code; the measurement and its consequences are in `plan.md` §8.1.
 - Withdrawn after checking: "`return` in a statement-form `catch` does not return" — it does.

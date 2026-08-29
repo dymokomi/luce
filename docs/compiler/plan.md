@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-28 (Stage-0 0.23).
+Last updated: 2026-08-29 (Stage-0 0.25).
 
 ## 1. Testing strategy (the part that must not be lost)
 
@@ -151,11 +151,30 @@ Standing rules:
 
 ## 8. Stage-0 constraints
 
-The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.23 is pinned. Remaining constraints:
+The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.25 is pinned. Remaining constraints:
 
-- Call depth is 32768 host frames; both interpreters cap at `frame_limit = 2000`.
-- Reserved identifiers (`error`, `bytes`, `i8`…), single-member enum `match` arms, class fields spelled `pub name: T`, no top-level function sharing a name with a pattern binding, no optional list elements (`list[T?]`), `continue` is not an empty match arm, lists index with `i64` only and no `u32`↔`i64` mixing, no `-> !` call as a diverging match arm (use `error(...)`).
+- Reserved identifiers (`error`, `bytes`, `i8`…, and now `pass` and `never`), no top-level function sharing a name with a pattern binding, lists index with `i64` only and no `u32`↔`i64` mixing, no `-> !` call as a diverging match arm — divergence must be declared `-> never`, and a fallible helper still reads `error(...)` inline.
+- Stage-0 recognises divergence only through a *bare-name* call. `x else self.bail(…)` is refused where `x else bail(…)` is accepted, and the unreachable lint sees the same narrow set.
+- Argument labels differ by dialect: Stage-0 writes `f(name = value)`, the 1.0 spec and our own parser write `f(name: value)`. Probe programs must be written in the dialect of whichever compiler runs them.
+- Stack, not frame count, is the real recursion limit — see §8.1.
 - Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm it fails on the installed `luce-0` before reporting or working around it. History in `done.md` §5.
+
+### 8.1 The depth budget is a stack budget
+
+Stage-0 0.25 advertises 1,000,000 frames on a 512 MiB stack. That pairing assumes about 512 bytes per frame, which compiler-shaped code does not obey, so the advertised number is not the number to plan against.
+
+Measured on 0.25/arm64-macOS (method: bisect the depth at which a built program takes SIGBUS, then divide the 512 MiB reservation by it):
+
+| shape | bytes per frame | frames before the guard page |
+| --- | --- | --- |
+| 2-arm match building a value struct | 715 | ~750,000 |
+| 10-arm | 2,664 | ~201,000 |
+| 30-arm | 8,343 | ~64,000 |
+| one HIR-interpreter call (six host frames) | ~32,000 | ~16,600 |
+
+The cost is linear in the number of match arms that build a value struct — about 270 bytes per arm, never reused across arms that cannot both run. Past the ceiling the process takes SIGBUS; Stage-0's frame counter never fires, so the promised trap does not appear.
+
+Consequences we hold to: both interpreters cap at `frame_limit = 4000`, a threefold margin under the measured fat-callee ceiling of 12,875, so exhaustion is *reported* rather than fatal. The number is recorded with its measurement in `backends/interpreter.luc`. Re-measure when the reservation or the interpreter's shape changes.
 
 ## 9. Conventions worth keeping
 
