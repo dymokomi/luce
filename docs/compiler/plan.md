@@ -160,6 +160,7 @@ The compiler must stay buildable by Stage-0 (the frozen seed) until it builds it
 - Argument labels differ by dialect: Stage-0 writes `f(name = value)`, the 1.0 spec and our own parser write `f(name: value)`. Probe programs must be written in the dialect of whichever compiler runs them.
 - Stack, not frame count, is the real recursion limit — see §8.1.
 - Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm it fails on the installed `luce-0` before reporting or working around it. History in `done.md` §5.
+- Open requests to the Stage-0 team: [`stage0-0.26.md`](stage0-0.26.md), with reproductions in `build/stage0-0.25-repro/` and `build/stage0-0.26-repro/`.
 
 ### 8.1 The depth budget is a stack budget
 
