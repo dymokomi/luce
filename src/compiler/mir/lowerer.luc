@@ -82,10 +82,10 @@ from compiler.mir.canonical import InstructionForm, MirConstant, MirData, MirExt
 from compiler.mir.canonical import MirProgram, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, intern_mir_type, make_enum_type
-from compiler.mir.canonical import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm, HirReceiverKind, Value
+from compiler.mir.canonical import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers, signatures_match
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
-from compiler.hir.ir import entry_at, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
+from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 import compiler.hir.ir
 from compiler.mir.verifier import terminates
 from compiler.hir.analyzer import AnalyzedProgram
@@ -123,6 +123,13 @@ struct RecoverTarget:
     pub let region_index: i64
     pub let defer_start: i64
 
+# HIR has one callable identity. MIR distinguishes code in this artifact from
+# a host binding, so this table is the single, explicit split point used by
+# every call after all source-level lookup and argument placement is finished.
+union LoweredFunction:
+    Defined(function: FunctionId)
+    External(external: ExternId)
+
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     let program: HirProgram
@@ -130,6 +137,7 @@ pub class Lowerer:
     let types: MirTypeTable
     let externs: list[MirExtern]
     let data: list[MirData]
+    let lowered_functions: list[LoweredFunction]
     # The register table, slots, live locals, and parameter registers of the
     # function being lowered.
     var registers: list[TypeId]
@@ -156,6 +164,7 @@ pub class Lowerer:
         self.types = create_builtin_mir_types()
         self.externs = list[MirExtern]()
         self.data = list[MirData]()
+        self.lowered_functions = list[LoweredFunction]()
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
@@ -174,10 +183,26 @@ pub class Lowerer:
     ## Lower every function in every module, or stop at the first construct
     ## the executable slice cannot express yet.
     pub func lower() -> MirProgram!:
+        # Declare every callable identity before lowering any body, so forward
+        # and cross-module calls need no late lookup or placeholder state.
+        var next_definition: u32 = 0
+        for function in self.program.functions:
+            match function.implementation:
+                ExternalC(is_blocking):
+                    let module = self.program.modules[function.module.value]
+                    let signature = try self.lower_external_signature(module, function)
+                    let external = try self.declare_c_extern(function.name, signature)
+                    self.lowered_functions.append(LoweredFunction.External(external = external))
+                else:
+                    self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
+                    next_definition += 1
         let functions = list[MirFunction]()
         for function in self.program.functions:
-            let module = self.program.modules[function.module.value]
-            functions.append(try self.lower_function(module, function))
+            match function.implementation:
+                ExternalC(is_blocking): pass
+                else:
+                    let module = self.program.modules[function.module.value]
+                    functions.append(try self.lower_function(module, function))
         let entry = find_entry(functions)
         return MirProgram(
             types = self.types,
@@ -187,6 +212,28 @@ pub class Lowerer:
             functions = functions,
             entry = entry,
         )
+
+    func lower_external_signature(module: HirModule, function: HirFunction) -> MirSignature!:
+        let parameters = list[TypeId]()
+        for parameter in function.parameters:
+            parameters.append(try self.mir_type_of(module, function, function.span, parameter.value_type))
+        let results = list[TypeId]()
+        if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
+            results.append(try self.mir_type_of(module, function, function.span, function.result))
+        return MirSignature(parameters = parameters, results = results, is_fallible = false)
+
+    # C symbols inhabit one linker namespace even when several source
+    # modules declare them. Equal declarations share one MIR identity; a
+    # conflicting declaration is rejected before any backend sees it.
+    func declare_c_extern(name: str, signature: MirSignature) -> ExternId!:
+        for index in range(0, len(self.externs)):
+            let existing = self.externs[index]
+            if existing.convention != CallingConvention.c or existing.name != name: continue
+            if not signatures_match(existing.signature, signature):
+                error("lowerer: conflicting declarations of C symbol `" + name + "`")
+            return ExternId(value = u32(index))
+        self.externs.append(MirExtern(name = name, convention = CallingConvention.c, signature = signature))
+        return ExternId(value = u32(len(self.externs) - 1))
 
     # Lower one function body. The canonical name is `module.function` so
     # artifacts stay unambiguous across modules. `main` keeps the entry
@@ -239,8 +286,9 @@ pub class Lowerer:
                 self.parameters.append(Local(symbol = parameter.symbol.value, address = self.new_register(parameter_type)))
 
         let body = list[MirInstruction]()
-        try self.lower_prologue(module, function, function.body, body)
-        try self.lower_scope(module, function, function.body, body)
+        let source_body = function_body(function)
+        try self.lower_prologue(module, function, source_body, body)
+        try self.lower_scope(module, function, source_body, body)
         # MIR ends every path with a syntactic terminator. A unit function may
         # simply finish, so it gets `Return []`. A value function whose body
         # does not end in a terminator has already been proved by HirGenerator
@@ -256,11 +304,17 @@ pub class Lowerer:
             else:
                 body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
         var name = module.name + "." + function.name
+        var convention = CallingConvention.luce
+        match function.implementation:
+            ExportedC(export_body):
+                name = function.name
+                convention = CallingConvention.c
+            else: pass
         let receiver = function.receiver
         if receiver != none: name = module.name + "." + describe_type(self.program.types, receiver.owner) + "." + function.name
         return MirFunction(
             name = name,
-            convention = CallingConvention.luce,
+            convention = convention,
             signature = MirSignature(parameters = parameter_types, results = results, is_fallible = is_fallible),
             registers = self.registers,
             slots = self.slots,
@@ -1078,7 +1132,7 @@ pub class Lowerer:
         for argument in placed: call_arguments.append(argument)
         let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
         results.append(reported_error)
-        body.append(MirInstruction(form = InstructionForm.Call(results = self.operands.run(results), function = FunctionId(value = u32(target)), arguments = self.operands.run(call_arguments)), span = span))
+        self.emit_call(target, results, call_arguments, span, body)
         return FallibleResult(value = value, error_value = reported_error)
 
     # A fallible initializer writes into fresh caller-owned struct storage and
@@ -1101,10 +1155,7 @@ pub class Lowerer:
         let call_arguments = [error_temp]
         for argument in placed: call_arguments.append(argument)
         let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-        body.append(MirInstruction(
-            form = InstructionForm.Call(results = self.operands.run([reported_error]), function = FunctionId(value = u32(target)), arguments = self.operands.run(call_arguments)),
-            span = span,
-        ))
+        self.emit_call(target, [reported_error], call_arguments, span, body)
         return FallibleResult(value = value, error_value = reported_error)
 
     # Arguments are lowered in the order they were written, then placed by
@@ -1126,13 +1177,10 @@ pub class Lowerer:
                 let result_temp = self.new_temp(result_type, span, body)
                 let with_slot = [result_temp]
                 for argument in placed: with_slot.append(argument)
-                body.append(MirInstruction(form = InstructionForm.Call(results = self.operands.run(results), function = FunctionId(value = u32(target)), arguments = self.operands.run(with_slot)), span = span))
+                self.emit_call(target, results, with_slot, span, body)
                 return result_temp
             results.append(self.new_register(result_type))
-        body.append(MirInstruction(
-            form = InstructionForm.Call(results = self.operands.run(results), function = FunctionId(value = u32(target)), arguments = self.operands.run(placed)),
-            span = span,
-        ))
+        self.emit_call(target, results, placed, span, body)
         if len(results) == 0: return RegisterId(value = no_register)
         return results[0]
 
@@ -1151,11 +1199,19 @@ pub class Lowerer:
         let value_type = try self.mir_type_of(module, function, span, receiver.owner)
         let value = self.new_temp(value_type, span, body)
         placed[0] = value
-        body.append(MirInstruction(
-            form = InstructionForm.Call(results = no_registers(), function = FunctionId(value = u32(target)), arguments = self.operands.run(placed)),
-            span = span,
-        ))
+        self.emit_call(target, list[RegisterId](), placed, span, body)
         return value
+
+    # The sole HIR-call → MIR-call split. Argument and result placement is
+    # shared; only the identity space changes at the canonical MIR boundary.
+    func emit_call(target: i64, results: list[RegisterId], arguments: list[RegisterId], span: SourceSpan, body: list[MirInstruction]):
+        let result_run = self.operands.run(results)
+        let argument_run = self.operands.run(arguments)
+        match self.lowered_functions[target]:
+            Defined(function):
+                body.append(MirInstruction(form = InstructionForm.Call(results = result_run, function = function, arguments = argument_run), span = span))
+            External(external):
+                body.append(MirInstruction(form = InstructionForm.CallExtern(results = result_run, external = external, arguments = argument_run), span = span))
 
     # `a and b` evaluates `b` only when `a` is true; `a or b` only when `a`
     # is false. Both are an `If` whose unevaluated arm yields the constant

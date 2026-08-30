@@ -93,7 +93,7 @@ examples and tests link back here rather than restating it.
   constants, tuples, optionals, integer ranges and `for`, structs (including
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
-  equality, and `print` of a literal or a `str` value — is lowered to canonical
+  equality, direct scalar C imports/exports, and `print` of a literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
   The complete differential corpus is compiled, linked, and executed through
   QBE 1.3 as both the native oracle and the product native path. QBE IL and

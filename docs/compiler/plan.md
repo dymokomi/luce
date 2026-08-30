@@ -162,7 +162,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
-  symbols interpreted only by their backends.
+  symbols interpreted only by their backends. The direct scalar-function rung
+  is complete: ordinary definitions, `export c func`, and `extern func` share
+  one HIR function table, symbol kind, import path, argument checker, and
+  `Call` node; lowering performs the sole split into MIR definitions/externs.
+  HIR/MIR hosts, Wasm `env` imports, exact exports, QBE ABI extension types,
+  and real libc linkage are covered. Handles, strings, `out`, extern structs
+  and variables, exported structs/enums, and `cfunc` remain on this item.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.

@@ -29,11 +29,11 @@ from compiler.core_types import is_core_type_name
 from compiler.frontend.source import SourceSpan, format_diagnostic
 from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, ConstantSyntax, EnumSyntax, ExpressionSyntax
 from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax
-from compiler.frontend.syntax import FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, NominalTypeSyntax, StatementSyntax
+from compiler.frontend.syntax import ExternFunctionSyntax, FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, NominalTypeSyntax, StatementSyntax
 from compiler.frontend.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType
-from compiler.hir.ir import HirConstant, HirFunction, HirNode, HirNodeForm, NodeId, Operands, no_node
+from compiler.hir.ir import HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
 from compiler.hir.ir import HirEnum, HirEnumCase, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
 from compiler.hir.ir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
@@ -61,8 +61,16 @@ struct FunctionSymbol:
     pub let receiver: HirReceiver?
     pub let parameters: list[HirParameter]
     pub let result: TypeId
-    pub let syntax: FunctionSyntax
+    pub let source: CollectedFunctionSource
     pub let span: SourceSpan
+
+# A callable is collected once regardless of where its implementation lives.
+# This prevents external declarations from growing parallel symbol, import,
+# lookup, argument-placement, and HIR-call paths.
+union CollectedFunctionSource:
+    Defined(syntax: FunctionSyntax)
+    ExportedC(syntax: FunctionSyntax)
+    ExternalC(is_blocking: bool)
 
 # One declared struct: its name and type identity exist before any field is
 # resolved, so fields and methods anywhere may name any struct.
@@ -459,7 +467,7 @@ pub class HirGenerator:
                     TypeAlias(type_alias):
                         try self.collect_alias(module_index, declaration.is_public, type_alias, declaration.span)
                     Function(function):
-                        try self.collect_function(module_index, declaration.is_public, declaration.documentation, none, function, declaration.span)
+                        try self.collect_function(module_index, declaration.is_public, declaration.documentation, none, function, false, declaration.span)
                     NominalType(nominal):
                         try self.collect_struct_members(module_index, nominal)
                     Enumeration(enumeration):
@@ -473,11 +481,11 @@ pub class HirGenerator:
                     ExportEnum(export_enum):
                         try self.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
                     ExportFunction(export_function):
-                        try self.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
+                        try self.collect_function(module_index, true, declaration.documentation, none, export_function, true, declaration.span)
                     ExternType(extern_type):
                         try self.fail_at(module_index, declaration.span, "extern type declarations are not implemented yet")
                     ExternFunction(extern_function):
-                        try self.fail_at(module_index, declaration.span, "extern function declarations are not implemented yet")
+                        try self.collect_extern_function(module_index, declaration.is_public, declaration.documentation, extern_function, declaration.span)
                     ExternVariable(extern_variable):
                         try self.fail_at(module_index, declaration.span, "extern variable declarations are not implemented yet")
                     ExternStruct(extern_struct):
@@ -610,10 +618,12 @@ pub class HirGenerator:
     # type, and every following parameter is ordinary. A default is checked
     # once here as a constant expression and embedded at each call site that
     # omits the argument.
-    func collect_function(module_index: i64, is_public: bool, documentation: list[str], receiver: HirReceiver?, function: FunctionSyntax, span: SourceSpan) -> !:
+    func collect_function(module_index: i64, is_public: bool, documentation: list[str], receiver: HirReceiver?, function: FunctionSyntax, is_exported_c: bool, span: SourceSpan) -> !:
         if receiver == none: try self.require_free_module_name(module_index, function.name, span)
         if len(function.generic_parameters) > 0:
             try self.fail_at(module_index, span, "generic functions are not implemented yet")
+        if is_exported_c and receiver != none:
+            try self.fail_at(module_index, span, "an exported C function cannot be a method")
 
         let parameters = list[HirParameter]()
         var has_self = false
@@ -641,6 +651,8 @@ pub class HirGenerator:
                     try self.fail_at(module_index, parameter.span, "parameter `" + parameter.name + "` cannot store a fallible type; `T!` is a function-result effect")
             var default_value = NodeId(value = no_node)
             let default_syntax = parameter.default_value
+            if is_exported_c and default_syntax != none:
+                try self.fail_at(module_index, parameter.span, "an exported C parameter takes no default")
             if default_syntax != none:
                 default_value = try self.check_constant_expression(module_index, default_syntax, parameter_type, "default of parameter `" + parameter.name + "`")
                 saw_default = true
@@ -654,6 +666,10 @@ pub class HirGenerator:
         if result_syntax != none:
             result = try self.resolve_type(module_index, result_syntax)
         try self.validate_function_result(module_index, result, span)
+        if is_exported_c and self.contains_fallible(result):
+            try self.fail_at(module_index, span, "an exported C function cannot be fallible")
+        if is_exported_c:
+            try self.require_c_function_type(module_index, parameters, result, span, "exported C function `" + function.name + "`")
         var checked_receiver: HirReceiver? = none
         if receiver != none:
             if receiver.kind == HirReceiverKind.initializer:
@@ -674,6 +690,8 @@ pub class HirGenerator:
                     if function.is_mutating: kind = HirReceiverKind.mutating_method
                 checked_receiver = HirReceiver(owner = receiver.owner, kind = kind)
         let function_symbol = self.make_symbol(function.name, SymbolKind.function, result)
+        var source = CollectedFunctionSource.Defined(syntax = function)
+        if is_exported_c: source = CollectedFunctionSource.ExportedC(syntax = function)
         self.functions.append(FunctionSymbol(
             symbol = function_symbol,
             module_index = module_index,
@@ -683,9 +701,57 @@ pub class HirGenerator:
             receiver = checked_receiver,
             parameters = parameters,
             result = result,
-            syntax = function,
+            source = source,
             span = span,
         ))
+
+    # Collect a host-supplied C function into the same callable table as a
+    # definition. The first executable slice accepts direct scalar values;
+    # richer handle/string/out translations are added on this same identity.
+    func collect_extern_function(module_index: i64, is_public: bool, documentation: list[str], function: ExternFunctionSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, function.name, span)
+        let parameters = list[HirParameter]()
+        for parameter in function.parameters:
+            for previous in parameters:
+                if previous.name == parameter.name:
+                    try self.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
+            if parameter.is_out:
+                try self.fail_at(module_index, parameter.span, "extern `out` parameters are not implemented yet")
+            let value_type = try self.resolve_type(module_index, parameter.value_type)
+            let symbol = self.make_symbol(parameter.name, SymbolKind.parameter, value_type)
+            parameters.append(HirParameter(symbol = symbol, name = parameter.name, value_type = value_type, default_value = NodeId(value = no_node)))
+        var result = resolve_builtin_type(BuiltinType.unit)
+        let result_syntax = function.result
+        if result_syntax != none: result = try self.resolve_type(module_index, result_syntax)
+        if self.contains_fallible(result):
+            try self.fail_at(module_index, span, "an extern function cannot be fallible")
+        try self.require_c_function_type(module_index, parameters, result, span, "extern function `" + function.name + "`")
+        let function_symbol = self.make_symbol(function.name, SymbolKind.function, result)
+        self.functions.append(FunctionSymbol(
+            symbol = function_symbol,
+            module_index = module_index,
+            name = function.name,
+            is_public = is_public,
+            documentation = documentation,
+            receiver = none,
+            parameters = parameters,
+            result = result,
+            source = CollectedFunctionSource.ExternalC(is_blocking = function.is_blocking),
+            span = span,
+        ))
+
+    # The direct C-call slice intentionally admits exactly the scalar types
+    # canonical MIR and both artifact backends already represent without a
+    # target-specific layout decision.
+    func require_c_function_type(module_index: i64, parameters: list[HirParameter], result: TypeId, span: SourceSpan, what: str) -> !:
+        for parameter in parameters:
+            if not self.is_direct_c_scalar(parameter.value_type):
+                try self.fail_at(module_index, span, what + " parameter `" + parameter.name + "` has unsupported boundary type `" + self.describe_type(parameter.value_type) + "`")
+        if not types_match(result, resolve_builtin_type(BuiltinType.unit)) and not self.is_direct_c_scalar(result):
+            try self.fail_at(module_index, span, what + " has unsupported result type `" + self.describe_type(result) + "`")
+
+    func is_direct_c_scalar(value: TypeId) -> bool:
+        return types_match(value, resolve_builtin_type(BuiltinType.boolean)) or is_integer_type(self.types, value) or is_floating_type(self.types, value)
 
     # A field default or parameter default: checked in an empty scope, so it
     # cannot name a local or `self`, and required to be a literal tree
@@ -772,7 +838,7 @@ pub class HirGenerator:
                             try self.fail_at(module_index, member.span, "an initializer does not use `mutating`; initialization already writes `self`")
                         receiver_kind = HirReceiverKind.initializer
                     let receiver = HirReceiver(owner = self.structs[struct_index].type_id, kind = receiver_kind)
-                    try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, member.span)
+                    try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, false, member.span)
                     if receiver_kind == HirReceiverKind.initializer: initializer = len(self.functions) - 1
         let item = self.structs[struct_index]
         self.structs[struct_index] = CollectedStruct(
@@ -893,7 +959,7 @@ pub class HirGenerator:
                         if case_value.name == function.name:
                             try self.fail_at(module_index, member.span, "`" + function.name + "` is both a case and a method of `" + enumeration.name + "`")
                     let receiver = HirReceiver(owner = item.type_id, kind = HirReceiverKind.type_function)
-                    try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, member.span)
+                    try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, false, member.span)
                 else: try self.fail_at(module_index, member.span, "an enum declares cases and methods only")
 
     func find_enum_in_module(module_index: i64, name: str) -> i64:
@@ -1014,6 +1080,26 @@ pub class HirGenerator:
     # is checked statement by statement, and a non-unit function must provably
     # return on every path.
     func check_function(function: FunctionSymbol) -> HirFunction!:
+        var source: FunctionSyntax? = none
+        var is_exported_c = false
+        match function.source:
+            Defined(syntax): source = syntax
+            ExportedC(syntax):
+                source = syntax
+                is_exported_c = true
+            ExternalC(is_blocking):
+                return HirFunction(
+                    symbol = function.symbol,
+                    module = ModuleId(value = u32(function.module_index)),
+                    name = function.name,
+                    is_public = function.is_public,
+                    documentation = function.documentation,
+                    receiver = none,
+                    parameters = function.parameters,
+                    result = function.result,
+                    implementation = HirFunctionImplementation.ExternalC(is_blocking = is_blocking),
+                    span = function.span,
+                )
         self.current_result = function.result
         self.current_receiver = function.receiver
         self.locals = list[LocalBinding]()
@@ -1031,13 +1117,17 @@ pub class HirGenerator:
             let is_mutable = parameter.name == "self" and self_is_mutable
             self.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = is_mutable))
 
-        let body_syntax = function.syntax.body else trap("function definition has no body")
+        let definition = source else trap("defined function lost its syntax")
+        let body_syntax = definition.body else trap("function definition has no body")
         let body = try self.check_suite(body_syntax.statements)
         var successful_result = function.result
         let fallible_result = self.fallible_inner(function.result)
         if fallible_result != none: successful_result = fallible_result
         if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(body):
             try self.fail(function.span, "function `" + function.name + "` may finish without returning `" + self.describe_type(function.result) + "`")
+        let body_run = self.push_nodes(body)
+        var implementation = HirFunctionImplementation.Defined(body = body_run)
+        if is_exported_c: implementation = HirFunctionImplementation.ExportedC(body = body_run)
         return HirFunction(
             symbol = function.symbol,
             module = ModuleId(value = u32(function.module_index)),
@@ -1047,7 +1137,7 @@ pub class HirGenerator:
             receiver = function.receiver,
             parameters = function.parameters,
             result = function.result,
-            body = self.push_nodes(body),
+            implementation = implementation,
             span = function.span,
         )
 

@@ -360,7 +360,7 @@ backend translates canonical MIR directly into QBE IL:
 | `Block` / `Loop` / `If` / `Br` | labels, `jmp`, `jnz` | a dozen lines |
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
 | structural `Struct` / `Enum` | memory plus backend-computed offsets and `blit` | direct |
-| `convention = c` | QBE ABI types and platform ABI lowering | reserved for the extern/export slice |
+| `convention = c` | QBE ABI extension types and platform ABI lowering | direct scalar imports/exports complete; richer translations remain |
 | `CallExtern`, `FunctionAddress`, `DataAddress` | `call $sym`, `$sym` as a value, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
 | fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
@@ -395,10 +395,9 @@ Two consequences for the design record:
   contract is WASI preview 1 — `luce_rt_write` becomes `fd_write`, an
   entry gains `_start` and `proc_exit` — so a module runs under any wasm
   runtime with no bespoke host.
-- **arm64 and x86-64** will emit an object file and call the system
-  linker — the only way `extern` C functions and `libluce_rt` link. The
-  current direct executable writers stay as a no-dependency path and are
-  not extended.
+- **QBE native** links C externs and the future `libluce_rt` through the host
+  toolchain. Luce-native backends begin only after the language and runtime
+  baseline is complete, and must prove the same canonical MIR against QBE.
 - The order of work: new `mir/canonical.luc` and verifier → MIR interpreter
   and the three-way harness (both done: `tests/compiler/differential_test.luc`)
   → the lowerer in vertical slices (scalars and locals, control flow, calls and constants — done;
@@ -482,6 +481,14 @@ signature may contain only C-representable types; the backend then applies
 the target's C ABI. `MirData` is address-free raw payload. Address-bearing
 constants will use a typed, structural MIR representation when the language
 needs them; target-sized relocation slots do not belong in canonical MIR.
+
+Source-level C imports are not a second HIR call system. A `HirFunction` has
+one symbol and one closed implementation choice: defined Luce body, defined C
+export, or host-supplied C function. All three use the ordinary `Call` node
+and argument placement. The lowerer performs the only split, mapping that
+identity to either a MIR `FunctionId` or `ExternId`; Wasm then chooses its
+`env` namespace and QBE/native interprets the same extern name as a linker
+symbol. Neither namespace nor ABI byte placement appears before a backend.
 
 ### Instructions
 
