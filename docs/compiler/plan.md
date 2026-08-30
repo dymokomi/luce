@@ -176,9 +176,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   optionals remain tagged; one canonical MIR boundary adapter alone
   encodes/decodes C null and traps `null_foreign` for bare zero tokens. C
   exports are ordinary Luce bodies behind shared MIR wrappers, so source calls
-  never acquire boundary behavior. Real QBE/libc `getpid` and `malloc`/`free`
-  execution prove both representations. Strings, `out`, extern structs and
-  variables, exported structs/enums, and `cfunc` remain on this item.
+  never acquire boundary behavior. `out` slots are also complete: HIR retains
+  their ordered source contract, one lowerer adapter passes call-owned raw
+  pointers and shapes declared-result-then-output values, the semantic hosts
+  cover both sides of that memory boundary, and real QBE/libc
+  `posix_memalign` proves a nullable pointer output. Real QBE/libc `getpid` and
+  `malloc`/`free` execution prove both handle representations. Strings, extern
+  structs and variables, exported structs/enums, and `cfunc` remain on this
+  item.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.

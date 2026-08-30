@@ -82,7 +82,8 @@ examples and tests link back here rather than restating it.
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
   `defer`, recoverable `Error` values with `try`/`catch`, nominal pointer- and
-  integer-represented C handles, loops, and returns.
+  integer-represented C handles, C `out` parameters as ordinary results,
+  loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,
@@ -95,7 +96,8 @@ examples and tests link back here rather than restating it.
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
   equality, direct scalar C imports/exports with nominal integer and pointer
-  handles (including boundary-only null translation), and `print` of a
+  handles (including boundary-only null translation), ordered `out` results,
+  and `print` of a
   literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
   The complete differential corpus is compiled, linked, and executed through

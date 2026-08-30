@@ -33,7 +33,7 @@ from compiler.frontend.syntax import ExternFunctionSyntax, ExternTypeSyntax, Fun
 from compiler.frontend.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType
-from compiler.hir.ir import HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
+from compiler.hir.ir import HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
 from compiler.hir.ir import HirEnum, HirEnumCase, HirExternRepresentation, HirExternType, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
 from compiler.hir.ir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
@@ -70,7 +70,7 @@ struct FunctionSymbol:
 union CollectedFunctionSource:
     Defined(syntax: FunctionSyntax)
     ExportedC(syntax: FunctionSyntax)
-    ExternalC(is_blocking: bool)
+    ExternalC(contract: HirCFunction)
 
 # One declared struct: its name and type identity exist before any field is
 # resolved, so fields and methods anywhere may name any struct.
@@ -742,26 +742,39 @@ pub class HirGenerator:
         ))
 
     # Collect a host-supplied C function into the same callable table as a
-    # definition. The first executable slice accepts direct scalar values;
-    # richer handle/string/out translations are added on this same identity.
+    # definition. Inputs become ordinary source parameters. Outputs remain in
+    # the ordered C contract and become source result components, so calls do
+    # not grow a parallel argument-placement path.
     func collect_extern_function(module_index: i64, is_public: bool, documentation: list[str], function: ExternFunctionSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, function.name, span)
         let parameters = list[HirParameter]()
+        let slots = list[HirCSlot]()
+        let names = list[str]()
         for parameter in function.parameters:
-            for previous in parameters:
-                if previous.name == parameter.name:
+            for previous in names:
+                if previous == parameter.name:
                     try self.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
-            if parameter.is_out:
-                try self.fail_at(module_index, parameter.span, "extern `out` parameters are not implemented yet")
+            names.append(parameter.name)
             let value_type = try self.resolve_type(module_index, parameter.value_type)
+            if not self.is_c_function_value(value_type):
+                var kind = "parameter"
+                if parameter.is_out: kind = "out parameter"
+                try self.fail_at(module_index, parameter.span, "extern function `" + function.name + "` " + kind + " `" + parameter.name + "` has unsupported boundary type `" + self.describe_type(value_type) + "`")
+            if parameter.is_out:
+                slots.append(HirCSlot.Output(name = parameter.name, value_type = value_type))
+                continue
             let symbol = self.make_symbol(parameter.name, SymbolKind.parameter, value_type)
+            slots.append(HirCSlot.Input(parameter = u32(len(parameters))))
             parameters.append(HirParameter(symbol = symbol, name = parameter.name, value_type = value_type, default_value = NodeId(value = no_node)))
-        var result = resolve_builtin_type(BuiltinType.unit)
+        var declared_result = resolve_builtin_type(BuiltinType.unit)
         let result_syntax = function.result
-        if result_syntax != none: result = try self.resolve_type(module_index, result_syntax)
-        if self.contains_fallible(result):
+        if result_syntax != none: declared_result = try self.resolve_type(module_index, result_syntax)
+        if self.contains_fallible(declared_result):
             try self.fail_at(module_index, span, "an extern function cannot be fallible")
-        try self.require_c_function_type(module_index, parameters, result, span, "extern function `" + function.name + "`")
+        if not types_match(declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_value(declared_result):
+            try self.fail_at(module_index, span, "extern function `" + function.name + "` has unsupported result type `" + self.describe_type(declared_result) + "`")
+        let contract = HirCFunction(is_blocking = function.is_blocking, slots = slots, declared_result = declared_result)
+        let result = self.c_source_result(contract)
         let function_symbol = self.make_symbol(function.name, SymbolKind.function, result)
         self.functions.append(FunctionSymbol(
             symbol = function_symbol,
@@ -772,9 +785,24 @@ pub class HirGenerator:
             receiver = none,
             parameters = parameters,
             result = result,
-            source = CollectedFunctionSource.ExternalC(is_blocking = function.is_blocking),
+            source = CollectedFunctionSource.ExternalC(contract = contract),
             span = span,
         ))
+
+    # A void C result contributes no source component. One remaining value is
+    # returned directly; two or more use the language's ordinary tuple. This
+    # is the only result-shaping rule for `out` declarations.
+    func c_source_result(contract: HirCFunction) -> TypeId:
+        let components = list[TypeId]()
+        if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
+            components.append(contract.declared_result)
+        for slot in contract.slots:
+            match slot:
+                Output(name, value_type): components.append(value_type)
+                Input(parameter): pass
+        if len(components) == 0: return resolve_builtin_type(BuiltinType.unit)
+        if len(components) == 1: return components[0]
+        return self.intern_tuple(components)
 
     # Register a pointer- or integer-shaped handle as a nominal HIR type. The
     # representation records only its source contract; null translation and
@@ -1167,7 +1195,7 @@ pub class HirGenerator:
             ExportedC(syntax):
                 source = syntax
                 is_exported_c = true
-            ExternalC(is_blocking):
+            ExternalC(contract):
                 return HirFunction(
                     symbol = function.symbol,
                     module = ModuleId(value = u32(function.module_index)),
@@ -1177,7 +1205,7 @@ pub class HirGenerator:
                     receiver = none,
                     parameters = function.parameters,
                     result = function.result,
-                    implementation = HirFunctionImplementation.ExternalC(is_blocking = is_blocking),
+                    implementation = HirFunctionImplementation.ExternalC(contract = contract),
                     span = function.span,
                 )
         self.current_result = function.result

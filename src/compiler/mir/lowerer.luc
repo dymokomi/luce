@@ -83,7 +83,7 @@ from compiler.mir.canonical import MirProgram, MirSignature, MirSlot, MirTypeTab
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, intern_mir_type, make_enum_type
 from compiler.mir.canonical import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers, signatures_match
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 import compiler.hir.ir
@@ -117,6 +117,13 @@ struct FallibleResult:
     pub let value: RegisterId
     pub let error_value: RegisterId
 
+# One C output slot allocated around a call. `raw_type` is what C writes;
+# `value_type` is the tagged/nominal HIR type reconstructed afterward.
+struct COutputSlot:
+    let value_type: ir.TypeId
+    let raw_type: TypeId
+    let address: RegisterId
+
 # Where a recover leaves its catch expression, and which deferred suffix
 # belongs to the handler rather than the surrounding function.
 struct RecoverTarget:
@@ -135,11 +142,15 @@ union LoweredFunction:
 # raw call slot, so its signature alone cannot distinguish `Window` from
 # `Window?` or from another pointer-shaped handle. Keep that semantic identity
 # beside the interned extern until every declaration has been checked.
+union CExternSlot:
+    Input(value_type: ir.TypeId)
+    Output(value_type: ir.TypeId)
+
 struct CExternContract:
     let external: ExternId
     let name: str
-    let parameters: list[ir.TypeId]
-    let result: ir.TypeId
+    let slots: list[CExternSlot]
+    let declared_result: ir.TypeId
     let is_blocking: bool
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
@@ -202,10 +213,10 @@ pub class Lowerer:
         var next_definition: u32 = 0
         for function in self.program.functions:
             match function.implementation:
-                ExternalC(is_blocking):
+                ExternalC(contract):
                     let module = self.program.modules[function.module.value]
-                    let signature = try self.lower_external_signature(module, function)
-                    let external = try self.declare_c_extern(function, is_blocking, signature)
+                    let signature = try self.lower_external_signature(module, function, contract)
+                    let external = try self.declare_c_extern(function, contract, signature)
                     self.lowered_functions.append(LoweredFunction.External(external = external))
                 ExportedC(body):
                     self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
@@ -216,7 +227,7 @@ pub class Lowerer:
         let functions = list[MirFunction]()
         for function in self.program.functions:
             match function.implementation:
-                ExternalC(is_blocking): pass
+                ExternalC(contract): pass
                 ExportedC(body):
                     let module = self.program.modules[function.module.value]
                     functions.append(try self.lower_function(module, function))
@@ -234,22 +245,27 @@ pub class Lowerer:
             entry = entry,
         )
 
-    func lower_external_signature(module: HirModule, function: HirFunction) -> MirSignature!:
+    func lower_external_signature(module: HirModule, function: HirFunction, contract: HirCFunction) -> MirSignature!:
         let parameters = list[TypeId]()
-        for parameter in function.parameters:
-            parameters.append(try self.c_boundary_type_of(module, function, function.span, parameter.value_type))
+        for slot in contract.slots:
+            match slot:
+                Input(parameter):
+                    parameters.append(try self.c_boundary_type_of(module, function, function.span, function.parameters[parameter].value_type))
+                Output(name, value_type):
+                    # C receives the address of caller-owned raw storage.
+                    parameters.append(builtin_mir_type(BuiltinMirType.pointer))
         let results = list[TypeId]()
-        if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
-            results.append(try self.c_boundary_type_of(module, function, function.span, function.result))
+        if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
+            results.append(try self.c_boundary_type_of(module, function, function.span, contract.declared_result))
         return MirSignature(parameters = parameters, results = results, is_fallible = false)
 
     # C symbols inhabit one linker namespace even when several source
     # modules declare them. Equal source contracts share one MIR identity; a
     # conflict is rejected before handle identity or nullability is erased.
-    func declare_c_extern(function: HirFunction, is_blocking: bool, signature: MirSignature) -> ExternId!:
+    func declare_c_extern(function: HirFunction, boundary: HirCFunction, signature: MirSignature) -> ExternId!:
         for contract in self.c_extern_contracts:
             if contract.name != function.name: continue
-            if not self.c_extern_contract_matches(contract, function, is_blocking):
+            if not self.c_extern_contract_matches(contract, function, boundary):
                 error("lowerer: conflicting declarations of C symbol `" + function.name + "`")
             let existing = self.externs[contract.external.value]
             if not signatures_match(existing.signature, signature):
@@ -258,23 +274,37 @@ pub class Lowerer:
 
         let external = ExternId(value = u32(len(self.externs)))
         self.externs.append(MirExtern(name = function.name, convention = CallingConvention.c, signature = signature))
-        let parameters = list[ir.TypeId]()
-        for parameter in function.parameters: parameters.append(parameter.value_type)
+        let slots = list[CExternSlot]()
+        for slot in boundary.slots:
+            match slot:
+                Input(parameter): slots.append(CExternSlot.Input(value_type = function.parameters[parameter].value_type))
+                Output(name, value_type): slots.append(CExternSlot.Output(value_type = value_type))
         self.c_extern_contracts.append(CExternContract(
             external = external,
             name = function.name,
-            parameters = parameters,
-            result = function.result,
-            is_blocking = is_blocking,
+            slots = slots,
+            declared_result = boundary.declared_result,
+            is_blocking = boundary.is_blocking,
         ))
         return external
 
-    func c_extern_contract_matches(contract: CExternContract, function: HirFunction, is_blocking: bool) -> bool:
-        if contract.is_blocking != is_blocking: return false
-        if not types_match(contract.result, function.result): return false
-        if len(contract.parameters) != len(function.parameters): return false
-        for index in range(0, len(contract.parameters)):
-            if not types_match(contract.parameters[index], function.parameters[index].value_type): return false
+    func c_extern_contract_matches(contract: CExternContract, function: HirFunction, boundary: HirCFunction) -> bool:
+        if contract.is_blocking != boundary.is_blocking: return false
+        if not types_match(contract.declared_result, boundary.declared_result): return false
+        if len(contract.slots) != len(boundary.slots): return false
+        for index in range(0, len(contract.slots)):
+            let expected = contract.slots[index]
+            match boundary.slots[index]:
+                Input(parameter):
+                    match expected:
+                        Input(value_type):
+                            if not types_match(value_type, function.parameters[parameter].value_type): return false
+                        Output(value_type): return false
+                Output(name, value_type):
+                    match expected:
+                        Input(input_type): return false
+                        Output(output_type):
+                            if not types_match(output_type, value_type): return false
         return true
 
     # Lower one function body. The canonical name is `module.function` so
@@ -1268,7 +1298,7 @@ pub class Lowerer:
         let called = self.program.functions[target]
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         match called.implementation:
-            ExternalC(is_blocking): return try self.lower_c_import_call(module, function, span, target, called, placed, body)
+            ExternalC(contract): return try self.lower_c_import_call(module, function, span, target, called, contract, placed, body)
             else: pass
         let results = list[RegisterId]()
         if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
@@ -1290,16 +1320,43 @@ pub class Lowerer:
     # MIR value representations. Nullable pointer handles are tagged optionals
     # everywhere except the raw call operands/results; bare nulls trap at this
     # exact boundary in both directions.
-    func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, placed: list[RegisterId], body: list[MirInstruction]) -> RegisterId!:
+    func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, contract: HirCFunction, placed: list[RegisterId], body: list[MirInstruction]) -> RegisterId!:
         let encoded = list[RegisterId]()
-        for index in range(0, len(placed)):
-            encoded.append(try self.encode_c_boundary_value(module, function, span, called.parameters[index].value_type, placed[index], body))
+        let output_slots = list[COutputSlot]()
+        for slot in contract.slots:
+            match slot:
+                Input(parameter):
+                    let value_type = called.parameters[parameter].value_type
+                    encoded.append(try self.encode_c_boundary_value(module, function, span, value_type, placed[parameter], body))
+                Output(name, value_type):
+                    let raw_type = try self.c_boundary_type_of(module, function, span, value_type)
+                    let address = self.new_temp(raw_type, span, body)
+                    encoded.append(address)
+                    output_slots.append(COutputSlot(value_type = value_type, raw_type = raw_type, address = address))
         let raw_results = list[RegisterId]()
-        if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
-            raw_results.append(self.new_register(try self.c_boundary_type_of(module, function, span, called.result)))
+        if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
+            raw_results.append(self.new_register(try self.c_boundary_type_of(module, function, span, contract.declared_result)))
         self.emit_call(target, raw_results, encoded, span, body)
-        if len(raw_results) == 0: return RegisterId(value = no_register)
-        return try self.decode_c_boundary_value(module, function, span, called.result, raw_results[0], body)
+
+        let values = list[RegisterId]()
+        let value_types = list[ir.TypeId]()
+        if len(raw_results) > 0:
+            values.append(try self.decode_c_boundary_value(module, function, span, contract.declared_result, raw_results[0], body))
+            value_types.append(contract.declared_result)
+        for output in output_slots:
+            let raw_value = self.load_value(output.raw_type, output.address, span, body)
+            values.append(try self.decode_c_boundary_value(module, function, span, output.value_type, raw_value, body))
+            value_types.append(output.value_type)
+
+        if len(values) == 0: return RegisterId(value = no_register)
+        if len(values) == 1: return values[0]
+        let tuple_type = try self.mir_type_of(module, function, span, called.result)
+        let result = self.new_temp(tuple_type, span, body)
+        for index in range(0, len(values)):
+            let field = self.field_address(tuple_type, result, index, span, body)
+            let field_type = try self.mir_type_of(module, function, span, value_types[index])
+            self.store_value(field_type, field, values[index], span, body)
+        return result
 
     # Internal value -> C slot. Only nullable pointer handles need structural
     # conversion; a bare pointer is validated, and every other admitted scalar

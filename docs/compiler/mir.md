@@ -507,6 +507,18 @@ by source calls and a public C-convention wrapper owning those adapters. Wasm,
 QBE, and the MIR interpreter consume that same wrapper; only the artifact
 backend decides the pointer width and C ABI placement.
 
+An extern `out` declaration is retained in HIR as an ordered, target-neutral
+C slot contract beside the ordinary source callable signature. Inputs refer
+to source parameter indices; outputs name a source type but are not callable
+parameters. The lowerer allocates one call-owned raw slot per output, passes
+its abstract pointer in declaration order, then loads and applies the same C
+value decoder used for declared results. The declared non-void result comes
+first, followed by outputs; zero components produce `unit`, one is returned
+directly, and multiple components use the ordinary aggregate-result protocol.
+The HIR host returns these raw output values explicitly. The MIR host instead
+writes through a narrow `MirExternMemory` view, which tests the actual pointer
+contract without exposing the interpreter's storage or a target layout.
+
 ### Instructions
 
 Every instruction carries a `SourceSpan`. `r` is a register operand; `->

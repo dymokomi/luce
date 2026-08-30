@@ -17,7 +17,7 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, HirNodeForm, NodeId
-from compiler.hir.ir import HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import HirCFunction, HirCSlot, HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type
 from compiler.hir.ir import TypeTable, integer_bit_width, integer_maximum, integer_minimum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
@@ -66,8 +66,14 @@ union RunEvaluation:
 ## Deterministic bindings for source `extern func` declarations. Artifact
 ## backends bind the same callable by their own host mechanism; the semantic
 ## oracle receives behavior explicitly and never consults ambient symbols.
+## `result` is the declared C return (unit for void); `outputs` contains raw
+## C-shaped values for every `out` slot in declaration order.
+pub struct HirExternResult:
+    pub let result: Value
+    pub let outputs: list[Value]
+
 pub interface HirExternHost:
-    func call(function: HirFunction, arguments: list[Value]) -> Value!
+    func call(function: HirFunction, arguments: list[Value]) -> HirExternResult!
 
 ## The reusable interpreter backend. Each execution gets private program state.
 pub class HirInterpreter: HirExecutionBackend:
@@ -174,11 +180,11 @@ class HirInterpreterRun:
     # frame still holds `self` as the method left it.
     func call(function: HirFunction, arguments: list[Value]) -> Invocation!:
         match function.implementation:
-            ExternalC(is_blocking):
+            ExternalC(contract):
                 let host = self.external_host else error("interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` has no host binding")
                 let encoded = try self.encode_c_arguments(function, arguments)
                 let external_result = try host.call(function, encoded)
-                let result = try self.decode_c_result(function, external_result)
+                let result = try self.decode_c_result(function, contract, external_result)
                 return Invocation(value = result, receiver = Value.Unit)
             else: pass
         if self.depth >= frame_limit: error("interpreter: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
@@ -251,17 +257,46 @@ class HirInterpreterRun:
         if self.scalar_value_matches(value, value_type): return value
         trap("typed C argument is incompatible with its HIR slot")
 
-    # Decode a C-shaped result immediately on return. A nullable pointer token
-    # becomes an ordinary tagged optional; a bare null never enters HIR.
-    func decode_c_result(function: HirFunction, value: Value) -> Value!:
-        let value_type = function.result
+    # Decode the declared return and every output immediately after a C call,
+    # then apply the one source result-shaping rule from HirGenerator.
+    func decode_c_result(function: HirFunction, contract: HirCFunction, external: HirExternResult) -> Value!:
+        let values = list[BoxedValue]()
+        if types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
+            match external.result:
+                Unit: pass
+                else: error(self.incompatible_c_result(function, "result", contract.declared_result))
+        else:
+            values.append(BoxedValue(value = try self.decode_c_value(function, external.result, contract.declared_result, "result")))
+
+        var expected_outputs = 0
+        for slot in contract.slots:
+            match slot:
+                Output(name, value_type): expected_outputs += 1
+                Input(parameter): pass
+        if len(external.outputs) != expected_outputs:
+            error("interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` returned " + str(len(external.outputs)) + " out value(s), expected " + str(expected_outputs))
+        var output_index = 0
+        for slot in contract.slots:
+            match slot:
+                Output(name, value_type):
+                    values.append(BoxedValue(value = try self.decode_c_value(function, external.outputs[output_index], value_type, "out parameter `" + name + "`")))
+                    output_index += 1
+                Input(parameter): pass
+
+        if len(values) == 0: return Value.Unit
+        if len(values) == 1: return values[0].value
+        return Value.Tuple(elements = values)
+
+    # Decode one raw C value. A nullable pointer token becomes an ordinary
+    # tagged optional; a bare null never enters HIR.
+    func decode_c_value(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
         let optional_inner = self.optional_pointer_handle(value_type)
         if optional_inner != none:
             match value:
                 Foreign(token):
                     if token == 0: return Value.Absent
                     return Value.Present(value = BoxedValue(value = Value.Foreign(token = token)))
-                else: error(self.incompatible_c_result(function))
+                else: error(self.incompatible_c_result(function, slot, value_type))
 
         let extern_index = self.extern_type_index(value_type)
         if extern_index >= 0:
@@ -269,15 +304,15 @@ class HirInterpreterRun:
                 Foreign(token):
                     match self.program.extern_types[extern_index].representation:
                         Pointer:
-                            if token == 0: error(self.null_foreign(function, "result"))
+                            if token == 0: error(self.null_foreign(function, slot))
                         Integer(representation):
                             if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
-                                error(self.incompatible_c_result(function))
+                                error(self.incompatible_c_result(function, slot, value_type))
                     return value
-                else: error(self.incompatible_c_result(function))
+                else: error(self.incompatible_c_result(function, slot, value_type))
 
         if self.scalar_value_matches(value, value_type): return value
-        error(self.incompatible_c_result(function))
+        error(self.incompatible_c_result(function, slot, value_type))
 
     func decode_c_argument(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
         let optional_inner = self.optional_pointer_handle(value_type)
@@ -338,8 +373,8 @@ class HirInterpreterRun:
                     Integer(representation): return none
             else: return none
 
-    func incompatible_c_result(function: HirFunction) -> str:
-        return "interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` returned a value incompatible with `" + describe_type(self.program.types, function.result) + "`"
+    func incompatible_c_result(function: HirFunction, slot: str, value_type: TypeId) -> str:
+        return "interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` returned " + slot + " incompatible with `" + describe_type(self.program.types, value_type) + "`"
 
     func incompatible_c_argument(function: HirFunction, slot: str, value_type: TypeId) -> str:
         return "interpreter: C export `" + function.name + "` received " + slot + " incompatible with `" + describe_type(self.program.types, value_type) + "`"
