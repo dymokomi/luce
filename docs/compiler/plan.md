@@ -73,6 +73,12 @@ choose semantics. Design is written down before code — in the file header
 and, for gates, in the spec — and a slice is ticked only on a green
 `./test.sh` with the commit in.
 
+The stage-0 `examples/` corpus is a standing progress input. Its audited matrix
+lives in `examples/README.md`: adopt only cohesive sources that become an
+automated parser/HIR/MIR/artifact gate, modernize them to the current 1.0
+surface, and pin the first unsupported stage until it advances. Do not bulk
+copy generated caches or duplicate programs merely to increase the count.
+
 ## 2. Canonical MIR — the decisions (details in `mir.md`)
 
 - **Structured control flow** (`Block`/`Loop`/`If`/`Switch`/`Br`/`BrIf`/`Yield`), not a basic-block graph. Luce has no `goto`; structure → jumps is trivial for native, jumps → structure (the relooper) is the hard direction and is avoided entirely. **Encoded flat**: a body is one instruction list with `Else`/`Case`/`Default`/`End` markers — the wasm encoding — so every consumer is a single linear pass with a region stack and a body is one contiguous allocation.

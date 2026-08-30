@@ -20,7 +20,7 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, direct scalar C imports/exports, nominal handle erasure, pointer/null and output-slot boundary adapters, and shared C-export wrappers, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, C calls as `env` imports and exact exports, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, QBE C ABI extension types, exact C symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 425 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 426 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -87,6 +87,13 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   writes through a narrow memory view. Wasm encodes the same MIR, and a real
   QBE/libc `posix_memalign(void **, ...)` execution proves nullable pointer
   output, allocation, and cleanup end to end.
+- [x] **Stage-0 examples became measured compiler-progress inputs**
+  (2026-08-30). The 0.28 corpus at `d5b4583` is catalogued by capability in
+  `examples/README.md` instead of copied wholesale. The adapted
+  recursive-descent calculator parses under the current 1.0 surface and pins
+  its first HIR gap. The inventory independently confirms that collections,
+  indexing/slicing, and string/runtime primitives unlock most small and medium
+  real programs, matching the existing runtime-before-collections plan.
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
 - [x] Native rung 0 proved direct image writing for the original slice; removed
