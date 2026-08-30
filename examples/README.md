@@ -23,8 +23,8 @@ belongs to.
   manifest-generated raw module. See its README for the current implementation
   boundary.
 - `stage0_calculator.luc` is the stage-0 recursive-descent calculator adapted
-  to the 1.0 syntax and entry contract. It parses today and intentionally pins
-  the first HIR gap (`len`/string operations) until that frontier advances.
+  to the 1.0 syntax, explicit UTF-8-byte scanning, and entry contract. It
+  checks, compiles through QBE, links, and executes as a native gate.
 
 ## Stage-0 example corpus as a progress gate
 
@@ -38,7 +38,7 @@ artifacts are never imported.
 | Upstream program | What it measures | Current disposition |
 |---|---|---|
 | `hello` | entry arguments, strings, output | Intent represented by `hello.luc`; compiled on both artifact paths. |
-| `calc` | string scanning/slicing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; parser green, HIR frontier pinned. |
+| `calc` | byte scanning, checked indexing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; native QBE execution green. |
 | `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | Catalogued; waits for collections and their runtime. |
 | `bf` | arrays, string/array indexing, characters, string builder | Catalogued; waits for dense storage and string operations. |
 | `dice` | RNG, arrays/lists, formatted strings, files | Catalogued; waits for collections, formatting, and the standard runtime. |

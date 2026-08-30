@@ -442,7 +442,7 @@ symbol).
 | `Func(signature)` | what a function pointer points at |
 
 How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
-unsigned)`; `str` and `bytes` → a `{Ptr, Int(64)}` `Struct` (address and
+unsigned)`; `str` and `bytes` → a `{Ptr, u64}` `Struct` (address and
 length; a literal's bytes are a data item); `list`, `map`, `set` → `Ptr` to
 runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
 future managed class references is still open, but foreign handles stay
@@ -632,9 +632,9 @@ Emitted by the lowerer, never by user code; the verifier knows their
 signatures.
 
 ```
-luce_rt_alloc(size, align) -> Ptr        luce_rt_retain(Ptr)         luce_rt_release(Ptr)
+luce_rt_alloc(u64 size, u64 align) -> Ptr luce_rt_retain(Ptr)        luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
-luce_rt_trap(message, length)            luce_rt_write(bytes, length)
+luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
 luce_rt_spawn(function, input) -> Ptr    luce_rt_wait(Ptr) -> Ptr    luce_rt_cancel(Ptr)
 luce_rt_transfer(value, type_info) -> Ptr                             value-graph copy (§19.2)

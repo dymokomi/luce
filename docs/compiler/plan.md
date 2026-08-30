@@ -195,6 +195,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   ordinary global state; null translation remains confined to callable C
   boundaries. Strings, extern structs, exported structs/enums, and `cfunc`
   remain on this item.
+- [x] **Checked byte access and the first adopted native example**
+  (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
+  have explicit target-neutral HIR semantics and lower to the existing
+  structural MIR field/element operations plus an explicit trap edge. String
+  and byte counts are now the spec's `u64` throughout canonical MIR and the
+  runtime seam. The adapted Stage-0 recursive-descent calculator scans UTF-8
+  bytes (never integer-indexes `str`), checks, compiles and links through the
+  product QBE path, then executes successfully. Wasm and both semantic oracles
+  agree on successful access and out-of-bounds traps.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.

@@ -77,7 +77,8 @@ examples and tests link back here rather than restating it.
   closures, generics, and the C boundary syntax.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, parameter
-  defaults, bindings, assignment, scalars, strings, tuples, optionals,
+  defaults, bindings, assignment, scalars, strings, checked byte indexing and
+  byte-sequence lengths, tuples, optionals,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
@@ -95,7 +96,8 @@ examples and tests link back here rather than restating it.
   constants, tuples, optionals, integer ranges and `for`, structs (including
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
-  equality, direct scalar C imports/exports with nominal integer and pointer
+  equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, direct
+  scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   and `print` of a
   literal or a `str` value — is lowered to canonical
