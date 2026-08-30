@@ -64,7 +64,7 @@ Measured on 0.25/arm64-macOS; method and full table in `plan.md` §8.1.
 | | value | verdict |
 | --- | --- | --- |
 | Stack under the compiler today | 512 MiB, from Stage-0's link-time reservation | fine, and not ours to keep |
-| Stack in what we emit | 64 MiB (`arm64_macos.luc`), 8 MiB on Linux, 1 MiB shadow stack on wasm | macOS done, Linux unaddressed |
+| Stack in what we emit | 64 MiB (`backends/native/arm64_macos.luc`), 8 MiB on Linux, 1 MiB shadow stack on wasm | macOS done, Linux unaddressed |
 | Cost of one interpreted call | ~32 KiB across six host frames | 8–30× the norm |
 | ↳ and it depends on the build mode | 42.7 KiB release, 52.9 KiB debug (0.26) | see below |
 | `frame_limit` | 2000, declared | right for one host, wrong elsewhere |
@@ -104,7 +104,7 @@ The rest is the work.
 
 The expression grammar now counts its own depth and refuses past **256**, the
 number Swift's parser and Clang's `-fbracket-depth` use, both from the C++
-standard's recommended minimum limits. `parser.luc:parse_expression` carries
+standard's recommended minimum limits. `frontend/parser.luc:parse_expression` carries
 the counter; `parse_nested_expression` holds the body it used to.
 
 Measured before the fix: 26,250 nested parentheses took SIGBUS, and 25,000 did
@@ -239,11 +239,11 @@ Measured on this machine, checking a file of N simple statements:
 | 8,000 comment lines | 25.0 s | 0.07 s |
 | 64,000 statements | — | 3.10 s |
 
-The fix, in `tokenizer.luc`: decode `bytes(source)` once into a `list[char]`
+The fix, in `frontend/tokenizer.luc`: decode `bytes(source)` once into a `list[char]`
 (`decode_utf8`), scan that, and build token text with `text_between` rather
 than slicing the source. Two smaller ones went with it — `len(self.source)`
 hoisted out of the scanning loops, and bracket matching precomputed once in
-`parser.luc:match_brackets` instead of scanned per nesting level.
+`frontend/parser.luc:match_brackets` instead of scanned per nesting level.
 
 **This is why the crash looked unreachable.** At the old speed, 26,000 nested
 parentheses took minutes to tokenize, so the stack overflow behind them never

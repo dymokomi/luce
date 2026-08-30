@@ -52,7 +52,7 @@ and, for gates, in the spec — and a slice is ticked only on a green
 
 **Own the whole native toolchain: no LLVM, no external assembler or linker at build time.**
 
-- **Codegen**: a QBE-shaped pass written in Luce, using QBE (MIT, ~12k lines C) as *reference*, not a port — SSA construction, slot promotion, C ABI incl. Apple arm64, instruction selection, spilling, the simple register allocator — with our own machine-code encoders (seeds: the mnemonic constants in `arm64_macos.luc` / `x86_64_linux.luc`).
+- **Codegen**: a QBE-shaped pass written in Luce, using QBE (MIT, ~12k lines C) as *reference*, not a port — SSA construction, slot promotion, C ABI incl. Apple arm64, instruction selection, spilling, the simple register allocator — with our own machine-code encoders (seeds: the mnemonic constants in `backends/native/arm64_macos.luc` / `backends/native/x86_64_linux.luc`).
 - **Timing**: after enums land (MIR settles). First read QBE and write `docs/compiler/native.md`; then the arm64 pass as a fourth column in the harness; x86-64 afterwards.
 - **Linker rungs**: rung 0 (today) one image, raw syscalls; **rung 1 (required for the host)** Mach-O dyld imports of libSystem and frameworks, stubs/GOT, bind info, own ad-hoc code signature — ELF stays fully static; rung 2 links our own object files when separate compilation exists; rung 3 (a real linker for foreign `.o`/`.a`) deferred indefinitely.
 - **`libluce_rt`** is Luce, compiled into every program as more MIR, bottoming out in syscalls on Linux and libSystem on macOS. It is the layer *above* the OS library.
@@ -203,7 +203,7 @@ Where we are short, in the order it will bite. The design record that turns this
 - ~~The front end has no nesting guard.~~ **Closed 2026-08-29.** Expression nesting is capped at 256; 26,250 nested parentheses used to take SIGBUS. Statement and type nesting are still unguarded and still unmeasured.
 - **`frame_limit` is declared, not derived.** It is right for a 512 MiB host and wrong everywhere else. Once self-hosted on the 64 MiB we now emit, the fat-callee ceiling is about 1,600 — under the current limit. The fix is to compute it at startup from the real stack bounds, as CPython does.
 - **32 KiB per interpreted call is eight to thirty times the norm** (a lean tree-walker spends 1–4 KiB). It is Stage-0's per-arm slot inflation in our wide `match` walkers. Thinner frames are a linear multiplier on depth that costs no address space, which is why this is the fix rather than a bigger constant.
-- **Only the macOS backend can reserve a stack.** `arm64_macos.luc` writes 64 MiB into `LC_MAIN.stacksize`; the ELF backend emits one `PT_LOAD` and no `PT_GNU_STACK`, so Linux hands out its 8 MiB regardless. The two precedents are Zig's (`PT_GNU_STACK` plus `setrlimit` at startup) and rustc's (run the work on a spawned thread with an explicit size).
+- **Only the macOS backend can reserve a stack.** `backends/native/arm64_macos.luc` writes 64 MiB into `LC_MAIN.stacksize`; the ELF backend emits one `PT_LOAD` and no `PT_GNU_STACK`, so Linux hands out its 8 MiB regardless. The two precedents are Zig's (`PT_GNU_STACK` plus `setrlimit` at startup) and rustc's (run the work on a spawned thread with an explicit size).
 
 ## 9. Conventions worth keeping
 

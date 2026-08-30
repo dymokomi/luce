@@ -395,7 +395,7 @@ Two consequences for the design record:
   linker — the only way `extern` C functions and `libluce_rt` link. The
   current direct executable writers stay as a no-dependency path and are
   not extended.
-- The order of work: new `canonical_ir.luc` and verifier → MIR interpreter
+- The order of work: new `mir/canonical.luc` and verifier → MIR interpreter
   and the three-way harness (both done: `tests/compiler/differential_test.luc`)
   → the lowerer in vertical slices (scalars and locals, control flow, calls and constants — done;
   enums and `match`, structs and ARC, closures and interfaces, failure and

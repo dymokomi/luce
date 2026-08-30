@@ -57,9 +57,9 @@ A few terms recur in the source and in this README:
   repository. The compiler source must stay inside the language subset it
   understands until Luce can build itself.
 - **HIR** — the High-level Intermediate Representation: source after names and
-  types have meaning (`src/compiler/hir.luc`). The interpreter runs it directly.
+  types have meaning (`src/compiler/hir/ir.luc`). The interpreter runs it directly.
 - **MIR / canonical IR** — the flat, target-independent instruction stream the
-  compiled backends consume (`src/compiler/canonical_ir.luc`).
+  compiled backends consume (`src/compiler/mir/canonical.luc`).
 - **Slice** — the part of the 1.0 language a stage implements today. The parser
   covers most of 1.0; HIR generation, the interpreter, and the compiled path
   each cover a smaller, growing slice.
@@ -116,7 +116,7 @@ can execute it yet.
 native smoke test on a supported host. To run one file:
 
 ```sh
-./stage0/bin/luce-0 test tests/compiler/parser_test.luc
+./stage0/bin/luce-0 test tests/compiler/frontend/parser_test.luc
 ```
 
 A test is a zero-argument `pub func test_*` function; Stage-0 discovers them
@@ -147,17 +147,14 @@ Read in this order; each stop hands off to the next.
 ## Finding your way around
 
 - `src/luce.luc` is the command-line program.
-- `src/compiler/source.luc` is the shared source span and diagnostic format.
-- `src/compiler/tokenizer.luc`, `parser.luc`, and `syntax.luc` are the source
-  frontend.
-- `src/compiler/hir_gen.luc` and `hir.luc` turn source syntax into resolved,
-  typed program meaning.
-- `src/compiler/semantic_analyzer.luc` is the home for flow and ownership
-  analysis as those checks are implemented.
+- `src/compiler/frontend/` owns source spans, tokens, syntax, and parsing.
+- `src/compiler/hir/` turns syntax into resolved, typed program meaning and
+  owns semantic flow analysis.
 - `src/compiler/backends/interpreter.luc` runs typed HIR directly.
-- `src/compiler/lowerer.luc`, `canonical_ir.luc`, `mir_verifier.luc`, and
-  `optimizer.luc` form the target-independent compiled path.
-- `src/compiler/backends/` contains the WebAssembly, Mach-O, and ELF emitters.
+- `src/compiler/mir/` owns lowering, canonical MIR, verification, and
+  target-independent optimization.
+- `src/compiler/backends/` contains artifact emitters; the temporary seed
+  native encoders are isolated under `backends/native/`.
 
 ## Contributing constraints
 
