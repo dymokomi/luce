@@ -344,6 +344,20 @@ pub func self_replacement() -> i64:
     return t * 10 + v.sum()
 func scale(value: i64, factor: i64 = 3, offset: i64 = -1) -> i64: return value * factor + offset
 pub func parameter_defaults() -> i64: return scale(2) + scale(2, 10) + scale(2, offset = 5)
+struct CustomPair:
+    let left: i64
+    let right: i64
+    func init(self, value: i64, swap: bool = false):
+        if swap:
+            self.left = value + 1
+            self.right = value
+        else:
+            self.left = value
+            self.right = value + 1
+pub func custom_init() -> i64:
+    let normal = CustomPair(3)
+    let swapped = CustomPair(value = 8, swap = true)
+    return normal.left * 1000 + normal.right * 100 + swapped.left * 10 + swapped.right
 LUCE
 "$cli" build --package org.luce.tests "$test_dir/structs.wasm" "$test_dir/structs.luc" >/dev/null
 structs() { expect 0 "$2" wasmtime run --invoke "structs.$1" "$test_dir/structs.wasm"; }
@@ -355,6 +369,7 @@ structs nested 24
 structs equality 111
 structs self_replacement 330
 structs parameter_defaults 35
+structs custom_init 3498
 
 printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name = "luce", count = 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
 "$cli" build --package org.luce.tests "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
@@ -844,6 +859,15 @@ pub func handler_answer() -> i64:
         if failure.code == invalid and failure.message == "context": recover 22
         recover 0
     return returned_from_handler() + recovered
+struct Positive:
+    let value: i64
+    func init(self, value: i64) -> unit!:
+        if value < 0: error(invalid, "negative")
+        self.value = value
+func checked_init(value: i64) -> i64:
+    let positive = Positive(value) catch failure: return -1
+    return positive.value
+pub func initializer_answer() -> i64: return checked_init(43) + checked_init(-1)
 LUCE
 "$cli" build --package org.luce.tests "$test_dir/failures.wasm" "$test_dir/failures.luc" >/dev/null
 expect 0 "checked
@@ -861,6 +885,7 @@ error handler
 checked
 return handler
 42" wasmtime run --invoke failures.handler_answer "$test_dir/failures.wasm"
+expect 0 "42" wasmtime run --invoke failures.initializer_answer "$test_dir/failures.wasm"
 
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'

@@ -159,6 +159,15 @@ awkward on structured code. When a native backend needs them, it can build a
 graph *after* canonical MIR as its own private step. Canonical MIR does not
 change.
 
+Custom struct initialization reuses the aggregate protocol without adding a
+MIR instruction. HIR's `Initialize` allocates fresh caller-owned struct
+storage, passes its address as parameter 0 (`self`) to the initializer, and
+yields that address after the unit-returning call succeeds. A fallible
+initializer places the caller-owned `Error` slot before `self`, exactly like
+every other fallible call. Definite initialization has already been proved in
+typed HIR, so MIR never represents a partially initialized value outside that
+call.
+
 ### Failing: errors are just values
 
 On to `checked_sum`, which can fail. In Luce a function returning `T!`

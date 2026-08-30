@@ -34,7 +34,7 @@ from compiler.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, Ty
 from compiler.tokenizer import Token, TokenKind
 from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType
 from compiler.hir import HirConstant, HirFunction, HirNode, HirNodeForm, NodeId, Operands, no_node
-from compiler.hir import HirEnum, HirEnumCase, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirStruct
+from compiler.hir import HirEnum, HirEnumCase, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
 from compiler.hir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir import describe_type, integer_maximum, integer_minimum
@@ -73,6 +73,8 @@ struct CollectedStruct:
     pub let documentation: list[str]
     pub let type_id: TypeId
     pub let fields: list[HirField]
+    # Function-table index of the custom initializer, or -1 for memberwise.
+    pub let initializer: i64
     pub let syntax: NominalTypeSyntax
     pub let span: SourceSpan
 
@@ -321,12 +323,15 @@ pub class HirGenerator:
 
         let hir_structs = list[HirStruct]()
         for item in self.structs:
+            var initializer: SymbolId? = none
+            if item.initializer >= 0: initializer = self.functions[item.initializer].symbol
             hir_structs.append(HirStruct(
                 module = ModuleId(value = u32(item.module_index)),
                 name = item.name,
                 is_public = item.is_public,
                 documentation = item.documentation,
                 fields = item.fields,
+                initializer = initializer,
                 span = item.span,
             ))
 
@@ -621,6 +626,8 @@ pub class HirGenerator:
             if parameter.name == "self":
                 let owner = receiver else error(self.diagnostic_at(module_index, parameter.span, "`self` is the receiver of a method; only a type member declares it"))
                 if len(parameters) > 0: try self.fail_at(module_index, parameter.span, "`self` must be the first parameter")
+                if parameter.annotation != none: try self.fail_at(module_index, parameter.span, "`self` does not take a type annotation")
+                if parameter.default_value != none: try self.fail_at(module_index, parameter.span, "`self` does not take a default value")
                 parameter_type = owner.owner
                 has_self = true
             else:
@@ -649,9 +656,23 @@ pub class HirGenerator:
         try self.validate_function_result(module_index, result, span)
         var checked_receiver: HirReceiver? = none
         if receiver != none:
-            if function.is_mutating and not has_self:
+            if receiver.kind == HirReceiverKind.initializer:
+                if not has_self:
+                    try self.fail_at(module_index, span, "initializer `init` requires `self` as its first parameter")
+                var successful = result
+                let fallible = self.fallible_inner(result)
+                if fallible != none: successful = fallible
+                if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail_at(module_index, span, "initializer `init` must return `unit` or `unit!`")
+                checked_receiver = receiver
+            elif function.is_mutating and not has_self:
                 try self.fail_at(module_index, span, "`mutating` requires a `self` parameter")
-            checked_receiver = HirReceiver(owner = receiver.owner, has_self = has_self, is_mutating = function.is_mutating)
+            else:
+                var kind = HirReceiverKind.type_function
+                if has_self:
+                    kind = HirReceiverKind.value_method
+                    if function.is_mutating: kind = HirReceiverKind.mutating_method
+                checked_receiver = HirReceiver(owner = receiver.owner, kind = kind)
         let function_symbol = self.make_symbol(function.name, SymbolKind.function, result)
         self.functions.append(FunctionSymbol(
             symbol = function_symbol,
@@ -704,6 +725,7 @@ pub class HirGenerator:
             documentation = documentation,
             type_id = type_id,
             fields = list[HirField](),
+            initializer = -1,
             syntax = nominal,
             span = span,
         ))
@@ -713,12 +735,15 @@ pub class HirGenerator:
     func collect_struct_members(module_index: i64, nominal: NominalTypeSyntax) -> !:
         let struct_index = self.find_struct_in_module(module_index, nominal.name)
         let fields = list[HirField]()
+        var initializer = -1
         for member in nominal.members:
             match member.value:
                 Field(field):
                     for previous in fields:
                         if previous.name == field.name:
                             try self.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
+                    if self.find_method(self.structs[struct_index].type_id, field.name) >= 0:
+                        try self.fail_at(module_index, field.span, "`" + field.name + "` is both a field and a method of `" + nominal.name + "`")
                     if field.is_weak: try self.fail_at(module_index, field.span, "`weak` fields belong to classes, not structs")
                     let field_type = try self.resolve_type(module_index, field.value_type)
                     if self.contains_fallible(field_type):
@@ -736,15 +761,19 @@ pub class HirGenerator:
                         default_value = default_value,
                     ))
                 Function(function):
-                    if function.name == "init":
-                        try self.fail_at(module_index, member.span, "custom initializers are not implemented yet")
                     if self.find_method(self.structs[struct_index].type_id, function.name) >= 0:
                         try self.fail_at(module_index, member.span, "duplicate method `" + function.name + "` in `" + nominal.name + "`")
                     for field in fields:
                         if field.name == function.name:
                             try self.fail_at(module_index, member.span, "`" + function.name + "` is both a field and a method of `" + nominal.name + "`")
-                    let receiver = HirReceiver(owner = self.structs[struct_index].type_id, has_self = false, is_mutating = function.is_mutating)
+                    var receiver_kind = HirReceiverKind.type_function
+                    if function.name == "init":
+                        if function.is_mutating:
+                            try self.fail_at(module_index, member.span, "an initializer does not use `mutating`; initialization already writes `self`")
+                        receiver_kind = HirReceiverKind.initializer
+                    let receiver = HirReceiver(owner = self.structs[struct_index].type_id, kind = receiver_kind)
                     try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, member.span)
+                    if receiver_kind == HirReceiverKind.initializer: initializer = len(self.functions) - 1
         let item = self.structs[struct_index]
         self.structs[struct_index] = CollectedStruct(
             module_index = item.module_index,
@@ -753,6 +782,7 @@ pub class HirGenerator:
             documentation = item.documentation,
             type_id = item.type_id,
             fields = fields,
+            initializer = initializer,
             syntax = item.syntax,
             span = item.span,
         )
@@ -862,7 +892,7 @@ pub class HirGenerator:
                     for case_value in cases:
                         if case_value.name == function.name:
                             try self.fail_at(module_index, member.span, "`" + function.name + "` is both a case and a method of `" + enumeration.name + "`")
-                    let receiver = HirReceiver(owner = item.type_id, has_self = false, is_mutating = function.is_mutating)
+                    let receiver = HirReceiver(owner = item.type_id, kind = HirReceiverKind.type_function)
                     try self.collect_function(module_index, member.is_public, member.documentation, receiver, function, member.span)
                 else: try self.fail_at(module_index, member.span, "an enum declares cases and methods only")
 
@@ -990,10 +1020,12 @@ pub class HirGenerator:
         self.loop_depth = 0
         self.recovery_types = list[TypeId]()
 
-        # `self` is assignable only in a mutating method (spec §8.7).
+        # Whole-value `self` is assignable only in a mutating method. An
+        # initializer writes individual fields through its dedicated path;
+        # definite initialization is proved by SemanticAnalyzer.
         var self_is_mutable = false
         let receiver = function.receiver
-        if receiver != none: self_is_mutable = receiver.is_mutating
+        if receiver != none: self_is_mutable = receiver.kind == HirReceiverKind.mutating_method
         for parameter in function.parameters:
             try self.require_free_local_name(parameter.name, function.span)
             let is_mutable = parameter.name == "self" and self_is_mutable
@@ -1271,7 +1303,11 @@ pub class HirGenerator:
         let local_index = self.find_local(root_name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
         let local = self.locals[local_index]
-        if not local.is_mutable:
+        var initializer_field = false
+        let active_receiver = self.current_receiver
+        if root_name == "self" and active_receiver != none:
+            initializer_field = active_receiver.kind == HirReceiverKind.initializer
+        if not local.is_mutable and not initializer_field:
             if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
             try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
         let path = list[u32]()
@@ -1285,7 +1321,8 @@ pub class HirGenerator:
             let field = self.structs[struct_index].fields[field_index]
             if not field.is_public and self.structs[struct_index].module_index != self.current_module:
                 try self.fail(span, "field `" + names[index] + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
-            if not field.is_mutable: try self.fail(span, "cannot assign to `let` field `" + names[index] + "`; declare it with `var`")
+            if not field.is_mutable and not initializer_field:
+                try self.fail(span, "cannot assign to `let` field `" + names[index] + "`; declare it with `var`")
             path.append(u32(field_index))
             place_type = field.value_type
             index -= 1
@@ -1654,25 +1691,40 @@ pub class HirGenerator:
             return try self.check_enum_value(resolved.enum_index, resolved.case_index, arguments, span, expected)
         let function = self.functions[resolved.function_index]
 
-        # Positional arguments fill parameters left to right; named arguments
-        # then land anywhere, but each parameter is supplied once. A method
-        # call's receiver is argument 0, and must be a mutable place when the
-        # method is `mutating`.
-        let assigned = list[bool]()
-        for parameter in function.parameters: assigned.append(false)
         # Pairs of (parameter index, argument node), in source order.
         let typed_arguments = list[u32]()
-        var positional_index = 0
-        var saw_named = false
+        var first_source_parameter = 0
         let receiver_value = resolved.receiver
         if receiver_value.value != no_node:
             let method = function.receiver else trap("a receiver was resolved for a function without one")
-            if method.is_mutating: try self.require_mutable_place(receiver_value, callee.span)
+            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee.span)
             typed_arguments.append(0)
             typed_arguments.append(receiver_value.value)
-            assigned[0] = true
-            positional_index = 1
+            first_source_parameter = 1
+        let placed = try self.check_function_arguments(
+            function,
+            arguments,
+            first_source_parameter,
+            typed_arguments,
+            span,
+            "function `" + function.name + "`",
+            "call to `" + function.name + "`",
+        )
+        let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = placed), function.result, span)
+        return try self.require_type(typed, expected)
 
+    # Positional arguments fill source-visible parameters left to right;
+    # named arguments then land anywhere, each exactly once. Hidden receiver
+    # parameters are already present in `placed` and occupy the prefix before
+    # `first_source_parameter`. Defaults are appended after explicit source
+    # arguments, preserving their evaluation order without repeating this
+    # protocol for calls and construction.
+    func check_function_arguments(function: FunctionSymbol, arguments: list[ArgumentSyntax], first_source_parameter: i64, placed: list[u32], span: SourceSpan, subject: str, missing_subject: str) -> Operands!:
+        let assigned = list[bool]()
+        for parameter_index in range(0, len(function.parameters)):
+            assigned.append(parameter_index < first_source_parameter)
+        var positional_index = first_source_parameter
+        var saw_named = false
         for argument in arguments:
             var parameter_index = -1
             let label = argument.label
@@ -1683,26 +1735,26 @@ pub class HirGenerator:
             else:
                 saw_named = true
                 parameter_index = find_parameter(function, label)
-                if parameter_index < 0: try self.fail(argument.span, "function `" + function.name + "` has no parameter `" + label + "`")
+                if parameter_index < first_source_parameter:
+                    try self.fail(argument.span, subject + " has no parameter `" + label + "`")
             if parameter_index >= len(function.parameters):
-                try self.fail(argument.span, "function `" + function.name + "` accepts " + str(len(function.parameters)) + " argument(s)")
+                try self.fail(argument.span, subject + " accepts " + str(len(function.parameters) - first_source_parameter) + " argument(s)")
             if assigned[parameter_index]:
                 try self.fail(argument.span, "parameter `" + function.parameters[parameter_index].name + "` is supplied more than once")
             assigned[parameter_index] = true
             let checked = try self.check_expression(argument.value, function.parameters[parameter_index].value_type)
-            typed_arguments.append(u32(parameter_index))
-            typed_arguments.append(checked.value)
+            placed.append(u32(parameter_index))
+            placed.append(checked.value)
 
-        for parameter_index in range(0, len(function.parameters)):
+        for parameter_index in range(first_source_parameter, len(function.parameters)):
             if assigned[parameter_index]: continue
             let default_value = function.parameters[parameter_index].default_value
             if default_value.value != no_node:
-                typed_arguments.append(u32(parameter_index))
-                typed_arguments.append(default_value.value)
+                placed.append(u32(parameter_index))
+                placed.append(default_value.value)
                 continue
-            try self.fail(span, "call to `" + function.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
-        let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.push_run(typed_arguments)), function.result, span)
-        return try self.require_type(typed, expected)
+            try self.fail(span, missing_subject + " is missing argument `" + function.parameters[parameter_index].name + "`")
+        return self.push_run(placed)
 
     # `ErrorCode.package(n)` is a declaration-only compiler constructor. The
     # full package identity lives once on HirProgram; this node stores only
@@ -1871,6 +1923,9 @@ pub class HirGenerator:
         let foreign = item.module_index != self.current_module
         if foreign and not item.is_public:
             try self.fail(span, "`" + item.name + "` is private to module `" + self.sources[item.module_index].name + "`")
+        let initializer = item.initializer
+        if initializer >= 0:
+            return try self.check_custom_initializer(struct_index, initializer, arguments, span, expected)
         # Given values by field position; `no_node` marks one not yet given.
         let values = list[NodeId]()
         for field in item.fields:
@@ -1908,6 +1963,34 @@ pub class HirGenerator:
                 try self.fail(span, "construction of `" + item.name + "` is missing field `" + field.name + "`")
             fields.append(field.default_value)
         let typed = self.push_node(HirNodeForm.StructValue(struct_index = struct_index, fields = self.push_nodes(fields)), item.type_id, span)
+        return try self.require_type(typed, expected)
+
+    # A custom initializer keeps its source-level `unit`/`unit!` result on the
+    # function, while construction changes only the successful side to the
+    # fresh struct value. Parameter zero is `self`; it is supplied by
+    # execution, never by source syntax.
+    func check_custom_initializer(struct_index: i64, function_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.structs[struct_index]
+        let function = self.functions[function_index]
+        let foreign = item.module_index != self.current_module
+        if foreign and not function.is_public:
+            try self.fail(span, "initializer `init` is private to module `" + self.sources[item.module_index].name + "`")
+
+        let typed_arguments = list[u32]()
+        let placed = try self.check_function_arguments(
+            function,
+            arguments,
+            1,
+            typed_arguments,
+            span,
+            "initializer for `" + item.name + "`",
+            "construction of `" + item.name + "`",
+        )
+
+        var construction_type = item.type_id
+        if self.fallible_inner(function.result) != none:
+            construction_type = self.intern_fallible(item.type_id)
+        let typed = self.push_node(HirNodeForm.Initialize(function = function.symbol, arguments = placed), construction_type, span)
         return try self.require_type(typed, expected)
 
     # `value.field`: the value must be a struct with that field, visible here.
@@ -2022,8 +2105,10 @@ pub class HirGenerator:
                     try self.fail(callee.span, "`" + self.describe_type(owner) + "` has no method `" + name + "`")
                 let method = self.functions[method_index]
                 let method_receiver = method.receiver else trap("method without a receiver")
-                if not method_receiver.has_self:
+                if method_receiver.kind == HirReceiverKind.type_function:
                     try self.fail(callee.span, "`" + name + "` is a type function; call it as `" + self.describe_type(owner) + "." + name + "(...)`")
+                if method_receiver.kind == HirReceiverKind.initializer:
+                    try self.fail(callee.span, "initializer `init` is called by constructing a `" + self.describe_type(owner) + "` value")
                 try self.require_method_visible(method_index, owner, callee.span)
                 return ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1, enum_index = -1, case_index = -1)
             else:
@@ -2093,7 +2178,7 @@ pub class HirGenerator:
         if method_index < 0:
             try self.fail(span, "`" + self.describe_type(owner) + "` has no type function `" + name + "`")
         let receiver = self.functions[method_index].receiver else trap("method without a receiver")
-        if receiver.has_self:
+        if receiver.kind != HirReceiverKind.type_function:
             try self.fail(span, "`" + name + "` takes `self`; call it through a `" + self.describe_type(owner) + "` value")
         try self.require_method_visible(method_index, owner, span)
         return ResolvedCallee(function_index = method_index, receiver = NodeId(value = no_node), struct_index = -1, enum_index = -1, case_index = -1)

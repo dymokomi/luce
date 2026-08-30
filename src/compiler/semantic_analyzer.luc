@@ -4,45 +4,342 @@
 #
 #   DESCRIPTION:
 #       The semantic middle end between type checking and execution/lowering.
-#       This stage will own rules that need typed program context:
-#       control-flow validity, definite initialization, moves, borrows,
-#       lifetimes, and ownership.
-#
-#       Today `HirGenerator` already proves the flow rules supported by
-#       the executable slice, and Luce has no owning reference values to track.
-#       The analyzer is therefore an intentional identity pass over the HIR
-#       data, but it returns a distinct `AnalyzedProgram` wrapper. That wrapper
-#       makes the permanent pipeline boundary enforceable: interpreters and
-#       lowerers cannot accidentally consume unchecked HIR. Rules move here as
-#       HIR grows rich enough to express them.
-#
-#       Example:
-#
-#       HirProgram -> SemanticAnalyzer.analyze -> AnalyzedProgram
+#       HirGenerator resolves local facts; this stage proves facts that need
+#       control-flow joins. Initializer safety is the first such proof:
+#       successful paths initialize every field exactly once, while partial
+#       `self` cannot be read or escape.
 #
 #==============================================================================================
 
-from compiler.hir import HirProgram
+from compiler.hir import BinaryOperation, HirFunction, HirProgram, HirReceiverKind
+from compiler.hir import NodeId, Operands, SymbolId, TypeId, entry_at, no_node, node_at, node_form, node_span
+from compiler.source import SourceSpan, format_diagnostic
 
-## Typed HIR that has crossed whole-program semantic analysis. The wrapper
-## carries no extra facts yet; future flow and ownership results belong here.
+## Typed HIR that has crossed whole-program semantic analysis.
 pub struct AnalyzedProgram:
     pub let hir: HirProgram
 
-## Applies whole-program semantic rules to typed HIR and marks the result as
-## analyzed without changing its representation level.
+# The three-point lattice needed at a branch join. `maybe_initialized` means
+# some continuing paths wrote the field and others did not; neither another
+# write nor successful completion is safe from that state.
+enum FieldState:
+    uninitialized
+    initialized
+    maybe_initialized
+
+class InitializationState:
+    pub let fields: list[FieldState]
+
+    pub init(count: i64):
+        self.fields = list[FieldState]()
+        for index in range(0, count): self.fields.append(FieldState.uninitialized)
+
+# A statement can reach the following statement normally, recover from the
+# nearest catch handler, or leave the initializer entirely. Returns and
+# failures need no stored state after their own safety checks.
+struct InitializationFlow:
+    pub let normal: InitializationState?
+    pub let recovered: InitializationState?
+
+## Applies whole-program semantic rules and marks the result as analyzed.
 pub class SemanticAnalyzer:
     let program: HirProgram
+    var function: HirFunction?
+    var self_symbol: SymbolId
+    var field_names: list[str]
 
-    ## Prepare to analyze one HIR program; no source syntax is needed beyond
-    ## this boundary because names and types are already resolved in HIR.
     pub init(program: HirProgram):
         self.program = program
+        self.function = none
+        self.self_symbol = SymbolId(value = no_node)
+        self.field_names = list[str]()
 
     # mark: Analysis ===========================================================================
 
-    ## Validate and annotate one HIR program. For example, this will
-    ## eventually reject a use after move and attach ownership facts needed by
-    ## lowering. The current language slice needs no work beyond `HirGenerator`.
     pub func analyze() -> AnalyzedProgram!:
+        for function in self.program.functions:
+            let receiver = function.receiver
+            if receiver == none or receiver.kind != HirReceiverKind.initializer: continue
+            try self.analyze_initializer(function, receiver.owner)
         return AnalyzedProgram(hir = self.program)
+
+    func analyze_initializer(function: HirFunction, owner: TypeId) -> !:
+        let struct_index = self.struct_index(owner)
+        self.function = function
+        self.self_symbol = function.parameters[0].symbol
+        self.field_names = list[str]()
+        for field in self.program.structs[struct_index].fields: self.field_names.append(field.name)
+
+        let initial = InitializationState(len(self.field_names))
+        let flow = try self.analyze_suite(function.body, initial, false, false)
+        let completion = flow.normal
+        if completion != none: try self.require_complete(completion, function.span)
+        self.function = none
+
+    # Analyze a sequence. Normal exits feed the next statement; recover exits
+    # bypass the remainder and are accumulated for the enclosing catch.
+    func analyze_suite(statements: Operands, initial: InitializationState, may_repeat: bool, recover_allowed: bool) -> InitializationFlow!:
+        var normal: InitializationState? = initial
+        var recovered: InitializationState? = none
+        for position in range(0, i64(statements.count)):
+            if normal == none: break
+            let statement = node_at(self.program, statements, position)
+            let flow = try self.analyze_statement(statement, normal, may_repeat, recover_allowed)
+            recovered = self.join_optional(recovered, flow.recovered)
+            normal = flow.normal
+        return InitializationFlow(normal = normal, recovered = recovered)
+
+    func analyze_statement(statement: NodeId, state: InitializationState, may_repeat: bool, recover_allowed: bool) -> InitializationFlow!:
+        let continuing = InitializationFlow(normal = state, recovered = none)
+        match node_form(self.program, statement):
+            BreakStatement: return InitializationFlow(normal = none, recovered = none)
+            ContinueStatement: return InitializationFlow(normal = none, recovered = none)
+            Binding(symbol, is_mutable, value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return continuing
+            Assignment(symbol, operation, value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return continuing
+            FieldAssignment(symbol, path, operation, value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                if symbol.value != self.self_symbol.value: return continuing
+                if path.count != 1:
+                    try self.fail(statement, "an initializer assigns stored fields directly through `self`")
+                let field = entry_at(self.program, path, 0)
+                if may_repeat:
+                    try self.fail(statement, "field `" + self.field_names[field] + "` cannot be initialized inside a loop")
+                match operation:
+                    Replace: pass
+                    Combine(binary): try self.fail(statement, "initialization uses `=`, not a compound assignment")
+                if state.fields[field] != FieldState.uninitialized:
+                    try self.fail(statement, "field `" + self.field_names[field] + "` may be initialized only once")
+                state.fields[field] = FieldState.initialized
+                return continuing
+            PrintValue(value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return continuing
+            ReturnStatement(value):
+                if value.value != no_node and not try self.analyze_expression(value, state, may_repeat):
+                    return InitializationFlow(normal = none, recovered = none)
+                try self.require_complete(state, node_span(self.program, statement))
+                return InitializationFlow(normal = none, recovered = none)
+            RecoverStatement(value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                if not recover_allowed: try self.fail(statement, "`recover` escaped its catch analysis")
+                return InitializationFlow(normal = none, recovered = state)
+            DeferStatement(action):
+                discard(try self.analyze_expression_or_statement(action, state, may_repeat))
+                return continuing
+            ExpressionStatement(value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return continuing
+            IfStatement(branches, has_fallback, fallback):
+                var joined_normal: InitializationState? = none
+                var joined_recovered: InitializationState? = none
+                var next_condition = self.copy_state(state)
+                var conditions_continue = true
+                for branch in range(0, i64(branches.count) // 3):
+                    let condition = NodeId(value = u32(entry_at(self.program, branches, branch * 3)))
+                    if not try self.analyze_expression(condition, next_condition, may_repeat):
+                        conditions_continue = false
+                        break
+                    let branch_state = self.copy_state(next_condition)
+                    let body = Operands(start = u32(entry_at(self.program, branches, branch * 3 + 1)), count = u32(entry_at(self.program, branches, branch * 3 + 2)))
+                    let flow = try self.analyze_suite(body, branch_state, may_repeat, recover_allowed)
+                    joined_normal = self.join_optional(joined_normal, flow.normal)
+                    joined_recovered = self.join_optional(joined_recovered, flow.recovered)
+                if conditions_continue:
+                    if has_fallback:
+                        let flow = try self.analyze_suite(fallback, self.copy_state(next_condition), may_repeat, recover_allowed)
+                        joined_normal = self.join_optional(joined_normal, flow.normal)
+                        joined_recovered = self.join_optional(joined_recovered, flow.recovered)
+                    else:
+                        joined_normal = self.join_optional(joined_normal, next_condition)
+                return InitializationFlow(normal = joined_normal, recovered = joined_recovered)
+            WhileStatement(condition, body):
+                # The condition is part of the repeatable region too.
+                if not try self.analyze_expression(condition, state, true):
+                    return InitializationFlow(normal = none, recovered = none)
+                let flow = try self.analyze_suite(body, self.copy_state(state), true, recover_allowed)
+                return InitializationFlow(normal = state, recovered = flow.recovered)
+            ForStatement(symbol, iterable, body):
+                if not try self.analyze_expression(iterable, state, may_repeat):
+                    return InitializationFlow(normal = none, recovered = none)
+                let flow = try self.analyze_suite(body, self.copy_state(state), true, recover_allowed)
+                return InitializationFlow(normal = state, recovered = flow.recovered)
+            Match(subject, arms, has_result):
+                if not try self.analyze_expression(subject, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return try self.analyze_statement_match(arms, state, may_repeat, recover_allowed)
+            else: return continuing
+
+    func analyze_statement_match(arms: Operands, state: InitializationState, may_repeat: bool, recover_allowed: bool) -> InitializationFlow!:
+        var normal: InitializationState? = none
+        var recovered: InitializationState? = none
+        for position in range(0, i64(arms.count)):
+            match node_form(self.program, node_at(self.program, arms, position)):
+                MatchArm(patterns, statements, value):
+                    let flow = try self.analyze_suite(statements, self.copy_state(state), may_repeat, recover_allowed)
+                    normal = self.join_optional(normal, flow.normal)
+                    recovered = self.join_optional(recovered, flow.recovered)
+                else: pass
+        return InitializationFlow(normal = normal, recovered = recovered)
+
+    # mark: Expressions ========================================================================
+
+    # Returns whether the expression has a successful continuation. `Raise`
+    # is the only expression guaranteed not to; fallible calls still have a
+    # success path, which is the path definite initialization must prove.
+    func analyze_expression(value: NodeId, state: InitializationState, may_repeat: bool) -> bool!:
+        match node_form(self.program, value):
+            Reference(symbol):
+                if symbol.value == self.self_symbol.value: try self.require_complete(state, node_span(self.program, value))
+            Unary(operation, operand): return try self.analyze_expression(operand, state, may_repeat)
+            Binary(left, operation, right):
+                if not try self.analyze_expression(left, state, may_repeat): return false
+                match operation:
+                    LogicalAnd:
+                        let skipped = self.copy_state(state)
+                        let evaluated = self.copy_state(state)
+                        let evaluated_continues = try self.analyze_expression(right, evaluated, may_repeat)
+                        let joined = self.join_continuations(skipped, true, evaluated, evaluated_continues)
+                        if joined != none: self.replace_state(state, joined)
+                        return joined != none
+                    LogicalOr:
+                        let skipped = self.copy_state(state)
+                        let evaluated = self.copy_state(state)
+                        let evaluated_continues = try self.analyze_expression(right, evaluated, may_repeat)
+                        let joined = self.join_continuations(skipped, true, evaluated, evaluated_continues)
+                        if joined != none: self.replace_state(state, joined)
+                        return joined != none
+                    else: return try self.analyze_expression(right, state, may_repeat)
+            Conditional(selected, condition, alternative):
+                if not try self.analyze_expression(condition, state, may_repeat): return false
+                let selected_state = self.copy_state(state)
+                let selected_continues = try self.analyze_expression(selected, selected_state, may_repeat)
+                let alternative_state = self.copy_state(state)
+                let alternative_continues = try self.analyze_expression(alternative, alternative_state, may_repeat)
+                let joined = self.join_continuations(selected_state, selected_continues, alternative_state, alternative_continues)
+                if joined != none: self.replace_state(state, joined)
+                return joined != none
+            Range(lower, upper, inclusive):
+                if not try self.analyze_expression(lower, state, may_repeat): return false
+                return try self.analyze_expression(upper, state, may_repeat)
+            Call(function, arguments): return try self.analyze_arguments(arguments, state, may_repeat)
+            Initialize(function, arguments): return try self.analyze_arguments(arguments, state, may_repeat)
+            Raise(code, message):
+                if not try self.analyze_expression(code, state, may_repeat): return false
+                discard(try self.analyze_expression(message, state, may_repeat))
+                return false
+            Try(inner): return try self.analyze_expression(inner, state, may_repeat)
+            Catch(caught, failure, body):
+                let before = self.copy_state(state)
+                let success = self.copy_state(state)
+                let success_continues = try self.analyze_expression(caught, success, may_repeat)
+                let handler = try self.analyze_suite(body, before, may_repeat, true)
+                var joined: InitializationState? = none
+                if success_continues: joined = success
+                joined = self.join_optional(joined, handler.recovered)
+                if joined != none: self.replace_state(state, joined)
+                return joined != none
+            Tuple(elements): return try self.analyze_run(elements, state, may_repeat)
+            Element(inner, index): return try self.analyze_expression(inner, state, may_repeat)
+            StructValue(struct_index, fields): return try self.analyze_run(fields, state, may_repeat)
+            FieldAccess(inner, field):
+                match node_form(self.program, inner):
+                    Reference(symbol):
+                        if symbol.value == self.self_symbol.value:
+                            if state.fields[field] != FieldState.initialized:
+                                try self.fail(value, "field `" + self.field_names[field] + "` is read before it is initialized")
+                            return true
+                    else: pass
+                return try self.analyze_expression(inner, state, may_repeat)
+            Some(inner): return try self.analyze_expression(inner, state, may_repeat)
+            ElseFallback(inner, arm):
+                if not try self.analyze_expression(inner, state, may_repeat): return false
+                let present = self.copy_state(state)
+                let absent = self.copy_state(state)
+                let absent_continues = try self.analyze_expression(arm, absent, may_repeat)
+                let joined = self.join_continuations(present, true, absent, absent_continues)
+                if joined != none: self.replace_state(state, joined)
+                return joined != none
+            EnumValue(enum_index, case_index, payload): return try self.analyze_run(payload, state, may_repeat)
+            Match(subject, arms, has_result):
+                if not try self.analyze_expression(subject, state, may_repeat): return false
+                var joined: InitializationState? = none
+                for position in range(0, i64(arms.count)):
+                    match node_form(self.program, node_at(self.program, arms, position)):
+                        MatchArm(patterns, statements, arm_value):
+                            let arm_state = self.copy_state(state)
+                            let flow = try self.analyze_suite(statements, arm_state, may_repeat, false)
+                            let arm_completion = flow.normal
+                            if arm_completion != none and try self.analyze_expression(arm_value, arm_completion, may_repeat):
+                                joined = self.join_optional(joined, arm_completion)
+                        else: pass
+                if joined != none: self.replace_state(state, joined)
+                return joined != none
+            else: pass
+        return true
+
+    func analyze_arguments(arguments: Operands, state: InitializationState, may_repeat: bool) -> bool!:
+        for pair in range(0, i64(arguments.count) // 2):
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            if not try self.analyze_expression(argument, state, may_repeat): return false
+        return true
+
+    func analyze_run(values: Operands, state: InitializationState, may_repeat: bool) -> bool!:
+        for position in range(0, i64(values.count)):
+            if not try self.analyze_expression(node_at(self.program, values, position), state, may_repeat): return false
+        return true
+
+    # A deferred action is stored as a statement node, while every other
+    # recursive child here is an expression node.
+    func analyze_expression_or_statement(value: NodeId, state: InitializationState, may_repeat: bool) -> bool!:
+        match node_form(self.program, value):
+            ExpressionStatement(inner): return try self.analyze_expression(inner, state, may_repeat)
+            PrintValue(inner): return try self.analyze_expression(inner, state, may_repeat)
+            else: return true
+
+    # mark: State ===============================================================================
+
+    func copy_state(state: InitializationState) -> InitializationState:
+        let copied = InitializationState(0)
+        for field in state.fields: copied.fields.append(field)
+        return copied
+
+    func replace_state(destination: InitializationState, source: InitializationState):
+        for index in range(0, len(destination.fields)): destination.fields[index] = source.fields[index]
+
+    func join_optional(left: InitializationState?, right: InitializationState?) -> InitializationState?:
+        if left == none: return right
+        if right == none: return left
+        return self.join_states(left, right)
+
+    func join_continuations(left: InitializationState, left_continues: bool, right: InitializationState, right_continues: bool) -> InitializationState?:
+        if left_continues and right_continues: return self.join_states(left, right)
+        if left_continues: return left
+        if right_continues: return right
+        return none
+
+    func join_states(left: InitializationState, right: InitializationState) -> InitializationState:
+        let joined = InitializationState(0)
+        for index in range(0, len(left.fields)):
+            if left.fields[index] == right.fields[index]: joined.fields.append(left.fields[index])
+            else: joined.fields.append(FieldState.maybe_initialized)
+        return joined
+
+    func require_complete(state: InitializationState, span: SourceSpan) -> !:
+        for index in range(0, len(state.fields)):
+            if state.fields[index] != FieldState.initialized:
+                error(self.diagnostic(span, "initializer may finish before field `" + self.field_names[index] + "` is initialized"))
+
+    func struct_index(owner: TypeId) -> i64:
+        match self.program.types.definitions[owner.value].form:
+            Struct(index): return index
+            else: trap("initializer receiver is not a struct")
+
+    func fail(node: NodeId, message: str) -> !:
+        error(self.diagnostic(node_span(self.program, node), message))
+
+    func diagnostic(span: SourceSpan, message: str) -> str:
+        let active = self.function else trap("initializer diagnostic outside a function")
+        return format_diagnostic(self.program.modules[active.module.value].path, span, message)

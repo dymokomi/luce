@@ -20,7 +20,8 @@
 #       calls between them across modules, module constants, parameter
 #       defaults, tuples, optionals, `str` and `bytes` values with equality,
 #       integer range values and `for` iteration, lexical `defer`,
-#       structs with fields, methods, `mutating` methods and type functions,
+#       structs with memberwise and custom initializers, fields, methods,
+#       `mutating` methods and type functions,
 #       terminal output of a literal or a `str` value, and returning. The slice boundary lives
 #       here, not in canonical MIR — failure, classes, and collections reach
 #       the lowerer as HIR and stop with "does not support ... yet" until this
@@ -42,9 +43,12 @@
 #       takes a hidden leading `pointer` parameter — the caller's slot for the
 #       result — and returns nothing; an aggregate parameter is passed as a
 #       pointer. The callee never writes through that pointer, with one
-#       deliberate exception: a `mutating` method's `self`, whose stores land
+#       deliberate exceptions: a `mutating` method's `self`, whose stores land
 #       in the caller's `var` slot — that is what `mutating` means, and
-#       HirGenerator has already proved the receiver is a mutable place.
+#       HirGenerator has already proved the receiver is a mutable place; and
+#       an initializer's `self`, which is fresh caller-owned storage. A custom
+#       initializer returns source-level unit, while its `Initialize` HIR
+#       expression yields that completed storage (or the ordinary Error).
 #       Layout comes from the `TargetLayout`, so the MIR of a tuple-heavy
 #       program differs between wasm32 and arm64 exactly where offsets differ.
 #
@@ -79,7 +83,7 @@ from compiler.canonical_ir import MirProgram, MirRelocation, MirSignature, MirSl
 from compiler.canonical_ir import MirType, TargetLayout, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.canonical_ir import align_of, enum_payload_offset, find_runtime_symbol, intern_mir_type, make_enum_type
 from compiler.canonical_ir import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers, size_of
-from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm, Value
+from compiler.hir import AssignmentOperation, BinaryOperation, BuiltinType, HirConstant, HirFunction, HirNodeForm, HirReceiverKind, Value
 from compiler.hir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir import entry_at, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 import compiler.hir
@@ -344,6 +348,9 @@ pub class Lowerer:
                 try self.lower_prologue_node(module, function, condition, body)
                 try self.lower_prologue_node(module, function, alternative, body)
             Call(callee, arguments):
+                for pair in range(0, i64(arguments.count) // 2):
+                    try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
+            Initialize(callee, arguments):
                 for pair in range(0, i64(arguments.count) // 2):
                     try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
             Raise(code, message):
@@ -729,6 +736,10 @@ pub class Lowerer:
                 if self.fallible_inner(node_type(self.program, expression)) != none:
                     try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible call")
                 return try self.lower_call(module, function, expression, callee, arguments, body)
+            Initialize(callee, arguments):
+                if self.fallible_inner(node_type(self.program, expression)) != none:
+                    try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible initializer")
+                return try self.lower_initializer(module, function, expression, callee, arguments, body)
             Raise(code, message): return try self.lower_raise(module, function, expression, code, message, body)
             Try(value): return try self.lower_try(module, function, expression, value, body)
             Catch(value, failure, catch_body): return try self.lower_catch(module, function, expression, value, failure, catch_body, body)
@@ -969,6 +980,7 @@ pub class Lowerer:
         let span = node_span(self.program, expression)
         match node_form(self.program, expression):
             Call(callee, arguments): return try self.lower_fallible_call(module, function, expression, callee, arguments, body)
+            Initialize(callee, arguments): return try self.lower_fallible_initializer(module, function, expression, callee, arguments, body)
             Match(subject, arms, has_result): return try self.lower_fallible_match(module, function, expression, subject, arms, body)
             Conditional(value, condition, alternative):
                 let successful = self.fallible_inner(node_type(self.program, expression)) else error(self.unsupported(module, function, span, "a non-fallible expression in fallible lowering"))
@@ -1073,6 +1085,32 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.Call(results = self.operands.run(results), function = FunctionId(value = u32(target)), arguments = self.operands.run(call_arguments)), span = span))
         return FallibleResult(value = value, error_value = reported_error)
 
+    # A fallible initializer writes into fresh caller-owned struct storage and
+    # returns the ordinary caller-owned Error pointer. Its source-level unit
+    # success is replaced by the completed storage address in HIR.
+    func lower_fallible_initializer(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.program, expression)
+        let target = self.function_index_of(callee)
+        if target < 0: try self.fail_unsupported(module, function, span, "an initializer symbol that is not a function")
+        let called = self.program.functions[target]
+        let receiver = called.receiver else error(self.unsupported(module, function, span, "an initializer without a receiver"))
+        if receiver.kind != HirReceiverKind.initializer:
+            try self.fail_unsupported(module, function, span, "an Initialize node naming a non-initializer")
+        let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
+        let value_type = try self.mir_type_of(module, function, span, receiver.owner)
+        let value = self.new_temp(value_type, span, body)
+        placed[0] = value
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let error_temp = self.new_temp(error_type, span, body)
+        let call_arguments = [error_temp]
+        for argument in placed: call_arguments.append(argument)
+        let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(
+            form = InstructionForm.Call(results = self.operands.run([reported_error]), function = FunctionId(value = u32(target)), arguments = self.operands.run(call_arguments)),
+            span = span,
+        ))
+        return FallibleResult(value = value, error_value = reported_error)
+
     # Arguments are lowered in the order they were written, then placed by
     # the parameter index HIR resolved for each (named arguments may be
     # written in any order). The callee is a `FunctionId`, its index in
@@ -1101,6 +1139,27 @@ pub class Lowerer:
         ))
         if len(results) == 0: return RegisterId(value = no_register)
         return results[0]
+
+    # The non-fallible form uses the same fresh receiver slot without an
+    # Error parameter. The initializer returns unit; the expression returns
+    # the slot it completed.
+    func lower_initializer(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let target = self.function_index_of(callee)
+        if target < 0: try self.fail_unsupported(module, function, span, "an initializer symbol that is not a function")
+        let called = self.program.functions[target]
+        let receiver = called.receiver else error(self.unsupported(module, function, span, "an initializer without a receiver"))
+        if receiver.kind != HirReceiverKind.initializer:
+            try self.fail_unsupported(module, function, span, "an Initialize node naming a non-initializer")
+        let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
+        let value_type = try self.mir_type_of(module, function, span, receiver.owner)
+        let value = self.new_temp(value_type, span, body)
+        placed[0] = value
+        body.append(MirInstruction(
+            form = InstructionForm.Call(results = no_registers(), function = FunctionId(value = u32(target)), arguments = self.operands.run(placed)),
+            span = span,
+        ))
+        return value
 
     # `a and b` evaluates `b` only when `a` is true; `a or b` only when `a`
     # is false. Both are an `If` whose unevaluated arm yields the constant

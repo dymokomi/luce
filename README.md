@@ -77,7 +77,8 @@ examples and tests link back here rather than restating it.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, parameter
   defaults, bindings, assignment, scalars, strings, tuples, optionals,
-  structs and enums with methods and `mutating`, exhaustive `match`,
+  structs with memberwise or custom (including fallible) initialization,
+  enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
   `defer`, recoverable `Error` values with `try`/`catch`, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
@@ -88,11 +89,11 @@ examples and tests link back here rather than restating it.
   and has a verifier and its own interpreter covering every instruction.
 - The compiled slice — every scalar type with checked arithmetic, locals,
   every operator, `if`/`while`, functions and calls across modules, module
-  constants, tuples, optionals, integer ranges and `for`, structs, enums and
-  `match`, methods, lexical `defer`, caller-owned failure propagation and
-  recovery, `str`/`bytes` values with equality, and `print` of a literal or a
-  `str` value — is lowered to
-  canonical MIR and
+  constants, tuples, optionals, integer ranges and `for`, structs (including
+  custom initialization), enums and `match`, methods, lexical `defer`,
+  caller-owned failure propagation and recovery, `str`/`bytes` values with
+  equality, and `print` of a literal or a `str` value — is lowered to canonical
+  MIR and
   encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
   Mach-O and x86-64 ELF writers still cover only the original slice (checked
   i32/i64 arithmetic, `print` of a literal, `return`); see
