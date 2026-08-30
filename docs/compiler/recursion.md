@@ -64,13 +64,13 @@ Measured on 0.25/arm64-macOS; method and full table in `plan.md` §8.1.
 | | value | verdict |
 | --- | --- | --- |
 | Stack under the compiler today | 512 MiB, from Stage-0's link-time reservation | fine, and not ours to keep |
-| Stack in what we emit | 64 MiB (`backends/native/arm64_macos.luc`), 8 MiB on Linux, 1 MiB shadow stack on wasm | macOS done, Linux unaddressed |
+| Stack in what we emit | host-toolchain default through QBE; 1 MiB shadow stack on wasm | native policy waits for our own backend/runtime |
 | Cost of one interpreted call | ~32 KiB across six host frames | 8–30× the norm |
 | ↳ and it depends on the build mode | 42.7 KiB release, 52.9 KiB debug (0.26) | see below |
 | `frame_limit` | 2000, declared | right for one host, wrong elsewhere |
 | Front-end nesting cap | 256 on expressions | done; other productions unmeasured |
 | Front-end throughput | linear, ~450 KB/s | was quadratic — see §5 |
-| Stack probe | wasm only | the native backends have none |
+| Stack probe | wasm only | the QBE/host native path has none |
 
 Two of these are already good and worth saying plainly. The wasm backend
 emits a real stack-pointer probe: every frame checks that the new frame base
@@ -184,12 +184,15 @@ done once for `evaluate` and can do again with measurements to guide it.
 
 ### Phase 5 — a stack on every target, and a way to choose it
 
-- **Linux**: the ELF backend emits a single `PT_LOAD` and no `PT_GNU_STACK`,
-  so a program we emit gets the kernel's 8 MiB whatever we intend. Two
-  precedents: Zig's (emit `PT_GNU_STACK.p_memsz`, then `setrlimit` at startup
-  because the kernel ignores the header) or rustc's (run the work on a
-  spawned thread with an explicit size). The second is more portable and does
-  not depend on the hard limit permitting the raise.
+- **QBE baseline**: native executables inherit the host C driver and operating
+  system's stack policy. Stage 1 measures and records that behavior but does
+  not duplicate linker or loader machinery around the oracle.
+- **Luce-owned native backends**, when they begin after the QBE language
+  baseline is complete, must choose an explicit policy. Two precedents are
+  Zig's (`PT_GNU_STACK` plus `setrlimit` at startup because Linux ignores the
+  header size) and rustc's (run the work on a spawned thread with an explicit
+  size). The second is more portable and does not depend on a hard limit
+  permitting the raise.
 - **Windows**, when it arrives: `/STACK` in the PE header; note its guard page
   is consumed on first overflow, so recovery needs an explicit reset.
 - **A `--stack` flag** on `luce build`, defaulting to **16 MiB** for ordinary

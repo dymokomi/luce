@@ -41,14 +41,14 @@ function through the HIR interpreter, or build an artifact:
 The package identity is explicit because it is embedded in stable `ErrorCode`
 values. It must remain the same when the source tree moves.
 
-Native output is also available for Apple silicon macOS and x86-64 Linux:
+Native output uses the pinned QBE toolchain for the current host:
 
 ```sh
-./build/luce build --package org.luce.examples --target arm64-macos build/hello examples/hello.luc
-./build/luce build --package org.luce.examples --target x86_64-linux build/hello examples/hello.luc
+./build/luce build --package org.luce.examples --target native build/hello examples/hello.luc
+./build/hello
 ```
 
-Use the target that matches the machine where the executable will run.
+`bootstrap.sh` installs QBE; the host C driver supplies assembly and linking.
 
 ## Vocabulary
 
@@ -64,7 +64,7 @@ A few terms recur in the source and in this README:
 - **Slice** — the part of the 1.0 language a stage implements today. The parser
   covers most of 1.0; HIR generation, the interpreter, and the compiled path
   each cover a smaller, growing slice.
-- **Artifact** — the bytes `luce build` writes: a WebAssembly module or a
+- **Artifact** — the file `luce build` installs: a WebAssembly module or a
   native executable.
 
 ## What works today
@@ -96,11 +96,11 @@ examples and tests link back here rather than restating it.
   equality, and `print` of a literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
   The complete differential corpus is compiled, linked, and executed through
-  QBE 1.3 as the native oracle. The ARM64
-  Mach-O and x86-64 ELF writers still cover only the original slice (checked
-  i32/i64 arithmetic, `print` of a literal, `return`); see
-  `docs/compiler/plan.md` §3 for why. Native executables start at `main`;
-  WebAssembly exports every public function.
+  QBE 1.3 as both the native oracle and the product native path. QBE IL and
+  assembly travel through memory; only a candidate executable is written in a
+  uniquely owned same-directory scratch area, then atomically renamed over the
+  destination. Native executables start at `main`; WebAssembly exports every
+  public function.
 - The test suite exercises the frontend, semantic model, both interpreters,
   lowering, MIR verification, each artifact encoder, the command line's exit
   statuses and diagnostics, and runs every fixture through the HIR
@@ -155,8 +155,8 @@ Read in this order; each stop hands off to the next.
 - `src/compiler/backends/interpreter.luc` runs typed HIR directly.
 - `src/compiler/mir/` owns lowering, canonical MIR, verification, and
   target-independent optimization.
-- `src/compiler/backends/` contains artifact emitters; the temporary seed
-  native encoders are isolated under `backends/native/`.
+- `src/compiler/backends/` contains the Wasm emitter, QBE emitter and host
+  materializer, backend-owned layout, and the two semantic execution engines.
 
 ## Contributing constraints
 

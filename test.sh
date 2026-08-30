@@ -43,13 +43,6 @@ fi
 # WebAssembly execution under wasmtime, when it is installed.
 ./tests/wasm_test.sh ./stage0/bin/luce-0
 
-# 4. Native smoke test: build the compiler, build hello.luc for this host,
-#    and run it.
-
-if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
-    ./tests/arm64_macos_test.sh ./stage0/bin/luce-0
-fi
-
-if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
-    ./tests/x86_64_linux_test.sh ./stage0/bin/luce-0
-fi
+# 4. Native smoke test: QBE and the host toolchain build and run the same
+#    executable path on every supported bootstrap host.
+./tests/native_test.sh ./stage0/bin/luce-0

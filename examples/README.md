@@ -34,7 +34,7 @@ Declarations without `pub` are intentionally module-private. Build the
 ./build/luce check --package org.luce.examples examples/semantic_core/math.luc examples/semantic_core/main.luc
 ./build/luce run --package org.luce.examples main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc   # prints 42
 ./build/luce build --package org.luce.examples build/answer.wasm examples/compiled_core/main.luc
-./build/luce build --package org.luce.examples --target arm64-macos build/hello examples/hello.luc
+./build/luce build --package org.luce.examples --target native build/hello examples/hello.luc
 ./build/hello                                                                                 # prints Hello, world!
 ./stage0/bin/luce-0 test tests/compiler/examples_test.luc
 ```

@@ -16,10 +16,9 @@ from luce.compiler.backends.interpreter import HirInterpreter
 from luce.compiler.backends.mir_interpreter import MirInterpreter, MirValue
 from luce.compiler.backends.layout import LayoutRules
 from luce.compiler.backends.qbe import QbeBackend
+from luce.compiler.backends.qbe_toolchain import QbeToolchain
 from luce.compiler.backends.wasm import WasmBackend
-from luce.compiler.mir.canonical import FunctionId, MirProgram, find_mir_function
-from luce.compiler.backends.native.arm64_macos import Arm64MacosBackend
-from luce.compiler.backends.native.x86_64_linux import X86_64LinuxBackend
+from luce.compiler.mir.canonical import MirProgram
 from luce.compiler.hir.ir import Value
 from luce.compiler.hir.generator import HirGenerator, SourceModule
 from luce.compiler.mir.lowerer import Lowerer
@@ -29,6 +28,7 @@ from luce.compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
 from luce.compiler.frontend.tokenizer import Tokenizer
 import std.files
 import std.os
+import std.paths
 import std.strings
 
 func interpreter_layout() -> LayoutRules:
@@ -391,31 +391,49 @@ func has_qbe() -> bool:
         return false
     return status == 0
 
-func execute_with_qbe(program: MirProgram, function_name: str) -> i64:
-    let selected = find_mir_function(program, "main." + function_name)
-    if selected < 0: trap("QBE fixture function is missing: " + function_name)
-    var executable_program = program
-    executable_program.entry = FunctionId(value = u32(selected))
+struct QbeResult:
+    let status: i64
+    let output: str
 
-    let stem = "/private/tmp/luce-qbe-corpus"
-    let source = stem + ".ssa"
-    let assembly = stem + ".s"
-    let executable = stem
-    let output = stem + ".out"
-    let text = QbeBackend().emit_il(executable_program) catch reason:
+func quote_shell_argument(value: str) -> str:
+    return "'" + strings.replace(value, "'", "'\"'\"'") + "'"
+
+func execute_with_qbe(program: MirProgram) -> QbeResult:
+    let scratch = files.make_temporary_directory(".", ".luce-qbe-corpus-") catch reason:
         trap(reason)
-    files.write_bytes(source, strings.to_bytes(text)) catch reason:
+    let executable = paths.join(scratch, "program")
+    let output_path = paths.join(scratch, "stdout")
+    QbeToolchain().materialize(program, executable) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
         trap(reason)
-    let compile = os.Process("qbe -o " + assembly + " " + source + " && cc -o " + executable + " " + assembly) catch reason:
-        trap(reason)
-    let compile_status = compile.wait() catch reason:
-        trap(reason)
-    if compile_status != 0: trap("QBE fixture did not compile")
-    let process = os.Process("{ " + executable + " >" + output + " 2>/dev/null; } 2>/dev/null") catch reason:
+    let process = os.Process("{ " + quote_shell_argument(executable) + " > " + quote_shell_argument(output_path) + " 2>/dev/null; } 2>/dev/null") catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
         trap(reason)
     let status = process.wait() catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
         trap(reason)
-    return status
+    let output = files.read(output_path) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    files.remove_all(scratch) catch reason:
+        trap(reason)
+    return QbeResult(status = status, output = output)
+
+# Most semantic fixtures expose `answer` so the HIR and MIR interpreters can
+# call them directly. The product native path needs the language's real process
+# entry shape; add that wrapper in source so it passes through every stage
+# instead of mutating verified MIR into a C-incompatible `main`.
+func with_qbe_entry(fixture: Fixture, check_value: bool) -> str:
+    if fixture.function_name == "main": return fixture.source
+    if not check_value:
+        return fixture.source + "\npub func main(arguments: slice[str]) -> i32:\n    " + fixture.function_name + "()\n    return 0i32\n"
+    let status = fixture.expected_value % 256
+    let wrong_status = (status + 1) % 256
+    return fixture.source + "\npub func main(arguments: slice[str]) -> i32:\n    let result = " + fixture.function_name + "()\n    if result != " + str(fixture.expected_value) + ": return " + str(wrong_status) + "i32\n    return " + str(status) + "i32\n"
 
 # mark: Agreement ==============================================================================
 
@@ -455,8 +473,8 @@ pub func test_hir_and_mir_interpreters_agree_across_modules():
         trap(reason)
     assert(mir_integer(results) == 47)
 
-# Every backend encodes every fixture it can express without error from the
-# same target-neutral MIR. The temporary seed native targets need a `main`.
+# Every compiled backend encodes every fixture without error from the same
+# target-neutral MIR.
 pub func test_every_backend_encodes_every_fixture_it_can_express():
     for fixture in fixtures():
         let program = analyzed(fixture.source)
@@ -467,13 +485,6 @@ pub func test_every_backend_encodes_every_fixture_it_can_express():
         let qbe = QbeBackend().emit_il(mir) catch reason:
             trap(reason + "\n" + fixture.source)
         assert(len(qbe) > 0)
-        if fixture.function_name == "main":
-            let arm64 = Arm64MacosBackend().emit(mir) catch reason:
-                trap(reason)
-            assert(len(arm64) > 0)
-            let x86 = X86_64LinuxBackend().emit(mir) catch reason:
-                trap(reason)
-            assert(len(x86) > 0)
 
 # QBE is the native oracle, not merely a syntax producer. When the pinned QBE
 # toolchain is available, compile and execute the complete non-trapping corpus.
@@ -482,22 +493,20 @@ pub func test_every_backend_encodes_every_fixture_it_can_express():
 pub func test_qbe_executes_every_non_trapping_fixture_when_available():
     if not has_qbe(): return
     for fixture in fixtures():
-        let program = lowered(analyzed(fixture.source))
-        let status = execute_with_qbe(program, fixture.function_name)
+        let program = lowered(analyzed(with_qbe_entry(fixture, true)))
+        let result = execute_with_qbe(program)
         let expected_status = fixture.expected_value % 256
-        if status != expected_status:
-            trap("QBE returned " + str(status) + ", expected " + str(expected_status) + ":\n" + fixture.source)
-        let output = files.read("/private/tmp/luce-qbe-corpus.out") catch reason:
-            trap(reason)
-        if output != fixture.expected_output:
-            trap("QBE printed `" + output + "`, expected `" + fixture.expected_output + "`:\n" + fixture.source)
+        if result.status != expected_status:
+            trap("QBE returned " + str(result.status) + ", expected " + str(expected_status) + ":\n" + fixture.source)
+        if result.output != fixture.expected_output:
+            trap("QBE printed `" + result.output + "`, expected `" + fixture.expected_output + "`:\n" + fixture.source)
 
 pub func test_qbe_traps_on_every_trapping_fixture_when_available():
     if not has_qbe(): return
     for fixture in trapping_fixtures():
-        let program = lowered(analyzed(fixture.source))
-        let status = execute_with_qbe(program, fixture.function_name)
-        if status == 0: trap("QBE did not trap:\n" + fixture.source)
+        let program = lowered(analyzed(with_qbe_entry(fixture, false)))
+        let result = execute_with_qbe(program)
+        if result.status == 0: trap("QBE did not trap:\n" + fixture.source)
 
 # Lowering is target-independent; the resulting program can be passed to any
 # backend without being rebuilt for that backend.
@@ -506,10 +515,7 @@ pub func test_one_mir_program_feeds_every_backend():
     let mir = lowered(program)
     let wasm = WasmBackend().emit(mir) catch reason:
         trap(reason)
-    let arm64 = Arm64MacosBackend().emit(mir) catch reason:
-        trap(reason)
-    let x86 = X86_64LinuxBackend().emit(mir) catch reason:
+    let qbe = QbeBackend().emit_il(mir) catch reason:
         trap(reason)
     assert(len(wasm) > 8)
-    assert(len(arm64) > 0)
-    assert(len(x86) > 0)
+    assert(len(qbe) > 0)

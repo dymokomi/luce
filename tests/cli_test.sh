@@ -57,6 +57,25 @@ expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luc
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests other.main "$test_dir/main.luc"
 
 expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --target arm64-macos "$test_dir/out" examples/compiled_core/main.luc
+expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --target native "$test_dir/out" examples/compiled_core/main.luc
+
+expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --target native "$test_dir/native" examples/hello.luc
+native_output=$("$test_dir/native")
+if [ "$native_output" != "Hello, world!" ]; then
+    echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
+    exit 1
+fi
+
+# A host-tool failure must preserve an existing destination and report the
+# tool that failed. An empty PATH makes qbe unavailable without relying on the
+# host's installed tools.
+mkdir "$test_dir/empty-path"
+printf 'previous artifact' > "$test_dir/preserved"
+expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --target native "$test_dir/preserved" examples/hello.luc
+preserved=$(cat "$test_dir/preserved")
+if [ "$preserved" != "previous artifact" ]; then
+    echo "cli: failed native build replaced the previous artifact" >&2
+    exit 1
+fi
 
 echo "cli: ok"

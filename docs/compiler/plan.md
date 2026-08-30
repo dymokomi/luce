@@ -23,8 +23,15 @@ is preserved in stash `pre-stage1-qbe-recovery`. Neither belongs in stage 1.
 
 The clean continuation is branch `stage1-qbe`, based on `origin/main`. Its
 first commit, `eb6dbfd`, made the permanent stage boundaries visible as
-`frontend/`, `hir/`, `mir/`, and `backends/`; the two old seed encoders are
-quarantined in `backends/native/` until QBE replaces them.
+`frontend/`, `hir/`, `mir/`, and `backends/`. The two old seed encoders were
+removed once the QBE product path replaced them; their history remains in
+`origin/main` without occupying the stage-1 architecture.
+
+`stage1-qbe` is the sole development line through complete planned 1.0
+coverage. Do not merge partial slices back into the current `main`. Once every
+planned source feature passes the frontend/HIR/MIR/QBE/Wasm gates, audit the
+finished branch as a whole, make that history the new local `main`, and pause
+before beginning Luce-owned native backends.
 
 Every unpublished change has this disposition:
 
@@ -93,9 +100,10 @@ and linker produce the executable. QBE owns SSA destruction, instruction
 selection, register allocation, ABI lowering, and assembly emission. Luce
 does not duplicate those passes in stage 1.
 
-- HIR and canonical MIR remain shared. Target divergence starts at the
-  `ArtifactBackend` boundary: Wasm, QBE, and eventually Luce-native backends
-  consume the same verified MIR contract.
+- HIR and canonical MIR remain shared. Target divergence starts at the backend
+  boundary: Wasm, QBE, and eventually Luce-native backends consume the same
+  verified MIR contract. Their output shapes intentionally do not share a fake
+  byte-only interface.
 - The QBE backend is one compact MIR-to-QBE translation layer. Host process
   invocation and output paths are a separate materialization concern;
   target-specific ABI and layout facts stay inside the backend.
@@ -139,11 +147,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   corpus, and require the checksum-pinned QBE 1.3 tool in the full test gate.
   No target IR or platform layout was added before the backend boundary
   (`facc3c3`).
-- [ ] **QBE product materialization**: expose native QBE builds through the
-  command line, with explicit host-tool diagnostics and collision-free scratch
-  paths. Stage-0 0.28 now provides the required atomic
-  `files.make_temporary_directory`; then add QBE to each generated-program gate
-  as those gates land.
+- [x] **QBE product materialization** (2026-08-30): `--target native` streams
+  canonical-MIR-derived IL into QBE and QBE assembly into the host C driver.
+  Only the linked candidate touches disk, inside an atomically unique,
+  owner-only directory beside the output; same-filesystem rename installs it
+  atomically. QBE and linker stderr become explicit diagnostics, failed builds
+  preserve the prior artifact, and the product path owns no `.ssa` or `.s`
+  files. The complete differential corpus and native smoke gate use this path.
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
@@ -277,9 +287,13 @@ Three patterns hold across all of them. A declared count limit exists so the err
 Where we are short, in the order it will bite. The design record that turns this list into work is [`recursion.md`](recursion.md):
 
 - ~~The front end has no nesting guard.~~ **Closed 2026-08-29.** Expression nesting is capped at 256; 26,250 nested parentheses used to take SIGBUS. Statement and type nesting are still unguarded and still unmeasured.
-- **`frame_limit` is declared, not derived.** It is right for a 512 MiB host and wrong everywhere else. Once self-hosted on the 64 MiB we now emit, the fat-callee ceiling is about 1,600 — under the current limit. The fix is to compute it at startup from the real stack bounds, as CPython does.
+- **`frame_limit` is declared, not derived.** It is right for Stage-0's 512 MiB
+  host and unproven for executables linked by the QBE host toolchain. The fix
+  is to compute it at startup from real stack bounds, as CPython does.
 - **32 KiB per interpreted call is eight to thirty times the norm** (a lean tree-walker spends 1–4 KiB). It is Stage-0's per-arm slot inflation in our wide `match` walkers. Thinner frames are a linear multiplier on depth that costs no address space, which is why this is the fix rather than a bigger constant.
-- **Only the macOS backend can reserve a stack.** `backends/native/arm64_macos.luc` writes 64 MiB into `LC_MAIN.stacksize`; the ELF backend emits one `PT_LOAD` and no `PT_GNU_STACK`, so Linux hands out its 8 MiB regardless. The two precedents are Zig's (`PT_GNU_STACK` plus `setrlimit` at startup) and rustc's (run the work on a spawned thread with an explicit size).
+- **The QBE baseline inherits the host stack policy.** Stage 1 deliberately
+  does not rebuild linker/loader policy around the oracle. An explicit stack
+  contract belongs to the later runtime and Luce-owned backend project.
 
 ## 9. Conventions worth keeping
 

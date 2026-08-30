@@ -348,7 +348,7 @@ signatures carry only C-representable types. Byte layout is not a verifier
 input because it does not exist in MIR. Backends assume the verified meaning
 and choose its target representation.
 
-### Native backends, and QBE
+### QBE native backend
 
 Stage 1 uses [QBE](https://c9x.me/compile/) 1.3 as its native oracle. The
 backend translates canonical MIR directly into QBE IL:
@@ -369,9 +369,14 @@ backend translates canonical MIR directly into QBE IL:
 The QBE backend owns target layout, lowers
 structured control flow to QBE's graph, and relies on QBE for ABI lowering,
 instruction selection, and register allocation. The first implementation
-uses the real QBE toolchain as an oracle. A later Luce-native backend can be
-differential-tested against it. Both paths consume the same canonical MIR;
-neither adds a target-specific lowering stage before the backend boundary.
+uses the real QBE toolchain as both oracle and product native path. IL is fed
+to QBE over stdin and its assembly is fed to the host C driver over stdin. The
+linked candidate is the only intermediate file; it lives in an atomically
+owned directory beside the requested output and replaces that output by an
+atomic same-filesystem rename. A later Luce-native backend can be
+differential-tested against this baseline. Both paths consume the same
+canonical MIR; neither adds target-specific lowering before the backend
+boundary.
 
 Two consequences for the design record:
 

@@ -1,0 +1,112 @@
+#==============================================================================================
+#
+#   qbe_toolchain - Turn QBE IL into an atomically installed host executable
+#
+#   DESCRIPTION:
+#       `qbe.luc` is the pure canonical-MIR translator. This file owns the
+#       deliberately impure half of the QBE backend: child processes, the host
+#       assembler/linker, scratch storage, and installation of the finished
+#       artifact.
+#
+#       No `.ssa` or `.s` file is created. QBE reads IL from stdin and its
+#       assembly is collected in memory; the host C driver then reads that
+#       assembly from stdin. The only candidate file lives in a uniquely owned
+#       directory beside the requested output. Renaming it into place is
+#       therefore atomic on the same filesystem: a failed build cannot truncate
+#       or partly replace the previous artifact, and concurrent builds cannot
+#       share scratch state.
+#
+#       Tool stderr is captured inside the owned directory and included in a
+#       stage-prefixed diagnostic. Cleanup is attempted on every failure path.
+#
+#==============================================================================================
+
+from compiler.backends.qbe import QbeBackend
+from compiler.backends.executable import find_executable_entry
+from compiler.mir.canonical import MirProgram
+import std.files
+import std.io
+import std.os
+import std.paths
+import std.strings
+
+## The host half of the QBE backend. Command names are constructor inputs so
+## tests can prove missing-tool diagnostics without changing process-global
+## state; product builds use `qbe` and `cc` from PATH.
+pub class QbeToolchain:
+    let qbe_command: str
+    let c_compiler_command: str
+
+    pub init(qbe_command: str = "qbe", c_compiler_command: str = "cc"):
+        self.qbe_command = qbe_command
+        self.c_compiler_command = c_compiler_command
+
+    ## Translate verified canonical MIR, assemble and link it for the host, and
+    ## atomically replace `output` only after the complete executable exists.
+    pub func materialize(program: MirProgram, output: str) -> !:
+        var executable_program = program
+        executable_program.entry = try find_executable_entry(program)
+        let il = try QbeBackend().emit_il(executable_program)
+        let parent = paths.dir(output)
+        let scratch = try files.make_temporary_directory(parent, ".luce-qbe-")
+        let qbe_error = paths.join(scratch, "qbe.stderr")
+        let linker_error = paths.join(scratch, "linker.stderr")
+        let candidate = paths.join(scratch, "artifact")
+
+        let assembly = self.assemble(il, qbe_error) catch reason:
+            error(failure_after_cleanup(scratch, reason))
+        self.link(assembly, candidate, linker_error) catch reason:
+            error(failure_after_cleanup(scratch, reason))
+        files.rename(candidate, output) catch reason:
+            error(failure_after_cleanup(scratch, "qbe toolchain: cannot install `" + output + "`: " + reason))
+        files.remove_all(scratch) catch reason:
+            error("qbe toolchain: built `" + output + "` but cannot remove scratch `" + scratch + "`: " + reason)
+
+    func assemble(il: str, error_path: str) -> str!:
+        let command = quote_shell_argument(self.qbe_command) + " - 2> " + quote_shell_argument(error_path)
+        let process = os.Process(command) catch reason:
+            error("qbe toolchain: cannot start `" + self.qbe_command + "`: " + reason)
+        process.feed(il) catch reason:
+            error("qbe toolchain: cannot write QBE input: " + reason)
+        process.finish_input() catch reason:
+            error("qbe toolchain: cannot finish QBE input: " + reason)
+        let encoded = io.drain(process) catch reason:
+            error("qbe toolchain: cannot read QBE output: " + reason)
+        let status = process.wait() catch reason:
+            error("qbe toolchain: cannot wait for QBE: " + reason)
+        if status != 0:
+            error(tool_failure("qbe", status, error_path))
+        return strings.from_bytes(encoded) else error("qbe toolchain: QBE emitted assembly that is not UTF-8")
+
+    func link(assembly: str, candidate: str, error_path: str) -> !:
+        let command = quote_shell_argument(self.c_compiler_command) + " -x assembler -o " + quote_shell_argument(candidate) + " - 2> " + quote_shell_argument(error_path)
+        let process = os.Process(command) catch reason:
+            error("qbe toolchain: cannot start `" + self.c_compiler_command + "`: " + reason)
+        process.feed(assembly) catch reason:
+            error("qbe toolchain: cannot write assembly to the host compiler: " + reason)
+        process.finish_input() catch reason:
+            error("qbe toolchain: cannot finish host-compiler input: " + reason)
+        discard(io.drain(process)) catch reason:
+            error("qbe toolchain: cannot read host-compiler output: " + reason)
+        let status = process.wait() catch reason:
+            error("qbe toolchain: cannot wait for the host compiler: " + reason)
+        if status != 0:
+            error(tool_failure("host compiler", status, error_path))
+
+# The shell is the Stage-0 process boundary. Keep its quoting here, beside the
+# commands that need it, and never interpolate an unquoted path or tool name.
+func quote_shell_argument(value: str) -> str:
+    return "'" + strings.replace(value, "'", "'\"'\"'") + "'"
+
+func tool_failure(tool: str, status: i64, error_path: str) -> str:
+    let detail = files.read(error_path) catch reason:
+        return "qbe toolchain: " + tool + " exited with status " + str(status) + " (cannot read stderr: " + reason + ")"
+    let trimmed = strings.trim(detail)
+    if len(trimmed) == 0:
+        return "qbe toolchain: " + tool + " exited with status " + str(status)
+    return "qbe toolchain: " + tool + " exited with status " + str(status) + ": " + trimmed
+
+func failure_after_cleanup(scratch: str, reason: str) -> str:
+    files.remove_all(scratch) catch cleanup_reason:
+        return reason + "; cannot remove scratch `" + scratch + "`: " + cleanup_reason
+    return reason

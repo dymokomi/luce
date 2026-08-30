@@ -19,9 +19,8 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
-| QBE backend (`backends/qbe.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, and a private caller-owned fallible-result ABI. The complete differential corpus is compiled, linked, and executed through real QBE. Product/CLI materialization is the next slice. |
-| Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
-| Tests | 405 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and real QBE and checks values, output, and traps. |
+| QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
+| Tests | 396 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -46,9 +45,17 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   it. All current non-trapping fixtures compile, link, and agree on result and
   output; every trapping fixture first compiles successfully and then traps
   (`facc3c3`).
+- [x] **QBE is the product native path** (2026-08-30). `luce build --target
+  native` feeds IL and assembly through child-process stdin, captures tool
+  diagnostics, links inside Stage-0 0.28's atomically owned temporary
+  directory beside the destination, and installs by same-filesystem rename.
+  Missing-QBE and missing-linker regressions prove cleanup and preservation of
+  an existing artifact. The partial handwritten Mach-O/ELF encoders and their
+  duplicated platform smoke scripts were removed after QBE replaced them.
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
-- [x] Native rung 0 (arm64 Mach-O, x86-64 ELF) for the original slice only.
+- [x] Native rung 0 proved direct image writing for the original slice; removed
+  after the QBE product path superseded it, so stage 1 has one native path.
 - [x] Stage-0 0.22 → 0.23: interface-error trap and temporary-receiver use-after-free reported with reproductions (`build/stage0-0.22-repro.tar.gz`), fixed upstream, workarounds removed; call depth raised, deep-recursion fixtures restored.
 - [x] Decision record: `docs/vision.md`, `docs/language/1.0-gap-audit.md`, lineage evidence (§4 below), proving programs and gates (`plan.md` §5–6), cautionary tales (`plan.md` §7).
 - [x] **Milestone 4 — composites** (`b6f24f4`). Tuples as anonymous structs in slots (`FieldAddress`, `Memcpy`); optionals as `u8`-tagged two-case enums with the payload after the tag; `str`/`bytes` as `{pointer, i64 length}` with structural equality (inline byte loop); `print` of a `str` value. Established the **aggregate protocol**: a register of aggregate type holds an address, copies are explicit `Memcpy`, aggregate results go through a hidden leading pointer parameter, aggregate parameters are passed by pointer (`mir/lowerer.luc` header, `mir.md`).
