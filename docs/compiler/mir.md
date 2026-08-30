@@ -357,6 +357,7 @@ backend translates canonical MIR directly into QBE IL:
 |---|---|---|
 | write-once registers | temporaries; QBE builds SSA itself | trivial |
 | `Alloca` / `Load` / `Store` slots | `alloc8` / `loadl` / `storel`; QBE promotes non-escaping slots | trivial — the promotion pass becomes QBE's |
+| external-global load/store | typed load/store through `extern $symbol` | QBE's dynamic constant owns GOT/PIC access |
 | `Block` / `Loop` / `If` / `Br` | labels, `jmp`, `jnz` | a dozen lines |
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
 | structural `Struct` / `Enum` | memory plus backend-computed offsets and `blit` | direct |
@@ -415,15 +416,17 @@ Two consequences for the design record:
 MirProgram
     types       list[MirType]       every target-neutral type used
     externs     list[MirExtern]     imported symbols: C functions and the runtime
+    external_globals list[MirExternalGlobal] C-owned observable scalar state
     globals     list[MirGlobal]     module-level mutable state
     data        list[MirData]       address-free constant bytes, such as string payloads
     functions   list[MirFunction]
     entry       FunctionId?         process entry when the artifact is an executable
 ```
 
-Identities are indices: `TypeId`, `FunctionId`, `ExternId`, `GlobalId`,
-`DataId`. A call names a function *or* an extern; the artifact decides how
-each is bound (wasm import versus linker symbol).
+Identities are indices: `TypeId`, `FunctionId`, `ExternId`,
+`ExternalGlobalId`, `GlobalId`, `DataId`. A call names a function *or* an
+extern; the artifact decides how each is bound (wasm import versus linker
+symbol).
 
 ### Types
 
@@ -473,6 +476,7 @@ MirFunction
     span          SourceSpan
 
 MirExtern     name, convention (c | runtime), params, results, fallible
+MirExternalGlobal name, value type
 MirGlobal     type, initial: DataId?, is_mutable
 MirData       bytes, minimum alignment
 ```
@@ -519,6 +523,20 @@ The HIR host returns these raw output values explicitly. The MIR host instead
 writes through a narrow `MirExternMemory` view, which tests the actual pointer
 contract without exposing the interpreter's storage or a target layout.
 
+An `extern var` is not a compiler-owned `MirGlobal`: it names mutable storage
+owned by C or the embedding host. HIR uses explicit load and store nodes, and
+canonical MIR retains a `MirExternalGlobal` identity plus an explicit
+instruction for every access, so reads are observable and optimization can
+never mistake the object for constant local data. The source type is checked
+before nominal handles erase to scalar MIR types. Equal declarations share
+one linker identity; conflicting types and function/object symbol collisions
+fail in the lowerer. The HIR and MIR interpreters bind separate variable-host
+interfaces, QBE emits direct object loads/stores, and Wasm imports a mutable
+global from `env`. No namespace, address, pointer width, layout, or ABI fact
+enters HIR or MIR. Unlike a pointer handle crossing a C function boundary, a
+bare zero handle stored in an external object is ordinary state and does not
+trap or acquire optional semantics.
+
 ### Instructions
 
 Every instruction carries a `SourceSpan`. `r` is a register operand; `->
@@ -563,6 +581,8 @@ ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
+LoadExternalGlobal(ExternalGlobalId)      -> r: type
+StoreExternalGlobal(ExternalGlobalId, value)
 FunctionAddress(FunctionId)               -> r: Ptr     for closures, witness tables, C callbacks
 ```
 

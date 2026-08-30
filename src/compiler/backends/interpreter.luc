@@ -17,7 +17,7 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, HirNodeForm, NodeId
-from compiler.hir.ir import HirCFunction, HirCSlot, HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type
 from compiler.hir.ir import TypeTable, integer_bit_width, integer_maximum, integer_minimum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
@@ -75,6 +75,13 @@ pub struct HirExternResult:
 pub interface HirExternHost:
     func call(function: HirFunction, arguments: list[Value]) -> HirExternResult!
 
+## Explicit mutable storage for source `extern var` declarations. Keeping it
+## separate from callable bindings lets an oracle host provide only the kind
+## of foreign state a test uses.
+pub interface HirExternVariableHost:
+    func load(variable: HirExternVariable) -> Value!
+    func store(variable: HirExternVariable, value: Value) -> !
+
 ## The reusable interpreter backend. Each execution gets private program state.
 pub class HirInterpreter: HirExecutionBackend:
     ## Create a stateless HIR interpreter; each `run` owns its call frames.
@@ -84,18 +91,26 @@ pub class HirInterpreter: HirExecutionBackend:
 
     ## Run one selected function from an analyzed HIR program.
     pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
-        return try HirInterpreterRun(program.hir, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, none, none).run(module_name, function_name)
 
     ## Run with explicit behavior for any host-supplied C functions reached.
     pub func run_with_host(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternHost) -> Value!:
-        return try HirInterpreterRun(program.hir, host).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, host, none).run(module_name, function_name)
+
+    ## Run with C-owned global storage but no callable C imports.
+    pub func run_with_globals(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternVariableHost) -> Value!:
+        return try HirInterpreterRun(program.hir, none, host).run(module_name, function_name)
+
+    ## Run a program that uses both callable imports and C-owned globals.
+    pub func run_with_hosts(program: AnalyzedProgram, module_name: str, function_name: str, functions: HirExternHost?, variables: HirExternVariableHost?) -> Value!:
+        return try HirInterpreterRun(program.hir, functions, variables).run(module_name, function_name)
 
     ## Invoke one exact C export as an external caller would: arguments arrive
     ## in C boundary form and the result leaves in that form. This keeps export
     ## adaptation inside the semantic oracle instead of teaching tests or
     ## hosts how tagged Luce optionals happen to be represented.
     pub func call_c_export(program: AnalyzedProgram, function_name: str, arguments: list[Value]) -> Value!:
-        return try HirInterpreterRun(program.hir, none).call_c_export(function_name, arguments)
+        return try HirInterpreterRun(program.hir, none, none).call_c_export(function_name, arguments)
 
 # Executes one checked program directly by symbol identity.
 # Frames the interpreter allows before reporting exhaustion. Unbounded
@@ -125,12 +140,14 @@ let frame_limit: i64 = 2000
 class HirInterpreterRun:
     let program: HirProgram
     let external_host: HirExternHost?
+    let external_variable_host: HirExternVariableHost?
     var depth: i64
 
     # Retain the immutable semantic program used for all calls in this run.
-    pub init(program: HirProgram, external_host: HirExternHost?):
+    pub init(program: HirProgram, external_host: HirExternHost?, external_variable_host: HirExternVariableHost?):
         self.program = program
         self.external_host = external_host
+        self.external_variable_host = external_variable_host
         self.depth = 0
 
     ## Run one public entry function to its returned value. It takes no
@@ -358,6 +375,22 @@ class HirInterpreterRun:
                 else: return false
         return false
 
+    # External globals are not call slots: a zero pointer-shaped handle is a
+    # valid stored token and is therefore checked only for nominal value shape.
+    func require_external_variable_value(variable: HirExternVariable, value: Value) -> !:
+        let extern_index = self.extern_type_index(variable.value_type)
+        if extern_index >= 0:
+            match value:
+                Foreign(token):
+                    match self.program.extern_types[extern_index].representation:
+                        Pointer: return
+                        Integer(representation):
+                            if token >= integer_minimum(self.program.types, representation) and token <= integer_maximum(self.program.types, representation): return
+                else: pass
+            error("interpreter: extern variable `" + variable.name + "` has a value incompatible with `" + describe_type(self.program.types, variable.value_type) + "`")
+        if self.scalar_value_matches(value, variable.value_type): return
+        error("interpreter: extern variable `" + variable.name + "` has a value incompatible with `" + describe_type(self.program.types, variable.value_type) + "`")
+
     func extern_type_index(value_type: TypeId) -> i64:
         match self.program.types.definitions[value_type.value].form:
             Extern(index): return index
@@ -442,6 +475,24 @@ class HirInterpreterRun:
                     Replace: assigned = right
                     Combine(binary): assigned = try evaluate_binary(bindings[index].value, binary, right, self.program.types)
                 bindings[index] = Binding(symbol = symbol, value = assigned)
+                return Execution.Next
+            ExternStore(variable_index, operation, value):
+                let variable = self.program.extern_variables[variable_index]
+                let host = self.external_variable_host else error("interpreter: extern variable `" + variable.name + "` has no host binding")
+                let evaluated = try self.evaluate(value, bindings)
+                var right = Value.Unit
+                match evaluated:
+                    Evaluated(item): right = item
+                    Transferred(execution): return execution
+                var assigned = right
+                match operation:
+                    Replace: pass
+                    Combine(binary):
+                        let current = try host.load(variable)
+                        try self.require_external_variable_value(variable, current)
+                        assigned = try evaluate_binary(current, binary, right, self.program.types)
+                try self.require_external_variable_value(variable, assigned)
+                try host.store(variable, assigned)
                 return Execution.Next
             FieldAssignment(symbol, path_run, operation, value):
                 let index = find_binding(bindings, symbol)
@@ -591,6 +642,12 @@ class HirInterpreterRun:
                         # Initializers are literal trees; re-evaluating is lookup.
                         return try self.evaluate(constant.value, list[Binding]())
                 trap("typed reference points outside its call frame")
+            ExternLoad(variable_index):
+                let variable = self.program.extern_variables[variable_index]
+                let host = self.external_variable_host else error("interpreter: extern variable `" + variable.name + "` has no host binding")
+                let value = try host.load(variable)
+                try self.require_external_variable_value(variable, value)
+                return Evaluation.Evaluated(value = value)
             Unary(operation, operand):
                 match try self.evaluate(operand, bindings):
                     Evaluated(item): return Evaluation.Evaluated(value = try evaluate_unary(operation, item, self.program.types))

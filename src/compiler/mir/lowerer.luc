@@ -77,8 +77,8 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, FunctionId
-from compiler.mir.canonical import InstructionForm, MirConstant, MirData, MirExtern, MirFunction, MirGlobal, MirInstruction
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, ExternalGlobalId, FunctionId
+from compiler.mir.canonical import InstructionForm, MirConstant, MirData, MirExtern, MirExternalGlobal, MirFunction, MirGlobal, MirInstruction
 from compiler.mir.canonical import MirProgram, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, intern_mir_type, make_enum_type
@@ -153,12 +153,20 @@ struct CExternContract:
     let declared_result: ir.TypeId
     let is_blocking: bool
 
+struct ExternalGlobalContract:
+    let global: ExternalGlobalId
+    let name: str
+    let value_type: ir.TypeId
+
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     let program: HirProgram
     # Program-wide tables the lowered functions refer to by identity.
     let types: MirTypeTable
     let externs: list[MirExtern]
+    let external_globals: list[MirExternalGlobal]
+    let lowered_external_globals: list[ExternalGlobalId]
+    let external_global_contracts: list[ExternalGlobalContract]
     let data: list[MirData]
     let lowered_functions: list[LoweredFunction]
     let c_extern_contracts: list[CExternContract]
@@ -187,6 +195,9 @@ pub class Lowerer:
         self.program = program.hir
         self.types = create_builtin_mir_types()
         self.externs = list[MirExtern]()
+        self.external_globals = list[MirExternalGlobal]()
+        self.lowered_external_globals = list[ExternalGlobalId]()
+        self.external_global_contracts = list[ExternalGlobalContract]()
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
         self.c_extern_contracts = list[CExternContract]()
@@ -224,6 +235,10 @@ pub class Lowerer:
                 Defined(body):
                     self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
                     next_definition += 1
+        # C objects share the linker namespace with C functions. Equal
+        # declarations in several raw modules share one canonical identity.
+        for variable in self.program.extern_variables:
+            self.lowered_external_globals.append(try self.declare_external_global(variable))
         let functions = list[MirFunction]()
         for function in self.program.functions:
             match function.implementation:
@@ -239,6 +254,7 @@ pub class Lowerer:
         return MirProgram(
             types = self.types,
             externs = self.externs,
+            external_globals = self.external_globals,
             globals = list[MirGlobal](),
             data = self.data,
             functions = functions,
@@ -306,6 +322,22 @@ pub class Lowerer:
                         Output(output_type):
                             if not types_match(output_type, value_type): return false
         return true
+
+    # One external object identity per linker symbol. HIR type identity is
+    # compared before nominal handles are erased to their MIR token shape.
+    func declare_external_global(variable: ir.HirExternVariable) -> ExternalGlobalId!:
+        for external in self.externs:
+            if external.name == variable.name:
+                error("lowerer: C symbol `" + variable.name + "` is declared as both a function and a variable")
+        for contract in self.external_global_contracts:
+            if contract.name != variable.name: continue
+            if not types_match(contract.value_type, variable.value_type):
+                error("lowerer: conflicting declarations of C global `" + variable.name + "`")
+            return contract.global
+        let global = ExternalGlobalId(value = u32(len(self.external_globals)))
+        self.external_globals.append(MirExternalGlobal(name = variable.name, value_type = self.external_global_type(variable.value_type)))
+        self.external_global_contracts.append(ExternalGlobalContract(global = global, name = variable.name, value_type = variable.value_type))
+        return global
 
     # Lower one function body. The canonical name is `module.function` so
     # artifacts stay unambiguous across modules. `main` keeps the entry
@@ -504,6 +536,7 @@ pub class Lowerer:
                         else: pass
             Binding(symbol, is_mutable, value): try self.lower_prologue_node(module, function, value, body)
             Assignment(symbol, operation, value): try self.lower_prologue_node(module, function, value, body)
+            ExternStore(variable, operation, value): try self.lower_prologue_node(module, function, value, body)
             FieldAssignment(symbol, path, operation, value): try self.lower_prologue_node(module, function, value, body)
             PrintValue(value): try self.lower_prologue_node(module, function, value, body)
             ReturnStatement(value):
@@ -622,6 +655,18 @@ pub class Lowerer:
                 let address = try self.address_of(module, function, span, symbol)
                 let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
                 try self.lower_store(module, function, span, value_type, address, operation, value, body)
+            ExternStore(variable_index, operation, value):
+                let global = self.lowered_external_globals[variable_index]
+                let value_type = self.external_globals[global.value].value_type
+                let right = try self.lower_expression(module, function, value, body)
+                var stored = right
+                match operation:
+                    Replace: pass
+                    Combine(binary):
+                        let current = self.new_register(value_type)
+                        body.append(MirInstruction(form = InstructionForm.LoadExternalGlobal(result = current, global = global), span = span))
+                        stored = try self.lower_binary_operation(module, function, span, binary, value_type, current, right, body)
+                body.append(MirInstruction(form = InstructionForm.StoreExternalGlobal(global = global, value = stored), span = span))
             FieldAssignment(symbol, path, operation, value):
                 # Walk the path through HIR field types to reach the place.
                 var address = try self.address_of(module, function, span, symbol)
@@ -1030,6 +1075,11 @@ pub class Lowerer:
                     return try self.lower_expression(module, function, constant.value, body)
                 let local = try self.local_of(module, function, span, symbol)
                 return self.load_value(value_type, local.address, span, body)
+            ExternLoad(variable_index):
+                let global = self.lowered_external_globals[variable_index]
+                let result = self.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.LoadExternalGlobal(result = result, global = global), span = span))
+                return result
             Tuple(elements):
                 # Fill a fresh slot field by field; the slot's address is the value.
                 let temp = self.new_temp(value_type, span, body)
@@ -2061,10 +2111,18 @@ pub class Lowerer:
         error(self.unsupported(module, function, span, "a reference to a symbol that is not a local"))
 
     # Declare a runtime service once, with the signature the runtime table
-    # fixes for it.
+    # fixes for it. Runtime services and source C declarations share the
+    # linker's symbol namespace, but never each other's semantic contract.
     func runtime_extern(name: str) -> ExternId!:
         for index in range(0, len(self.externs)):
-            if self.externs[index].name == name: return ExternId(value = u32(index))
+            let external = self.externs[index]
+            if external.name != name: continue
+            if external.convention != CallingConvention.runtime:
+                error("lowerer: C symbol `" + name + "` conflicts with runtime service")
+            return ExternId(value = u32(index))
+        for global in self.external_globals:
+            if global.name == name:
+                error("lowerer: C symbol `" + name + "` conflicts with runtime service")
         let symbol = find_runtime_symbol(name) else error("lowerer: `" + name + "` is not a runtime service")
         self.externs.append(MirExtern(name = name, convention = CallingConvention.runtime, signature = symbol.signature))
         return ExternId(value = u32(len(self.externs) - 1))
@@ -2073,18 +2131,8 @@ pub class Lowerer:
     # have a `TypeId`; the HIR one is spelled `ir.TypeId` here. `char` is its
     # code point in a `u32`.
     func mir_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: ir.TypeId) -> TypeId!:
-        if types_match(value, resolve_builtin_type(BuiltinType.signed_i8)): return builtin_mir_type(BuiltinMirType.signed_i8)
-        if types_match(value, resolve_builtin_type(BuiltinType.signed_i16)): return builtin_mir_type(BuiltinMirType.signed_i16)
-        if types_match(value, resolve_builtin_type(BuiltinType.signed_i32)): return builtin_mir_type(BuiltinMirType.signed_i32)
-        if types_match(value, resolve_builtin_type(BuiltinType.signed_i64)): return builtin_mir_type(BuiltinMirType.signed_i64)
-        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u8)): return builtin_mir_type(BuiltinMirType.unsigned_u8)
-        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u16)): return builtin_mir_type(BuiltinMirType.unsigned_u16)
-        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u32)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
-        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u64)): return builtin_mir_type(BuiltinMirType.unsigned_u64)
-        if types_match(value, resolve_builtin_type(BuiltinType.float32)): return builtin_mir_type(BuiltinMirType.float32)
-        if types_match(value, resolve_builtin_type(BuiltinType.float64)): return builtin_mir_type(BuiltinMirType.float64)
-        if types_match(value, resolve_builtin_type(BuiltinType.boolean)): return builtin_mir_type(BuiltinMirType.boolean)
-        if types_match(value, resolve_builtin_type(BuiltinType.character)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
+        let scalar = self.scalar_mir_type(value)
+        if scalar != none: return scalar
         # Composites are interned structurally, so two `(i64, bool)` tuples
         # share one MIR type and the verifier sees each layout once.
         match self.program.types.definitions[value.value].form:
@@ -2134,6 +2182,36 @@ pub class Lowerer:
                     Pointer: return builtin_mir_type(BuiltinMirType.pointer)
                     Integer(representation): return try self.mir_type_of(module, function, span, representation)
             else: error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
+
+    # The one scalar mapping shared by ordinary values and external-global
+    # declarations. This is semantic width, not target ABI placement.
+    func scalar_mir_type(value: ir.TypeId) -> TypeId?:
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i8)): return builtin_mir_type(BuiltinMirType.signed_i8)
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i16)): return builtin_mir_type(BuiltinMirType.signed_i16)
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i32)): return builtin_mir_type(BuiltinMirType.signed_i32)
+        if types_match(value, resolve_builtin_type(BuiltinType.signed_i64)): return builtin_mir_type(BuiltinMirType.signed_i64)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u8)): return builtin_mir_type(BuiltinMirType.unsigned_u8)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u16)): return builtin_mir_type(BuiltinMirType.unsigned_u16)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u32)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
+        if types_match(value, resolve_builtin_type(BuiltinType.unsigned_u64)): return builtin_mir_type(BuiltinMirType.unsigned_u64)
+        if types_match(value, resolve_builtin_type(BuiltinType.float32)): return builtin_mir_type(BuiltinMirType.float32)
+        if types_match(value, resolve_builtin_type(BuiltinType.float64)): return builtin_mir_type(BuiltinMirType.float64)
+        if types_match(value, resolve_builtin_type(BuiltinType.boolean)): return builtin_mir_type(BuiltinMirType.boolean)
+        if types_match(value, resolve_builtin_type(BuiltinType.character)): return builtin_mir_type(BuiltinMirType.unsigned_u32)
+        return none
+
+    func external_global_type(value: ir.TypeId) -> TypeId:
+        let scalar = self.scalar_mir_type(value)
+        if scalar != none: return scalar
+        match self.program.types.definitions[value.value].form:
+            Extern(index):
+                match self.program.extern_types[index].representation:
+                    Pointer: return builtin_mir_type(BuiltinMirType.pointer)
+                    Integer(representation):
+                        let lowered = self.scalar_mir_type(representation)
+                        if lowered != none: return lowered
+            else: pass
+        trap("HIR admitted an unsupported external-global type")
 
     # The raw C slot type differs from the ordinary MIR value type only for a
     # nullable pointer handle: its tagged optional is encoded as one pointer

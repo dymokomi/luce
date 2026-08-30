@@ -29,12 +29,12 @@ from compiler.core_types import is_core_type_name
 from compiler.frontend.source import SourceSpan, format_diagnostic
 from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, ConstantSyntax, EnumSyntax, ExpressionSyntax
 from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax
-from compiler.frontend.syntax import ExternFunctionSyntax, ExternTypeSyntax, FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, NominalTypeSyntax, StatementSyntax
+from compiler.frontend.syntax import ExternFunctionSyntax, ExternTypeSyntax, ExternVariableSyntax, FunctionSyntax, IfBranchSyntax, ModuleSyntax, NominalTypeKind, NominalTypeSyntax, StatementSyntax
 from compiler.frontend.syntax import SuiteSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType
 from compiler.hir.ir import HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
-from compiler.hir.ir import HirEnum, HirEnumCase, HirExternRepresentation, HirExternType, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
+from compiler.hir.ir import HirEnum, HirEnumCase, HirExternRepresentation, HirExternType, HirExternVariable, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
 from compiler.hir.ir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir.ir import describe_type, integer_maximum, integer_minimum
@@ -109,6 +109,16 @@ struct CollectedExternType:
     pub let representation: HirExternRepresentation
     pub let span: SourceSpan
 
+# A C-owned mutable global. Collection resolves and validates its semantic
+# type once; executable HIR refers to its table identity directly.
+struct CollectedExternVariable:
+    pub let module_index: i64
+    pub let name: str
+    pub let is_public: bool
+    pub let documentation: list[str]
+    pub let value_type: TypeId
+    pub let span: SourceSpan
+
 # What a callee spelling resolved to: a function (with the receiver value
 # when it is a method call), a struct whose memberwise initializer is being
 # called, or an enum case being constructed.
@@ -154,15 +164,20 @@ struct ImportedModule:
     pub let name: str
     pub let module_index: i64
 
-struct ImportedFunction:
-    pub let name: str
-    pub let function_index: i64
+union ImportedValue:
+    Function(function_index: i64)
+    ExternalVariable(variable_index: i64)
 
-# What one module's imports made visible: module names for qualified calls,
-# and selectively imported functions for direct calls.
+struct ImportedValueBinding:
+    pub let name: str
+    pub let value: ImportedValue
+
+# What one module's imports made visible: module names for qualified access,
+# and one typed value namespace for selective imports. Adding another source
+# value kind extends `ImportedValue`; it does not add another parallel table.
 struct ModuleBindings:
     pub let modules: list[ImportedModule]
-    pub let functions: list[ImportedFunction]
+    pub let values: list[ImportedValueBinding]
 
 # One live local: `let total = 0` puts a `total` in scope until its suite ends.
 struct LocalBinding:
@@ -223,6 +238,7 @@ pub class HirGenerator:
     let structs: list[CollectedStruct]
     let enums: list[CollectedEnum]
     let extern_types: list[CollectedExternType]
+    let extern_variables: list[CollectedExternVariable]
     var next_symbol: i64
     # The module, function contract, import bindings, live local bindings, and
     # loop depth of whatever is being checked right now.
@@ -261,11 +277,12 @@ pub class HirGenerator:
         self.structs = list[CollectedStruct]()
         self.enums = list[CollectedEnum]()
         self.extern_types = list[CollectedExternType]()
+        self.extern_variables = list[CollectedExternVariable]()
         self.next_symbol = 0
         self.current_module = 0
         self.current_result = resolve_builtin_type(BuiltinType.unit)
         self.current_receiver = none
-        self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
+        self.bindings = ModuleBindings(modules = list[ImportedModule](), values = list[ImportedValueBinding]())
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
         self.recovery_types = list[TypeId]()
@@ -379,6 +396,17 @@ pub class HirGenerator:
                 span = item.span,
             ))
 
+        let hir_extern_variables = list[HirExternVariable]()
+        for item in self.extern_variables:
+            hir_extern_variables.append(HirExternVariable(
+                module = ModuleId(value = u32(item.module_index)),
+                name = item.name,
+                is_public = item.is_public,
+                documentation = item.documentation,
+                value_type = item.value_type,
+                span = item.span,
+            ))
+
         return HirProgram(
             package_identity = self.package_identity,
             types = self.types,
@@ -388,6 +416,7 @@ pub class HirGenerator:
             structs = hir_structs,
             enums = hir_enums,
             extern_types = hir_extern_types,
+            extern_variables = hir_extern_variables,
             functions = hir_functions,
             nodes = self.nodes,
             node_types = self.node_types,
@@ -429,7 +458,7 @@ pub class HirGenerator:
     # imported module exists, every selected function exists and is public,
     # and no two imports land on the same local name.
     func resolve_imports(module_index: i64) -> ModuleBindings!:
-        let bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
+        let bindings = ModuleBindings(modules = list[ImportedModule](), values = list[ImportedValueBinding]())
         for imported in self.sources[module_index].syntax.imports:
             let imported_name = imported.path.dotted()
             let imported_module = self.find_source(imported_name)
@@ -446,11 +475,17 @@ pub class HirGenerator:
                 for selected in imported.names:
                     try self.require_free_import_name(module_index, bindings, selected.name, selected.span)
                     let function_index = self.find_function_in_module(imported_module, selected.name)
-                    if function_index < 0:
-                        try self.fail_at(module_index, selected.span, "module `" + imported_name + "` has no function `" + selected.name + "`")
-                    if not self.functions[function_index].is_public:
+                    if function_index >= 0:
+                        if not self.functions[function_index].is_public:
+                            try self.fail_at(module_index, selected.span, "`" + selected.name + "` is private to module `" + imported_name + "`")
+                        bindings.values.append(ImportedValueBinding(name = selected.name, value = ImportedValue.Function(function_index = function_index)))
+                        continue
+                    let variable_index = self.find_extern_variable_in_module(imported_module, selected.name)
+                    if variable_index < 0:
+                        try self.fail_at(module_index, selected.span, "module `" + imported_name + "` has no value `" + selected.name + "`")
+                    if not self.extern_variables[variable_index].is_public:
                         try self.fail_at(module_index, selected.span, "`" + selected.name + "` is private to module `" + imported_name + "`")
-                    bindings.functions.append(ImportedFunction(name = selected.name, function_index = function_index))
+                    bindings.values.append(ImportedValueBinding(name = selected.name, value = ImportedValue.ExternalVariable(variable_index = variable_index)))
         return bindings
 
     # An imported name may not collide with a declaration or another import.
@@ -467,10 +502,12 @@ pub class HirGenerator:
             try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
         if self.find_extern_type_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.find_extern_variable_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
         for imported in bindings.modules:
             if imported.name == name:
                 try self.fail_at(module_index, span, "duplicate imported name `" + name + "`")
-        for imported in bindings.functions:
+        for imported in bindings.values:
             if imported.name == name:
                 try self.fail_at(module_index, span, "duplicate imported name `" + name + "`")
 
@@ -521,7 +558,7 @@ pub class HirGenerator:
                     ExternFunction(extern_function):
                         try self.collect_extern_function(module_index, declaration.is_public, declaration.documentation, extern_function, declaration.span)
                     ExternVariable(extern_variable):
-                        try self.fail_at(module_index, declaration.span, "extern variable declarations are not implemented yet")
+                        try self.collect_extern_variable(module_index, declaration.is_public, declaration.documentation, extern_variable, declaration.span)
                     ExternStruct(extern_struct):
                         try self.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
 
@@ -551,6 +588,23 @@ pub class HirGenerator:
             typed = NodeId(value = no_node),
         ))
 
+    # C globals are mutable source values but not Luce-owned storage. Keep the
+    # closed one-word vocabulary here so every later stage receives a valid,
+    # already resolved contract.
+    func collect_extern_variable(module_index: i64, is_public: bool, documentation: list[str], syntax: ExternVariableSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, syntax.name, span)
+        let value_type = try self.resolve_type(module_index, syntax.value_type)
+        if not self.is_c_variable_value(value_type):
+            try self.fail_at(module_index, syntax.value_type.span, "extern variable `" + syntax.name + "` has unsupported boundary type `" + self.describe_type(value_type) + "`")
+        self.extern_variables.append(CollectedExternVariable(
+            module_index = module_index,
+            name = syntax.name,
+            is_public = is_public,
+            documentation = documentation,
+            value_type = value_type,
+            span = span,
+        ))
+
     func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
         if self.find_function_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
@@ -563,6 +617,8 @@ pub class HirGenerator:
         if self.find_alias_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
         if self.find_constant_in_module(module_index, name) >= 0:
+            try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_extern_variable_in_module(module_index, name) >= 0:
             try self.fail_at(module_index, span, "duplicate declaration `" + name + "`")
 
     func collect_module_bindings() -> !:
@@ -840,10 +896,22 @@ pub class HirGenerator:
     # pointer-shaped handle. The optional stays tagged in ordinary HIR and is
     # encoded as C null only by the boundary adapter.
     func is_c_function_value(value: TypeId) -> bool:
+        if self.is_c_scalar_or_handle(value): return true
+        match self.types.definitions[value.value].form:
+            Optional(inner): return self.is_pointer_extern_type(inner)
+            else: return false
+
+    # An external variable is exactly one C scalar or opaque handle. Unlike a
+    # call slot it admits no optional encoding and applies no null translation.
+    func is_c_variable_value(value: TypeId) -> bool:
+        return self.is_c_scalar_or_handle(value)
+
+    # The common direct C vocabulary before a particular boundary position
+    # decides whether pointer-shaped optional translation is meaningful.
+    func is_c_scalar_or_handle(value: TypeId) -> bool:
         if types_match(value, resolve_builtin_type(BuiltinType.boolean)) or is_integer_type(self.types, value) or is_floating_type(self.types, value): return true
         match self.types.definitions[value.value].form:
             Extern(index): return true
-            Optional(inner): return self.is_pointer_extern_type(inner)
             else: return false
 
     func is_pointer_extern_type(value: TypeId) -> bool:
@@ -864,7 +932,7 @@ pub class HirGenerator:
         # Signatures are collected before import bindings exist; a default
         # may not name imports then, and sees an empty binding set.
         self.current_module = module_index
-        self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
+        self.bindings = ModuleBindings(modules = list[ImportedModule](), values = list[ImportedValueBinding]())
         if module_index < len(self.module_bindings): self.enter_module(module_index)
         self.locals = list[LocalBinding]()
         let checked = try self.check_expression(value, expected)
@@ -1456,8 +1524,25 @@ pub class HirGenerator:
     func check_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         var name = ""
         match target.form:
-            Name(value_name): name = value_name
-            Member(member_value, field_name): return try self.check_field_assignment(member_value, field_name, operator, value, span)
+            Name(value_name):
+                name = value_name
+                if self.find_local(name) < 0:
+                    let variable_index = self.find_visible_extern_variable(name)
+                    if variable_index >= 0: return try self.check_extern_assignment(variable_index, operator, value, span)
+            Member(member_value, field_name):
+                match member_value.form:
+                    Name(module_name):
+                        if self.find_local(module_name) < 0:
+                            let imported_module = self.find_imported_module(module_name)
+                            if imported_module >= 0:
+                                let variable_index = self.find_extern_variable_in_module(imported_module, field_name)
+                                if variable_index < 0:
+                                    try self.fail(span, "module `" + self.sources[imported_module].name + "` has no external variable `" + field_name + "`")
+                                if not self.extern_variables[variable_index].is_public:
+                                    try self.fail(span, "`" + field_name + "` is private to module `" + self.sources[imported_module].name + "`")
+                                return try self.check_extern_assignment(variable_index, operator, value, span)
+                    else: pass
+                return try self.check_field_assignment(member_value, field_name, operator, value, span)
             else: try self.fail(span, "index assignment is not implemented yet")
         let local_index = self.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
@@ -1479,6 +1564,21 @@ pub class HirGenerator:
                 )
             operation = AssignmentOperation.Combine(operation = resolved.operation)
         return self.push_statement(HirNodeForm.Assignment(symbol = local.symbol, operation = operation, value = checked), span)
+
+    # C-owned globals are always mutable, and every read/write remains an
+    # observable HIR operation. Compound assignment is one read followed by
+    # one write, expressed by the same resolved operation as local assignment.
+    func check_extern_assignment(variable_index: i64, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let variable = self.extern_variables[variable_index]
+        let checked = try self.check_expression(value, variable.value_type)
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(variable.value_type, binary_operator, self.type_of(checked), span)
+            if not types_match(resolved.result, variable.value_type):
+                try self.fail(span, "assignment changes `" + variable.name + "` from `" + self.describe_type(variable.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        return self.push_statement(HirNodeForm.ExternStore(variable = u32(variable_index), operation = operation, value = checked), span)
 
     # `root.a.b = value`: the root is a mutable local (or `self` in a mutating
     # method), every field on the way is `var`, and the path is recorded as
@@ -1620,6 +1720,11 @@ pub class HirGenerator:
                     if constant.typed.value == no_node: trap("constant was not typed")
                     let reference = self.push_node(HirNodeForm.Reference(symbol = constant.symbol), self.type_of(constant.typed), value.span)
                     return try self.require_type(reference, expected)
+                let variable_index = self.find_visible_extern_variable(name)
+                if variable_index >= 0:
+                    let variable = self.extern_variables[variable_index]
+                    let load = self.push_node(HirNodeForm.ExternLoad(variable = u32(variable_index)), variable.value_type, value.span)
+                    return try self.require_type(load, expected)
                 if self.find_visible_function(name) >= 0:
                     try self.fail(value.span, "function values are not implemented yet")
                 if self.find_struct_in_module(self.current_module, name) >= 0:
@@ -2215,8 +2320,16 @@ pub class HirGenerator:
                     if case_index < 0: try self.fail(span, "enum `" + type_name + "` has no case `" + name + "`")
                     return try self.check_enum_value(enum_index, case_index, list[ArgumentSyntax](), span, expected)
         if root_name != "" and self.find_local(root_name) < 0:
-            if self.find_imported_module(root_name) >= 0:
-                try self.fail(span, "module members other than functions are not implemented yet")
+            let imported_module = self.find_imported_module(root_name)
+            if imported_module >= 0:
+                let variable_index = self.find_extern_variable_in_module(imported_module, name)
+                if variable_index >= 0:
+                    let variable = self.extern_variables[variable_index]
+                    if not variable.is_public:
+                        try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
+                    let load = self.push_node(HirNodeForm.ExternLoad(variable = u32(variable_index)), variable.value_type, span)
+                    return try self.require_type(load, expected)
+                try self.fail(span, "module `" + self.sources[imported_module].name + "` has no value `" + name + "`")
             if self.find_struct_in_module(self.current_module, root_name) >= 0:
                 try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
             let enum_index = self.find_enum_in_module(self.current_module, root_name)
@@ -2494,7 +2607,7 @@ pub class HirGenerator:
     func require_free_local_name(name: str, span: SourceSpan) -> !:
         if self.find_local(name) >= 0:
             try self.fail(span, "`" + name + "` is already bound in this scope")
-        if self.find_imported_function(name) >= 0 or self.find_imported_module(name) >= 0:
+        if self.find_imported_function(name) >= 0 or self.find_imported_extern_variable(name) >= 0 or self.find_imported_module(name) >= 0:
             try self.fail(span, "local `" + name + "` cannot shadow an imported name")
 
     # Innermost binding first, so a suite's binding wins over an outer one.
@@ -2513,9 +2626,25 @@ pub class HirGenerator:
         return self.find_function_in_module(self.current_module, name)
 
     func find_imported_function(name: str) -> i64:
-        for imported in self.bindings.functions:
-            if imported.name == name: return imported.function_index
+        for imported in self.bindings.values:
+            if imported.name != name: continue
+            match imported.value:
+                Function(function_index): return function_index
+                ExternalVariable(variable_index): return -1
         return -1
+
+    func find_imported_extern_variable(name: str) -> i64:
+        for imported in self.bindings.values:
+            if imported.name != name: continue
+            match imported.value:
+                ExternalVariable(variable_index): return variable_index
+                Function(function_index): return -1
+        return -1
+
+    func find_visible_extern_variable(name: str) -> i64:
+        let imported = self.find_imported_extern_variable(name)
+        if imported >= 0: return imported
+        return self.find_extern_variable_in_module(self.current_module, name)
 
     func find_imported_module(name: str) -> i64:
         for imported in self.bindings.modules:
@@ -2557,6 +2686,11 @@ pub class HirGenerator:
     func find_extern_type_in_module(module_index: i64, name: str) -> i64:
         for index in range(0, len(self.extern_types)):
             if self.extern_types[index].module_index == module_index and self.extern_types[index].name == name: return index
+        return -1
+
+    func find_extern_variable_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.extern_variables)):
+            if self.extern_variables[index].module_index == module_index and self.extern_variables[index].name == name: return index
         return -1
 
     # Intern by `TypeForm`. The diagnostic `name` is stored for messages; two

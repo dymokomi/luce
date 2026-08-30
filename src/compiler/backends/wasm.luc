@@ -78,6 +78,7 @@ let i64_value_type: u8 = 0x7E
 let f32_value_type: u8 = 0x7D
 let f64_value_type: u8 = 0x7C
 let function_import_kind: u8 = 0x00
+let global_import_kind: u8 = 0x03
 let function_export_kind: u8 = 0x00
 let memory_export_kind: u8 = 0x02
 let global_mutable: u8 = 0x01
@@ -97,10 +98,10 @@ let scratch_iovec_length: i64 = 4     # iovec.buf_len: i32 byte count
 let scratch_written: i64 = 8          # where fd_write stores the count written
 let scratch_size: i64 = 16            # data items pack after this
 
-# The shadow stack: global 0 holds the stack pointer, starting at the top of
-# a sixteen-page memory and growing down toward the data. Frames are
+# The shadow stack pointer follows imported external globals in Wasm's global
+# index space, starts at the top of a sixteen-page memory, and grows down
+# toward the data. Frames are
 # 16-byte aligned. A memory without a stack stays one page.
-let stack_pointer_global: i64 = 0
 let page_size: i64 = 65536
 let stack_pages: i64 = 16
 let stack_top: i64 = 1048576
@@ -261,7 +262,7 @@ pub class WasmBackend:
         # `\0asm`, then binary format version 1.
         append_all(output, [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])
         append_section(output, type_section, encode_type_entries(plan))
-        if len(plan.imports) > 0:
+        if len(plan.imports) > 0 or len(plan.global_imports) > 0:
             append_section(output, import_section, encode_import_entries(plan))
         append_section(output, function_section, encode_function_entries(program, plan))
         if plan.has_memory:
@@ -292,6 +293,11 @@ struct WasmImport:
     let field_name: str
     let type_index: i64
 
+struct WasmGlobalImport:
+    let module_name: str
+    let field_name: str
+    let value_type: u8
+
 # Everything decided before any byte is written: the type table, the
 # imports (which take the first function indices), the type index of every
 # defined function, where each data item lands in memory, whether the
@@ -302,6 +308,7 @@ struct ModulePlan:
     let layout: TypeLayout
     let signatures: list[WasmSignature]
     let imports: list[WasmImport]
+    let global_imports: list[WasmGlobalImport]
     let function_types: list[i64]
     let data_offsets: list[i64]
     # First byte past the data items, rounded to a frame boundary: the
@@ -316,6 +323,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
     let layout = TypeLayout(program.types, wasm_layout())
     let signatures = list[WasmSignature]()
     let imports = list[WasmImport]()
+    let global_imports = list[WasmGlobalImport]()
     for index in range(0, len(program.externs)):
         let external = program.externs[index]
         match external.convention:
@@ -330,6 +338,12 @@ func plan_module(program: MirProgram) -> ModulePlan!:
                 let type_index = intern_signature(signatures, try wasm_signature(program.types, external.signature))
                 imports.append(WasmImport(external = index, module_name = c_import_module, field_name = external.name, type_index = type_index))
             luce: error("wasm backend found a Luce-convention extern `" + external.name + "`")
+    for global in program.external_globals:
+        global_imports.append(WasmGlobalImport(
+            module_name = c_import_module,
+            field_name = global.name,
+            value_type = try wasm_value_type(program.types, global.value_type),
+        ))
 
     # An entry gets `_start`, which needs `proc_exit(i32)` to report the
     # exit status. The import is not tied to a MIR extern.
@@ -365,6 +379,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         layout = layout,
         signatures = signatures,
         imports = imports,
+        global_imports = global_imports,
         function_types = function_types,
         data_offsets = data_offsets,
         data_end = data_end,
@@ -437,15 +452,23 @@ func encode_type_entries(plan: ModulePlan) -> list[u8]:
         append_all(entries, signature.results)
     return entries
 
-# Each import names its module and field and the function type it has.
+# Function and global imports share one section but retain their independent
+# WebAssembly index spaces. Functions are emitted first; external globals
+# follow in canonical table order and are all mutable by language contract.
 func encode_import_entries(plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
-    append_unsigned(entries, len(plan.imports))
+    append_unsigned(entries, len(plan.imports) + len(plan.global_imports))
     for item in plan.imports:
         append_name(entries, item.module_name)
         append_name(entries, item.field_name)
         entries.append(function_import_kind)
         append_unsigned(entries, item.type_index)
+    for item in plan.global_imports:
+        append_name(entries, item.module_name)
+        append_name(entries, item.field_name)
+        entries.append(global_import_kind)
+        entries.append(item.value_type)
+        entries.append(global_mutable)
     return entries
 
 # The function section only names each defined function's type index; the
@@ -643,26 +666,26 @@ func plan_frame(layout: TypeLayout, function: MirFunction) -> FramePlan:
 func encode_prologue(frame: FramePlan, plan: ModulePlan, body: list[u8]):
     if frame.size == 0: return
     body.append(opcode_global_get)
-    append_unsigned(body, stack_pointer_global)
+    append_unsigned(body, len(plan.global_imports))
     append_constant(body, frame.size, false)
     body.append(opcode_i32_sub)
     body.append(opcode_local_tee)
     append_unsigned(body, frame.frame_pointer_local)
     body.append(opcode_global_set)
-    append_unsigned(body, stack_pointer_global)
+    append_unsigned(body, len(plan.global_imports))
     local_get_index(body, frame.frame_pointer_local)
     append_constant(body, plan.data_end, false)
     body.append(opcode_i32_lt_u)
     append_trap_if_true(body)
 
 # `local.get fp; i32.const size; i32.add; global.set sp`
-func encode_epilogue(frame: FramePlan, body: list[u8]):
+func encode_epilogue(frame: FramePlan, plan: ModulePlan, body: list[u8]):
     if frame.size == 0: return
     local_get_index(body, frame.frame_pointer_local)
     append_constant(body, frame.size, false)
     body.append(opcode_i32_add)
     body.append(opcode_global_set)
-    append_unsigned(body, stack_pointer_global)
+    append_unsigned(body, len(plan.global_imports))
 
 # mark: Register kinds ========================================================================
 
@@ -870,6 +893,15 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
         DataAddress(result, data):
             append_constant(body, plan.data_offsets[data.value], false)
             local_set(body, result)
+        LoadExternalGlobal(result, global):
+            body.append(opcode_global_get)
+            append_unsigned(body, i64(global.value))
+            append_canonicalise(body, try register_kind(types, function, result))
+            local_set(body, result)
+        StoreExternalGlobal(global, value):
+            local_get(body, value)
+            body.append(opcode_global_set)
+            append_unsigned(body, i64(global.value))
         Call(results, target, arguments):
             # Direct call: arguments in order, the callee's index in the
             # function index space, then results popped into their locals.
@@ -932,14 +964,14 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 append_unsigned(body, depth + 1)
                 body.append(opcode_end)
         Return(values):
-            encode_epilogue(frame, body)
+            encode_epilogue(frame, plan, body)
             for index in range(0, i64(values.count)):
                 local_get(body, register_at(function, values, index))
             body.append(opcode_return)
         Raise(failure):
             # Value results are absent on failure. The final result is the
             # caller-owned error slot that r0 names by MIR invariant.
-            encode_epilogue(frame, body)
+            encode_epilogue(frame, plan, body)
             for index in range(0, len(function.signature.results) - 1):
                 try append_default_value(body, types, function.signature.results[index])
             local_get(body, failure)

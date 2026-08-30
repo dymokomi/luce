@@ -187,9 +187,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   pointers and shapes declared-result-then-output values, the semantic hosts
   cover both sides of that memory boundary, and real QBE/libc
   `posix_memalign` proves a nullable pointer output. Real QBE/libc `getpid` and
-  `malloc`/`free` execution prove both handle representations. Strings, extern
-  structs and variables, exported structs/enums, and `cfunc` remain on this
-  item.
+  `malloc`/`free` execution prove both handle representations. External
+  variables are also complete: HIR retains explicit observable loads/stores,
+  canonical MIR owns a distinct external-global table and instructions, both
+  semantic oracles use explicit variable hosts, QBE binds the C object symbol,
+  and Wasm imports one mutable `env` global. Bare pointer-handle zero is
+  ordinary global state; null translation remains confined to callable C
+  boundaries. Strings, extern structs, exported structs/enums, and `cfunc`
+  remain on this item.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
