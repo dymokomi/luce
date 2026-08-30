@@ -887,6 +887,52 @@ return handler
 42" wasmtime run --invoke failures.handler_answer "$test_dir/failures.wasm"
 expect 0 "42" wasmtime run --invoke failures.initializer_answer "$test_dir/failures.wasm"
 
+# Fixed arrays retain the same inline value semantics and checked place paths
+# when the shared MIR reaches WebAssembly.
+cat > "$test_dir/arrays.luc" <<'LUCE'
+type Row = array[i64, 2]
+struct Grid:
+    var rows: array[Row, 2]
+struct Cell:
+    var value: i64
+    mutating func bump(self, by: i64): self.value += by
+func reverse(value: Row) -> Row: return [value[1u64], value[0u64]]
+pub func answer() -> i64:
+    var grid = Grid(rows = [[1, 2], [3, 4]])
+    var copy = grid
+    copy.rows[1u64][0u64] += 5
+    let reversed = reverse(copy.rows[1u64])
+    if grid == copy: return 0
+    return grid.rows[1u64][0u64] * 100 + reversed[0u64] * 10 + reversed[1u64]
+pub func empty() -> u64:
+    let values: array[i64, 0] = []
+    return values.length
+pub func method() -> i64:
+    var cells: array[Cell, 2] = [Cell(value = 1), Cell(value = 2)]
+    cells[1u64].bump(5)
+    return cells[1u64].value
+pub func missing() -> i64:
+    let values: Row = [1, 2]
+    return values[2u64]
+pub func missing_store() -> i64:
+    var values: Row = [1, 2]
+    values[2u64] = 3
+    return 0
+LUCE
+"$cli" build --package org.luce.tests "$test_dir/arrays.wasm" "$test_dir/arrays.luc" >/dev/null
+expect 0 "348" wasmtime run --invoke arrays.answer "$test_dir/arrays.wasm"
+expect 0 "0" wasmtime run --invoke arrays.empty "$test_dir/arrays.wasm"
+expect 0 "7" wasmtime run --invoke arrays.method "$test_dir/arrays.wasm"
+for name in missing missing_store; do
+    set +e
+    wasmtime run --invoke "arrays.$name" "$test_dir/arrays.wasm" >/dev/null 2>&1; status=$?
+    set -e
+    if [ "$status" = 0 ]; then
+        echo "wasm: arrays.$name exited 0, expected a bounds trap" >&2
+        exit 1
+    fi
+done
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:

@@ -214,7 +214,24 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   is conservatively unchanged because it is not a closed world. The same
   optimized, reverified canonical MIR feeds Wasm and QBE; only the backends
   choose whether package-public functions are exposed by their artifact model.
-- [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
+- [x] **Fixed value arrays and the second adopted native example**
+  (2026-08-30): `array[T, N]` is a canonical HIR type; contextual literals,
+  value copies, structural equality, `.length`, checked `u64` reads, and
+  mutable mixed field/element places—including mutating method receivers—lower
+  once to canonical MIR `Array` and `ElementAddress`; equality uses a
+  count-independent MIR loop. HIR, MIR, Wasm, and real QBE agree on nested
+  arrays, zero length, aggregate calls/results, and bounds traps. The adapted
+  Stage-0 sort program uses allocation-free fixed storage and is a native QBE gate.
+- [ ] **Audited freestanding-runtime substrate**: implement the spec's
+  `.native.luc` boundary, compiler-known `native_ptr[T]` / `native_mut_ptr[T]`,
+  named raw load/store/copy and linear-memory growth primitives, plus an
+  explicit runtime package build/link mode. These operations remain confined
+  to reviewed runtime modules and become backend intrinsics only after HIR;
+  allocator policy must not return to the compiler.
+- [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
+  linear memory, `write`, `trap`, string/bytes primitives; through the MIR
+  interpreter's stub runtime first, then compiled. This starts only after the
+  audited substrate above can express the implementation honestly.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
 - [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.

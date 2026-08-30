@@ -448,7 +448,9 @@ runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
 future managed class references is still open, but foreign handles stay
 tagged internally); a scalar `T!` result → a scalar and error pointer, never a
 type;
-tuples → anonymous `Struct`; class references and `weak` → `Ptr` managed by
+tuples → anonymous `Struct`; `array[T, N]` → `Array(T, N)` with `N` retained
+as a target-neutral type fact and element placement deferred to the backend;
+class references and `weak` → `Ptr` managed by
 the runtime; interface values → a two-`Ptr` `Struct`.
 
 Aggregates never sit in a register. The lowerer's protocol: a register of

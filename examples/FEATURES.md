@@ -27,6 +27,7 @@ also run or compile is defined once, under "What works today" in the
 | Boolean, absence, number, character, string, raw, formatted, triple, and byte literals | `operators_and_literals.luc` |
 | Arithmetic, bitwise, range, comparison, identity, and Boolean operators | `operators_and_literals.luc` |
 | Checked arithmetic lowered to Wasm and QBE | `compiled_core/main.luc` |
+| Fixed-array values, copies, checked mutation, sorting, and QBE execution | `stage0_sort.luc` |
 | Native entry point and terminal output through the QBE product path | `hello.luc` |
 | Optional, fallible, combined, tuple, function, and applied types | `language_tour.luc`, `operators_and_literals.luc` |
 | Static `test` declarations and assertions | `language_tour.luc`, `operators_and_literals.luc` |

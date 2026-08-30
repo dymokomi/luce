@@ -96,7 +96,9 @@ examples and tests link back here rather than restating it.
   constants, tuples, optionals, integer ranges and `for`, structs (including
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
-  equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, direct
+  equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, fixed
+  value arrays with contextual literals, structural equality, copies,
+  checked indexing and nested mutable places, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   and `print` of a

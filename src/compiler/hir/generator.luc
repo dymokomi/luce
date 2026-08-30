@@ -40,6 +40,7 @@ from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir.ir import describe_type, integer_maximum, integer_minimum
 from compiler.hir.ir import is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, type_forms_match, types_match
+from compiler.hir.ir import place_element_step, place_field_step
 
 # mark: HirGenerator state ====================================================================
 
@@ -218,6 +219,14 @@ struct ResolvedBinary:
 struct CheckedBinaryOperands:
     pub let left: NodeId
     pub let right: NodeId
+
+# One fully resolved assignment destination. `steps` is the compact HIR
+# `(kind, payload)` path from the root symbol to `value_type`.
+struct CheckedPlace:
+    pub let symbol: SymbolId
+    pub let value_type: TypeId
+    pub let steps: list[u32]
+    pub let initializer_field: bool
 
 ## Generates typed HIR for one whole program. Collection is internal so
 ## callers cannot run a partial generation; public use begins and ends at
@@ -1050,7 +1059,41 @@ pub class HirGenerator:
                 for element in elements:
                     if self.contains_type(element, target): return true
                 return false
+            Array(element, count): return self.contains_type(element, target)
             Optional(inner): return self.contains_type(inner, target)
+            else: return false
+
+    # Equality is structural for value aggregates and exists exactly when
+    # every stored component is itself equatable. This keeps unsupported
+    # slice/function comparisons out of HIR instead of failing in lowering.
+    func is_equatable_type(value_type: TypeId) -> bool:
+        match self.types.definitions[value_type.value].form:
+            Unit: return true
+            Boolean: return true
+            Integer(bits, is_signed): return true
+            Floating(bits): return true
+            Character: return true
+            String: return true
+            Bytes: return true
+            ErrorCode: return true
+            Error: return true
+            Extern(index): return true
+            Range(inner): return self.is_equatable_type(inner)
+            Array(element, count): return self.is_equatable_type(element)
+            Optional(inner): return self.is_equatable_type(inner)
+            Tuple(elements):
+                for element in elements:
+                    if not self.is_equatable_type(element): return false
+                return true
+            Struct(index):
+                for field in self.structs[index].fields:
+                    if not self.is_equatable_type(field.value_type): return false
+                return true
+            Enum(index):
+                for case_value in self.enums[index].cases:
+                    for field in case_value.payload:
+                        if not self.is_equatable_type(field.value_type): return false
+                return true
             else: return false
 
     func find_struct_in_module(module_index: i64, name: str) -> i64:
@@ -1225,6 +1268,19 @@ pub class HirGenerator:
                             return self.intern_range(inner)
                         else:
                             error(self.diagnostic_at(module_index, value.span, "`range` needs one type argument"))
+                if path.dotted() == "array" and len(arguments) == 2:
+                    var element_type = resolve_builtin_type(BuiltinType.unit)
+                    var count = -1
+                    match arguments[0]:
+                        TypeArgument(element): element_type = try self.resolve_type(module_index, element)
+                        else: error(self.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
+                    match arguments[1]:
+                        IntegerArgument(token): count = try self.decode_integer_at(module_index, token)
+                        else: error(self.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
+                    if count < 0: error(self.diagnostic_at(module_index, value.span, "`array` length cannot be negative"))
+                    return self.intern_array(element_type, count)
+                if path.dotted() == "array":
+                    error(self.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
                 error(self.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
             GroupedType(grouped):
                 return try self.resolve_type(module_index, grouped)
@@ -1542,8 +1598,10 @@ pub class HirGenerator:
                                     try self.fail(span, "`" + field_name + "` is private to module `" + self.sources[imported_module].name + "`")
                                 return try self.check_extern_assignment(variable_index, operator, value, span)
                     else: pass
-                return try self.check_field_assignment(member_value, field_name, operator, value, span)
-            else: try self.fail(span, "index assignment is not implemented yet")
+                return try self.check_place_assignment(target, operator, value, span)
+            Index(indexed, subscript): return try self.check_place_assignment(target, operator, value, span)
+            Group(grouped): return try self.check_assignment(grouped, operator, value, span)
+            else: error(self.diagnostic(span, "assignment needs a named mutable place"))
         let local_index = self.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
         let local = self.locals[local_index]
@@ -1580,59 +1638,62 @@ pub class HirGenerator:
             operation = AssignmentOperation.Combine(operation = resolved.operation)
         return self.push_statement(HirNodeForm.ExternStore(variable = u32(variable_index), operation = operation, value = checked), span)
 
-    # `root.a.b = value`: the root is a mutable local (or `self` in a mutating
-    # method), every field on the way is `var`, and the path is recorded as
-    # field indices so no consumer repeats the name resolution.
-    func check_field_assignment(member_value: ExpressionSyntax, field_name: str, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
-        # Walk down to the root name, collecting field names outermost last.
-        let names = [field_name]
-        var current = member_value
-        var root_name = ""
-        while true:
-            match current.form:
-                Name(candidate):
-                    root_name = candidate
-                    break
-                Member(inner, inner_name):
-                    names.append(inner_name)
-                    current = inner
-                Group(grouped): current = grouped
-                else: try self.fail(span, "assignment needs a named place; `" + field_name + "` here is a field of a temporary value")
-        let local_index = self.find_local(root_name)
-        if local_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
-        let local = self.locals[local_index]
-        var initializer_field = false
-        let active_receiver = self.current_receiver
-        if root_name == "self" and active_receiver != none:
-            initializer_field = active_receiver.kind == HirReceiverKind.initializer
-        if not local.is_mutable and not initializer_field:
-            if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
-            try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
-        let path = list[u32]()
-        var place_type = local.value_type
-        var index = len(names) - 1
-        while index >= 0:
-            let struct_index = self.struct_of(place_type)
-            if struct_index < 0: try self.fail(span, "`" + self.describe_type(place_type) + "` has no field `" + names[index] + "`")
-            let field_index = self.find_field(struct_index, names[index])
-            if field_index < 0: try self.fail(span, "struct `" + self.structs[struct_index].name + "` has no field `" + names[index] + "`")
-            let field = self.structs[struct_index].fields[field_index]
-            if not field.is_public and self.structs[struct_index].module_index != self.current_module:
-                try self.fail(span, "field `" + names[index] + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
-            if not field.is_mutable and not initializer_field:
-                try self.fail(span, "cannot assign to `let` field `" + names[index] + "`; declare it with `var`")
-            path.append(u32(field_index))
-            place_type = field.value_type
-            index -= 1
-        let checked = try self.check_expression(value, place_type)
+    # Resolve every field name and index expression in an assignment target
+    # once. The resulting path is target-neutral and can mix field and array
+    # steps; consumers never walk source syntax or repeat mutability checks.
+    func check_place_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let place = try self.resolve_assignment_place(target, span)
+        if len(place.steps) == 0: trap("place assignment has no path steps")
+        let checked = try self.check_expression(value, place.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
             let binary_operator = operator[0:len(operator) - 1]
-            let resolved = try self.resolve_binary_operation(place_type, binary_operator, self.type_of(checked), span)
-            if not types_match(resolved.result, place_type):
-                try self.fail(span, "assignment changes `" + field_name + "` from `" + self.describe_type(place_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            let resolved = try self.resolve_binary_operation(place.value_type, binary_operator, self.type_of(checked), span)
+            if not types_match(resolved.result, place.value_type):
+                try self.fail(span, "assignment changes the place from `" + self.describe_type(place.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
             operation = AssignmentOperation.Combine(operation = resolved.operation)
-        return self.push_statement(HirNodeForm.FieldAssignment(symbol = local.symbol, path = self.push_run(path), operation = operation, value = checked), span)
+        return self.push_statement(HirNodeForm.PlaceAssignment(symbol = place.symbol, steps = self.push_run(place.steps), operation = operation, value = checked), span)
+
+    func resolve_assignment_place(target: ExpressionSyntax, span: SourceSpan) -> CheckedPlace!:
+        match target.form:
+            Group(grouped): return try self.resolve_assignment_place(grouped, span)
+            Name(root_name):
+                let local_index = self.find_local(root_name)
+                if local_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
+                let local = self.locals[local_index]
+                var initializer_field = false
+                let active_receiver = self.current_receiver
+                if root_name == "self" and active_receiver != none:
+                    initializer_field = active_receiver.kind == HirReceiverKind.initializer
+                if not local.is_mutable and not initializer_field:
+                    if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
+                    try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
+                return CheckedPlace(symbol = local.symbol, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
+            Member(base, name):
+                let place = try self.resolve_assignment_place(base, span)
+                let struct_index = self.struct_of(place.value_type)
+                if struct_index < 0: try self.fail(span, "`" + self.describe_type(place.value_type) + "` has no field `" + name + "`")
+                let field_index = self.find_field(struct_index, name)
+                if field_index < 0: try self.fail(span, "struct `" + self.structs[struct_index].name + "` has no field `" + name + "`")
+                let field = self.structs[struct_index].fields[field_index]
+                if not field.is_public and self.structs[struct_index].module_index != self.current_module:
+                    try self.fail(span, "field `" + name + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
+                if not field.is_mutable and not place.initializer_field:
+                    try self.fail(span, "cannot assign to `let` field `" + name + "`; declare it with `var`")
+                place.steps.append(place_field_step)
+                place.steps.append(u32(field_index))
+                return CheckedPlace(symbol = place.symbol, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
+            Index(base, subscript):
+                let place = try self.resolve_assignment_place(base, span)
+                var element_type = resolve_builtin_type(BuiltinType.unit)
+                match self.types.definitions[place.value_type.value].form:
+                    Array(element, count): element_type = element
+                    else: try self.fail(span, "`" + self.describe_type(place.value_type) + "` does not support mutable indexing")
+                let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
+                place.steps.append(place_element_step)
+                place.steps.append(index.value)
+                return CheckedPlace(symbol = place.symbol, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
+            else: error(self.diagnostic(span, "assignment needs a named mutable place"))
 
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
@@ -1766,7 +1827,7 @@ pub class HirGenerator:
                 if case_index < 0: try self.fail(value.span, "enum `" + self.enums[enum_index].name + "` has no case `" + name + "`")
                 return try self.check_enum_value(enum_index, case_index, arguments, value.span, expected)
             ListValue(elements):
-                error(self.diagnostic(value.span, "list literals are not implemented yet"))
+                return try self.check_array_literal(elements, value.span, expected)
             MapValue(entries):
                 error(self.diagnostic(value.span, "map literals are not implemented yet"))
             Member(member_value, name):
@@ -1944,8 +2005,10 @@ pub class HirGenerator:
             if not types_match(left, boolean_type): try self.fail(span, "`" + operator + "` requires `bool` operands")
             if operator == "and": return ResolvedBinary(operation = BinaryOperation.LogicalAnd, result = boolean_type)
             return ResolvedBinary(operation = BinaryOperation.LogicalOr, result = boolean_type)
-        if operator == "==": return ResolvedBinary(operation = BinaryOperation.Equal(operand_type = left), result = boolean_type)
-        if operator == "!=": return ResolvedBinary(operation = BinaryOperation.NotEqual(operand_type = left), result = boolean_type)
+        if operator == "==" or operator == "!=":
+            if not self.is_equatable_type(left): try self.fail(span, "`" + operator + "` cannot compare `" + self.describe_type(left) + "`")
+            if operator == "==": return ResolvedBinary(operation = BinaryOperation.Equal(operand_type = left), result = boolean_type)
+            return ResolvedBinary(operation = BinaryOperation.NotEqual(operand_type = left), result = boolean_type)
         if operator == "<" or operator == "<=" or operator == ">" or operator == ">=":
             if not is_ordered_type(self.types, left): try self.fail(span, "`" + operator + "` does not order `" + self.describe_type(left) + "`")
             if operator == "<": return ResolvedBinary(operation = BinaryOperation.Less(operand_type = left), result = boolean_type)
@@ -2345,6 +2408,12 @@ pub class HirGenerator:
         if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
             let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
             return try self.require_type(length, expected)
+        match self.types.definitions[checked_type.value].form:
+            Array(element, count):
+                if name == "length":
+                    let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
+            else: pass
         if types_match(checked_type, resolve_builtin_type(BuiltinType.string)) and name == "byte_count":
             let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
             return try self.require_type(length, expected)
@@ -2375,22 +2444,28 @@ pub class HirGenerator:
         let typed = self.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
         return try self.require_type(typed, expected)
 
-    # `bytes` is the byte-addressable text-adjacent core value. String integer
+    # Fixed arrays and `bytes` use checked `u64` indices. String integer
     # indexing is intentionally absent because byte and Unicode-scalar indices
-    # are different domains (§12.7). Every core sequence index is `u64`.
+    # are different domains (§12.7).
     func check_index(indexed: ExpressionSyntax, subscript: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let value = try self.check_expression(indexed, none)
         let value_type = self.type_of(value)
-        if not types_match(value_type, resolve_builtin_type(BuiltinType.byte_string)):
-            if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
-                try self.fail(span, "`str` does not support integer indexing; iterate characters or encode UTF-8 bytes")
-            try self.fail(span, "`" + self.describe_type(value_type) + "` does not support indexing yet")
+        var element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+        if types_match(value_type, resolve_builtin_type(BuiltinType.byte_string)):
+            element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+        else:
+            match self.types.definitions[value_type.value].form:
+                Array(element, count): element_type = element
+                else:
+                    if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
+                        try self.fail(span, "`str` does not support integer indexing; iterate characters or encode UTF-8 bytes")
+                    try self.fail(span, "`" + self.describe_type(value_type) + "` does not support indexing yet")
         let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
-        let result = self.push_node(HirNodeForm.SequenceIndex(value = value, index = index), resolve_builtin_type(BuiltinType.unsigned_u8), span)
+        let result = self.push_node(HirNodeForm.SequenceIndex(value = value, index = index), element_type, span)
         return try self.require_type(result, expected)
 
     # A mutating method needs somewhere to write: a `var` local, `self` in a
-    # mutating method, or a `var` field reached through such a place.
+    # mutating method, or a mutable field/array element reached through one.
     func require_mutable_place(value: NodeId, span: SourceSpan) -> !:
         match self.node_form(value):
             Reference(symbol):
@@ -2405,6 +2480,10 @@ pub class HirGenerator:
                 if not stored.is_mutable:
                     try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
                 try self.require_mutable_place(inner, span)
+            SequenceIndex(inner, index):
+                match self.types.definitions[self.type_of(inner).value].form:
+                    Array(element, count): try self.require_mutable_place(inner, span)
+                    else: try self.fail(span, "mutating method needs a mutable fixed-array element receiver")
             else: try self.fail(span, "mutating method needs a `var` receiver, not a temporary value")
 
     # Find which function a callee spelling names: a bare `helper(...)`, or a
@@ -2540,6 +2619,25 @@ pub class HirGenerator:
         let tuple_type = self.intern_tuple(parts)
         return try self.require_type(self.push_node(HirNodeForm.Tuple(elements = self.push_nodes(checked)), tuple_type, span), expected)
 
+    # Brackets remain the list-literal syntax by default. An expected fixed
+    # array type selects the allocation-free value form and supplies both its
+    # element type and exact count.
+    func check_array_literal(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let needed = expected else error(self.diagnostic(span, "list literals are not implemented yet; a fixed-array literal needs an `array[T, N]` context"))
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        var count = -1
+        match self.types.definitions[needed.value].form:
+            Array(element, array_count):
+                element_type = element
+                count = array_count
+            else: error(self.diagnostic(span, "list literals are not implemented yet"))
+        if len(elements) != count:
+            try self.fail(span, "fixed-array literal has " + str(len(elements)) + " element(s), expected `" + self.describe_type(needed) + "`")
+        let checked = list[NodeId]()
+        for element in elements:
+            checked.append(try self.check_expression(element, element_type))
+        return self.push_node(HirNodeForm.Array(elements = self.push_nodes(checked)), needed, span)
+
     func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let checked_optional = try self.check_expression(optional_value, none)
         let inner = self.optional_inner(self.type_of(checked_optional)) else error(self.diagnostic(span, "`else` requires an optional value, found `" + self.describe_type(self.type_of(checked_optional)) + "`"))
@@ -2553,14 +2651,20 @@ pub class HirGenerator:
     # spelling becomes a value, with range failures reported at the token.
 
     func decode_integer(token: Token) -> i64!:
-        let value = try self.decode_negative_integer(token)
+        return try self.decode_integer_at(self.current_module, token)
+
+    func decode_integer_at(module_index: i64, token: Token) -> i64!:
+        let value = try self.decode_negative_integer_at(module_index, token)
         if value == -9223372036854775807 - 1:
-            try self.fail(token.span, "integer literal is outside the representable integer range")
+            try self.fail_at(module_index, token.span, "integer literal is outside the representable integer range")
         return -value
 
     # Accumulating below zero leaves room for the minimum signed magnitude,
     # which positive i64 cannot represent.
     func decode_negative_integer(token: Token) -> i64!:
+        return try self.decode_negative_integer_at(self.current_module, token)
+
+    func decode_negative_integer_at(module_index: i64, token: Token) -> i64!:
         let text_end = len(token.text) - len(token.suffix)
         var base = 10
         var position = 0
@@ -2582,7 +2686,7 @@ pub class HirGenerator:
                 var threshold = numerator // base
                 if numerator % base != 0: threshold += 1
                 if value < threshold:
-                    try self.fail(token.span, "integer literal is outside the representable integer range")
+                    try self.fail_at(module_index, token.span, "integer literal is outside the representable integer range")
                 value = value * base - digit
             position += 1
         return value
@@ -2734,6 +2838,9 @@ pub class HirGenerator:
 
     func intern_range(inner: TypeId) -> TypeId:
         return self.intern_named("range[" + self.describe_type(inner) + "]", TypeForm.Range(element = inner))
+
+    func intern_array(element: TypeId, count: i64) -> TypeId:
+        return self.intern_named("array[" + self.describe_type(element) + ", " + str(count) + "]", TypeForm.Array(element = element, count = count))
 
     func intern_tuple(elements: list[TypeId]) -> TypeId:
         var name = "("
@@ -3050,6 +3157,7 @@ pub class HirGenerator:
             NoneLiteral: return true
             Some(inner): return self.is_constant_expression(inner)
             Tuple(elements): return self.run_is_constant(elements)
+            Array(elements): return self.run_is_constant(elements)
             StructValue(struct_index, fields): return self.run_is_constant(fields)
             EnumValue(enum_index, case_index, payload): return self.run_is_constant(payload)
             ErrorCodeLiteral(value): return true
@@ -3126,6 +3234,7 @@ pub class HirGenerator:
             Optional(inner): return self.contains_fallible(inner)
             Slice(inner): return self.contains_fallible(inner)
             Range(inner): return self.contains_fallible(inner)
+            Array(inner, count): return self.contains_fallible(inner)
             Tuple(elements):
                 for element in elements:
                     if self.contains_fallible(element): return true

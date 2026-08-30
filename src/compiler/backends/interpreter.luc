@@ -21,6 +21,7 @@ from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFuncti
 from compiler.hir.ir import entry_at, node_at, node_form, node_type
 from compiler.hir.ir import TypeTable, integer_bit_width, integer_maximum, integer_minimum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
+from compiler.hir.ir import place_element_step, place_field_step
 from compiler.hir.analyzer import AnalyzedProgram
 import std.strings
 
@@ -31,11 +32,16 @@ struct Binding:
     pub let symbol: SymbolId
     pub let value: Value
 
-# A mutable place: a binding and the field indices from it to the value.
-# `cursor.position` is the binding of `cursor` and the path `[0]`.
+# One resolved step of an assignment place. Dynamic index expressions have
+# already run when an Element reaches the value-rebuilding helpers.
+union AssignmentPlaceStep:
+    Field(index: i64)
+    Element(index: i64)
+
+# A mutable place: a binding and resolved field/element steps to its value.
 struct Place:
     pub let symbol: SymbolId
-    pub let path: list[i64]
+    pub let steps: list[AssignmentPlaceStep]
 
 # What one call produced, plus the receiver's final value so a mutating
 # method's writes to `self` can be copied back into the caller's place.
@@ -63,6 +69,10 @@ union Evaluation:
 union RunEvaluation:
     EvaluatedRun(values: list[BoxedValue])
     TransferredRun(execution: Execution)
+
+union PlaceEvaluation:
+    EvaluatedPlace(place: Place, value: Value)
+    TransferredPlace(execution: Execution)
 
 ## Deterministic bindings for source `extern func` declarations. Artifact
 ## backends bind the same callable by their own host mechanism; the semantic
@@ -495,10 +505,36 @@ class HirInterpreterRun:
                 try self.require_external_variable_value(variable, assigned)
                 try host.store(variable, assigned)
                 return Execution.Next
-            FieldAssignment(symbol, path_run, operation, value):
+            PlaceAssignment(symbol, step_run, operation, value):
                 let index = find_binding(bindings, symbol)
-                if index < 0: trap("typed field assignment refers to an unknown binding")
-                let path = self.entries(path_run)
+                if index < 0: trap("typed place assignment refers to an unknown binding")
+                let steps = list[AssignmentPlaceStep]()
+                # Resolve the complete target, including bounds checks, before
+                # evaluating the right-hand side. Assignment target effects
+                # precede value effects in the source language.
+                var current = bindings[index].value
+                for position in range(0, i64(step_run.count) // 2):
+                    let kind = u32(entry_at(self.program, step_run, position * 2))
+                    let payload = entry_at(self.program, step_run, position * 2 + 1)
+                    if kind == place_field_step:
+                        steps.append(AssignmentPlaceStep.Field(index = payload))
+                        match current:
+                            Record(fields): current = fields[payload].value
+                            else: trap("field step applied to a non-struct HIR value")
+                    elif kind == place_element_step:
+                        match try self.evaluate(NodeId(value = u32(payload)), bindings):
+                            Evaluated(item):
+                                match item:
+                                    Integer(element_index):
+                                        steps.append(AssignmentPlaceStep.Element(index = element_index))
+                                        match current:
+                                            Array(elements):
+                                                if element_index < 0 or element_index >= len(elements): error("interpreter: index out of bounds")
+                                                current = elements[element_index].value
+                                            else: trap("element step applied to a non-array HIR value")
+                                    else: trap("typed place index is not an integer")
+                            Transferred(execution): return execution
+                    else: trap("typed place assignment has an unknown step")
                 let evaluated = try self.evaluate(value, bindings)
                 var right = Value.Unit
                 match evaluated:
@@ -507,8 +543,11 @@ class HirInterpreterRun:
                 var assigned = right
                 match operation:
                     Replace: assigned = right
-                    Combine(binary): assigned = try evaluate_binary(value_at_path(bindings[index].value, path, 0), binary, right, self.program.types)
-                bindings[index] = Binding(symbol = symbol, value = value_with_path(bindings[index].value, path, 0, assigned))
+                    # The right-hand side may itself mutate the root. Read the
+                    # selected value afterward, matching ordinary compound
+                    # assignment while retaining the already-resolved steps.
+                    Combine(binary): assigned = try evaluate_binary(try value_at_assignment_place(bindings[index].value, steps, 0), binary, right, self.program.types)
+                bindings[index] = Binding(symbol = symbol, value = try value_with_assignment_place(bindings[index].value, steps, 0, assigned))
                 return Execution.Next
             PrintText(value):
                 print(value)
@@ -655,23 +694,27 @@ class HirInterpreterRun:
                         match item:
                             Bytes(payload): return Evaluation.Evaluated(value = Value.Integer(value = len(payload)))
                             Text(text): return Evaluation.Evaluated(value = Value.Integer(value = len(strings.to_bytes(text))))
+                            Array(elements): return Evaluation.Evaluated(value = Value.Integer(value = len(elements)))
                             else: trap("typed sequence length has a non-sequence value")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             SequenceIndex(value, index):
                 let sequence = try self.evaluate(value, bindings)
-                var payload = list[u8]()
+                var sequence_value = Value.Unit
                 match sequence:
-                    Evaluated(item):
-                        match item:
-                            Bytes(value_bytes): payload = value_bytes
-                            else: trap("typed sequence index has a non-byte value")
+                    Evaluated(item): sequence_value = item
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
                 match try self.evaluate(index, bindings):
                     Evaluated(item):
                         match item:
                             Integer(position):
-                                if position < 0 or position >= len(payload): error("interpreter: index out of bounds")
-                                return Evaluation.Evaluated(value = Value.Integer(value = i64(payload[position])))
+                                match sequence_value:
+                                    Bytes(payload):
+                                        if position < 0 or position >= len(payload): error("interpreter: index out of bounds")
+                                        return Evaluation.Evaluated(value = Value.Integer(value = i64(payload[position])))
+                                    Array(elements):
+                                        if position < 0 or position >= len(elements): error("interpreter: index out of bounds")
+                                        return Evaluation.Evaluated(value = elements[position].value)
+                                    else: trap("typed sequence index has a non-sequence value")
                             else: trap("typed sequence index has a non-integer index")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Unary(operation, operand):
@@ -761,6 +804,10 @@ class HirInterpreterRun:
                 match try self.evaluate_run(elements, bindings):
                     EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Tuple(elements = items))
                     TransferredRun(execution): return Evaluation.Transferred(execution = execution)
+            Array(elements):
+                match try self.evaluate_run(elements, bindings):
+                    EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Array(elements = items))
+                    TransferredRun(execution): return Evaluation.Transferred(execution = execution)
             Element(value, index):
                 match try self.evaluate(value, bindings):
                     Evaluated(item):
@@ -805,24 +852,75 @@ class HirInterpreterRun:
         let target = self.find_function(function)
         let values = list[Value]()
         for parameter in target.parameters: values.append(Value.Unit)
+        let receiver = target.receiver
+        var mutable_receiver_place: Place? = none
         # Arguments are pairs: parameter index, then the argument node.
         for pair in range(0, i64(arguments.count) // 2):
             let parameter_index = entry_at(self.program, arguments, pair * 2)
             let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
-            match try self.evaluate(argument, bindings):
-                Evaluated(item): values[parameter_index] = item
-                Transferred(execution): return Evaluation.Transferred(execution = execution)
+            if parameter_index == 0 and receiver != none and receiver.kind == HirReceiverKind.mutating_method:
+                match try self.evaluate_mutable_place(argument, bindings):
+                    EvaluatedPlace(place, item):
+                        mutable_receiver_place = place
+                        values[parameter_index] = item
+                    TransferredPlace(execution): return Evaluation.Transferred(execution = execution)
+            else:
+                match try self.evaluate(argument, bindings):
+                    Evaluated(item): values[parameter_index] = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+        if receiver != none and receiver.kind == HirReceiverKind.mutating_method:
+            # Selecting an inout receiver happens before later arguments, but
+            # its value is read when the call begins. A later argument may
+            # have mutated the same place; MIR naturally observes that through
+            # the selected address, so the semantic oracle must do so too.
+            let place = mutable_receiver_place else trap("mutating call on a value that is not a place")
+            let index = find_binding(bindings, place.symbol)
+            if index < 0: trap("mutating call refers to an unknown binding")
+            values[0] = try value_at_assignment_place(bindings[index].value, place.steps, 0)
         let invocation = try self.call(target, values)
         # A mutating method changed its copy of `self`; the caller's place
         # receives that copy (HirGenerator proved it is a place).
-        let receiver = target.receiver
         if receiver != none and receiver.kind == HirReceiverKind.mutating_method:
-            let receiver_node = NodeId(value = u32(entry_at(self.program, arguments, 1)))
-            let place = place_of(self.program, receiver_node) else trap("mutating call on a value that is not a place")
+            let place = mutable_receiver_place else trap("mutating call on a value that is not a place")
             let index = find_binding(bindings, place.symbol)
             if index < 0: trap("mutating call refers to an unknown binding")
-            bindings[index] = Binding(symbol = place.symbol, value = value_with_path(bindings[index].value, place.path, 0, invocation.receiver))
+            bindings[index] = Binding(symbol = place.symbol, value = try value_with_assignment_place(bindings[index].value, place.steps, 0, invocation.receiver))
         return Evaluation.Evaluated(value = invocation.value)
+
+    # Evaluate one mutable receiver exactly once while retaining where its
+    # final value must be copied back after the method returns.
+    func evaluate_mutable_place(value: NodeId, bindings: list[Binding]) -> PlaceEvaluation!:
+        match node_form(self.program, value):
+            Reference(symbol):
+                let index = find_binding(bindings, symbol)
+                if index < 0: trap("mutating call refers to an unknown binding")
+                return PlaceEvaluation.EvaluatedPlace(place = Place(symbol = symbol, steps = list[AssignmentPlaceStep]()), value = bindings[index].value)
+            FieldAccess(inner, field):
+                match try self.evaluate_mutable_place(inner, bindings):
+                    EvaluatedPlace(place, base):
+                        match base:
+                            Record(fields):
+                                place.steps.append(AssignmentPlaceStep.Field(index = field))
+                                return PlaceEvaluation.EvaluatedPlace(place = place, value = fields[field].value)
+                            else: trap("mutating field receiver has a non-record base")
+                    TransferredPlace(execution): return PlaceEvaluation.TransferredPlace(execution = execution)
+            SequenceIndex(inner, index_node):
+                match try self.evaluate_mutable_place(inner, bindings):
+                    EvaluatedPlace(place, base):
+                        match try self.evaluate(index_node, bindings):
+                            Evaluated(index_value):
+                                match index_value:
+                                    Integer(index):
+                                        match base:
+                                            Array(elements):
+                                                if index < 0 or index >= len(elements): error("interpreter: index out of bounds")
+                                                place.steps.append(AssignmentPlaceStep.Element(index = index))
+                                                return PlaceEvaluation.EvaluatedPlace(place = place, value = elements[index].value)
+                                            else: trap("mutating element receiver has a non-array base")
+                                    else: trap("mutating element receiver has a non-integer index")
+                            Transferred(execution): return PlaceEvaluation.TransferredPlace(execution = execution)
+                    TransferredPlace(execution): return PlaceEvaluation.TransferredPlace(execution = execution)
+            else: trap("mutating call on a value that is not a place")
 
     # Construction owns fresh receiver storage. The initializer's source
     # result is unit-shaped; success substitutes the completed receiver while
@@ -957,39 +1055,46 @@ class HirInterpreterRun:
 # mark: Bindings ==============================================================================
 
 # The place an expression names: a reference, or fields reached from one.
-func place_of(program: HirProgram, value: NodeId) -> Place?:
-    match node_form(program, value):
-        Reference(symbol): return Place(symbol = symbol, path = list[i64]())
-        FieldAccess(inner, field):
-            let base = place_of(program, inner)
-            if base == none: return none
-            let path = list[i64]()
-            for step in base.path: path.append(step)
-            path.append(field)
-            return Place(symbol = base.symbol, path = path)
-        else: return none
+# Read the value selected by a fully evaluated mixed field/array place.
+func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], start: i64) -> Value!:
+    if start >= len(steps): return value
+    match steps[start]:
+        Field(index):
+            match value:
+                Record(fields): return try value_at_assignment_place(fields[index].value, steps, start + 1)
+                else: trap("field step applied to a non-struct HIR value")
+        Element(index):
+            match value:
+                Array(elements):
+                    if index < 0 or index >= len(elements): error("interpreter: index out of bounds")
+                    return try value_at_assignment_place(elements[index].value, steps, start + 1)
+                else: trap("element step applied to a non-array HIR value")
 
-# The value `path` steps into `value`, from `start`.
-func value_at_path(value: Value, path: list[i64], start: i64) -> Value:
-    if start >= len(path): return value
-    match value:
-        Record(fields): return value_at_path(fields[path[start]].value, path, start + 1)
-        else: trap("field path applied to a non-struct HIR value")
-
-# `value` with the field at `path` replaced by `replacement`; structs are
-# values, so the enclosing records are rebuilt along the path.
-func value_with_path(value: Value, path: list[i64], start: i64, replacement: Value) -> Value:
-    if start >= len(path): return replacement
-    match value:
-        Record(fields):
-            let rebuilt = list[BoxedValue]()
-            for index in range(0, len(fields)):
-                if index == path[start]:
-                    rebuilt.append(BoxedValue(value = value_with_path(fields[index].value, path, start + 1, replacement)))
-                else:
-                    rebuilt.append(fields[index])
-            return Value.Record(fields = rebuilt)
-        else: trap("field path applied to a non-struct HIR value")
+# Rebuild each enclosing value aggregate with the selected place replaced.
+func value_with_assignment_place(value: Value, steps: list[AssignmentPlaceStep], start: i64, replacement: Value) -> Value!:
+    if start >= len(steps): return replacement
+    match steps[start]:
+        Field(selected):
+            match value:
+                Record(fields):
+                    let rebuilt = list[BoxedValue]()
+                    for index in range(0, len(fields)):
+                        if index == selected:
+                            rebuilt.append(BoxedValue(value = try value_with_assignment_place(fields[index].value, steps, start + 1, replacement)))
+                        else: rebuilt.append(fields[index])
+                    return Value.Record(fields = rebuilt)
+                else: trap("field step applied to a non-struct HIR value")
+        Element(selected):
+            match value:
+                Array(elements):
+                    if selected < 0 or selected >= len(elements): error("interpreter: index out of bounds")
+                    let rebuilt = list[BoxedValue]()
+                    for index in range(0, len(elements)):
+                        if index == selected:
+                            rebuilt.append(BoxedValue(value = try value_with_assignment_place(elements[index].value, steps, start + 1, replacement)))
+                        else: rebuilt.append(elements[index])
+                    return Value.Array(elements = rebuilt)
+                else: trap("element step applied to a non-array HIR value")
 
 # Remove locals introduced after a lexical scope began.
 func trim_bindings(bindings: list[Binding], count: i64):
@@ -1078,6 +1183,10 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         Tuple(left_value):
             match right:
                 Tuple(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Array(left_value):
+            match right:
+                Array(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
                 else: trap("typed binary expression has unequal value types")
         Record(left_fields):
             match right:
