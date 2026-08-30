@@ -204,7 +204,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   bytes (never integer-indexes `str`), checks, compiles and links through the
   product QBE path, then executes successfully. Wasm and both semantic oracles
   agree on successful access and out-of-bounds traps.
-- [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
+- [x] **Closed-world MIR reachability** (2026-08-30): package `pub` visibility
+  and explicit artifact export are orthogonal MIR facts, so `pub` no longer
+  masquerades as a native ABI promise. Package APIs, the explicit process
+  entry and explicit C-export wrappers root a deterministic graph over direct
+  calls and function addresses. Surviving identities are remapped in source
+  order; externs, C globals, Luce globals and data reachable only from
+  discarded functions are pruned and remapped too. A rootless private library
+  is conservatively unchanged because it is not a closed world. The same
+  optimized, reverified canonical MIR feeds Wasm and QBE; only the backends
+  choose whether package-public functions are exposed by their artifact model.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.

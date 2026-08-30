@@ -472,7 +472,8 @@ MirFunction
     registers     list[TypeId]        every register, by index
     slots         list[TypeId]          backend computes size and alignment
     body          list[Instruction]   structured, see below
-    is_public     bool
+    is_public     bool                  source-package API visibility
+    is_exported   bool                  explicit artifact symbol, independent of `pub`
     span          SourceSpan
 
 MirExtern     name, convention (c | runtime), params, results, fallible
@@ -486,6 +487,14 @@ signature may contain only C-representable types; the backend then applies
 the target's C ABI. `MirData` is address-free raw payload. Address-bearing
 constants will use a typed, structural MIR representation when the language
 needs them; target-sized relocation slots do not belong in canonical MIR.
+
+`is_public` retains source-package API visibility without turning it into a
+native ABI promise. `is_exported` records the orthogonal artifact decision
+made by an explicit boundary declaration; a process entry is the independent
+`MirProgram.entry` root. Reachability keeps all three root families separate.
+Wasm can expose its package API while QBE/native exports only explicit C
+symbols and the entry. A rootless private library is preserved because its
+eventual consumer set is not yet known.
 
 Source-level C imports are not a second HIR call system. A `HirFunction` has
 one symbol and one closed implementation choice: defined Luce body, defined C

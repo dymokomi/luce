@@ -8,9 +8,10 @@
 #       simplify control flow here; target-specific rewrites belong later in a
 #       backend.
 #
-#       Optimization is optional for correctness. The first
-#       implementation is an identity pass, which makes the final compiler
-#       architecture visible while preserving today's instruction stream.
+#       Optimization is optional for correctness. Closed-world reachability is
+#       the first pass: package APIs, process entries, and explicit artifact
+#       symbols are roots; direct calls and function addresses are edges.
+#       Unreachable definitions and their resources never reach a backend.
 #       `MirVerifier` runs before and after this stage.
 #
 #       Example:
@@ -19,7 +20,8 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import MirProgram
+from compiler.mir.canonical import DataId, ExternId, ExternalGlobalId, FunctionId, GlobalId, InstructionForm
+from compiler.mir.canonical import MirData, MirExtern, MirExternalGlobal, MirFunction, MirGlobal, MirInstruction, MirProgram
 
 ## Runs target-independent optimization passes over canonical MIR.
 pub class Optimizer:
@@ -31,7 +33,230 @@ pub class Optimizer:
 
     # mark: Optimization =======================================================================
 
-    ## Return optimized canonical MIR. This is currently an explicit no-op;
-    ## adding the first transform changes this method, not the pipeline shape.
+    ## Return optimized canonical MIR. Passes preserve the verified canonical
+    ## vocabulary and never introduce target or backend facts.
     pub func optimize() -> MirProgram:
-        return self.program
+        return ProgramReachability(self.program).run()
+
+# mark: Closed-world reachability ============================================================
+
+## Keeps exactly the program state reachable from a package API, process entry,
+## or explicit artifact symbol. Original order is retained so output and
+## diagnostics stay deterministic; surviving table identities are remapped
+## once afterward.
+class ProgramReachability:
+    let program: MirProgram
+    let reachable_functions: list[bool]
+    let reachable_externs: list[bool]
+    let reachable_external_globals: list[bool]
+    let reachable_globals: list[bool]
+    let reachable_data: list[bool]
+    let pending: list[FunctionId]
+
+    init(program: MirProgram):
+        self.program = program
+        self.reachable_functions = false_marks(len(program.functions))
+        self.reachable_externs = false_marks(len(program.externs))
+        self.reachable_external_globals = false_marks(len(program.external_globals))
+        self.reachable_globals = false_marks(len(program.globals))
+        self.reachable_data = false_marks(len(program.data))
+        self.pending = list[FunctionId]()
+
+    func run() -> MirProgram:
+        let entry = self.program.entry
+        if entry != none: self.discover(entry)
+        for index in range(0, len(self.program.functions)):
+            let function = self.program.functions[index]
+            if function.is_public or function.is_exported:
+                self.discover(FunctionId(value = u32(index)))
+        # With no process entry, package API, or explicit artifact exports,
+        # this is not a closed world (for example, a library awaiting a
+        # packaging policy).
+        # Preserving it is the only sound target-independent choice.
+        if len(self.pending) == 0: return self.program
+        self.trace_edges()
+
+        let function_remap = build_remap(self.reachable_functions)
+        let extern_remap = build_remap(self.reachable_externs)
+        let external_global_remap = build_remap(self.reachable_external_globals)
+        let global_remap = build_remap(self.reachable_globals)
+        let data_remap = build_remap(self.reachable_data)
+        let functions = list[MirFunction]()
+        for index in range(0, len(self.program.functions)):
+            if self.reachable_functions[index]:
+                functions.append(self.rewrite_function(
+                    self.program.functions[index],
+                    function_remap,
+                    extern_remap,
+                    external_global_remap,
+                    global_remap,
+                    data_remap,
+                ))
+
+        let externs = list[MirExtern]()
+        for index in range(0, len(self.program.externs)):
+            if self.reachable_externs[index]: externs.append(self.program.externs[index])
+        let external_globals = list[MirExternalGlobal]()
+        for index in range(0, len(self.program.external_globals)):
+            if self.reachable_external_globals[index]:
+                external_globals.append(self.program.external_globals[index])
+        let globals = list[MirGlobal]()
+        for index in range(0, len(self.program.globals)):
+            if self.reachable_globals[index]:
+                globals.append(self.rewrite_global(self.program.globals[index], data_remap))
+        let data = list[MirData]()
+        for index in range(0, len(self.program.data)):
+            if self.reachable_data[index]: data.append(self.program.data[index])
+
+        var optimized_entry: FunctionId? = none
+        if entry != none: optimized_entry = self.remapped_function(entry, function_remap)
+        return MirProgram(
+            types = self.program.types,
+            externs = externs,
+            external_globals = external_globals,
+            globals = globals,
+            data = data,
+            functions = functions,
+            entry = optimized_entry,
+        )
+
+    func discover(function: FunctionId):
+        let index = i64(function.value)
+        if self.reachable_functions[index]: return
+        self.reachable_functions[index] = true
+        self.pending.append(function)
+
+    func trace_edges():
+        var next = 0
+        while next < len(self.pending):
+            let function = self.program.functions[self.pending[next].value]
+            next += 1
+            for instruction in function.body:
+                match instruction.form:
+                    FunctionAddress(result, target): self.discover(target)
+                    Call(results, target, arguments): self.discover(target)
+                    CallExtern(results, external, arguments): self.reachable_externs[external.value] = true
+                    LoadExternalGlobal(result, global): self.reachable_external_globals[global.value] = true
+                    StoreExternalGlobal(global, value): self.reachable_external_globals[global.value] = true
+                    DataAddress(result, data): self.reachable_data[data.value] = true
+                    GlobalAddress(result, global): self.discover_global(global)
+                    else: pass
+
+    func discover_global(global: GlobalId):
+        self.reachable_globals[global.value] = true
+        let initial = self.program.globals[global.value].initial
+        if initial != none: self.reachable_data[initial.value] = true
+
+    func remapped_function(function: FunctionId, remap: list[i64]) -> FunctionId:
+        let mapped = remapped_index(function.value, remap, "function")
+        return FunctionId(value = u32(mapped))
+
+    func remapped_extern(external: ExternId, remap: list[i64]) -> ExternId:
+        return ExternId(value = u32(remapped_index(external.value, remap, "extern")))
+
+    func remapped_external_global(global: ExternalGlobalId, remap: list[i64]) -> ExternalGlobalId:
+        return ExternalGlobalId(value = u32(remapped_index(global.value, remap, "external global")))
+
+    func remapped_global(global: GlobalId, remap: list[i64]) -> GlobalId:
+        return GlobalId(value = u32(remapped_index(global.value, remap, "global")))
+
+    func remapped_data(data: DataId, remap: list[i64]) -> DataId:
+        return DataId(value = u32(remapped_index(data.value, remap, "data")))
+
+    func rewrite_function(
+        function: MirFunction,
+        function_remap: list[i64],
+        extern_remap: list[i64],
+        external_global_remap: list[i64],
+        global_remap: list[i64],
+        data_remap: list[i64],
+    ) -> MirFunction:
+        let body = list[MirInstruction]()
+        for instruction in function.body:
+            var form = instruction.form
+            match instruction.form:
+                FunctionAddress(result, target):
+                    form = InstructionForm.FunctionAddress(
+                        result = result,
+                        function = self.remapped_function(target, function_remap),
+                    )
+                Call(results, target, arguments):
+                    form = InstructionForm.Call(
+                        results = results,
+                        function = self.remapped_function(target, function_remap),
+                        arguments = arguments,
+                    )
+                CallExtern(results, external, arguments):
+                    form = InstructionForm.CallExtern(
+                        results = results,
+                        external = self.remapped_extern(external, extern_remap),
+                        arguments = arguments,
+                    )
+                LoadExternalGlobal(result, global):
+                    form = InstructionForm.LoadExternalGlobal(
+                        result = result,
+                        global = self.remapped_external_global(global, external_global_remap),
+                    )
+                StoreExternalGlobal(global, value):
+                    form = InstructionForm.StoreExternalGlobal(
+                        global = self.remapped_external_global(global, external_global_remap),
+                        value = value,
+                    )
+                DataAddress(result, data):
+                    form = InstructionForm.DataAddress(
+                        result = result,
+                        data = self.remapped_data(data, data_remap),
+                    )
+                GlobalAddress(result, global):
+                    form = InstructionForm.GlobalAddress(
+                        result = result,
+                        global = self.remapped_global(global, global_remap),
+                    )
+                else: pass
+            body.append(MirInstruction(form = form, span = instruction.span))
+        return MirFunction(
+            name = function.name,
+            convention = function.convention,
+            signature = function.signature,
+            registers = function.registers,
+            slots = function.slots,
+            body = body,
+            operands = function.operands,
+            is_public = function.is_public,
+            is_exported = function.is_exported,
+            span = function.span,
+        )
+
+    func rewrite_global(global: MirGlobal, data_remap: list[i64]) -> MirGlobal:
+        var initial: DataId? = none
+        let old_initial = global.initial
+        if old_initial != none: initial = self.remapped_data(old_initial, data_remap)
+        return MirGlobal(
+            name = global.name,
+            value_type = global.value_type,
+            initial = initial,
+            is_mutable = global.is_mutable,
+        )
+
+# A compact index map shared by every program table. `-1` means discarded;
+# asking to remap it is an optimizer invariant violation on already-verified MIR.
+func false_marks(count: i64) -> list[bool]:
+    let marks = list[bool]()
+    for index in range(0, count): marks.append(false)
+    return marks
+
+func build_remap(reachable: list[bool]) -> list[i64]:
+    let remap = list[i64]()
+    var next = 0
+    for is_reachable in reachable:
+        if is_reachable:
+            remap.append(next)
+            next += 1
+        else:
+            remap.append(-1)
+    return remap
+
+func remapped_index(old: u32, remap: list[i64], kind: str) -> i64:
+    let mapped = remap[old]
+    if mapped < 0: trap("reachable MIR refers to discarded " + kind)
+    return mapped

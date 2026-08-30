@@ -106,8 +106,9 @@ examples and tests link back here rather than restating it.
   QBE 1.3 as both the native oracle and the product native path. QBE IL and
   assembly travel through memory; only a candidate executable is written in a
   uniquely owned same-directory scratch area, then atomically renamed over the
-  destination. Native executables start at `main`; WebAssembly exports every
-  public function.
+  destination. Native executables start at `main`; MIR keeps package `pub`
+  visibility separate from explicit artifact exports. Wasm exposes the
+  package API, while QBE exports only the entry and explicit C boundaries.
 - The test suite exercises the frontend, semantic model, both interpreters,
   lowering, MIR verification, each artifact encoder, the command line's exit
   statuses and diagnostics, and runs every fixture through the HIR

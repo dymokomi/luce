@@ -16,11 +16,11 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
 | HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, `bytes.length`, checked `bytes[u64]`, `str.byte_count`, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, direct scalar `extern func`/`export c func`, ordered C `out` results, nominal integer- and pointer-represented extern handles, and observable scalar `extern var` state, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, `cfunc`). Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes everything HIR generation produces. Runs `main(arguments: slice[str])` with an empty slice. |
-| Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
+| Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; target-neutral reachability removes unreachable closed-world functions and their resources before backends; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values, equality, lengths and checked byte indexing, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, direct scalar C imports/exports and external variables, nominal handle erasure, pointer/null and output-slot boundary adapters, and shared C-export wrappers, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, C calls and mutable C globals as `env` imports, exact exports, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, QBE C ABI extension types, exact C function/object symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 438 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 440 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -117,6 +117,16 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   toolchain, links, executes, and returns success. HIR, MIR, Wasm and QBE
   differential fixtures cover byte length, UTF-8 byte count, indexing and the
   out-of-bounds trap.
+- [x] **Closed-world reachability has explicit roots** (2026-08-30). The
+  recovery implementation was not reused: its `pub`/artifact-export
+  conflation was removed from canonical MIR. Package visibility, explicit C
+  export and the independently selected process entry are separate facts. The
+  optimizer traces their calls and function addresses, preserves original
+  order, remaps every surviving identity, and removes unreachable functions,
+  externs, external globals, globals and data. Rootless private libraries
+  remain intact rather than pretending an absent root set means an empty
+  program. Pre/post verification and the complete differential QBE corpus
+  exercise the pass; Wasm alone chooses to expose package-public functions.
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
 - [x] Native rung 0 proved direct image writing for the original slice; removed
