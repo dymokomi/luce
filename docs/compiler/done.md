@@ -159,14 +159,28 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 - [x] **The runtime allocation boundary is settled before implementation**
   (2026-08-30). The lowerer will request a runtime count of a structural MIR
   type, never target bytes or alignment; backend legalization alone converts
-  that request to the private `luce_rt_alloc` byte ABI. Allocation ownership,
+  that request to the bound private allocator's byte signature. Allocation
+  ownership,
   zero-count/zero-size behavior, overflow and exhaustion are explicit in spec
   §23.4. The sealed, freestanding `libluce_rt` package owns allocator policy
   and is composed with application MIR before optimization. Reviewed
   `.native.luc` modules retain typed pointee identities and can reach only a
   stable, monotonically committed arena capability; Wasm growth and native
-  reservation remain backend implementations. This records the guardrails;
-  it does not claim the substrate or allocator is implemented yet.
+  reservation remain backend implementations. This checkpoint recorded the
+  guardrails implemented by the following substrate; it did not claim the
+  production allocator.
+- [x] **Typed storage now crosses canonical MIR and both artifact backends**
+  (2026-08-30). `AllocateStorage(TypeId, u64)` preserves element structure
+  until a backend computes bytes and alignment. One verified program-level
+  binding points to the exact private `(u64, u64) -> Ptr` Luce allocator
+  function; optimizer reachability follows and remaps it only from live
+  allocation instructions. The MIR oracle uses semantic test memory without
+  executing allocator policy. QBE and Wasm directly call the composed
+  function after enforcing zero-count null, positive zero-size one-byte
+  storage and count-by-size overflow traps; native QBE and Wasmtime execute
+  all three cases. The former `luce_rt_alloc` extern route is gone, so MIR
+  cannot smuggle target byte layout around the typed instruction. The
+  production sealed runtime and source collection lowering remain pending.
 - [x] **Exact ordinary function values reuse the canonical callable model**
   (2026-08-30). A named, capture-free Luce declaration has an exact `func`
   type and explicit `FunctionAddress` HIR form; calls through values are

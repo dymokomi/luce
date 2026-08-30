@@ -262,11 +262,11 @@ Pointers themselves are untyped: `Ptr` is just an address. The type travels
 on the `Load`, `Store`, or `FieldAddress` that uses it, which is what a
 backend actually needs, and typed pointers would only say it twice.
 
-### The runtime: things MIR asks for by name
+### The runtime: explicit calls and typed service bindings
 
-The typed allocation request below is the settled next canonical-MIR slice;
-the current lowerer does not emit it until the sealed native/runtime substrate
-can implement it without circular allocation.
+The typed allocation substrate is canonical MIR now. The source lowerer does
+not emit it until a managed language operation owns its lifetime protocol, but
+all MIR consumers already implement and test the operation itself.
 
 Where does memory for a `list` come from? Who counts references for a
 class? Who prints? Ownership and I/O remain **calls to a small, fixed set of
@@ -281,11 +281,14 @@ CallExtern luce_rt_write, r2, 13
 ```
 
 `AllocateStorage` means storage for `r0` consecutive `Point` values. It does
-not contain `sizeof(Point)` or `alignof(Point)`. The selected backend performs
-checked count-by-size legalization from its layout cache and emits the private
-`luce_rt_alloc(byte_count, byte_alignment)` call. This is the same boundary
-that already turns `FieldAddress` into a target byte offset; the lowerer and
-canonical program remain identical for Wasm and QBE.
+not contain `sizeof(Point)` or `alignof(Point)`. `MirProgram.runtime_bindings`
+maps the semantic `storage_allocator` service to one exact private Luce
+`FunctionId` with signature `(u64 byte_count, u64 byte_alignment) -> Ptr`.
+The selected backend performs checked count-by-size legalization from its
+layout cache and calls that definition directly. It never searches a function
+or linker name. This is the same boundary that already turns `FieldAddress`
+into a target byte offset; the lowerer and canonical program remain identical
+for Wasm and QBE.
 
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
@@ -666,14 +669,14 @@ and count into the function's `operands` array — so an instruction is a
 fixed-size value and a body is two contiguous arrays: instructions and
 operands.
 
-### Runtime symbols
+### Runtime services
 
-Emitted by the lowerer, never by user code; the verifier knows their
-signatures.
+Emitted by the lowerer or runtime composer, never by user code; the verifier
+knows their signatures and bindings.
 
 ```
 AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
-  backend legalization: luce_rt_alloc(u64 byte_count, u64 byte_align) -> Ptr
+  bound private function: (u64 byte_count, u64 byte_align) -> Ptr
 luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
@@ -695,6 +698,8 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
   every fallible path ends in one of those terminators;
 - `c`-convention signatures contain only C-representable types;
 - runtime symbols are called with their known signatures;
+- runtime bindings are unique private Luce functions with the service's exact
+  signature, and every `AllocateStorage` has a storage-allocator binding;
 - globals and data items name existing initializers and valid minimum alignments.
 
 ### Open questions
