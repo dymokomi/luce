@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install the Stage-0 0.25 toolchain this repository builds with.
+# Install the Stage-0 0.26 toolchain this repository builds with.
 # Downloads the archive for this machine from the stage0 release of
 # dymokomi/luce-stage-0, verifies its checksum, and unpacks to ./stage0/.
 set -eu
@@ -19,13 +19,20 @@ esac
 
 # Checksums, one per flavor. bootstrap refuses to install an archive it
 # cannot verify.
-checksum_macos_aarch64=2d2ada820983b6d8869ade6e43b67b41178ab319bb8e8a4cec6c588c21d934c5
-checksum_linux_x86_64=15be55f292dd466da8ee276d107541a3e4013b34eaa6b6db7e9c4c6d11f1acbd
+#
+# The macOS sum is from the 0.26 pre-release archive (source 86b97fac, the
+# commit the release ships) that this tree was migrated against. Confirm it
+# against the published asset when the release goes live; a rebuild that is
+# not byte-identical fails here as a mismatch, which is the safe direction.
+# The Linux sum waits on its CI build — TBD makes bootstrap refuse with a
+# clear message rather than install something it cannot check.
+checksum_macos_aarch64=a48a09a67538a49e22959d8b0e06bb228508e38c700be14e7f983b32959f91e2
+checksum_linux_x86_64=TBD
 
 eval "expected=\$checksum_$(printf %s "$flavor" | tr - _)"
 [ "$expected" != TBD ] || { echo "bootstrap: checksum missing for $flavor" >&2; exit 1; }
 
-archive="luce-0.25-$flavor.tar.gz"
+archive="luce-0.26-$flavor.tar.gz"
 url="https://github.com/$repo/releases/download/$release_tag/$archive"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
