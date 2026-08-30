@@ -103,17 +103,34 @@ cheap standard one.
 Once self-hosted on the 64 MiB we emit, the fat-callee ceiling is about 1,600
 — under the limit, so the guard would stop guarding.
 
-- At startup, query the real bounds (`pthread_get_stacksize_np` on macOS,
-  `pthread_getattr_np` on glibc, `GetCurrentThreadStackLimits` on Windows),
-  exactly as CPython does, and fall back to a documented constant when the
-  query fails.
+**On macOS the query lies, and we would have believed it.** The Stage-0 team
+built this guard, and reports that neither `pthread_get_stacksize_np` nor
+`getrlimit(RLIMIT_STACK)` reflects a linker `-stack_size`: both answer the
+8 MiB default on a main thread that actually has 512 MiB. A guard measuring
+from the platform bound therefore under-estimates by 64× and starts refusing
+calls on a stack with room to spare. Our own §8.1 measurements saw the same
+thing from the other side — raising `ulimit -s` moved nothing, because the
+reservation was never the rlimit's to describe.
+
+So the plan is not "query the bound":
+
+- **Take the floor from the host, not from the platform.** The right design is
+  a host ABI slot carrying the stack floor, exactly as the call-depth budget is
+  carried today; the host is the only party that reliably knows the stack it
+  reserved. This is the direction the Stage-0 team intends and it is an ABI
+  change, so we adopt it rather than invent a second answer.
+- **Until that exists, resolve every uncertainty toward not firing.** Take the
+  *lower* of the platform bound and an entry-frame estimate. A quiet guard
+  costs nothing; one that fires early is a wrong answer to a correct program.
 - Compute `N = (S − R) / (F × H) / k` with `R` = 1 MiB (our diagnostic path
   builds a source trace, so more than Clang's 256 KiB), `F × H` = the measured
   per-call cost, `k` = 10.
 - Keep a declared floor so a failure is reproducible across machines: never
   report a limit above what the smallest supported host affords.
 - Acceptance: the same runaway program traps with a message rather than
-  faulting when run under an artificially small stack (`ulimit -s 1024`).
+  faulting when run under an artificially small stack (`ulimit -s 1024`), and —
+  the case that catches the Darwin bug — does *not* trap early on a main thread
+  whose real stack is far larger than the platform reports.
 
 ### Phase 3 — a stack probe in the native backends and the interpreters
 
@@ -122,7 +139,10 @@ already has it.
 
 - Record the stack base once at entry; at each interpreter call and each
   recursive front-end production, compare the current stack pointer against
-  `base + (S − R)`.
+  `base + (S − R)`. Stage-0's implementation of exactly this traps our
+  fat-frame recursion with a full call trace instead of taking SIGBUS, and
+  reaches 597,695 frames on the 512 MiB it could not previously spend — so the
+  mechanism is proven, and only its interaction with the C boundary is open.
 - On breach: the same reported trap as the count limit, so the two mechanisms
   are indistinguishable to a user and only one message needs documenting.
 - This is what makes the promise in §1 true rather than approximately true.

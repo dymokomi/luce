@@ -100,6 +100,31 @@ We have written the same promise into our own language spec (§13.6: stack
 exhaustion is a trap on every target, never a fault, and the report names the
 limit), so we are asking for something we intend to hold ourselves to.
 
+### Their answer, and where §1 stands (2026-08-29)
+
+Everything below §1 landed. On §1 itself:
+
+- **1a did not reproduce for them** — nine shapes, flat at 896 B/frame,
+  StackColoring already merging the arm slots. We found why: growth needs a
+  union payload *destructured into arm bindings* **and** a value struct built
+  in the same arm. Either alone is flat at 636 B for any arm count, and the
+  data flow between them is irrelevant. Their shapes had the struct without the
+  destructuring. `build/stage0-0.25-repro/` now measures all three controls in
+  one run and its README carries the matrix.
+- **1b was built, worked, and was reverted** — it traps our fat-frame recursion
+  with a call trace instead of SIGBUS and reaches 597,695 frames, but it aborts
+  a `cfunc` disposer callback, and a depth guard that breaks the C boundary is
+  worse than the fault it replaces. The intended design is a host ABI slot
+  carrying the floor, which is a deliberate ABI bump. We agree with reverting.
+- **1c is withdrawn.** They are right: lowering the advertised number does not
+  make a frame counter hold, because the counter measures the wrong quantity
+  and no value of it is honest. We asked for a fallback that would not have
+  helped. 1b remains the answer.
+- **Carried into our own tree**: on macOS neither `pthread_get_stacksize_np`
+  nor `getrlimit(RLIMIT_STACK)` reflects a linker `-stack_size`. Our
+  `recursion.md` Phase 2 said to query exactly those, and would have
+  under-estimated the main thread by 64×. Corrected.
+
 ---
 
 ## 2. `else` and `catch` fallbacks recognise divergence too narrowly
