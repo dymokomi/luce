@@ -12,8 +12,8 @@
 #       Public use begins at `MirInterpreter.run`. Memory is one flat byte
 #       array with a bump allocator that never frees (a test program is
 #       short-lived); address 0 is reserved so a null pointer is 0. Data items
-#       are copied in at load with their relocations patched, globals get
-#       storage initialised from their data, and every call frame allocates
+#       are copied in at load, globals get storage initialised from their
+#       data, and every call frame allocates
 #       its `Alloca` slots on entry. A function's address, for `FunctionAddress`
 #       and `CallIndirect`, is `function_address_base + index`.
 #
@@ -32,10 +32,11 @@
 
 from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, InstructionForm
 from compiler.mir.canonical import MirConstant, MirFunction, MirInstruction, MirProgram, MirSignature, MirType
-from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, RelocationTarget, TypeId, UnaryOp
-from compiler.mir.canonical import align_up, bits_of, builtin_mir_type, find_mir_function, int_maximum
+from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
+from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_function, int_maximum
 from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_int_type, is_ptr_type
-from compiler.mir.canonical import is_signed_int_type, mir_type, size_of, align_of
+from compiler.mir.canonical import is_signed_int_type, mir_type
+from compiler.backends.layout import LayoutRules, TypeLayout, align_up
 import std.strings
 
 # mark: Values and flow ========================================================================
@@ -103,6 +104,7 @@ let frame_limit: i64 = 2000
 
 pub class MirInterpreter:
     let program: MirProgram
+    let layout: TypeLayout
     var depth: i64
     let memory: list[u8]
     let float_cells: list[FloatCell]
@@ -113,8 +115,9 @@ pub class MirInterpreter:
     pub var output: str
 
     ## Prepare to run one program; memory is laid out on the first `run`.
-    pub init(program: MirProgram):
+    pub init(program: MirProgram, rules: LayoutRules):
         self.program = program
+        self.layout = TypeLayout(program.types, rules)
         self.depth = 0
         self.memory = list[u8]()
         self.float_cells = list[FloatCell]()
@@ -143,22 +146,12 @@ pub class MirInterpreter:
                 self.memory[address + index] = item.bytes[index]
             self.data_addresses.append(address)
         for global in program.globals:
-            let size = size_of(program.types, program.layout, global.value_type)
-            self.global_addresses.append(self.allocate(size, align_of(program.types, program.layout, global.value_type)))
-        # Relocations and initialisers can name items laid out later, so they
-        # are patched only once every address is known.
-        for index in range(0, len(program.data)):
-            for relocation in program.data[index].relocations:
-                var target = 0
-                match relocation.target:
-                    Function(id): target = function_address_base + i64(id.value)
-                    Data(id): target = self.data_addresses[id.value]
-                    Global(id): target = self.global_addresses[id.value]
-                self.write_int(self.data_addresses[index] + relocation.offset, program.layout.pointer_size, target)
+            let size = self.layout.size_of(global.value_type)
+            self.global_addresses.append(self.allocate(size, self.layout.align_of(global.value_type)))
         for index in range(0, len(program.globals)):
             let initial = program.globals[index].initial
             if initial != none:
-                let size = size_of(program.types, program.layout, program.globals[index].value_type)
+                let size = self.layout.size_of(program.globals[index].value_type)
                 let source = self.data_addresses[initial.value]
                 for offset in range(0, size):
                     self.memory[self.global_addresses[index] + offset] = self.memory[source + offset]
@@ -178,7 +171,7 @@ pub class MirInterpreter:
             registers[position] = arguments[position]
         let slots = list[i64]()
         for slot in function.slots:
-            slots.append(self.allocate(size_of(self.program.types, self.program.layout, slot.value_type), slot.align))
+            slots.append(self.allocate(self.layout.size_of(slot.value_type), self.layout.align_of(slot.value_type)))
         let frame = Frame(function = function, registers = registers, slots = slots)
         if self.depth >= frame_limit: error("mir interpreter: trap: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
         self.depth += 1
@@ -310,14 +303,16 @@ pub class MirInterpreter:
                 self.store(value_type, ptr_of(frame.registers[address.value]), frame.registers[value.value])
             FieldAddress(result, struct_type, base, field):
                 match mir_type(types, struct_type):
-                    Struct(fields, size, align):
-                        frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + fields[field].offset)
+                    Struct(fields):
+                        frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + self.layout.field_offset(struct_type, field))
                     else: trap("verified FieldAddress on a non-struct type")
+            EnumPayloadAddress(result, enum_type, base):
+                frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + self.layout.enum_payload_offset(enum_type))
             ElementAddress(result, element_type, base, index):
-                let stride = size_of(types, self.program.layout, element_type)
+                let stride = self.layout.size_of(element_type)
                 frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + int_of(frame.registers[index.value]) * stride)
             Memcpy(destination, source, value_type):
-                let size = size_of(types, self.program.layout, value_type)
+                let size = self.layout.size_of(value_type)
                 let to = ptr_of(frame.registers[destination.value])
                 let from = ptr_of(frame.registers[source.value])
                 for offset in range(0, size):
@@ -473,7 +468,7 @@ pub class MirInterpreter:
                 if cell.address == address: return MirValue.Float(value = cell.value)
             return MirValue.Float(value = 0.0)
         if is_bool_type(types, value_type): return MirValue.Bool(value = self.memory[address] != 0)
-        if is_ptr_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.program.layout.pointer_size, false))
+        if is_ptr_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.layout.pointer_size(), false))
         return MirValue.Int(value = self.read_int(address, bits_of(types, value_type) // 8, is_signed_int_type(types, value_type)))
 
     func store(value_type: TypeId, address: i64, value: MirValue):
@@ -486,7 +481,7 @@ pub class MirInterpreter:
             else: self.memory[address] = u8(0)
             return
         if is_ptr_type(types, value_type):
-            self.write_int(address, self.program.layout.pointer_size, ptr_of(value))
+            self.write_int(address, self.layout.pointer_size(), ptr_of(value))
             return
         self.write_int(address, bits_of(types, value_type) // 8, int_of(value))
 

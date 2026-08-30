@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-29 (Stage-0 0.26).
+Last updated: 2026-08-30 (Stage-0 0.26).
 
 ## 1. Where things stand
 
@@ -16,7 +16,7 @@ Last updated: 2026-08-29 (Stage-0 0.26).
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
 | HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: custom `init`, classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, extern/export. Each fails with "not implemented yet" and a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes everything HIR generation produces. Runs `main(arguments: slice[str])` with an empty slice. |
-| Canonical MIR (`mir/canonical.luc`) | Designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction. |
+| Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
@@ -29,6 +29,14 @@ Last updated: 2026-08-29 (Stage-0 0.26).
 - [x] HIR generation for scalars, locals, control flow, calls, constants, tuples, optionals, `str`/`bytes`/`char` literals, `print` of a literal.
 - [x] HIR interpreter as oracle (spec §7 arithmetic, `frame_limit = 2000`, measured rather than inherited — `plan.md` §8.1).
 - [x] Canonical MIR contract, verifier, MIR interpreter (`mir.md`).
+- [x] **Canonical MIR is target-neutral** (2026-08-30). Removed target names,
+  pointer width/alignment, aggregate byte sizes and offsets, slot alignment,
+  and target-sized data relocations from MIR. `FieldAddress`,
+  `ElementAddress`, and `EnumPayloadAddress` retain logical structure; one
+  lowering now feeds every backend. Backend-owned `TypeLayout` computes and
+  caches byte placement. `test.sh` rejects backend imports and concrete target
+  concepts in frontend/HIR/MIR, and the full 392-test plus CLI/Wasm/native
+  diagnostic suite is green.
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
 - [x] Native rung 0 (arm64 Mach-O, x86-64 ELF) for the original slice only.

@@ -84,7 +84,7 @@ examples and tests link back here rather than restating it.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,
-  explicit memory with target layout, structured control flow, calls to a
+  explicit memory with structural aggregates, target-neutral control flow, calls to a
   named runtime, failure as data — see [docs/compiler/mir.md](docs/compiler/mir.md))
   and has a verifier and its own interpreter covering every instruction.
 - The compiled slice — every scalar type with checked arithmetic, locals,

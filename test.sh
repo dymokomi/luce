@@ -14,17 +14,25 @@ unset LUCE_LIB
 luce=./stage0/bin/luce-0-fast
 [ -x "$luce" ] || luce=./stage0/bin/luce-0
 
-# 1. Unit tests: every tests/compiler/**/*_test.luc file.
+# 1. Architectural boundary: target and backend concepts begin at backends/.
+# Frontend, HIR, and MIR are lowered once and must remain target-neutral.
+if grep -R -n -E 'compiler\.backends|TargetLayout|LayoutRules|TypeLayout|pointer_(size|align)|arm64|x86_64|wasm32|macos|linux' \
+    src/compiler/frontend src/compiler/hir src/compiler/mir; then
+    echo "platform dependency found before the backend boundary" >&2
+    exit 1
+fi
+
+# 2. Unit tests: every tests/compiler/**/*_test.luc file.
 "$luce" test
 
-# 2. Command-line contract: exit statuses, usage, and that every failure
+# 3. Command-line contract: exit statuses, usage, and that every failure
 #    path prints its diagnostic (tests/cli_test.sh).
 ./tests/cli_test.sh ./stage0/bin/luce-0
 
 # WebAssembly execution under wasmtime, when it is installed.
 ./tests/wasm_test.sh ./stage0/bin/luce-0
 
-# 3. Native smoke test: build the compiler, build hello.luc for this host,
+# 4. Native smoke test: build the compiler, build hello.luc for this host,
 #    and run it.
 
 if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then

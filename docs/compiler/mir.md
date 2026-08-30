@@ -7,9 +7,10 @@ before a backend turns it into machine code.
 If you have read the top-level README you know the pipeline:
 
 ```
-source → tokens → syntax tree → typed HIR → canonical MIR → wasm / arm64 / x86-64
-                                    │
-                                    └→ the reference interpreter
+source → tokens → syntax tree → typed HIR → canonical MIR → backend
+                                    │                    ├→ QBE
+                                    └→ reference         ├→ wasm
+                                        interpreter     └→ future native encoders
 ```
 
 Typed HIR is the program *as the language sees it*: names resolved, types
@@ -225,7 +226,7 @@ of each one. Duplicated code, yes; but mechanical, verifiable, and free of
 any runtime mechanism. Traps (§13.4) do not run deferred code, exactly as
 the language says.
 
-### Memory: structs, enums, and why MIR knows the target
+### Memory: structure in MIR, byte layout in the backend
 
 Our example only has integers, so let us add a struct:
 
@@ -244,20 +245,18 @@ r3: Ptr = FieldAddress Point, r2, 1     ; address of field 1
 r4: i32 = Load i32, r3
 ```
 
-`FieldAddress` needs to know that field 1 sits at offset 8. Who decides
-that? Not the backend — **MIR does, and stores the answer**. Every `Struct`
-and `Enum` type in a MIR program carries its field offsets, size, and
-alignment, computed by the lowerer from a `TargetLayout` (pointer width,
-alignment rules, the platform's C ABI conventions).
+`FieldAddress` names field 1; it does not contain the byte offset. MIR's
+`Struct` stores the fields in declaration order and `Enum` stores its tag and
+case payload types. That is the language-visible structure. The selected
+backend computes and caches sizes, alignments, field offsets, enum payload
+placement, and pointer width while encoding the program.
 
-This is the one place MIR is *not* target-independent, and it is deliberate.
-Luce talks to C (§21). An `extern struct` must have exactly the layout the C
-compiler gave it *on that platform*, and the only way every backend agrees
-is for MIR to say the offsets out loud and for the verifier to check them
-against the layout. So a wasm32 build and an arm64 build of the same source
-produce two different MIR programs — the same instructions, different
-offsets — and that is correct. It is also why `build` takes a target
-*before* lowering.
+This boundary is strict. Lowering runs once, before a backend is selected,
+and the same `MirProgram` can be handed to wasm, QBE, or a future native
+encoder. The C boundary does not weaken that rule: a `c` signature records
+the C-representable shape and the backend applies that target's ABI and data
+layout. Target names, ABI placement, and byte layout never occur in HIR or
+MIR.
 
 Pointers themselves are untyped: `Ptr` is just an address. The type travels
 on the `Load`, `Store`, or `FieldAddress` that uses it, which is what a
@@ -332,7 +331,7 @@ Three independent executions of every test program:
 1. the **HIR interpreter**, which executes typed HIR and has never heard of
    MIR — so a lowering bug cannot hide in it;
 2. a **MIR interpreter**, a few hundred lines that walk the structured
-   instructions above — no target, no runtime, runs on any machine;
+   instructions above using explicit backend layout rules and no host ABI;
 3. the **compiled artifact**: a wasm module under `wasmtime`, or a native
    executable.
 
@@ -343,10 +342,11 @@ makes that true by construction.
 
 Underneath the testing sits the **verifier**, which runs before and after
 optimization and proves the structural rules: every register defined once
-and before use, types match, branch depths in range, struct offsets agree
-with the layout, fallible paths end in `Return` or `Raise`, C-convention
-signatures carry only C-representable types. Backends assume all of it and
-check nothing.
+and before use, types match, branch depths in range, aggregate type references
+are well founded, fallible paths end in `Return` or `Raise`, and C-convention
+signatures carry only C-representable types. Byte layout is not a verifier
+input because it does not exist in MIR. Backends assume the verified meaning
+and choose its target representation.
 
 ### Native backends, and QBE
 
@@ -360,19 +360,19 @@ its intermediate language:
 | `Alloca` / `Load` / `Store` slots | `alloc8` / `loadl` / `storel`; QBE promotes non-escaping slots | trivial — the promotion pass becomes QBE's |
 | `Block` / `Loop` / `If` / `Br` | labels, `jmp`, `jnz` | a dozen lines |
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
-| `Struct` with stored offsets | `type :name = { … }` aggregates | direct |
+| structural `Struct` / `Enum` | QBE aggregate types plus backend-computed padding | direct |
 | `convention = c` | QBE performs the SysV / Apple arm64 / RISC-V ABI lowering | direct |
-| `CallExtern`, `FunctionAddress`, data relocations | `call $sym`, `$sym` as a value, `data $x = { l $f }` | direct |
+| `CallExtern`, `FunctionAddress`, `DataAddress` | `call $sym`, `$sym` as a value, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
 | fallible `(value, error pointer)` plus caller-owned error parameter | aggregate return or target return registers; error storage is explicit | a small per-backend ABI choice |
 | narrow integer types | sub-word ops spelled out (`extsb`, `storeh`); widths only in signatures | see the open question below |
 
-Nothing in the design fights QBE, and two of its decisions — stored layout
-and backend-owned C ABI — are exactly what QBE expects. A QBE rewritten in
-Luce would be the CFG-plus-SSA layer the *Control flow* section reserves for
-native targets, built from canonical MIR and free to assume everything the
-verifier proved. Either way native output goes through an assembler and
-linker, which is why the plan below says "object file", not "executable".
+Nothing in the design fights QBE. The QBE backend owns target layout, lowers
+structured control flow to QBE's graph, and relies on QBE for ABI lowering,
+instruction selection, and register allocation. The first implementation
+uses the real QBE toolchain as an oracle. A later Luce-native backend can be
+differential-tested against it. Both paths consume the same canonical MIR;
+neither adds a target-specific lowering stage before the backend boundary.
 
 Two consequences for the design record:
 
@@ -410,11 +410,10 @@ Two consequences for the design record:
 
 ```
 MirProgram
-    layout      TargetLayout        pointer width, alignments, C ABI rules
-    types       list[MirType]       every type used, with computed size/align
+    types       list[MirType]       every target-neutral type used
     externs     list[MirExtern]     imported symbols: C functions and the runtime
     globals     list[MirGlobal]     module-level mutable state
-    data        list[MirData]       constant bytes: strings, witness tables, jump tables
+    data        list[MirData]       address-free constant bytes, such as string payloads
     functions   list[MirFunction]
     entry       FunctionId?         process entry when the artifact is an executable
 ```
@@ -430,10 +429,10 @@ each is bound (wasm import versus linker symbol).
 | `Int(bits, signed)` | `i8`…`i64`, `u8`…`u64`; source widths are kept |
 | `Float(bits)` | `f32`, `f64` |
 | `Bool` | one byte, 0 or 1 |
-| `Ptr` | pointer-width address, untyped |
-| `Struct(fields, size, align)` | fields are `(type, offset)`; offsets follow `layout` |
+| `Ptr` | abstract address, untyped; its width is a backend fact |
+| `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
 | `Array(element, count)` | fixed arrays |
-| `Enum(tag, cases, size, align)` | tag is an `Int`; each case is a `Struct` payload |
+| `Enum(tag, cases)` | tag is an `Int`; each case is a `Struct` payload |
 | `Func(signature)` | what a function pointer points at |
 
 How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
@@ -464,20 +463,21 @@ MirFunction
     results       list[TypeId]        0, 1, or 2 (value, error pointer)
     fallible      bool                parameter 0 owns Error; last result reports it
     registers     list[TypeId]        every register, by index
-    slots         list[(TypeId, align)]
+    slots         list[TypeId]          backend computes size and alignment
     body          list[Instruction]   structured, see below
     is_public     bool
     span          SourceSpan
 
 MirExtern     name, convention (c | runtime), params, results, fallible
 MirGlobal     type, initial: DataId?, is_mutable
-MirData       bytes, align, relocations: list[(offset, FunctionId | DataId | GlobalId)]
+MirData       bytes, minimum alignment
 ```
 
 `convention = c` marks an export (§21.5) or a callback handed to C. Such a
 signature may contain only C-representable types; the backend then applies
-the target's C ABI. Relocations let constant data hold addresses (a witness
-table, a string table) before final addresses exist.
+the target's C ABI. `MirData` is address-free raw payload. Address-bearing
+constants will use a typed, structural MIR representation when the language
+needs them; target-sized relocation slots do not belong in canonical MIR.
 
 ### Instructions
 
@@ -518,6 +518,7 @@ Alloca(slot)                              -> r: Ptr
 Load(type, address)                       -> r: type
 Store(type, address, value)
 FieldAddress(struct_type, base, index)    -> r: Ptr
+EnumPayloadAddress(enum_type, base)       -> r: Ptr
 ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
 DataAddress(DataId)                       -> r: Ptr
@@ -585,14 +586,14 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
 - every operand type matches the instruction;
 - `Br`/`BrIf` depths are in range, and `Block`/`If` result registers are
   defined on every path to the join;
-- struct and enum offsets and sizes agree with `layout`;
+- aggregate type references point backward, so by-value types are finite;
 - a fallible signature takes a `Ptr` as parameter 0 and returns a `Ptr` last;
   fallible calls pass the caller-owned error slot and define the reported
   error pointer; a fallible `Return` reports null and `Raise` returns r0;
   every fallible path ends in one of those terminators;
 - `c`-convention signatures contain only C-representable types;
 - runtime symbols are called with their known signatures;
-- relocations point at existing items.
+- globals and data items name existing initializers and valid minimum alignments.
 
 ### Open questions
 
