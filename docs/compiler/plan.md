@@ -223,6 +223,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   count-independent MIR loop. HIR, MIR, Wasm, and real QBE agree on nested
   arrays, zero length, aggregate calls/results, and bounds traps. The adapted
   Stage-0 sort program uses allocation-free fixed storage and is a native QBE gate.
+- [x] **The adopted Brainfuck example is a whole-program integration gate**
+  (2026-08-30): Stage-0's interpreter algorithm now runs with explicit fixed
+  tape/output capacities, retaining its bytecode loop, forward/backward
+  bracket search, nested `while`/`match`, wrapping `u8` cells and output
+  verification. HIR execution, optimized canonical MIR, Wasm encoding and the
+  native QBE product path all agree. This is deliberately an example gate,
+  not a second array implementation or a hidden builder; growable output still
+  waits for the target-neutral allocation/runtime contract.
 - [x] **Exact ordinary function values** (2026-08-30): named Luce functions
   become statically typed HIR `FunctionAddress` values and calls through
   locals, constants, fields, parameters, results, conditionals and imported

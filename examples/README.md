@@ -29,6 +29,10 @@ belongs to.
   proves array value copies, aggregate calls/results, checked mutation, and
   structural equality through native QBE without depending on the future
   collection runtime.
+- `stage0_brainfuck.luc` preserves Stage-0's interpreter loop and bracket
+  search with explicit fixed tape/output capacities. Bytes, nested control
+  flow, exhaustive matching, wrapping cells, checked mutation and aggregate
+  results execute through HIR, Wasm and native QBE.
 - `function_values.luc` is an end-to-end exact-function-value example. Named
   function addresses, selection, aliases, fields, parameters/results and
   fallible calls execute through the semantic oracle and native QBE, and the
@@ -54,7 +58,7 @@ artifacts are never imported.
 | `hello` | entry arguments, strings, output | Intent represented by `hello.luc`; compiled on both artifact paths. |
 | `calc` | byte scanning, checked indexing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; native QBE execution green. |
 | `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` adopted as allocation-free `stage0_sort.luc` using fixed arrays; the growable-list form and `stats` still wait for collections/runtime. |
-| `bf` | arrays, string/array indexing, characters, string builder | Catalogued; waits for dense storage and string operations. |
+| `bf` | arrays, byte indexing, nested loops/match, wrapping cells, output construction | Adopted as allocation-free `stage0_brainfuck.luc`; the interpreter executes through every current product path, while general builders still wait for the runtime. |
 | `dice` | RNG, arrays/lists, formatted strings, files | Catalogued; waits for collections, formatting, and the standard runtime. |
 | `life` | two-dimensional arrays, terminal input/output, timing | Fixed-array storage is now covered; the full program still waits for terminal and timing host services. |
 | `wordcount` | maps, string scanning, builders, files | Catalogued; waits for collections and string operations. |
@@ -63,7 +67,8 @@ artifacts are never imported.
 | `editor` | classes/ARC, closures, collections, terminal UI, files, LSP client | Catalogued for the host proving-program phase. |
 | `lsp` | interfaces, classes, JSON, byte framing, I/O, processes | Catalogued for the host proving-program phase. |
 
-The fixed-array slice removes allocation-free dense storage from this map.
+The fixed-array slice and the Brainfuck gate remove allocation-free dense
+storage and nontrivial byte-driven interpreter control flow from this map.
 The remaining small and medium programs are dominated by growable
 collections, slicing, text construction, files, and host services. Their
 runtime work starts only after the target-neutral allocation contract is

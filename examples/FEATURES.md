@@ -28,6 +28,7 @@ also run or compile is defined once, under "What works today" in the
 | Arithmetic, bitwise, range, comparison, identity, and Boolean operators | `operators_and_literals.luc` |
 | Checked arithmetic lowered to Wasm and QBE | `compiled_core/main.luc` |
 | Fixed-array values, copies, checked mutation, sorting, and QBE execution | `stage0_sort.luc` |
+| Bytecode-style interpretation with nested loops, match, fixed tape/output, and QBE execution | `stage0_brainfuck.luc` |
 | Exact named function values, selection, storage, and indirect calls | `function_values.luc` |
 | Exact named C-callable values, generated adapters, and C indirect calls | `cfunc_values.luc` |
 | Native entry point and terminal output through the QBE product path | `hello.luc` |
