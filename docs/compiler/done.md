@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-30 (Stage-0 0.26).
+Last updated: 2026-08-30 (Stage-0 0.27).
 
 ## 1. Where things stand
 
@@ -21,7 +21,7 @@ Last updated: 2026-08-30 (Stage-0 0.26).
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
 | Tests | 392 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~125 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
-| Toolchain | Stage-0 0.26 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
+| Toolchain | Stage-0 0.27 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
 
 ## 2. Done, in order
 
@@ -52,6 +52,11 @@ Last updated: 2026-08-30 (Stage-0 0.26).
 - [x] **Spans are 16 bytes** (2026-08-28). `SourceSpan` is four `u32`s instead of four `i64`s; it sits in every token, syntax node, HIR node, and MIR instruction. Tokens keep their `str` text for now (front-end-only cost).
 - [x] **Ids are `u32`** (2026-08-28). `TypeId`, `SymbolId`, `ModuleId`, `RegisterId`, `FunctionId`, `ExternId`, `GlobalId`, `DataId` hold a `u32` index; `no_register` (`u32` max) replaces the `-1` sentinel. The first data-oriented-layout item (`plan.md` §5). The `i64(...)` widening every index site needed under Stage-0 went away in 0.26, which indexes with any integer: 98 conversions deleted 2026-08-29.
 - [x] **Stage-0 0.26 adopted** (2026-08-29). Six `discard(...)` sites for the new unused-result rule, and a parser refactor that made 113 more unnecessary — `expect_symbol`/`expect_kind`/`expect_keyword` answer nothing now, `step()` moves past a token where `advance()` answers the one it moved past, and the eleven callers that wanted the token read `current()` first. Installed from the pre-release archive at `86b97fac`; `bootstrap.sh` holds the Linux checksum at `TBD` until CI publishes it. The exchange, including the request list and what the team answered, is in `stage0-0.26.md`.
+- [x] **Stage-0 0.27 adopted** (2026-08-30). Both release archives are
+  pinned by published checksums. The reported quadratic `str` traversal is
+  fixed upstream: the unchanged 20k–160k-character reproduction takes
+  0.12–0.15 s per complete case. The clean 392-test, CLI, Wasm, and native
+  gate passed; evidence is in `stage0-0.27.md`.
 - [x] **The front end is linear** (2026-08-29, `recursion.md` §5). It was quadratic in file size: 8,000 statements took 179 s, 8,000 comment lines took 25 s. Three causes — bracket matching scanned per nesting level, `len(self.source)` sat inside the scanning loops, and `str` indexing walks the string in Stage-0 (`text[i]` is O(i), `for c in text` is O(n²), `text[a:b]` is O(a)). The tokenizer now decodes `bytes(source)` once into a `list[char]`, scans that, and builds token text with `text_between`; the parser precomputes bracket matches in `match_brackets`. Same inputs: 0.42 s and 0.07 s, and 1.4 MB in 3.1 s. Reported upstream for 0.27 with a reproduction (`build/stage0-0.27-repro/`), since the `str` cost is Stage-0's and it bounded self-hosting.
 - [x] **Expression nesting is bounded** (2026-08-29). 26,250 nested parentheses took SIGBUS; 25,000 did not. `parse_expression` counts its depth and refuses past 256 — Swift's and Clang's number, from the C++ standard's recommended minimums — with `expression nests deeper than 256`. Pinned by `test_expression_nesting_is_bounded`. The crash had been invisible because the old tokenizer took minutes to reach that depth: fixing throughput is what exposed it.
 - [x] **Integer ranges and `for`** (2026-08-29). `range[T]` is an immutable `{lower, upper, inclusive}` value for every implemented integer width; it can be bound, compared, passed, and returned under the aggregate protocol. `for` binds each element immutably, handles empty and closed ranges, and gives `continue` an inner block so it reaches the increment rather than restarting the same value. A closed range ending at the type maximum stops before incrementing. The HIR oracle, MIR interpreter, and wasm agree on half-open/closed/empty/max ranges, nesting, break/continue, early return, and range aggregate calls. The gate is settled separately in the spec: `try for` selects `FallibleIterable[T]` and makes propagation visible; its executable path waits for the failure ABI.
