@@ -276,6 +276,35 @@ which will churn any snapshot of diagnostic output. It did not affect us.
 
 ---
 
+## New, found after 0.26 shipped — for 0.27
+
+**Walking a `str` is quadratic.** `text[i]` costs O(i), `for c in text` is
+O(n²) over the whole string, and `text[a:b]` costs O(a). One pass over a
+160,000-character file takes 24 s; the same pass over `bytes(text)` is
+instant, and `bytes(text)` itself is one linear pass.
+
+| characters | `for c in text` |
+| --- | --- |
+| 20,000 | 0.55 s |
+| 40,000 | 1.62 s |
+| 80,000 | 6.08 s |
+| 160,000 | 24.16 s |
+
+Our tokenizer walked the source this way and was quadratic in file size:
+8,000 statements took 179 s. Rewriting it to decode `bytes(source)` once and
+scan a `list[char]` brought that to 0.42 s and made throughput linear — 425×
+on one file, and the difference between a compiler that can read its own
+~500 KB of source and one that cannot.
+
+The workaround exists, so this is not blocking us. But it costs `str` its
+usefulness for the thing a compiler mostly does, and the next person to write
+a scanner will hit it too. The obvious shape is a byte array plus an
+all-ASCII flag set at construction, which makes `text[i]` a single load
+without changing character-indexed semantics; a cached last-index/offset pair
+would fix sequential scans alone, which is every tokenizer's access pattern.
+
+Reproduction with a `run.sh`: `build/stage0-0.27-repro/`.
+
 ## What we are not asking for
 
 - **Argument labels.** See the header: we changed our spec to `name = value`.
