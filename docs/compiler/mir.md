@@ -362,7 +362,7 @@ backend translates canonical MIR directly into QBE IL:
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
 | structural `Struct` / `Enum` | memory plus backend-computed offsets and `blit` | direct |
 | `convention = c` | QBE ABI extension types and platform ABI lowering | scalar and nominal-handle imports/exports complete; richer translations remain |
-| `CallExtern`, `FunctionAddress`, `DataAddress` | `call $sym`, `$sym` as a value, named data | direct |
+| `CallExtern`, `FunctionAddress`, `ExternAddress`, `DataAddress` | direct C call, defined/imported callable tokens, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
 | fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
 | narrow integer types | `w` temporaries plus explicit extension, guards, and sub-word memory operations | direct legalization |
@@ -595,6 +595,7 @@ GlobalAddress(GlobalId)                   -> r: Ptr
 LoadExternalGlobal(ExternalGlobalId)      -> r: type
 StoreExternalGlobal(ExternalGlobalId, value)
 FunctionAddress(FunctionId)               -> r: Ptr     opaque exact-function call token
+ExternAddress(ExternId)                   -> r: Ptr     opaque C-symbol call token
 ```
 
 **Calls** — a fallible target takes the caller's error-slot pointer as its
@@ -605,15 +606,19 @@ separate hidden result-slot argument described above.
 ```
 Call(FunctionId, args)                       -> results
 CallExtern(ExternId, args)                   -> results
-CallIndirect(signature, target, args)        -> results
+CallIndirect(signature, convention, target, args) -> results
 ```
 
 An exact source `func(P...) -> R` is an opaque pointer-shaped value in
 canonical MIR; its type is carried by the `CallIndirect` operation, not
 recovered from its representation. `FunctionAddress` creates the token for a
 defined Luce function. QBE currently represents it as a code address, while
-Wasm represents it as a slot in an on-demand funcref table. Neither choice is
-a HIR/MIR fact. A later closure slice may make the backend token refer to a
+Wasm represents it as a slot in an on-demand funcref table. A source `cfunc`
+uses the same opaque token and indirect operation, but the operation retains
+the C convention; `ExternAddress` names an exact imported C symbol, while a
+converted Luce definition's `FunctionAddress` names its generated C adapter.
+Table indices, code addresses and ABI placement are not HIR/MIR facts. A later
+closure slice may make an ordinary-function backend token refer to a
 managed code-and-environment descriptor without changing source type checking
 or introducing target layout before the backend boundary.
 

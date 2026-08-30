@@ -821,7 +821,9 @@ pub class HirGenerator:
                     try self.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
             names.append(parameter.name)
             let value_type = try self.resolve_type(module_index, parameter.value_type)
-            if not self.is_c_function_value(value_type):
+            var supported = self.is_c_function_value(value_type)
+            if parameter.is_out: supported = self.is_c_function_component(value_type)
+            if not supported:
                 var kind = "parameter"
                 if parameter.is_out: kind = "out parameter"
                 try self.fail_at(module_index, parameter.span, "extern function `" + function.name + "` " + kind + " `" + parameter.name + "` has unsupported boundary type `" + self.describe_type(value_type) + "`")
@@ -836,7 +838,7 @@ pub class HirGenerator:
         if result_syntax != none: declared_result = try self.resolve_type(module_index, result_syntax)
         if self.contains_fallible(declared_result):
             try self.fail_at(module_index, span, "an extern function cannot be fallible")
-        if not types_match(declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_value(declared_result):
+        if not types_match(declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(declared_result):
             try self.fail_at(module_index, span, "extern function `" + function.name + "` has unsupported result type `" + self.describe_type(declared_result) + "`")
         let contract = HirCFunction(is_blocking = function.is_blocking, slots = slots, declared_result = declared_result)
         let result = self.c_source_result(contract)
@@ -891,20 +893,31 @@ pub class HirGenerator:
             span = span,
         ))
 
-    # The direct C-call slice intentionally admits exactly the scalar types
-    # canonical MIR and both artifact backends already represent without a
-    # target-specific layout decision.
+    # An exported function receives values from C, so its current vocabulary
+    # excludes cfunc pointers until the foreign-pointer oracle exists. Extern
+    # calls use the direction-aware checks in `collect_extern_function`: an
+    # exact named callback may flow out as an input, but arbitrary pointers do
+    # not yet flow back through results or `out` slots.
     func require_c_function_type(module_index: i64, parameters: list[HirParameter], result: TypeId, span: SourceSpan, what: str) -> !:
         for parameter in parameters:
-            if not self.is_c_function_value(parameter.value_type):
+            if not self.is_c_function_component(parameter.value_type):
                 try self.fail_at(module_index, span, what + " parameter `" + parameter.name + "` has unsupported boundary type `" + self.describe_type(parameter.value_type) + "`")
-        if not types_match(result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_value(result):
+        if not types_match(result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(result):
             try self.fail_at(module_index, span, what + " has unsupported result type `" + self.describe_type(result) + "`")
 
-    # A direct C function slot is a scalar, a nominal handle, or an optional
-    # pointer-shaped handle. The optional stays tagged in ordinary HIR and is
-    # encoded as C null only by the boundary adapter.
+    # An outbound extern-call input may additionally carry one complete cfunc:
+    # the value must already name a Luce adapter or exact extern symbol.
     func is_c_function_value(value: TypeId) -> bool:
+        if self.is_c_scalar_or_handle(value): return true
+        match self.types.definitions[value.value].form:
+            CFunction(parameters, result): return true
+            Optional(inner): return self.is_pointer_extern_type(inner)
+            else: return false
+
+    # A component inside a `cfunc` signature cannot itself be a function
+    # pointer. This enforces the deliberately closed, non-recursive callback
+    # vocabulary while ordinary extern slots may carry one complete cfunc.
+    func is_c_function_component(value: TypeId) -> bool:
         if self.is_c_scalar_or_handle(value): return true
         match self.types.definitions[value.value].form:
             Optional(inner): return self.is_pointer_extern_type(inner)
@@ -1300,7 +1313,16 @@ pub class HirGenerator:
                 try self.validate_function_result(module_index, result_type, result.span)
                 return self.intern_function_type(parts, result_type)
             CFunctionType(parameters, result):
-                error(self.diagnostic_at(module_index, value.span, "cfunc types are not implemented yet"))
+                let parts = list[TypeId]()
+                for parameter in parameters:
+                    let parameter_type = try self.resolve_type(module_index, parameter)
+                    if not self.is_c_function_component(parameter_type):
+                        try self.fail_at(module_index, parameter.span, "a `cfunc` parameter has unsupported C boundary type `" + self.describe_type(parameter_type) + "`")
+                    parts.append(parameter_type)
+                let result_type = try self.resolve_type(module_index, result)
+                if not types_match(result_type, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(result_type):
+                    try self.fail_at(module_index, result.span, "a `cfunc` result has unsupported C boundary type `" + self.describe_type(result_type) + "`")
+                return self.intern_c_function_type(parts, result_type)
             OptionalType(optional_value):
                 return self.intern_optional(try self.resolve_type(module_index, optional_value))
             FallibleType(successful_value):
@@ -2130,13 +2152,17 @@ pub class HirGenerator:
         let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = placed), function.result, span)
         return try self.require_type(typed, expected)
 
-    # Calls through a `func` value have no declaration labels or defaults:
-    # the type carries only parameter order, exact types, and the result.
+    # Calls through `func` and `cfunc` values share one semantic operation.
+    # Neither type carries declaration labels or defaults; the convention is
+    # a type fact consumed only when canonical MIR is built.
     func check_indirect_call_node(checked_callee: NodeId, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         let parameters = list[TypeId]()
         var result = resolve_builtin_type(BuiltinType.unit)
         match self.types.definitions[self.type_of(checked_callee).value].form:
             Function(function_parameters, function_result):
+                for parameter in function_parameters: parameters.append(parameter)
+                result = function_result
+            CFunction(function_parameters, function_result):
                 for parameter in function_parameters: parameters.append(parameter)
                 result = function_result
             else: try self.fail(self.span_of(checked_callee), "`" + self.describe_type(self.type_of(checked_callee)) + "` is not callable")
@@ -2150,17 +2176,43 @@ pub class HirGenerator:
         let typed = self.push_node(HirNodeForm.IndirectCall(callee = checked_callee, arguments = self.push_nodes(checked_arguments)), result, span)
         return try self.require_type(typed, expected)
 
-    # A declaration name becomes a capture-free function value with its exact
-    # Luce signature. C declarations use `cfunc`, never the Luce call ABI.
+    # A declaration name becomes a capture-free callable value. A Luce
+    # definition normally uses its exact `func` type, but a matching `cfunc`
+    # context selects a C adapter. An extern declaration has only a `cfunc`
+    # identity and cannot be converted when `out` changes its source shape.
     func check_function_address(function_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let function = self.functions[function_index]
         if function.receiver != none:
             try self.fail(span, "method values are not supported; pass an explicit capture-free function")
-        match function.source:
-            ExternalC(contract): try self.fail(span, "extern function `" + function.name + "` converts only to a matching `cfunc` type")
-            else: pass
         let parameters = list[TypeId]()
         for parameter in function.parameters: parameters.append(parameter.value_type)
+        let c_context = self.c_function_context(expected)
+        match function.source:
+            ExternalC(contract):
+                for slot in contract.slots:
+                    match slot:
+                        Output(name, value_type): try self.fail(span, "extern function `" + function.name + "` has `out` slots and cannot become a `cfunc` value")
+                        Input(parameter): pass
+                for parameter in function.parameters:
+                    if not self.is_c_function_component(parameter.value_type):
+                        try self.fail(span, "extern function `" + function.name + "` parameter `" + parameter.name + "` cannot appear in a `cfunc` signature as `" + self.describe_type(parameter.value_type) + "`")
+                if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(contract.declared_result):
+                    try self.fail(span, "extern function `" + function.name + "` result cannot appear in a `cfunc` signature as `" + self.describe_type(contract.declared_result) + "`")
+                let function_type = self.intern_c_function_type(parameters, contract.declared_result)
+                let address = self.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+                return try self.require_type(address, expected)
+            else: pass
+        if c_context != none:
+            for parameter in function.parameters:
+                if not self.is_c_function_component(parameter.value_type):
+                    try self.fail(span, "function `" + function.name + "` parameter `" + parameter.name + "` cannot cross a C callback boundary as `" + self.describe_type(parameter.value_type) + "`")
+            if self.contains_fallible(function.result):
+                try self.fail(span, "fallible function `" + function.name + "` cannot become a `cfunc` value")
+            if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(function.result):
+                try self.fail(span, "function `" + function.name + "` result cannot cross a C callback boundary as `" + self.describe_type(function.result) + "`")
+            let function_type = self.intern_c_function_type(parameters, function.result)
+            let address = self.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+            return try self.require_type(address, expected)
         let function_type = self.intern_function_type(parameters, function.result)
         let address = self.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
         return try self.require_type(address, expected)
@@ -2933,6 +2985,28 @@ pub class HirGenerator:
             name = name + self.describe_type(parameter)
             index += 1
         return self.intern_named(name + ") -> " + self.describe_type(result), TypeForm.Function(parameters = parameters, result = result))
+
+    func intern_c_function_type(parameters: list[TypeId], result: TypeId) -> TypeId:
+        var name = "cfunc("
+        var index = 0
+        for parameter in parameters:
+            if index > 0: name = name + ", "
+            name = name + self.describe_type(parameter)
+            index += 1
+        return self.intern_named(name + ") -> " + self.describe_type(result), TypeForm.CFunction(parameters = parameters, result = result))
+
+    # Unwrap only the contextual optional injection that `require_type`
+    # already owns. This lets `Some(c_callback)` choose C conversion without
+    # duplicating optional construction here.
+    func c_function_context(expected: TypeId?) -> TypeId?:
+        if expected == none: return none
+        match self.types.definitions[expected.value].form:
+            CFunction(parameters, result): return expected
+            Optional(inner):
+                match self.types.definitions[inner.value].form:
+                    CFunction(parameters, result): return inner
+                    else: return none
+            else: return none
 
     func optional_inner(value: TypeId) -> TypeId?:
         if i64(value.value) >= len(self.types.definitions): return none

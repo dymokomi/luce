@@ -193,8 +193,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   semantic oracles use explicit variable hosts, QBE binds the C object symbol,
   and Wasm imports one mutable `env` global. Bare pointer-handle zero is
   ordinary global state; null translation remains confined to callable C
-  boundaries. Strings, extern structs, exported structs/enums, and `cfunc`
-  remain on this item.
+  boundaries. Exact named `cfunc` values are complete in the separate rung
+  below. Strings, extern structs, exported structs/enums, dynamically
+  supplied C function pointers, and nullable cfunc slots remain on this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
@@ -233,8 +234,24 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   optimized MIR, Wasmtime, real QBE and `examples/function_values.luc` agree,
   including aggregate/fallible protocols, defer capture and evaluation order.
   This does **not** claim closures or the spec's infallible-to-fallible lift:
-  both need the managed environment/allocation contract below. `cfunc` remains
-  on the C-boundary item.
+  both need the managed environment/allocation contract below.
+- [x] **Exact named `cfunc` values and C-convention indirect calls**
+  (2026-08-30): the contextual type is now a canonical HIR form, while calls
+  reuse the same positional `IndirectCall` node as ordinary function values.
+  A matching capture-free Luce name selects one demand-generated C adapter;
+  an exact extern name becomes an external-symbol address without a wrapper.
+  Canonical MIR adds only the facts that actually diverge at this boundary:
+  `CallIndirect` carries its calling convention and `ExternAddress` names a C
+  symbol. C null adaptation for nullable pointer-handle parameters/results is
+  shared with direct C calls. The verifier, optimizer and MIR oracle cover the
+  new identity/convention edges; Wasm maps definitions then addressed imports
+  into its backend-owned table; real QBE executes both libc addresses and a
+  generated adapter invoked back from libc through `atexit`. Stored fields,
+  parameters/results, aliases and selection run in
+  the differential corpus and `examples/cfunc_values.luc`. This rung does
+  **not** claim pointers dynamically returned by C, nullable cfunc slots, or
+  lambda/closure conversion; those need the explicit foreign-pointer oracle
+  and managed-environment work rather than an implicit representation trick.
 - [ ] **Settle the target-neutral runtime allocation contract before coding
   it.** The language already reserves reviewed `.native.luc` capabilities,
   but neither the spec nor canonical MIR yet says how a runtime requests

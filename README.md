@@ -101,6 +101,7 @@ examples and tests link back here rather than restating it.
   checked indexing and nested mutable places, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
+  exact named C-callable values with generated adapters or extern addresses,
   and `print` of a
   literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.

@@ -96,6 +96,11 @@ from compiler.hir.analyzer import AnalyzedProgram
 from compiler.frontend.source import SourceSpan, format_diagnostic
 import std.strings
 
+func contains_symbol(symbols: list[SymbolId], target: SymbolId) -> bool:
+    for symbol in symbols:
+        if symbol.value == target.value: return true
+    return false
+
 # One local of the function being lowered: its HIR symbol and the register
 # holding its slot address.
 struct Local:
@@ -148,6 +153,12 @@ union LoweredFunction:
     Defined(function: FunctionId)
     External(external: ExternId)
 
+# A C-callable adapter is generated only when an address conversion needs
+# one, except that an explicit `export c` already owns the same adapter.
+union CWrapper:
+    Absent
+    Present(function: FunctionId)
+
 # The source-level contract behind one interned C symbol. Canonical MIR has
 # already erased handle nominality and boundary optionals when it describes a
 # raw call slot, so its signature alone cannot distinguish `Window` from
@@ -180,6 +191,7 @@ pub class Lowerer:
     let external_global_contracts: list[ExternalGlobalContract]
     let data: list[MirData]
     let lowered_functions: list[LoweredFunction]
+    let c_wrappers: list[CWrapper]
     let c_extern_contracts: list[CExternContract]
     # The register table, slots, live locals, and parameter registers of the
     # function being lowered.
@@ -211,6 +223,7 @@ pub class Lowerer:
         self.external_global_contracts = list[ExternalGlobalContract]()
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
+        self.c_wrappers = list[CWrapper]()
         self.c_extern_contracts = list[CExternContract]()
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
@@ -233,6 +246,7 @@ pub class Lowerer:
         # Declare every callable identity before lowering any body, so forward
         # and cross-module calls need no late lookup or placeholder state.
         var next_definition: u32 = 0
+        let callback_symbols = self.c_wrapper_symbols()
         for function in self.program.functions:
             match function.implementation:
                 ExternalC(contract):
@@ -240,12 +254,19 @@ pub class Lowerer:
                     let signature = try self.lower_external_signature(module, function, contract)
                     let external = try self.declare_c_extern(function, contract, signature)
                     self.lowered_functions.append(LoweredFunction.External(external = external))
+                    self.c_wrappers.append(CWrapper.Absent)
                 ExportedC(body):
                     self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
+                    self.c_wrappers.append(CWrapper.Present(function = FunctionId(value = next_definition + 1)))
                     next_definition += 2
                 Defined(body):
                     self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
                     next_definition += 1
+                    if contains_symbol(callback_symbols, function.symbol):
+                        self.c_wrappers.append(CWrapper.Present(function = FunctionId(value = next_definition)))
+                        next_definition += 1
+                    else:
+                        self.c_wrappers.append(CWrapper.Absent)
         # C objects share the linker namespace with C functions. Equal
         # declarations in several raw modules share one canonical identity.
         for variable in self.program.extern_variables:
@@ -257,10 +278,13 @@ pub class Lowerer:
                 ExportedC(body):
                     let module = self.program.modules[function.module.value]
                     functions.append(try self.lower_function(module, function))
-                    functions.append(try self.lower_export_wrapper(module, function))
+                    functions.append(try self.lower_c_wrapper(module, function, true))
                 Defined(body):
                     let module = self.program.modules[function.module.value]
                     functions.append(try self.lower_function(module, function))
+                    match self.c_wrappers[self.function_index_of(function.symbol)]:
+                        Present(wrapper): functions.append(try self.lower_c_wrapper(module, function, false))
+                        Absent: pass
         let entry = self.find_entry(functions)
         return MirProgram(
             types = self.types,
@@ -271,6 +295,21 @@ pub class Lowerer:
             functions = functions,
             entry = entry,
         )
+
+    # HIR has already fixed each address conversion's type. Scan that one
+    # canonical fact before assigning FunctionIds so generated adapters never
+    # require late identity patching or backend-specific discovery.
+    func c_wrapper_symbols() -> list[SymbolId]:
+        let symbols = list[SymbolId]()
+        for index in range(0, len(self.program.nodes)):
+            match self.program.nodes[index].form:
+                FunctionAddress(target):
+                    match self.program.types.definitions[self.program.node_types[index].value].form:
+                        CFunction(parameters, result):
+                            if not contains_symbol(symbols, target): symbols.append(target)
+                        else: pass
+                else: pass
+        return symbols
 
     # Entry selection uses source visibility directly without confusing it
     # with the separate artifact-export flag retained in MIR. The function
@@ -468,10 +507,11 @@ pub class Lowerer:
         self.error_slot = -1
         self.result_slot = -1
 
-    # One target-neutral C export adapter. The source body remains an ordinary
+    # One target-neutral C adapter. The source body remains an ordinary
     # Luce-convention function so source calls never acquire boundary traps or
-    # null encoding. Both artifact backends consume this same wrapper.
-    func lower_export_wrapper(module: HirModule, function: HirFunction) -> MirFunction!:
+    # null encoding. Explicit exports and named cfunc conversions share it;
+    # both artifact backends consume the same canonical wrapper.
+    func lower_c_wrapper(module: HirModule, function: HirFunction, is_exported: bool) -> MirFunction!:
         self.begin_function()
         let body = list[MirInstruction]()
         let parameter_types = list[TypeId]()
@@ -509,8 +549,12 @@ pub class Lowerer:
             results.append(try self.c_boundary_type_of(module, function, function.span, function.result))
             body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run([encoded])), span = function.span))
 
+        var wrapper_name = function.name
+        # A leading dot cannot be written as a Luce declaration name, making
+        # the generated namespace collision-free without backend mangling.
+        if not is_exported: wrapper_name = ".luce_cfunc_" + str(function.symbol.value)
         return MirFunction(
-            name = function.name,
+            name = wrapper_name,
             convention = CallingConvention.c,
             signature = MirSignature(parameters = parameter_types, results = results, is_fallible = false),
             registers = self.registers,
@@ -518,7 +562,7 @@ pub class Lowerer:
             body = body,
             operands = self.operands.operands,
             is_public = false,
-            is_exported = true,
+            is_exported = is_exported,
             span = function.span,
         )
 
@@ -1154,12 +1198,21 @@ pub class Lowerer:
                 # an indirect signature that disagrees with the definition.
                 if self.is_process_entry(self.program.functions[source_index]):
                     try self.fail_unsupported(module, function, span, "process-entry function values")
-                var lowered = FunctionId(value = 0)
-                match self.lowered_functions[source_index]:
-                    Defined(function_id): lowered = function_id
-                    External(external): trap("Luce function address names a C extern")
                 let result = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = lowered), span = span))
+                match self.program.types.definitions[node_type(self.program, expression).value].form:
+                    CFunction(parameters, function_result):
+                        match self.lowered_functions[source_index]:
+                            External(external): body.append(MirInstruction(form = InstructionForm.ExternAddress(result = result, external = external), span = span))
+                            Defined(function_id):
+                                match self.c_wrappers[source_index]:
+                                    Present(wrapper): body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = wrapper), span = span))
+                                    Absent: trap("cfunc conversion has no predeclared C wrapper")
+                    else:
+                        var lowered = FunctionId(value = 0)
+                        match self.lowered_functions[source_index]:
+                            Defined(function_id): lowered = function_id
+                            External(external): trap("Luce function address names a C extern")
+                        body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = lowered), span = span))
                 return result
             ExternLoad(variable_index):
                 let global = self.lowered_external_globals[variable_index]
@@ -1403,8 +1456,9 @@ pub class Lowerer:
             placed[parameter_index] = try self.lower_expression(module, function, argument, body)
         return placed
 
-    # Canonical calling shape for a source `func` type. Hidden error and
-    # aggregate-result pointers are the same protocol direct calls use.
+    # Canonical calling shape for either callable type. Luce values reuse the
+    # direct-call hidden result/error protocol; cfunc values use the closed raw
+    # C boundary shape and are necessarily infallible.
     func lower_function_value_signature(module: HirModule, function: HirFunction, span: SourceSpan, function_type: ir.TypeId) -> MirSignature!:
         let source_parameters = list[ir.TypeId]()
         var source_result = resolve_builtin_type(BuiltinType.unit)
@@ -1412,6 +1466,14 @@ pub class Lowerer:
             Function(parameters, result):
                 for parameter in parameters: source_parameters.append(parameter)
                 source_result = result
+            CFunction(parameters, result):
+                let c_parameters = list[TypeId]()
+                for parameter in parameters:
+                    c_parameters.append(try self.c_boundary_type_of(module, function, span, parameter))
+                let c_results = list[TypeId]()
+                if not types_match(result, resolve_builtin_type(BuiltinType.unit)):
+                    c_results.append(try self.c_boundary_type_of(module, function, span, result))
+                return MirSignature(parameters = c_parameters, results = c_results, is_fallible = false)
             else: trap("indirect call has a non-function HIR type")
         let parameters = list[TypeId]()
         let results = list[TypeId]()
@@ -1430,6 +1492,12 @@ pub class Lowerer:
             parameters.append(self.register_type_for(value_type))
         return MirSignature(parameters = parameters, results = results, is_fallible = fallible != none)
 
+    func function_value_convention(function_type: ir.TypeId) -> CallingConvention:
+        match self.program.types.definitions[function_type.value].form:
+            CFunction(parameters, result): return CallingConvention.c
+            Function(parameters, result): return CallingConvention.luce
+            else: trap("indirect call has a non-function HIR type")
+
     # Callee expression first, then positional arguments left to right.
     func lower_indirect_operands(module: HirModule, function: HirFunction, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> IndirectOperands!:
         let target = try self.lower_expression(module, function, callee, body)
@@ -1441,8 +1509,11 @@ pub class Lowerer:
     func lower_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.program, expression)
         let operands = try self.lower_indirect_operands(module, function, callee, arguments, body)
-        let signature = try self.lower_function_value_signature(module, function, span, node_type(self.program, callee))
+        let callee_type = node_type(self.program, callee)
+        let signature = try self.lower_function_value_signature(module, function, span, callee_type)
         if signature.is_fallible: trap("fallible indirect call entered infallible lowering")
+        if self.function_value_convention(callee_type) == CallingConvention.c:
+            return try self.lower_c_indirect_call(module, function, expression, callee_type, operands, signature, body)
         let call_arguments = list[RegisterId]()
         let results = list[RegisterId]()
         let source_result = node_type(self.program, expression)
@@ -1456,8 +1527,33 @@ pub class Lowerer:
                 value = self.new_register(result_type)
                 results.append(value)
         for argument in operands.values: call_arguments.append(argument)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, convention = CallingConvention.luce, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
         return value
+
+    # A cfunc call uses the same evaluated callee/argument list as an ordinary
+    # indirect call, but each nullable pointer-shaped slot is translated at
+    # this one C boundary. ABI placement is still a backend responsibility.
+    func lower_c_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee_type: ir.TypeId, operands: IndirectOperands, signature: MirSignature, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let source_parameters = list[ir.TypeId]()
+        var source_result = resolve_builtin_type(BuiltinType.unit)
+        match self.program.types.definitions[callee_type.value].form:
+            CFunction(parameters, result):
+                for parameter in parameters: source_parameters.append(parameter)
+                source_result = result
+            else: trap("C indirect call has a non-cfunc HIR type")
+        let call_arguments = list[RegisterId]()
+        for index in range(0, len(operands.values)):
+            call_arguments.append(try self.encode_c_boundary_value(module, function, span, source_parameters[index], operands.values[index], body))
+        # A bare cfunc is pointer-shaped: zero is observable while stored but
+        # invoking it is the precise `null_foreign` trap boundary.
+        self.emit_nonnull_c_guard(operands.target, span, body)
+        let raw_results = list[RegisterId]()
+        if not types_match(source_result, resolve_builtin_type(BuiltinType.unit)):
+            raw_results.append(self.new_register(try self.c_boundary_type_of(module, function, span, source_result)))
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(raw_results), signature = signature, convention = CallingConvention.c, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
+        if len(raw_results) == 0: return RegisterId(value = no_register)
+        return try self.decode_c_boundary_value(module, function, span, source_result, raw_results[0], body)
 
     func lower_fallible_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
         let span = node_span(self.program, expression)
@@ -1480,7 +1576,7 @@ pub class Lowerer:
         for argument in operands.values: call_arguments.append(argument)
         let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
         results.append(reported_error)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, convention = self.function_value_convention(node_type(self.program, callee)), target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
         return FallibleResult(value = value, error_value = reported_error)
 
     func lower_fallible_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
@@ -2456,6 +2552,7 @@ pub class Lowerer:
                 let present = try self.mir_type_of(module, function, span, inner)
                 return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
             Function(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
+            CFunction(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
                 # declared target-neutral token representation; ABI placement

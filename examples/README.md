@@ -34,6 +34,11 @@ belongs to.
   fallible calls execute through the semantic oracle and native QBE, and the
   same canonical MIR builds as WebAssembly. Closure environments and the
   infallible-to-fallible adapter remain a later managed-runtime slice.
+- `cfunc_values.luc` exercises the matching C-callable value shape through
+  aliases, fields, parameters/results and selection. Capture-free named Luce
+  functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
+  same example. Dynamic and nullable pointers arriving from C remain later
+  boundary work.
 
 ## Stage-0 example corpus as a progress gate
 
