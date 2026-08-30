@@ -77,7 +77,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 ### Proving program 1 — the guest
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
-- [ ] **`for` and ranges.** *Gate: fallible iteration protocol.*
+- [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
 - [ ] **`defer`, `try`/`catch`, `Error`**: failure-as-data ABI, `defer` duplicated onto every exit, `catch` forms; custom struct `init` rides on this.
 - [ ] **`extern` import/export** with wasm namespaces (`kino`/`lucia` imports, `lucia_alloc`/`lucia_main` exports); C signatures verified by the MIR verifier.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
@@ -122,7 +122,7 @@ Gates — settle in `1.0.md` before the feature lands in `hir_gen`:
 
 | Gate | Before | Evidence |
 |---|---|---|
-| Fallible iteration protocol (item / end / error, propagation visible at the loop) | `for` | query results, journal folds, directory verbs all have three outcomes |
+| ~~Fallible iteration protocol (item / end / error, propagation visible at the loop)~~ | `for` | **met**: `try for` + `FallibleIterable[T]`, `next() -> T?!` (spec §§9.4, 17.1) |
 | Owned (non-copyable, consuming) values — state transitions, destruction on every exit | classes / ARC | keys wiped in destructors, guest handles, journal lock fd |
 | Scoped values generalised from `mutable_slice`/`task` | closures | borrowed `const Element*`, `thread_local const char*` |
 | Closure capture: explicit vs §14.1 implicit shared cell, by the both-ways corpus test | closures | the compiler and all three C++ repos are closure-light corpora |

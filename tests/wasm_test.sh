@@ -653,6 +653,39 @@ LUCE
 "$cli" build "$test_dir/enum_boxes.wasm" "$test_dir/enum_boxes.luc" >/dev/null
 expect 0 "103" wasmtime run --invoke enum_boxes.answer "$test_dir/enum_boxes.wasm"
 
+# Integer range values and `for`, including a closed maximum endpoint and
+# `continue` flowing through the increment block.
+cat > "$test_dir/ranges.luc" <<'LUCE'
+func span() -> range[i64]: return 2..=4
+func sum(values: range[i64]) -> i64:
+    var total = 0
+    for value in values: total += value
+    return total
+pub func half_open() -> i64:
+    var total = 0
+    for i in 0..<5: total += i
+    return total
+pub func controlled() -> i64:
+    var total = 0
+    for i in 1..=5:
+        if i == 2: continue
+        if i == 5: break
+        total += i
+    return total
+pub func maximum() -> u8:
+    var last: u8 = 0
+    for i in 253u8..=255u8: last = i
+    return last
+pub func passed() -> i64:
+    let values = span()
+    return sum(values) + (10 if values == 2..=4 else 0)
+LUCE
+"$cli" build "$test_dir/ranges.wasm" "$test_dir/ranges.luc" >/dev/null
+expect 0 "10" wasmtime run --invoke ranges.half_open "$test_dir/ranges.wasm"
+expect 0 "8" wasmtime run --invoke ranges.controlled "$test_dir/ranges.wasm"
+expect 0 "255" wasmtime run --invoke ranges.maximum "$test_dir/ranges.wasm"
+expect 0 "19" wasmtime run --invoke ranges.passed "$test_dir/ranges.wasm"
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:

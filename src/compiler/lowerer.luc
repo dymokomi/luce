@@ -19,6 +19,7 @@
 #       `else`, `while` with `break` and `continue`, functions with direct
 #       calls between them across modules, module constants, parameter
 #       defaults, tuples, optionals, `str` and `bytes` values with equality,
+#       integer range values and `for` iteration,
 #       structs with fields, methods, `mutating` methods and type functions,
 #       terminal output of a literal or a `str` value, and returning. The slice boundary lives
 #       here, not in canonical MIR — failure, classes, and collections reach
@@ -98,6 +99,7 @@ struct Local:
 enum Region:
     block
     loop_body
+    for_continue
     if_arm
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
@@ -248,6 +250,9 @@ pub class Lowerer:
                     if has_fallback: try self.lower_prologue(module, function, fallback, body)
                 WhileStatement(condition, loop_body):
                     try self.lower_prologue(module, function, loop_body, body)
+                ForStatement(symbol, iterable, loop_body):
+                    try self.reserve_slot(module, function, symbol, span, body)
+                    try self.lower_prologue(module, function, loop_body, body)
                 else: pass
 
     # A `match` may sit anywhere an expression can and binds payloads in its
@@ -282,10 +287,14 @@ pub class Lowerer:
                 for branch in range(0, i64(branches.count) // 3):
                     try self.lower_prologue_node(module, function, self.branch_condition(branches, branch), body)
             WhileStatement(condition, loop_body): try self.lower_prologue_node(module, function, condition, body)
+            ForStatement(symbol, iterable, loop_body): try self.lower_prologue_node(module, function, iterable, body)
             Unary(operation, operand): try self.lower_prologue_node(module, function, operand, body)
             Binary(left, operation, right):
                 try self.lower_prologue_node(module, function, left, body)
                 try self.lower_prologue_node(module, function, right, body)
+            Range(lower, upper, inclusive):
+                try self.lower_prologue_node(module, function, lower, body)
+                try self.lower_prologue_node(module, function, upper, body)
             Conditional(value, condition, alternative):
                 try self.lower_prologue_node(module, function, value, body)
                 try self.lower_prologue_node(module, function, condition, body)
@@ -371,12 +380,14 @@ pub class Lowerer:
                 try self.lower_if(module, function, span, branches, 0, has_fallback, fallback, body)
             WhileStatement(condition, loop_body):
                 try self.lower_while(module, function, span, condition, loop_body, body)
+            ForStatement(symbol, iterable, loop_body):
+                try self.lower_for(module, function, span, symbol, iterable, loop_body, body)
             Match(subject, arms, has_result):
                 let discarded = try self.lower_match(module, function, statement, subject, arms, false, body)
             BreakStatement:
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, span) + 1, values = no_registers()), span = span))
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.break_depth(module, function, span), values = no_registers()), span = span))
             ContinueStatement:
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.loop_depth(module, function, span), values = no_registers()), span = span))
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.continue_depth(module, function, span), values = no_registers()), span = span))
             else: try self.fail_unsupported(module, function, span, "an expression node where a statement was expected")
 
     # Store a value, or combine it with what the place holds, at an address.
@@ -464,6 +475,72 @@ pub class Lowerer:
         self.emit_end(span, body)
         self.emit_end(span, body)
 
+    # A range loop uses its immutable iteration binding as the private
+    # counter slot. The extra inner block is the `continue` target: leaving
+    # it reaches the increment, while `break` crosses it, the loop, and lands
+    # at the outer block. The endpoint test before increment keeps a closed
+    # range ending at the integer maximum from overflowing.
+    func lower_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+        let ranged = try self.lower_expression(module, function, iterable, body)
+        let range_type = try self.mir_type_of(module, function, span, node_type(self.program, iterable))
+        var element_hir_type = node_type(self.program, iterable)
+        match self.program.types.definitions[element_hir_type.value].form:
+            Range(element): element_hir_type = element
+            else: try self.fail_unsupported(module, function, span, "a non-range `for` iterable")
+        let element_type = try self.mir_type_of(module, function, span, element_hir_type)
+        let lower = try self.load_field(range_type, ranged, 0, span, body)
+        let upper = try self.load_field(range_type, ranged, 1, span, body)
+        let inclusive = try self.load_field(range_type, ranged, 2, span, body)
+        let counter = (try self.local_of(module, function, span, symbol)).address
+        self.store_value(element_type, counter, lower, span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        self.regions.append(Region.block)
+        self.regions.append(Region.loop_body)
+
+        let current = self.load_value(element_type, counter, span, body)
+        let above = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = above, operation = BinaryOp.gt, left = current, right = upper), span = span))
+        let at_or_above = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = at_or_above, operation = BinaryOp.ge, left = current, right = upper), span = span))
+        let done = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(inclusive, [done], span, body)
+        self.emit_yield(above, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(at_or_above, span, body)
+        self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        self.regions.append(Region.for_continue)
+        for position in range(0, i64(statements.count)):
+            try self.lower_statement(module, function, node_at(self.program, statements, position), body)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_end(span, body)
+
+        let is_upper = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = is_upper, operation = BinaryOp.eq, left = current, right = upper), span = span))
+        let is_last = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(inclusive, [is_last], span, body)
+        self.emit_yield(is_upper, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(self.bool_constant(false, span, body), span, body)
+        self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = is_last, depth = 1, values = no_registers()), span = span))
+
+        let one = self.new_register(element_type)
+        body.append(MirInstruction(form = InstructionForm.Const(result = one, value = MirConstant.Int(value = 1)), span = span))
+        let next = self.new_register(element_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = current, right = one), span = span))
+        self.store_value(element_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+
+        self.regions.remove(len(self.regions) - 1)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
     # Lower statements inside one new region.
     func lower_region(module: HirModule, function: HirFunction, region: Region, statements: Operands, body: list[MirInstruction]) -> !:
         self.regions.append(region)
@@ -471,13 +548,25 @@ pub class Lowerer:
             try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         self.regions.remove(len(self.regions) - 1)
 
-    # The branch depth of the innermost enclosing loop: zero when the branch
-    # sits directly in the loop body, one more for each `If` arm in between.
-    func loop_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
+    # `continue` targets a range loop's increment block or a while loop's
+    # loop label, whichever belongs to the innermost source loop.
+    func continue_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
         var depth = 0
         var index = len(self.regions) - 1
         while index >= 0:
+            if self.regions[index] == Region.for_continue: return depth
             if self.regions[index] == Region.loop_body: return depth
+            depth += 1
+            index -= 1
+        error(self.unsupported(module, function, span, "`break`/`continue` outside a loop"))
+
+    # `break` crosses the loop itself and reaches its surrounding block. A
+    # range loop's continue block is counted naturally on the walk.
+    func break_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
+        var depth = 0
+        var index = len(self.regions) - 1
+        while index >= 0:
+            if self.regions[index] == Region.loop_body: return depth + 1
             depth += 1
             index -= 1
         error(self.unsupported(module, function, span, "`break`/`continue` outside a loop"))
@@ -569,6 +658,16 @@ pub class Lowerer:
                     let element_type = try self.mir_type_of(module, function, node_span(self.program, element_node), node_type(self.program, element_node))
                     let field = self.field_address(value_type, temp, index, span, body)
                     self.store_value(element_type, field, element, span, body)
+                return temp
+            Range(lower, upper, inclusive):
+                let temp = self.new_temp(value_type, span, body)
+                let lower_value = try self.lower_expression(module, function, lower, body)
+                let element_type = try self.mir_type_of(module, function, node_span(self.program, lower), node_type(self.program, lower))
+                self.store_value(element_type, self.field_address(value_type, temp, 0, span, body), lower_value, span, body)
+                let upper_value = try self.lower_expression(module, function, upper, body)
+                self.store_value(element_type, self.field_address(value_type, temp, 1, span, body), upper_value, span, body)
+                let boundary = self.bool_constant(inclusive, span, body)
+                self.store_value(builtin_mir_type(BuiltinMirType.boolean), self.field_address(value_type, temp, 2, span, body), boundary, span, body)
                 return temp
             Element(tuple_value, index):
                 let base = try self.lower_expression(module, function, tuple_value, body)
@@ -1137,6 +1236,17 @@ pub class Lowerer:
                     let right_value = self.load_value(element_type, right_field, span, body)
                     so_far = try self.lower_and_then(module, function, span, so_far, elements[index], left_value, right_value, body)
                 return so_far
+            Range(inner):
+                var so_far = self.bool_constant(true, span, body)
+                let field_types = [inner, inner, resolve_builtin_type(BuiltinType.boolean)]
+                for index in range(0, len(field_types)):
+                    let left_field = self.field_address(mir_value_type, left, index, span, body)
+                    let right_field = self.field_address(mir_value_type, right, index, span, body)
+                    let element_type = try self.mir_type_of(module, function, span, field_types[index])
+                    let left_value = self.load_value(element_type, left_field, span, body)
+                    let right_value = self.load_value(element_type, right_field, span, body)
+                    so_far = try self.lower_and_then(module, function, span, so_far, field_types[index], left_value, right_value, body)
+                return so_far
             Struct(index):
                 var so_far = self.bool_constant(true, span, body)
                 let fields = self.program.structs[index].fields
@@ -1318,6 +1428,10 @@ pub class Lowerer:
                 let field_types = list[TypeId]()
                 for element in elements:
                     field_types.append(try self.mir_type_of(module, function, span, element))
+                return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
+            Range(element):
+                let element_type = try self.mir_type_of(module, function, span, element)
+                let field_types = [element_type, element_type, builtin_mir_type(BuiltinMirType.boolean)]
                 return intern_mir_type(self.types, make_struct_type(self.types, self.layout, field_types))
             Struct(index):
                 let field_types = list[TypeId]()
