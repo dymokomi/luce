@@ -50,8 +50,8 @@ must agree:
 1. the HIR interpreter — the definition of behaviour, never sees MIR;
 2. the MIR interpreter — the lowerer's first consumer, using explicit
    backend layout rules rather than the host platform;
-3. a compiled artifact — wasm under `wasmtime` (and native where the slice
-   allows).
+3. a compiled artifact — wasm under `wasmtime`, and native through pinned
+   QBE 1.3 for the complete current lowerer corpus.
 
 When two agree and one differs, the stage between them is wrong. Every
 lowerer slice adds fixtures to `differential_test.luc` *and* the same
@@ -96,8 +96,9 @@ does not duplicate those passes in stage 1.
 - HIR and canonical MIR remain shared. Target divergence starts at the
   `ArtifactBackend` boundary: Wasm, QBE, and eventually Luce-native backends
   consume the same verified MIR contract.
-- The QBE backend is one compact MIR-to-QBE translation layer plus process
-  invocation. Target-specific ABI or toolchain facts stay inside that backend.
+- The QBE backend is one compact MIR-to-QBE translation layer. Host process
+  invocation and output paths are a separate materialization concern;
+  target-specific ABI and layout facts stay inside the backend.
 - Tests execute the same generated and hand-written programs through the HIR
   interpreter, MIR interpreter, Wasm, and QBE. A later native backend must
   agree with QBE before it can replace it.
@@ -133,9 +134,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   target-sized relocations from canonical MIR. Lower once; compute cached byte
   layout in each backend. The architecture gate rejects future platform leaks
   before `backends/` (`b09ac68`).
-- [ ] **QBE backend oracle**: translate verified canonical MIR to QBE IL,
-  compile and execute the existing differential corpus, then add QBE to every
-  generated-program gate.
+- [x] **QBE backend oracle** (2026-08-30): translate verified canonical MIR
+  directly to QBE IL, compile and execute the complete existing differential
+  corpus, and require the checksum-pinned QBE 1.3 tool in the full test gate.
+  No target IR or platform layout was added before the backend boundary
+  (`facc3c3`).
+- [ ] **QBE product materialization**: expose native QBE builds through the
+  command line, with explicit host-tool diagnostics and collision-free scratch
+  paths; then add QBE to each generated-program gate as those gates land.
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.

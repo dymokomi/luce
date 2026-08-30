@@ -17,8 +17,9 @@ end-to-end slices. Unsupported features fail with a clear diagnostic.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.27, the seed compiler for the current machine, and verifies its
-checksum. `./stage0` is that downloaded toolchain, not this repository's source.
+Stage-0 0.27 and the official QBE 1.3 source, verifies both checksums, and builds
+the QBE oracle. `./stage0` is the resulting pinned toolchain, not this
+repository's source.
 
 ```sh
 ./bootstrap.sh
@@ -93,8 +94,9 @@ examples and tests link back here rather than restating it.
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
   equality, and `print` of a literal or a `str` value — is lowered to canonical
-  MIR and
-  encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
+  MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
+  The complete differential corpus is compiled, linked, and executed through
+  QBE 1.3 as the native oracle. The ARM64
   Mach-O and x86-64 ELF writers still cover only the original slice (checked
   i32/i64 arithmetic, `print` of a literal, `return`); see
   `docs/compiler/plan.md` §3 for why. Native executables start at `main`;
@@ -102,7 +104,7 @@ examples and tests link back here rather than restating it.
 - The test suite exercises the frontend, semantic model, both interpreters,
   lowering, MIR verification, each artifact encoder, the command line's exit
   statuses and diagnostics, and runs every fixture through the HIR
-  interpreter, the MIR interpreter, and each encoder to prove they agree. On
+  interpreter, the MIR interpreter, and real QBE to prove they agree. On
   a supported native host it also builds and
   runs a smoke-test executable.
 

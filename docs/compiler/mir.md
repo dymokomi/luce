@@ -350,9 +350,8 @@ and choose its target representation.
 
 ### Native backends, and QBE
 
-The native plan does not assume LLVM. The likely path is [QBE](https://c9x.me/compile/)
-— used as is, or rewritten in Luce — and canonical MIR was checked against
-its intermediate language:
+Stage 1 uses [QBE](https://c9x.me/compile/) 1.3 as its native oracle. The
+backend translates canonical MIR directly into QBE IL:
 
 | Canonical MIR | QBE IL | Effort |
 |---|---|---|
@@ -360,14 +359,14 @@ its intermediate language:
 | `Alloca` / `Load` / `Store` slots | `alloc8` / `loadl` / `storel`; QBE promotes non-escaping slots | trivial — the promotion pass becomes QBE's |
 | `Block` / `Loop` / `If` / `Br` | labels, `jmp`, `jnz` | a dozen lines |
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
-| structural `Struct` / `Enum` | QBE aggregate types plus backend-computed padding | direct |
-| `convention = c` | QBE performs the SysV / Apple arm64 / RISC-V ABI lowering | direct |
+| structural `Struct` / `Enum` | memory plus backend-computed offsets and `blit` | direct |
+| `convention = c` | QBE ABI types and platform ABI lowering | reserved for the extern/export slice |
 | `CallExtern`, `FunctionAddress`, `DataAddress` | `call $sym`, `$sym` as a value, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
-| fallible `(value, error pointer)` plus caller-owned error parameter | aggregate return or target return registers; error storage is explicit | a small per-backend ABI choice |
-| narrow integer types | sub-word ops spelled out (`extsb`, `storeh`); widths only in signatures | see the open question below |
+| fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
+| narrow integer types | `w` temporaries plus explicit extension, guards, and sub-word memory operations | direct legalization |
 
-Nothing in the design fights QBE. The QBE backend owns target layout, lowers
+The QBE backend owns target layout, lowers
 structured control flow to QBE's graph, and relies on QBE for ABI lowering,
 instruction selection, and register allocation. The first implementation
 uses the real QBE toolchain as an oracle. A later Luce-native backend can be
@@ -379,10 +378,10 @@ Two consequences for the design record:
 - The result pair of a fallible scalar function states MIR's *meaning*.
   Error storage and its lifetime are already fixed by the explicit parameter;
   each backend only picks how to return the scalar-and-pointer pair: wasm
-  multi-value, QBE an aggregate or target return registers.
-- The narrow-integer question tilts toward normalizing to `i32`/`i64` early,
-  keeping exact widths only in `Struct` fields and `c` signatures — the form
-  both wasm and QBE want. Still decided at the first lowerer slice.
+  multi-value, QBE an error-pointer return plus a private result out-pointer.
+- Narrow integer types remain exact in canonical MIR. QBE holds them in `w`
+  or `l` temporaries and uses explicit extension, range guards, and sub-word
+  loads/stores at the backend boundary.
 
 ### What comes next
 
@@ -597,14 +596,5 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
 
 ### Open questions
 
-- **Narrow integers** — kept as distinct MIR types (as written here) or
-  normalized to `i32`/`i64` early with explicit `Extend`/`Wrap`, keeping
-  exact widths only in `Struct` fields and `c` signatures? Both wasm and
-  QBE want the second; the C boundary needs widths either way. Decided at
-  the first lowerer slice.
 - **Optionals of references** — null-pointer niche (the plan) or a uniform
   two-case enum? The niche must not leak into `c`-convention signatures.
-- **Fallible result pair per backend** — wasm multi-value returns (implemented;
-  universally supported now), QBE an aggregate or target return registers.
-  The caller-owned error parameter is canonical MIR, not a backend choice and
-  never a global.

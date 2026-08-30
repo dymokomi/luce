@@ -14,14 +14,15 @@ Last updated: 2026-08-30 (Stage-0 0.27).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: custom `init`, classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, extern/export. Each fails with "not implemented yet" and a span. |
+| HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, extern/export. Each fails with "not implemented yet" and a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes everything HIR generation produces. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
+| QBE backend (`backends/qbe.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, and a private caller-owned fallible-result ABI. The complete differential corpus is compiled, linked, and executed through real QBE. Product/CLI materialization is the next slice. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
-| Tests | 392 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~125 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
-| Toolchain | Stage-0 0.27 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
+| Tests | 405 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and real QBE and checks values, output, and traps. |
+| Toolchain | Stage-0 0.27 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
 
@@ -37,6 +38,14 @@ Last updated: 2026-08-30 (Stage-0 0.27).
   caches byte placement. `test.sh` rejects backend imports and concrete target
   concepts in frontend/HIR/MIR, and the full 392-test plus CLI/Wasm/native
   diagnostic suite is green.
+- [x] **QBE is the native oracle** (2026-08-30). One compact backend translates
+  verified canonical MIR directly into QBE IL; it computes 64-bit aggregate
+  layout locally, flattens structured regions without a second shared IR, and
+  legalizes Luce arithmetic and failure results. Official QBE 1.3 is pinned by
+  checksum and installed by `bootstrap.sh`; `test.sh` refuses to silently skip
+  it. All current non-trapping fixtures compile, link, and agree on result and
+  output; every trapping fixture first compiles successfully and then traps
+  (`facc3c3`).
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
 - [x] Native rung 0 (arm64 Mach-O, x86-64 ELF) for the original slice only.
@@ -65,9 +74,9 @@ Last updated: 2026-08-30 (Stage-0 0.27).
 - [x] **Source failure is explicit data and control** (2026-08-29). `ErrorCode.package` accepts restricted constant `u32` expressions, rejects duplicates package-wide, and embeds an explicit compilation identity rather than a path-derived name. `T!` is confined to the outer result of a function; parameters, bindings, constants, fields, payloads, nested effects, and unhandled values are rejected. The HIR oracle models raise/recover as explicit transfers, never host-language errors. Lowering covers scalar, unit, aggregate, conditional, and match-produced fallible values; `try` copies failure into the caller's slot, `catch` binds ordinary `Error` data, and both run the correct deferred suffix. Differential and wasmtime fixtures prove success, propagation, recovery, code/message inspection, and defer order. The compiler API takes `PackageInput`; the raw CLI requires `--package ID`.
 - [x] **Custom struct initialization** (2026-08-29). A receiver has one closed protocol (`type_function`, value method, mutating method, or initializer), and construction is an explicit `Initialize` HIR node rather than a call whose result is reinterpreted later. `SemanticAnalyzer` now performs the first whole-program flow proof: a three-state field lattice joins continuing `if`/`match`/`catch` paths, rejects writes in repeatable regions, and proves every successful exit initialized each field exactly once before any read, method call, or escape of partial `self`. The HIR interpreter creates a private incomplete record; MIR passes fresh caller-owned aggregate storage as initializer `self`; fallible initializers add the existing caller-owned Error slot without a second ABI. Differential and wasmtime fixtures cover default/named arguments, branch initialization, success, and failure.
 
-## 3. Bugs the three-way harness found
+## 3. Bugs the multi-backend harness found
 
-Kept as evidence that the testing strategy (`plan.md` §1) earns its cost. Four of the six were in "reference" implementations.
+Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.
 
 1. HIR oracle: `~0u8` produced `-1` (signed complement on an unsigned type).
 2. HIR oracle: i64 arithmetic computed before the range check, tripping the host.
@@ -75,6 +84,13 @@ Kept as evidence that the testing strategy (`plan.md` §1) earns its cost. Four 
 4. Wasm: u32 constants above the i32 maximum emitted an invalid LEB; a function ending in an `If` with returning arms failed validation (needs a trailing `unreachable`).
 5. Both interpreters: `1 << 63` overflowed the host — replaced by `shift_left_within`.
 6. MIR interpreter: a `Loop` consumed a branch depth twice, so a `BrIf` carrying values out of a loop dropped them. Invisible until milestone 4's string equality (`while` branches carry nothing). Pinned by `test_branch_out_of_a_loop_delivers_its_values_to_the_block`.
+7. QBE parser: floor-division adjustment mixed `w` and `l`, and unreachable
+   structured tails could place a second terminator in the same block.
+8. QBE execution: a then-arm fallthrough edge was not recorded when its else
+   arm terminated, so a reachable join became `hlt`.
+9. QBE execution: division by zero relied on target behavior, and `u64`
+   arithmetic used the machine's full range instead of MIR's current `i64`
+   ceiling. The trapping corpus caught both.
 
 ## 4. Where this came from — the lineage and the evidence
 
