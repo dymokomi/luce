@@ -9,7 +9,38 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-29 (Stage-0 0.26).
+Last updated: 2026-08-30 (Stage-0 0.27).
+
+## Recovery audit of the unpublished native branch
+
+The 83 commits after `origin/main` grew the compiler by 32,954 lines across
+144 files. Architecture-specific source alone reached about 17,400 lines,
+with another 2,100 lines of shared native machinery, before its tests and
+design document. That is larger than QBE itself without yet providing QBE's
+coverage. The experiment is preserved at
+`recovery/native-backends-2026-08-30`; its unfinished framework-linking work
+is preserved in stash `pre-stage1-qbe-recovery`. Neither belongs in stage 1.
+
+The clean continuation is branch `stage1-qbe`, based on `origin/main`. Its
+first commit, `eb6dbfd`, made the permanent stage boundaries visible as
+`frontend/`, `hir/`, `mir/`, and `backends/`; the two old seed encoders are
+quarantined in `backends/native/` until QBE replaces them.
+
+Every unpublished change has this disposition:
+
+| Commit or range | Audit finding | Disposition |
+|---|---|---|
+| `99d91dc` | The C import/export capability is required, but the implementation duplicated function and extern symbols, imports, lookup, and impossible sentinel states. It also gave common HIR/MIR fields WebAssembly-specific meaning. | Rewrite around one callable-resolution path and a platform-neutral ABI boundary. |
+| `efac149` | Whole-program reachability belongs in MIR, but `pub` visibility was treated as artifact export and all data was retained, making the root model incomplete. | Rewrite after export identity is explicit. |
+| `7e54621` | The bounded heap model is target-neutral, but allocator policy was placed in the compiler and used linear metadata searches before runtime requirements existed. | Defer to `libluce_rt`; retain the behavioral tests as design evidence. |
+| `cb54a92` | Deterministic generated programs are useful, but are strongest once HIR, MIR, Wasm, and QBE all execute the same corpus. | Reintroduce as a cross-backend gate with QBE. |
+| `0ff695f` | The document specifies the superseded in-tree QBE-shaped compiler. | Replace; do not retain. |
+| `b8b167f..3ecf059` | Native CFG, slot promotion, and the start of target ABI machinery duplicate work QBE already owns. | Remove from stage 1. |
+| `192b308` | Independently verified Stage-0 0.27 adoption; unrelated to native architecture. | Reapply independently. |
+| `3616b97..14d3fb8` | Full ARM64 selection, allocation, encoding, layout, and execution stack. Cleanly tested in isolation, but premature and much too large for stage 1. | Preserve only on the recovery branch; do not port. |
+| `8b28f54..06d5df0` | A second near-copy of the same stack for x86-64 confirmed the abstraction boundary was wrong. | Preserve only on the recovery branch; do not port. |
+| `970c08f`, `109caeb` | IEEE encoding and shared artifact-corpus ideas are target-neutral exceptions embedded in the native series. | Re-evaluate when QBE tests need them; copy no code speculatively. |
+| `c63630b..51a6a89` | Mach-O signing, dyld binding, C import/export, and the unfinished framework draft are backend/linker work built on the discarded stack. | Use tests as later requirements; implement stage 1 through QBE and the host toolchain. |
 
 ## 1. Testing strategy (the part that must not be lost)
 
@@ -17,7 +48,8 @@ Every language feature is proven by **three independent executions** that
 must agree:
 
 1. the HIR interpreter — the definition of behaviour, never sees MIR;
-2. the MIR interpreter — the lowerer's first consumer, no target;
+2. the MIR interpreter — the lowerer's first consumer, using explicit
+   backend layout rules rather than the host platform;
 3. a compiled artifact — wasm under `wasmtime` (and native where the slice
    allows).
 
@@ -38,7 +70,12 @@ and, for gates, in the spec — and a slice is ticked only on a green
 
 - **Structured control flow** (`Block`/`Loop`/`If`/`Switch`/`Br`/`BrIf`/`Yield`), not a basic-block graph. Luce has no `goto`; structure → jumps is trivial for native, jumps → structure (the relooper) is the hard direction and is avoided entirely. **Encoded flat**: a body is one instruction list with `Else`/`Case`/`Default`/`End` markers — the wasm encoding — so every consumer is a single linear pass with a region stack and a body is one contiguous allocation.
 - **Typed write-once registers**, not an operand stack. Registers map to wasm locals for free and to native registers directly. Mutable locals live in `Alloca` slots; a later pass promotes them.
-- **Canonical given a `TargetLayout`**: struct/enum offsets are computed by the lowerer and stored in MIR; the verifier checks them. Required for C interop. A wasm32 program and an arm64 program are different MIR programs.
+- **Canonical before target layout**: MIR aggregate types retain field and case
+  structure, while pointers stay abstract. `FieldAddress` names a field and
+  `ElementAddress` names an element type and index; no byte offset, pointer
+  width, or target-natural alignment is stored in MIR. Each backend computes
+  and caches its layout when encoding. The same MIR program therefore feeds
+  Wasm, QBE, and later native backends.
 - **Aggregates never sit in a register**: a register of aggregate type holds an address; copies are explicit `Memcpy`; aggregate results go through a hidden leading pointer parameter; aggregate parameters are passed by pointer, written through only by a `mutating` receiver.
 - **Runtime as symbols** (`luce_rt_*`), never instructions. wasm imports them; native links `libluce_rt`.
 - **Failure as data with explicit ownership**: a fallible function receives a caller-owned `Error` slot as hidden parameter 0 and returns `(value, null)` on success or `(absent, error_out)` on failure. `try` is a call plus one conditional branch; propagation copies into the current function's slot after active `defer`s; no allocation or unwinding.
@@ -48,16 +85,27 @@ and, for gates, in the spec — and a slice is ticked only on a green
 - **Narrow integers stay MIR types** (Prism `DType` and the C ABI need exact widths).
 - **Open**: optionals are a uniform `u8`-tagged enum today; a null niche for references is undecided. Fallible ABI is per backend (wasm multi-value, QBE out-pointer/aggregate — never a global).
 
-## 3. Native backends, QBE, and the linker — the decisions
+## 3. Backends, QBE, and the linker — the decisions
 
-**Own the whole native toolchain: no LLVM, no external assembler or linker at build time.**
+**Stage 1 uses real QBE as the native backend and semantic oracle.** Luce emits
+QBE IL from verified canonical MIR, invokes QBE, and lets the host assembler
+and linker produce the executable. QBE owns SSA destruction, instruction
+selection, register allocation, ABI lowering, and assembly emission. Luce
+does not duplicate those passes in stage 1.
 
-- **Codegen**: a QBE-shaped pass written in Luce, using QBE (MIT, ~12k lines C) as *reference*, not a port — SSA construction, slot promotion, C ABI incl. Apple arm64, instruction selection, spilling, the simple register allocator — with our own machine-code encoders (seeds: the mnemonic constants in `backends/native/arm64_macos.luc` / `backends/native/x86_64_linux.luc`).
-- **Timing**: after enums land (MIR settles). First read QBE and write `docs/compiler/native.md`; then the arm64 pass as a fourth column in the harness; x86-64 afterwards.
-- **Linker rungs**: rung 0 (today) one image, raw syscalls; **rung 1 (required for the host)** Mach-O dyld imports of libSystem and frameworks, stubs/GOT, bind info, own ad-hoc code signature — ELF stays fully static; rung 2 links our own object files when separate compilation exists; rung 3 (a real linker for foreign `.o`/`.a`) deferred indefinitely.
-- **`libluce_rt`** is Luce, compiled into every program as more MIR, bottoming out in syscalls on Linux and libSystem on macOS. It is the layer *above* the OS library.
-- **Dependency-free verdict**: Linux fully; macOS at build time fully, with the normal run-time dependency on libSystem. Clang is used only to *generate* C bindings.
-- **Size estimate** beyond today: ~15–25k lines of Luce (lowerer rest, runtime, codegen, encoders, image writers).
+- HIR and canonical MIR remain shared. Target divergence starts at the
+  `ArtifactBackend` boundary: Wasm, QBE, and eventually Luce-native backends
+  consume the same verified MIR contract.
+- The QBE backend is one compact MIR-to-QBE translation layer plus process
+  invocation. Target-specific ABI or toolchain facts stay inside that backend.
+- Tests execute the same generated and hand-written programs through the HIR
+  interpreter, MIR interpreter, Wasm, and QBE. A later native backend must
+  agree with QBE before it can replace it.
+- Our own machine-code encoders and image writers are a later backend project,
+  after the language, runtime, MIR, and QBE oracle are stable. They begin from
+  the shared MIR boundary, not by introducing target passes into the core.
+- `libluce_rt` is Luce compiled as ordinary MIR. During stage 1 QBE links it
+  through the host toolchain; later native backends may own that final link.
 
 ### WebAssembly
 
@@ -76,12 +124,27 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 ### Proving program 1 — the guest
 
+- [x] **Recover the compact compiler shape** (2026-08-30): preserve the
+  unpublished native experiment, restart from `origin/main`, and organize the
+  existing code by frontend/HIR/MIR/backend ownership without compatibility
+  wrappers (`eb6dbfd`).
+- [x] **Enforce the backend boundary** (2026-08-30): remove concrete targets,
+  pointer width/alignment, aggregate offsets/sizes, slot alignment, and raw
+  target-sized relocations from canonical MIR. Lower once; compute cached byte
+  layout in each backend. The architecture gate rejects future platform leaks
+  before `backends/` (`b09ac68`).
+- [ ] **QBE backend oracle**: translate verified canonical MIR to QBE IL,
+  compile and execute the existing differential corpus, then add QBE to every
+  generated-program gate.
+
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
-- [ ] **`extern` import/export** with wasm namespaces (`kino`/`lucia` imports, `lucia_alloc`/`lucia_main` exports); C signatures verified by the MIR verifier.
+- [ ] **`extern` import/export** through one source-level callable model;
+  C signatures verified by the MIR verifier, with Wasm namespaces and native
+  symbols interpreted only by their backends.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
@@ -94,8 +157,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Closures.** *Gate: capture rule.*
 - [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
-- [ ] **`docs/compiler/native.md`**, then the **arm64 QBE-shaped pass** as a fourth harness column, then **x86-64**.
-- [ ] **Native rung 1** (dyld imports + own signing). Required for the host.
+- [ ] **Luce-native backends**, only after QBE is a stable harness column;
+  implement one target behind the existing MIR backend boundary, then prove it
+  against QBE before adding another.
+- [ ] **Native image/link support** after native code generation is justified.
 - [ ] **C import (FIIR)** from headers via Clang, for Cocoa/Metal, OpenSSL/Monocypher, wasm3 during transition.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
