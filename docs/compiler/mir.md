@@ -360,7 +360,7 @@ backend translates canonical MIR directly into QBE IL:
 | `Block` / `Loop` / `If` / `Br` | labels, `jmp`, `jnz` | a dozen lines |
 | `Block` result registers | assign a temp on each path; QBE inserts the phi | trivial |
 | structural `Struct` / `Enum` | memory plus backend-computed offsets and `blit` | direct |
-| `convention = c` | QBE ABI extension types and platform ABI lowering | direct scalar imports/exports complete; richer translations remain |
+| `convention = c` | QBE ABI extension types and platform ABI lowering | scalar and nominal-handle imports/exports complete; richer translations remain |
 | `CallExtern`, `FunctionAddress`, `DataAddress` | `call $sym`, `$sym` as a value, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
 | fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
@@ -442,8 +442,9 @@ How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
 unsigned)`; `str` and `bytes` → a `{Ptr, Int(64)}` `Struct` (address and
 length; a literal's bytes are a data item); `list`, `map`, `set` → `Ptr` to
 runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
-references is still open); a scalar `T!` result → a scalar and error pointer,
-never a type;
+future managed class references is still open, but foreign handles stay
+tagged internally); a scalar `T!` result → a scalar and error pointer, never a
+type;
 tuples → anonymous `Struct`; class references and `weak` → `Ptr` managed by
 the runtime; interface values → a two-`Ptr` `Struct`.
 
@@ -490,13 +491,21 @@ identity to either a MIR `FunctionId` or `ExternId`; Wasm then chooses its
 `env` namespace and QBE/native interprets the same extern name as a linker
 symbol. Neither namespace nor ABI byte placement appears before a backend.
 
-An integer-represented `extern type` is nominal in HIR and therefore cannot
-be constructed from, converted to, or used as its backing integer. The
-lowerer's ordinary type mapping is the single erasure point: it maps the
-handle to the declared canonical MIR integer type. From there calls and
-comparisons need no handle-specific MIR instruction, and each backend applies
-the same C ABI rules it already applies to that integer width. Pointer-shaped
-handles deliberately wait for explicit pointer/null boundary semantics.
+An `extern type` is nominal in HIR and therefore cannot be constructed from,
+converted to, or used as its backing representation. The lowerer's ordinary
+type mapping is the single erasure point: an integer-shaped handle becomes its
+declared exact MIR integer, while a pointer-shaped handle becomes MIR's
+abstract `Ptr`. Calls and comparisons then need no handle-specific MIR
+instruction, and no pointer width or ABI fact has entered the pipeline.
+
+A nullable pointer handle remains the ordinary tagged optional everywhere in
+Luce. Only a C import or export boundary adapts it to one raw `Ptr`: zero
+decodes to `none`, and `none` encodes to zero. A bare pointer-handle slot emits
+the canonical `Trap("null_foreign")` guard in either direction. An exported C
+function is therefore two MIR functions: a private Luce-convention body used
+by source calls and a public C-convention wrapper owning those adapters. Wasm,
+QBE, and the MIR interpreter consume that same wrapper; only the artifact
+backend decides the pointer width and C ABI placement.
 
 ### Instructions
 
@@ -616,5 +625,7 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
 
 ### Open questions
 
-- **Optionals of references** — null-pointer niche (the plan) or a uniform
-  two-case enum? The niche must not leak into `c`-convention signatures.
+- **Optionals of future managed class references** — null-pointer niche or a
+  uniform two-case enum? This does not include pointer-shaped foreign handles:
+  those are uniformly tagged in MIR and adapted to raw null only at an
+  explicit `c`-convention boundary.

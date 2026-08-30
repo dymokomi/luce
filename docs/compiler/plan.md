@@ -90,7 +90,11 @@ and, for gates, in the spec — and a slice is ticked only on a green
 - **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
 - **`Yield`** is the structured phi: a region that produces values names them on every exit.
 - **Narrow integers stay MIR types** (Prism `DType` and the C ABI need exact widths).
-- **Open**: optionals are a uniform `u8`-tagged enum today; a null niche for references is undecided. Fallible ABI is per backend (wasm multi-value, QBE out-pointer/aggregate — never a global).
+- **Open**: optionals are a uniform `u8`-tagged enum today; whether future
+  managed class references may use a null niche is undecided. Pointer-shaped
+  foreign handles are settled: tagged internally and raw-null only at a C
+  boundary. Fallible ABI is per backend (wasm multi-value, QBE
+  out-pointer/aggregate — never a global).
 
 ## 3. Backends, QBE, and the linker — the decisions
 
@@ -167,12 +171,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   one HIR function table, symbol kind, import path, argument checker, and
   `Call` node; lowering performs the sole split into MIR definitions/externs.
   HIR/MIR hosts, Wasm `env` imports, exact exports, QBE ABI extension types,
-  and real libc linkage are covered. Integer-represented nominal handles are
-  also complete: HIR preserves their identity and opacity, while the one MIR
-  lowering erases them to the declared integer representation; real QBE/libc
-  `getpid` execution proves the boundary. Pointer-shaped handles, strings,
-  `out`, extern structs and variables, exported structs/enums, and `cfunc`
-  remain on this item.
+  and real libc linkage are covered. Integer- and pointer-represented nominal
+  handles are also complete: HIR preserves identity and opacity; ordinary
+  optionals remain tagged; one canonical MIR boundary adapter alone
+  encodes/decodes C null and traps `null_foreign` for bare zero tokens. C
+  exports are ordinary Luce bodies behind shared MIR wrappers, so source calls
+  never acquire boundary behavior. Real QBE/libc `getpid` and `malloc`/`free`
+  execution prove both representations. Strings, `out`, extern structs and
+  variables, exported structs/enums, and `cfunc` remain on this item.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.

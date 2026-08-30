@@ -130,6 +130,18 @@ union LoweredFunction:
     Defined(function: FunctionId)
     External(external: ExternId)
 
+# The source-level contract behind one interned C symbol. Canonical MIR has
+# already erased handle nominality and boundary optionals when it describes a
+# raw call slot, so its signature alone cannot distinguish `Window` from
+# `Window?` or from another pointer-shaped handle. Keep that semantic identity
+# beside the interned extern until every declaration has been checked.
+struct CExternContract:
+    let external: ExternId
+    let name: str
+    let parameters: list[ir.TypeId]
+    let result: ir.TypeId
+    let is_blocking: bool
+
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     let program: HirProgram
@@ -138,6 +150,7 @@ pub class Lowerer:
     let externs: list[MirExtern]
     let data: list[MirData]
     let lowered_functions: list[LoweredFunction]
+    let c_extern_contracts: list[CExternContract]
     # The register table, slots, live locals, and parameter registers of the
     # function being lowered.
     var registers: list[TypeId]
@@ -165,6 +178,7 @@ pub class Lowerer:
         self.externs = list[MirExtern]()
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
+        self.c_extern_contracts = list[CExternContract]()
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
@@ -191,16 +205,23 @@ pub class Lowerer:
                 ExternalC(is_blocking):
                     let module = self.program.modules[function.module.value]
                     let signature = try self.lower_external_signature(module, function)
-                    let external = try self.declare_c_extern(function.name, signature)
+                    let external = try self.declare_c_extern(function, is_blocking, signature)
                     self.lowered_functions.append(LoweredFunction.External(external = external))
-                else:
+                ExportedC(body):
+                    self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
+                    next_definition += 2
+                Defined(body):
                     self.lowered_functions.append(LoweredFunction.Defined(function = FunctionId(value = next_definition)))
                     next_definition += 1
         let functions = list[MirFunction]()
         for function in self.program.functions:
             match function.implementation:
                 ExternalC(is_blocking): pass
-                else:
+                ExportedC(body):
+                    let module = self.program.modules[function.module.value]
+                    functions.append(try self.lower_function(module, function))
+                    functions.append(try self.lower_export_wrapper(module, function))
+                Defined(body):
                     let module = self.program.modules[function.module.value]
                     functions.append(try self.lower_function(module, function))
         let entry = find_entry(functions)
@@ -216,24 +237,45 @@ pub class Lowerer:
     func lower_external_signature(module: HirModule, function: HirFunction) -> MirSignature!:
         let parameters = list[TypeId]()
         for parameter in function.parameters:
-            parameters.append(try self.mir_type_of(module, function, function.span, parameter.value_type))
+            parameters.append(try self.c_boundary_type_of(module, function, function.span, parameter.value_type))
         let results = list[TypeId]()
         if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
-            results.append(try self.mir_type_of(module, function, function.span, function.result))
+            results.append(try self.c_boundary_type_of(module, function, function.span, function.result))
         return MirSignature(parameters = parameters, results = results, is_fallible = false)
 
     # C symbols inhabit one linker namespace even when several source
-    # modules declare them. Equal declarations share one MIR identity; a
-    # conflicting declaration is rejected before any backend sees it.
-    func declare_c_extern(name: str, signature: MirSignature) -> ExternId!:
-        for index in range(0, len(self.externs)):
-            let existing = self.externs[index]
-            if existing.convention != CallingConvention.c or existing.name != name: continue
+    # modules declare them. Equal source contracts share one MIR identity; a
+    # conflict is rejected before handle identity or nullability is erased.
+    func declare_c_extern(function: HirFunction, is_blocking: bool, signature: MirSignature) -> ExternId!:
+        for contract in self.c_extern_contracts:
+            if contract.name != function.name: continue
+            if not self.c_extern_contract_matches(contract, function, is_blocking):
+                error("lowerer: conflicting declarations of C symbol `" + function.name + "`")
+            let existing = self.externs[contract.external.value]
             if not signatures_match(existing.signature, signature):
-                error("lowerer: conflicting declarations of C symbol `" + name + "`")
-            return ExternId(value = u32(index))
-        self.externs.append(MirExtern(name = name, convention = CallingConvention.c, signature = signature))
-        return ExternId(value = u32(len(self.externs) - 1))
+                trap("matching C contracts lowered to different MIR signatures")
+            return contract.external
+
+        let external = ExternId(value = u32(len(self.externs)))
+        self.externs.append(MirExtern(name = function.name, convention = CallingConvention.c, signature = signature))
+        let parameters = list[ir.TypeId]()
+        for parameter in function.parameters: parameters.append(parameter.value_type)
+        self.c_extern_contracts.append(CExternContract(
+            external = external,
+            name = function.name,
+            parameters = parameters,
+            result = function.result,
+            is_blocking = is_blocking,
+        ))
+        return external
+
+    func c_extern_contract_matches(contract: CExternContract, function: HirFunction, is_blocking: bool) -> bool:
+        if contract.is_blocking != is_blocking: return false
+        if not types_match(contract.result, function.result): return false
+        if len(contract.parameters) != len(function.parameters): return false
+        for index in range(0, len(contract.parameters)):
+            if not types_match(contract.parameters[index], function.parameters[index].value_type): return false
+        return true
 
     # Lower one function body. The canonical name is `module.function` so
     # artifacts stay unambiguous across modules. `main` keeps the entry
@@ -248,17 +290,7 @@ pub class Lowerer:
         if function.name == "main" and not is_entry:
             try self.fail_unsupported(module, function, function.span, "entry parameters other than `(arguments: slice[str])`")
 
-        self.registers = list[TypeId]()
-        self.slots = list[MirSlot]()
-        self.locals = list[Local]()
-        self.parameters = list[Local]()
-        self.regions = list[Region]()
-        self.defers = list[NodeId]()
-        self.loop_defer_starts = list[i64]()
-        self.recover_targets = list[RecoverTarget]()
-        self.operands = OperandBuilder()
-        self.error_slot = -1
-        self.result_slot = -1
+        self.begin_function()
         let parameter_types = list[TypeId]()
         let results = list[TypeId]()
         let fallible_result = self.fallible_inner(function.result)
@@ -304,23 +336,90 @@ pub class Lowerer:
             else:
                 body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
         var name = module.name + "." + function.name
-        var convention = CallingConvention.luce
+        var is_public = function.is_public
         match function.implementation:
             ExportedC(export_body):
-                name = function.name
-                convention = CallingConvention.c
+                # The source body always keeps Luce calling semantics. A
+                # separate canonical MIR wrapper owns the C boundary.
+                is_public = false
             else: pass
         let receiver = function.receiver
         if receiver != none: name = module.name + "." + describe_type(self.program.types, receiver.owner) + "." + function.name
         return MirFunction(
             name = name,
-            convention = convention,
+            convention = CallingConvention.luce,
             signature = MirSignature(parameters = parameter_types, results = results, is_fallible = is_fallible),
             registers = self.registers,
             slots = self.slots,
             body = body,
             operands = self.operands.operands,
-            is_public = function.is_public,
+            is_public = is_public,
+            span = function.span,
+        )
+
+    func begin_function():
+        self.registers = list[TypeId]()
+        self.slots = list[MirSlot]()
+        self.locals = list[Local]()
+        self.parameters = list[Local]()
+        self.regions = list[Region]()
+        self.defers = list[NodeId]()
+        self.loop_defer_starts = list[i64]()
+        self.recover_targets = list[RecoverTarget]()
+        self.operands = OperandBuilder()
+        self.error_slot = -1
+        self.result_slot = -1
+
+    # One target-neutral C export adapter. The source body remains an ordinary
+    # Luce-convention function so source calls never acquire boundary traps or
+    # null encoding. Both artifact backends consume this same wrapper.
+    func lower_export_wrapper(module: HirModule, function: HirFunction) -> MirFunction!:
+        self.begin_function()
+        let body = list[MirInstruction]()
+        let parameter_types = list[TypeId]()
+        let internal_arguments = list[RegisterId]()
+        for parameter in function.parameters:
+            let raw_type = try self.c_boundary_type_of(module, function, function.span, parameter.value_type)
+            parameter_types.append(raw_type)
+            let raw_value = self.new_register(raw_type)
+            internal_arguments.append(try self.decode_c_boundary_value(module, function, function.span, parameter.value_type, raw_value, body))
+
+        let source_index = self.function_index_of(function.symbol)
+        if source_index < 0: error("lowerer: C export has no source function identity")
+        var internal = FunctionId(value = 0)
+        match self.lowered_functions[source_index]:
+            Defined(function_id): internal = function_id
+            External(external): trap("C export mapped to an external identity")
+        let results = list[TypeId]()
+        if types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
+            body.append(MirInstruction(form = InstructionForm.Call(results = no_registers(), function = internal, arguments = self.operands.run(internal_arguments)), span = function.span))
+            body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = function.span))
+        else:
+            let internal_type = try self.mir_type_of(module, function, function.span, function.result)
+            var internal_result = RegisterId(value = no_register)
+            let call_results = list[RegisterId]()
+            if self.is_aggregate(internal_type):
+                internal_result = self.new_temp(internal_type, function.span, body)
+                let with_result = [internal_result]
+                for argument in internal_arguments: with_result.append(argument)
+                body.append(MirInstruction(form = InstructionForm.Call(results = no_registers(), function = internal, arguments = self.operands.run(with_result)), span = function.span))
+            else:
+                internal_result = self.new_register(internal_type)
+                call_results.append(internal_result)
+                body.append(MirInstruction(form = InstructionForm.Call(results = self.operands.run(call_results), function = internal, arguments = self.operands.run(internal_arguments)), span = function.span))
+            let encoded = try self.encode_c_boundary_value(module, function, function.span, function.result, internal_result, body)
+            results.append(try self.c_boundary_type_of(module, function, function.span, function.result))
+            body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run([encoded])), span = function.span))
+
+        return MirFunction(
+            name = function.name,
+            convention = CallingConvention.c,
+            signature = MirSignature(parameters = parameter_types, results = results, is_fallible = false),
+            registers = self.registers,
+            slots = self.slots,
+            body = body,
+            operands = self.operands.operands,
+            is_public = true,
             span = function.span,
         )
 
@@ -1168,6 +1267,9 @@ pub class Lowerer:
         if target < 0: try self.fail_unsupported(module, function, span, "a call to a symbol that is not a function")
         let called = self.program.functions[target]
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
+        match called.implementation:
+            ExternalC(is_blocking): return try self.lower_c_import_call(module, function, span, target, called, placed, body)
+            else: pass
         let results = list[RegisterId]()
         if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
             let result_type = try self.mir_type_of(module, function, span, called.result)
@@ -1183,6 +1285,79 @@ pub class Lowerer:
         self.emit_call(target, results, placed, span, body)
         if len(results) == 0: return RegisterId(value = no_register)
         return results[0]
+
+    # Adapt one host-supplied C call without changing ordinary HIR or canonical
+    # MIR value representations. Nullable pointer handles are tagged optionals
+    # everywhere except the raw call operands/results; bare nulls trap at this
+    # exact boundary in both directions.
+    func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, placed: list[RegisterId], body: list[MirInstruction]) -> RegisterId!:
+        let encoded = list[RegisterId]()
+        for index in range(0, len(placed)):
+            encoded.append(try self.encode_c_boundary_value(module, function, span, called.parameters[index].value_type, placed[index], body))
+        let raw_results = list[RegisterId]()
+        if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
+            raw_results.append(self.new_register(try self.c_boundary_type_of(module, function, span, called.result)))
+        self.emit_call(target, raw_results, encoded, span, body)
+        if len(raw_results) == 0: return RegisterId(value = no_register)
+        return try self.decode_c_boundary_value(module, function, span, called.result, raw_results[0], body)
+
+    # Internal value -> C slot. Only nullable pointer handles need structural
+    # conversion; a bare pointer is validated, and every other admitted scalar
+    # already has its canonical C-width MIR type.
+    func encode_c_boundary_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let optional_inner = self.optional_pointer_handle(value_type)
+        if optional_inner != none:
+            let optional_type = try self.mir_type_of(module, function, span, value_type)
+            let present = self.load_present(value, span, body)
+            let encoded = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            self.open_if(present, [encoded], span, body)
+            let payload = self.load_value(
+                builtin_mir_type(BuiltinMirType.pointer),
+                self.payload_address(optional_type, value, span, body),
+                span,
+                body,
+            )
+            self.emit_yield(payload, span, body)
+            self.emit_else(span, body)
+            self.emit_yield(self.null_constant(span, body), span, body)
+            self.emit_end(span, body)
+            return encoded
+        if self.is_pointer_handle(value_type): self.emit_nonnull_c_guard(value, span, body)
+        return value
+
+    # C slot -> internal value. Decoding allocates the ordinary tagged
+    # optional before any source operation can observe the value.
+    func decode_c_boundary_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let optional_inner = self.optional_pointer_handle(value_type)
+        if optional_inner != none:
+            let optional_type = try self.mir_type_of(module, function, span, value_type)
+            let decoded = self.new_temp(optional_type, span, body)
+            let null_value = self.null_constant(span, body)
+            let present = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = present, operation = BinaryOp.ne, left = value, right = null_value), span = span))
+            self.open_if(present, list[RegisterId](), span, body)
+            self.store_tag(decoded, 1, span, body)
+            self.store_value(
+                builtin_mir_type(BuiltinMirType.pointer),
+                self.payload_address(optional_type, decoded, span, body),
+                value,
+                span,
+                body,
+            )
+            self.emit_else(span, body)
+            self.store_tag(decoded, 0, span, body)
+            self.emit_end(span, body)
+            return decoded
+        if self.is_pointer_handle(value_type): self.emit_nonnull_c_guard(value, span, body)
+        return value
+
+    func emit_nonnull_c_guard(value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        let null_value = self.null_constant(span, body)
+        let is_null = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = is_null, operation = BinaryOp.eq, left = value, right = null_value), span = span))
+        self.open_if(is_null, list[RegisterId](), span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "null_foreign"), span = span))
+        self.emit_end(span, body)
 
     # The non-fallible form uses the same fresh receiver slot without an
     # Error parameter. The initializer returns unit; the expression returns
@@ -1896,10 +2071,35 @@ pub class Lowerer:
                 return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
-                # declared integer representation; ABI placement remains a
-                # backend concern exactly as it is for ordinary integers.
-                return try self.mir_type_of(module, function, span, self.program.extern_types[index].representation)
+                # declared target-neutral token representation; ABI placement
+                # remains a backend concern.
+                match self.program.extern_types[index].representation:
+                    Pointer: return builtin_mir_type(BuiltinMirType.pointer)
+                    Integer(representation): return try self.mir_type_of(module, function, span, representation)
             else: error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
+
+    # The raw C slot type differs from the ordinary MIR value type only for a
+    # nullable pointer handle: its tagged optional is encoded as one pointer
+    # at the call boundary. This is target-independent shape translation, not
+    # ABI placement.
+    func c_boundary_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: ir.TypeId) -> TypeId!:
+        if self.optional_pointer_handle(value) != none: return builtin_mir_type(BuiltinMirType.pointer)
+        return try self.mir_type_of(module, function, span, value)
+
+    func is_pointer_handle(value: ir.TypeId) -> bool:
+        match self.program.types.definitions[value.value].form:
+            Extern(index):
+                match self.program.extern_types[index].representation:
+                    Pointer: return true
+                    Integer(representation): return false
+            else: return false
+
+    func optional_pointer_handle(value: ir.TypeId) -> ir.TypeId?:
+        match self.program.types.definitions[value.value].form:
+            Optional(inner):
+                if self.is_pointer_handle(inner): return inner
+                return none
+            else: return none
 
     # `str` and `bytes` share one shape: a pointer to the bytes and their count.
     func byte_string_type() -> TypeId:

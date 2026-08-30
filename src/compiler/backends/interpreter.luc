@@ -84,6 +84,13 @@ pub class HirInterpreter: HirExecutionBackend:
     pub func run_with_host(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternHost) -> Value!:
         return try HirInterpreterRun(program.hir, host).run(module_name, function_name)
 
+    ## Invoke one exact C export as an external caller would: arguments arrive
+    ## in C boundary form and the result leaves in that form. This keeps export
+    ## adaptation inside the semantic oracle instead of teaching tests or
+    ## hosts how tagged Luce optionals happen to be represented.
+    pub func call_c_export(program: AnalyzedProgram, function_name: str, arguments: list[Value]) -> Value!:
+        return try HirInterpreterRun(program.hir, none).call_c_export(function_name, arguments)
+
 # Executes one checked program directly by symbol identity.
 # Frames the interpreter allows before reporting exhaustion. Unbounded
 # recursion is a trap in the language (section 13.4); the bound is what turns
@@ -139,6 +146,24 @@ class HirInterpreterRun:
                 error("interpreter: unhandled failure from `" + module_name + "." + function_name + "`: " + render_error(failure.value))
             else: return result
 
+    func call_c_export(function_name: str, arguments: list[Value]) -> Value!:
+        var selected: HirFunction? = none
+        for function in self.program.functions:
+            if function.name != function_name: continue
+            match function.implementation:
+                ExportedC(body):
+                    if selected != none: error("interpreter: duplicate C export `" + function_name + "`")
+                    selected = function
+                else: pass
+        let function = selected else error("interpreter: unknown C export `" + function_name + "`")
+        if len(arguments) != len(function.parameters):
+            error("interpreter: C export `" + function_name + "` expects " + str(len(function.parameters)) + " argument(s), got " + str(len(arguments)))
+        let decoded = list[Value]()
+        for index in range(0, len(arguments)):
+            decoded.append(try self.decode_c_argument(function, arguments[index], function.parameters[index].value_type, "parameter `" + function.parameters[index].name + "`"))
+        let result = try self.invoke(function, decoded)
+        return try self.encode_c_value(function, result, function.result, "result")
+
     # mark: Functions and scopes ================================================================
 
     # Call one function: a fresh frame holding the arguments, then the body.
@@ -151,9 +176,9 @@ class HirInterpreterRun:
         match function.implementation:
             ExternalC(is_blocking):
                 let host = self.external_host else error("interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` has no host binding")
-                let result = try host.call(function, arguments)
-                if not self.external_value_matches(result, function.result):
-                    error("interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` returned a value incompatible with `" + describe_type(self.program.types, function.result) + "`")
+                let encoded = try self.encode_c_arguments(function, arguments)
+                let external_result = try host.call(function, encoded)
+                let result = try self.decode_c_result(function, external_result)
                 return Invocation(value = result, receiver = Value.Unit)
             else: pass
         if self.depth >= frame_limit: error("interpreter: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
@@ -190,7 +215,96 @@ class HirInterpreterRun:
             Recovered(value): trap("recover escaped its catch handler")
             else: trap("loop control escaped a function")
 
-    func external_value_matches(value: Value, value_type: TypeId) -> bool:
+    # Encode ordinary semantic values into the C-shaped values an explicit
+    # host receives. This is a boundary operation: tagged optionals become a
+    # zero/nonzero token, and a zero token in a bare pointer slot traps.
+    func encode_c_arguments(function: HirFunction, arguments: list[Value]) -> list[Value]!:
+        let encoded = list[Value]()
+        for index in range(0, len(arguments)):
+            encoded.append(try self.encode_c_value(function, arguments[index], function.parameters[index].value_type, "parameter `" + function.parameters[index].name + "`"))
+        return encoded
+
+    func encode_c_value(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
+        let optional_inner = self.optional_pointer_handle(value_type)
+        if optional_inner != none:
+            match value:
+                Absent: return Value.Foreign(token = 0)
+                Present(item):
+                    match item.value:
+                        Foreign(token): return Value.Foreign(token = token)
+                        else: trap("typed pointer-handle optional contains a non-handle value")
+                else: trap("typed pointer-handle optional has a non-optional value")
+
+        let extern_index = self.extern_type_index(value_type)
+        if extern_index >= 0:
+            match value:
+                Foreign(token):
+                    match self.program.extern_types[extern_index].representation:
+                        Pointer:
+                            if token == 0: error(self.null_foreign(function, slot))
+                        Integer(representation):
+                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
+                                trap("typed integer handle is outside its declared representation")
+                    return value
+                else: trap("typed handle slot contains a non-handle value")
+
+        if self.scalar_value_matches(value, value_type): return value
+        trap("typed C argument is incompatible with its HIR slot")
+
+    # Decode a C-shaped result immediately on return. A nullable pointer token
+    # becomes an ordinary tagged optional; a bare null never enters HIR.
+    func decode_c_result(function: HirFunction, value: Value) -> Value!:
+        let value_type = function.result
+        let optional_inner = self.optional_pointer_handle(value_type)
+        if optional_inner != none:
+            match value:
+                Foreign(token):
+                    if token == 0: return Value.Absent
+                    return Value.Present(value = BoxedValue(value = Value.Foreign(token = token)))
+                else: error(self.incompatible_c_result(function))
+
+        let extern_index = self.extern_type_index(value_type)
+        if extern_index >= 0:
+            match value:
+                Foreign(token):
+                    match self.program.extern_types[extern_index].representation:
+                        Pointer:
+                            if token == 0: error(self.null_foreign(function, "result"))
+                        Integer(representation):
+                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
+                                error(self.incompatible_c_result(function))
+                    return value
+                else: error(self.incompatible_c_result(function))
+
+        if self.scalar_value_matches(value, value_type): return value
+        error(self.incompatible_c_result(function))
+
+    func decode_c_argument(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
+        let optional_inner = self.optional_pointer_handle(value_type)
+        if optional_inner != none:
+            match value:
+                Foreign(token):
+                    if token == 0: return Value.Absent
+                    return Value.Present(value = BoxedValue(value = Value.Foreign(token = token)))
+                else: error(self.incompatible_c_argument(function, slot, value_type))
+
+        let extern_index = self.extern_type_index(value_type)
+        if extern_index >= 0:
+            match value:
+                Foreign(token):
+                    match self.program.extern_types[extern_index].representation:
+                        Pointer:
+                            if token == 0: error(self.null_foreign(function, slot))
+                        Integer(representation):
+                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
+                                error(self.incompatible_c_argument(function, slot, value_type))
+                    return value
+                else: error(self.incompatible_c_argument(function, slot, value_type))
+
+        if self.scalar_value_matches(value, value_type): return value
+        error(self.incompatible_c_argument(function, slot, value_type))
+
+    func scalar_value_matches(value: Value, value_type: TypeId) -> bool:
         if types_match(value_type, resolve_builtin_type(BuiltinType.unit)):
             match value:
                 Unit: return true
@@ -207,14 +321,35 @@ class HirInterpreterRun:
             match value:
                 Floating(item): return true
                 else: return false
-        match self.program.types.definitions[value_type.value].form:
-            Extern(index):
-                let representation = self.program.extern_types[index].representation
-                match value:
-                    Integer(item): return item >= integer_minimum(self.program.types, representation) and item <= integer_maximum(self.program.types, representation)
-                    else: return false
-            else: pass
         return false
+
+    func extern_type_index(value_type: TypeId) -> i64:
+        match self.program.types.definitions[value_type.value].form:
+            Extern(index): return index
+            else: return -1
+
+    func optional_pointer_handle(value_type: TypeId) -> TypeId?:
+        match self.program.types.definitions[value_type.value].form:
+            Optional(inner):
+                let index = self.extern_type_index(inner)
+                if index < 0: return none
+                match self.program.extern_types[index].representation:
+                    Pointer: return inner
+                    Integer(representation): return none
+            else: return none
+
+    func incompatible_c_result(function: HirFunction) -> str:
+        return "interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` returned a value incompatible with `" + describe_type(self.program.types, function.result) + "`"
+
+    func incompatible_c_argument(function: HirFunction, slot: str, value_type: TypeId) -> str:
+        return "interpreter: C export `" + function.name + "` received " + slot + " incompatible with `" + describe_type(self.program.types, value_type) + "`"
+
+    func null_foreign(function: HirFunction, slot: str) -> str:
+        var label = "extern `" + self.program.modules[function.module.value].name + "." + function.name + "`"
+        match function.implementation:
+            ExportedC(body): label = "C export `" + function.name + "`"
+            else: pass
+        return "interpreter: null_foreign crossing " + label + " " + slot
 
     # A suite is one lexical scope: bindings made inside it are trimmed away
     # however the suite exits.
@@ -801,6 +936,10 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         Integer(left_value):
             match right:
                 Integer(right_value): return try evaluate_integer_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Foreign(left_token):
+            match right:
+                Foreign(right_token): return evaluate_optional_equality(left_token == right_token, operation)
                 else: trap("typed binary expression has unequal value types")
         Floating(left_value):
             match right:
