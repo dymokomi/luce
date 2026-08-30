@@ -105,6 +105,14 @@ struct ArmBinding:
     pub let symbol: SymbolId
     pub let value_type: TypeId
 
+# One package error-code declaration already seen. The numeric component must
+# be unique across every module in the package; the name makes the diagnostic
+# useful without becoming runtime identity.
+struct DeclaredErrorCode:
+    pub let value: u32
+    pub let module_index: i64
+    pub let name: str
+
 # What the arms of one `match` have covered so far, for exhaustiveness and
 # reachability. Literal values are compared structurally; ranges are stored
 # as inclusive (low, high) pairs.
@@ -178,6 +186,7 @@ struct CheckedBinaryOperands:
 ## callers cannot run a partial generation; public use begins and ends at
 ## `HirGenerator.generate`.
 pub class HirGenerator:
+    let package_identity: str
     let sources: list[SourceModule]
     let types: TypeTable
     let symbols: list[HirSymbol]
@@ -200,6 +209,13 @@ pub class HirGenerator:
     var bindings: ModuleBindings
     var locals: list[LocalBinding]
     var loop_depth: i64
+    # Nested catch handlers' success types, innermost last. `recover` consults
+    # this stack and therefore cannot escape or target the wrong handler.
+    var recovery_types: list[TypeId]
+    # The top-level constant currently being checked (`-1` otherwise), and
+    # package error codes registered from those declarations.
+    var current_constant: i64
+    let error_codes: list[DeclaredErrorCode]
     # The node table under construction (see `hir.luc`): children are pushed
     # before their parents, so every `NodeId` a form names already exists.
     let nodes: list[HirNode]
@@ -208,7 +224,8 @@ pub class HirGenerator:
     let extra: list[u32]
     let values: list[Value]
 
-    pub init(sources: list[SourceModule]):
+    pub init(package_identity: str, sources: list[SourceModule]):
+        self.package_identity = package_identity
         self.sources = sources
         self.types = create_builtin_type_table()
         self.symbols = list[HirSymbol]()
@@ -227,6 +244,9 @@ pub class HirGenerator:
         self.bindings = ModuleBindings(modules = list[ImportedModule](), functions = list[ImportedFunction]())
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
+        self.recovery_types = list[TypeId]()
+        self.current_constant = -1
+        self.error_codes = list[DeclaredErrorCode]()
         self.nodes = list[HirNode]()
         self.node_types = list[TypeId]()
         self.node_spans = list[SourceSpan]()
@@ -268,6 +288,7 @@ pub class HirGenerator:
 
     ## Generate typed HIR or stop at the first semantic problem.
     pub func generate() -> HirProgram!:
+        if self.package_identity == "": error("package identity must not be empty")
         try self.validate_module_names()
         try self.validate_mutating_placements()
         try self.collect_declarations()
@@ -321,6 +342,7 @@ pub class HirGenerator:
             ))
 
         return HirProgram(
+            package_identity = self.package_identity,
             types = self.types,
             symbols = self.symbols,
             modules = modules,
@@ -542,6 +564,8 @@ pub class HirGenerator:
             if previous == key:
                 try self.fail_at(item.module_index, item.span, "constant `" + item.name + "` is recursive")
         self.constant_stack.append(key)
+        let saved_constant = self.current_constant
+        self.current_constant = index
         let saved_module = self.current_module
         let saved_bindings = self.bindings
         self.enter_module(item.module_index)
@@ -550,6 +574,11 @@ pub class HirGenerator:
         if annotation != none:
             expected = try self.resolve_type(item.module_index, annotation)
         let typed = try self.check_expression(item.value, expected)
+        if self.contains_fallible(self.type_of(typed)):
+            try self.fail_at(item.module_index, item.span, "a fallible value cannot be stored in a constant; handle it with `try` or `catch`")
+        if not self.is_constant_expression(typed):
+            try self.fail_at(item.module_index, item.value.span, "initializer of constant `" + item.name + "` must be a constant expression")
+        self.current_constant = saved_constant
         self.constant_stack.remove(len(self.constant_stack) - 1)
         self.current_module = saved_module
         self.bindings = saved_bindings
@@ -601,6 +630,8 @@ pub class HirGenerator:
                     "parameter `" + parameter.name + "` requires a type",
                 ))
                 parameter_type = try self.resolve_type(module_index, annotation)
+                if self.contains_fallible(parameter_type):
+                    try self.fail_at(module_index, parameter.span, "parameter `" + parameter.name + "` cannot store a fallible type; `T!` is a function-result effect")
             var default_value = NodeId(value = no_node)
             let default_syntax = parameter.default_value
             if default_syntax != none:
@@ -615,6 +646,7 @@ pub class HirGenerator:
         let result_syntax = function.result
         if result_syntax != none:
             result = try self.resolve_type(module_index, result_syntax)
+        try self.validate_function_result(module_index, result, span)
         var checked_receiver: HirReceiver? = none
         if receiver != none:
             if function.is_mutating and not has_self:
@@ -689,6 +721,8 @@ pub class HirGenerator:
                             try self.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
                     if field.is_weak: try self.fail_at(module_index, field.span, "`weak` fields belong to classes, not structs")
                     let field_type = try self.resolve_type(module_index, field.value_type)
+                    if self.contains_fallible(field_type):
+                        try self.fail_at(module_index, field.span, "field `" + field.name + "` cannot store a fallible type; `T!` is a function-result effect")
                     var default_value = NodeId(value = no_node)
                     let default_syntax = field.default_value
                     if default_syntax != none:
@@ -802,6 +836,8 @@ pub class HirGenerator:
                     if previous.name == field.name:
                         try self.fail_at(module_index, case_syntax.span, "duplicate payload field `" + field.name + "` in case `" + case_syntax.name + "`")
                 payload.append(HirPayloadField(name = field.name, value_type = try self.resolve_type(module_index, field.value_type)))
+                if self.contains_fallible(payload[len(payload) - 1].value_type):
+                    try self.fail_at(module_index, case_syntax.span, "case payload `" + field.name + "` cannot store a fallible type; `T!` is a function-result effect")
             cases.append(HirEnumCase(name = case_syntax.name, documentation = case_syntax.documentation, payload = payload))
         let item = self.enums[enum_index]
         self.enums[enum_index] = CollectedEnum(
@@ -928,8 +964,13 @@ pub class HirGenerator:
             FunctionType(parameters, result):
                 let parts = list[TypeId]()
                 for parameter in parameters:
-                    parts.append(try self.resolve_type(module_index, parameter))
-                return self.intern_function_type(parts, try self.resolve_type(module_index, result))
+                    let parameter_type = try self.resolve_type(module_index, parameter)
+                    if self.contains_fallible(parameter_type):
+                        try self.fail_at(module_index, parameter.span, "a function-type parameter cannot store a fallible type; `T!` is a function-result effect")
+                    parts.append(parameter_type)
+                let result_type = try self.resolve_type(module_index, result)
+                try self.validate_function_result(module_index, result_type, result.span)
+                return self.intern_function_type(parts, result_type)
             CFunctionType(parameters, result):
                 error(self.diagnostic_at(module_index, value.span, "cfunc types are not implemented yet"))
             OptionalType(optional_value):
@@ -947,6 +988,7 @@ pub class HirGenerator:
         self.current_receiver = function.receiver
         self.locals = list[LocalBinding]()
         self.loop_depth = 0
+        self.recovery_types = list[TypeId]()
 
         # `self` is assignable only in a mutating method (spec §8.7).
         var self_is_mutable = false
@@ -959,7 +1001,10 @@ pub class HirGenerator:
 
         let body_syntax = function.syntax.body else trap("function definition has no body")
         let body = try self.check_suite(body_syntax.statements)
-        if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(body):
+        var successful_result = function.result
+        let fallible_result = self.fallible_inner(function.result)
+        if fallible_result != none: successful_result = fallible_result
+        if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(body):
             try self.fail(function.span, "function `" + function.name + "` may finish without returning `" + self.describe_type(function.result) + "`")
         return HirFunction(
             symbol = function.symbol,
@@ -1004,6 +1049,8 @@ pub class HirGenerator:
                 let printed = try self.check_print_call(value)
                 if printed != none: return [printed]
                 let checked = try self.check_expression(value, none)
+                if self.fallible_inner(self.type_of(checked)) != none:
+                    try self.fail(statement.span, "a fallible value must be handled with `try` or `catch`")
                 return [self.push_statement(HirNodeForm.ExpressionStatement(value = checked), statement.span)]
             IfStatement(branches, fallback):
                 return [try self.check_if(branches, fallback, statement.span)]
@@ -1012,7 +1059,10 @@ pub class HirGenerator:
             DeferStatement(value):
                 return try self.check_defer(value, statement.span)
             RecoverStatement(value):
-                error(self.diagnostic(statement.span, "`recover` is not implemented yet"))
+                if len(self.recovery_types) == 0:
+                    try self.fail(statement.span, "`recover` is only valid inside a `catch` handler")
+                let recovered = try self.check_expression(value, self.recovery_types[len(self.recovery_types) - 1])
+                return [self.push_statement(HirNodeForm.RecoverStatement(value = recovered), statement.span)]
             ForStatement(is_fallible, name, iterable, body):
                 return [try self.check_for(is_fallible, name, iterable, body, statement.span)]
             MatchStatement(subject, arms):
@@ -1137,6 +1187,8 @@ pub class HirGenerator:
                     expected = try self.resolve_type(self.current_module, annotation)
                 let checked = try self.check_expression(value, expected)
                 let checked_type = self.type_of(checked)
+                if self.contains_fallible(checked_type):
+                    try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
                 let symbol = self.make_symbol(name, SymbolKind.local, checked_type)
                 self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked_type, is_mutable = is_mutable))
                 return [self.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = checked), span)]
@@ -1148,6 +1200,8 @@ pub class HirGenerator:
                     expected = try self.resolve_type(self.current_module, annotation)
                 let checked = try self.check_expression(value, expected)
                 let checked_type = self.type_of(checked)
+                if self.contains_fallible(checked_type):
+                    try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
                 let elements = self.tuple_elements(checked_type) else error(self.diagnostic(span, "tuple binding requires a tuple value, found `" + self.describe_type(checked_type) + "`"))
                 if len(names) != len(elements):
                     try self.fail(span, "tuple binding has " + str(len(names)) + " name(s), value has " + str(len(elements)))
@@ -1248,13 +1302,16 @@ pub class HirGenerator:
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
     func check_return(value: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
+        var successful_result = self.current_result
+        let fallible_result = self.fallible_inner(self.current_result)
+        if fallible_result != none: successful_result = fallible_result
         if value == none:
-            if not types_match(self.current_result, resolve_builtin_type(BuiltinType.unit)):
-                try self.fail(span, "return requires a `" + self.describe_type(self.current_result) + "` value")
+            if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)):
+                try self.fail(span, "return requires a `" + self.describe_type(successful_result) + "` value")
             return self.push_statement(HirNodeForm.ReturnStatement(value = NodeId(value = no_node)), span)
-        if types_match(self.current_result, resolve_builtin_type(BuiltinType.unit)):
+        if types_match(successful_result, resolve_builtin_type(BuiltinType.unit)):
             try self.fail(span, "a `unit` function cannot return a value")
-        let checked = try self.check_expression(value, self.current_result)
+        let checked = try self.check_expression(value, successful_result)
         return self.push_statement(HirNodeForm.ReturnStatement(value = checked), span)
 
     # Each `if`/`elif` condition must be bool; every branch body is its own
@@ -1389,7 +1446,7 @@ pub class HirGenerator:
             SpawnValue(function, arguments):
                 error(self.diagnostic(value.span, "`spawn` is not implemented yet"))
             CatchValue(caught, failure_name, body):
-                error(self.diagnostic(value.span, "`catch` is not implemented yet"))
+                return try self.check_catch(caught, failure_name, body, value.span, expected)
 
     # A bare literal becomes a constant. An unsuffixed integer is i64 unless
     # the context asks for another integer width, e.g. `let count: i32 = 7`.
@@ -1450,7 +1507,13 @@ pub class HirGenerator:
             let checked = try self.check_expression(operand, boolean_type)
             let expression = self.push_node(HirNodeForm.Unary(operation = UnaryOperation.LogicalNot, operand = checked), boolean_type, span)
             return try self.require_type(expression, expected)
-        if operator == "try": try self.fail(span, "fallible calls are not implemented yet")
+        if operator == "try":
+            let checked = try self.check_expression(operand, none)
+            let successful = self.fallible_inner(self.type_of(checked)) else error(self.diagnostic(span, "`try` needs a fallible expression"))
+            if self.fallible_inner(self.current_result) == none:
+                try self.fail(span, "`try` can propagate failure only from a fallible function")
+            let typed = self.push_node(HirNodeForm.Try(value = checked), successful, span)
+            return try self.require_type(typed, expected)
 
         # `-9223372036854775808` must fold as one negative literal: its
         # magnitude does not fit positive i64, so negate-after-check would
@@ -1573,6 +1636,17 @@ pub class HirGenerator:
     # Check one call: each parameter must be supplied once.
     func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented yet")
+        match callee.form:
+            Name(name):
+                if name == "error" and self.find_local(name) < 0:
+                    return try self.check_error_call(arguments, span, expected)
+            Member(owner, name):
+                match owner.form:
+                    Name(owner_name):
+                        if owner_name == "ErrorCode" and name == "package" and self.find_local(owner_name) < 0:
+                            return try self.check_error_code_package(arguments, span, expected)
+                    else: pass
+            else: pass
         let resolved = try self.resolve_callee(callee)
         if resolved.struct_index >= 0:
             return try self.check_struct_value(resolved.struct_index, arguments, span, expected)
@@ -1628,6 +1702,164 @@ pub class HirGenerator:
                 continue
             try self.fail(span, "call to `" + function.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
         let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.push_run(typed_arguments)), function.result, span)
+        return try self.require_type(typed, expected)
+
+    # `ErrorCode.package(n)` is a declaration-only compiler constructor. The
+    # full package identity lives once on HirProgram; this node stores only
+    # the package-local numeric component.
+    func check_error_code_package(arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if self.current_constant < 0:
+            try self.fail(span, "`ErrorCode.package` is valid only as a top-level constant initializer")
+        let declaration = self.constants[self.current_constant]
+        if not error_code_call_is_whole_initializer(declaration.value, span):
+            try self.fail(span, "`ErrorCode.package` must be the whole top-level constant initializer")
+        if len(arguments) != 1 or arguments[0].label != none:
+            try self.fail(span, "`ErrorCode.package` takes one positional constant `u32`")
+        let number = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u32))
+        if not self.is_constant_expression(number):
+            try self.fail(arguments[0].span, "`ErrorCode.package` needs a constant `u32` expression")
+        let code = try self.evaluate_constant_u32(number)
+        for previous in self.error_codes:
+            if previous.value == code:
+                try self.fail(span, "package error code " + str(code) + " is already declared as `" + self.sources[previous.module_index].name + "." + previous.name + "`")
+        self.error_codes.append(DeclaredErrorCode(value = code, module_index = declaration.module_index, name = declaration.name))
+        let typed = self.push_node(HirNodeForm.ErrorCodeLiteral(value = code), resolve_builtin_type(BuiltinType.error_code), span)
+        return try self.require_type(typed, expected)
+
+    # Evaluate the deliberately small constant language admitted inside an
+    # ErrorCode declaration. Type checking has already fixed every operand to
+    # u32; this pass applies the language's checked arithmetic and shift rules
+    # without executing arbitrary source code.
+    func evaluate_constant_u32(id: NodeId) -> u32!:
+        let span = self.span_of(id)
+        match self.node_form(id):
+            Constant(index):
+                match self.values[index]:
+                    Integer(value): return u32(value)
+                    else: pass
+            Reference(symbol):
+                let referenced = self.constant_node(symbol)
+                if referenced.value != no_node: return try self.evaluate_constant_u32(referenced)
+            Unary(operation, operand):
+                let value = try self.evaluate_constant_u32(operand)
+                match operation:
+                    NumericIdentity(operand_type): return value
+                    IntegerBitwiseNot(operand_type): return u32(4294967295) - value
+                    else: pass
+            Binary(left, operation, right):
+                let a = i64(try self.evaluate_constant_u32(left))
+                let b = i64(try self.evaluate_constant_u32(right))
+                match operation:
+                    Add(operand_type):
+                        if a > 4294967295 - b: try self.fail(span, "constant `u32` addition overflows")
+                        return u32(a + b)
+                    Subtract(operand_type):
+                        if a < b: try self.fail(span, "constant `u32` subtraction overflows")
+                        return u32(a - b)
+                    Multiply(operand_type):
+                        if a != 0 and b > 4294967295 // a: try self.fail(span, "constant `u32` multiplication overflows")
+                        return u32(a * b)
+                    FloorDivide(operand_type):
+                        if b == 0: try self.fail(span, "constant integer division by zero")
+                        return u32(a // b)
+                    Remainder(operand_type):
+                        if b == 0: try self.fail(span, "constant integer remainder by zero")
+                        return u32(a % b)
+                    BitwiseAnd(operand_type): return u32(a & b)
+                    BitwiseOr(operand_type): return u32(a | b)
+                    BitwiseXor(operand_type): return u32(a ^ b)
+                    ShiftLeft(operand_type): return try self.constant_shift_left(u32(a), b, span)
+                    ShiftRight(operand_type):
+                        if b < 0 or b >= 32: try self.fail(span, "constant `u32` shift count must be smaller than 32")
+                        var shifted = a
+                        for step in range(0, b): shifted //= 2
+                        return u32(shifted)
+                    else: pass
+            Conditional(value, condition, alternative):
+                if try self.evaluate_constant_bool(condition): return try self.evaluate_constant_u32(value)
+                return try self.evaluate_constant_u32(alternative)
+            else: pass
+        error(self.diagnostic(span, "`ErrorCode.package` needs a constant `u32` expression"))
+
+    func constant_shift_left(value: u32, count: i64, span: SourceSpan) -> u32!:
+        if count < 0 or count >= 32: try self.fail(span, "constant `u32` shift count must be smaller than 32")
+        var shifted = i64(value)
+        for step in range(0, count): shifted = (shifted * 2) % 4294967296
+        return u32(shifted)
+
+    func evaluate_constant_bool(id: NodeId) -> bool!:
+        let span = self.span_of(id)
+        match self.node_form(id):
+            Constant(index):
+                match self.values[index]:
+                    Boolean(value): return value
+                    else: pass
+            Reference(symbol):
+                let referenced = self.constant_node(symbol)
+                if referenced.value != no_node: return try self.evaluate_constant_bool(referenced)
+            Unary(operation, operand):
+                match operation:
+                    LogicalNot: return not try self.evaluate_constant_bool(operand)
+                    else: pass
+            Binary(left, operation, right):
+                match operation:
+                    LogicalAnd: return try self.evaluate_constant_bool(left) and try self.evaluate_constant_bool(right)
+                    LogicalOr: return try self.evaluate_constant_bool(left) or try self.evaluate_constant_bool(right)
+                    Equal(operand_type):
+                        if types_match(operand_type, resolve_builtin_type(BuiltinType.boolean)):
+                            return try self.evaluate_constant_bool(left) == try self.evaluate_constant_bool(right)
+                        return try self.evaluate_constant_u32(left) == try self.evaluate_constant_u32(right)
+                    NotEqual(operand_type):
+                        if types_match(operand_type, resolve_builtin_type(BuiltinType.boolean)):
+                            return try self.evaluate_constant_bool(left) != try self.evaluate_constant_bool(right)
+                        return try self.evaluate_constant_u32(left) != try self.evaluate_constant_u32(right)
+                    Less(operand_type): return try self.evaluate_constant_u32(left) < try self.evaluate_constant_u32(right)
+                    LessEqual(operand_type): return try self.evaluate_constant_u32(left) <= try self.evaluate_constant_u32(right)
+                    Greater(operand_type): return try self.evaluate_constant_u32(left) > try self.evaluate_constant_u32(right)
+                    GreaterEqual(operand_type): return try self.evaluate_constant_u32(left) >= try self.evaluate_constant_u32(right)
+                    else: pass
+            Conditional(value, condition, alternative):
+                if try self.evaluate_constant_bool(condition): return try self.evaluate_constant_bool(value)
+                return try self.evaluate_constant_bool(alternative)
+            else: pass
+        error(self.diagnostic(span, "conditional ErrorCode expression needs a constant `bool` condition"))
+
+    func constant_node(symbol: SymbolId) -> NodeId:
+        for constant in self.constants:
+            if constant.symbol.value == symbol.value: return constant.typed
+        return NodeId(value = no_node)
+
+    # `error(code, message)` creates ordinary Error data in the current
+    # function's caller-owned slot, then transfers control. A catch handler
+    # does not catch its own failures, so its surrounding function must also
+    # be fallible before an error can escape from the handler.
+    func check_error_call(arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if self.fallible_inner(self.current_result) == none:
+            try self.fail(span, "`error` can escape only from a fallible function")
+        if len(arguments) != 2 or arguments[0].label != none or arguments[1].label != none:
+            try self.fail(span, "`error` takes an `ErrorCode` and a `str`")
+        let code = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.error_code))
+        let message = try self.check_expression(arguments[1].value, resolve_builtin_type(BuiltinType.string))
+        let typed = self.push_node(HirNodeForm.Raise(code = code, message = message), self.never_type(), span)
+        return try self.require_type(typed, expected)
+
+    # `value catch failure: ...` unwraps one fallible expression. The handler
+    # is a lexical scope with an immutable Error binding and must transfer on
+    # every path through recover, error/trap, or a surrounding return.
+    func check_catch(caught: ExpressionSyntax, failure_name: str, body: SuiteSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked = try self.check_expression(caught, none)
+        let successful = self.fallible_inner(self.type_of(checked)) else error(self.diagnostic(caught.span, "`catch` needs a fallible expression"))
+        try self.require_free_local_name(failure_name, span)
+        let failure = self.make_symbol(failure_name, SymbolKind.local, resolve_builtin_type(BuiltinType.error_value))
+        let outer_count = len(self.locals)
+        self.locals.append(LocalBinding(symbol = failure, name = failure_name, value_type = resolve_builtin_type(BuiltinType.error_value), is_mutable = false))
+        self.recovery_types.append(successful)
+        let statements = try self.check_suite(body.statements)
+        self.recovery_types.remove(len(self.recovery_types) - 1)
+        while len(self.locals) > outer_count: self.locals.remove(len(self.locals) - 1)
+        if not self.statements_return(statements):
+            try self.fail(body.span, "every `catch` path must `recover`, return, or terminate")
+        let typed = self.push_node(HirNodeForm.Catch(value = checked, failure = failure, body = self.push_nodes(statements)), successful, span)
         return try self.require_type(typed, expected)
 
     # `Point(x: 1.0, y: 2.0)`: the synthesized memberwise initializer. Fields
@@ -1715,6 +1947,19 @@ pub class HirGenerator:
                     try self.fail(span, "enum `" + root_name + "` has no case `" + name + "`")
                 return try self.check_enum_value(enum_index, case_index, list[ArgumentSyntax](), span, expected)
         let checked = try self.check_expression(member_value, none)
+        if types_match(self.type_of(checked), resolve_builtin_type(BuiltinType.error_value)):
+            var field = -1
+            var field_type = resolve_builtin_type(BuiltinType.unit)
+            if name == "code":
+                field = 0
+                field_type = resolve_builtin_type(BuiltinType.error_code)
+            elif name == "message":
+                field = 1
+                field_type = resolve_builtin_type(BuiltinType.string)
+            else:
+                try self.fail(span, "`Error` has no field `" + name + "`")
+            let typed = self.push_node(HirNodeForm.FieldAccess(value = checked, field = field), field_type, span)
+            return try self.require_type(typed, expected)
         let struct_index = self.struct_of(self.type_of(checked))
         if struct_index < 0:
             try self.fail(span, "`" + self.describe_type(self.type_of(checked)) + "` has no field `" + name + "`")
@@ -2339,6 +2584,9 @@ pub class HirGenerator:
     func require_type(value: NodeId, expected: TypeId?) -> NodeId!:
         if expected == none: return value
         let found = self.type_of(value)
+        match self.types.definitions[found.value].form:
+            Never: return value
+            else: pass
         if types_match(found, expected): return value
         let inner = self.optional_inner(expected)
         if inner != none and types_match(found, inner):
@@ -2361,6 +2609,7 @@ pub class HirGenerator:
             Tuple(elements): return self.run_is_constant(elements)
             StructValue(struct_index, fields): return self.run_is_constant(fields)
             EnumValue(enum_index, case_index, payload): return self.run_is_constant(payload)
+            ErrorCodeLiteral(value): return true
             Unary(operation, operand): return self.is_constant_expression(operand)
             Binary(left, operation, right): return self.is_constant_expression(left) and self.is_constant_expression(right)
             Range(lower, upper, inclusive): return self.is_constant_expression(lower) and self.is_constant_expression(upper)
@@ -2374,12 +2623,19 @@ pub class HirGenerator:
             if not self.is_constant_expression(NodeId(value = self.extra[i64(run.start) + index])): return false
         return true
 
-    # Conservative: a suite definitely returns only when a statement is a
-    # `return`, or an `if` with an `else` whose every arm definitely returns.
+    # Conservative: a suite definitely transfers only when a statement is a
+    # return/recover/terminating expression, or every arm of a closed branch
+    # definitely transfers. Function completion and catch handlers share this
+    # structural proof even though the destination differs.
     func statements_return(statements: list[NodeId]) -> bool:
         for statement in statements:
             match self.node_form(statement):
                 ReturnStatement(value): return true
+                RecoverStatement(value): return true
+                ExpressionStatement(value):
+                    match self.types.definitions[self.type_of(value).value].form:
+                        Never: return true
+                        else: pass
                 IfStatement(branches, has_fallback, fallback):
                     if has_fallback:
                         var every_branch_returns = true
@@ -2410,6 +2666,51 @@ pub class HirGenerator:
     func describe_type(value: TypeId) -> str:
         return describe_type(self.types, value)
 
+    # The successful side of `T!`, or none for an ordinary type.
+    func fallible_inner(value: TypeId) -> TypeId?:
+        if i64(value.value) >= len(self.types.definitions): return none
+        match self.types.definitions[value.value].form:
+            Fallible(inner): return inner
+            else: return none
+
+    # Fallibility is control flow, not a source-level value representation.
+    # Follow value containers so aliases cannot hide it in storage; function
+    # types are a boundary because their result may itself declare an effect.
+    func contains_fallible(value: TypeId) -> bool:
+        if i64(value.value) >= len(self.types.definitions): return false
+        match self.types.definitions[value.value].form:
+            Fallible(inner): return true
+            Optional(inner): return self.contains_fallible(inner)
+            Slice(inner): return self.contains_fallible(inner)
+            Range(inner): return self.contains_fallible(inner)
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_fallible(element): return true
+                return false
+            Struct(index):
+                for field in self.structs[index].fields:
+                    if self.contains_fallible(field.value_type): return true
+                return false
+            Enum(index):
+                for case_value in self.enums[index].cases:
+                    for field in case_value.payload:
+                        if self.contains_fallible(field.value_type): return true
+                return false
+            else: return false
+
+    func validate_function_result(module_index: i64, result: TypeId, span: SourceSpan) -> !:
+        let successful = self.fallible_inner(result)
+        if successful != none:
+            if self.contains_fallible(successful):
+                try self.fail_at(module_index, span, "fallibility cannot nest; a function result has at most one outer `!`")
+        elif self.contains_fallible(result):
+            try self.fail_at(module_index, span, "fallibility must be the outermost function-result effect")
+
+    # `never` is structural but created lazily because no source spelling can
+    # name it; compiler-known terminators are its only producers.
+    func never_type() -> TypeId:
+        return self.intern_named("never", TypeForm.Never)
+
     # `path:line:column: message` for the current module, or a chosen one.
     func diagnostic(span: SourceSpan, message: str) -> str:
         return format_diagnostic(self.sources[self.current_module].path, span, message)
@@ -2430,6 +2731,15 @@ func find_literal_token(value: ExpressionSyntax) -> Token?:
     match value.form:
         Literal(token): return token
         else: return none
+
+# Parentheses do not stop a compiler constructor from being the whole
+# initializer; every other syntax wrapper would make ErrorCode a subvalue.
+func error_code_call_is_whole_initializer(value: ExpressionSyntax, call_span: SourceSpan) -> bool:
+    match value.form:
+        Group(grouped): return error_code_call_is_whole_initializer(grouped, call_span)
+        Call(callee, type_arguments, arguments):
+            return value.span.start == call_span.start and value.span.end == call_span.end
+        else: return false
 
 # Report whether an integer expression still needs a type from its context.
 # Examples: `5`, `-5`, and `(5)` qualify; `5i64` and `count` do not.
@@ -2525,6 +2835,8 @@ func builtin_type_id(name: str) -> TypeId?:
         "char" => resolve_builtin_type(BuiltinType.character)
         "str" => resolve_builtin_type(BuiltinType.string)
         "bytes" => resolve_builtin_type(BuiltinType.byte_string)
+        "ErrorCode" => resolve_builtin_type(BuiltinType.error_code)
+        "Error" => resolve_builtin_type(BuiltinType.error_value)
         else => none
 
 func decode_digit(c: char) -> i64:

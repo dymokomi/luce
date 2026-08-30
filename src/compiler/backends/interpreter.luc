@@ -47,8 +47,21 @@ struct Invocation:
 union Execution:
     Next
     Returned(value: Value)
+    Raised(error_value: Value)
+    Recovered(value: Value)
     Broke
     Continued
+
+# Expression evaluation either produces its typed value or transfers control
+# through the surrounding statement/scope. Host `!` remains reserved for
+# traps and compiler/runtime faults; recoverable Luce failure never uses it.
+union Evaluation:
+    Evaluated(value: Value)
+    Transferred(execution: Execution)
+
+union RunEvaluation:
+    EvaluatedRun(values: list[BoxedValue])
+    TransferredRun(execution: Execution)
 
 ## The reusable interpreter backend. Each execution gets private program state.
 pub class HirInterpreter: HirExecutionBackend:
@@ -107,7 +120,12 @@ class HirInterpreterRun:
             arguments.append(Value.TextSlice(items = list[str]()))
         elif len(function.parameters) > 0:
             error("interpreter: entry function `" + module_name + "." + function_name + "` must take no arguments")
-        return try self.invoke(function, arguments)
+        let result = try self.invoke(function, arguments)
+        match result:
+            FallibleSuccess(success): return success.value
+            FallibleFailure(failure):
+                error("interpreter: unhandled failure from `" + module_name + "." + function_name + "`: " + render_error(failure.value))
+            else: return result
 
     # mark: Functions and scopes ================================================================
 
@@ -133,10 +151,23 @@ class HirInterpreterRun:
         var receiver = Value.Unit
         if len(bindings) > 0: receiver = bindings[0].value
         match outcome:
-            Returned(value): return Invocation(value = value, receiver = receiver)
+            Returned(value):
+                match self.program.types.definitions[function.result.value].form:
+                    Fallible(inner): return Invocation(value = Value.FallibleSuccess(value = BoxedValue(value = value)), receiver = receiver)
+                    else: return Invocation(value = value, receiver = receiver)
+            Raised(error_value):
+                match self.program.types.definitions[function.result.value].form:
+                    Fallible(inner): return Invocation(value = Value.FallibleFailure(error_value = BoxedValue(value = error_value)), receiver = receiver)
+                    else: trap("failure escaped a non-fallible checked function")
             Next:
                 if types_match(function.result, resolve_builtin_type(BuiltinType.unit)): return Invocation(value = Value.Unit, receiver = receiver)
+                match self.program.types.definitions[function.result.value].form:
+                    Fallible(inner):
+                        if types_match(inner, resolve_builtin_type(BuiltinType.unit)):
+                            return Invocation(value = Value.FallibleSuccess(value = BoxedValue(value = Value.Unit)), receiver = receiver)
+                    else: pass
                 trap("checked function `" + function.name + "` finished without returning a value")
+            Recovered(value): trap("recover escaped its catch handler")
             else: trap("loop control escaped a function")
 
     # A suite is one lexical scope: bindings made inside it are trimmed away
@@ -178,12 +209,18 @@ class HirInterpreterRun:
             BreakStatement: return Execution.Broke
             ContinueStatement: return Execution.Continued
             Binding(symbol, is_mutable, value):
-                bindings.append(Binding(symbol = symbol, value = try self.evaluate(value, bindings)))
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): bindings.append(Binding(symbol = symbol, value = item))
+                    Transferred(execution): return execution
                 return Execution.Next
             Assignment(symbol, operation, value):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed assignment refers to an unknown binding")
-                let right = try self.evaluate(value, bindings)
+                let evaluated = try self.evaluate(value, bindings)
+                var right = Value.Unit
+                match evaluated:
+                    Evaluated(item): right = item
+                    Transferred(execution): return execution
                 var assigned = right
                 match operation:
                     Replace: assigned = right
@@ -194,7 +231,11 @@ class HirInterpreterRun:
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed field assignment refers to an unknown binding")
                 let path = self.entries(path_run)
-                let right = try self.evaluate(value, bindings)
+                let evaluated = try self.evaluate(value, bindings)
+                var right = Value.Unit
+                match evaluated:
+                    Evaluated(item): right = item
+                    Transferred(execution): return execution
                 var assigned = right
                 match operation:
                     Replace: assigned = right
@@ -206,35 +247,59 @@ class HirInterpreterRun:
                 return Execution.Next
             PrintValue(value):
                 match try self.evaluate(value, bindings):
-                    Text(item): print(item)
-                    else: trap("typed `print` received a non-string HIR value")
+                    Evaluated(item):
+                        match item:
+                            Text(text): print(text)
+                            else: trap("typed `print` received a non-string HIR value")
+                    Transferred(execution): return execution
                 return Execution.Next
             ReturnStatement(value):
                 if value.value == no_node: return Execution.Returned(value = Value.Unit)
-                return Execution.Returned(value = try self.evaluate(value, bindings))
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): return Execution.Returned(value = item)
+                    Transferred(execution): return execution
+            RecoverStatement(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): return Execution.Recovered(value = item)
+                    Transferred(execution): return execution
             DeferStatement(action): trap("defer marker executed outside its lexical scope")
             ExpressionStatement(value):
-                discard(try self.evaluate(value, bindings))
-                return Execution.Next
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): return Execution.Next
+                    Transferred(execution): return execution
             IfStatement(branches, has_fallback, fallback):
                 # Each branch is a triple: condition, body start, body count.
                 for branch in range(0, i64(branches.count) // 3):
                     let condition = NodeId(value = u32(entry_at(self.program, branches, branch * 3)))
-                    if as_boolean(try self.evaluate(condition, bindings)):
-                        let body = Operands(start = u32(entry_at(self.program, branches, branch * 3 + 1)), count = u32(entry_at(self.program, branches, branch * 3 + 2)))
-                        return try self.execute_scope(body, bindings)
+                    match try self.evaluate(condition, bindings):
+                        Evaluated(item):
+                            if as_boolean(item):
+                                let body = Operands(start = u32(entry_at(self.program, branches, branch * 3 + 1)), count = u32(entry_at(self.program, branches, branch * 3 + 2)))
+                                return try self.execute_scope(body, bindings)
+                        Transferred(execution): return execution
                 if has_fallback: return try self.execute_scope(fallback, bindings)
                 return Execution.Next
             WhileStatement(condition, body):
-                while as_boolean(try self.evaluate(condition, bindings)):
+                while true:
+                    let evaluated = try self.evaluate(condition, bindings)
+                    var keep_going = false
+                    match evaluated:
+                        Evaluated(item): keep_going = as_boolean(item)
+                        Transferred(execution): return execution
+                    if not keep_going: return Execution.Next
                     match try self.execute_scope(body, bindings):
                         Next: continue
                         Continued: continue
                         Broke: return Execution.Next
                         Returned(value): return Execution.Returned(value = value)
-                return Execution.Next
+                        Raised(error_value): return Execution.Raised(error_value = error_value)
+                        Recovered(value): return Execution.Recovered(value = value)
             ForStatement(symbol, iterable, body):
-                let ranged = try self.evaluate(iterable, bindings)
+                let evaluated = try self.evaluate(iterable, bindings)
+                var ranged = Value.Unit
+                match evaluated:
+                    Evaluated(item): ranged = item
+                    Transferred(execution): return execution
                 var lower = 0
                 var upper = 0
                 var inclusive = false
@@ -265,6 +330,8 @@ class HirInterpreterRun:
                     match outcome:
                         Broke: return Execution.Next
                         Returned(value): return Execution.Returned(value = value)
+                        Raised(error_value): return Execution.Raised(error_value = error_value)
+                        Recovered(value): return Execution.Recovered(value = value)
                         else: pass
                     # Do not overflow when a closed range ends at the type's
                     # maximum; the endpoint has already been delivered.
@@ -277,7 +344,11 @@ class HirInterpreterRun:
             else: trap("expression node executed as a statement")
 
     func execute_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Execution!:
-        let selected = try self.evaluate(subject, bindings)
+        let evaluated = try self.evaluate(subject, bindings)
+        var selected = Value.Unit
+        match evaluated:
+            Evaluated(item): selected = item
+            Transferred(execution): return execution
         let outer_count = len(bindings)
         for position in range(0, i64(arms.count)):
             let arm = node_at(self.program, arms, position)
@@ -293,75 +364,144 @@ class HirInterpreterRun:
     # mark: Expressions =========================================================================
 
     # Evaluate one expression to its value.
-    func evaluate(expression: NodeId, bindings: list[Binding]) -> Value!:
+    func evaluate(expression: NodeId, bindings: list[Binding]) -> Evaluation!:
         match node_form(self.program, expression):
-            Constant(value): return self.program.values[value]
+            Constant(value): return Evaluation.Evaluated(value = self.program.values[value])
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
-                if index >= 0: return bindings[index].value
+                if index >= 0: return Evaluation.Evaluated(value = bindings[index].value)
                 for constant in self.program.constants:
                     if constant.symbol.value == symbol.value:
                         # Initializers are literal trees; re-evaluating is lookup.
                         return try self.evaluate(constant.value, list[Binding]())
                 trap("typed reference points outside its call frame")
             Unary(operation, operand):
-                return try evaluate_unary(operation, try self.evaluate(operand, bindings), self.program.types)
+                match try self.evaluate(operand, bindings):
+                    Evaluated(item): return Evaluation.Evaluated(value = try evaluate_unary(operation, item, self.program.types))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             Binary(left, operation, right):
-                let left_value = try self.evaluate(left, bindings)
+                let left_evaluation = try self.evaluate(left, bindings)
+                var left_value = Value.Unit
+                match left_evaluation:
+                    Evaluated(item): left_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
                 # `and` and `or` short-circuit: the right side must not run
                 # when the left side already decides the answer.
                 match operation:
                     LogicalAnd:
-                        if not as_boolean(left_value): return Value.Boolean(value = false)
-                        return Value.Boolean(value = as_boolean(try self.evaluate(right, bindings)))
+                        if not as_boolean(left_value): return Evaluation.Evaluated(value = Value.Boolean(value = false))
                     LogicalOr:
-                        if as_boolean(left_value): return Value.Boolean(value = true)
-                        return Value.Boolean(value = as_boolean(try self.evaluate(right, bindings)))
-                    else: return try evaluate_binary(left_value, operation, try self.evaluate(right, bindings), self.program.types)
+                        if as_boolean(left_value): return Evaluation.Evaluated(value = Value.Boolean(value = true))
+                    else: pass
+                match try self.evaluate(right, bindings):
+                    Evaluated(item):
+                        match operation:
+                            LogicalAnd, LogicalOr: return Evaluation.Evaluated(value = Value.Boolean(value = as_boolean(item)))
+                            else: return Evaluation.Evaluated(value = try evaluate_binary(left_value, operation, item, self.program.types))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             Conditional(value, condition, alternative):
-                if as_boolean(try self.evaluate(condition, bindings)):
-                    return try self.evaluate(value, bindings)
-                return try self.evaluate(alternative, bindings)
+                match try self.evaluate(condition, bindings):
+                    Evaluated(item):
+                        if as_boolean(item): return try self.evaluate(value, bindings)
+                        return try self.evaluate(alternative, bindings)
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             Range(lower, upper, inclusive):
-                return Value.Record(fields = [
-                    BoxedValue(value = try self.evaluate(lower, bindings)),
-                    BoxedValue(value = try self.evaluate(upper, bindings)),
-                    BoxedValue(value = Value.Boolean(value = inclusive)),
-                ])
+                let low = try self.evaluate(lower, bindings)
+                var low_value = Value.Unit
+                match low:
+                    Evaluated(item): low_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                let high = try self.evaluate(upper, bindings)
+                match high:
+                    Evaluated(item):
+                        return Evaluation.Evaluated(value = Value.Record(fields = [
+                            BoxedValue(value = low_value),
+                            BoxedValue(value = item),
+                            BoxedValue(value = Value.Boolean(value = inclusive)),
+                        ]))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             Call(function, arguments): return try self.evaluate_call(function, arguments, bindings)
-            StructValue(struct_index, fields): return Value.Record(fields = try self.evaluate_run(fields, bindings))
+            ErrorCodeLiteral(value):
+                return Evaluation.Evaluated(value = Value.Record(fields = [
+                    BoxedValue(value = Value.Text(value = self.program.package_identity)),
+                    BoxedValue(value = Value.Integer(value = i64(value))),
+                ]))
+            Raise(code, message):
+                let code_evaluation = try self.evaluate(code, bindings)
+                var code_value = Value.Unit
+                match code_evaluation:
+                    Evaluated(item): code_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                match try self.evaluate(message, bindings):
+                    Evaluated(item):
+                        let error_value = Value.Record(fields = [BoxedValue(value = code_value), BoxedValue(value = item)])
+                        return Evaluation.Transferred(execution = Execution.Raised(error_value = error_value))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            Try(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            FallibleSuccess(success): return Evaluation.Evaluated(value = success.value)
+                            FallibleFailure(error_value): return Evaluation.Transferred(execution = Execution.Raised(error_value = error_value.value))
+                            else: trap("typed `try` received a non-fallible HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            Catch(value, failure, body): return try self.evaluate_catch(value, failure, body, bindings)
+            StructValue(struct_index, fields):
+                match try self.evaluate_run(fields, bindings):
+                    EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Record(fields = items))
+                    TransferredRun(execution): return Evaluation.Transferred(execution = execution)
             FieldAccess(record, field):
                 match try self.evaluate(record, bindings):
-                    Record(fields): return fields[field].value
-                    else: trap("field access applied to a non-struct HIR value")
-            Tuple(elements): return Value.Tuple(elements = try self.evaluate_run(elements, bindings))
+                    Evaluated(item):
+                        match item:
+                            Record(fields): return Evaluation.Evaluated(value = fields[field].value)
+                            else: trap("field access applied to a non-struct HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            Tuple(elements):
+                match try self.evaluate_run(elements, bindings):
+                    EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Tuple(elements = items))
+                    TransferredRun(execution): return Evaluation.Transferred(execution = execution)
             Element(value, index):
                 match try self.evaluate(value, bindings):
-                    Tuple(elements):
-                        if index < 0 or index >= len(elements): trap("tuple element index is out of range")
-                        return elements[index].value
-                    else: trap("tuple element applied to a non-tuple HIR value")
-            NoneLiteral: return Value.Absent
-            Some(value): return Value.Present(value = BoxedValue(value = try self.evaluate(value, bindings)))
+                    Evaluated(item):
+                        match item:
+                            Tuple(elements):
+                                if index < 0 or index >= len(elements): trap("tuple element index is out of range")
+                                return Evaluation.Evaluated(value = elements[index].value)
+                            else: trap("tuple element applied to a non-tuple HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            NoneLiteral: return Evaluation.Evaluated(value = Value.Absent)
+            Some(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): return Evaluation.Evaluated(value = Value.Present(value = BoxedValue(value = item)))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             ElseFallback(value, arm):
                 match try self.evaluate(value, bindings):
-                    Absent: return try self.evaluate(arm, bindings)
-                    Present(item): return item.value
-                    else: trap("`else` applied to a non-optional HIR value")
-            EnumValue(enum_index, case_index, payload): return Value.Variant(case_index = case_index, payload = try self.evaluate_run(payload, bindings))
+                    Evaluated(item):
+                        match item:
+                            Absent: return try self.evaluate(arm, bindings)
+                            Present(present): return Evaluation.Evaluated(value = present.value)
+                            else: trap("`else` applied to a non-optional HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            EnumValue(enum_index, case_index, payload):
+                match try self.evaluate_run(payload, bindings):
+                    EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Variant(case_index = case_index, payload = items))
+                    TransferredRun(execution): return Evaluation.Transferred(execution = execution)
             Match(subject, arms, has_result): return try self.evaluate_match(subject, arms, bindings)
             else: trap("statement node evaluated as an expression")
 
     # The recursive walkers are kept small on purpose: the oracle recurses
     # once per interpreted call, and every local of `evaluate` is host stack
     # for the whole depth. Each heavy arm lives in its own function.
-    func evaluate_run(run: Operands, bindings: list[Binding]) -> list[BoxedValue]!:
+    func evaluate_run(run: Operands, bindings: list[Binding]) -> RunEvaluation!:
         let items = list[BoxedValue]()
         for position in range(0, i64(run.count)):
-            items.append(BoxedValue(value = try self.evaluate(node_at(self.program, run, position), bindings)))
-        return items
+            match try self.evaluate(node_at(self.program, run, position), bindings):
+                Evaluated(item): items.append(BoxedValue(value = item))
+                Transferred(execution): return RunEvaluation.TransferredRun(execution = execution)
+        return RunEvaluation.EvaluatedRun(values = items)
 
-    func evaluate_call(function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Value!:
+    func evaluate_call(function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
         let target = self.find_function(function)
         let values = list[Value]()
         for parameter in target.parameters: values.append(Value.Unit)
@@ -369,7 +509,9 @@ class HirInterpreterRun:
         for pair in range(0, i64(arguments.count) // 2):
             let parameter_index = entry_at(self.program, arguments, pair * 2)
             let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
-            values[parameter_index] = try self.evaluate(argument, bindings)
+            match try self.evaluate(argument, bindings):
+                Evaluated(item): values[parameter_index] = item
+                Transferred(execution): return Evaluation.Transferred(execution = execution)
         let invocation = try self.call(target, values)
         # A mutating method changed its copy of `self`; the caller's place
         # receives that copy (HirGenerator proved it is a place).
@@ -380,10 +522,14 @@ class HirInterpreterRun:
             let index = find_binding(bindings, place.symbol)
             if index < 0: trap("mutating call refers to an unknown binding")
             bindings[index] = Binding(symbol = place.symbol, value = value_with_path(bindings[index].value, place.path, 0, invocation.receiver))
-        return invocation.value
+        return Evaluation.Evaluated(value = invocation.value)
 
-    func evaluate_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Value!:
-        let selected = try self.evaluate(subject, bindings)
+    func evaluate_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Evaluation!:
+        let evaluated = try self.evaluate(subject, bindings)
+        var selected = Value.Unit
+        match evaluated:
+            Evaluated(item): selected = item
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
         let outer_count = len(bindings)
         for position in range(0, i64(arms.count)):
             let arm = node_at(self.program, arms, position)
@@ -395,6 +541,26 @@ class HirInterpreterRun:
                         return result
                 else: trap("match arm run names a non-arm node")
         trap("checked `match` selected no arm")
+
+    # Handle the failure of exactly `value`. Success bypasses the handler;
+    # failure binds Error and runs a lexical scope whose Recovered transfer
+    # becomes this expression's value. Every other transfer keeps travelling.
+    func evaluate_catch(value: NodeId, failure: SymbolId, body: Operands, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate(value, bindings):
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+            Evaluated(item):
+                match item:
+                    FallibleSuccess(success): return Evaluation.Evaluated(value = success.value)
+                    FallibleFailure(error_value):
+                        let outer_count = len(bindings)
+                        bindings.append(Binding(symbol = failure, value = error_value.value))
+                        let outcome = try self.execute_scope(body, bindings)
+                        trim_bindings(bindings, outer_count)
+                        match outcome:
+                            Recovered(recovered): return Evaluation.Evaluated(value = recovered)
+                            Next: trap("checked catch handler finished without transferring")
+                            else: return Evaluation.Transferred(execution = outcome)
+                    else: trap("typed `catch` received a non-fallible HIR value")
 
     # mark: Patterns ============================================================================
 
@@ -597,7 +763,35 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
                 Absent: return evaluate_optional_equality(false, operation)
                 Present(right_value): return try evaluate_binary(left_value.value, operation, right_value.value, types)
                 else: trap("typed binary expression has unequal value types")
+        FallibleSuccess(value): trap("fallible call outcome escaped `try` or `catch`")
+        FallibleFailure(error_value): trap("fallible call outcome escaped `try` or `catch`")
         TextSlice(left_items): trap("slices have no binary operations in the current slice")
+
+# Render the source-visible Error shape only at the host execution boundary.
+# Internal propagation retains the structured value and never parses text.
+func render_error(value: Value) -> str:
+    match value:
+        Record(error_fields):
+            if len(error_fields) != 2: return "malformed Error"
+            var message = "<non-string message>"
+            match error_fields[1].value:
+                Text(text): message = text
+                else: pass
+            match error_fields[0].value:
+                Record(code_fields):
+                    if len(code_fields) == 2:
+                        var domain = "<invalid package>"
+                        var code = -1
+                        match code_fields[0].value:
+                            Text(text): domain = text
+                            else: pass
+                        match code_fields[1].value:
+                            Integer(number): code = number
+                            else: pass
+                        return domain + ":" + str(code) + ": " + message
+                else: pass
+            return "malformed Error: " + message
+        else: return "malformed Error"
 
 # Unit supports equality only; `unit == unit` is true.
 func evaluate_unit_binary(operation: BinaryOperation) -> Value:

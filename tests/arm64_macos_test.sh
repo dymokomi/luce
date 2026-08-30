@@ -9,7 +9,7 @@ test_dir=$(mktemp -d "${TMPDIR:-/tmp}/luce-arm64-macos.XXXXXX")
 trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 
 "$luce" build src/luce.luc -o "$test_dir/luce"
-"$test_dir/luce" build --target arm64-macos "$test_dir/hello" examples/hello.luc
+"$test_dir/luce" build --package org.luce.tests --target arm64-macos "$test_dir/hello" examples/hello.luc
 
 description=$(file "$test_dir/hello")
 case "$description" in
@@ -29,7 +29,7 @@ fi
 # Integer overflow must trap (language section 7): the image dies by signal
 # rather than returning a wrapped value. SIGTRAP on arm64, SIGILL on x86-64.
 printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
-"$test_dir/luce" build --target arm64-macos "$test_dir/overflow" "$test_dir/overflow.luc"
+"$test_dir/luce" build --package org.luce.tests --target arm64-macos "$test_dir/overflow" "$test_dir/overflow.luc"
 set +e
 { "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2>/dev/null
 set -e

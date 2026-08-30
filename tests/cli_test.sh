@@ -43,19 +43,20 @@ printf 'pub func main() -> i64: return true\n' > "$test_dir/wrong.luc"
 expect 0 "Luce v" "$cli" --version
 expect 2 "usage:" "$cli"
 expect 2 "unknown command" "$cli" frobnicate
-expect 2 "check: expected at least one FILE" "$cli" check
-expect 2 "run: entry must be MODULE.FUNCTION" "$cli" run main "$test_dir/main.luc"
-expect 2 "build: unknown target" "$cli" build --target z80 out "$test_dir/main.luc"
+expect 2 "expected \`--package ID\`" "$cli" check
+expect 2 "check: expected at least one FILE" "$cli" check --package org.luce.tests
+expect 2 "run: entry must be MODULE.FUNCTION" "$cli" run --package org.luce.tests main "$test_dir/main.luc"
+expect 2 "build: unknown target" "$cli" build --package org.luce.tests --target z80 out "$test_dir/main.luc"
 
-expect 0 "checked 1 file(s)" "$cli" check "$test_dir/main.luc"
-expect 1 "cannot read" "$cli" check "$test_dir/missing.luc"
-expect 1 "expected \`i64\`, found \`bool\`" "$cli" check "$test_dir/wrong.luc"
+expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests "$test_dir/main.luc"
+expect 1 "cannot read" "$cli" check --package org.luce.tests "$test_dir/missing.luc"
+expect 1 "expected \`i64\`, found \`bool\`" "$cli" check --package org.luce.tests "$test_dir/wrong.luc"
 
-expect 0 "5" "$cli" run main.main "$test_dir/main.luc"
-expect 1 "module \`main\` has no function \`nope\`" "$cli" run main.nope "$test_dir/main.luc"
-expect 1 "unknown module \`other\`" "$cli" run other.main "$test_dir/main.luc"
+expect 0 "5" "$cli" run --package org.luce.tests main.main "$test_dir/main.luc"
+expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luce.tests main.nope "$test_dir/main.luc"
+expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests other.main "$test_dir/main.luc"
 
-expect 0 "built $test_dir/out.wasm" "$cli" build "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 1 "executable: needs one public \`main\`" "$cli" build --target arm64-macos "$test_dir/out" examples/compiled_core/main.luc
+expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests "$test_dir/out.wasm" examples/compiled_core/main.luc
+expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --target arm64-macos "$test_dir/out" examples/compiled_core/main.luc
 
 echo "cli: ok"

@@ -102,6 +102,23 @@ enum Region:
     for_continue
     if_arm
 
+# How one shared match-arm dispatcher leaves the selected arm. Statement
+# matches execute a scope; value and fallible matches branch to a result block.
+union MatchExit:
+    Statement
+    Value(block_depth: i64)
+    Fallible(block_depth: i64)
+
+struct FallibleResult:
+    pub let value: RegisterId
+    pub let error_value: RegisterId
+
+# Where a recover leaves its catch expression, and which deferred suffix
+# belongs to the handler rather than the surrounding function.
+struct RecoverTarget:
+    pub let region_index: i64
+    pub let defer_start: i64
+
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     let program: HirProgram
@@ -121,11 +138,12 @@ pub class Lowerer:
     # the first action belonging to each active source loop.
     var defers: list[NodeId]
     var loop_defer_starts: list[i64]
+    var recover_targets: list[RecoverTarget]
     # The operand table of the function being lowered.
     var operands: OperandBuilder
-    # The hidden result pointer of a function returning an aggregate (`-1`
-    # when the function returns a scalar or nothing), and the data item
-    # holding the newline `print` writes after a value (`-1` until first use).
+    # Hidden caller-owned Error and aggregate-result pointers (`-1` when the
+    # function does not use that protocol), and the newline data item.
+    var error_slot: i64
     var result_slot: i64
     var newline_data: i64
 
@@ -143,7 +161,9 @@ pub class Lowerer:
         self.regions = list[Region]()
         self.defers = list[NodeId]()
         self.loop_defer_starts = list[i64]()
+        self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
+        self.error_slot = -1
         self.result_slot = -1
         self.newline_data = -1
 
@@ -187,19 +207,30 @@ pub class Lowerer:
         self.regions = list[Region]()
         self.defers = list[NodeId]()
         self.loop_defer_starts = list[i64]()
+        self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
+        self.error_slot = -1
         self.result_slot = -1
         let parameter_types = list[TypeId]()
         let results = list[TypeId]()
-        let returns_unit = types_match(function.result, resolve_builtin_type(BuiltinType.unit))
+        let fallible_result = self.fallible_inner(function.result)
+        let is_fallible = fallible_result != none
+        var successful_result = function.result
+        if fallible_result != none: successful_result = fallible_result
+        let returns_unit = types_match(successful_result, resolve_builtin_type(BuiltinType.unit))
+        if is_fallible:
+            let pointer = builtin_mir_type(BuiltinMirType.pointer)
+            parameter_types.append(pointer)
+            self.error_slot = i64(self.new_register(pointer).value)
         if not returns_unit:
-            let result_type = try self.mir_type_of(module, function, function.span, function.result)
+            let result_type = try self.mir_type_of(module, function, function.span, successful_result)
             if self.is_aggregate(result_type):
                 let pointer = builtin_mir_type(BuiltinMirType.pointer)
                 parameter_types.append(pointer)
                 self.result_slot = i64(self.new_register(pointer).value)
             else:
                 results.append(result_type)
+        if is_fallible: results.append(builtin_mir_type(BuiltinMirType.pointer))
         if not is_entry:
             for parameter in function.parameters:
                 let parameter_type = self.register_type_for(try self.mir_type_of(module, function, function.span, parameter.value_type))
@@ -216,7 +247,11 @@ pub class Lowerer:
         # the trailing `Unreachable` records that proof for the verifier.
         if not terminates(body):
             if returns_unit:
-                body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = function.span))
+                if is_fallible:
+                    let no_error = self.null_constant(function.span, body)
+                    body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run([no_error])), span = function.span))
+                else:
+                    body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = function.span))
             else:
                 body.append(MirInstruction(form = InstructionForm.Unreachable, span = function.span))
         var name = module.name + "." + function.name
@@ -225,7 +260,7 @@ pub class Lowerer:
         return MirFunction(
             name = name,
             convention = CallingConvention.luce,
-            signature = MirSignature(parameters = parameter_types, results = results, is_fallible = false),
+            signature = MirSignature(parameters = parameter_types, results = results, is_fallible = is_fallible),
             registers = self.registers,
             slots = self.slots,
             body = body,
@@ -289,6 +324,7 @@ pub class Lowerer:
             PrintValue(value): try self.lower_prologue_node(module, function, value, body)
             ReturnStatement(value):
                 if value.value != no_node: try self.lower_prologue_node(module, function, value, body)
+            RecoverStatement(value): try self.lower_prologue_node(module, function, value, body)
             DeferStatement(action): try self.lower_prologue_node(module, function, action, body)
             ExpressionStatement(value): try self.lower_prologue_node(module, function, value, body)
             IfStatement(branches, has_fallback, fallback):
@@ -310,6 +346,14 @@ pub class Lowerer:
             Call(callee, arguments):
                 for pair in range(0, i64(arguments.count) // 2):
                     try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
+            Raise(code, message):
+                try self.lower_prologue_node(module, function, code, body)
+                try self.lower_prologue_node(module, function, message, body)
+            Try(value): try self.lower_prologue_node(module, function, value, body)
+            Catch(value, failure, catch_body):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.reserve_slot(module, function, failure, span, body)
+                try self.lower_prologue(module, function, catch_body, body)
             Tuple(elements): try self.lower_prologue_run(module, function, elements, body)
             Element(value, index): try self.lower_prologue_node(module, function, value, body)
             StructValue(struct_index, fields): try self.lower_prologue_run(module, function, fields, body)
@@ -353,18 +397,33 @@ pub class Lowerer:
             ReturnStatement(value):
                 if value.value == no_node:
                     try self.emit_deferred_from(module, function, 0, body)
-                    body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
+                    if self.error_slot >= 0:
+                        let no_error = self.null_constant(span, body)
+                        body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run([no_error])), span = span))
+                    else:
+                        body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
                     return
                 let register = try self.lower_expression(module, function, value, body)
+                let returned = list[RegisterId]()
                 if self.result_slot >= 0:
                     # The caller owns the result's memory; fill it and return nothing.
                     let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
                     body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.result_slot)), source = register, value_type = value_type), span = span))
-                    try self.emit_deferred_from(module, function, 0, body)
-                    body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
-                    return
+                else:
+                    returned.append(register)
                 try self.emit_deferred_from(module, function, 0, body)
-                body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run([register])), span = span))
+                if self.error_slot >= 0: returned.append(self.null_constant(span, body))
+                body.append(MirInstruction(form = InstructionForm.Return(values = self.operands.run(returned)), span = span))
+            RecoverStatement(value):
+                if len(self.recover_targets) == 0:
+                    try self.fail_unsupported(module, function, span, "`recover` outside a catch handler")
+                let target = self.recover_targets[len(self.recover_targets) - 1]
+                let recovered = try self.lower_expression(module, function, value, body)
+                try self.emit_deferred_from(module, function, target.defer_start, body)
+                let values = list[RegisterId]()
+                if recovered.value != no_register: values.append(recovered)
+                let depth = len(self.regions) - 1 - target.region_index
+                body.append(MirInstruction(form = InstructionForm.Br(depth = depth, values = self.operands.run(values)), span = span))
             DeferStatement(action):
                 self.defers.append(action)
             Binding(symbol, is_mutable, value):
@@ -431,6 +490,10 @@ pub class Lowerer:
     func hir_field_type(value_type: hir.TypeId, field: i64) -> hir.TypeId:
         match self.program.types.definitions[value_type.value].form:
             Struct(index): return self.program.structs[index].fields[field].value_type
+            Error:
+                if field == 0: return resolve_builtin_type(BuiltinType.error_code)
+                if field == 1: return resolve_builtin_type(BuiltinType.string)
+                trap("field of Error is out of range")
             else: trap("field of a non-struct HIR type")
 
     # mark: Control flow =======================================================================
@@ -663,13 +726,99 @@ pub class Lowerer:
         # expression form has a scalar type or is refused below.
         match node_form(self.program, expression):
             Call(callee, arguments):
+                if self.fallible_inner(node_type(self.program, expression)) != none:
+                    try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible call")
                 return try self.lower_call(module, function, expression, callee, arguments, body)
+            Raise(code, message): return try self.lower_raise(module, function, expression, code, message, body)
+            Try(value): return try self.lower_try(module, function, expression, value, body)
+            Catch(value, failure, catch_body): return try self.lower_catch(module, function, expression, value, failure, catch_body, body)
             else: return try self.lower_typed_expression(module, function, expression, body)
+
+    # Fill this function's caller-owned Error and leave through `Raise r0`.
+    # The code and message are ordinary aggregate values copied fieldwise.
+    func lower_raise(module: HirModule, function: HirFunction, expression: NodeId, code: NodeId, message: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        if self.error_slot < 0: try self.fail_unsupported(module, function, span, "`error` in a non-fallible function")
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let code_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_code))
+        let message_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.string))
+        let destination = RegisterId(value = u32(self.error_slot))
+        let code_value = try self.lower_expression(module, function, code, body)
+        self.store_value(code_type, self.field_address(error_type, destination, 0, span, body), code_value, span, body)
+        let message_value = try self.lower_expression(module, function, message, body)
+        self.store_value(message_type, self.field_address(error_type, destination, 1, span, body), message_value, span, body)
+        try self.emit_deferred_from(module, function, 0, body)
+        body.append(MirInstruction(form = InstructionForm.Raise(failure = destination), span = span))
+        return RegisterId(value = no_register)
+
+    # Propagation is a null test followed by one explicit failure arm. Copying
+    # into r0 transfers ownership to our caller before local slots disappear.
+    func lower_try(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        if self.error_slot < 0: try self.fail_unsupported(module, function, span, "`try` in a non-fallible function")
+        let attempted = try self.lower_fallible_expression(module, function, value, body)
+        let failed = self.error_is_present(attempted.error_value, span, body)
+        self.open_if(failed, list[RegisterId](), span, body)
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.error_slot)), source = attempted.error_value, value_type = error_type), span = span))
+        try self.emit_deferred_from(module, function, 0, body)
+        body.append(MirInstruction(form = InstructionForm.Raise(failure = RegisterId(value = u32(self.error_slot))), span = span))
+        self.emit_end(span, body)
+        return attempted.value
+
+    # Recovery is the same data test with a value-producing If. The failure
+    # arm binds Error in its reserved slot; recover branches out of the If,
+    # while success yields the call's value directly.
+    func lower_catch(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, failure: SymbolId, catch_body: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let attempted = try self.lower_fallible_expression(module, function, value, body)
+        var result = RegisterId(value = no_register)
+        let results = list[RegisterId]()
+        if not types_match(node_type(self.program, expression), resolve_builtin_type(BuiltinType.unit)):
+            let success_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
+            result = self.new_register(self.register_type_for(success_type))
+            results.append(result)
+        let failed = self.error_is_present(attempted.error_value, span, body)
+        self.open_if(failed, results, span, body)
+        self.regions.append(Region.if_arm)
+        let local = try self.local_of(module, function, span, failure)
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        self.store_value(error_type, local.address, attempted.error_value, span, body)
+        let defer_start = len(self.defers)
+        self.recover_targets.append(RecoverTarget(region_index = len(self.regions) - 1, defer_start = defer_start))
+        try self.lower_scope(module, function, catch_body, body)
+        # HirGenerator proved every handler path transfers. `lower_scope`
+        # still emits the normal-fallthrough copies of deferred actions after
+        # those branches; this marker preserves that proof for the region
+        # verifier without making the unreachable copies observable.
+        body.append(MirInstruction(form = InstructionForm.Unreachable, span = span))
+        self.recover_targets.remove(len(self.recover_targets) - 1)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_else(span, body)
+        if attempted.value.value != no_register: self.emit_yield(attempted.value, span, body)
+        self.emit_end(span, body)
+        return result
+
+    func error_is_present(error_value: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let no_error = self.null_constant(span, body)
+        let failed = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = failed, operation = BinaryOp.ne, left = error_value, right = no_error), span = span))
+        return failed
 
     func lower_typed_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.program, expression)
         let value_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
         match node_form(self.program, expression):
+            ErrorCodeLiteral(value):
+                let temp = self.new_temp(value_type, span, body)
+                let domain_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.string))
+                let domain = try self.lower_byte_constant(domain_type, strings.to_bytes(self.program.package_identity), span, body)
+                self.store_value(domain_type, self.field_address(value_type, temp, 0, span, body), domain, span, body)
+                let code_type = builtin_mir_type(BuiltinMirType.unsigned_u32)
+                let code = self.new_register(code_type)
+                body.append(MirInstruction(form = InstructionForm.Const(result = code, value = MirConstant.Int(value = i64(value))), span = span))
+                self.store_value(code_type, self.field_address(value_type, temp, 1, span, body), code, span, body)
+                return temp
             Constant(index):
                 var constant = MirConstant.Null
                 match self.program.values[index]:
@@ -813,6 +962,117 @@ pub class Lowerer:
             else:
                 error(self.unsupported(module, function, span, "expression `" + str(node_form(self.program, expression)) + "`"))
 
+    # A fallible expression yields its success register (absent for unit) and
+    # reported error pointer together. Calls are the primitive producer;
+    # conditional expressions join both components through region results.
+    func lower_fallible_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.program, expression)
+        match node_form(self.program, expression):
+            Call(callee, arguments): return try self.lower_fallible_call(module, function, expression, callee, arguments, body)
+            Match(subject, arms, has_result): return try self.lower_fallible_match(module, function, expression, subject, arms, body)
+            Conditional(value, condition, alternative):
+                let successful = self.fallible_inner(node_type(self.program, expression)) else error(self.unsupported(module, function, span, "a non-fallible expression in fallible lowering"))
+                let condition_value = try self.lower_expression(module, function, condition, body)
+                var result_value = RegisterId(value = no_register)
+                let results = list[RegisterId]()
+                if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+                    let value_type = try self.mir_type_of(module, function, span, successful)
+                    result_value = self.new_register(self.register_type_for(value_type))
+                    results.append(result_value)
+                let result_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                results.append(result_error)
+                self.open_if(condition_value, results, span, body)
+                let chosen = try self.lower_fallible_expression(module, function, value, body)
+                self.emit_fallible_yield(chosen, span, body)
+                self.emit_else(span, body)
+                let fallback = try self.lower_fallible_expression(module, function, alternative, body)
+                self.emit_fallible_yield(fallback, span, body)
+                self.emit_end(span, body)
+                return FallibleResult(value = result_value, error_value = result_error)
+            else: error(self.unsupported(module, function, span, "fallible expression `" + str(node_form(self.program, expression)) + "`"))
+
+    # A fallible match joins both halves of the effect at one block: the
+    # successful value (when non-unit) and the reported Error pointer. Pattern
+    # testing and bindings mirror ordinary match lowering, while arm exits use
+    # `lower_fallible_expression` so no T! value ever becomes a MIR register.
+    func lower_fallible_match(module: HirModule, function: HirFunction, node: NodeId, subject: NodeId, arms: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.program, node)
+        let successful = self.fallible_inner(node_type(self.program, node)) else error(self.unsupported(module, function, span, "a non-fallible match in fallible lowering"))
+        let subject_type = node_type(self.program, subject)
+        let selected = try self.lower_expression(module, function, subject, body)
+        var result_value = RegisterId(value = no_register)
+        let result_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        let results = list[RegisterId]()
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let value_type = try self.mir_type_of(module, function, span, successful)
+            result_value = self.new_register(self.register_type_for(value_type))
+            results.append(result_value)
+        results.append(result_error)
+        let block_depth = len(self.regions)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.operands.run(results)), span = span))
+        self.regions.append(Region.block)
+
+        try self.lower_match_arms(module, function, selected, subject_type, arms, MatchExit.Fallible(block_depth = block_depth), span, body)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_end(span, body)
+        return FallibleResult(value = result_value, error_value = result_error)
+
+    func lower_fallible_arm_body(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
+        let defer_start = len(self.defers)
+        for position in range(0, i64(statements.count)):
+            try self.lower_statement(module, function, node_at(self.program, statements, position), body)
+        let result = try self.lower_fallible_expression(module, function, value, body)
+        try self.emit_deferred_from(module, function, defer_start, body)
+        while len(self.defers) > defer_start: self.defers.remove(len(self.defers) - 1)
+        let values = list[RegisterId]()
+        if result.value.value != no_register: values.append(result.value)
+        values.append(result.error_value)
+        let depth = len(self.regions) - 1 - block_depth
+        body.append(MirInstruction(form = InstructionForm.Br(depth = depth, values = self.operands.run(values)), span = span))
+
+    func emit_fallible_yield(result: FallibleResult, span: SourceSpan, body: list[MirInstruction]):
+        let values = list[RegisterId]()
+        if result.value.value != no_register: values.append(result.value)
+        values.append(result.error_value)
+        body.append(MirInstruction(form = InstructionForm.Yield(values = self.operands.run(values)), span = span))
+
+    # Source arguments are evaluated in source order and then placed by the
+    # parameter indices HIR resolved for named arguments.
+    func lower_placed_arguments(module: HirModule, function: HirFunction, called: HirFunction, arguments: Operands, body: list[MirInstruction]) -> list[RegisterId]!:
+        let placed = list[RegisterId]()
+        for parameter in called.parameters: placed.append(RegisterId(value = no_register))
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            placed[parameter_index] = try self.lower_expression(module, function, argument, body)
+        return placed
+
+    func lower_fallible_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.program, expression)
+        let target = self.function_index_of(callee)
+        if target < 0: try self.fail_unsupported(module, function, span, "a call to a symbol that is not a function")
+        let called = self.program.functions[target]
+        let successful = self.fallible_inner(called.result) else error(self.unsupported(module, function, span, "a non-fallible call in fallible lowering"))
+        let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let error_temp = self.new_temp(error_type, span, body)
+        let call_arguments = [error_temp]
+        var value = RegisterId(value = no_register)
+        let results = list[RegisterId]()
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.mir_type_of(module, function, span, successful)
+            if self.is_aggregate(result_type):
+                value = self.new_temp(result_type, span, body)
+                call_arguments.append(value)
+            else:
+                value = self.new_register(result_type)
+                results.append(value)
+        for argument in placed: call_arguments.append(argument)
+        let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        results.append(reported_error)
+        body.append(MirInstruction(form = InstructionForm.Call(results = self.operands.run(results), function = FunctionId(value = u32(target)), arguments = self.operands.run(call_arguments)), span = span))
+        return FallibleResult(value = value, error_value = reported_error)
+
     # Arguments are lowered in the order they were written, then placed by
     # the parameter index HIR resolved for each (named arguments may be
     # written in any order). The callee is a `FunctionId`, its index in
@@ -822,13 +1082,7 @@ pub class Lowerer:
         let target = self.function_index_of(callee)
         if target < 0: try self.fail_unsupported(module, function, span, "a call to a symbol that is not a function")
         let called = self.program.functions[target]
-        let placed = list[RegisterId]()
-        for parameter in called.parameters: placed.append(RegisterId(value = no_register))
-        # Arguments are pairs: parameter index, then the argument node.
-        for pair in range(0, i64(arguments.count) // 2):
-            let parameter_index = entry_at(self.program, arguments, pair * 2)
-            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
-            placed[parameter_index] = try self.lower_expression(module, function, argument, body)
+        let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         let results = list[RegisterId]()
         if not types_match(called.result, resolve_builtin_type(BuiltinType.unit)):
             let result_type = try self.mir_type_of(module, function, span, called.result)
@@ -939,6 +1193,18 @@ pub class Lowerer:
             result = self.new_register(self.register_type_for(try self.mir_type_of(module, function, span, node_type(self.program, node))))
             body.append(MirInstruction(form = InstructionForm.Block(results = self.operands.run([result])), span = span))
             self.regions.append(Region.block)
+        var arm_exit = MatchExit.Statement
+        if has_result: arm_exit = MatchExit.Value(block_depth = block_depth)
+        try self.lower_match_arms(module, function, selected, subject_type, arms, arm_exit, span, body)
+        if has_result:
+            self.regions.remove(len(self.regions) - 1)
+            self.emit_end(span, body)
+        return result
+
+    # Emit the pattern-test chain shared by statement, value, and fallible
+    # matches. Each open If remains around the following arm's Else, which is
+    # why a branch to an outer result block counts all earlier alternatives.
+    func lower_match_arms(module: HirModule, function: HirFunction, selected: RegisterId, subject_type: hir.TypeId, arms: Operands, arm_exit: MatchExit, span: SourceSpan, body: list[MirInstruction]) -> !:
         var open_arms = 0
         var closed = false
         for position in range(0, i64(arms.count)):
@@ -946,23 +1212,20 @@ pub class Lowerer:
             let arm = node_at(self.program, arms, position)
             match node_form(self.program, arm):
                 MatchArm(patterns, statements, value):
-                    let binds = self.arm_binds(patterns)
-                    # Each `If` stays on the region stack after its `Else`: the
-                    # next arm is emitted inside that else-arm, so branch depths
-                    # (to the result block, or `break`/`continue` past it) count it.
-                    if binds:
-                        # One `If` per alternative, each with its own copy of the body.
+                    if self.arm_binds(patterns):
+                        # Payload bindings point into a case-specific layout,
+                        # so every alternative needs its own copy of the arm.
                         for alternative in range(0, i64(patterns.count)):
                             let pattern = node_at(self.program, patterns, alternative)
                             let test = try self.lower_pattern_test(module, function, pattern, selected, subject_type, body)
                             self.open_if(test, list[RegisterId](), span, body)
                             self.regions.append(Region.if_arm)
                             try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
-                            try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                            try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
                             self.emit_else(span, body)
                             open_arms += 1
                     elif self.arm_is_wildcard(patterns):
-                        try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
                         closed = true
                     else:
                         var test = try self.lower_pattern_test(module, function, node_at(self.program, patterns, 0), selected, subject_type, body)
@@ -971,26 +1234,24 @@ pub class Lowerer:
                             test = self.lower_or(test, next, span, body)
                         self.open_if(test, list[RegisterId](), span, body)
                         self.regions.append(Region.if_arm)
-                        try self.lower_arm_body(module, function, statements, value, has_result, block_depth, span, body)
+                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
                         self.emit_else(span, body)
                         open_arms += 1
                 else: try self.fail_unsupported(module, function, span, "a match arm that is not a `MatchArm` node")
-        if not closed:
-            body.append(MirInstruction(form = InstructionForm.Trap(reason = "unreachable match arm"), span = span))
+        if not closed: body.append(MirInstruction(form = InstructionForm.Trap(reason = "unreachable match arm"), span = span))
         for arm in range(0, open_arms):
             self.regions.remove(len(self.regions) - 1)
             self.emit_end(span, body)
-        if has_result:
-            self.regions.remove(len(self.regions) - 1)
-            self.emit_end(span, body)
-        return result
 
-    # An arm's body: its statements, or its value branched to the match's
-    # result block through every region opened since.
-    func lower_arm_body(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, has_result: bool, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
-        if not has_result:
-            try self.lower_scope(module, function, statements, body)
-            return
+    func lower_selected_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, arm_exit: MatchExit, span: SourceSpan, body: list[MirInstruction]) -> !:
+        match arm_exit:
+            Statement: try self.lower_scope(module, function, statements, body)
+            Value(block_depth): try self.lower_value_match_arm(module, function, statements, value, block_depth, span, body)
+            Fallible(block_depth): try self.lower_fallible_arm_body(module, function, statements, value, block_depth, span, body)
+
+    # A value arm branches to the match's result block through every pattern
+    # region opened since the block.
+    func lower_value_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
         let defer_start = len(self.defers)
         for position in range(0, i64(statements.count)):
             try self.lower_statement(module, function, node_at(self.program, statements, position), body)
@@ -1247,6 +1508,11 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Bool(value = value)), span = span))
         return register
 
+    func null_constant(span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let register = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Null), span = span))
+        return register
+
     # mark: Aggregate equality ==================================================================
     #
     # Aggregates support `==` and `!=` only. Equality is structural and short-
@@ -1331,6 +1597,12 @@ pub class Lowerer:
                 return result
             String: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
             Bytes: return try self.lower_bytes_equality(mir_value_type, left, right, span, body)
+            ErrorCode:
+                let fields = [resolve_builtin_type(BuiltinType.string), resolve_builtin_type(BuiltinType.unsigned_u32)]
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, body)
+            Error:
+                let fields = [resolve_builtin_type(BuiltinType.error_code), resolve_builtin_type(BuiltinType.string)]
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, body)
             Enum(index):
                 # Same tag, then the same payload for that case.
                 let left_tag = self.load_tag(left, span, body)
@@ -1350,6 +1622,15 @@ pub class Lowerer:
                 self.emit_end(span, body)
                 return result
             else: error(self.unsupported(module, function, span, "equality on `" + describe_type(self.program.types, value_type) + "`"))
+
+    func lower_structural_fields(module: HirModule, function: HirFunction, span: SourceSpan, mir_value_type: TypeId, fields: list[hir.TypeId], left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        var so_far = self.bool_constant(true, span, body)
+        for index in range(0, len(fields)):
+            let field_type = try self.mir_type_of(module, function, span, fields[index])
+            let left_value = self.load_value(field_type, self.field_address(mir_value_type, left, index, span, body), span, body)
+            let right_value = self.load_value(field_type, self.field_address(mir_value_type, right, index, span, body), span, body)
+            so_far = try self.lower_and_then(module, function, span, so_far, fields[index], left_value, right_value, body)
+        return so_far
 
     # `so_far and left == right`, evaluated only when `so_far` holds.
     func lower_and_then(module: HirModule, function: HirFunction, span: SourceSpan, so_far: RegisterId, value_type: hir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
@@ -1470,6 +1751,13 @@ pub class Lowerer:
         match self.program.types.definitions[value.value].form:
             String: return self.byte_string_type()
             Bytes: return self.byte_string_type()
+            ErrorCode:
+                let fields = [self.byte_string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
+                return intern_mir_type(self.types, make_struct_type(self.types, self.layout, fields))
+            Error:
+                let code = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_code))
+                let fields = [code, self.byte_string_type()]
+                return intern_mir_type(self.types, make_struct_type(self.types, self.layout, fields))
             Tuple(elements):
                 let field_types = list[TypeId]()
                 for element in elements:
@@ -1505,6 +1793,12 @@ pub class Lowerer:
     func byte_string_type() -> TypeId:
         let fields = [builtin_mir_type(BuiltinMirType.pointer), builtin_mir_type(BuiltinMirType.signed_i64)]
         return intern_mir_type(self.types, make_struct_type(self.types, self.layout, fields))
+
+    func fallible_inner(value: hir.TypeId) -> hir.TypeId?:
+        if i64(value.value) >= len(self.program.types.definitions): return none
+        match self.program.types.definitions[value.value].form:
+            Fallible(inner): return inner
+            else: return none
 
     # mark: Diagnostics =========================================================================
 
