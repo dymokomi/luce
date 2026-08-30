@@ -231,7 +231,17 @@ refusing every write). Please do refuse the bare form in 0.26 rather than let
 it linger: a field that is silently mutable because its author omitted a word
 is the one outcome worse than a migration.
 
-**5b. `discard(expr)` and the unused-result lint.** Neither exists today:
+**5b. `discard(expr)` and the unused-result lint.** *Landed in 0.26 as a hard
+error. Our measured exposure before the bump: about 164 statement-position
+calls to a name that answers a value, of which 113 are three parser helpers —
+`expect_symbol` (65 of 68 call sites ignore the token), `expect_kind` (38 of
+42), `expect_keyword` (10 of 14). For those the lint is not asking for 113
+`discard(...)` wrappers; it is telling us the signature is wrong, and the fix
+is `-> !` plus a `take_*` variant for the eleven sites that want the token.
+The rest take the wrapper. Estimate is name-based and over-approximates, so
+the authoritative list comes from the pre-release archive.*
+
+Original request: Neither exists today:
 `discard(produces())` is `unknown function discard`, and a dropped result is
 accepted in silence. Our spec has `discard[T](value: T)` as a compiler-known
 call (§7.8) with the name reserved (§3.5), precisely so that dropping a result
