@@ -28,6 +28,10 @@ if grep -R -n -E 'compiler\.backends|TargetLayout|LayoutRules|TypeLayout|pointer
     echo "platform dependency found before the backend boundary" >&2
     exit 1
 fi
+if grep -n -E 'arm64|x86_64|wasm32|macos|linux' src/compiler/backends/layout.luc; then
+    echo "concrete target found in shared backend layout" >&2
+    exit 1
+fi
 
 # 2. Unit tests: every tests/compiler/**/*_test.luc file.
 "$luce" test
