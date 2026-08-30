@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-30 (Stage-0 0.27).
+Last updated: 2026-08-30 (Stage-0 0.28).
 
 ## Recovery audit of the unpublished native branch
 
@@ -141,7 +141,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   (`facc3c3`).
 - [ ] **QBE product materialization**: expose native QBE builds through the
   command line, with explicit host-tool diagnostics and collision-free scratch
-  paths; then add QBE to each generated-program gate as those gates land.
+  paths. Stage-0 0.28 now provides the required atomic
+  `files.make_temporary_directory`; then add QBE to each generated-program gate
+  as those gates land.
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
@@ -226,7 +228,10 @@ Standing rules:
 
 ## 8. Stage-0 constraints
 
-The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.26 is pinned — installed from the pre-release archive built at `86b97fac`, the commit the release ships; `bootstrap.sh` carries that macOS checksum and holds the Linux one at `TBD` until CI publishes it, so a Linux bootstrap refuses cleanly rather than installing something unverified. Remaining constraints:
+The compiler must stay buildable by Stage-0 (the frozen seed) until it builds
+itself. Stage-0 0.28 is pinned by the published checksums for both supported
+hosts; the release was built from source commit
+`d5b458355179c059ce9c506c37990612c2c8f68f`. Remaining constraints:
 
 - Reserved identifiers (`error`, `bytes`, `i8`…, `pass`, `never`), and no top-level function sharing a name with a pattern binding.
 - A dropped result is an error (`luce.sema.unused`): write `discard(...)` around a value nothing receives, with any `catch` outside it — `discard(risky()) catch reason:`.

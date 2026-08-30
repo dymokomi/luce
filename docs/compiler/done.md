@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-30 (Stage-0 0.27).
+Last updated: 2026-08-30 (Stage-0 0.28).
 
 ## 1. Where things stand
 
@@ -22,7 +22,7 @@ Last updated: 2026-08-30 (Stage-0 0.27).
 | QBE backend (`backends/qbe.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, and a private caller-owned fallible-result ABI. The complete differential corpus is compiled, linked, and executed through real QBE. Product/CLI materialization is the next slice. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
 | Tests | 405 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and real QBE and checks values, output, and traps. |
-| Toolchain | Stage-0 0.27 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
+| Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
 
@@ -66,6 +66,11 @@ Last updated: 2026-08-30 (Stage-0 0.27).
   fixed upstream: the unchanged 20k–160k-character reproduction takes
   0.12–0.15 s per complete case. The clean 392-test, CLI, Wasm, and native
   gate passed; evidence is in `stage0-0.27.md`.
+- [x] **Stage-0 0.28 adopted** (2026-08-30). Both host archives are pinned by
+  their published checksums. The release adds the atomic, owner-only
+  `files.make_temporary_directory` operation needed by QBE product
+  materialization. The complete 405-test, QBE differential, CLI, Wasm, and
+  native gate passes under the new module-format 73 and host-ABI 32 toolchain.
 - [x] **The front end is linear** (2026-08-29, `recursion.md` §5). It was quadratic in file size: 8,000 statements took 179 s, 8,000 comment lines took 25 s. Three causes — bracket matching scanned per nesting level, `len(self.source)` sat inside the scanning loops, and `str` indexing walks the string in Stage-0 (`text[i]` is O(i), `for c in text` is O(n²), `text[a:b]` is O(a)). The tokenizer now decodes `bytes(source)` once into a `list[char]`, scans that, and builds token text with `text_between`; the parser precomputes bracket matches in `match_brackets`. Same inputs: 0.42 s and 0.07 s, and 1.4 MB in 3.1 s. Reported upstream for 0.27 with a reproduction (`build/stage0-0.27-repro/`), since the `str` cost is Stage-0's and it bounded self-hosting.
 - [x] **Expression nesting is bounded** (2026-08-29). 26,250 nested parentheses took SIGBUS; 25,000 did not. `parse_expression` counts its depth and refuses past 256 — Swift's and Clang's number, from the C++ standard's recommended minimums — with `expression nests deeper than 256`. Pinned by `test_expression_nesting_is_bounded`. The crash had been invisible because the old tokenizer took minutes to reach that depth: fixing throughput is what exposed it.
 - [x] **Integer ranges and `for`** (2026-08-29). `range[T]` is an immutable `{lower, upper, inclusive}` value for every implemented integer width; it can be bound, compared, passed, and returned under the aggregate protocol. `for` binds each element immutably, handles empty and closed ranges, and gives `continue` an inner block so it reaches the increment rather than restarting the same value. A closed range ending at the type maximum stops before incrementing. The HIR oracle, MIR interpreter, and wasm agree on half-open/closed/empty/max ranges, nesting, break/continue, early return, and range aggregate calls. The gate is settled separately in the spec: `try for` selects `FallibleIterable[T]` and makes propagation visible; its executable path waits for the failure ABI.
@@ -134,4 +139,9 @@ The proving programs (`plan.md` §4): first the seed guest commands rewritten in
 - 0.25's depth/stack pairing does not hold for compiler-shaped code; the measurement and its consequences are in `plan.md` §8.1.
 - 0.26: every remaining request landed except the depth guard (§1). Adopted the same day from the pre-release archive: six `discard(...)` sites, the parser refactor that made 113 of them unnecessary, and 98 index conversions deleted. Suite green at each step. `stage0-0.26.md` carries the exchange, including their §1a reproduction of our two-ingredient finding and their reverted stack-pointer guard.
 - 0.26 changed the default build to O1+FastISel, which costs about a quarter more stack per interpreted call than `--release`; `frame_limit = 2000` still clears the worst mode by 5×.
+- 0.27 fixed the reported quadratic `str` traversal; measurements and the
+  adoption gate are recorded in `stage0-0.27.md`.
+- 0.28 added atomic temporary-directory creation and made string encoding
+  metadata and callback context explicit. It also advanced the module format
+  to 73 and host ABI to 32; the full compiler gate passes on the new formats.
 - Withdrawn after checking: "`return` in a statement-form `catch` does not return" — it does.

@@ -17,7 +17,7 @@ end-to-end slices. Unsupported features fail with a clear diagnostic.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.27 and the official QBE 1.3 source, verifies both checksums, and builds
+Stage-0 0.28 and the official QBE 1.3 source, verifies both checksums, and builds
 the QBE oracle. `./stage0` is the resulting pinned toolchain, not this
 repository's source.
 

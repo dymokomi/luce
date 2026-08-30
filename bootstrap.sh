@@ -1,11 +1,12 @@
 #!/bin/sh
 # Install the pinned tools this repository builds and tests with: the Stage-0
-# 0.27 compiler/runtime and QBE 1.3. Every downloaded archive is verified
+# 0.28 compiler/runtime and QBE 1.3. Every downloaded archive is verified
 # before it is unpacked; the resulting executables live under ./stage0/bin/.
 set -eu
 
 release_tag=stage0
 repo=dymokomi/luce-stage-0
+stage0_version=0.28
 here=$(CDPATH= cd "$(dirname "$0")" && pwd)
 prefix="$here/stage0"
 
@@ -20,15 +21,15 @@ esac
 # Checksums, one per flavor. bootstrap refuses to install an archive it
 # cannot verify.
 #
-# These are the digests published with the immutable 0.27 release assets
-# built from source commit 4bdc76edf91d65816aef1963f198bbae45c553b1.
-checksum_macos_aarch64=fc2476373b2011bb65457a2025b070437e42215b88d94764a5329601671fb5cd
-checksum_linux_x86_64=15e7e823ad09c4f8fbabf78a224ebb1e80e70bdcc1e8854c01fb4b21b321ef9a
+# These are the digests published with the 0.28 release assets built from
+# source commit d5b458355179c059ce9c506c37990612c2c8f68f.
+checksum_macos_aarch64=2ad464b80e8b314eac66dbbe8c3468f337a049ae1b1da068fc749f57366ce7a1
+checksum_linux_x86_64=8871dad25cd5c23b63d76183f55cfa48ec483331e39edb4947544288a9665d16
 
 eval "expected=\$checksum_$(printf %s "$flavor" | tr - _)"
 [ "$expected" != TBD ] || { echo "bootstrap: checksum missing for $flavor" >&2; exit 1; }
 
-archive="luce-0.27-$flavor.tar.gz"
+archive="luce-$stage0_version-$flavor.tar.gz"
 url="https://github.com/$repo/releases/download/$release_tag/$archive"
 qbe_archive=qbe-1.3.tar.xz
 qbe_url="https://c9x.me/compile/release/$qbe_archive"
