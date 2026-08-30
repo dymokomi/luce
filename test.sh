@@ -3,6 +3,8 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$repo_root"
+PATH="$repo_root/stage0/bin:$PATH"
+export PATH
 
 # The in-repo stage-0 compiler must link against its own matching runtime.
 # Clear any LUCE_LIB inherited from a separately installed toolchain, whose
@@ -13,6 +15,11 @@ unset LUCE_LIB
 # edit/test loop; the shipped archive contains only luce-0.
 luce=./stage0/bin/luce-0-fast
 [ -x "$luce" ] || luce=./stage0/bin/luce-0
+
+if ! command -v qbe >/dev/null 2>&1; then
+    echo "test: QBE 1.3 not found; run ./bootstrap.sh" >&2
+    exit 1
+fi
 
 # 1. Architectural boundary: target and backend concepts begin at backends/.
 # Frontend, HIR, and MIR are lowered once and must remain target-neutral.

@@ -1,0 +1,784 @@
+#==============================================================================================
+#
+#   qbe - Verified canonical MIR into QBE 1.3 intermediate language
+#
+#   DESCRIPTION:
+#       This is the native stage-1 translation boundary. It does not introduce
+#       another shared IR: one emitter flattens MIR's structured regions into
+#       QBE blocks, maps registers and memory operations directly, and computes
+#       byte layout under QBE's current 64-bit targets. QBE then owns SSA
+#       construction, slot promotion, instruction selection, register
+#       allocation, C ABI lowering, and assembly emission.
+#
+#       QBE accepts non-SSA temporaries, which is especially useful for MIR
+#       region results. Every `Yield` or value-carrying branch copies into the
+#       region's result temporaries; QBE inserts the necessary phi nodes.
+#
+#       `emit_il` deliberately stops at textual QBE IL. Tool invocation and
+#       linking are a separate host concern: they need paths, diagnostics, and
+#       an output location, while this translation is deterministic and pure.
+#       Keeping the seam explicit makes the emitter unit-testable even when QBE
+#       is not installed and prevents shell/toolchain policy leaking into MIR.
+#
+#==============================================================================================
+
+from compiler.backends.layout import LayoutRules, TypeLayout
+from compiler.mir.canonical import BinaryOp, ConvertOp, FunctionId, InstructionForm, MirConstant
+from compiler.mir.canonical import MirFunction, MirProgram, MirSignature, RegisterId, RegisterRun, TypeId, UnaryOp
+from compiler.mir.canonical import bits_of, describe_mir_type, is_float_type, is_int_type
+from compiler.mir.canonical import is_signed_int_type, mir_type, register_at
+
+## Pure canonical-MIR to QBE-IL translation.
+pub class QbeBackend:
+    pub init():
+        return
+
+    pub func emit_il(program: MirProgram) -> str!:
+        return try QbeEmitter(program).emit()
+
+# Current QBE targets are all 64-bit. Target selection remains in the
+# toolchain invocation; byte layout belongs here at the backend boundary.
+func qbe_layout() -> LayoutRules:
+    return LayoutRules(pointer_size = 8, pointer_align = 8)
+
+enum RegionKind:
+    block
+    loop
+    conditional
+
+struct Region:
+    let kind: RegionKind
+    let branch_label: str
+    let exit_label: str
+    let alternative_label: str
+    let results: RegisterRun
+    var saw_alternative: bool
+    var has_exit_edge: bool
+
+class QbeEmitter:
+    let program: MirProgram
+    let layout: TypeLayout
+    var output: str
+    var labels: i64
+    var temporaries: i64
+    var regions: list[Region]
+    var terminated: bool
+
+    init(program: MirProgram):
+        self.program = program
+        self.layout = TypeLayout(program.types, qbe_layout())
+        self.output = ""
+        self.labels = 0
+        self.temporaries = 0
+        self.regions = list[Region]()
+        self.terminated = false
+
+    func emit() -> str!:
+        try self.emit_data()
+        try self.emit_globals()
+        for index in range(0, len(self.program.functions)):
+            try self.emit_function(FunctionId(value = u32(index)), self.program.functions[index])
+        return self.output
+
+    # mark: File-scope definitions -------------------------------------------------------------
+
+    func emit_data() -> !:
+        for index in range(0, len(self.program.data)):
+            let item = self.program.data[index]
+            self.output = self.output + "data $d" + str(index) + " = align " + str(item.align) + " { "
+            if len(item.bytes) == 0:
+                self.output = self.output + "z 0"
+            else:
+                self.output = self.output + "b"
+                for byte in item.bytes: self.output = self.output + " " + str(byte)
+            self.output = self.output + " }\n"
+        if len(self.program.data) > 0: self.output = self.output + "\n"
+
+    func emit_globals() -> !:
+        for index in range(0, len(self.program.globals)):
+            let global = self.program.globals[index]
+            let size = self.layout.size_of(global.value_type)
+            let align = self.layout.align_of(global.value_type)
+            self.output = self.output + "data $g" + str(index) + " = align " + str(align) + " { "
+            let initial = global.initial
+            if initial == none:
+                self.output = self.output + "z " + str(size)
+            else:
+                let payload = self.program.data[initial.value].bytes
+                if len(payload) < size: error("qbe backend: initializer for global `" + global.name + "` is shorter than its type")
+                self.output = self.output + "b"
+                for offset in range(0, size): self.output = self.output + " " + str(payload[offset])
+            self.output = self.output + " }\n"
+        if len(self.program.globals) > 0: self.output = self.output + "\n"
+
+    # mark: Functions --------------------------------------------------------------------------
+
+    func emit_function(id: FunctionId, function: MirFunction) -> !:
+        if len(function.signature.results) > 1 and not function.signature.is_fallible:
+            error("qbe backend: multiple results are not implemented for `" + function.name + "`")
+        if function.signature.is_fallible and len(function.signature.results) > 2:
+            error("qbe backend: fallible function `" + function.name + "` has an invalid verified signature")
+
+        self.regions = list[Region]()
+        self.terminated = false
+        var is_entry = false
+        let entry = self.program.entry
+        if entry != none: is_entry = entry.value == id.value
+        if is_entry: self.output = self.output + "export "
+        self.output = self.output + "function"
+        if function.signature.is_fallible:
+            self.output = self.output + " l"
+        elif len(function.signature.results) == 1:
+            self.output = self.output + " " + try self.base_type(function.signature.results[0])
+        self.output = self.output + " $" + self.function_name(id) + "("
+        for index in range(0, len(function.signature.parameters)):
+            if index > 0: self.output = self.output + ", "
+            self.output = self.output + try self.base_type(function.signature.parameters[index]) + " %r" + str(index)
+        if function.signature.is_fallible and len(function.signature.results) == 2:
+            if len(function.signature.parameters) > 0: self.output = self.output + ", "
+            self.output = self.output + "l %q_result_out"
+        self.output = self.output + ") {\n@start\n"
+
+        for instruction in function.body:
+            try self.emit_instruction(function, instruction.form)
+        if len(self.regions) != 0: error("qbe backend: unterminated MIR region in `" + function.name + "`")
+        if not self.terminated: error("qbe backend: function `" + function.name + "` has no terminating instruction")
+        self.output = self.output + "}\n\n"
+
+    func emit_instruction(function: MirFunction, form: InstructionForm) -> !:
+        match form:
+            Block(results): self.open_block(results)
+            Loop: self.open_loop()
+            If(condition, results):
+                self.ensure_open_block()
+                self.open_if(condition, results)
+            Else: try self.emit_else()
+            End: try self.close_region()
+            Switch(tag): error("qbe backend: `Switch` is not implemented")
+            Case(value): error("qbe backend: `Case` outside a supported switch")
+            Default: error("qbe backend: `Default` outside a supported switch")
+            Br(depth, values):
+                self.ensure_open_block()
+                try self.emit_branch(function, depth, values)
+            BrIf(condition, depth, values):
+                self.ensure_open_block()
+                try self.emit_conditional_branch(function, condition, depth, values)
+            Yield(values):
+                self.ensure_open_block()
+                try self.emit_branch(function, 0, values)
+            Return(values):
+                self.ensure_open_block()
+                try self.emit_return(function, values)
+            Raise(failure):
+                self.ensure_open_block()
+                self.terminate("\tret " + self.reg(failure) + "\n")
+            Trap(reason):
+                self.ensure_open_block()
+                self.terminate("\thlt\n")
+            Unreachable:
+                if not self.terminated: self.terminate("\thlt\n")
+            else:
+                self.ensure_open_block()
+                try self.emit_operation(function, form)
+
+    # mark: Straight-line operations -----------------------------------------------------------
+
+    func emit_operation(function: MirFunction, form: InstructionForm) -> !:
+        match form:
+            Const(result, value):
+                self.line(self.reg(result) + " =" + try self.base_type(self.register_type(function, result)) + " copy " + try self.constant(function, result, value))
+            Copy(result, source):
+                self.line(self.reg(result) + " =" + try self.base_type(self.register_type(function, result)) + " copy " + self.reg(source))
+            Binary(result, operation, left, right):
+                try self.emit_binary(function, result, operation, left, right)
+            Unary(result, operation, operand):
+                try self.emit_unary(function, result, operation, operand)
+            Convert(result, operation, operand):
+                try self.emit_convert(function, result, operation, operand)
+            Alloca(result, slot):
+                if slot < 0 or slot >= len(function.slots): error("qbe backend: invalid slot in `" + function.name + "`")
+                let value_type = function.slots[slot].value_type
+                let align = self.layout.align_of(value_type)
+                var instruction = "alloc4"
+                if align > 8: instruction = "alloc16"
+                elif align > 4: instruction = "alloc8"
+                self.line(self.reg(result) + " =l " + instruction + " " + str(self.layout.size_of(value_type)))
+            Load(result, value_type, address):
+                self.line(self.reg(result) + " =" + try self.base_type(value_type) + " " + try self.load_instruction(value_type) + " " + self.reg(address))
+            Store(value_type, address, value):
+                self.line(try self.store_instruction(value_type) + " " + self.reg(value) + ", " + self.reg(address))
+            FieldAddress(result, struct_type, base, field):
+                self.line(self.reg(result) + " =l add " + self.reg(base) + ", " + str(self.layout.field_offset(struct_type, field)))
+            EnumPayloadAddress(result, enum_type, base):
+                self.line(self.reg(result) + " =l add " + self.reg(base) + ", " + str(self.layout.enum_payload_offset(enum_type)))
+            ElementAddress(result, element_type, base, index):
+                let scaled = self.temp()
+                self.line(scaled + " =l mul " + self.reg(index) + ", " + str(self.layout.size_of(element_type)))
+                self.line(self.reg(result) + " =l add " + self.reg(base) + ", " + scaled)
+            Memcpy(destination, source, value_type):
+                self.line("blit " + self.reg(source) + ", " + self.reg(destination) + ", " + str(self.layout.size_of(value_type)))
+            DataAddress(result, data):
+                self.line(self.reg(result) + " =l copy $d" + str(data.value))
+            GlobalAddress(result, global):
+                self.line(self.reg(result) + " =l copy $g" + str(global.value))
+            FunctionAddress(result, target):
+                self.line(self.reg(result) + " =l copy $" + self.function_name(target))
+            Call(results, target, arguments):
+                try self.emit_call(function, results, "$" + self.function_name(target), self.program.functions[target.value].signature, arguments)
+            CallExtern(results, external, arguments):
+                let symbol = self.program.externs[external.value]
+                if symbol.name == "luce_rt_write":
+                    self.output = self.output + "\tcall $write(w 1"
+                    for index in range(0, i64(arguments.count)):
+                        let argument = register_at(function, arguments, index)
+                        self.output = self.output + ", " + try self.base_type(self.register_type(function, argument)) + " " + self.reg(argument)
+                    self.output = self.output + ")\n"
+                else:
+                    try self.emit_call(function, results, "$" + symbol.name, symbol.signature, arguments)
+            CallIndirect(results, signature, target, arguments):
+                try self.emit_call(function, results, self.reg(target), signature, arguments)
+            else: error("qbe backend: internal operation dispatch failure")
+
+    func emit_call(function: MirFunction, results: RegisterRun, target: str, signature: MirSignature, arguments: RegisterRun) -> !:
+        if results.count > 1 and not signature.is_fallible: error("qbe backend: multiple call results are not implemented")
+        var result_storage = ""
+        if signature.is_fallible and results.count == 2:
+            let value_result = register_at(function, results, 0)
+            let value_type = self.register_type(function, value_result)
+            result_storage = self.temp()
+            var allocation = "alloc4"
+            let align = self.layout.align_of(value_type)
+            if align > 8: allocation = "alloc16"
+            elif align > 4: allocation = "alloc8"
+            self.line(result_storage + " =l " + allocation + " " + str(self.layout.size_of(value_type)))
+        self.output = self.output + "\t"
+        if signature.is_fallible:
+            let error_result = register_at(function, results, i64(results.count) - 1)
+            self.output = self.output + self.reg(error_result) + " =l "
+        elif results.count == 1:
+            let result = register_at(function, results, 0)
+            self.output = self.output + self.reg(result) + " =" + try self.base_type(self.register_type(function, result)) + " "
+        self.output = self.output + "call " + target + "("
+        for index in range(0, i64(arguments.count)):
+            if index > 0: self.output = self.output + ", "
+            let argument = register_at(function, arguments, index)
+            self.output = self.output + try self.base_type(self.register_type(function, argument)) + " " + self.reg(argument)
+        if result_storage != "":
+            if arguments.count > 0: self.output = self.output + ", "
+            self.output = self.output + "l " + result_storage
+        self.output = self.output + ")\n"
+        if result_storage != "":
+            let value_result = register_at(function, results, 0)
+            let value_type = self.register_type(function, value_result)
+            self.line(self.reg(value_result) + " =" + try self.base_type(value_type) + " " + try self.load_instruction(value_type) + " " + result_storage)
+
+    # mark: Arithmetic -------------------------------------------------------------------------
+
+    func emit_binary(function: MirFunction, result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, left)
+        if operation == BinaryOp.eq or operation == BinaryOp.ne or operation == BinaryOp.lt or operation == BinaryOp.le or operation == BinaryOp.gt or operation == BinaryOp.ge:
+            try self.emit_comparison(function, result, operation, left, right)
+            return
+        if is_float_type(self.program.types, value_type):
+            var name = ""
+            match operation:
+                add: name = "add"
+                sub: name = "sub"
+                mul: name = "mul"
+                div: name = "div"
+                else: error("qbe backend: floating `" + str(operation) + "` is not implemented")
+            self.line(self.reg(result) + " =" + try self.base_type(value_type) + " " + name + " " + self.reg(left) + ", " + self.reg(right))
+            return
+        if not is_int_type(self.program.types, value_type): error("qbe backend: binary operation on `" + describe_mir_type(self.program.types, value_type) + "`")
+
+        match operation:
+            add, sub, mul: try self.emit_checked_arithmetic(function, result, operation, left, right)
+            floor_div: try self.emit_floor_division(function, result, left, right, false)
+            rem: try self.emit_floor_division(function, result, left, right, true)
+            bit_and: self.emit_integer_result(function, result, "and", left, right)
+            bit_or: self.emit_integer_result(function, result, "or", left, right)
+            bit_xor: self.emit_integer_result(function, result, "xor", left, right)
+            shift_left: try self.emit_shift(function, result, "shl", left, right)
+            shift_right:
+                var name = "shr"
+                if is_signed_int_type(self.program.types, value_type): name = "sar"
+                try self.emit_shift(function, result, name, left, right)
+            else: error("qbe backend: integer `" + str(operation) + "` is not implemented")
+
+    func emit_checked_arithmetic(function: MirFunction, result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, result)
+        let bits = bits_of(self.program.types, value_type)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        var name = "add"
+        if operation == BinaryOp.sub: name = "sub"
+        elif operation == BinaryOp.mul: name = "mul"
+
+        if bits < 64:
+            let wide_left = try self.widen_integer(value_type, left)
+            let wide_right = try self.widen_integer(value_type, right)
+            let wide_result = self.temp()
+            self.line(wide_result + " =l " + name + " " + wide_left + ", " + wide_right)
+            try self.guard_range(value_type, wide_result)
+            self.line(self.reg(result) + " =w copy " + wide_result)
+            return
+
+        let computed = self.reg(result)
+        self.line(computed + " =l " + name + " " + self.reg(left) + ", " + self.reg(right))
+        let bad = self.temp()
+        if operation == BinaryOp.add:
+            if signed:
+                let a = self.temp()
+                let b = self.temp()
+                let both = self.temp()
+                self.line(a + " =l xor " + self.reg(left) + ", " + computed)
+                self.line(b + " =l xor " + self.reg(right) + ", " + computed)
+                self.line(both + " =l and " + a + ", " + b)
+                self.line(bad + " =w csltl " + both + ", 0")
+            else:
+                # Canonical MIR carries every integer as an `i64`, so `u64`
+                # deliberately stops at 2^63-1 rather than representing the
+                # upper half of the machine range.
+                self.line(bad + " =w csltl " + computed + ", 0")
+        elif operation == BinaryOp.sub:
+            if signed:
+                let different = self.temp()
+                let changed = self.temp()
+                let both = self.temp()
+                self.line(different + " =l xor " + self.reg(left) + ", " + self.reg(right))
+                self.line(changed + " =l xor " + self.reg(left) + ", " + computed)
+                self.line(both + " =l and " + different + ", " + changed)
+                self.line(bad + " =w csltl " + both + ", 0")
+            else:
+                self.line(bad + " =w cultl " + self.reg(left) + ", " + self.reg(right))
+        else:
+            let zero = self.temp()
+            let check = self.new_label("mul_check")
+            let okay = self.new_label("mul_ok")
+            self.line(zero + " =w ceql " + self.reg(right) + ", 0")
+            self.terminate("\tjnz " + zero + ", @" + okay + ", @" + check + "\n")
+            self.label(check)
+            let quotient = self.temp()
+            var divide = "div"
+            if not signed: divide = "udiv"
+            self.line(quotient + " =l " + divide + " " + computed + ", " + self.reg(right))
+            self.line(bad + " =w cnel " + quotient + ", " + self.reg(left))
+            self.emit_guard(bad)
+            if not signed:
+                let outside_mir = self.temp()
+                self.line(outside_mir + " =w csltl " + computed + ", 0")
+                self.emit_guard(outside_mir)
+            self.terminate("\tjmp @" + okay + "\n")
+            self.label(okay)
+            return
+        self.emit_guard(bad)
+
+    func emit_floor_division(function: MirFunction, result: RegisterId, left: RegisterId, right: RegisterId, wants_remainder: bool) -> !:
+        let value_type = self.register_type(function, result)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        let bits = bits_of(self.program.types, value_type)
+        let left_value = try self.arithmetic_value(value_type, left)
+        let right_value = try self.arithmetic_value(value_type, right)
+        let divisor_is_zero = self.temp()
+        self.line(divisor_is_zero + " =w ceql " + right_value + ", 0")
+        self.emit_guard(divisor_is_zero)
+
+        if not wants_remainder and signed and bits == 64:
+            let is_minimum = self.temp()
+            let is_negative_one = self.temp()
+            let overflows = self.temp()
+            self.line(is_minimum + " =w ceql " + left_value + ", -9223372036854775808")
+            self.line(is_negative_one + " =w ceql " + right_value + ", -1")
+            self.line(overflows + " =w and " + is_minimum + ", " + is_negative_one)
+            self.emit_guard(overflows)
+
+        var special_end = ""
+        if wants_remainder and signed and bits == 64:
+            # Luce defines minimum % -1 as zero even though the corresponding
+            # division overflows. Avoid issuing the target division at all.
+            let is_minimum = self.temp()
+            let is_negative_one = self.temp()
+            let is_special = self.temp()
+            let special = self.new_label("remainder_minimum")
+            let ordinary = self.new_label("remainder_ordinary")
+            special_end = self.new_label("remainder_end")
+            self.line(is_minimum + " =w ceql " + self.reg(left) + ", -9223372036854775808")
+            self.line(is_negative_one + " =w ceql " + self.reg(right) + ", -1")
+            self.line(is_special + " =w and " + is_minimum + ", " + is_negative_one)
+            self.terminate("\tjnz " + is_special + ", @" + special + ", @" + ordinary + "\n")
+            self.label(special)
+            self.line(self.reg(result) + " =l copy 0")
+            self.terminate("\tjmp @" + special_end + "\n")
+            self.label(ordinary)
+        var divide = "div"
+        if not signed: divide = "udiv"
+        let quotient = self.temp()
+        self.line(quotient + " =l " + divide + " " + left_value + ", " + right_value)
+        var floored = quotient
+        if signed:
+            let truncated_remainder = self.temp()
+            let nonzero = self.temp()
+            let signs = self.temp()
+            let negative = self.temp()
+            let adjust = self.temp()
+            let wide_adjust = self.temp()
+            floored = self.temp()
+            self.line(truncated_remainder + " =l rem " + left_value + ", " + right_value)
+            self.line(nonzero + " =w cnel " + truncated_remainder + ", 0")
+            self.line(signs + " =l xor " + left_value + ", " + right_value)
+            self.line(negative + " =w csltl " + signs + ", 0")
+            self.line(adjust + " =w and " + nonzero + ", " + negative)
+            self.line(wide_adjust + " =l extuw " + adjust)
+            self.line(floored + " =l sub " + quotient + ", " + wide_adjust)
+        var value = floored
+        if wants_remainder:
+            let product = self.temp()
+            value = self.temp()
+            self.line(product + " =l mul " + floored + ", " + right_value)
+            self.line(value + " =l sub " + left_value + ", " + product)
+        if bits < 64:
+            if not wants_remainder: try self.guard_range(value_type, value)
+            self.line(self.reg(result) + " =w copy " + value)
+        else:
+            self.line(self.reg(result) + " =l copy " + value)
+        if special_end != "": self.label(special_end)
+
+    func emit_integer_result(function: MirFunction, result: RegisterId, operation: str, left: RegisterId, right: RegisterId):
+        let value_type = self.register_type(function, result)
+        let base = self.integer_base(value_type)
+        let raw = self.temp()
+        self.line(raw + " =" + base + " " + operation + " " + self.reg(left) + ", " + self.reg(right))
+        self.canonicalize_integer(value_type, result, raw)
+
+    func emit_shift(function: MirFunction, result: RegisterId, operation: str, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, result)
+        let bits = bits_of(self.program.types, value_type)
+        let valid = self.temp()
+        self.line(valid + " =w cult" + self.integer_base(value_type) + " " + self.reg(right) + ", " + str(bits))
+        let bad = self.temp()
+        self.line(bad + " =w ceqw " + valid + ", 0")
+        self.emit_guard(bad)
+        self.emit_integer_result(function, result, operation, left, right)
+
+    func emit_comparison(function: MirFunction, result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, left)
+        var relation = "eq"
+        match operation:
+            eq: relation = "eq"
+            ne: relation = "ne"
+            lt: relation = "lt"
+            le: relation = "le"
+            gt: relation = "gt"
+            ge: relation = "ge"
+            else: error("qbe backend: invalid comparison")
+        if is_int_type(self.program.types, value_type) and operation != BinaryOp.eq and operation != BinaryOp.ne:
+            if is_signed_int_type(self.program.types, value_type): relation = "s" + relation
+            else: relation = "u" + relation
+        self.line(self.reg(result) + " =w c" + relation + try self.base_type(value_type) + " " + self.reg(left) + ", " + self.reg(right))
+
+    func emit_unary(function: MirFunction, result: RegisterId, operation: UnaryOp, operand: RegisterId) -> !:
+        let value_type = self.register_type(function, result)
+        match operation:
+            neg:
+                if is_float_type(self.program.types, value_type): self.line(self.reg(result) + " =" + try self.base_type(value_type) + " neg " + self.reg(operand))
+                else:
+                    let bits = bits_of(self.program.types, value_type)
+                    if bits < 64:
+                        let wide = try self.widen_integer(value_type, operand)
+                        let negated = self.temp()
+                        self.line(negated + " =l sub 0, " + wide)
+                        try self.guard_range(value_type, negated)
+                        self.line(self.reg(result) + " =w copy " + negated)
+                    else:
+                        let minimum = -9223372036854775807 - 1
+                        let bad = self.temp()
+                        self.line(bad + " =w ceql " + self.reg(operand) + ", " + str(minimum))
+                        self.emit_guard(bad)
+                        self.line(self.reg(result) + " =l neg " + self.reg(operand))
+            bit_not:
+                let raw = self.temp()
+                self.line(raw + " =" + self.integer_base(value_type) + " xor " + self.reg(operand) + ", -1")
+                self.canonicalize_integer(value_type, result, raw)
+            bool_not:
+                self.line(self.reg(result) + " =w ceqw " + self.reg(operand) + ", 0")
+
+    func emit_convert(function: MirFunction, result: RegisterId, operation: ConvertOp, operand: RegisterId) -> !:
+        let source = self.register_type(function, operand)
+        let destination = self.register_type(function, result)
+        match operation:
+            extend:
+                let widened = try self.widen_integer(source, operand)
+                self.line(self.reg(result) + " =" + self.integer_base(destination) + " copy " + widened)
+            wrap:
+                self.canonicalize_integer(destination, result, self.reg(operand))
+            int_to_float:
+                var prefix = "u"
+                if is_signed_int_type(self.program.types, source): prefix = "s"
+                var width = "l"
+                if bits_of(self.program.types, source) <= 32: width = "w"
+                self.line(self.reg(result) + " =" + try self.base_type(destination) + " " + prefix + width + "tof " + self.reg(operand))
+            float_to_int:
+                var prefix = "d"
+                if try self.base_type(source) == "s": prefix = "s"
+                var sign = "ui"
+                if is_signed_int_type(self.program.types, destination): sign = "si"
+                let converted = self.temp()
+                self.line(converted + " =" + self.integer_base(destination) + " " + prefix + "to" + sign + " " + self.reg(operand))
+                if bits_of(self.program.types, destination) < 32:
+                    let wide = self.temp()
+                    self.line(wide + " =l extsw " + converted)
+                    try self.guard_range(destination, wide)
+                self.canonicalize_integer(destination, result, converted)
+
+    # mark: Structured control ----------------------------------------------------------------
+
+    func open_block(results: RegisterRun):
+        let end_label = self.new_label("block_end")
+        self.regions.append(Region(kind = RegionKind.block, branch_label = end_label, exit_label = end_label, alternative_label = "", results = results, saw_alternative = false, has_exit_edge = false))
+
+    func open_loop():
+        let header = self.new_label("loop")
+        let end_label = self.new_label("loop_end")
+        if not self.terminated: self.terminate("\tjmp @" + header + "\n")
+        self.label(header)
+        self.regions.append(Region(kind = RegionKind.loop, branch_label = header, exit_label = end_label, alternative_label = "", results = RegisterRun(start = 0, count = 0), saw_alternative = false, has_exit_edge = false))
+
+    func open_if(condition: RegisterId, results: RegisterRun):
+        let yes = self.new_label("if_yes")
+        let no = self.new_label("if_no")
+        let end_label = self.new_label("if_end")
+        self.terminate("\tjnz " + self.reg(condition) + ", @" + yes + ", @" + no + "\n")
+        self.label(yes)
+        self.regions.append(Region(kind = RegionKind.conditional, branch_label = end_label, exit_label = end_label, alternative_label = no, results = results, saw_alternative = false, has_exit_edge = false))
+
+    func emit_else() -> !:
+        if len(self.regions) == 0: error("qbe backend: `Else` without an open region")
+        let index = len(self.regions) - 1
+        if self.regions[index].kind != RegionKind.conditional or self.regions[index].saw_alternative:
+            error("qbe backend: invalid `Else`")
+        if not self.terminated:
+            self.terminate("\tjmp @" + self.regions[index].exit_label + "\n")
+            self.regions[index].has_exit_edge = true
+        self.regions[index].saw_alternative = true
+        self.label(self.regions[index].alternative_label)
+
+    func close_region() -> !:
+        if len(self.regions) == 0: error("qbe backend: `End` without an open region")
+        let region = self.regions[len(self.regions) - 1]
+        self.regions.remove(len(self.regions) - 1)
+        var reaches_exit = region.has_exit_edge
+        if region.kind == RegionKind.conditional and not region.saw_alternative:
+            if not self.terminated:
+                self.terminate("\tjmp @" + region.exit_label + "\n")
+                reaches_exit = true
+            self.label(region.alternative_label)
+            self.terminate("\tjmp @" + region.exit_label + "\n")
+            reaches_exit = true
+        elif not self.terminated:
+            self.terminate("\tjmp @" + region.exit_label + "\n")
+            reaches_exit = true
+        self.label(region.exit_label)
+        if not reaches_exit: self.terminate("\thlt\n")
+
+    func emit_branch(function: MirFunction, depth: i64, values: RegisterRun) -> !:
+        let index = try self.region_index(depth)
+        let region = self.regions[index]
+        if region.kind != RegionKind.loop: self.regions[index].has_exit_edge = true
+        try self.assign_results(function, region.results, values)
+        self.terminate("\tjmp @" + region.branch_label + "\n")
+
+    func emit_conditional_branch(function: MirFunction, condition: RegisterId, depth: i64, values: RegisterRun) -> !:
+        let taken = self.new_label("branch_taken")
+        let following = self.new_label("branch_next")
+        self.terminate("\tjnz " + self.reg(condition) + ", @" + taken + ", @" + following + "\n")
+        self.label(taken)
+        let index = try self.region_index(depth)
+        let region = self.regions[index]
+        if region.kind != RegionKind.loop: self.regions[index].has_exit_edge = true
+        try self.assign_results(function, region.results, values)
+        self.terminate("\tjmp @" + region.branch_label + "\n")
+        self.label(following)
+
+    func emit_return(function: MirFunction, values: RegisterRun) -> !:
+        if function.signature.is_fallible:
+            if values.count == 2:
+                let value = register_at(function, values, 0)
+                let value_type = self.register_type(function, value)
+                self.line(try self.store_instruction(value_type) + " " + self.reg(value) + ", %q_result_out")
+                self.terminate("\tret " + self.reg(register_at(function, values, 1)) + "\n")
+            elif values.count == 1:
+                self.terminate("\tret " + self.reg(register_at(function, values, 0)) + "\n")
+            else:
+                error("qbe backend: fallible return has an invalid arity")
+        elif values.count == 0: self.terminate("\tret\n")
+        elif values.count == 1: self.terminate("\tret " + self.reg(register_at(function, values, 0)) + "\n")
+        else: error("qbe backend: multiple return values are not implemented")
+
+    func assign_results(function: MirFunction, destinations: RegisterRun, values: RegisterRun) -> !:
+        if destinations.count != values.count: error("qbe backend: region result arity changed after verification")
+        for index in range(0, i64(values.count)):
+            let destination = register_at(function, destinations, index)
+            let value = register_at(function, values, index)
+            self.line(self.reg(destination) + " =" + try self.base_type(self.register_type(function, destination)) + " copy " + self.reg(value))
+
+    func region_index(depth: i64) -> i64!:
+        if depth < 0 or depth >= len(self.regions): error("qbe backend: branch depth is outside its regions")
+        return len(self.regions) - 1 - depth
+
+    # mark: Type and text helpers ---------------------------------------------------------------
+
+    func base_type(id: TypeId) -> str!:
+        match mir_type(self.program.types, id):
+            Int(bits, is_signed):
+                if bits <= 32: return "w"
+                return "l"
+            Float(bits):
+                if bits == 32: return "s"
+                return "d"
+            Bool: return "w"
+            Ptr: return "l"
+            else: error("qbe backend: aggregate `" + describe_mir_type(self.program.types, id) + "` cannot occupy a temporary")
+
+    func integer_base(id: TypeId) -> str:
+        if bits_of(self.program.types, id) <= 32: return "w"
+        return "l"
+
+    func load_instruction(id: TypeId) -> str!:
+        match mir_type(self.program.types, id):
+            Int(bits, is_signed):
+                if bits == 8:
+                    if is_signed: return "loadsb"
+                    return "loadub"
+                if bits == 16:
+                    if is_signed: return "loadsh"
+                    return "loaduh"
+                if bits == 32: return "loadw"
+                return "loadl"
+            Float(bits):
+                if bits == 32: return "loads"
+                return "loadd"
+            Bool: return "loadub"
+            Ptr: return "loadl"
+            else: error("qbe backend: cannot load an aggregate")
+
+    func store_instruction(id: TypeId) -> str!:
+        match mir_type(self.program.types, id):
+            Int(bits, is_signed):
+                if bits == 8: return "storeb"
+                if bits == 16: return "storeh"
+                if bits == 32: return "storew"
+                return "storel"
+            Float(bits):
+                if bits == 32: return "stores"
+                return "stored"
+            Bool: return "storeb"
+            Ptr: return "storel"
+            else: error("qbe backend: cannot store an aggregate")
+
+    func constant(function: MirFunction, result: RegisterId, value: MirConstant) -> str!:
+        match value:
+            Int(item): return str(item)
+            Float(item):
+                if try self.base_type(self.register_type(function, result)) == "s": return "s_" + str(item)
+                return "d_" + str(item)
+            Bool(item):
+                if item: return "1"
+                return "0"
+            Null: return "0"
+
+    func register_type(function: MirFunction, register: RegisterId) -> TypeId:
+        return function.registers[register.value]
+
+    func widen_integer(value_type: TypeId, register: RegisterId) -> str!:
+        let bits = bits_of(self.program.types, value_type)
+        if bits == 64: return self.reg(register)
+        let widened = self.temp()
+        var operation = "extu"
+        if is_signed_int_type(self.program.types, value_type): operation = "exts"
+        if bits == 8: operation = operation + "b"
+        elif bits == 16: operation = operation + "h"
+        else: operation = operation + "w"
+        self.line(widened + " =l " + operation + " " + self.reg(register))
+        return widened
+
+    func arithmetic_value(value_type: TypeId, register: RegisterId) -> str!:
+        if bits_of(self.program.types, value_type) < 64: return try self.widen_integer(value_type, register)
+        return self.reg(register)
+
+    func guard_range(value_type: TypeId, value: str) -> !:
+        let bits = bits_of(self.program.types, value_type)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        var minimum = 0
+        var maximum = 0
+        if signed:
+            if bits == 8:
+                minimum = -128
+                maximum = 127
+            elif bits == 16:
+                minimum = -32768
+                maximum = 32767
+            else:
+                minimum = -2147483647 - 1
+                maximum = 2147483647
+        else:
+            if bits == 8: maximum = 255
+            elif bits == 16: maximum = 65535
+            else: maximum = 4294967295
+        let below = self.temp()
+        let above = self.temp()
+        let bad = self.temp()
+        self.line(below + " =w csltl " + value + ", " + str(minimum))
+        self.line(above + " =w csgtl " + value + ", " + str(maximum))
+        self.line(bad + " =w or " + below + ", " + above)
+        self.emit_guard(bad)
+
+    func emit_guard(bad: str):
+        let trap_label = self.new_label("trap")
+        let okay = self.new_label("checked")
+        self.terminate("\tjnz " + bad + ", @" + trap_label + ", @" + okay + "\n")
+        self.label(trap_label)
+        self.terminate("\thlt\n")
+        self.label(okay)
+
+    func canonicalize_integer(value_type: TypeId, result: RegisterId, value: str):
+        let bits = bits_of(self.program.types, value_type)
+        if bits >= 32:
+            self.line(self.reg(result) + " =" + self.integer_base(value_type) + " copy " + value)
+            return
+        var operation = "extu"
+        if is_signed_int_type(self.program.types, value_type): operation = "exts"
+        if bits == 8: operation = operation + "b"
+        else: operation = operation + "h"
+        self.line(self.reg(result) + " =w " + operation + " " + value)
+
+    func function_name(id: FunctionId) -> str:
+        let entry = self.program.entry
+        if entry != none:
+            if entry.value == id.value: return "main"
+        return "luce_f" + str(id.value)
+
+    func reg(id: RegisterId) -> str:
+        return "%r" + str(id.value)
+
+    func temp() -> str:
+        let name = "%q" + str(self.temporaries)
+        self.temporaries += 1
+        return name
+
+    func new_label(prefix: str) -> str:
+        let name = prefix + str(self.labels)
+        self.labels += 1
+        return name
+
+    func line(text: str):
+        self.output = self.output + "\t" + text + "\n"
+
+    func terminate(text: str):
+        self.output = self.output + text
+        self.terminated = true
+
+    func label(name: str):
+        self.output = self.output + "@" + name + "\n"
+        self.terminated = false
+
+    func ensure_open_block():
+        if self.terminated: self.label(self.new_label("dead"))
