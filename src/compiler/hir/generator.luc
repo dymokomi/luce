@@ -1465,6 +1465,11 @@ pub class HirGenerator:
                     try self.fail(span, "`defer` requires a unit-producing call")
                 let action = self.push_statement(HirNodeForm.ExpressionStatement(value = checked), span)
                 return self.capture_deferred_action(action, span)
+            IndirectCall(callee, arguments):
+                if not types_match(self.type_of(checked), resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`defer` requires a unit-producing call")
+                let action = self.push_statement(HirNodeForm.ExpressionStatement(value = checked), span)
+                return self.capture_deferred_action(action, span)
             else: error(self.diagnostic(span, "`defer` requires a call"))
 
     # Return the hidden capture bindings followed by one `DeferStatement`.
@@ -1485,6 +1490,14 @@ pub class HirGenerator:
                             let argument = NodeId(value = self.extra[i64(arguments.start) + pair * 2 + 1])
                             captured_arguments.append(self.capture_defer_value(argument, statements).value)
                         let captured_call = self.push_node(HirNodeForm.Call(function = function, arguments = self.push_run(captured_arguments)), resolve_builtin_type(BuiltinType.unit), span)
+                        captured_action = self.push_statement(HirNodeForm.ExpressionStatement(value = captured_call), span)
+                    IndirectCall(callee, arguments):
+                        let captured_callee = self.capture_defer_value(callee, statements)
+                        let captured_arguments = list[NodeId]()
+                        for position in range(0, i64(arguments.count)):
+                            let argument = NodeId(value = self.extra[i64(arguments.start) + position])
+                            captured_arguments.append(self.capture_defer_value(argument, statements))
+                        let captured_call = self.push_node(HirNodeForm.IndirectCall(callee = captured_callee, arguments = self.push_nodes(captured_arguments)), resolve_builtin_type(BuiltinType.unit), span)
                         captured_action = self.push_statement(HirNodeForm.ExpressionStatement(value = captured_call), span)
                     else: pass
             else: pass
@@ -1786,8 +1799,9 @@ pub class HirGenerator:
                     let variable = self.extern_variables[variable_index]
                     let load = self.push_node(HirNodeForm.ExternLoad(variable = u32(variable_index)), variable.value_type, value.span)
                     return try self.require_type(load, expected)
-                if self.find_visible_function(name) >= 0:
-                    try self.fail(value.span, "function values are not implemented yet")
+                let function_index = self.find_visible_function(name)
+                if function_index >= 0:
+                    return try self.check_function_address(function_index, value.span, expected)
                 if self.find_struct_in_module(self.current_module, name) >= 0:
                     try self.fail(value.span, "`" + name + "` is a type; construct a value with `" + name + "(...)` or call a type function with `" + name + ".name(...)`")
                 if self.find_enum_in_module(self.current_module, name) >= 0:
@@ -2050,7 +2064,44 @@ pub class HirGenerator:
                             return try self.check_error_code_package(arguments, span, expected)
                     else: pass
             else: pass
-        let resolved = try self.resolve_callee(callee)
+        match callee.form:
+            Name(name):
+                if self.find_local(name) >= 0 or self.find_constant_in_module(self.current_module, name) >= 0 or self.find_visible_extern_variable(name) >= 0:
+                    let checked = try self.check_expression(callee, none)
+                    return try self.check_indirect_call_node(checked, arguments, span, expected)
+            Member(owner, name):
+                return try self.check_member_call(owner, name, arguments, callee.span, span, expected)
+            else:
+                let checked = try self.check_expression(callee, none)
+                return try self.check_indirect_call_node(checked, arguments, span, expected)
+        return try self.check_resolved_call(try self.resolve_callee(callee), arguments, callee.span, span, expected)
+
+    # Resolve the three meanings of `owner.name(...)` once: a module/type
+    # declaration path, an instance method, or a function-valued field. A
+    # value receiver is evaluated exactly once before the latter two diverge.
+    func check_member_call(owner: ExpressionSyntax, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let named = try self.resolve_named_callee(owner, name, callee_span)
+        if named != none: return try self.check_resolved_call(named, arguments, callee_span, span, expected)
+
+        let receiver = try self.check_expression(owner, none)
+        let owner_type = self.type_of(receiver)
+        let method_index = self.find_method(owner_type, name)
+        if method_index >= 0:
+            let method = self.functions[method_index]
+            let method_receiver = method.receiver else trap("method without a receiver")
+            if method_receiver.kind == HirReceiverKind.type_function:
+                try self.fail(callee_span, "`" + name + "` is a type function; call it as `" + self.describe_type(owner_type) + "." + name + "(...)`")
+            if method_receiver.kind == HirReceiverKind.initializer:
+                try self.fail(callee_span, "initializer `init` is called by constructing a `" + self.describe_type(owner_type) + "` value")
+            try self.require_method_visible(method_index, owner_type, callee_span)
+            let resolved = ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1, enum_index = -1, case_index = -1)
+            return try self.check_resolved_call(resolved, arguments, callee_span, span, expected)
+        let selected = try self.check_field_access_node(receiver, name, callee_span, none)
+        return try self.check_indirect_call_node(selected, arguments, span, expected)
+
+    # Apply declaration labels/defaults and the hidden receiver protocol after
+    # call-head resolution has decided that this is a direct declaration call.
+    func check_resolved_call(resolved: ResolvedCallee, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
         if resolved.struct_index >= 0:
             return try self.check_struct_value(resolved.struct_index, arguments, span, expected)
         if resolved.enum_index >= 0:
@@ -2063,7 +2114,7 @@ pub class HirGenerator:
         let receiver_value = resolved.receiver
         if receiver_value.value != no_node:
             let method = function.receiver else trap("a receiver was resolved for a function without one")
-            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee.span)
+            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee_span)
             typed_arguments.append(0)
             typed_arguments.append(receiver_value.value)
             first_source_parameter = 1
@@ -2078,6 +2129,41 @@ pub class HirGenerator:
         )
         let typed = self.push_node(HirNodeForm.Call(function = function.symbol, arguments = placed), function.result, span)
         return try self.require_type(typed, expected)
+
+    # Calls through a `func` value have no declaration labels or defaults:
+    # the type carries only parameter order, exact types, and the result.
+    func check_indirect_call_node(checked_callee: NodeId, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let parameters = list[TypeId]()
+        var result = resolve_builtin_type(BuiltinType.unit)
+        match self.types.definitions[self.type_of(checked_callee).value].form:
+            Function(function_parameters, function_result):
+                for parameter in function_parameters: parameters.append(parameter)
+                result = function_result
+            else: try self.fail(self.span_of(checked_callee), "`" + self.describe_type(self.type_of(checked_callee)) + "` is not callable")
+        if len(arguments) != len(parameters):
+            try self.fail(span, "function value accepts " + str(len(parameters)) + " argument(s), got " + str(len(arguments)))
+        let checked_arguments = list[NodeId]()
+        for index in range(0, len(arguments)):
+            if arguments[index].label != none:
+                try self.fail(arguments[index].span, "function-value calls use positional arguments because labels are not part of the type")
+            checked_arguments.append(try self.check_expression(arguments[index].value, parameters[index]))
+        let typed = self.push_node(HirNodeForm.IndirectCall(callee = checked_callee, arguments = self.push_nodes(checked_arguments)), result, span)
+        return try self.require_type(typed, expected)
+
+    # A declaration name becomes a capture-free function value with its exact
+    # Luce signature. C declarations use `cfunc`, never the Luce call ABI.
+    func check_function_address(function_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let function = self.functions[function_index]
+        if function.receiver != none:
+            try self.fail(span, "method values are not supported; pass an explicit capture-free function")
+        match function.source:
+            ExternalC(contract): try self.fail(span, "extern function `" + function.name + "` converts only to a matching `cfunc` type")
+            else: pass
+        let parameters = list[TypeId]()
+        for parameter in function.parameters: parameters.append(parameter.value_type)
+        let function_type = self.intern_function_type(parameters, function.result)
+        let address = self.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+        return try self.require_type(address, expected)
 
     # Positional arguments fill source-visible parameters left to right;
     # named arguments then land anywhere, each exactly once. Hidden receiver
@@ -2385,6 +2471,11 @@ pub class HirGenerator:
         if root_name != "" and self.find_local(root_name) < 0:
             let imported_module = self.find_imported_module(root_name)
             if imported_module >= 0:
+                let function_index = self.find_function_in_module(imported_module, name)
+                if function_index >= 0:
+                    if not self.functions[function_index].is_public:
+                        try self.fail(span, "`" + name + "` is private to module `" + self.sources[imported_module].name + "`")
+                    return try self.check_function_address(function_index, span, expected)
                 let variable_index = self.find_extern_variable_in_module(imported_module, name)
                 if variable_index >= 0:
                     let variable = self.extern_variables[variable_index]
@@ -2404,6 +2495,12 @@ pub class HirGenerator:
                     try self.fail(span, "enum `" + root_name + "` has no case `" + name + "`")
                 return try self.check_enum_value(enum_index, case_index, list[ArgumentSyntax](), span, expected)
         let checked = try self.check_expression(member_value, none)
+        return try self.check_field_access_node(checked, name, span, expected)
+
+    # Complete value-member selection from an already evaluated receiver. This
+    # is shared with function-valued field calls so computed receivers retain
+    # source-order, single-evaluation semantics.
+    func check_field_access_node(checked: NodeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let checked_type = self.type_of(checked)
         if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
             let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
@@ -2486,10 +2583,8 @@ pub class HirGenerator:
                     else: try self.fail(span, "mutating method needs a mutable fixed-array element receiver")
             else: try self.fail(span, "mutating method needs a `var` receiver, not a temporary value")
 
-    # Find which function a callee spelling names: a bare `helper(...)`, or a
-    # qualified `module.helper(...)` through an imported module.
-    # `helper(...)`, `module.helper(...)`, `Point(...)`, `Point.origin(...)`,
-    # `module.Point(...)`, `module.Point.origin(...)`, or `value.method(...)`.
+    # Resolve the bare declaration spellings left after value and member calls
+    # have been separated above: a free function or struct construction.
     func resolve_callee(callee: ExpressionSyntax) -> ResolvedCallee!:
         match callee.form:
             Name(name):
@@ -2501,29 +2596,8 @@ pub class HirGenerator:
                 let struct_index = self.find_struct_in_module(self.current_module, name)
                 if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index, enum_index = -1, case_index = -1)
                 error(self.diagnostic(callee.span, "unknown function `" + name + "`"))
-            Member(value, name):
-                let named = try self.resolve_named_callee(value, name, callee.span)
-                if named != none: return named
-                let receiver = try self.check_expression(value, none)
-                let owner = self.type_of(receiver)
-                let struct_index = self.struct_of(owner)
-                if struct_index < 0 and self.enum_of(owner) < 0:
-                    try self.fail(callee.span, "`" + self.describe_type(owner) + "` has no method `" + name + "`")
-                let method_index = self.find_method(owner, name)
-                if method_index < 0:
-                    if struct_index >= 0 and self.find_field(struct_index, name) >= 0:
-                        try self.fail(callee.span, "`" + name + "` is a field of `" + self.describe_type(owner) + "`, not a method")
-                    try self.fail(callee.span, "`" + self.describe_type(owner) + "` has no method `" + name + "`")
-                let method = self.functions[method_index]
-                let method_receiver = method.receiver else trap("method without a receiver")
-                if method_receiver.kind == HirReceiverKind.type_function:
-                    try self.fail(callee.span, "`" + name + "` is a type function; call it as `" + self.describe_type(owner) + "." + name + "(...)`")
-                if method_receiver.kind == HirReceiverKind.initializer:
-                    try self.fail(callee.span, "initializer `init` is called by constructing a `" + self.describe_type(owner) + "` value")
-                try self.require_method_visible(method_index, owner, callee.span)
-                return ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1, enum_index = -1, case_index = -1)
             else:
-                error(self.diagnostic(callee.span, "only named functions are callable in the current semantic slice"))
+                trap("non-name call head reached declaration resolution")
 
     # The spellings whose head is a module or type name rather than a value:
     # `module.f`, `module.Type`, `Type.f`, `module.Type.f`. Absent when the
@@ -3138,10 +3212,31 @@ pub class HirGenerator:
             Never: return value
             else: pass
         if types_match(found, expected): return value
+        if self.is_function_fallibility_lift(found, expected):
+            error(self.diagnostic(self.span_of(value), "infallible-to-fallible function conversion is not implemented until managed function environments exist"))
         let inner = self.optional_inner(expected)
         if inner != none and types_match(found, inner):
             return self.push_node(HirNodeForm.Some(value = value), expected, self.span_of(value))
         error(self.diagnostic(self.span_of(value), "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(found) + "`"))
+
+    # Spec §8.5 permits this one function conversion. It cannot be represented
+    # by an exact code address alone for an arbitrary stored function value:
+    # the adapter must retain that value as an environment. Recognize it
+    # explicitly so valid future work never masquerades as a type mismatch.
+    func is_function_fallibility_lift(found: TypeId, expected: TypeId) -> bool:
+        match self.types.definitions[found.value].form:
+            Function(found_parameters, found_result):
+                match self.types.definitions[expected.value].form:
+                    Function(expected_parameters, expected_result):
+                        if len(found_parameters) != len(expected_parameters): return false
+                        for index in range(0, len(found_parameters)):
+                            if not types_match(found_parameters[index], expected_parameters[index]): return false
+                        if self.fallible_inner(found_result) != none: return false
+                        let success = self.fallible_inner(expected_result)
+                        if success == none: return false
+                        return types_match(found_result, success)
+                    else: return false
+            else: return false
 
     # A literal: its value goes into the value table, the node names it.
     func push_constant(value: Value, value_type: TypeId, span: SourceSpan) -> NodeId:
@@ -3161,6 +3256,7 @@ pub class HirGenerator:
             StructValue(struct_index, fields): return self.run_is_constant(fields)
             EnumValue(enum_index, case_index, payload): return self.run_is_constant(payload)
             ErrorCodeLiteral(value): return true
+            FunctionAddress(function): return true
             Unary(operation, operand): return self.is_constant_expression(operand)
             Binary(left, operation, right): return self.is_constant_expression(left) and self.is_constant_expression(right)
             Range(lower, upper, inclusive): return self.is_constant_expression(lower) and self.is_constant_expression(upper)

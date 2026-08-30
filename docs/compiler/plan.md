@@ -222,16 +222,32 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   count-independent MIR loop. HIR, MIR, Wasm, and real QBE agree on nested
   arrays, zero length, aggregate calls/results, and bounds traps. The adapted
   Stage-0 sort program uses allocation-free fixed storage and is a native QBE gate.
-- [ ] **Audited freestanding-runtime substrate**: implement the spec's
-  `.native.luc` boundary, compiler-known `native_ptr[T]` / `native_mut_ptr[T]`,
-  named raw load/store/copy and linear-memory growth primitives, plus an
-  explicit runtime package build/link mode. These operations remain confined
-  to reviewed runtime modules and become backend intrinsics only after HIR;
-  allocator policy must not return to the compiler.
+- [x] **Exact ordinary function values** (2026-08-30): named Luce functions
+  become statically typed HIR `FunctionAddress` values and calls through
+  locals, constants, fields, parameters, results, conditionals and imported
+  module members become `IndirectCall`. Labels/defaults remain declaration-call
+  facts; function-value calls are positional and exact. Canonical MIR uses its
+  existing opaque pointer-shaped call token plus the exact signature on
+  `CallIndirect`; QBE calls code addresses and Wasm adds a function table only
+  when either function-value instruction occurs. Both semantic oracles,
+  optimized MIR, Wasmtime, real QBE and `examples/function_values.luc` agree,
+  including aggregate/fallible protocols, defer capture and evaluation order.
+  This does **not** claim closures or the spec's infallible-to-fallible lift:
+  both need the managed environment/allocation contract below. `cfunc` remains
+  on the C-boundary item.
+- [ ] **Settle the target-neutral runtime allocation contract before coding
+  it.** The language already reserves reviewed `.native.luc` capabilities,
+  but neither the spec nor canonical MIR yet says how a runtime requests
+  storage without the lowerer inventing target byte sizes/alignment. A shared
+  primitive cannot be "linear-memory growth": that is a Wasm backend fact,
+  not a QBE/native semantic operation. Specify allocation ownership,
+  raw-load/store/copy capabilities and the runtime package build/link mode;
+  only then implement the smallest audited substrate. Allocator policy must
+  not return to the compiler.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
-  linear memory, `write`, `trap`, string/bytes primitives; through the MIR
-  interpreter's stub runtime first, then compiled. This starts only after the
-  audited substrate above can express the implementation honestly.
+  backend-provided storage, `write`, `trap`, string/bytes primitives; through
+  the MIR interpreter's stub runtime first, then compiled. This starts only
+  after the audited substrate above can express the implementation honestly.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
 - [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.

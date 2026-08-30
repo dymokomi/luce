@@ -264,9 +264,15 @@ if [ "$status" = 0 ]; then
 fi
 
 printf 'pub let scale = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\npub struct Pair:\n    pub let a: i64\n    pub let b: i64\n    pub func sum(self) -> i64: return self.a + self.b\n' > "$test_dir/math.luc"
-printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a = 1, b = 2)\n    return math.double(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
+printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a = 1, b = 2)\n    let operation: func(i64) -> i64 = math.double\n    return operation(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
 "$cli" build --package org.luce.tests "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
 expect 0 "45" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
+
+# Exact ordinary function values: the same reviewable example used by the HIR
+# oracle and native QBE product path executes through Wasm's function table.
+"$cli" build --package org.luce.tests "$test_dir/function_values.wasm" examples/function_values.luc >/dev/null
+expect 0 "42" wasmtime run --invoke function_values.answer "$test_dir/function_values.wasm"
+expect 0 "" wasmtime run "$test_dir/function_values.wasm"
 
 # Structs and methods: construction with defaults, field places, mutating
 # methods writing through the caller's slot, type functions.

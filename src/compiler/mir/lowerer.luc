@@ -22,6 +22,7 @@
 #       integer range values and `for` iteration, lexical `defer`,
 #       structs with memberwise and custom initializers, fields, methods,
 #       `mutating` methods and type functions,
+#       exact named function values and indirect calls,
 #       terminal output of a literal or a `str` value, and returning. The slice boundary lives
 #       here, not in canonical MIR — failure, classes, and collections reach
 #       the lowerer as HIR and stop with "does not support ... yet" until this
@@ -119,6 +120,13 @@ union MatchExit:
 struct FallibleResult:
     pub let value: RegisterId
     pub let error_value: RegisterId
+
+# The already-evaluated components of an indirect call. Keeping them together
+# makes the required source order explicit: select the callee first, then
+# evaluate every positional argument from left to right.
+struct IndirectOperands:
+    let target: RegisterId
+    let values: list[RegisterId]
 
 # One C output slot allocated around a call. `raw_type` is what C writes;
 # `value_type` is the tagged/nominal HIR type reconstructed afterward.
@@ -288,6 +296,13 @@ pub class Lowerer:
             found = candidate
         return found
 
+    # Source process-entry recognition is shared by entry selection, its
+    # temporary parameter erasure, and the function-address safety check.
+    func is_process_entry(function: HirFunction) -> bool:
+        if not function.is_public or function.receiver != none or function.name != "main": return false
+        if len(function.parameters) != 1: return false
+        return types_match(function.parameters[0].value_type, resolve_builtin_type(BuiltinType.string_slice))
+
     func lower_external_signature(module: HirModule, function: HirFunction, contract: HirCFunction) -> MirSignature!:
         let parameters = list[TypeId]()
         for slot in contract.slots:
@@ -374,9 +389,8 @@ pub class Lowerer:
     # and, being an aggregate, arrives as a pointer — which is exactly what a
     # `mutating` method needs: its stores land in the caller's slot.
     func lower_function(module: HirModule, function: HirFunction) -> MirFunction!:
-        let string_slice = resolve_builtin_type(BuiltinType.string_slice)
         let is_entry_name = function.is_public and function.receiver == none and function.name == "main"
-        let is_entry = is_entry_name and len(function.parameters) == 1 and types_match(function.parameters[0].value_type, string_slice)
+        let is_entry = self.is_process_entry(function)
         if is_entry_name and not is_entry:
             try self.fail_unsupported(module, function, function.span, "entry parameters other than `(arguments: slice[str])`")
 
@@ -597,6 +611,10 @@ pub class Lowerer:
             Call(callee, arguments):
                 for pair in range(0, i64(arguments.count) // 2):
                     try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
+            FunctionAddress(target): pass
+            IndirectCall(callee, arguments):
+                try self.lower_prologue_node(module, function, callee, body)
+                try self.lower_prologue_run(module, function, arguments, body)
             Initialize(callee, arguments):
                 for pair in range(0, i64(arguments.count) // 2):
                     try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), body)
@@ -1009,6 +1027,10 @@ pub class Lowerer:
                 if self.fallible_inner(node_type(self.program, expression)) != none:
                     try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible call")
                 return try self.lower_call(module, function, expression, callee, arguments, body)
+            IndirectCall(callee, arguments):
+                if self.fallible_inner(node_type(self.program, expression)) != none:
+                    try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible function-value call")
+                return try self.lower_indirect_call(module, function, expression, callee, arguments, body)
             Initialize(callee, arguments):
                 if self.fallible_inner(node_type(self.program, expression)) != none:
                     try self.fail_unsupported(module, function, node_span(self.program, expression), "an unhandled fallible initializer")
@@ -1124,6 +1146,21 @@ pub class Lowerer:
                     return try self.lower_expression(module, function, constant.value, body)
                 let local = try self.local_of(module, function, span, symbol)
                 return self.load_value(value_type, local.address, span, body)
+            FunctionAddress(target):
+                let source_index = self.function_index_of(target)
+                if source_index < 0: trap("function address names an unknown HIR symbol")
+                # The temporary entry lowering drops its not-yet-representable
+                # `slice[str]` parameter. Refuse its address rather than emit
+                # an indirect signature that disagrees with the definition.
+                if self.is_process_entry(self.program.functions[source_index]):
+                    try self.fail_unsupported(module, function, span, "process-entry function values")
+                var lowered = FunctionId(value = 0)
+                match self.lowered_functions[source_index]:
+                    Defined(function_id): lowered = function_id
+                    External(external): trap("Luce function address names a C extern")
+                let result = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = lowered), span = span))
+                return result
             ExternLoad(variable_index):
                 let global = self.lowered_external_globals[variable_index]
                 let result = self.new_register(value_type)
@@ -1286,6 +1323,7 @@ pub class Lowerer:
         let span = node_span(self.program, expression)
         match node_form(self.program, expression):
             Call(callee, arguments): return try self.lower_fallible_call(module, function, expression, callee, arguments, body)
+            IndirectCall(callee, arguments): return try self.lower_fallible_indirect_call(module, function, expression, callee, arguments, body)
             Initialize(callee, arguments): return try self.lower_fallible_initializer(module, function, expression, callee, arguments, body)
             Match(subject, arms, has_result): return try self.lower_fallible_match(module, function, expression, subject, arms, body)
             Conditional(value, condition, alternative):
@@ -1364,6 +1402,86 @@ pub class Lowerer:
             let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
             placed[parameter_index] = try self.lower_expression(module, function, argument, body)
         return placed
+
+    # Canonical calling shape for a source `func` type. Hidden error and
+    # aggregate-result pointers are the same protocol direct calls use.
+    func lower_function_value_signature(module: HirModule, function: HirFunction, span: SourceSpan, function_type: ir.TypeId) -> MirSignature!:
+        let source_parameters = list[ir.TypeId]()
+        var source_result = resolve_builtin_type(BuiltinType.unit)
+        match self.program.types.definitions[function_type.value].form:
+            Function(parameters, result):
+                for parameter in parameters: source_parameters.append(parameter)
+                source_result = result
+            else: trap("indirect call has a non-function HIR type")
+        let parameters = list[TypeId]()
+        let results = list[TypeId]()
+        let fallible = self.fallible_inner(source_result)
+        var successful = source_result
+        if fallible != none:
+            successful = fallible
+            parameters.append(builtin_mir_type(BuiltinMirType.pointer))
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.mir_type_of(module, function, span, successful)
+            if self.is_aggregate(result_type): parameters.append(builtin_mir_type(BuiltinMirType.pointer))
+            else: results.append(result_type)
+        if fallible != none: results.append(builtin_mir_type(BuiltinMirType.pointer))
+        for parameter in source_parameters:
+            let value_type = try self.mir_type_of(module, function, span, parameter)
+            parameters.append(self.register_type_for(value_type))
+        return MirSignature(parameters = parameters, results = results, is_fallible = fallible != none)
+
+    # Callee expression first, then positional arguments left to right.
+    func lower_indirect_operands(module: HirModule, function: HirFunction, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> IndirectOperands!:
+        let target = try self.lower_expression(module, function, callee, body)
+        let values = list[RegisterId]()
+        for position in range(0, i64(arguments.count)):
+            values.append(try self.lower_expression(module, function, node_at(self.program, arguments, position), body))
+        return IndirectOperands(target = target, values = values)
+
+    func lower_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let operands = try self.lower_indirect_operands(module, function, callee, arguments, body)
+        let signature = try self.lower_function_value_signature(module, function, span, node_type(self.program, callee))
+        if signature.is_fallible: trap("fallible indirect call entered infallible lowering")
+        let call_arguments = list[RegisterId]()
+        let results = list[RegisterId]()
+        let source_result = node_type(self.program, expression)
+        var value = RegisterId(value = no_register)
+        if not types_match(source_result, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.mir_type_of(module, function, span, source_result)
+            if self.is_aggregate(result_type):
+                value = self.new_temp(result_type, span, body)
+                call_arguments.append(value)
+            else:
+                value = self.new_register(result_type)
+                results.append(value)
+        for argument in operands.values: call_arguments.append(argument)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
+        return value
+
+    func lower_fallible_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.program, expression)
+        let operands = try self.lower_indirect_operands(module, function, callee, arguments, body)
+        let signature = try self.lower_function_value_signature(module, function, span, node_type(self.program, callee))
+        if not signature.is_fallible: trap("infallible indirect call entered fallible lowering")
+        let successful = self.fallible_inner(node_type(self.program, expression)) else trap("fallible indirect call has an infallible result")
+        let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let call_arguments = [self.new_temp(error_type, span, body)]
+        let results = list[RegisterId]()
+        var value = RegisterId(value = no_register)
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.mir_type_of(module, function, span, successful)
+            if self.is_aggregate(result_type):
+                value = self.new_temp(result_type, span, body)
+                call_arguments.append(value)
+            else:
+                value = self.new_register(result_type)
+                results.append(value)
+        for argument in operands.values: call_arguments.append(argument)
+        let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        results.append(reported_error)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.operands.run(results), signature = signature, target = operands.target, arguments = self.operands.run(call_arguments)), span = span))
+        return FallibleResult(value = value, error_value = reported_error)
 
     func lower_fallible_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
         let span = node_span(self.program, expression)
@@ -2337,6 +2455,7 @@ pub class Lowerer:
                 let absent = intern_mir_type(self.types, make_struct_type(list[TypeId]()))
                 let present = try self.mir_type_of(module, function, span, inner)
                 return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
+            Function(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
                 # declared target-neutral token representation; ABI placement

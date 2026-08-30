@@ -594,7 +594,7 @@ DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
 LoadExternalGlobal(ExternalGlobalId)      -> r: type
 StoreExternalGlobal(ExternalGlobalId, value)
-FunctionAddress(FunctionId)               -> r: Ptr     for closures, witness tables, C callbacks
+FunctionAddress(FunctionId)               -> r: Ptr     opaque exact-function call token
 ```
 
 **Calls** — a fallible target takes the caller's error-slot pointer as its
@@ -607,6 +607,15 @@ Call(FunctionId, args)                       -> results
 CallExtern(ExternId, args)                   -> results
 CallIndirect(signature, target, args)        -> results
 ```
+
+An exact source `func(P...) -> R` is an opaque pointer-shaped value in
+canonical MIR; its type is carried by the `CallIndirect` operation, not
+recovered from its representation. `FunctionAddress` creates the token for a
+defined Luce function. QBE currently represents it as a code address, while
+Wasm represents it as a slot in an on-demand funcref table. Neither choice is
+a HIR/MIR fact. A later closure slice may make the backend token refer to a
+managed code-and-environment descriptor without changing source type checking
+or introducing target layout before the backend boundary.
 
 **Control flow** — a body is one flat instruction list; these open,
 separate, and close regions in that list:

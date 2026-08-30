@@ -29,6 +29,11 @@ belongs to.
   proves array value copies, aggregate calls/results, checked mutation, and
   structural equality through native QBE without depending on the future
   collection runtime.
+- `function_values.luc` is an end-to-end exact-function-value example. Named
+  function addresses, selection, aliases, fields, parameters/results and
+  fallible calls execute through the semantic oracle and native QBE, and the
+  same canonical MIR builds as WebAssembly. Closure environments and the
+  infallible-to-fallible adapter remain a later managed-runtime slice.
 
 ## Stage-0 example corpus as a progress gate
 
@@ -55,10 +60,11 @@ artifacts are never imported.
 
 The fixed-array slice removes allocation-free dense storage from this map.
 The remaining small and medium programs are dominated by growable
-collections, slicing, text construction, files, and host services. The next
-runtime work therefore starts by implementing the audited native-memory
-surface required to express `libluce_rt` honestly; allocator policy does not
-belong in HIR, MIR, or the compiler itself.
+collections, slicing, text construction, files, and host services. Their
+runtime work starts only after the target-neutral allocation contract is
+settled: canonical MIR cannot manufacture target byte sizes or prescribe
+WebAssembly linear-memory growth. Allocator policy does not belong in HIR,
+MIR, or the compiler itself.
 
 `FEATURES.md` maps the complete parser-supported 1.0 source surface to
 these files. Payload enums are Luce's tagged unions; there is intentionally no

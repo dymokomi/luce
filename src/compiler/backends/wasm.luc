@@ -36,14 +36,17 @@
 #       below the end of the data area, so runaway recursion is a trap, not
 #       silent corruption of data.
 #
-#       Calls are direct: a MIR `Call` pushes its arguments and uses wasm's
-#       `call` with the callee's index. MIR parameter registers `r0..rN-1`
-#       are exactly wasm's parameter locals `0..N-1`, so registers map onto
-#       locals without renumbering; only the remaining registers are declared.
+#       A MIR `Call` pushes its arguments and uses wasm's direct `call`.
+#       Function values use an artifact-local table: `FunctionAddress` is the
+#       stable MIR-function slot and `CallIndirect` supplies its exact MIR
+#       signature to wasm's checked `call_indirect`. The table exists only in
+#       modules that use either instruction. MIR parameter registers
+#       `r0..rN-1` are exactly wasm's parameter locals `0..N-1`, so registers
+#       map onto locals without renumbering; only the remainder are declared.
 #
 #       Read `emit` top-down: it writes the sections in the order the binary
-#       format requires — type, import, function, memory, global, export,
-#       code, data — and each `encode_*` below produces one section's
+#       format requires — type, import, function, optional table, memory,
+#       global, export, optional elements, code, data — and each `encode_*`
 #       payload. The function index space is: imports first (in extern order,
 #       then `proc_exit`), then every defined MIR function in program order,
 #       then `_start` when present. The instruction encoders follow, grouped
@@ -66,9 +69,11 @@ func wasm_layout() -> LayoutRules:
 let type_section: u8 = 0x01
 let import_section: u8 = 0x02
 let function_section: u8 = 0x03
+let table_section: u8 = 0x04
 let memory_section: u8 = 0x05
 let global_section: u8 = 0x06
 let export_section: u8 = 0x07
+let element_section: u8 = 0x09
 let code_section: u8 = 0x0A
 let data_section: u8 = 0x0B
 
@@ -77,6 +82,7 @@ let i32_value_type: u8 = 0x7F
 let i64_value_type: u8 = 0x7E
 let f32_value_type: u8 = 0x7D
 let f64_value_type: u8 = 0x7C
+let function_reference_type: u8 = 0x70
 let function_import_kind: u8 = 0x00
 let global_import_kind: u8 = 0x03
 let function_export_kind: u8 = 0x00
@@ -118,6 +124,7 @@ let opcode_br: u8 = 0x0C
 let opcode_br_if: u8 = 0x0D
 let opcode_return: u8 = 0x0F
 let opcode_call: u8 = 0x10
+let opcode_call_indirect: u8 = 0x11
 let opcode_drop: u8 = 0x1A
 # Variables
 let opcode_local_get: u8 = 0x20
@@ -265,6 +272,8 @@ pub class WasmBackend:
         if len(plan.imports) > 0 or len(plan.global_imports) > 0:
             append_section(output, import_section, encode_import_entries(plan))
         append_section(output, function_section, encode_function_entries(program, plan))
+        if plan.has_function_table:
+            append_section(output, table_section, encode_table_entry(program))
         if plan.has_memory:
             append_section(output, memory_section, encode_memory_entry(plan))
         if plan.has_stack:
@@ -274,6 +283,8 @@ pub class WasmBackend:
         # when something follows the count.
         if len(exports) > 1:
             append_section(output, export_section, exports)
+        if plan.has_function_table:
+            append_section(output, element_section, encode_element_entries(program, plan))
         append_section(output, code_section, try encode_code_entries(program, plan))
         if len(program.data) > 0:
             append_section(output, data_section, encode_data_entries(program, plan))
@@ -316,6 +327,7 @@ struct ModulePlan:
     let data_end: i64
     let has_memory: bool
     let has_stack: bool
+    let has_function_table: bool
     let proc_exit_import: i64
     let start_type: i64
 
@@ -358,10 +370,18 @@ func plan_module(program: MirProgram) -> ModulePlan!:
 
     let function_types = list[i64]()
     var has_stack = false
+    var has_function_table = false
     for function in program.functions:
-        let signature = try wasm_signature(program.types, function.signature)
-        function_types.append(intern_signature(signatures, signature))
+        let function_signature = try wasm_signature(program.types, function.signature)
+        function_types.append(intern_signature(signatures, function_signature))
         if len(function.slots) > 0: has_stack = true
+        for instruction in function.body:
+            match instruction.form:
+                FunctionAddress(result, target): has_function_table = true
+                CallIndirect(results, indirect_signature, target, arguments):
+                    has_function_table = true
+                    discard(intern_signature(signatures, try wasm_signature(program.types, indirect_signature)))
+                else: pass
 
     # Data items pack after the scratch area, each at its own alignment.
     let data_offsets = list[i64]()
@@ -385,6 +405,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         data_end = data_end,
         has_memory = has_memory,
         has_stack = has_stack,
+        has_function_table = has_function_table,
         proc_exit_import = proc_exit_import,
         start_type = start_type,
     )
@@ -402,6 +423,11 @@ func wasm_signatures_match(left: WasmSignature, right: WasmSignature) -> bool:
     for index in range(0, len(left.results)):
         if left.results[index] != right.results[index]: return false
     return true
+
+func signature_index(signatures: list[WasmSignature], signature: WasmSignature) -> i64:
+    for index in range(0, len(signatures)):
+        if wasm_signatures_match(signatures[index], signature): return index
+    trap("wasm module plan omitted an instruction signature")
 
 func wasm_signature(types: MirTypeTable, signature: MirSignature) -> WasmSignature!:
     let parameters = list[u8]()
@@ -481,6 +507,16 @@ func encode_function_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
     for type_index in plan.function_types:
         append_unsigned(entries, type_index)
     if has_start(plan): append_unsigned(entries, plan.start_type)
+    return entries
+
+# One funcref table whose slots correspond exactly to canonical FunctionId
+# values. It is absent from programs without first-class function operations.
+func encode_table_entry(program: MirProgram) -> list[u8]:
+    let entries = list[u8]()
+    append_unsigned(entries, 1)
+    entries.append(function_reference_type)
+    entries.append(0x00) # minimum only
+    append_unsigned(entries, len(program.functions))
     return entries
 
 # One memory with no maximum. It holds the scratch area and the data items
@@ -596,6 +632,20 @@ func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
         entries.append(opcode_end)
         append_unsigned(entries, len(item.bytes))
         append_all(entries, item.bytes)
+    return entries
+
+# Initialise table slot `i` with defined MIR function `i`. Imports and the
+# synthetic `_start` wrapper are deliberately not source function values.
+func encode_element_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
+    let entries = list[u8]()
+    append_unsigned(entries, 1)
+    entries.append(0x00)             # active segment for table 0
+    entries.append(opcode_i32_const)
+    append_signed(entries, 0)
+    entries.append(opcode_end)
+    append_unsigned(entries, len(program.functions))
+    for index in range(0, len(program.functions)):
+        append_unsigned(entries, defined_function_index(plan, index))
     return entries
 
 # mark: Registers as locals ===================================================================
@@ -912,6 +962,10 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             local_get(body, value)
             body.append(opcode_global_set)
             append_unsigned(body, i64(global.value))
+        FunctionAddress(result, target):
+            # The element segment preserves FunctionId order exactly.
+            append_constant(body, i64(target.value), false)
+            local_set(body, result)
         Call(results, target, arguments):
             # Direct call: arguments in order, the callee's index in the
             # function index space, then results popped into their locals.
@@ -921,6 +975,17 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 local_get(body, register_at(function, arguments, index))
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(target.value)))
+            var index = i64(results.count) - 1
+            while index >= 0:
+                local_set(body, register_at(function, results, index))
+                index -= 1
+        CallIndirect(results, signature, target, arguments):
+            for index in range(0, i64(arguments.count)):
+                local_get(body, register_at(function, arguments, index))
+            local_get(body, target)
+            body.append(opcode_call_indirect)
+            append_unsigned(body, signature_index(plan.signatures, try wasm_signature(types, signature)))
+            append_unsigned(body, 0) # table index
             var index = i64(results.count) - 1
             while index >= 0:
                 local_set(body, register_at(function, results, index))
