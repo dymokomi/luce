@@ -166,25 +166,41 @@ returns either a `T` or an `Error` (§13.2). Many compilers implement that
 with exceptions, unwinding, and landing pads. MIR does something plainer:
 
 ```
-func checked_sum(r0: i64) -> (i64, Ptr)        ; second result: the error slot
-    r1: Bool = Lt r0, 0
-    If r1
-      r2: Ptr = DataAddress data0              ; "limit must not be negative"
-      r3: Ptr = CallExtern luce_rt_error_make, <math.negative>, r2, 27
-      Raise r3
+func checked_sum(r0: Ptr, r1: i64) -> (i64, Ptr)
+    ; r0 is storage for one Error, owned by this call's caller
+    r2: Bool = Lt r1, 0
+    If r2
+      r3: Ptr = FieldAddress Error, r0, 0       ; error.code
+      r4: Ptr = DataAddress data0               ; constant math.negative
+      Memcpy r3, r4, ErrorCode
+      r5: Ptr = FieldAddress Error, r0, 1       ; error.message
+      r6: Ptr = DataAddress data1               ; constant str value
+      Memcpy r5, r6, str
+      Raise r0
     End
-    r4: i64 = Call sum_to, r0                  ; sum_to cannot fail: one result
-    Return r4, null                            ; value present, error absent
+    r7: i64 = Call sum_to, r1                   ; sum_to cannot fail: one result
+    r8: Ptr = Const null
+    Return r7, r8                               ; value present, error absent
 ```
 
-A fallible function has **two results**: the value and an *error slot*, a
-pointer that is null when nothing went wrong. `Raise` is `Return` with an
-absent value and a present error. Now look at how a *caller* would use it:
+A fallible scalar function receives a hidden **caller-owned `Error` slot** as
+parameter 0 and has two results: the value and a pointer to that slot. The
+pointer is null on success; on failure it is exactly parameter 0. `Raise r0`
+is `Return` with an absent value and the filled slot. The callee never returns
+a pointer into its own frame and failure needs no heap allocation or hidden
+runtime ownership.
+
+Now look at how a fallible *caller* propagates it:
 
 ```
-r6: i64, r7: Ptr = Call checked_sum, r0
-r8: Bool = Ne r7, null
-BrIf r8, 2                                     ; `try`: propagate to the function's raise path
+r9: Ptr = Alloca error_slot
+r10: i64, r11: Ptr = Call checked_sum, r9, r1
+r12: Ptr = Const null
+r13: Bool = Ne r11, r12
+If r13
+  Memcpy r0, r11, Error                         ; copy into our caller's slot
+  Raise r0                                     ; `try` runs active defers first
+End
 ```
 
 `try` is a call followed by one conditional branch. `catch` is the same
@@ -339,7 +355,7 @@ its intermediate language:
 | `convention = c` | QBE performs the SysV / Apple arm64 / RISC-V ABI lowering | direct |
 | `CallExtern`, `FunctionAddress`, data relocations | `call $sym`, `$sym` as a value, `data $x = { l $f }` | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
-| fallible `(value, error)` | one return value: an aggregate, or an out-pointer for the error | a per-backend ABI choice |
+| fallible `(value, error pointer)` plus caller-owned error parameter | aggregate return or target return registers; error storage is explicit | a small per-backend ABI choice |
 | narrow integer types | sub-word ops spelled out (`extsb`, `storeh`); widths only in signatures | see the open question below |
 
 Nothing in the design fights QBE, and two of its decisions — stored layout
@@ -351,8 +367,10 @@ linker, which is why the plan below says "object file", not "executable".
 
 Two consequences for the design record:
 
-- The "two results" of a fallible function state MIR's *meaning*. Each
-  backend picks the ABI: wasm multi-value, QBE an out-pointer or aggregate.
+- The result pair of a fallible scalar function states MIR's *meaning*.
+  Error storage and its lifetime are already fixed by the explicit parameter;
+  each backend only picks how to return the scalar-and-pointer pair: wasm
+  multi-value, QBE an aggregate or target return registers.
 - The narrow-integer question tilts toward normalizing to `i32`/`i64` early,
   keeping exact widths only in `Struct` fields and `c` signatures — the form
   both wasm and QBE want. Still decided at the first lowerer slice.
@@ -413,7 +431,8 @@ How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
 unsigned)`; `str` and `bytes` → a `{Ptr, Int(64)}` `Struct` (address and
 length; a literal's bytes are a data item); `list`, `map`, `set` → `Ptr` to
 runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
-references is still open); a `T!` result → two registers, never a type;
+references is still open); a scalar `T!` result → a scalar and error pointer,
+never a type;
 tuples → anonymous `Struct`; class references and `weak` → `Ptr` managed by
 the runtime; interface values → a two-`Ptr` `Struct`.
 
@@ -422,7 +441,9 @@ aggregate type holds the value's *address* (a slot, a field, a parameter's
 pointer), copies are explicit `Memcpy`s, a function returning an aggregate
 takes a hidden leading `Ptr` parameter for the caller's result slot and
 returns nothing, and an aggregate parameter is passed by pointer (safe
-because parameters are immutable).
+because parameters are immutable). A fallible function reserves parameter 0
+for the error slot; when its success value is an aggregate, the result slot is
+parameter 1. Source parameters follow both hidden parameters.
 
 ### Functions, externs, globals, data
 
@@ -431,8 +452,8 @@ MirFunction
     name          `module.function`, or the export symbol
     convention    luce | c
     params        list[TypeId]
-    results       list[TypeId]        0, 1, or 2 (value, error)
-    fallible      bool                the last result is the error slot
+    results       list[TypeId]        0, 1, or 2 (value, error pointer)
+    fallible      bool                parameter 0 owns Error; last result reports it
     registers     list[TypeId]        every register, by index
     slots         list[(TypeId, align)]
     body          list[Instruction]   structured, see below
@@ -495,8 +516,10 @@ GlobalAddress(GlobalId)                   -> r: Ptr
 FunctionAddress(FunctionId)               -> r: Ptr     for closures, witness tables, C callbacks
 ```
 
-**Calls** — a fallible target defines two registers; the second is the
-error slot, null when absent.
+**Calls** — a fallible target takes the caller's error-slot pointer as its
+first argument. Its last result is null on success or that same pointer on
+failure. A scalar success result precedes it; aggregate success data uses the
+separate hidden result-slot argument described above.
 
 ```
 Call(FunctionId, args)                       -> results
@@ -516,7 +539,7 @@ Br(depth, values)                 leave region `depth`, supplying its results
 BrIf(condition, depth, values)
 Yield(values)                     leave the innermost region normally, supplying its results (a Br 0 that reads as an exit)
 Return(values)
-Raise(failure)                    Return with an absent value and a present error
+Raise(failure)                    Return absent value(s) and r0, the filled caller-owned Error slot
 Trap(reason)                      unconditional; runs no deferred code
 Unreachable                       after a diverging call; verifier-only
 ```
@@ -543,7 +566,6 @@ luce_rt_alloc(size, align) -> Ptr        luce_rt_retain(Ptr)         luce_rt_rel
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, length)            luce_rt_write(bytes, length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
-luce_rt_error_make(code, message) -> Ptr luce_rt_error_code(Ptr) -> i64
 luce_rt_spawn(function, input) -> Ptr    luce_rt_wait(Ptr) -> Ptr    luce_rt_cancel(Ptr)
 luce_rt_transfer(value, type_info) -> Ptr                             value-graph copy (§19.2)
 ```
@@ -555,8 +577,10 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
 - `Br`/`BrIf` depths are in range, and `Block`/`If` result registers are
   defined on every path to the join;
 - struct and enum offsets and sizes agree with `layout`;
-- fallible calls define their error register; every path of a fallible
-  function ends in `Return` or `Raise`;
+- a fallible signature takes a `Ptr` as parameter 0 and returns a `Ptr` last;
+  fallible calls pass the caller-owned error slot and define the reported
+  error pointer; a fallible `Return` reports null and `Raise` returns r0;
+  every fallible path ends in one of those terminators;
 - `c`-convention signatures contain only C-representable types;
 - runtime symbols are called with their known signatures;
 - relocations point at existing items.
@@ -570,6 +594,7 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
   the first lowerer slice.
 - **Optionals of references** — null-pointer niche (the plan) or a uniform
   two-case enum? The niche must not leak into `c`-convention signatures.
-- **Fallible results per backend** — wasm multi-value returns (the plan;
-  universally supported now), QBE an out-pointer or aggregate. Not an error
-  global: that would reintroduce hidden state.
+- **Fallible result pair per backend** — wasm multi-value returns (implemented;
+  universally supported now), QBE an aggregate or target return registers.
+  The caller-owned error parameter is canonical MIR, not a backend choice and
+  never a global.

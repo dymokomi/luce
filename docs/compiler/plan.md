@@ -41,7 +41,7 @@ and, for gates, in the spec — and a slice is ticked only on a green
 - **Canonical given a `TargetLayout`**: struct/enum offsets are computed by the lowerer and stored in MIR; the verifier checks them. Required for C interop. A wasm32 program and an arm64 program are different MIR programs.
 - **Aggregates never sit in a register**: a register of aggregate type holds an address; copies are explicit `Memcpy`; aggregate results go through a hidden leading pointer parameter; aggregate parameters are passed by pointer, written through only by a `mutating` receiver.
 - **Runtime as symbols** (`luce_rt_*`), never instructions. wasm imports them; native links `libluce_rt`.
-- **Failure as data**: a fallible function returns `(value, error_ptr)`; `try` is a call plus one conditional branch; `defer` is duplicated onto every exit; no unwinding.
+- **Failure as data with explicit ownership**: a fallible function receives a caller-owned `Error` slot as hidden parameter 0 and returns `(value, null)` on success or `(absent, error_out)` on failure. `try` is a call plus one conditional branch; propagation copies into the current function's slot after active `defer`s; no allocation or unwinding.
 - **Semantics fixed in MIR**: `Add` means checked add; `floor_div`/`rem` are floor semantics; shifts trap on count, drop bits shifted out. Checks are removed only by proof, never by build mode.
 - **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
 - **`Yield`** is the structured phi: a region that produces values names them on every exit.
