@@ -66,6 +66,7 @@ Measured on 0.25/arm64-macOS; method and full table in `plan.md` §8.1.
 | Stack under the compiler today | 512 MiB, from Stage-0's link-time reservation | fine, and not ours to keep |
 | Stack in what we emit | 64 MiB (`arm64_macos.luc`), 8 MiB on Linux, 1 MiB shadow stack on wasm | macOS done, Linux unaddressed |
 | Cost of one interpreted call | ~32 KiB across six host frames | 8–30× the norm |
+| ↳ and it depends on the build mode | 42.7 KiB release, 52.9 KiB debug (0.26) | see below |
 | `frame_limit` | 2000, declared | right for one host, wrong elsewhere |
 | Front-end nesting cap | none | **a crash today** |
 | Stack probe | wasm only | the native backends have none |
@@ -76,6 +77,23 @@ has not fallen below the data segment and traps if it has (`wasm.luc`, the
 overflow guard around the shadow-stack prologue). That is exactly mechanism
 (1) from §2, and it is the model to copy to the native backends. And the
 macOS backend now reserves 64 MiB explicitly rather than inheriting 8 MiB.
+
+**The ceiling now depends on which mode built the compiler.** 0.26 makes
+`luce build` without `--release` an O1+FastISel path, and FastISel spends more
+stack per frame. Measured on our own interpreter with the 0.26 pre-release,
+fat-callee ceilings:
+
+| build of our compiler | bytes per interpreted call | ceiling | margin at `frame_limit = 2000` |
+| --- | --- | --- | --- |
+| 0.25 (O3) | 41,700 | 12,875 | 6× |
+| 0.26 `--release` | 42,686 | 12,577 | 6× |
+| 0.26 default (O1+FastISel) | 52,945 | 10,140 | 5× |
+
+Debug costs about a quarter more stack per call and drops the ceiling ~19%.
+Two consequences we hold to: build the self-hosting compiler `--release` when
+depth matters and debug when turnaround matters, and keep `frame_limit` at a
+number that survives the *worst* mode — 2000 does, with 5× to spare, which is
+the argument for having chosen it over 4000.
 
 The rest is the work.
 

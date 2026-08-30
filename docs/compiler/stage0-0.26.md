@@ -232,14 +232,30 @@ it linger: a field that is silently mutable because its author omitted a word
 is the one outcome worse than a migration.
 
 **5b. `discard(expr)` and the unused-result lint.** *Landed in 0.26 as a hard
-error. Our measured exposure before the bump: about 164 statement-position
-calls to a name that answers a value, of which 113 are three parser helpers —
-`expect_symbol` (65 of 68 call sites ignore the token), `expect_kind` (38 of
-42), `expect_keyword` (10 of 14). For those the lint is not asking for 113
-`discard(...)` wrappers; it is telling us the signature is wrong, and the fix
-is `-> !` plus a `take_*` variant for the eleven sites that want the token.
-The rest take the wrapper. Estimate is name-based and over-approximates, so
-the authoritative list comes from the pre-release archive.*
+error. **Authoritative count, from the pre-release archive (`86b97fac`): 127
+sites**, against an estimate of 164 — the estimate over-approximated as
+expected. 124 are in `src/`, 3 in `tests/`:*
+
+| callee | sites | note |
+| --- | --- | --- |
+| `expect_symbol` | 65 | 65 of 68 call sites ignore the token |
+| `expect_kind` | 38 | 38 of 42 |
+| `expect_keyword` | 10 | 10 of 14 |
+| `advance` | 8 | genuinely mixed — 21 of 29 sites use it |
+| `check`, `evaluate`, `resolve_alias` | 3 | one each |
+| `*_with_backend`, `check` in tests | 3 | all the `f() catch reason:` shape |
+
+*113 of the 127 are the three parser helpers, whose signature is the actual
+defect: they answer a `Token!` that almost nobody wants. The fix there is
+`-> !` plus a `take_*` variant for the eleven sites that do — **not** 113
+`discard(...)` wrappers, which would silence the lint while preserving what it
+correctly found. The remaining 14 take the wrapper.*
+
+***Nothing else in 0.26 touches us.*** *With those 127 sites mechanically
+wrapped in a throwaway copy of the tree, the 0.26 archive runs our whole suite
+green: 370 passed in 15 files, plus the CLI, wasm, and arm64-macOS native
+gates. The `let`/`var` field and `const` migrations we did earlier cover the
+two breaking changes.*
 
 Original request: Neither exists today:
 `discard(produces())` is `unknown function discard`, and a dropped result is
