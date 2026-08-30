@@ -90,7 +90,11 @@ copy generated caches or duplicate programs merely to increase the count.
   and caches its layout when encoding. The same MIR program therefore feeds
   Wasm, QBE, and later native backends.
 - **Aggregates never sit in a register**: a register of aggregate type holds an address; copies are explicit `Memcpy`; aggregate results go through a hidden leading pointer parameter; aggregate parameters are passed by pointer, written through only by a `mutating` receiver.
-- **Runtime as symbols** (`luce_rt_*`), never instructions. wasm imports them; native links `libluce_rt`.
+- **Runtime services as symbols** (`luce_rt_*`). Ownership, weak references,
+  I/O and traps are ordinary verified calls. Typed storage allocation is the
+  sole canonical instruction because its structural `TypeId` must survive to
+  the backend; backend legalization turns it into the private byte-count ABI.
+  The composed runtime supplies the symbols to both artifact paths.
 - **Failure as data with explicit ownership**: a fallible function receives a caller-owned `Error` slot as hidden parameter 0 and returns `(value, null)` on success or `(absent, error_out)` on failure. `try` is a call plus one conditional branch; propagation copies into the current function's slot after active `defer`s; no allocation or unwinding.
 - **Semantics fixed in MIR**: `Add` means checked add; `floor_div`/`rem` are floor semantics; shifts trap on count, drop bits shifted out. Checks are removed only by proof, never by build mode.
 - **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
@@ -260,15 +264,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   **not** claim pointers dynamically returned by C, nullable cfunc slots, or
   lambda/closure conversion; those need the explicit foreign-pointer oracle
   and managed-environment work rather than an implicit representation trick.
-- [ ] **Settle the target-neutral runtime allocation contract before coding
-  it.** The language already reserves reviewed `.native.luc` capabilities,
-  but neither the spec nor canonical MIR yet says how a runtime requests
-  storage without the lowerer inventing target byte sizes/alignment. A shared
-  primitive cannot be "linear-memory growth": that is a Wasm backend fact,
-  not a QBE/native semantic operation. Specify allocation ownership,
-  raw-load/store/copy capabilities and the runtime package build/link mode;
-  only then implement the smallest audited substrate. Allocator policy must
-  not return to the compiler.
+- [x] **Settle the target-neutral runtime allocation contract before coding
+  it** (2026-08-30, spec §§21.12 and 23.4). Canonical MIR requests storage for
+  a runtime count of one structural `TypeId`; it never manufactures target
+  byte size/alignment. Only a backend legalizes that request to the private
+  `luce_rt_alloc(byte_count, byte_alignment)` ABI using its existing layout
+  cache and checked multiplication. The allocation starts with one strong
+  storage owner; retain/release share it and the last release returns the
+  opaque block after element cleanup. The HIR oracle keeps semantic values;
+  the MIR oracle uses explicit test layout. `libluce_rt` is a sealed Luce
+  package composed with application MIR before optimization, while its
+  `.native.luc` substrate exposes only typed load/store/advance/copy and a
+  stable, host-sized, monotonically committed byte arena. Wasm growth and
+  native reservation are backend implementations of that provider. No
+  pointer/integer casts, source `sizeof`, target layout, allocator policy, or
+  application-native authority enters HIR/MIR or the compiler. The sealed
+  package alone may own module-private mutable allocator state; it lowers as
+  an ordinary structural MIR global and cannot escape into application source.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only

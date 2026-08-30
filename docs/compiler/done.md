@@ -156,6 +156,17 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   runtime-sized array and builder, without adding a compiler-only collection
   path. The HIR oracle answers 42, the same canonical MIR builds as Wasm, and
   the installed native QBE executable exits successfully.
+- [x] **The runtime allocation boundary is settled before implementation**
+  (2026-08-30). The lowerer will request a runtime count of a structural MIR
+  type, never target bytes or alignment; backend legalization alone converts
+  that request to the private `luce_rt_alloc` byte ABI. Allocation ownership,
+  zero-count/zero-size behavior, overflow and exhaustion are explicit in spec
+  §23.4. The sealed, freestanding `libluce_rt` package owns allocator policy
+  and is composed with application MIR before optimization. Reviewed
+  `.native.luc` modules retain typed pointee identities and can reach only a
+  stable, monotonically committed arena capability; Wasm growth and native
+  reservation remain backend implementations. This records the guardrails;
+  it does not claim the substrate or allocator is implemented yet.
 - [x] **Exact ordinary function values reuse the canonical callable model**
   (2026-08-30). A named, capture-free Luce declaration has an exact `func`
   type and explicit `FunctionAddress` HIR form; calls through values are

@@ -264,23 +264,37 @@ backend actually needs, and typed pointers would only say it twice.
 
 ### The runtime: things MIR asks for by name
 
+The typed allocation request below is the settled next canonical-MIR slice;
+the current lowerer does not emit it until the sealed native/runtime substrate
+can implement it without circular allocation.
+
 Where does memory for a `list` come from? Who counts references for a
-class? Who prints? MIR does not have instructions for any of it. It has
-**calls to a small, fixed set of runtime symbols**:
+class? Who prints? Ownership and I/O remain **calls to a small, fixed set of
+runtime symbols**. Allocation is the one operation that must retain its
+structural type until the backend boundary:
 
 ```
-r1: Ptr = CallExtern luce_rt_alloc, 24, 8
+r0: u64 = Const 3
+r1: Ptr = AllocateStorage Point, r0
 CallExtern luce_rt_retain, r1
 CallExtern luce_rt_write, r2, 13
 ```
 
+`AllocateStorage` means storage for `r0` consecutive `Point` values. It does
+not contain `sizeof(Point)` or `alignof(Point)`. The selected backend performs
+checked count-by-size legalization from its layout cache and emits the private
+`luce_rt_alloc(byte_count, byte_alignment)` call. This is the same boundary
+that already turns `FieldAddress` into a target byte offset; the lowerer and
+canonical program remain identical for Wasm and QBE.
+
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
 join — and says it should be "small and explicit enough to replace per
-host". Naming those services as symbols keeps MIR identical for every
-target and gives each backend exactly one job for them: wasm imports the
-symbols (or links a runtime compiled to wasm); native links `libluce_rt`.
-The full symbol list is in the appendix.
+host". The sealed `libluce_rt` source package is composed with application MIR
+before optimization and verification, so both artifact backends consume one
+program. Only the tiny stable-arena provider remains backend-owned: Wasm may
+grow its memory, while native may reserve/commit virtual storage. Neither fact
+appears in HIR or canonical MIR. The full service list is in the appendix.
 
 Retain and release calls are placed by the lowerer using the ownership facts
 that `SemanticAnalyzer` will attach to HIR (§11.3). Until that analysis
@@ -590,6 +604,7 @@ FieldAddress(struct_type, base, index)    -> r: Ptr
 EnumPayloadAddress(enum_type, base)       -> r: Ptr
 ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
+AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
 LoadExternalGlobal(ExternalGlobalId)      -> r: type
@@ -657,7 +672,9 @@ Emitted by the lowerer, never by user code; the verifier knows their
 signatures.
 
 ```
-luce_rt_alloc(u64 size, u64 align) -> Ptr luce_rt_retain(Ptr)        luce_rt_release(Ptr)
+AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
+  backend legalization: luce_rt_alloc(u64 byte_count, u64 byte_align) -> Ptr
+luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
