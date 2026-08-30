@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-29 (Stage-0 0.25).
+Last updated: 2026-08-29 (Stage-0 0.26).
 
 ## 1. Testing strategy (the part that must not be lost)
 
@@ -153,18 +153,20 @@ Standing rules:
 
 ## 8. Stage-0 constraints
 
-The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.25 is pinned. Remaining constraints:
+The compiler must stay buildable by Stage-0 (the frozen seed) until it builds itself. Stage-0 0.26 is pinned — installed from the pre-release archive built at `86b97fac`, the commit the release ships; `bootstrap.sh` carries that macOS checksum and holds the Linux one at `TBD` until CI publishes it, so a Linux bootstrap refuses cleanly rather than installing something unverified. Remaining constraints:
 
-- Reserved identifiers (`error`, `bytes`, `i8`…, and now `pass` and `never`), no top-level function sharing a name with a pattern binding, lists index with `i64` only and no `u32`↔`i64` mixing, no `-> !` call as a diverging match arm — divergence must be declared `-> never`, and a fallible helper still reads `error(...)` inline.
-- Stage-0 recognises divergence only through a *bare-name* call. `x else self.bail(…)` is refused where `x else bail(…)` is accepted, and the unreachable lint sees the same narrow set.
-- Argument labels differ by dialect: Stage-0 writes `f(name = value)`, the 1.0 spec and our own parser write `f(name: value)`. Probe programs must be written in the dialect of whichever compiler runs them.
-- Stack, not frame count, is the real recursion limit — see §8.1.
+- Reserved identifiers (`error`, `bytes`, `i8`…, `pass`, `never`), and no top-level function sharing a name with a pattern binding.
+- A dropped result is an error (`luce.sema.unused`): write `discard(...)` around a value nothing receives, with any `catch` outside it — `discard(risky()) catch reason:`.
+- Divergence must be declared `-> never`; a fallible helper still reads `error(...)` inline, and a `-> !` call is not a diverging arm.
+- Mixed-width arithmetic still needs an explicit conversion (`u32` + `i64` is refused), so the eight compound index expressions keep their `i64(...)`. Indexing itself no longer does: a `u32` id indexes a table directly.
+- Stack, not frame count, is the real recursion limit — see §8.1 — and since 0.26 the ceiling also depends on the build mode; `recursion.md` §3 has the numbers.
+- Lifted in 0.26, do not re-introduce the workarounds: `i64`-only indexing, bare `pub name: T` fields, file-scope `const`, single-member match arms, and the absence of `pass`/`never`/`list[T?]`.
 - Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm it fails on the installed `luce-0` before reporting or working around it. History in `done.md` §5.
 - Open requests to the Stage-0 team: [`stage0-0.26.md`](stage0-0.26.md), with reproductions in `build/stage0-0.25-repro/` and `build/stage0-0.26-repro/`.
 
 ### 8.1 The depth budget is a stack budget
 
-Stage-0 0.25 advertises 1,000,000 frames on a 512 MiB stack. That pairing assumes about 512 bytes per frame, which compiler-shaped code does not obey, so the advertised number is not the number to plan against.
+Stage-0 advertises 1,000,000 frames on a 512 MiB stack. That pairing assumes about 512 bytes per frame, which compiler-shaped code does not obey, so the advertised number is not the number to plan against. It still stands in 0.26: the stack-pointer guard that would fix it was built, worked, and was reverted for aborting a `cfunc` callback, so this remains the one open request.
 
 Measured on 0.25/arm64-macOS (method: bisect the depth at which a built program takes SIGBUS, then divide the 512 MiB reservation by it):
 

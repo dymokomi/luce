@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-29 (Stage-0 0.25).
+Last updated: 2026-08-29 (Stage-0 0.26).
 
 ## 1. Where things stand
 
@@ -21,7 +21,7 @@ Last updated: 2026-08-29 (Stage-0 0.25).
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | Native backends (arm64 Mach-O, x86-64 ELF) | The original slice only: constants, checked add/sub/mul, `print` of a literal, `return` from `main`. Direct executable writers, no linker. Not extended on purpose (`plan.md` §3). |
 | Tests | 370 unit tests; CLI contract script; `wasmtime` execution script; native smoke script (arm64 hello + overflow trap). `tests/compiler/differential_test.luc` runs ~110 fixtures through HIR interpreter, MIR interpreter, and every encoder and requires agreement. |
-| Toolchain | Stage-0 0.25 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
+| Toolchain | Stage-0 0.26 pinned in `bootstrap.sh`. Remaining constraints in `plan.md` §8. |
 
 ## 2. Done, in order
 
@@ -95,4 +95,6 @@ The proving programs (`plan.md` §4): first the seed guest commands rewritten in
 - 0.25 adoption, in commits: `bootstrap on stage-0 0.25`, `fields say let or var` (480 fields, 440 immutable and 40 mutable — the compiler found every mutation), `empty arms say pass` (21 arms that said `continue` and meant nothing), `drop the parallel supplied lists`, `interpreter depth from a measured stack budget`.
 - Bare `pub name: T` fields are accepted for 0.25 only and read as `var`, which is why the field migration was not deferred.
 - 0.25's depth/stack pairing does not hold for compiler-shaped code; the measurement and its consequences are in `plan.md` §8.1.
+- 0.26: every remaining request landed except the depth guard (§1). Adopted the same day from the pre-release archive: six `discard(...)` sites, the parser refactor that made 113 of them unnecessary, and 98 index conversions deleted. Suite green at each step. `stage0-0.26.md` carries the exchange, including their §1a reproduction of our two-ingredient finding and their reverted stack-pointer guard.
+- 0.26 changed the default build to O1+FastISel, which costs about a quarter more stack per interpreted call than `--release`; `frame_limit = 2000` still clears the worst mode by 5×.
 - Withdrawn after checking: "`return` in a statement-form `catch` does not return" — it does.
