@@ -68,7 +68,8 @@ Measured on 0.25/arm64-macOS; method and full table in `plan.md` §8.1.
 | Cost of one interpreted call | ~32 KiB across six host frames | 8–30× the norm |
 | ↳ and it depends on the build mode | 42.7 KiB release, 52.9 KiB debug (0.26) | see below |
 | `frame_limit` | 2000, declared | right for one host, wrong elsewhere |
-| Front-end nesting cap | none | **a crash today** |
+| Front-end nesting cap | 256 on expressions | done; other productions unmeasured |
+| Front-end throughput | linear, ~450 KB/s | was quadratic — see §5 |
 | Stack probe | wasm only | the native backends have none |
 
 Two of these are already good and worth saying plainly. The wasm backend
@@ -99,21 +100,24 @@ The rest is the work.
 
 ## 4. The work, in the order it should happen
 
-### Phase 1 — a nesting cap in the front end (a correctness bug, not tuning)
+### Phase 1 — a nesting cap in the front end — **done 2026-08-29**
 
-`parser.luc`, `hir_gen.luc`, and the analyzer recurse on nested expressions
-with nothing bounding them. `expression_limit` counts tokens, not depth.
-Deeply nested source therefore crashes the compiler before any of the rest of
-this document becomes relevant. This is Zig's open bug, and Swift's fix is the
-cheap standard one.
+The expression grammar now counts its own depth and refuses past **256**, the
+number Swift's parser and Clang's `-fbracket-depth` use, both from the C++
+standard's recommended minimum limits. `parser.luc:parse_expression` carries
+the counter; `parse_nested_expression` holds the body it used to.
 
-- A depth counter incremented on entry to the recursive expression, type, and
-  pattern productions, and on the matching HIR walkers.
-- Limit **256**, matching Swift, Clang, and C++ Annex B.
-- Fatal, with the limit in the message and a note naming the override, in the
-  shape Clang uses: `nesting deeper than 256; use --max-nesting=N to raise it`.
-- Acceptance: a generated file 10,000 parentheses deep produces that
-  diagnostic and exit 1. Today it faults.
+Measured before the fix: 26,250 nested parentheses took SIGBUS, and 25,000 did
+not — so the crash was real, but it sat a long way past anything a person
+writes, and a long way past what the old tokenizer could reach in a sitting
+(§ below). After: every depth answers with
+`expression nests deeper than 256` and exit 1. Pinned by
+`test_expression_nesting_is_bounded`.
+
+Still open, and deliberately not guessed at: statement and type nesting have
+their own recursions, and `hir_gen`'s walkers have theirs. None of them is
+known to crash — the expression case is the one that was reproduced — so they
+wait for evidence rather than a speculative counter.
 
 ### Phase 2 — derive the frame limit instead of declaring it
 
@@ -214,6 +218,42 @@ nested.luc:1:4210: nesting deeper than 256
 Neither is a crash, both are reproducible, and both are documented numbers
 rather than an emergent property of whichever machine ran the compiler. That
 is the whole of the difference between §1's promise and Zig's open bug.
+
+## 5. The tokenizer was quadratic, and it hid the crash
+
+Found while looking for the Phase 1 crash and worth recording separately,
+because the cause is not recursion at all.
+
+`str` in Stage-0 indexes by character, and indexing walks: `text[i]` costs
+O(i), `for c in text` costs O(n²) over the whole string, and `text[a:b]` costs
+O(a). The tokenizer did all three per character and per token, so it was
+quadratic in file size. `bytes` has none of this — indexing is constant time,
+and `bytes(source)` is one linear pass.
+
+Measured on this machine, checking a file of N simple statements:
+
+| input | before | after |
+| --- | --- | --- |
+| 2,000 statements | 11.3 s | 0.29 s |
+| 8,000 statements | 178.7 s | 0.42 s |
+| 8,000 comment lines | 25.0 s | 0.07 s |
+| 64,000 statements | — | 3.10 s |
+
+The fix, in `tokenizer.luc`: decode `bytes(source)` once into a `list[char]`
+(`decode_utf8`), scan that, and build token text with `text_between` rather
+than slicing the source. Two smaller ones went with it — `len(self.source)`
+hoisted out of the scanning loops, and bracket matching precomputed once in
+`parser.luc:match_brackets` instead of scanned per nesting level.
+
+**This is why the crash looked unreachable.** At the old speed, 26,000 nested
+parentheses took minutes to tokenize, so the stack overflow behind them never
+arrived while anyone was watching. Fixing throughput is what made the
+correctness bug visible — worth remembering the next time something is
+"too slow to test".
+
+The root cause is Stage-0's, not ours, and it bounds self-hosting: our own
+source is ~500 KB, which the old tokenizer would not have finished. Reported
+for 0.27 in `stage0-0.26.md`.
 
 ## 6. Deliberately not doing
 
