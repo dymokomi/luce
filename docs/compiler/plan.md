@@ -167,8 +167,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   one HIR function table, symbol kind, import path, argument checker, and
   `Call` node; lowering performs the sole split into MIR definitions/externs.
   HIR/MIR hosts, Wasm `env` imports, exact exports, QBE ABI extension types,
-  and real libc linkage are covered. Handles, strings, `out`, extern structs
-  and variables, exported structs/enums, and `cfunc` remain on this item.
+  and real libc linkage are covered. Integer-represented nominal handles are
+  also complete: HIR preserves their identity and opacity, while the one MIR
+  lowering erases them to the declared integer representation; real QBE/libc
+  `getpid` execution proves the boundary. Pointer-shaped handles, strings,
+  `out`, extern structs and variables, exported structs/enums, and `cfunc`
+  remain on this item.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.

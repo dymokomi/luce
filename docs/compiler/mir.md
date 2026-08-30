@@ -490,6 +490,14 @@ identity to either a MIR `FunctionId` or `ExternId`; Wasm then chooses its
 `env` namespace and QBE/native interprets the same extern name as a linker
 symbol. Neither namespace nor ABI byte placement appears before a backend.
 
+An integer-represented `extern type` is nominal in HIR and therefore cannot
+be constructed from, converted to, or used as its backing integer. The
+lowerer's ordinary type mapping is the single erasure point: it maps the
+handle to the declared canonical MIR integer type. From there calls and
+comparisons need no handle-specific MIR instruction, and each backend applies
+the same C ABI rules it already applies to that integer width. Pointer-shaped
+handles deliberately wait for explicit pointer/null boundary semantics.
+
 ### Instructions
 
 Every instruction carries a `SourceSpan`. `r` is a register operand; `->

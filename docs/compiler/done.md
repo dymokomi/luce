@@ -14,13 +14,13 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, direct scalar `extern func`/`export c func`, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, and the rich C boundary (handles/strings/out values, extern structs/variables, exported structs/enums, `cfunc`). Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`) | Functions, calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, tuples, optionals with `else`, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access and field assignment, `match` (statement and expression, exhaustive), restricted module constants, type aliases, direct scalar `extern func`/`export c func` and nominal integer-represented extern handles, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closures, interfaces, generics, executable `try for`, lists/maps/sets, formatted strings, and the remaining rich C boundary (pointer handles, strings/out values, extern structs/variables, exported structs/enums, `cfunc`). Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes everything HIR generation produces. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
-| Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, direct scalar C imports/exports, `print` of a value. |
+| Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, calls, constants, tuples, optionals, `str`/`bytes` values and equality, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, field places, direct scalar C imports/exports and integer-represented handles, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Everything the lowerer emits, with spec semantics (checked arithmetic, floor division, trapping shifts), WASI preview 1 host contract, scalar C symbols as `env` imports/exact exports, shadow stack with overflow guard, `memory.copy` for aggregates. Executed under `wasmtime` in tests. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | Direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, memory and aggregate operations, QBE C ABI extension types, exact C symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 405 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 413 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -61,6 +61,13 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   and conflicting signatures fail before a backend. Both semantic oracles
   use explicit hosts, Wasm alone chooses the `env` namespace, and QBE links
   libc while preserving exact exports and narrow signedness at its ABI edge.
+- [x] **Integer extern handles stay nominal until MIR** (2026-08-30).
+  `extern type Pid = i32` has a distinct HIR `TypeId`, module visibility, and
+  retained documentation. Literals and arithmetic cannot forge or inspect a
+  handle; equality and ordinary calls use the existing typed HIR paths. The
+  lowerer performs the sole erasure to its declared integer representation,
+  after which unchanged canonical MIR feeds explicit MIR hosts, Wasm `env`
+  imports, and QBE. A real libc `getpid` fixture compiles, links, and executes.
 - [x] Lowerer 3a–3c: scalars and locals, control flow, calls/parameters/constants.
 - [x] Wasm backend for everything the lowerer emits; WASI host contract; executed under `wasmtime` in `tests/wasm_test.sh`.
 - [x] Native rung 0 proved direct image writing for the original slice; removed

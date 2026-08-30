@@ -81,7 +81,8 @@ examples and tests link back here rather than restating it.
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
-  `defer`, recoverable `Error` values with `try`/`catch`, loops, and returns.
+  `defer`, recoverable `Error` values with `try`/`catch`, nominal
+  integer-represented C handles, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,
@@ -93,7 +94,8 @@ examples and tests link back here rather than restating it.
   constants, tuples, optionals, integer ranges and `for`, structs (including
   custom initialization), enums and `match`, methods, lexical `defer`,
   caller-owned failure propagation and recovery, `str`/`bytes` values with
-  equality, direct scalar C imports/exports, and `print` of a literal or a `str` value — is lowered to canonical
+  equality, direct scalar C imports/exports with nominal integer handles, and
+  `print` of a literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
   The complete differential corpus is compiled, linked, and executed through
   QBE 1.3 as both the native oracle and the product native path. QBE IL and
