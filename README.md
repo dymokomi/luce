@@ -75,8 +75,8 @@ examples and tests link back here rather than restating it.
   currently executable language slice includes functions, calls, parameter
   defaults, bindings, assignment, scalars, strings, tuples, optionals,
   structs and enums with methods and `mutating`, exhaustive `match`,
-  constants, type aliases,
-  conditionals, loops, and returns.
+  constants, type aliases, conditionals, integer ranges and `for`, lexical
+  `defer`, loops, and returns.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,
@@ -85,8 +85,9 @@ examples and tests link back here rather than restating it.
   and has a verifier and its own interpreter covering every instruction.
 - The compiled slice — every scalar type with checked arithmetic, locals,
   every operator, `if`/`while`, functions and calls across modules, module
-  constants, tuples, optionals, structs, enums and `match`, methods, `str`/`bytes` values
-  with equality, and `print` of a literal or a `str` value — is lowered to
+  constants, tuples, optionals, integer ranges and `for`, structs, enums and
+  `match`, methods, lexical `defer`, `str`/`bytes` values with equality, and
+  `print` of a literal or a `str` value — is lowered to
   canonical MIR and
   encoded as WebAssembly (executed under `wasmtime` in the tests). The ARM64
   Mach-O and x86-64 ELF writers still cover only the original slice (checked

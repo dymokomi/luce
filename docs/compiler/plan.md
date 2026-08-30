@@ -78,7 +78,8 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
-- [ ] **`defer`, `try`/`catch`, `Error`**: failure-as-data ABI, `defer` duplicated onto every exit, `catch` forms; custom struct `init` rides on this.
+- [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
+- [ ] **`try`/`catch`, `Error`**: failure-as-data ABI and catch forms; error propagation runs active `defer`s; custom struct `init` rides on this.
 - [ ] **`extern` import/export** with wasm namespaces (`kino`/`lucia` imports, `lucia_alloc`/`lucia_main` exports); C signatures verified by the MIR verifier.
 - [ ] **Dead-function reachability pass** on MIR from the entry and exports (small; smaller artifacts; the first "never compile what isn't reached" step).
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over linear memory, `write`, `trap`, string/bytes primitives; through the MIR interpreter's stub runtime first, then compiled.

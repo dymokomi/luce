@@ -686,6 +686,105 @@ expect 0 "8" wasmtime run --invoke ranges.controlled "$test_dir/ranges.wasm"
 expect 0 "255" wasmtime run --invoke ranges.maximum "$test_dir/ranges.wasm"
 expect 0 "19" wasmtime run --invoke ranges.passed "$test_dir/ranges.wasm"
 
+# `defer` uses the same programs as the differential fixtures: captures happen
+# at registration, cleanup is LIFO, and all ordinary scope exits run it.
+cat > "$test_dir/defers.luc" <<'LUCE'
+struct Label:
+    let text: str
+    func show(self): print(self.text)
+func captured() -> str:
+    print("capture")
+    return "saved"
+func show(value: str): print(value)
+pub func captured_lifo() -> i64:
+    var label = Label(text = "before")
+    defer label.show()
+    defer show(captured())
+    defer print("last")
+    label = Label(text = "after")
+    print("body")
+    return 7
+func value() -> i64:
+    print("value")
+    return 9
+pub func return_order() -> i64:
+    defer print("cleanup")
+    return value()
+func inner():
+    defer print("fallthrough")
+func explicit():
+    defer print("unit")
+    return
+enum Choice:
+    yes
+    no
+pub func nested_scopes() -> i64:
+    inner()
+    explicit()
+    defer print("outer")
+    if true:
+        defer print("inner")
+        print("body")
+    match Choice.yes:
+        .yes:
+            defer print("arm")
+            print("match")
+        .no: print("wrong")
+    return 1
+pub func loop_exits() -> i64:
+    defer print("function")
+    var visits = 0
+    for i in 0..<4:
+        defer print("iteration")
+        visits += 1
+        if i == 0: continue
+        if i == 2: break
+    return visits
+pub func while_exits() -> i64:
+    var visits = 0
+    while visits < 4:
+        defer print("while")
+        visits += 1
+        if visits == 1: continue
+        if visits == 3: break
+    return visits
+func pair() -> (i64, i64):
+    defer print("aggregate")
+    return (4, 2)
+pub func aggregate_return() -> i64:
+    let (a, b) = pair()
+    return a * 10 + b
+LUCE
+"$cli" build "$test_dir/defers.wasm" "$test_dir/defers.luc" >/dev/null
+expect 0 "capture
+body
+last
+saved
+before
+7" wasmtime run --invoke defers.captured_lifo "$test_dir/defers.wasm"
+expect 0 "value
+cleanup
+9" wasmtime run --invoke defers.return_order "$test_dir/defers.wasm"
+expect 0 "fallthrough
+unit
+body
+inner
+match
+arm
+outer
+1" wasmtime run --invoke defers.nested_scopes "$test_dir/defers.wasm"
+expect 0 "iteration
+iteration
+iteration
+function
+3" wasmtime run --invoke defers.loop_exits "$test_dir/defers.wasm"
+expect 0 "while
+while
+while
+3" wasmtime run --invoke defers.while_exits "$test_dir/defers.wasm"
+expect 0 "aggregate
+42" wasmtime run --invoke defers.aggregate_return "$test_dir/defers.wasm"
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:
@@ -704,6 +803,9 @@ pub func divide_by_zero() -> i64: return 7 // 0
 pub func minimum_by_minus_one() -> i64: return (-9223372036854775807 - 1) // -1
 pub func shift_too_far() -> i64: return 1 << 64
 pub func shift_negative() -> i64: return 1 >> -1
+pub func defer_trap() -> i64:
+    defer print("must not run")
+    return 1 // 0
 LUCE
 "$cli" build "$test_dir/traps.wasm" "$test_dir/traps.luc" >/dev/null
 for name in i8_overflow u8_underflow u32_overflow i16_negate divide_by_zero minimum_by_minus_one shift_too_far shift_negative; do
@@ -715,6 +817,16 @@ for name in i8_overflow u8_underflow u32_overflow i16_negate divide_by_zero mini
         exit 1
     fi
 done
+
+# An uncatchable trap skips cleanup, so this must fail without printing the
+# deferred line. The exact nonzero status belongs to wasmtime, not Luce.
+set +e
+output=$(wasmtime run --invoke traps.defer_trap "$test_dir/traps.wasm" 2>/dev/null); status=$?
+set -e
+if [ "$status" = 0 ] || [ -n "$output" ]; then
+    echo "wasm: traps.defer_trap exited $status and printed '$output', expected a silent trap" >&2
+    exit 1
+fi
 
 # Checked arithmetic: overflow must trap (wasm `unreachable`), never wrap.
 printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
