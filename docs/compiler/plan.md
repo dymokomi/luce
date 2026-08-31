@@ -317,6 +317,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   safe wrapper does not transfer authority. The target-neutral address token
   erases to canonical MIR `Ptr` only in the shared lowerer. Typed native
   operations and the sealed arena capability remain the next slice.
+- [x] **Lower the first typed native operations through the shared MIR path**
+  (2026-08-30). `native.load`, `native.store` and `native.advance` are
+  compiler-known HIR forms admitted only by native authority. Their checker
+  preserves source evaluation order, pointee identity and pointer mutability;
+  immutable stores, labels, wrong arity and non-pointer operands fail before
+  lowering. They become the existing canonical `Load`, `Store` and
+  `ElementAddress` instructions, so all backends consume one representation
+  and choose layout only at their existing boundary. Typed bulk copy, checked
+  pointer conversion and the sealed arena provider remain pending.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only

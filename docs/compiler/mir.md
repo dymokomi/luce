@@ -319,6 +319,13 @@ the typed operations that consume it retain their structural value type. Thus
 authority checking ends before MIR while layout still begins only in a
 backend.
 
+The first closed operations reuse MIR that already expresses their complete
+meaning: `native.load` becomes typed `Load`, `native.store` becomes typed
+`Store`, and element-count `native.advance` becomes `ElementAddress`. The HIR
+checker proves address mutability before that erasure. No native-operation
+symbol, byte offset or second memory instruction family survives into MIR;
+typed bulk copy and the sealed arena capability will extend this same rule.
+
 Retain and release calls are placed by the lowerer using the ownership facts
 that `SemanticAnalyzer` will attach to HIR (§11.3). Until that analysis
 exists, the lowerer uses the simplest rule that is never wrong — retain on
