@@ -49,6 +49,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   generic-struct conformance and existential dispatch, and the safe lift from
   an infallible implementation to a fallible requirement through both
   semantic oracles, Wasm, and native QBE.
+- `generic_enums.luc` proves inferred, explicit, contextual and
+  representation-distinct enum applications; concrete value/mutating methods,
+  matching, conformance witnesses and existential dispatch; and source-order
+  evaluation of named payloads through both semantic oracles, Wasm, and native
+  QBE.
 - `interfaces.luc` proves existential conversion and dynamic dispatch for
   value and class conformers. Value payload mutation detaches with copy-on-
   write, class payload mutation preserves shared identity, and infallible

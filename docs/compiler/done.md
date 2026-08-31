@@ -14,13 +14,13 @@ Last updated: 2026-08-31 (Stage-0 0.28).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/functions.luc`, `generics/nominals.luc`, `interfaces/values.luc`) | Functions, generic functions with abstract checking, bounded memberwise generic structs with concrete value/mutating method specializations and conformances, interface constraints and memoized concrete callable instances, nominal interface declarations, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, and infallible-to-fallible conformance adapters; direct calls, exact named `func`/`cfunc` values and shared indirect calls; managed closures, classes, collections, failure, control flow, native authority, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: `f16`, assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, generic classes/enums, independently generic methods and custom generic-nominal initializers/type functions, executable `try for`, maps/sets, formatted/triple strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/functions.luc`, `generics/nominals.luc`, `interfaces/values.luc`) | Functions, generic functions with abstract checking, bounded memberwise generic structs/enums with concrete value/mutating method specializations and conformances, interface constraints and memoized concrete callable instances, nominal interface declarations, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, and infallible-to-fallible conformance adapters; direct calls, exact named `func`/`cfunc` values and shared indirect calls; managed closures, classes, collections, failure, control flow, native authority, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: `f16`, assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, generic classes, independently generic methods and custom generic-nominal initializers/type functions, executable `try for`, maps/sets, formatted/triple strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including existential interface storage, dynamic calls and value/class mutation semantics; escaping/nested closures, shared mutable capture cells and weak captures; shared class identity, atomic weak promotion/zeroing, fallible construction cleanup, deterministic deinitialization, and isolated sealed-runtime state. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including nominal interface handles and normalized requirement/conformance metadata, typed function descriptors, closure schemas, mutable cells, nominal strong/weak class handles, payload schemas, and generated ownership helpers with no physical layout; the verifier proves every rule, reachability removes unreachable closed-world functions/resources, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations are fully specialized before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect and interface calls, backend-owned witness descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, and managed-class examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned aggregate/class/interface layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 637 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 642 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -787,6 +787,23 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   adapter resolution transaction, while one shared nominal-application matcher
   removed the prior parallel method-only form switch.
 
+- [x] **Generic enums** (2026-08-31). Case construction infers or accepts
+  concrete application arguments from payloads and context, validates the same
+  nominal bounds and visibility rules as structs, and specializes value and
+  mutating methods plus conformance witnesses into ordinary concrete HIR.
+  Matching, payload binding, equality, ownership analysis, and native-surface
+  containment now consume fully substituted case schemas. Canonical MIR keys
+  enum types by concrete HIR TypeId rather than source declaration, preventing
+  representation-distinct applications such as `Choice[i64]` and
+  `Choice[str]` from aliasing. Struct and enum constructor children now use
+  placed `(field, node)` runs, preserving named-argument evaluation order
+  independently of declaration-order storage. Both semantic oracles, native
+  QBE, Wasm, cross-module and diagnostic matrices, and
+  `examples/generic_enums.luc` agree. The 2,146-line declaration collector and
+  3,930-line function lowerer were reviewed again: the new behavior reused
+  their existing declaration/application and aggregate-lowering transactions;
+  extracting forwarding-only files would weaken rather than clarify ownership.
+
 - [x] **Interfaces and constrained static generics** (2026-08-31). Interface
   declarations retain nominal, generic requirement identities in HIR; explicit
   struct, class, and enum conformances are validated package-wide after every
@@ -801,7 +818,7 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   still ordinary functions, so HIR/MIR oracles, Wasm, native QBE, and
   `examples/constrained_generics.luc` agree without adding interface or target
   concepts to canonical MIR. Existential values are recorded separately below;
-  generic classes/enums, independently generic methods, serialized bodies, and
+  generic classes, independently generic methods, serialized bodies, and
   detailed expansion accounting remain on the generic side.
 
 - [x] **Existential interface values and dynamic witnesses** (2026-08-31).

@@ -582,9 +582,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   conformers, nested ownership, returned existentials, mutation, fallibility
   adaptation, and propagation (`done.md` §2).
 - [ ] **Finish the remaining generic surface.** Memberwise generic structs and
-  their owner-parameterized value/mutating methods and concrete conformances
-  are complete through both oracles and artifact backends (`done.md` §2).
-  Generic classes and enums come next; independently generic methods, custom
+  enums, including their owner-parameterized value/mutating methods and
+  concrete conformances, are complete through both oracles and artifact
+  backends (`done.md` §2). Generic classes come next; independently generic methods, custom
   generic-nominal initializers/type functions, serialized typed bodies,
   package/CLI budget configuration,
   origin/size/time expansion accounting, and path-rich budget diagnostics also
