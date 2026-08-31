@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-30 (Stage-0 0.28).
+Last updated: 2026-08-31 (Stage-0 0.28).
 
 ## Recovery audit of the unpublished native branch
 
@@ -459,9 +459,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   and ownership-retaining `slice[u8]` views are complete through both semantic
   oracles, QBE, and Wasm (`done.md` §2). Immutable `str` now shares that owned
   buffer substrate; escaping concatenation, scalar length and iteration, and
-  deterministic scalar ordering are complete through the same gates. Continue
-  with maps, sets, text/bytes
-  builders, and formatted strings. Structural list equality also waits for a cycle-aware comparison
+  deterministic scalar ordering are complete through the same gates. Ordinary
+  and raw text, character, and byte spellings now pass through one linear,
+  target-independent semantic decoder with the complete escape vocabulary.
+  Triple-quoted values remain paired with the canonical formatter because §4.4
+  makes their indentation trimming formatter-owned; preserving source
+  indentation in HIR would establish the wrong semantics. Continue with maps,
+  sets, text/bytes builders, formatted/triple strings, and the formatter.
+  Structural list equality also waits for a cycle-aware comparison
   context: recursive value/list graphs are already constructible, so an
   acyclic inline element loop would be an incorrect partial implementation.
   The bytes implementation follows §12.6 for both static and dynamic sources:

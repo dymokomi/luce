@@ -31,7 +31,7 @@ column because it does not determine stage-1 completion.
 | Spec | Capability | Frontend | HIR/oracle | MIR/oracle | QBE | Example | First open work |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Class, closure, generic, interface, and test scopes remain with those features. |
-| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | List literals execute; map literals and formatted/prefixed/triple strings remain. |
+| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw text, character, byte escapes, and list literals execute; map, formatted, and formatter-trimmed triple literals remain. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16`, maps/sets, classes, interfaces, generics, hashing, structural list equality, and recursive managed forms beyond the completed list/slice/bytes ownership graph. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Definite initialization for class/custom-construction and future managed places. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Dynamic sequence operations, identity for future shared-reference kinds, and capability-dependent conversions. |
@@ -94,6 +94,7 @@ policy.
 | §12.6/§7 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
 | Literal value, `u64` length, checked `u64` indexing | yes | yes | yes, including bounds trap | `bytes.luc` and calculator/Brainfuck examples | complete |
+| ASCII source, exact `\xNN`, and Unicode-scalar-to-UTF-8 escapes | yes | constants unchanged | yes, plus Wasm | `strings.luc` | complete |
 | Immutable concatenation with fresh owned storage and left-to-right operands | yes | yes | yes, plus Wasm | `bytes.luc` | complete |
 | Equality and unsigned lexicographic ordering | yes | yes | yes, plus Wasm | `bytes.luc` | complete |
 | Half-open O(1) slicing with checked bounds | yes | yes | yes, including traps | `bytes.luc` | complete for bytes |
@@ -107,6 +108,7 @@ HIR keeps the language types and their legal operations distinct.
 | §12.7/§7 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
 | Valid UTF-8 literal, O(1) `byte_count`, O(n) scalar `length()` | yes | yes | yes, plus Wasm | `strings.luc` | complete |
+| Ordinary and raw spellings with complete simple/Unicode escapes | yes | constants unchanged | yes, plus Wasm | `strings.luc` | complete |
 | Immutable concatenation with escaping owned storage | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Unicode scalar iteration with ordinary loop exits | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Exact equality and deterministic scalar-value/prefix ordering | yes | yes | yes, plus Wasm | `strings.luc` | complete |
@@ -145,7 +147,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |
 | `lists.luc` | Shared list identity, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
-| `strings.luc` | Owned UTF-8 concatenation, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
+| `strings.luc` | Raw/escaped text and bytes, owned UTF-8 concatenation, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `language_tour.luc` | Broad 1.0 declaration/control/managed surface | Parser only; each section migrates into focused executable examples as it lands. |
 | `operators_and_literals.luc` | Literal, collection, type, and operator surface | Parser only beyond the already executable scalar subset. |
 | `checkout/` | Multi-module application shape | Parser only until collections/strings are complete. |
