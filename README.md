@@ -80,7 +80,7 @@ examples and tests link back here rather than restating it.
   defaults, bindings, assignment, scalars, strings, checked byte indexing and
   byte-sequence lengths, fixed arrays, reference lists (literals, shared
   identity, length, checked get/set, append, insert, removal, clear, and
-  reserve), tuples, optionals,
+  reserve, plus shallow independent copies), tuples, optionals,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
@@ -102,7 +102,7 @@ examples and tests link back here rather than restating it.
   value arrays with contextual literals, structural equality, copies,
   checked indexing and nested mutable places, plus runtime-backed list
   literals, identity, checked access and shape mutation, aggregate elements,
-  growth, and collection-recursive value shapes on the QBE path, direct
+  growth, shallow copies, and collection-recursive value shapes on the QBE path, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,

@@ -413,8 +413,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
   `list[T]` construction, identity, indexed access, append, insert,
   `remove_at`, clear, reserve, aggregate elements, and growth now execute
-  through HIR, canonical MIR, and QBE (`done.md` §2). Finish `copy`, immutable
-  slicing, iteration-invalidation traps, ARC/reclamation, then maps, sets,
+  through HIR, canonical MIR, and QBE (`done.md` §2). Shallow `copy` with
+  independent collection storage is complete too. Finish immutable slicing,
+  iteration-invalidation traps, ARC/reclamation, then maps, sets,
   strings/bytes builders, and formatted strings. Do not promote the broad
   §12 row until every operation has its own conformance evidence.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.

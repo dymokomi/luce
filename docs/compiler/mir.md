@@ -301,7 +301,7 @@ for Wasm and QBE.
 
 Lists follow the same separation without duplicating the element type on each
 instruction. A `List(T)` register is the semantic handle; `ListCreate`,
-`ListLength`, slot insertion/removal, reservation, clearing, and
+`ListCopy`, `ListLength`, slot insertion/removal, reservation, clearing, and
 `ListElementAddress` derive `T` from that register. Operations that move or
 address elements ask the backend to pass its computed size/alignment to the
 exact composed runtime service. Bounds checking is part of canonical list
@@ -695,6 +695,7 @@ Memcpy(destination, source, type)                       one value of `type`
 MoveElements(destination, source, element_type, count)  overlap-safe typed range move
 AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
 ListCreate()                            -> r: List(T)    T is the result-register type
+ListCopy(value: List(T))                -> r: List(T)    shallow, independent storage
 ListLength(value: List(T))              -> r: u64
 ListAppendSlot(value: List(T))          -> r: Ptr       uninitialized typed slot
 ListInsertSlot(value: List(T), index: u64) -> r: Ptr    checked uninitialized slot
@@ -772,6 +773,7 @@ knows their signatures and bindings.
 AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
   bound private function: (u64 byte_count, u64 byte_align) -> Ptr
 ListCreate() -> List(T)                      typed semantic handle
+ListCopy(List(T)) -> List(T)                 backend supplies size/alignment
 ListLength(List(T)) -> u64
 ListAppendSlot(List(T)) -> Ptr               backend supplies size/alignment
 ListInsertSlot(List(T), u64) -> Ptr           backend checks index <= length
