@@ -411,7 +411,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   canonical request retains `TypeId`/count, backends derive matching physical
   classes, and allocator policy remains compiled Luce. Structural list/slice
   ownership services and managed element destruction are complete too
-  (`done.md` §2). `write`, `trap`, and the remaining string primitives remain.
+  (`done.md` §2). One compiler-owned sealed-runtime descriptor now maps the
+  closed service vocabulary to source identities; callers supply only the
+  resource location, so tests and future installations cannot drift into
+  separate manifests. Product CLI discovery of that resource awaits a
+  Stage-0 host `std.os.executable_path()` capability rather than embedding a
+  checkout-relative path, environment convention, or platform syscall in the
+  compiler. This does not block explicit composition or semantic work.
+  `write`, `trap`, and the remaining string primitives remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
