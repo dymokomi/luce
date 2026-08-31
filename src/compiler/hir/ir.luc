@@ -51,6 +51,7 @@ pub struct HirProgram:
     pub let modules: list[HirModule]
     pub let constants: list[HirConstant]
     pub let structs: list[HirStruct]
+    pub let classes: list[HirClass]
     pub let enums: list[HirEnum]
     pub let extern_types: list[HirExternType]
     pub let extern_variables: list[HirExternVariable]
@@ -110,6 +111,19 @@ pub struct HirStruct:
     ## The custom initializer's function symbol, or none when construction
     ## uses the synthesized memberwise initializer.
     pub let initializer: SymbolId?
+    pub let span: SourceSpan
+
+## One declared identity type. `TypeForm.Class(index)` names it by position
+## here. Fields describe the object payload; allocation and reference counts
+## are semantic operations, never HIR layout.
+pub struct HirClass:
+    pub let module: ModuleId
+    pub let name: str
+    pub let is_public: bool
+    pub let documentation: list[str]
+    pub let fields: list[HirField]
+    pub let initializer: SymbolId
+    pub let deinitializer: SymbolId?
     pub let span: SourceSpan
 
 ## One declared enum: a closed sum of cases. `TypeForm.Enum(index)` names it
@@ -180,6 +194,9 @@ pub struct HirField:
     pub let name: str
     pub let value_type: TypeId
     pub let is_mutable: bool
+    ## A class-only optional reference slot that never owns its referent.
+    ## Struct fields always set this to false.
+    pub let is_weak: bool
     pub let is_public: bool
     pub let documentation: list[str]
     ## `no_node` when the field has no default.
@@ -283,7 +300,7 @@ pub func function_body(function: HirFunction) -> Operands:
         ExportedC(body): return body
         ExternalC(contract): trap("external function has no HIR body")
 
-## The four meaningful receiver protocols. Keeping this as one closed choice
+## The five meaningful receiver protocols. Keeping this as one closed choice
 ## prevents impossible combinations of `has_self`, `is_mutating`, and
 ## `is_initializer` from leaking into later stages.
 pub enum HirReceiverKind:
@@ -291,6 +308,7 @@ pub enum HirReceiverKind:
     value_method
     mutating_method
     initializer
+    deinitializer
 
 ## Which type a member belongs to and how its receiver crosses the call
 ## boundary. Initializers and mutating methods both receive writable storage,
@@ -319,10 +337,12 @@ pub struct HirParameter:
 ## `PrintText`; `print` of any other `str` expression is `PrintValue`, whose
 ## text exists only at run time. `PlaceAssignment` is an assignment through
 ## a mutable root binding (a `var` local, or `self` in a mutating method).
-## Its `steps` are pairs in `extra`: a `place_field_step` plus a resolved
-## field index, or a `place_element_step` plus the NodeId of a checked `u64`
-## index. This one semantic path represents mixed places such as
-## `matrix.rows[i][j]` without preserving source names or syntax.
+## Its `steps` are pairs in `extra`: a value/class field step plus a resolved
+## field index, or an element step plus the NodeId of a checked `u64` index.
+## Class-field steps cross shared identity without requiring a mutable root;
+## weak-field steps expose the same source type but use non-owning storage.
+## This one semantic path represents mixed places such as
+## `model.document.pages[i]` without preserving source names or syntax.
 ## `IfStatement.branches` is a run of triples `(condition, body start, body
 ## count)`; `fallback` is the `else` suite when `has_fallback`.
 ##
@@ -466,6 +486,10 @@ pub let place_element_step: u32 = 1
 ## Index into shared list storage. Unlike an array element step, this mutates
 ## the referenced collection and therefore does not require a mutable binding.
 pub let place_list_element_step: u32 = 2
+## A strong field stored in a class payload.
+pub let place_class_field_step: u32 = 3
+## A non-owning optional class field stored as a weak slot.
+pub let place_weak_field_step: u32 = 4
 
 ## One unary operation with its operand family fixed where needed.
 pub union UnaryOperation:
@@ -536,6 +560,9 @@ pub union TypeForm:
     ## backend chooses layout; no pointer width or byte arithmetic exists here.
     NativePointer(pointee: TypeId, is_mutable: bool)
     Struct(index: i64)
+    ## A nominal shared identity. The table owns fields and lifecycle methods;
+    ## the type itself remains an abstract reference until a backend.
+    Class(index: i64)
     Enum(index: i64)
     Extern(index: i64)
 
@@ -606,6 +633,7 @@ pub func create_empty_hir_program() -> HirProgram:
         types = create_builtin_type_table(),
         symbols = list[HirSymbol](),
         structs = list[HirStruct](),
+        classes = list[HirClass](),
         enums = list[HirEnum](),
         extern_types = list[HirExternType](),
         extern_variables = list[HirExternVariable](),
@@ -742,6 +770,10 @@ pub func type_forms_match(left: TypeForm, right: TypeForm) -> bool:
         Struct(index):
             match right:
                 Struct(other): return index == other
+                else: return false
+        Class(index):
+            match right:
+                Class(other): return index == other
                 else: return false
         Enum(index):
             match right:
@@ -893,6 +925,47 @@ pub class BoxedValue:
     pub init(value: Value):
         self.value = value
 
+## The semantic oracle owns class storage, but only the interpreter knows how
+## to invoke a resolved source deinitializer. This narrow callback keeps that
+## execution policy out of the HIR data model while allowing deterministic
+## host ARC to trigger the language's final-release semantics.
+pub interface ClassFinalizer:
+    func finalize(class_index: i64, fields: list[BoxedValue], run_deinitializer: bool)
+
+## Shared identity behind one interpreted class value. The class index names
+## semantic payload metadata in HirProgram; neither target layout nor an ARC
+## header is represented here. The finalizer runs while fields are still live.
+pub class ClassStorage:
+    pub let class_index: i64
+    pub let fields: list[BoxedValue]
+    ## False only for the borrowed, non-finalizing semantic proxy supplied to
+    ## `deinit`; weak promotion must already observe that identity as dead.
+    pub let is_alive: bool
+    pub var is_initialized: bool
+    let finalizer: ClassFinalizer
+    let calls_finalizer: bool
+
+    pub init(class_index: i64, fields: list[BoxedValue], finalizer: ClassFinalizer, calls_finalizer: bool, is_alive: bool, is_initialized: bool):
+        self.class_index = class_index
+        self.fields = fields
+        self.finalizer = finalizer
+        self.calls_finalizer = calls_finalizer
+        self.is_alive = is_alive
+        self.is_initialized = is_initialized
+
+    deinit:
+        if self.calls_finalizer:
+            self.finalizer.finalize(self.class_index, self.fields, self.is_initialized)
+
+## One non-owning class slot. The host weak edge is an implementation of the
+## HIR oracle only: canonical MIR will retain an abstract weak-slot operation,
+## and each backend/runtime remains responsible for its concrete machinery.
+pub class WeakClassStorage:
+    pub weak var target: ClassStorage?
+
+    pub init(target: ClassStorage?):
+        self.target = target
+
 ## One backing buffer shared by a list and any immutable snapshots captured
 ## from it. A list replaces this buffer before its next write; slices keep the
 ## previous buffer alive without a source-visible lifetime.
@@ -967,6 +1040,11 @@ pub union Value:
     CFunction(symbol: SymbolId)
     ## A struct value: its fields in declaration order.
     Record(fields: list[BoxedValue])
+    ## A shared class identity. Payload fields live in the identity storage so
+    ## every ordinary value copy observes the same mutations.
+    Class(storage: ClassStorage)
+    ## Hidden representation of a source `weak var field: Class?` slot.
+    WeakClass(storage: WeakClassStorage)
     ## An enum value: which case, and its payload in declaration order.
     Variant(case_index: i64, payload: list[BoxedValue])
     Absent
@@ -1008,6 +1086,8 @@ pub union Value:
                     text = text + field.value.render()
                     index += 1
                 return text + "}"
+            Class(storage): return "<class#" + str(storage.class_index) + ">"
+            WeakClass(storage): return "<weak-class>"
             Tuple(elements):
                 var text = "("
                 var index = 0

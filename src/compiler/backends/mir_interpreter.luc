@@ -77,6 +77,10 @@ pub let list_address_base: i64 = 0x3000000
 pub let slice_address_base: i64 = 0x4000000
 ## Opaque immutable buffer owners occupy a fifth disjoint address range.
 pub let buffer_owner_address_base: i64 = 0x5000000
+## Class and weak-slot handles occupy disjoint semantic ranges. These are
+## oracle tokens only; compiled backends choose their own representation.
+pub let class_address_base: i64 = 0x6000000
+pub let weak_class_address_base: i64 = 0x7000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -164,6 +168,36 @@ class MirSlice:
         self.references = 1
         self.is_alive = true
 
+## One semantic class identity. Payload fields use independent typed cells so
+## the oracle tests lifecycle and ownership without choosing a target layout.
+class MirClassObject:
+    let class_index: i64
+    let fields: list[i64]
+    var references: i64
+    var is_initialized: bool
+    var is_alive: bool
+    var is_destroying: bool
+
+    pub init(class_index: i64, fields: list[i64]):
+        self.class_index = class_index
+        self.fields = fields
+        self.references = 1
+        self.is_initialized = false
+        self.is_alive = true
+        self.is_destroying = false
+
+## A separately owned weak slot. Its referent index remains stable after death
+## because oracle storage is append-only; promotion consults `is_alive`.
+class MirWeakClassSlot:
+    let referent: i64
+    var references: i64
+    var is_alive: bool
+
+    pub init(referent: i64):
+        self.referent = referent
+        self.references = 1
+        self.is_alive = true
+
 # One call: its registers and the addresses of its slots.
 class Frame:
     pub let function: MirFunction
@@ -211,6 +245,8 @@ pub class MirInterpreter: MirExternMemory:
     let lists: list[MirList]
     let immutable_buffers: list[MirImmutableBuffer]
     let slices: list[MirSlice]
+    let classes: list[MirClassObject]
+    let weak_classes: list[MirWeakClassSlot]
     var arena_address: i64
     var arena_committed: i64
     var external_host: MirExternHost?
@@ -232,6 +268,8 @@ pub class MirInterpreter: MirExternMemory:
         self.lists = list[MirList]()
         self.immutable_buffers = list[MirImmutableBuffer]()
         self.slices = list[MirSlice]()
+        self.classes = list[MirClassObject]()
+        self.weak_classes = list[MirWeakClassSlot]()
         self.arena_address = 0
         self.arena_committed = 0
         self.external_host = none
@@ -693,6 +731,84 @@ pub class MirInterpreter: MirExternMemory:
                 match storage.backing:
                     List(buffer, start): frame.registers[result.value] = MirValue.Ptr(value = buffer.elements[start + position])
                     Bytes(owner, data): frame.registers[result.value] = MirValue.Ptr(value = data + position)
+            ClassCreate(result, identity):
+                let fields = list[i64]()
+                for field in self.program.classes[identity.value].fields:
+                    fields.append(self.allocate(self.layout.size_of(field.storage_type), self.layout.align_of(field.storage_type)))
+                self.classes.append(MirClassObject(i64(identity.value), fields))
+                frame.registers[result.value] = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
+            ClassMarkInitialized(value):
+                let storage = try self.class_at(frame.registers[value.value], false)
+                storage.is_initialized = true
+            ClassRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.class_at(frame.registers[value.value], false)
+                    storage.references += 1
+            ClassRelease(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.class_at(frame.registers[value.value], false)
+                    if storage.references <= 0: trap("class reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        # Weak promotion observes death before user deinit and
+                        # before payload ownership starts unwinding.
+                        storage.is_alive = false
+                        storage.is_destroying = true
+                        let metadata = self.program.classes[storage.class_index]
+                        discard(try self.call(i64(metadata.destroyer.value), [
+                            frame.registers[value.value],
+                            MirValue.Bool(value = storage.is_initialized),
+                        ]))
+                        storage.is_destroying = false
+            ClassFieldAddress(result, value, field):
+                let storage = try self.class_at(frame.registers[value.value], true)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.fields[field])
+            WeakClassCreate(result, value):
+                # A deinitializer may publish its borrowed dying receiver only
+                # into a weak slot. The runtime control block is still alive
+                # under its implicit weak reference while destruction runs;
+                # promotion will nevertheless observe `is_alive == false`.
+                let referent = try self.class_index_at(frame.registers[value.value], true)
+                self.weak_classes.append(MirWeakClassSlot(referent))
+                frame.registers[result.value] = MirValue.Ptr(value = weak_class_address_base + len(self.weak_classes) - 1)
+            WeakClassRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.weak_class_at(frame.registers[value.value])
+                    storage.references += 1
+            WeakClassRelease(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.weak_class_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("weak class reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0: storage.is_alive = false
+            WeakClassPromote(destination, value, optional_type):
+                let target = ptr_of(frame.registers[destination.value])
+                var referent = -1
+                let weak_address = ptr_of(frame.registers[value.value])
+                if weak_address != 0:
+                    let weak_storage = try self.weak_class_at(frame.registers[value.value])
+                    let class_storage = self.classes[weak_storage.referent]
+                    if class_storage.is_alive: referent = weak_storage.referent
+                let tag_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+                if referent < 0:
+                    self.store(tag_type, target, MirValue.UnsignedInt(value = u64(0)))
+                else:
+                    let class_storage = self.classes[referent]
+                    class_storage.references += 1
+                    self.store(tag_type, target, MirValue.UnsignedInt(value = u64(1)))
+                    var class_type = builtin_mir_type(BuiltinMirType.pointer)
+                    match mir_type(self.program.types, optional_type):
+                        Enum(tag, cases): class_type = cases[1]
+                        else: trap("verified weak promotion has a non-optional type")
+                    self.store(
+                        class_type,
+                        target + self.layout.enum_payload_offset(optional_type),
+                        MirValue.Ptr(value = class_address_base + referent),
+                    )
             DataAddress(result, data):
                 frame.registers[result.value] = MirValue.Ptr(value = self.data_addresses[data.value])
             GlobalAddress(result, global):
@@ -767,6 +883,24 @@ pub class MirInterpreter: MirExternMemory:
         if index < 0 or index >= len(self.slices): error("mir interpreter: trap: invalid slice handle")
         let storage = self.slices[index]
         if not storage.is_alive: error("mir interpreter: trap: released slice handle")
+        return storage
+
+    func class_index_at(value: MirValue, allow_destroying: bool) -> i64!:
+        let index = ptr_of(value) - class_address_base
+        if index < 0 or index >= len(self.classes): error("mir interpreter: trap: invalid class handle")
+        let storage = self.classes[index]
+        if not storage.is_alive and not (allow_destroying and storage.is_destroying):
+            error("mir interpreter: trap: released class handle " + str(index) + " (class " + str(storage.class_index) + ")")
+        return index
+
+    func class_at(value: MirValue, allow_destroying: bool) -> MirClassObject!:
+        return self.classes[try self.class_index_at(value, allow_destroying)]
+
+    func weak_class_at(value: MirValue) -> MirWeakClassSlot!:
+        let index = ptr_of(value) - weak_class_address_base
+        if index < 0 or index >= len(self.weak_classes): error("mir interpreter: trap: invalid weak class handle")
+        let storage = self.weak_classes[index]
+        if not storage.is_alive: error("mir interpreter: trap: released weak class handle")
         return storage
 
     func immutable_buffer_at(owner: i64) -> MirImmutableBuffer!:

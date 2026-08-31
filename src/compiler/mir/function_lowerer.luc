@@ -15,7 +15,7 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, FunctionId, GlobalId
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ClassId, DataId, FunctionId, GlobalId
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
@@ -23,14 +23,21 @@ from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_min
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 import compiler.hir.ir
 from compiler.mir.verifier import terminates
 from compiler.frontend.source import SourceSpan
 import std.strings
 from compiler.mir.lowering_model import CExternContract, CExternSlot, COutputSlot, CWrapper, DeferredAction, ExternalGlobalContract
-from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, LoweredFunction, MatchExit, MirLoweringState
+from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, LoweredFunction, MatchExit, MirLoweringState, contains_symbol
 from compiler.mir.lowering_model import OwnershipHelper, RecoverTarget, Region
+
+## The non-owning result of adapting a source `Class?` for a weak sink. Presence
+## is kept separately from the weak handle because a dying `self` is already
+## unreachable by promotion even while the optional expression is `.some`.
+struct WeakClassSource:
+    let is_present: RegisterId
+    let value: RegisterId
 
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
@@ -161,11 +168,51 @@ pub class FunctionLowerer:
             span = span,
         )
 
+    ## Final-release callback for one class identity. Runtime weak zeroing has
+    ## already happened when this begins. A completed object runs its source
+    ## deinitializer with a borrowed receiver, then payload ownership unwinds
+    ## in reverse declaration order; a failed initializer skips only deinit.
+    pub func lower_class_destroyer(class_index: i64, identity: FunctionId) -> MirFunction:
+        self.begin_function()
+        let class_value = self.state.program.classes[class_index]
+        let class_type = TypeId(value = self.state.lowered_class_types[class_index])
+        let instance = self.state.new_register(class_type)
+        let initialized = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        let body = list[MirInstruction]()
+        let deinitializer = class_value.deinitializer
+        if deinitializer != none:
+            self.open_if(initialized, list[RegisterId](), class_value.span, body)
+            let target = self.state.function_index_of(deinitializer)
+            if target < 0: trap("class deinitializer has no source function identity")
+            self.emit_call(target, list[RegisterId](), [instance], class_value.span, body)
+            self.emit_end(class_value.span, body)
+        let fields = self.state.classes[class_index].fields
+        var field_index = len(fields) - 1
+        while field_index >= 0:
+            let address = self.class_field_address(instance, field_index, class_value.span, body)
+            self.emit_ownership_at(fields[field_index].storage_type, address, false, class_value.span, body)
+            field_index -= 1
+        body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = class_value.span))
+        return MirFunction(
+            name = ".luce_destroy_class" + str(class_index) + "_f" + str(identity.value),
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = [class_type, builtin_mir_type(BuiltinMirType.boolean)], results = list[TypeId](), is_fallible = false),
+            registers = self.state.registers,
+            slots = self.state.slots,
+            body = body,
+            operands = self.state.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = class_value.span,
+        )
+
     func type_needs_ownership(value_type: TypeId) -> bool:
         match mir_type(self.state.types, value_type):
             BufferOwner: return true
             List(element): return true
             Slice(element): return true
+            Class(identity): return true
+            WeakClass(identity): return true
             Struct(fields):
                 for field in fields:
                     if self.type_needs_ownership(field.value_type): return true
@@ -202,6 +249,12 @@ pub class FunctionLowerer:
             Slice(element):
                 if retaining: body.append(MirInstruction(form = InstructionForm.SliceRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.SliceRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
+            Class(identity):
+                if retaining: body.append(MirInstruction(form = InstructionForm.ClassRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.ClassRelease(value = value), span = span))
+            WeakClass(identity):
+                if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
             else: trap("managed scalar has no ownership operation")
 
     # Every managed expression result owns one structural reference. A value
@@ -262,6 +315,14 @@ pub class FunctionLowerer:
                 else:
                     let element_release = self.ownership_helper_for(element).release
                     body.append(MirInstruction(form = InstructionForm.SliceRelease(value = value, element_release = element_release), span = span))
+            Class(identity):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining: body.append(MirInstruction(form = InstructionForm.ClassRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.ClassRelease(value = value), span = span))
+            WeakClass(identity):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
             Struct(fields):
                 if retaining:
                     for index in range(0, len(fields)):
@@ -298,6 +359,8 @@ pub class FunctionLowerer:
             BufferOwner: self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             List(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Slice(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Class(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            WeakClass(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Struct(fields):
                 for index in range(0, len(fields)):
                     let field = fields[index]
@@ -681,9 +744,18 @@ pub class FunctionLowerer:
                 let value_type = self.state.globals[global_index].value_type
                 try self.lower_store(module, function, span, value_type, address, operation, value, body)
             PlaceAssignment(symbol, steps, operation, value):
-                try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol), self.state.program.symbols[symbol.value].value_type, steps, operation, value, body)
+                let root_type = self.state.program.symbols[symbol.value].value_type
+                let parameter = self.parameter_value(symbol)
+                var root_is_class = false
+                match self.state.program.types.definitions[root_type.value].form:
+                    Class(index): root_is_class = true
+                    else: pass
+                if root_is_class and parameter != none:
+                    try self.lower_place_store(module, function, span, parameter, true, root_type, steps, operation, value, body)
+                else:
+                    try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol), false, root_type, steps, operation, value, body)
             GlobalPlaceAssignment(global, steps, operation, value):
-                try self.lower_place_store(module, function, span, self.global_address(global, span, body), self.state.program.globals[global].value_type, steps, operation, value, body)
+                try self.lower_place_store(module, function, span, self.global_address(global, span, body), false, self.state.program.globals[global].value_type, steps, operation, value, body)
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
             IfStatement(branches, has_fallback, fallback):
@@ -705,9 +777,10 @@ pub class FunctionLowerer:
 
     # Walk one resolved target-neutral field/element path from either a local
     # slot or sealed-runtime global, then perform the shared store protocol.
-    func lower_place_store(module: HirModule, function: HirFunction, span: SourceSpan, root_address: RegisterId, root_type: ir.TypeId, steps: Operands, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
-        var address = root_address
+    func lower_place_store(module: HirModule, function: HirFunction, span: SourceSpan, root: RegisterId, root_is_value: bool, root_type: ir.TypeId, steps: Operands, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
+        var address = root
         var place_type = root_type
+        var weak_storage: TypeId? = none
         for position in range(0, i64(steps.count) // 2):
             let kind = u32(entry_at(self.state.program, steps, position * 2))
             let payload = entry_at(self.state.program, steps, position * 2 + 1)
@@ -739,9 +812,113 @@ pub class FunctionLowerer:
                 address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = index, element_retain = self.ownership_helper_for(mir_element).retain), span = span))
                 place_type = element_type
+            elif kind == place_class_field_step or kind == place_weak_field_step:
+                var class_index = -1
+                match self.state.program.types.definitions[place_type.value].form:
+                    Class(index): class_index = index
+                    else: trap("class-field assignment step has a non-class HIR type")
+                let class_type = try self.state.mir_type_of(module, function, span, place_type)
+                var instance = root
+                if not (root_is_value and position == 0): instance = self.load_value(class_type, address, span, body)
+                address = self.class_field_address(instance, payload, span, body)
+                place_type = self.state.program.classes[class_index].fields[payload].value_type
+                if kind == place_weak_field_step:
+                    weak_storage = self.state.classes[class_index].fields[payload].storage_type
             else: trap("place assignment has an unknown step")
+        if weak_storage != none:
+            match operation:
+                Replace: pass
+                Combine(binary): trap("weak class field has a compound assignment")
+            try self.lower_weak_store(module, function, span, weak_storage, address, value, body)
+            return
         let value_type = try self.state.mir_type_of(module, function, span, place_type)
         try self.lower_store(module, function, span, value_type, address, operation, value, body)
+
+    # mark: Weak fields ========================================================================
+
+    ## Replace one weak payload slot from its source-visible optional class.
+    ## This sink lowers the optional directly to a weak handle: constructing an
+    ## owning `Class?` first would retain a destruction-time borrowed `self` and
+    ## resurrect an identity whose strong count has already reached zero.
+    func lower_weak_store(module: HirModule, function: HirFunction, span: SourceSpan, storage_type: TypeId, address: RegisterId, value: NodeId, body: list[MirInstruction]) -> !:
+        let source = try self.lower_class_source_as_weak(module, function, span, storage_type, value, body)
+        self.emit_ownership_call(storage_type, address, false, span, body)
+        self.store_value(storage_type, address, source.value, span, body)
+
+    ## Adapt either `Class` or `Class?` to one weak +1 while preserving source
+    ## optional presence. Keeping one recursive walk for both types is what lets
+    ## conditionals and `else` compose without duplicating control-flow or
+    ## constructing an owning wrapper around a borrowed dying receiver.
+    func lower_class_source_as_weak(module: HirModule, function: HirFunction, span: SourceSpan, storage_type: TypeId, value: NodeId, body: list[MirInstruction]) -> WeakClassSource!:
+        match node_form(self.state.program, value):
+            NoneLiteral:
+                return WeakClassSource(
+                    is_present = self.bool_constant(false, span, body),
+                    value = self.typed_null_constant(storage_type, span, body),
+                )
+            Some(inner):
+                return try self.lower_class_source_as_weak(module, function, span, storage_type, inner, body)
+            Conditional(selected, condition, alternative):
+                let condition_start = len(self.state.defers)
+                let tested = try self.lower_expression(module, function, condition, body)
+                try self.emit_temporaries_from(condition_start, body)
+                let result_present = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                let result_value = self.state.new_register(storage_type)
+                self.open_if(tested, [result_present, result_value], span, body)
+                let selected_start = len(self.state.defers)
+                let chosen = try self.lower_class_source_as_weak(module, function, span, storage_type, selected, body)
+                try self.emit_temporaries_from(selected_start, body)
+                self.emit_weak_source_yield(chosen, span, body)
+                self.emit_else(span, body)
+                let alternative_start = len(self.state.defers)
+                let fallback = try self.lower_class_source_as_weak(module, function, span, storage_type, alternative, body)
+                try self.emit_temporaries_from(alternative_start, body)
+                self.emit_weak_source_yield(fallback, span, body)
+                self.emit_end(span, body)
+                return WeakClassSource(is_present = result_present, value = result_value)
+            ElseFallback(optional, arm):
+                let optional_start = len(self.state.defers)
+                let source = try self.lower_class_source_as_weak(module, function, span, storage_type, optional, body)
+                try self.emit_temporaries_from(optional_start, body)
+                let result = self.state.new_register(storage_type)
+                self.open_if(source.is_present, [result], span, body)
+                self.emit_yield(source.value, span, body)
+                self.emit_else(span, body)
+                let fallback_start = len(self.state.defers)
+                let fallback = try self.lower_class_source_as_weak(module, function, span, storage_type, arm, body)
+                try self.emit_temporaries_from(fallback_start, body)
+                self.emit_yield(fallback.value, span, body)
+                self.emit_end(span, body)
+                return WeakClassSource(is_present = self.bool_constant(true, span, body), value = result)
+            else:
+                match self.state.program.types.definitions[node_type(self.state.program, value).value].form:
+                    Class(class_index):
+                        let referent = try self.lower_expression(module, function, value, body)
+                        let created = self.state.new_register(storage_type)
+                        body.append(MirInstruction(form = InstructionForm.WeakClassCreate(result = created, value = referent), span = span))
+                        return WeakClassSource(is_present = self.bool_constant(true, span, body), value = created)
+                    Optional(inner):
+                        let optional = try self.lower_expression(module, function, value, body)
+                        let present = self.load_present(optional, span, body)
+                        let weak_value = self.state.new_register(storage_type)
+                        self.open_if(present, [weak_value], span, body)
+                        let optional_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                        var class_type = builtin_mir_type(BuiltinMirType.pointer)
+                        match mir_type(self.state.types, optional_type):
+                            Enum(tag, cases): class_type = cases[1]
+                            else: trap("weak field source is not an optional MIR value")
+                        let referent = self.load_value(class_type, self.payload_address(optional_type, optional, span, body), span, body)
+                        let created = self.state.new_register(storage_type)
+                        body.append(MirInstruction(form = InstructionForm.WeakClassCreate(result = created, value = referent), span = span))
+                        self.emit_yield(created, span, body)
+                        self.emit_else(span, body)
+                        self.emit_yield(self.typed_null_constant(storage_type, span, body), span, body)
+                        self.emit_end(span, body)
+                        return WeakClassSource(is_present = present, value = weak_value)
+                    else: trap("weak field source is neither a class nor an optional class")
+
+    func emit_weak_source_yield(source: WeakClassSource, span: SourceSpan, body: list[MirInstruction]):
+        body.append(MirInstruction(form = InstructionForm.Yield(values = self.state.operands.run([source.is_present, source.value])), span = span))
 
     # Store a value, or combine it with what the place holds, at an address.
     func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
@@ -765,10 +942,16 @@ pub class FunctionLowerer:
         let local = try self.state.local_of(module, function, span, symbol)
         return local.address
 
+    func parameter_value(symbol: SymbolId) -> RegisterId?:
+        for parameter in self.state.parameters:
+            if parameter.symbol == symbol.value: return parameter.address
+        return none
+
     # The HIR type of field `field` of a struct-typed HIR value.
     func hir_field_type(value_type: ir.TypeId, field: i64) -> ir.TypeId:
         match self.state.program.types.definitions[value_type.value].form:
             Struct(index): return self.state.program.structs[index].fields[field].value_type
+            Class(index): return self.state.program.classes[index].fields[field].value_type
             Error:
                 if field == 0: return resolve_builtin_type(BuiltinType.error_code)
                 if field == 1: return resolve_builtin_type(BuiltinType.string)
@@ -1146,10 +1329,21 @@ pub class FunctionLowerer:
         let span = node_span(self.state.program, expression)
         let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
         if not self.type_needs_ownership(value_type): return value
+        # A proven destruction-time receiver is a borrowed capability over an
+        # object whose strong count has already reached zero. Retaining or
+        # scheduling a release for that exact reference would resurrect or
+        # over-release it. Values read from its fields keep ordinary ownership.
+        if self.is_borrowed_self(function, expression): return value
         if self.expression_borrows_ownership(expression):
             self.emit_value_ownership(value_type, value, true, span, body)
         self.remember_owned_value(value, value_type, span)
         return value
+
+    func is_borrowed_self(function: HirFunction, expression: NodeId) -> bool:
+        if not contains_symbol(self.state.borrowed_receiver_methods, function.symbol): return false
+        match node_form(self.state.program, expression):
+            Reference(symbol): return len(function.parameters) > 0 and symbol.value == function.parameters[0].symbol.value
+            else: return false
 
     func expression_borrows_ownership(expression: NodeId) -> bool:
         match node_form(self.state.program, expression):
@@ -1159,7 +1353,12 @@ pub class FunctionLowerer:
             NativeLoad(pointer): return true
             SequenceIndex(value, index): return true
             Element(value, index): return true
-            FieldAccess(value, field): return true
+            FieldAccess(value, field): return not self.is_weak_field_access(value, field)
+            else: return false
+
+    func is_weak_field_access(value: NodeId, field: i64) -> bool:
+        match self.state.program.types.definitions[node_type(self.state.program, value).value].form:
+            Class(index): return self.state.program.classes[index].fields[field].is_weak
             else: return false
 
     # Operands are lowered left to right, so `2 + 3` defines the register for
@@ -1710,9 +1909,21 @@ pub class FunctionLowerer:
                 return temp
             FieldAccess(record, field_index):
                 let base = try self.lower_expression(module, function, record, body)
-                let struct_type = try self.state.mir_type_of(module, function, node_span(self.state.program, record), node_type(self.state.program, record))
-                let field = self.field_address(struct_type, base, field_index, span, body)
-                return self.load_value(value_type, field, span, body)
+                match self.state.program.types.definitions[node_type(self.state.program, record).value].form:
+                    Class(class_index):
+                        let field = self.class_field_address(base, field_index, span, body)
+                        let metadata = self.state.program.classes[class_index].fields[field_index]
+                        if metadata.is_weak:
+                            let weak_type = self.state.classes[class_index].fields[field_index].storage_type
+                            let weak_value = self.load_value(weak_type, field, span, body)
+                            let promoted = self.new_temp(value_type, span, body)
+                            body.append(MirInstruction(form = InstructionForm.WeakClassPromote(destination = promoted, value = weak_value, optional_type = value_type), span = span))
+                            return promoted
+                        return self.load_value(value_type, field, span, body)
+                    else:
+                        let struct_type = try self.state.mir_type_of(module, function, node_span(self.state.program, record), node_type(self.state.program, record))
+                        let field = self.field_address(struct_type, base, field_index, span, body)
+                        return self.load_value(value_type, field, span, body)
             NoneLiteral:
                 let temp = self.new_temp(value_type, span, body)
                 self.store_tag(temp, 0, span, body)
@@ -2117,6 +2328,28 @@ pub class FunctionLowerer:
             try self.state.fail_unsupported(module, function, span, "an Initialize node naming a non-initializer")
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         let value_type = try self.state.mir_type_of(module, function, span, receiver.owner)
+        var class_index = -1
+        match self.state.program.types.definitions[receiver.owner.value].form:
+            Class(index): class_index = index
+            else: pass
+        if class_index >= 0:
+            let value = self.state.new_register(value_type)
+            body.append(MirInstruction(form = InstructionForm.ClassCreate(result = value, identity = ClassId(value = u32(class_index))), span = span))
+            self.initialize_class_payload(class_index, value, span, body)
+            placed[0] = value
+            let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+            let error_temp = self.new_temp(error_type, span, body)
+            let call_arguments = [error_temp]
+            for argument in placed: call_arguments.append(argument)
+            let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            self.emit_call(target, [reported_error], call_arguments, span, body)
+            let failed = self.error_is_present(reported_error, span, body)
+            self.open_if(failed, list[RegisterId](), span, body)
+            body.append(MirInstruction(form = InstructionForm.ClassRelease(value = value), span = span))
+            self.emit_else(span, body)
+            body.append(MirInstruction(form = InstructionForm.ClassMarkInitialized(value = value), span = span))
+            self.emit_end(span, body)
+            return FallibleResult(value = value, error_value = reported_error)
         let value = self.new_temp(value_type, span, body)
         self.initialize_ownership_at(value_type, value, span, body)
         placed[0] = value
@@ -2278,11 +2511,28 @@ pub class FunctionLowerer:
             try self.state.fail_unsupported(module, function, span, "an Initialize node naming a non-initializer")
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         let value_type = try self.state.mir_type_of(module, function, span, receiver.owner)
+        match self.state.program.types.definitions[receiver.owner.value].form:
+            Class(class_index):
+                let value = self.state.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.ClassCreate(result = value, identity = ClassId(value = u32(class_index))), span = span))
+                self.initialize_class_payload(class_index, value, span, body)
+                placed[0] = value
+                self.emit_call(target, list[RegisterId](), placed, span, body)
+                body.append(MirInstruction(form = InstructionForm.ClassMarkInitialized(value = value), span = span))
+                return value
+            else: pass
         let value = self.new_temp(value_type, span, body)
         self.initialize_ownership_at(value_type, value, span, body)
         placed[0] = value
         self.emit_call(target, list[RegisterId](), placed, span, body)
         return value
+
+    func initialize_class_payload(class_index: i64, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        let fields = self.state.classes[class_index].fields
+        for field_index in range(0, len(fields)):
+            let field_type = fields[field_index].storage_type
+            if self.type_needs_ownership(field_type):
+                self.initialize_ownership_at(field_type, self.class_field_address(value, field_index, span, body), span, body)
 
     # The sole HIR-call → MIR-call split. Argument and result placement is
     # shared; only the identity space changes at the canonical MIR boundary.
@@ -2785,6 +3035,11 @@ pub class FunctionLowerer:
     func field_address(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
         let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.FieldAddress(result = address, struct_type = struct_type, base = base, field = field), span = span))
+        return address
+
+    func class_field_address(value: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ClassFieldAddress(result = address, value = value, field = field), span = span))
         return address
 
     func element_address(element_type: TypeId, base: RegisterId, index: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:

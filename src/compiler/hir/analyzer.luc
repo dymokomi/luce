@@ -12,13 +12,17 @@
 #==============================================================================================
 
 from compiler.hir.ir import BinaryOperation, HirFunction, HirProgram, HirReceiverKind
-from compiler.hir.ir import NodeId, Operands, SymbolId, TypeId, entry_at, function_body, no_node, node_at, node_form, node_span
-from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
+from compiler.hir.ir import NodeId, Operands, SymbolId, TypeId, entry_at, function_body, no_node, node_at, node_form, node_span, types_match
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 from compiler.frontend.source import SourceSpan, format_diagnostic
 
 ## Typed HIR that has crossed whole-program semantic analysis.
 pub struct AnalyzedProgram:
     pub let hir: HirProgram
+    ## Functions whose first parameter may receive a class identity after its
+    ## strong count reaches zero. Whole-program analysis proves that the exact
+    ## receiver never escapes through any transitive same-class method call.
+    pub let borrowed_receiver_methods: list[SymbolId]
 
 # The three-point lattice needed at a branch join. `maybe_initialized` means
 # some continuing paths wrote the field and others did not; neither another
@@ -48,28 +52,39 @@ pub class SemanticAnalyzer:
     var function: HirFunction?
     var self_symbol: SymbolId
     var field_names: list[str]
+    let borrowed_receiver_methods: list[SymbolId]
+    let active_borrowed_receiver_methods: list[SymbolId]
 
     pub init(program: HirProgram):
         self.program = program
         self.function = none
         self.self_symbol = SymbolId(value = no_node)
         self.field_names = list[str]()
+        self.borrowed_receiver_methods = list[SymbolId]()
+        self.active_borrowed_receiver_methods = list[SymbolId]()
 
     # mark: Analysis ===========================================================================
 
     pub func analyze() -> AnalyzedProgram!:
         for function in self.program.functions:
             let receiver = function.receiver
-            if receiver == none or receiver.kind != HirReceiverKind.initializer: continue
-            try self.analyze_initializer(function, receiver.owner)
-        return AnalyzedProgram(hir = self.program)
+            if receiver == none: continue
+            if receiver.kind == HirReceiverKind.initializer:
+                try self.analyze_initializer(function, receiver.owner)
+            elif receiver.kind == HirReceiverKind.deinitializer:
+                try self.analyze_deinitializer(function)
+        return AnalyzedProgram(hir = self.program, borrowed_receiver_methods = self.borrowed_receiver_methods)
 
     func analyze_initializer(function: HirFunction, owner: TypeId) -> !:
-        let struct_index = self.struct_index(owner)
         self.function = function
         self.self_symbol = function.parameters[0].symbol
         self.field_names = list[str]()
-        for field in self.program.structs[struct_index].fields: self.field_names.append(field.name)
+        match self.program.types.definitions[owner.value].form:
+            Struct(index):
+                for field in self.program.structs[index].fields: self.field_names.append(field.name)
+            Class(index):
+                for field in self.program.classes[index].fields: self.field_names.append(field.name)
+            else: trap("initializer receiver is not a struct or class")
 
         let initial = InitializationState(len(self.field_names))
         let flow = try self.analyze_suite(function_body(function), initial, false, false)
@@ -101,6 +116,9 @@ pub class SemanticAnalyzer:
             Assignment(symbol, operation, value):
                 if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
                 return continuing
+            GlobalStore(global, operation, value):
+                if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
+                return continuing
             ExternStore(variable, operation, value):
                 if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
                 return continuing
@@ -108,7 +126,8 @@ pub class SemanticAnalyzer:
                 if not try self.analyze_place_indices(steps, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
                 if not try self.analyze_expression(value, state, may_repeat): return InitializationFlow(normal = none, recovered = none)
                 if symbol.value != self.self_symbol.value: return continuing
-                if steps.count != 2 or u32(entry_at(self.program, steps, 0)) != place_field_step:
+                let first_step = u32(entry_at(self.program, steps, 0))
+                if steps.count != 2 or (first_step != place_field_step and first_step != place_class_field_step and first_step != place_weak_field_step):
                     try self.fail(statement, "an initializer assigns stored fields directly through `self`")
                 let field = entry_at(self.program, steps, 1)
                 if may_repeat:
@@ -212,11 +231,47 @@ pub class SemanticAnalyzer:
         match node_form(self.program, value):
             Reference(symbol):
                 if symbol.value == self.self_symbol.value: try self.require_complete(state, node_span(self.program, value))
+            NativeLoad(inner): return try self.analyze_expression(inner, state, may_repeat)
+            NativeRebind(inner): return try self.analyze_expression(inner, state, may_repeat)
+            NativeIsNull(inner): return try self.analyze_expression(inner, state, may_repeat)
+            NumericConvert(inner): return try self.analyze_expression(inner, state, may_repeat)
             Discard(inner): return try self.analyze_expression(inner, state, may_repeat)
+            StringScalarCount(inner): return try self.analyze_expression(inner, state, may_repeat)
             SequenceLength(inner): return try self.analyze_expression(inner, state, may_repeat)
+            ListCopy(inner): return try self.analyze_expression(inner, state, may_repeat)
+            ListClear(inner): return try self.analyze_expression(inner, state, may_repeat)
+            NativeStore(pointer, stored):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(stored, state, may_repeat)
+            NativeAdvance(pointer, stored):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(stored, state, may_repeat)
+            ListAppend(pointer, stored):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(stored, state, may_repeat)
+            ListRemoveAt(pointer, stored):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(stored, state, may_repeat)
+            ListReserve(pointer, stored):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(stored, state, may_repeat)
+            NativeMove(destination, source, count):
+                if not try self.analyze_expression(destination, state, may_repeat): return false
+                if not try self.analyze_expression(source, state, may_repeat): return false
+                return try self.analyze_expression(count, state, may_repeat)
+            NativeAllocate(element_type, count): return try self.analyze_expression(count, state, may_repeat)
+            NativeDeallocate(pointer, element_type, count):
+                if not try self.analyze_expression(pointer, state, may_repeat): return false
+                return try self.analyze_expression(count, state, may_repeat)
+            NativeArena(end): return try self.analyze_expression(end, state, may_repeat)
             SequenceIndex(inner, index):
                 if not try self.analyze_expression(inner, state, may_repeat): return false
                 return try self.analyze_expression(index, state, may_repeat)
+            SequenceSlice(inner, start, end):
+                if not try self.analyze_expression(inner, state, may_repeat): return false
+                if start.value != no_node and not try self.analyze_expression(start, state, may_repeat): return false
+                if end.value != no_node: return try self.analyze_expression(end, state, may_repeat)
+                return true
             Unary(operation, operand): return try self.analyze_expression(operand, state, may_repeat)
             Binary(left, operation, right):
                 if not try self.analyze_expression(left, state, may_repeat): return false
@@ -277,6 +332,11 @@ pub class SemanticAnalyzer:
                 return joined != none
             Tuple(elements): return try self.analyze_run(elements, state, may_repeat)
             Array(elements): return try self.analyze_run(elements, state, may_repeat)
+            List(elements): return try self.analyze_run(elements, state, may_repeat)
+            ListInsert(inner, index, element):
+                if not try self.analyze_expression(inner, state, may_repeat): return false
+                if not try self.analyze_expression(index, state, may_repeat): return false
+                return try self.analyze_expression(element, state, may_repeat)
             Element(inner, index): return try self.analyze_expression(inner, state, may_repeat)
             StructValue(struct_index, fields): return try self.analyze_run(fields, state, may_repeat)
             FieldAccess(inner, field):
@@ -334,6 +394,241 @@ pub class SemanticAnalyzer:
             PrintValue(inner): return try self.analyze_expression(inner, state, may_repeat)
             else: return true
 
+    # mark: Deinitializers =====================================================================
+
+    # A dying identity is a borrowed receiver. Reading or mutating its fields,
+    # invoking a transitively proven same-class method, and storing it into a
+    # weak slot are the only operations that cannot create a new strong owner
+    # and resurrect it. Record that proof for ownership lowering rather than
+    # making MIR rediscover a whole-program semantic fact.
+    func analyze_deinitializer(function: HirFunction) -> !:
+        try self.validate_borrowed_receiver_method(function)
+
+    # Follow only calls that pass the exact dying `self` as another method's
+    # receiver. The active set closes recursive call graphs; every reachable
+    # body is still inspected for an eventual owning sink before it is marked
+    # as proven.
+    func validate_borrowed_receiver_method(function: HirFunction) -> !:
+        if self.contains_borrowed_receiver_method(self.borrowed_receiver_methods, function.symbol): return
+        if self.contains_borrowed_receiver_method(self.active_borrowed_receiver_methods, function.symbol): return
+        self.active_borrowed_receiver_methods.append(function.symbol)
+
+        let previous_function = self.function
+        let previous_self = self.self_symbol
+        self.function = function
+        self.self_symbol = function.parameters[0].symbol
+        try self.validate_deinitializer_suite(function_body(function))
+        self.function = previous_function
+        self.self_symbol = previous_self
+
+        self.active_borrowed_receiver_methods.remove(len(self.active_borrowed_receiver_methods) - 1)
+        self.borrowed_receiver_methods.append(function.symbol)
+
+    func validate_deinitializer_suite(statements: Operands) -> !:
+        for position in range(0, i64(statements.count)):
+            try self.validate_deinitializer_statement(node_at(self.program, statements, position))
+
+    func validate_deinitializer_statement(statement: NodeId) -> !:
+        match node_form(self.program, statement):
+            BreakStatement: return
+            ContinueStatement: return
+            PrintText(value): return
+            Binding(symbol, is_mutable, value): try self.validate_deinitializer_expression(value, false)
+            Assignment(symbol, operation, value): try self.validate_deinitializer_expression(value, false)
+            ExternStore(symbol, operation, value): try self.validate_deinitializer_expression(value, false)
+            GlobalStore(symbol, operation, value): try self.validate_deinitializer_expression(value, false)
+            PlaceAssignment(symbol, steps, operation, value):
+                try self.validate_deinitializer_place_indices(steps)
+                try self.validate_deinitializer_expression(value, self.place_ends_in_weak_field(steps))
+            GlobalPlaceAssignment(symbol, steps, operation, value):
+                try self.validate_deinitializer_place_indices(steps)
+                try self.validate_deinitializer_expression(value, self.place_ends_in_weak_field(steps))
+            PrintValue(value): try self.validate_deinitializer_expression(value, false)
+            ReturnStatement(value):
+                if value.value != no_node: try self.validate_deinitializer_expression(value, false)
+            RecoverStatement(value): try self.validate_deinitializer_expression(value, false)
+            ExpressionStatement(value): try self.validate_deinitializer_expression(value, false)
+            DeferStatement(action): try self.validate_deinitializer_statement(action)
+            IfStatement(branches, has_fallback, fallback):
+                for branch in range(0, i64(branches.count) // 3):
+                    try self.validate_deinitializer_expression(NodeId(value = u32(entry_at(self.program, branches, branch * 3))), false)
+                    try self.validate_deinitializer_suite(Operands(
+                        start = u32(entry_at(self.program, branches, branch * 3 + 1)),
+                        count = u32(entry_at(self.program, branches, branch * 3 + 2)),
+                    ))
+                if has_fallback: try self.validate_deinitializer_suite(fallback)
+            WhileStatement(condition, body):
+                try self.validate_deinitializer_expression(condition, false)
+                try self.validate_deinitializer_suite(body)
+            ForStatement(symbol, iterable, body):
+                try self.validate_deinitializer_expression(iterable, false)
+                try self.validate_deinitializer_suite(body)
+            Match(subject, arms, has_result):
+                try self.validate_deinitializer_expression(subject, false)
+                try self.validate_deinitializer_arms(arms)
+            else: trap("expression node appeared directly in a deinitializer suite")
+
+    func validate_deinitializer_expression(value: NodeId, allow_direct_self: bool) -> !:
+        match node_form(self.program, value):
+            Constant(index): return
+            ExternLoad(index): return
+            GlobalLoad(index): return
+            FunctionAddress(index): return
+            ErrorCodeLiteral(index): return
+            NoneLiteral: return
+            Reference(symbol):
+                if symbol.value == self.self_symbol.value and not allow_direct_self:
+                    try self.fail(value, "deinitializer may use `self` only to access its fields, call one of its methods, or store a weak reference; a new strong reference would resurrect the class")
+            NativeLoad(inner): try self.validate_deinitializer_expression(inner, false)
+            NativeRebind(inner): try self.validate_deinitializer_expression(inner, false)
+            NativeIsNull(inner): try self.validate_deinitializer_expression(inner, false)
+            NumericConvert(inner): try self.validate_deinitializer_expression(inner, false)
+            Discard(inner): try self.validate_deinitializer_expression(inner, false)
+            StringScalarCount(inner): try self.validate_deinitializer_expression(inner, false)
+            SequenceLength(inner): try self.validate_deinitializer_expression(inner, false)
+            ListCopy(inner): try self.validate_deinitializer_expression(inner, false)
+            ListClear(inner): try self.validate_deinitializer_expression(inner, false)
+            Unary(operation, inner): try self.validate_deinitializer_expression(inner, false)
+            Try(inner): try self.validate_deinitializer_expression(inner, false)
+            NativeStore(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            NativeAdvance(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            SequenceIndex(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            ListAppend(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            ListRemoveAt(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            ListReserve(left, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            Range(left, right, inclusive):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            NativeMove(destination, source, count):
+                try self.validate_deinitializer_expression(destination, false)
+                try self.validate_deinitializer_expression(source, false)
+                try self.validate_deinitializer_expression(count, false)
+            NativeAllocate(element_type, count): try self.validate_deinitializer_expression(count, false)
+            NativeArena(count): try self.validate_deinitializer_expression(count, false)
+            NativeDeallocate(pointer, element_type, count):
+                try self.validate_deinitializer_expression(pointer, false)
+                try self.validate_deinitializer_expression(count, false)
+            SequenceSlice(inner, start, end):
+                try self.validate_deinitializer_expression(inner, false)
+                if start.value != no_node: try self.validate_deinitializer_expression(start, false)
+                if end.value != no_node: try self.validate_deinitializer_expression(end, false)
+            Binary(left, operation, right):
+                try self.validate_deinitializer_expression(left, false)
+                try self.validate_deinitializer_expression(right, false)
+            Conditional(selected, condition, alternative):
+                try self.validate_deinitializer_expression(condition, false)
+                try self.validate_deinitializer_expression(selected, allow_direct_self)
+                try self.validate_deinitializer_expression(alternative, allow_direct_self)
+            Call(symbol, arguments): try self.validate_deinitializer_call(symbol, arguments)
+            IndirectCall(callee, arguments):
+                try self.validate_deinitializer_expression(callee, false)
+                try self.validate_deinitializer_run(arguments, false)
+            Initialize(symbol, arguments): try self.validate_deinitializer_arguments(arguments, false)
+            Raise(code, message):
+                try self.validate_deinitializer_expression(code, false)
+                try self.validate_deinitializer_expression(message, false)
+            Trap(message): try self.validate_deinitializer_expression(message, false)
+            Assert(condition, message):
+                try self.validate_deinitializer_expression(condition, false)
+                try self.validate_deinitializer_expression(message, false)
+            Catch(caught, failure, body):
+                try self.validate_deinitializer_expression(caught, false)
+                try self.validate_deinitializer_suite(body)
+            Tuple(elements): try self.validate_deinitializer_run(elements, false)
+            Array(elements): try self.validate_deinitializer_run(elements, false)
+            List(elements): try self.validate_deinitializer_run(elements, false)
+            StructValue(struct_index, elements): try self.validate_deinitializer_run(elements, false)
+            EnumValue(enum_index, case_index, elements): try self.validate_deinitializer_run(elements, false)
+            ListInsert(inner, index, element):
+                try self.validate_deinitializer_expression(inner, false)
+                try self.validate_deinitializer_expression(index, false)
+                try self.validate_deinitializer_expression(element, false)
+            Element(inner, index): try self.validate_deinitializer_expression(inner, false)
+            FieldAccess(inner, field):
+                match node_form(self.program, inner):
+                    Reference(symbol):
+                        if symbol.value == self.self_symbol.value: return
+                    else: pass
+                try self.validate_deinitializer_expression(inner, false)
+            Some(inner): try self.validate_deinitializer_expression(inner, allow_direct_self)
+            ElseFallback(inner, arm):
+                try self.validate_deinitializer_expression(inner, allow_direct_self)
+                try self.validate_deinitializer_expression(arm, allow_direct_self)
+            Match(subject, arms, has_result):
+                try self.validate_deinitializer_expression(subject, false)
+                try self.validate_deinitializer_arms(arms)
+            else: trap("statement or pattern node appeared in a deinitializer expression")
+
+    func validate_deinitializer_call(symbol: SymbolId, arguments: Operands) -> !:
+        let target = self.function_with_symbol(symbol)
+        var permits_self_receiver = false
+        let current = self.function else trap("deinitializer analysis lost its function")
+        let current_receiver = current.receiver else trap("deinitializer has no receiver")
+        let target_receiver = target.receiver
+        if target_receiver != none:
+            permits_self_receiver = target_receiver.kind == HirReceiverKind.value_method and types_match(target_receiver.owner, current_receiver.owner)
+        var passes_borrowed_receiver = false
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            let is_borrowed_receiver = permits_self_receiver and parameter == 0 and self.is_direct_self_reference(argument)
+            try self.validate_deinitializer_expression(argument, is_borrowed_receiver)
+            if is_borrowed_receiver: passes_borrowed_receiver = true
+        if passes_borrowed_receiver: try self.validate_borrowed_receiver_method(target)
+
+    func is_direct_self_reference(value: NodeId) -> bool:
+        match node_form(self.program, value):
+            Reference(symbol): return symbol.value == self.self_symbol.value
+            else: return false
+
+    func contains_borrowed_receiver_method(methods: list[SymbolId], symbol: SymbolId) -> bool:
+        for method in methods:
+            if method.value == symbol.value: return true
+        return false
+
+    func validate_deinitializer_arguments(arguments: Operands, allow_direct_self: bool) -> !:
+        for pair in range(0, i64(arguments.count) // 2):
+            try self.validate_deinitializer_expression(NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1))), allow_direct_self)
+
+    func validate_deinitializer_run(values: Operands, allow_direct_self: bool) -> !:
+        for position in range(0, i64(values.count)):
+            try self.validate_deinitializer_expression(node_at(self.program, values, position), allow_direct_self)
+
+    func validate_deinitializer_arms(arms: Operands) -> !:
+        for position in range(0, i64(arms.count)):
+            match node_form(self.program, node_at(self.program, arms, position)):
+                MatchArm(patterns, statements, value):
+                    try self.validate_deinitializer_suite(statements)
+                    if value.value != no_node: try self.validate_deinitializer_expression(value, false)
+                else: trap("match arm run names a non-arm node")
+
+    func validate_deinitializer_place_indices(steps: Operands) -> !:
+        for position in range(0, i64(steps.count) // 2):
+            let kind = u32(entry_at(self.program, steps, position * 2))
+            if kind == place_element_step or kind == place_list_element_step:
+                try self.validate_deinitializer_expression(NodeId(value = u32(entry_at(self.program, steps, position * 2 + 1))), false)
+
+    func place_ends_in_weak_field(steps: Operands) -> bool:
+        if steps.count < 2: return false
+        return u32(entry_at(self.program, steps, i64(steps.count) - 2)) == place_weak_field_step
+
+    func function_with_symbol(symbol: SymbolId) -> HirFunction:
+        for function in self.program.functions:
+            if function.symbol.value == symbol.value: return function
+        trap("deinitializer call names an unknown function")
+
     # mark: State ===============================================================================
 
     func copy_state(state: InitializationState) -> InitializationState:
@@ -366,11 +661,6 @@ pub class SemanticAnalyzer:
         for index in range(0, len(state.fields)):
             if state.fields[index] != FieldState.initialized:
                 error(self.diagnostic(span, "initializer may finish before field `" + self.field_names[index] + "` is initialized"))
-
-    func struct_index(owner: TypeId) -> i64:
-        match self.program.types.definitions[owner.value].form:
-            Struct(index): return index
-            else: trap("initializer receiver is not a struct")
 
     func fail(node: NodeId, message: str) -> !:
         error(self.diagnostic(node_span(self.program, node), message))

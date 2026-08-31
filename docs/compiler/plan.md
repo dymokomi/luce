@@ -131,10 +131,11 @@ a substitute for or prerequisite to this QBE-complete claim.
 - **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
 - **`Yield`** is the structured phi: a region that produces values names them on every exit.
 - **Narrow integers stay MIR types** (Prism `DType` and the C ABI need exact widths).
-- **Open**: optionals are a uniform `u8`-tagged enum today; whether future
-  managed class references may use a null niche is undecided. Pointer-shaped
-  foreign handles are settled: tagged internally and raw-null only at a C
-  boundary. Fallible ABI is per backend (wasm multi-value, QBE
+- **Settled**: optionals, including `Class?`, remain uniform `u8`-tagged enums
+  in canonical MIR. Null class/weak handles are private storage sentinels and
+  never source values. Pointer-shaped foreign handles are likewise tagged
+  internally and raw-null only at a C boundary. Fallible ABI is per backend
+  (wasm multi-value, QBE
   out-pointer/aggregate — never a global).
 
 ## 3. Backends, QBE, and the linker — the decisions
@@ -203,20 +204,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
   166-line orchestration facade, a 1,111-line program-wide
-  declaration collector, a 776-line shared typed transaction/model, and one
-  2,522-line body checker. Declaration defaults cross that boundary through
+  declaration collector, a shared typed transaction/model, and one
+  2,603-line body checker. Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
-  MIR lowerer is likewise a 110-line whole-program coordinator, a 619-line
-  shared identity/type/state transaction, and one 3,239-line function walk.
+  MIR lowerer is likewise a small whole-program coordinator, one shared
+  identity/type/state transaction, and one 3,494-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
-  transaction; classes, closures, and interfaces may later expose a real
-  internal boundary. The size is now an active design warning: review the
-  ownership boundary when the first of those families lands, before adding a
-  second. Keep the 2,121-line parser and 2,019-line Wasm encoder sectioned
+  transaction. The class slice completed that ownership review: class ARC,
+  destruction, weak sinks, places, calls, and structured control all mutate
+  that same register/region/defer transaction, so extracting them would add a
+  forwarding graph or duplicate ownership state rather than establish a new
+  owner. Closures are the next mandatory review because capture environments
+  may provide an actual independently testable boundary. Keep the parser and
+  2,085-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -523,7 +527,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 ### Proving program 2 — the host
 
-- [ ] **Classes with ARC, weak references, `deinit`** — `SemanticAnalyzer` starts producing ownership facts. *Gates: owned values; scoped values.*
+- [x] **Core classes with ARC, weak fields, and `deinit`** (2026-08-31).
+  Nominal identities stay abstract through HIR and MIR; only backends choose
+  payload layout. The semantic analyzer proves complete initialization and
+  prevents publication from `init` and resurrection from `deinit`, including
+  transitive borrowed receiver helpers. Strong/weak runtime counts, atomic
+  weak zeroing, fallible-initializer cleanup, and reverse field destruction
+  agree through both oracles, QBE, Wasm, and `examples/classes.luc`.
+- [ ] **Finish the remaining §11 class contract.** Add compiler-known
+  `Weak[T]` values for dynamic weak collections, directly provable strong-cycle
+  diagnostics, resource/reentrancy lints, and the remaining rule-by-rule
+  negative matrix before promoting §11 from partial to complete.
 - [ ] **Closures.** *Gate: capture rule.*
 - [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
@@ -547,22 +561,26 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Give every cohesive source/test region a `# mark:` heading as it is touched.
   File length is reviewed at each vertical-slice audit; roughly 2,000 lines
   triggers an ownership review, not an arbitrary mechanical split. Wasm
-  module planning now has its own 263-line owner, leaving the related
-  instruction/section encoder cohesive at 2,019 lines; its byte plumbing is
+  module planning has its own owner, leaving the related instruction/section
+  encoder cohesive at 2,085 lines; its byte plumbing is
   too small to justify another module today.
   HIR generation now separates program declarations from mutually recursive
   body semantics over one typed transaction. MIR lowering separates the
   whole-program coordinator and shared identity/type transaction from one
   cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. The remaining 2,522-line HIR body checker
-  and 3,239-line MIR function lowerer stay intact until a language family
-  establishes a narrower ownership boundary. The 2,081-line HIR interpreter
+  forwarding-only collaborators. The remaining 2,603-line HIR body checker
+  and 3,494-line MIR function lowerer stay intact until a language family
+  establishes a narrower ownership boundary. The 2,205-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.
-  Classes or closures may expose a real ownership seam; line count alone does
-  not. Parser grammar is already frozen; separate its byte/token plumbing only
-  where one owner can retain the cursor and diagnostic state.
+  The class audit found no such seam: lifecycle semantics are inseparable from
+  the same expression/place/call transaction, and a class-only helper would
+  be forwarding rather than ownership. Closures trigger the next review;
+  capture/environment construction may have an independent contract. Line
+  count alone does not. Parser grammar is already frozen; separate its
+  byte/token plumbing only where one owner can retain the cursor and
+  diagnostic state.
 - [ ] **Bound recursion the way shipping compilers do** — [`recursion.md`](recursion.md) §4. Phase 1 (a 256-deep cap on expression nesting) landed 2026-08-29; phases 2–5 remain: `frame_limit` derived at startup from the host rather than declared, thinner interpreter frames, and a stack reservation on the ELF path. Statement and type nesting have their own recursions and are **unmeasured** — no evidence they crash, so they wait for evidence rather than a speculative counter.
 - [ ] Generated programs and fuzzing as release gates (not yet built; do not claim them).
 - [ ] Language freeze after the compiler and one host slice depend on every feature.

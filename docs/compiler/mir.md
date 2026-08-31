@@ -519,13 +519,13 @@ Two consequences for the design record:
   contract is WASI preview 1 — `luce_rt_write` becomes `fd_write`, an
   entry gains `_start` and `proc_exit` — so a module runs under any wasm
   runtime with no bespoke host.
-- **QBE native** links C externs and the future `libluce_rt` through the host
+- **QBE native** links C externs and the current compiled `libluce_rt` through the host
   toolchain. Luce-native backends begin only after the language and runtime
   baseline is complete, and must prove the same canonical MIR against QBE.
 - The order of work: new `mir/canonical.luc` and verifier → MIR interpreter
   and the three-way harness (both done: `tests/compiler/differential_test.luc`)
   → the lowerer in vertical slices (scalars and locals, control flow, calls and constants — done;
-  enums and `match`, structs and ARC, closures and interfaces, failure and
+  enums and `match`, structs and classes/ARC, closures and interfaces, failure and
   `defer`, collections, the C boundary, workers) → wasm encoder tracking
   each slice → native backends from MIR once it stops moving.
 
@@ -538,6 +538,8 @@ Two consequences for the design record:
 ```
 MirProgram
     types       list[MirType]       every target-neutral type used
+    classes     list[MirClass]      nominal payload schemas and destroyers
+    runtime_bindings list[MirRuntimeBinding] sealed service → function identities
     externs     list[MirExtern]     imported symbols: C functions and the runtime
     external_globals list[MirExternalGlobal] C-owned observable scalar state
     globals     list[MirGlobal]     module-level mutable state
@@ -562,6 +564,8 @@ symbol).
 | `BufferOwner` | opaque immutable string/byte storage owner; pointer-shaped only after backend legalization |
 | `List(element)` | typed mutable reference collection handle |
 | `Slice(element)` | typed immutable snapshot handle |
+| `Class(identity)` | owning nominal identity handle; payload layout remains a backend fact |
+| `WeakClass(identity)` | non-owning handle for the same nominal identity |
 | `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
 | `Array(element, count)` | fixed arrays |
 | `Enum(tag, cases)` | tag is an `Int`; each case is a `Struct` payload |
@@ -576,14 +580,15 @@ operations do not reinterpret one as the other.
 `list[T]` → `List(T)` and
 `slice[T]` → `Slice(T)`, both opaque reference-sized handles whose concrete
 headers are runtime/backend facts; future `map` and `set` handles follow the
-same typed-reference rule; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
-future managed class references is still open, but foreign handles stay
-tagged internally); a scalar `T!` result → a scalar and error pointer, never a
+same typed-reference rule; `T?` → a two-case `Enum` with a `u8` tag, including
+class optionals (foreign handles also stay tagged internally); a scalar `T!`
+result → a scalar and error pointer, never a
 type;
 tuples → anonymous `Struct`; `array[T, N]` → `Array(T, N)` with `N` retained
 as a target-neutral type fact and element placement deferred to the backend;
-class references and `weak` → `Ptr` managed by
-the runtime; interface values → a two-`Ptr` `Struct`.
+class references → `Class(id)` and weak field storage → `WeakClass(id)`, with
+their field schema and generated `(class, initialized)` destroyer in
+`MirProgram.classes`; interface values → a two-`Ptr` `Struct`.
 
 Aggregates never sit in a register. The lowerer's protocol: a register of
 aggregate type holds the value's *address* (a slot, a field, a parameter's
@@ -841,9 +846,14 @@ StringDecode(Ptr, u64, u64) -> (u32 scalar, u64 byte_width)
 BytesSlice(BufferOwner, Ptr, u64, u64, u64) -> Slice(u8)  backend checks start <= end <= length
 SliceLength(Slice(T)) -> u64
 SliceElementAddress(Slice(T), u64) -> Ptr     backend checks bounds and supplies size
+ClassCreate(ClassId) -> Class(T)              backend supplies payload size/alignment
+ClassMarkInitialized(Class(T))
+ClassRetain(Class(T)) / ClassRelease(Class(T))
+ClassFieldAddress(Class(T), field) -> Ptr     backend supplies payload offset
+WeakClassCreate(Class(T)) -> WeakClass(T)
+WeakClassRetain(WeakClass(T)) / WeakClassRelease(WeakClass(T))
+WeakClassPromote(WeakClass(T), Class(T)?)     atomic owned optional result
 list_iteration_active(List(T)) -> bool        backend guards every shape mutation
-luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
-luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
 luce_rt_spawn(function, input) -> Ptr    luce_rt_wait(Ptr) -> Ptr    luce_rt_cancel(Ptr)
@@ -876,11 +886,15 @@ expressed by canonical control flow and the trap contract.
 - runtime symbols are called with their known signatures;
 - runtime bindings are unique private Luce functions with the service's exact
   signature, and every `AllocateStorage` has a storage-allocator binding;
+- every nominal class has exactly one strong and one weak canonical type, a
+  valid private `(Class, bool) -> unit` destroyer, type-correct fields, and
+  exact class identities on create/field/weak/promotion instructions;
 - globals and data items name existing initializers and valid minimum alignments.
 
-### Open questions
+### Settled optional representation
 
-- **Optionals of future managed class references** — null-pointer niche or a
-  uniform two-case enum? This does not include pointer-shaped foreign handles:
-  those are uniformly tagged in MIR and adapted to raw null only at an
-  explicit `c`-convention boundary.
+Class optionals use the same uniform two-case `u8`-tagged enum as every other
+`T?`. A null `Class` or `WeakClass` handle is permitted only as an internal
+sentinel for partially initialized storage and absent weak slots; it is never
+a source value. Pointer-shaped foreign handles are also tagged in MIR and are
+adapted to raw null only at an explicit `c`-convention boundary.

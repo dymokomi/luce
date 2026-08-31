@@ -16,12 +16,12 @@
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, HirNodeForm, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, ClassFinalizer, ClassStorage, HirNodeForm, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 from compiler.hir.analyzer import AnalyzedProgram
 import std.strings
 
@@ -38,6 +38,8 @@ struct Binding:
 # already run when an Element reaches the value-rebuilding helpers.
 union AssignmentPlaceStep:
     Field(index: i64)
+    ClassField(index: i64)
+    WeakField(index: i64)
     Element(index: i64)
     ListElement(index: i64)
 
@@ -189,7 +191,7 @@ func zero_hir_value(program: HirProgram, value_type: TypeId) -> Value:
             return Value.Tuple(elements = values)
         else: trap("checked runtime global has no structural zero")
 
-class HirInterpreterRun:
+class HirInterpreterRun: ClassFinalizer:
     let program: HirProgram
     let external_host: HirExternHost?
     let external_variable_host: HirExternVariableHost?
@@ -207,6 +209,36 @@ class HirInterpreterRun:
         for global in program.globals:
             self.globals.append(zero_hir_value(program, global.value_type))
         self.depth = 0
+
+    ## Host ARC reaches this callback exactly when an interpreted class loses
+    ## its final strong reference. Source `deinit` runs before payload fields;
+    ## removing those fields from the tail establishes reverse declaration
+    ## order independently of the host list implementation.
+    pub func finalize(class_index: i64, fields: list[BoxedValue], run_deinitializer: bool):
+        self.finalize_class(class_index, fields, run_deinitializer) catch reason:
+            trap(reason)
+
+    func finalize_class(class_index: i64, fields: list[BoxedValue], run_deinitializer: bool) -> !:
+        let item = self.program.classes[class_index]
+        let deinitializer = item.deinitializer
+        if run_deinitializer and deinitializer != none:
+            let target = self.find_function(deinitializer)
+            # Stage-0 rightly forbids passing a dying `self` as a new strong
+            # callback argument. A non-finalizing proxy over the same payload
+            # supplies the borrowed source receiver without resurrecting the
+            # original identity or recursively invoking finalization.
+            let proxy = ClassStorage(class_index, fields, self, false, false, true)
+            let invocation = try self.call(target, [Value.Class(storage = proxy)])
+            match invocation.value:
+                Unit: pass
+                else: trap("checked class deinitializer returned a value")
+
+        # Box destruction, and therefore nested class finalization, follows
+        # source declaration order in reverse rather than host list policy.
+        var remaining = len(fields)
+        while remaining > 0:
+            remaining -= 1
+            fields.remove(remaining)
 
     ## Run one public entry function to its returned value. It takes no
     ## arguments, or the process entry's `(arguments: slice[str])`, which
@@ -680,6 +712,19 @@ class HirInterpreterRun:
                 match current:
                     Record(fields): current = fields[payload].value
                     else: trap("field step applied to a non-struct HIR value")
+            elif kind == place_class_field_step:
+                steps.append(AssignmentPlaceStep.ClassField(index = payload))
+                match current:
+                    Class(storage): current = storage.fields[payload].value
+                    else: trap("class-field step applied to a non-class HIR value")
+            elif kind == place_weak_field_step:
+                steps.append(AssignmentPlaceStep.WeakField(index = payload))
+                match current:
+                    Class(storage):
+                        match storage.fields[payload].value:
+                            WeakClass(slot): current = weak_class_value(slot)
+                            else: trap("weak class field has owning storage")
+                    else: trap("weak-field step applied to a non-class HIR value")
             elif kind == place_element_step:
                 match try self.evaluate(NodeId(value = u32(payload)), bindings):
                     Evaluated(item):
@@ -1063,7 +1108,14 @@ class HirInterpreterRun:
                     Evaluated(item):
                         match item:
                             Record(fields): return Evaluation.Evaluated(value = fields[field].value)
-                            else: trap("field access applied to a non-struct HIR value")
+                            Class(storage):
+                                let stored = storage.fields[field].value
+                                if self.program.classes[storage.class_index].fields[field].is_weak:
+                                    match stored:
+                                        WeakClass(slot): return Evaluation.Evaluated(value = weak_class_value(slot))
+                                        else: trap("weak class field has owning storage")
+                                return Evaluation.Evaluated(value = stored)
+                            else: trap("field access applied to a non-record HIR value")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Tuple(elements):
                 match try self.evaluate_run(elements, bindings):
@@ -1337,6 +1389,11 @@ class HirInterpreterRun:
                             Record(fields):
                                 place.steps.append(AssignmentPlaceStep.Field(index = field))
                                 return PlaceEvaluation.EvaluatedPlace(place = place, value = fields[field].value)
+                            Class(storage):
+                                if self.program.classes[storage.class_index].fields[field].is_weak:
+                                    trap("weak optional field cannot be a mutating value receiver")
+                                place.steps.append(AssignmentPlaceStep.ClassField(index = field))
+                                return PlaceEvaluation.EvaluatedPlace(place = place, value = storage.fields[field].value)
                             else: trap("mutating field receiver has a non-record base")
                     TransferredPlace(execution): return PlaceEvaluation.TransferredPlace(execution = execution)
             SequenceIndex(inner, index_node):
@@ -1371,10 +1428,20 @@ class HirInterpreterRun:
         let values = list[Value]()
         for parameter in target.parameters: values.append(Value.Unit)
         let fields = list[BoxedValue]()
-        let struct_index = self.struct_index(receiver.owner)
-        for field in self.program.structs[struct_index].fields:
-            fields.append(BoxedValue(value = Value.Unit))
-        values[0] = Value.Record(fields = fields)
+        match self.program.types.definitions[receiver.owner.value].form:
+            Struct(struct_index):
+                for field in self.program.structs[struct_index].fields:
+                    fields.append(BoxedValue(value = Value.Unit))
+                values[0] = Value.Record(fields = fields)
+            Class(class_index):
+                for field in self.program.classes[class_index].fields:
+                    if field.is_weak:
+                        fields.append(BoxedValue(value = Value.WeakClass(storage = WeakClassStorage(none))))
+                    else:
+                        fields.append(BoxedValue(value = Value.Unit))
+                let storage = ClassStorage(class_index, fields, self, true, true, false)
+                values[0] = Value.Class(storage = storage)
+            else: trap("initializer receiver is not a struct or class")
         for pair in range(0, i64(arguments.count) // 2):
             let parameter_index = entry_at(self.program, arguments, pair * 2)
             let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
@@ -1384,14 +1451,12 @@ class HirInterpreterRun:
         let invocation = try self.call(target, values)
         match invocation.value:
             FallibleSuccess(success):
+                mark_class_initialized(invocation.receiver)
                 return Evaluation.Evaluated(value = Value.FallibleSuccess(value = BoxedValue(value = invocation.receiver)))
             FallibleFailure(failure): return Evaluation.Evaluated(value = invocation.value)
-            else: return Evaluation.Evaluated(value = invocation.receiver)
-
-    func struct_index(owner: TypeId) -> i64:
-        match self.program.types.definitions[owner.value].form:
-            Struct(index): return index
-            else: trap("initializer receiver is not a struct")
+            else:
+                mark_class_initialized(invocation.receiver)
+                return Evaluation.Evaluated(value = invocation.receiver)
 
     func evaluate_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Evaluation!:
         let evaluated = try self.evaluate(subject, bindings)
@@ -1493,6 +1558,32 @@ class HirInterpreterRun:
 
 # mark: Bindings ==============================================================================
 
+# Construction arms source `deinit` only after an initializer reaches its
+# successful return. Struct receivers pass through unchanged.
+func mark_class_initialized(value: Value):
+    match value:
+        Class(storage): storage.is_initialized = true
+        else: pass
+
+# Weak slots never expose their storage carrier to source semantics. Reading
+# one atomically promotes a live host weak edge to the ordinary optional class
+# value used for the remainder of the expression.
+func weak_class_value(storage: WeakClassStorage) -> Value:
+    let target = storage.target
+    if target == none: return Value.Absent
+    if not target.is_alive: return Value.Absent
+    return Value.Present(value = BoxedValue(value = Value.Class(storage = target)))
+
+# Store one source optional class value without retaining its referent.
+func weak_class_storage_value(value: Value) -> Value:
+    match value:
+        Absent: return Value.WeakClass(storage = WeakClassStorage(none))
+        Present(boxed):
+            match boxed.value:
+                Class(storage): return Value.WeakClass(storage = WeakClassStorage(storage))
+                else: trap("weak field received a non-class optional payload")
+        else: trap("weak field received a non-optional HIR value")
+
 # The place an expression names: a reference, or fields reached from one.
 # Read the value selected by a fully evaluated mixed field/array place.
 func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], start: i64) -> Value!:
@@ -1502,6 +1593,17 @@ func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], s
             match value:
                 Record(fields): return try value_at_assignment_place(fields[index].value, steps, start + 1)
                 else: trap("field step applied to a non-struct HIR value")
+        ClassField(index):
+            match value:
+                Class(storage): return try value_at_assignment_place(storage.fields[index].value, steps, start + 1)
+                else: trap("class-field step applied to a non-class HIR value")
+        WeakField(index):
+            match value:
+                Class(storage):
+                    match storage.fields[index].value:
+                        WeakClass(slot): return try value_at_assignment_place(weak_class_value(slot), steps, start + 1)
+                        else: trap("weak class field has owning storage")
+                else: trap("weak-field step applied to a non-class HIR value")
         Element(index):
             match value:
                 Array(elements):
@@ -1539,6 +1641,19 @@ func value_with_assignment_place(value: Value, steps: list[AssignmentPlaceStep],
                         else: rebuilt.append(fields[index])
                     return Value.Record(fields = rebuilt)
                 else: trap("field step applied to a non-struct HIR value")
+        ClassField(selected):
+            match value:
+                Class(storage):
+                    storage.fields[selected] = BoxedValue(value = try value_with_assignment_place(storage.fields[selected].value, steps, start + 1, replacement))
+                    return value
+                else: trap("class-field step applied to a non-class HIR value")
+        WeakField(selected):
+            if start + 1 != len(steps): trap("weak-field step cannot contain a nested assignment")
+            match value:
+                Class(storage):
+                    storage.fields[selected] = BoxedValue(value = weak_class_storage_value(replacement))
+                    return value
+                else: trap("weak-field step applied to a non-class HIR value")
         Element(selected):
             match value:
                 Array(elements):
@@ -1662,6 +1777,15 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
             match right:
                 Record(right_fields): return try evaluate_tuple_binary(left_fields, operation, right_fields, types)
                 else: trap("typed binary expression has unequal value types")
+        Class(left_storage):
+            match right:
+                Class(right_storage):
+                    match operation:
+                        Identity(operand_type): return Value.Boolean(value = left_storage is right_storage)
+                        NotIdentity(operand_type): return Value.Boolean(value = not (left_storage is right_storage))
+                        else: trap("classes support identity operations only")
+                else: trap("typed binary expression has unequal value types")
+        WeakClass(storage): trap("hidden weak storage escaped field access")
         Variant(left_case, left_payload):
             match right:
                 Variant(right_case, right_payload):

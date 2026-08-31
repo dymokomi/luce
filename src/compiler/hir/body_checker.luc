@@ -19,7 +19,7 @@ from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operan
 from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, CollectedFunctionSource
 from compiler.hir.generation_model import DeclarationValueChecker, DeclaredErrorCode, FunctionSymbol, HirGenerationState, ImportedModule, ImportedValue, ImportedValueBinding
@@ -494,7 +494,28 @@ pub class HirBodyChecker: DeclarationValueChecker:
                     try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
                 return CheckedPlace(symbol = local.symbol, global = -1, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
             Member(base, name):
-                let place = try self.resolve_assignment_place(base, span, mutate_value)
+                # First inspect without requiring a mutable root: a class
+                # identity remains mutable through an immutable binding.
+                var place = try self.resolve_assignment_place(base, span, false)
+                let class_index = self.declarations.class_of(place.value_type)
+                if class_index >= 0:
+                    let field_index = self.declarations.find_class_field(class_index, name)
+                    if field_index < 0: try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
+                    let field = self.state.classes[class_index].fields[field_index]
+                    if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
+                        try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.classes[class_index].module_index].name + "`")
+                    let initializing_this_field = place.initializer_field and len(place.steps) == 0
+                    if mutate_value and not field.is_mutable and not initializing_this_field:
+                        try self.fail(span, "cannot assign to `let` field `" + name + "`; only its class initializer may set it")
+                    var step = place_class_field_step
+                    if field.is_weak: step = place_weak_field_step
+                    place.steps.append(step)
+                    place.steps.append(u32(field_index))
+                    return CheckedPlace(symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = initializing_this_field)
+
+                # Value fields propagate the caller's mutation requirement
+                # all the way to a mutable root.
+                place = try self.resolve_assignment_place(base, span, mutate_value)
                 let struct_index = self.declarations.struct_of(place.value_type)
                 if struct_index < 0: try self.fail(span, "`" + self.describe_type(place.value_type) + "` has no field `" + name + "`")
                 let field_index = self.declarations.find_field(struct_index, name)
@@ -688,6 +709,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
                     return try self.check_function_address(function_index, value.span, expected)
                 if self.declarations.find_struct_in_module(self.state.current_module, name) >= 0:
                     try self.fail(value.span, "`" + name + "` is a type; construct a value with `" + name + "(...)` or call a type function with `" + name + ".name(...)`")
+                if self.declarations.find_class_in_module(self.state.current_module, name) >= 0:
+                    try self.fail(value.span, "`" + name + "` is a class; construct an identity with `new " + name + "(...)` or call a type function with `" + name + ".name(...)`")
                 if self.declarations.find_enum_in_module(self.state.current_module, name) >= 0:
                     try self.fail(value.span, "`" + name + "` is a type; name a case with `" + name + ".case`")
                 error(self.diagnostic(value.span, "unknown name `" + name + "`"))
@@ -741,7 +764,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
             MatchValue(subject, arms):
                 return try self.check_match_value(subject, arms, value.span, expected)
             NewValue(value_type, arguments):
-                error(self.diagnostic(value.span, "`new` is not implemented yet"))
+                return try self.check_class_new(value_type, arguments, value.span, expected)
             SpawnValue(function, arguments):
                 error(self.diagnostic(value.span, "`spawn` is not implemented yet"))
             CatchValue(caught, failure_name, body):
@@ -933,6 +956,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
         if operator == "is" or operator == "is not":
             match self.state.types.definitions[left.value].form:
                 List(element): pass
+                Class(index): pass
                 else: try self.fail(span, "`" + operator + "` requires shared reference operands, found `" + self.describe_type(left) + "`")
             if operator == "is": return ResolvedBinary(operation = BinaryOperation.Identity(operand_type = left), result = boolean_type)
             return ResolvedBinary(operation = BinaryOperation.NotIdentity(operand_type = left), result = boolean_type)
@@ -1216,6 +1240,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 try self.fail(callee_span, "`" + name + "` is a type function; call it as `" + self.describe_type(owner_type) + "." + name + "(...)`")
             if method_receiver.kind == HirReceiverKind.initializer:
                 try self.fail(callee_span, "initializer `init` is called by constructing a `" + self.describe_type(owner_type) + "` value")
+            if method_receiver.kind == HirReceiverKind.deinitializer:
+                try self.fail(callee_span, "deinitializer `deinit` runs automatically at the final strong release and cannot be called directly")
             try self.require_method_visible(method_index, owner_type, callee_span)
             let resolved = ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1, enum_index = -1, case_index = -1)
             return try self.check_resolved_call(resolved, arguments, callee_span, span, expected)
@@ -1592,6 +1618,26 @@ pub class HirBodyChecker: DeclarationValueChecker:
         let typed = self.state.push_node(HirNodeForm.Catch(value = checked, failure = failure, body = self.state.push_nodes(statements)), successful, span)
         return try self.require_type(typed, expected)
 
+    # `new Document("Notes")`: classes have one explicit initializer and
+    # construction is the only operation that creates a fresh identity.
+    func check_class_new(value_syntax: TypeSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
+        let class_index = self.declarations.class_of(value_type)
+        if class_index < 0:
+            try self.fail(value_syntax.span, "`new` requires a class type, found `" + self.describe_type(value_type) + "`")
+        let item = self.state.classes[class_index]
+        if item.module_index != self.state.current_module and not item.is_public:
+            try self.fail(value_syntax.span, "class `" + item.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+        return try self.check_initializer_call(
+            item.name,
+            item.type_id,
+            item.module_index,
+            item.initializer,
+            arguments,
+            span,
+            expected,
+        )
+
     # `Point(x: 1.0, y: 2.0)`: the synthesized memberwise initializer. Fields
     # fill like parameters and defaults cover omissions. From another module
     # the struct and every field *given* must be public; a private field may
@@ -1649,11 +1695,15 @@ pub class HirBodyChecker: DeclarationValueChecker:
     # execution, never by source syntax.
     func check_custom_initializer(struct_index: i64, function_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         let item = self.state.structs[struct_index]
-        let function = self.state.functions[function_index]
-        let foreign = item.module_index != self.state.current_module
-        if foreign and not function.is_public:
-            try self.fail(span, "initializer `init` is private to module `" + self.state.sources[item.module_index].name + "`")
+        return try self.check_initializer_call(item.name, item.type_id, item.module_index, function_index, arguments, span, expected)
 
+    # Struct and class initializers share argument placement and fallibility;
+    # allocation versus caller-owned value storage remains a later semantic
+    # distinction selected by the construction result type.
+    func check_initializer_call(owner_name: str, owner_type: TypeId, owner_module: i64, function_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let function = self.state.functions[function_index]
+        if owner_module != self.state.current_module and not function.is_public:
+            try self.fail(span, "initializer `init` is private to module `" + self.state.sources[owner_module].name + "`")
         let typed_arguments = list[u32]()
         let placed = try self.check_function_arguments(
             function,
@@ -1661,13 +1711,13 @@ pub class HirBodyChecker: DeclarationValueChecker:
             1,
             typed_arguments,
             span,
-            "initializer for `" + item.name + "`",
-            "construction of `" + item.name + "`",
+            "initializer for `" + owner_name + "`",
+            "construction of `" + owner_name + "`",
         )
 
-        var construction_type = item.type_id
+        var construction_type = owner_type
         if self.state.fallible_inner(function.result) != none:
-            construction_type = self.state.intern_fallible(item.type_id)
+            construction_type = self.state.intern_fallible(owner_type)
         let typed = self.state.push_node(HirNodeForm.Initialize(function = function.symbol, arguments = placed), construction_type, span)
         return try self.require_type(typed, expected)
 
@@ -1711,6 +1761,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
                     return try self.require_type(load, expected)
                 try self.fail(span, "module `" + self.state.sources[imported_module].name + "` has no value `" + name + "`")
             if self.declarations.find_struct_in_module(self.state.current_module, root_name) >= 0:
+                try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
+            if self.declarations.find_class_in_module(self.state.current_module, root_name) >= 0:
                 try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
             let enum_index = self.declarations.find_enum_in_module(self.state.current_module, root_name)
             if enum_index >= 0:
@@ -1760,6 +1812,18 @@ pub class HirBodyChecker: DeclarationValueChecker:
             else:
                 try self.fail(span, "`Error` has no field `" + name + "`")
             let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field), field_type, span)
+            return try self.require_type(typed, expected)
+        let class_index = self.declarations.class_of(self.state.type_of(checked))
+        if class_index >= 0:
+            let field_index = self.declarations.find_class_field(class_index, name)
+            if field_index < 0:
+                if self.declarations.find_method(self.state.classes[class_index].type_id, name) >= 0:
+                    try self.fail(span, "`" + name + "` is a method of `" + self.state.classes[class_index].name + "`; call it with `(...)`")
+                try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
+            let field = self.state.classes[class_index].fields[field_index]
+            if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
+                try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.classes[class_index].module_index].name + "`")
+            let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
             return try self.require_type(typed, expected)
         let struct_index = self.declarations.struct_of(self.state.type_of(checked))
         if struct_index < 0:
@@ -1834,6 +1898,12 @@ pub class HirBodyChecker: DeclarationValueChecker:
                         try self.fail(span, "mutating method needs a `var` receiver; `" + local.name + "` is immutable")
                 try self.fail(span, "mutating method needs a `var` receiver")
             FieldAccess(inner, field):
+                let class_index = self.declarations.class_of(self.state.type_of(inner))
+                if class_index >= 0:
+                    let stored = self.state.classes[class_index].fields[field]
+                    if mutate_value and not stored.is_mutable:
+                        try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
+                    return
                 let struct_index = self.declarations.struct_of(self.state.type_of(inner))
                 let stored = self.state.structs[struct_index].fields[field]
                 if mutate_value and not stored.is_mutable:
@@ -1858,6 +1928,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 if function_index >= 0: return ResolvedCallee(function_index = function_index, receiver = NodeId(value = no_node), struct_index = -1, enum_index = -1, case_index = -1)
                 let struct_index = self.declarations.find_struct_in_module(self.state.current_module, name)
                 if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index, enum_index = -1, case_index = -1)
+                if self.declarations.find_class_in_module(self.state.current_module, name) >= 0:
+                    try self.fail(callee.span, "class `" + name + "` construction requires `new " + name + "(...)`")
                 error(self.diagnostic(callee.span, "unknown function `" + name + "`"))
             else:
                 trap("non-name call head reached declaration resolution")
@@ -1885,6 +1957,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
             if imported_module >= 0: return try self.resolve_module_member_callee(imported_module, name, span)
             let struct_index = self.declarations.find_struct_in_module(self.state.current_module, head)
             if struct_index >= 0: return try self.resolve_type_function(self.state.structs[struct_index].type_id, name, span)
+            let class_index = self.declarations.find_class_in_module(self.state.current_module, head)
+            if class_index >= 0: return try self.resolve_type_function(self.state.classes[class_index].type_id, name, span)
             let enum_index = self.declarations.find_enum_in_module(self.state.current_module, head)
             if enum_index >= 0: return try self.resolve_enum_member(enum_index, name, span)
             return none
@@ -1895,6 +1969,11 @@ pub class HirBodyChecker: DeclarationValueChecker:
             if not self.state.structs[struct_index].is_public:
                 try self.fail(span, "`" + type_name + "` is private to module `" + self.state.sources[imported_module].name + "`")
             return try self.resolve_type_function(self.state.structs[struct_index].type_id, name, span)
+        let class_index = self.declarations.find_class_in_module(imported_module, type_name)
+        if class_index >= 0:
+            if not self.state.classes[class_index].is_public:
+                try self.fail(span, "`" + type_name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+            return try self.resolve_type_function(self.state.classes[class_index].type_id, name, span)
         let enum_index = self.declarations.find_enum_in_module(imported_module, type_name)
         if enum_index < 0: return none
         if not self.state.enums[enum_index].is_public:
@@ -1918,6 +1997,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
             if not self.state.structs[struct_index].is_public:
                 try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[imported_module].name + "`")
             return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index, enum_index = -1, case_index = -1)
+        if self.declarations.find_class_in_module(imported_module, name) >= 0:
+            try self.fail(span, "class `" + name + "` construction requires `new " + self.state.sources[imported_module].name + "." + name + "(...)`")
         error(self.diagnostic(span, "module `" + self.state.sources[imported_module].name + "` has no function `" + name + "`"))
 
     # `Type.function(...)`: a method without `self`.

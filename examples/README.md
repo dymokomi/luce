@@ -44,6 +44,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
   same example. Dynamic and nullable pointers arriving from C remain later
   boundary work.
+- `classes.luc` proves explicit class construction, alias identity and shared
+  mutation, zeroing weak fields, destruction-time weak stores and dead-weak
+  fallback, transitive borrowed `deinit` helper methods, reverse field
+  destruction, and failed-initializer cleanup through both semantic oracles,
+  Wasm, and native QBE.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases, `let` fields, and `is`/`is not`, checked
   indexed mutation,
@@ -52,9 +57,8 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   concatenation, O(1) immutable snapshot slicing, ordered iteration with
   nested reads, alias-wide shape invalidation and cleanup across structured
   exits, evaluation order, and
-  geometric growth through the HIR
-  and MIR oracles and a real native QBE artifact. ARC and reclamation remain
-  explicit later list slices.
+  geometric growth, recursive ARC, and storage reclamation through the HIR
+  and MIR oracles, Wasm, and a real native QBE artifact.
 - `strings.luc` proves exact raw and escaped text/byte spellings, escaping
   owned concatenation and explicit disposal of an owned temporary, distinct
   byte/scalar lengths, Unicode scalar iteration, and lexicographic ordering
@@ -96,8 +100,8 @@ artifacts are never imported.
 The fixed-array slice, Brainfuck gate, and first runtime-backed list slice
 remove allocation-free dense storage, nontrivial byte-driven interpreter
 control flow, and basic growable sequence storage from this map. The remaining
-small and medium programs still need collection iteration, maps/sets, bytes slicing,
-text construction, files, and host services. Canonical MIR never manufactures
+small and medium programs still need maps/sets, text construction, files, and
+host services. Canonical MIR never manufactures
 target byte sizes or prescribes memory growth; allocator and collection policy
 remain in the runtime rather than HIR, MIR, or the compiler itself.
 

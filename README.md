@@ -88,7 +88,9 @@ examples and tests link back here rather than restating it.
   byte-sequence lengths, fixed arrays, reference lists (literals, shared
   identity, length, checked get/set, append, insert, removal, clear, and
   reserve, plus shallow independent copies and immutable snapshots), tuples,
-  optionals,
+  optionals, nominal classes with explicit construction, shared identity,
+  strong ARC, optional weak fields, deterministic destruction, and
+  initialization/resurrection analysis,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
@@ -112,7 +114,9 @@ examples and tests link back here rather than restating it.
   literals, identity, checked access and shape mutation, aggregate elements,
   growth, shallow copies, immutable snapshot slices, ordered list iteration
   with alias-wide shape-mutation invalidation, and collection-recursive
-  value shapes with structural retain/release and storage reclamation, direct
+  value shapes with structural retain/release and storage reclamation,
+  nominal classes with shared mutation, identity, strong/weak lifetime,
+  fallible construction cleanup, and reverse-order destruction, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,
