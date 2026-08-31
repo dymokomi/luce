@@ -47,6 +47,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   supplied explicitly. Owner-dependent constraints, defaults, recursion,
   mutation, and concrete/generic struct, class, and enum receivers specialize
   to ordinary functions through both semantic oracles, Wasm, and native QBE.
+- `generic_construction.luc` proves custom initialization of generic structs
+  and type functions on generic structs, classes, and enums. Owner arguments
+  are inferred from arguments or result context, or supplied explicitly, and
+  every construction specializes to ordinary functions through both semantic
+  oracles, Wasm, and native QBE.
 - `constrained_generics.luc` proves nominal interface requirements, explicit
   conformance, statically dispatched generic constraints, a constrained
   generic-struct method specialized from its applied receiver, concrete

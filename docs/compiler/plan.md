@@ -209,16 +209,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
-  339-line orchestration facade, a 2,253-line program-wide declaration
-  collector, a 1,150-line shared typed transaction/model, a 2,967-line body
-  checker, and focused 599- and 291-line generic function/nominal owners.
+  343-line orchestration facade, a 2,251-line program-wide declaration
+  collector, a 1,149-line shared typed transaction/model, a 3,005-line body
+  checker, and focused 658- and 291-line generic function/nominal owners.
   Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
-  MIR lowerer is likewise a small whole-program coordinator, one shared
-  identity/type/state transaction, and one 3,514-line function walk.
+  MIR lowerer is likewise a 186-line whole-program coordinator, one 865-line
+  identity/type/state transaction, and one 3,955-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
   transaction. The class slice completed that ownership review: class ARC,
@@ -590,9 +590,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Finish the remaining generic surface.** Memberwise generic structs,
   enums, and classes, including their owner-parameterized
   value/mutating/lifecycle methods, independently generic instance methods,
-  and concrete conformances are complete through both oracles and artifact
-  backends (`done.md` §2). Custom generic-nominal initializers/type functions,
-  serialized typed bodies,
+  custom initializers and type functions, and concrete conformances are
+  complete through both oracles and artifact backends (`done.md` §2).
+  Serialized typed bodies,
   package/CLI budget configuration,
   origin/size/time expansion accounting, and path-rich budget diagnostics also
   remain. Keep monomorphization out of canonical MIR.
