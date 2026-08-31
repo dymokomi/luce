@@ -89,8 +89,8 @@ examples and tests link back here rather than restating it.
   identity, length, checked get/set, append, insert, removal, clear, and
   reserve, plus shallow independent copies and immutable snapshots), tuples,
   optionals, nominal classes with explicit construction, shared identity,
-  strong ARC, optional weak fields, deterministic destruction, and
-  initialization/resurrection analysis,
+  strong ARC, optional weak fields, first-class `Weak[T]` handles,
+  deterministic destruction, and initialization/resurrection analysis,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical

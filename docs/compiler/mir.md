@@ -586,8 +586,9 @@ result → a scalar and error pointer, never a
 type;
 tuples → anonymous `Struct`; `array[T, N]` → `Array(T, N)` with `N` retained
 as a target-neutral type fact and element placement deferred to the backend;
-class references → `Class(id)` and weak field storage → `WeakClass(id)`, with
-their field schema and generated `(class, initialized)` destroyer in
+class references → `Class(id)` and both weak field storage and source
+`Weak[T]` values → `WeakClass(id)`, with their field schema and generated
+`(class, initialized)` destroyer in
 `MirProgram.classes`; interface values → a two-`Ptr` `Struct`.
 
 Aggregates never sit in a register. The lowerer's protocol: a register of

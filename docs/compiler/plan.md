@@ -205,13 +205,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   managed-language family.** The former 4,299-line HIR class is now a
   166-line orchestration facade, a 1,111-line program-wide
   declaration collector, a shared typed transaction/model, and one
-  2,603-line body checker. Declaration defaults cross that boundary through
+  2,631-line body checker. Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
   MIR lowerer is likewise a small whole-program coordinator, one shared
-  identity/type/state transaction, and one 3,494-line function walk.
+  identity/type/state transaction, and one 3,514-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
   transaction. The class slice completed that ownership review: class ARC,
@@ -534,10 +534,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   transitive borrowed receiver helpers. Strong/weak runtime counts, atomic
   weak zeroing, fallible-initializer cleanup, and reverse field destruction
   agree through both oracles, QBE, Wasm, and `examples/classes.luc`.
-- [ ] **Finish the remaining §11 class contract.** Add compiler-known
-  `Weak[T]` values for dynamic weak collections, directly provable strong-cycle
-  diagnostics, resource/reentrancy lints, and the remaining rule-by-rule
-  negative matrix before promoting §11 from partial to complete.
+- [x] **Compiler-known `Weak[T]` values** (2026-08-31). `T` is an exact class
+  identity, `Weak(value)` creates no strong edge, copies retain only the weak
+  handle, and `get()` atomically returns owned `T?`. Dynamic weak collections,
+  stored weak value fields, destruction-time creation from borrowed `self`,
+  and C-boundary rejection agree through HIR, MIR, QBE, and Wasm without user
+  generic machinery or target layout.
+- [ ] **Finish the remaining §11 class contract.** Add directly provable
+  strong-cycle diagnostics, resource/reentrancy lints, and the remaining
+  rule-by-rule negative matrix before promoting §11 from partial to complete.
 - [ ] **Closures.** *Gate: capture rule.*
 - [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
@@ -568,9 +573,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   body semantics over one typed transaction. MIR lowering separates the
   whole-program coordinator and shared identity/type transaction from one
   cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. The remaining 2,603-line HIR body checker
-  and 3,494-line MIR function lowerer stay intact until a language family
-  establishes a narrower ownership boundary. The 2,205-line HIR interpreter
+  forwarding-only collaborators. The remaining 2,631-line HIR body checker
+  and 3,514-line MIR function lowerer stay intact until a language family
+  establishes a narrower ownership boundary. The 2,219-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.

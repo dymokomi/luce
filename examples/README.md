@@ -45,10 +45,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   same example. Dynamic and nullable pointers arriving from C remain later
   boundary work.
 - `classes.luc` proves explicit class construction, alias identity and shared
-  mutation, zeroing weak fields, destruction-time weak stores and dead-weak
-  fallback, transitive borrowed `deinit` helper methods, reverse field
-  destruction, and failed-initializer cleanup through both semantic oracles,
-  Wasm, and native QBE.
+  mutation, zeroing weak fields, first-class `Weak[T]` collections,
+  destruction-time weak stores and dead-weak fallback, transitive borrowed
+  `deinit` helper methods, reverse field destruction, and failed-initializer
+  cleanup through both semantic oracles, Wasm, and native QBE.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases, `let` fields, and `is`/`is not`, checked
   indexed mutation,
