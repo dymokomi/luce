@@ -381,7 +381,9 @@ printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(argu
 "$cli" build --package org.luce.tests "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
 expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
-# Milestone 4: tuples, optionals, strings and bytes as values, print of a value.
+# Milestone 4: tuples, optionals, borrowed strings, and print of a value.
+# Owner-backed bytes require the explicitly composed sealed runtime and execute
+# through Wasmtime in tests/compiler/examples_test.luc.
 cat > "$test_dir/composites.luc" <<'LUCE'
 func pair() -> (i64, i64): return (3, 4)
 pub func destructure() -> i64:
@@ -457,11 +459,6 @@ func pick(flag: bool) -> str:
     return "no"
 func is_yes(s: str) -> bool: return s == "yes"
 pub func string_values() -> i64: return (1 if is_yes(pick(true)) else 0) + (2 if is_yes(pick(false)) else 0)
-pub func bytes_equality() -> i64:
-    let a = b"ab"
-    let c = b"ab"
-    let d = b"ac"
-    return (1 if a == c else 0) + (2 if a == d else 0)
 pub func string_in_tuple() -> i64:
     let a = ("x", 1)
     let b = ("x", 1)
@@ -481,7 +478,6 @@ composite optional_tuple 21
 composite optional_loop 3
 composite string_equality 1011
 composite string_values 1
-composite bytes_equality 1
 composite string_in_tuple 1
 
 printf 'func pick() -> str: return "yes"\npub func main(arguments: slice[str]) -> i32:\n    let greeting = "hi there"\n    print(greeting)\n    print(pick())\n    print("done")\n    return 0\n' > "$test_dir/print_value.luc"

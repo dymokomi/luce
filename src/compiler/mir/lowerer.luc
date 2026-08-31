@@ -18,7 +18,7 @@
 #       short-circuit `and`/`or` and the conditional expression, `if`/`elif`/
 #       `else`, `while` with `break` and `continue`, functions with direct
 #       calls between them across modules, module constants, parameter
-#       defaults, tuples, optionals, `str` and `bytes` values with equality,
+#       defaults, tuples, optionals, `str` and `bytes` values with comparison,
 #       integer range values and `for` iteration, lexical `defer`,
 #       structs with memberwise and custom initializers, fields, methods,
 #       `mutating` methods and type functions,
@@ -41,12 +41,13 @@
 #       a binding, an assignment, a tuple element, a `some` payload, or a
 #       `return`. A tuple is a struct of its elements; an optional is an enum
 #       with a `u8` tag (0 absent, 1 present) and the payload after it; `str`
-#       and `bytes` are `{pointer, u64 length}` whose bytes are a data item
-#       for a literal; a struct is the same `Struct` as a tuple of its field
-#       types (the name lives only in HIR). A function returning an aggregate
+#       is `{pointer, u64 length}`; `bytes` is `{owner, pointer, u64 length}`.
+#       Literal storage has an inert null owner while dynamic bytes retain an
+#       opaque runtime owner. A struct is the same `Struct` as a tuple of its
+#       field types (the name lives only in HIR). A function returning an aggregate
 #       takes a hidden leading `pointer` parameter — the caller's slot for the
 #       result — and returns nothing; an aggregate parameter is passed as a
-#       pointer. The callee never writes through that pointer, with one
+#       pointer. The callee never writes through that pointer, with two
 #       deliberate exceptions: a `mutating` method's `self`, whose stores land
 #       in the caller's `var` slot — that is what `mutating` means, and
 #       HirGenerator has already proved the receiver is a mutable place; and
@@ -616,6 +617,7 @@ pub class Lowerer:
 
     func type_needs_ownership(value_type: TypeId) -> bool:
         match mir_type(self.types, value_type):
+            ByteOwner: return true
             List(element): return true
             Slice(element): return true
             Struct(fields):
@@ -645,6 +647,9 @@ pub class Lowerer:
             self.emit_ownership_call(value_type, value, retaining, span, body)
             return
         match mir_type(self.types, value_type):
+            ByteOwner:
+                if retaining: body.append(MirInstruction(form = InstructionForm.BytesRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.BytesRelease(value = value), span = span))
             List(element):
                 if retaining: body.append(MirInstruction(form = InstructionForm.ListRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.ListRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
@@ -693,6 +698,10 @@ pub class Lowerer:
     # the walk and delegate their identity/buffer counts to the sealed runtime.
     func emit_ownership_at(value_type: TypeId, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
         match mir_type(self.types, value_type):
+            ByteOwner:
+                let value = self.load_value(value_type, address, span, body)
+                if retaining: body.append(MirInstruction(form = InstructionForm.BytesRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.BytesRelease(value = value), span = span))
             List(element):
                 let value = self.load_value(value_type, address, span, body)
                 if retaining:
@@ -740,6 +749,7 @@ pub class Lowerer:
     # complete partial value without target layout or a per-field bit mask.
     func initialize_ownership_at(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]):
         match mir_type(self.types, value_type):
+            ByteOwner: self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             List(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Slice(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Struct(fields):
@@ -967,7 +977,7 @@ pub class Lowerer:
                     try self.lower_prologue_node(module, function, node_at(self.program, elements, position), body)
             List(elements): try self.lower_prologue_run(module, function, elements, body)
             ListCopy(value): try self.lower_prologue_node(module, function, value, body)
-            ListSlice(value, start, end):
+            SequenceSlice(value, start, end):
                 try self.lower_prologue_node(module, function, value, body)
                 if start.value != no_node: try self.lower_prologue_node(module, function, start, body)
                 if end.value != no_node: try self.lower_prologue_node(module, function, end, body)
@@ -1607,7 +1617,7 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.Binary(result = result, operation = BinaryOp.eq, left = address, right = null), span = span))
                 return result
             ListCopy(value): return try self.lower_list_copy(module, function, expression, value, body)
-            ListSlice(value, start, end): return try self.lower_list_slice(module, function, expression, value, start, end, body)
+            SequenceSlice(value, start, end): return try self.lower_sequence_slice(module, function, expression, value, start, end, body)
             ListAppend(value, element): return try self.lower_list_append(module, function, expression, value, element, body)
             ListInsert(value, index, element): return try self.lower_list_insert(module, function, expression, value, index, element, body)
             ListRemoveAt(value, index): return try self.lower_list_remove_at(module, function, expression, value, index, body)
@@ -1638,19 +1648,53 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.ListConcat(result = result, left = left, right = right, element_retain = self.ownership_helper_for(element_type).retain), span = span))
         return result
 
-    func lower_list_slice(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, start: NodeId, end: NodeId, body: list[MirInstruction]) -> RegisterId!:
+    # Dynamic immutable bytes receive one opaque owner from the runtime. MIR
+    # keeps data and length explicit for O(1) reads while ownership remains a
+    # distinct non-address handle that backends cannot accidentally dereference.
+    func lower_bytes_concatenation(value_type: TypeId, left: RegisterId, right: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let left_data = try self.load_field(value_type, left, self.bytes_data_field(), span, body)
+        let left_length = try self.load_field(value_type, left, self.bytes_length_field(), span, body)
+        let right_data = try self.load_field(value_type, right, self.bytes_data_field(), span, body)
+        let right_length = try self.load_field(value_type, right, self.bytes_length_field(), span, body)
+        let owner_type = builtin_mir_type(BuiltinMirType.byte_owner)
+        let owner = self.new_register(owner_type)
+        body.append(MirInstruction(form = InstructionForm.BytesConcat(result = owner, left_data = left_data, left_length = left_length, right_data = right_data, right_length = right_length), span = span))
+        let data = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.BytesData(result = data, owner = owner), span = span))
+        let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = length, operation = BinaryOp.add, left = left_length, right = right_length), span = span))
+        let result = self.new_temp(value_type, span, body)
+        self.store_value(owner_type, self.field_address(value_type, result, self.bytes_owner_field(), span, body), owner, span, body)
+        self.store_value(builtin_mir_type(BuiltinMirType.pointer), self.field_address(value_type, result, self.bytes_data_field(), span, body), data, span, body)
+        self.store_value(builtin_mir_type(BuiltinMirType.unsigned_u64), self.field_address(value_type, result, self.bytes_length_field(), span, body), length, span, body)
+        return result
+
+    func lower_sequence_slice(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, start: NodeId, end: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.program, expression)
         let source = try self.lower_expression(module, function, value, body)
+        let hir_source_type = node_type(self.program, value)
+        let source_type = try self.mir_type_of(module, function, span, hir_source_type)
         var lower = self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), 0, span, body)
         if start.value != no_node: lower = try self.lower_expression(module, function, start, body)
         var upper = lower
         if end.value != no_node: upper = try self.lower_expression(module, function, end, body)
         else:
-            upper = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
-            body.append(MirInstruction(form = InstructionForm.ListLength(result = upper, value = source), span = span))
+            match self.program.types.definitions[hir_source_type.value].form:
+                List(element):
+                    upper = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                    body.append(MirInstruction(form = InstructionForm.ListLength(result = upper, value = source), span = span))
+                Bytes: upper = try self.load_field(source_type, source, self.bytes_length_field(), span, body)
+                else: trap("HIR admitted an unsupported sequence slice")
         let result_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
         let result = self.new_register(result_type)
-        body.append(MirInstruction(form = InstructionForm.ListSlice(result = result, value = source, start = lower, end = upper), span = span))
+        match self.program.types.definitions[hir_source_type.value].form:
+            List(element): body.append(MirInstruction(form = InstructionForm.ListSlice(result = result, value = source, start = lower, end = upper), span = span))
+            Bytes:
+                let owner = try self.load_field(source_type, source, self.bytes_owner_field(), span, body)
+                let data = try self.load_field(source_type, source, self.bytes_data_field(), span, body)
+                let length = try self.load_field(source_type, source, self.bytes_length_field(), span, body)
+                body.append(MirInstruction(form = InstructionForm.BytesSlice(result = result, owner = owner, data = data, length = length, start = lower, end = upper), span = span))
+            else: trap("HIR admitted an unsupported sequence slice")
         return result
 
     func lower_list_append(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, element: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -1892,7 +1936,7 @@ pub class Lowerer:
                         return length
                     else:
                         let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
-                        return try self.load_field(sequence_type, sequence, 1, span, body)
+                        return try self.load_field(sequence_type, sequence, self.byte_length_field(sequence_type), span, body)
             SequenceIndex(value, index):
                 return try self.lower_sequence_index(module, function, span, value, index, body)
             Tuple(elements):
@@ -2039,6 +2083,10 @@ pub class Lowerer:
                                 match operation:
                                     Add(item): return try self.lower_list_concatenation(module, function, span, left_type, left_register, right_register, body)
                                     else: pass
+                            Bytes:
+                                match operation:
+                                    Add(item): return try self.lower_bytes_concatenation(operand_type, left_register, right_register, span, body)
+                                    else: return try self.lower_bytes_comparison(module, function, span, operation, operand_type, left_register, right_register, body)
                             else: pass
                         if self.is_aggregate(operand_type):
                             return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
@@ -2951,18 +2999,22 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.Binary(result = present, operation = BinaryOp.eq, left = tag, right = one), span = span))
         return present
 
-    # A `str` or `bytes` literal: its bytes become a data item and the value
-    # is a fresh `{pointer, length}` slot.
+    # Literal bytes live in immutable program data. A `bytes` value records a
+    # null owner in addition to data and length; null is deliberately inert,
+    # so literals pay no allocation or reference-counting cost.
     func lower_byte_constant(value_type: TypeId, payload: list[u8], span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
         let data_id = self.add_data("bytes", payload)
         let temp = self.new_temp(value_type, span, body)
+        if self.is_bytes_mir_type(value_type):
+            let owner_type = builtin_mir_type(BuiltinMirType.byte_owner)
+            self.store_value(owner_type, self.field_address(value_type, temp, self.bytes_owner_field(), span, body), self.typed_null_constant(owner_type, span, body), span, body)
         let pointer = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.DataAddress(result = pointer, data = DataId(value = u32(data_id))), span = span))
-        let pointer_field = self.field_address(value_type, temp, 0, span, body)
+        let pointer_field = self.field_address(value_type, temp, self.byte_data_field(value_type), span, body)
         body.append(MirInstruction(form = InstructionForm.Store(value_type = builtin_mir_type(BuiltinMirType.pointer), address = pointer_field, value = pointer), span = span))
         let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
         body.append(MirInstruction(form = InstructionForm.Const(result = length, value = MirConstant.Int(value = len(payload))), span = span))
-        let length_field = self.field_address(value_type, temp, 1, span, body)
+        let length_field = self.field_address(value_type, temp, self.byte_length_field(value_type), span, body)
         body.append(MirInstruction(form = InstructionForm.Store(value_type = builtin_mir_type(BuiltinMirType.unsigned_u64), address = length_field, value = length), span = span))
         return temp
 
@@ -2990,9 +3042,9 @@ pub class Lowerer:
                 return self.load_value(element_type, address, span, body)
             else:
                 let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
-                let length = try self.load_field(sequence_type, sequence, 1, span, body)
+                let length = try self.load_field(sequence_type, sequence, self.byte_length_field(sequence_type), span, body)
                 let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
-                let byte_data = try self.load_field(sequence_type, sequence, 0, span, body)
+                let byte_data = try self.load_field(sequence_type, sequence, self.byte_data_field(sequence_type), span, body)
                 let address = self.checked_element_address_with_length(byte_type, byte_data, position, length, span, body)
                 return self.load_value(byte_type, address, span, body)
 
@@ -3198,6 +3250,93 @@ pub class Lowerer:
         self.emit_end(span, body)
         return result
 
+    func lower_bytes_comparison(module: HirModule, function: HirFunction, span: SourceSpan, operation: BinaryOperation, value_type: TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        match operation:
+            Equal(item): return try self.lower_bytes_equality(value_type, left, right, span, body)
+            NotEqual(item):
+                let equal = try self.lower_bytes_equality(value_type, left, right, span, body)
+                let result = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Unary(result = result, operation = UnaryOp.bool_not, operand = equal), span = span))
+                return result
+            Less(item): return try self.lower_bytes_ordering(operation, value_type, left, right, span, body)
+            LessEqual(item): return try self.lower_bytes_ordering(operation, value_type, left, right, span, body)
+            Greater(item): return try self.lower_bytes_ordering(operation, value_type, left, right, span, body)
+            GreaterEqual(item): return try self.lower_bytes_ordering(operation, value_type, left, right, span, body)
+            else: try self.fail_unsupported(module, function, span, "operation `" + str(operation) + "` on `bytes`")
+        return RegisterId(value = no_register)
+
+    # Return the requested relation over the first differing byte, or over
+    # lengths when one byte sequence is an exact prefix of the other.
+    func lower_bytes_ordering(operation: BinaryOperation, value_type: TypeId, left: RegisterId, right: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let order_type = builtin_mir_type(BuiltinMirType.signed_i8)
+        let left_length = try self.load_field(value_type, left, self.bytes_length_field(), span, body)
+        let right_length = try self.load_field(value_type, right, self.bytes_length_field(), span, body)
+        let left_data = try self.load_field(value_type, left, self.bytes_data_field(), span, body)
+        let right_data = try self.load_field(value_type, right, self.bytes_data_field(), span, body)
+        let left_is_not_longer = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = left_is_not_longer, operation = BinaryOp.le, left = left_length, right = right_length), span = span))
+        let shared_length = self.new_register(index_type)
+        self.open_if(left_is_not_longer, [shared_length], span, body)
+        self.emit_yield(left_length, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(right_length, span, body)
+        self.emit_end(span, body)
+
+        let length_order = self.new_register(order_type)
+        let lengths_equal = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = lengths_equal, operation = BinaryOp.eq, left = left_length, right = right_length), span = span))
+        self.open_if(lengths_equal, [length_order], span, body)
+        self.emit_yield(self.integer_constant(order_type, 0, span, body), span, body)
+        self.emit_else(span, body)
+        let unequal_length_order = self.new_register(order_type)
+        self.open_if(left_is_not_longer, [unequal_length_order], span, body)
+        self.emit_yield(self.integer_constant(order_type, -1, span, body), span, body)
+        self.emit_else(span, body)
+        self.emit_yield(self.integer_constant(order_type, 1, span, body), span, body)
+        self.emit_end(span, body)
+        self.emit_yield(unequal_length_order, span, body)
+        self.emit_end(span, body)
+
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+        let ordering = self.new_register(order_type)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.operands.run([ordering])), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = shared_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = self.operands.run([length_order])), span = span))
+        let left_address = self.element_address(byte_type, left_data, index, span, body)
+        let right_address = self.element_address(byte_type, right_data, index, span, body)
+        let left_byte = self.load_value(byte_type, left_address, span, body)
+        let right_byte = self.load_value(byte_type, right_address, span, body)
+        let less = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = less, operation = BinaryOp.lt, left = left_byte, right = right_byte), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = less, depth = 1, values = self.operands.run([self.integer_constant(order_type, -1, span, body)])), span = span))
+        let greater = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = greater, operation = BinaryOp.gt, left = left_byte, right = right_byte), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = greater, depth = 1, values = self.operands.run([self.integer_constant(order_type, 1, span, body)])), span = span))
+        let next = self.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+        var relation = BinaryOp.lt
+        match operation:
+            Less(item): relation = BinaryOp.lt
+            LessEqual(item): relation = BinaryOp.le
+            Greater(item): relation = BinaryOp.gt
+            GreaterEqual(item): relation = BinaryOp.ge
+            else: trap("non-ordering operation reached byte ordering")
+        let result = self.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = result, operation = relation, left = ordering, right = self.integer_constant(order_type, 0, span, body)), span = span))
+        return result
+
     # Same length, then the same bytes: a counter in a slot drives a loop
     # that leaves its block with `false` at the first mismatch and `true`
     # when the counter reaches the length.
@@ -3205,14 +3344,14 @@ pub class Lowerer:
         let boolean = builtin_mir_type(BuiltinMirType.boolean)
         let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
         let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
-        let left_length = try self.load_field(text_type, left, 1, span, body)
-        let right_length = try self.load_field(text_type, right, 1, span, body)
+        let left_length = try self.load_field(text_type, left, self.byte_length_field(text_type), span, body)
+        let right_length = try self.load_field(text_type, right, self.byte_length_field(text_type), span, body)
         let same_length = self.new_register(boolean)
         body.append(MirInstruction(form = InstructionForm.Binary(result = same_length, operation = BinaryOp.eq, left = left_length, right = right_length), span = span))
         let result = self.new_register(boolean)
         self.open_if(same_length, [result], span, body)
-        let left_bytes = try self.load_field(text_type, left, 0, span, body)
-        let right_bytes = try self.load_field(text_type, right, 0, span, body)
+        let left_bytes = try self.load_field(text_type, left, self.byte_data_field(text_type), span, body)
+        let right_bytes = try self.load_field(text_type, right, self.byte_data_field(text_type), span, body)
         let counter = self.new_temp(index_type, span, body)
         let zero = self.new_register(index_type)
         body.append(MirInstruction(form = InstructionForm.Const(result = zero, value = MirConstant.Int(value = 0)), span = span))
@@ -3309,14 +3448,14 @@ pub class Lowerer:
         # Composites are interned structurally, so two `(i64, bool)` tuples
         # share one MIR type and the verifier sees each layout once.
         match self.program.types.definitions[value.value].form:
-            String: return self.byte_string_type()
-            Bytes: return self.byte_string_type()
+            String: return self.string_type()
+            Bytes: return self.bytes_type()
             ErrorCode:
-                let fields = [self.byte_string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
+                let fields = [self.string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
                 return self.intern_lowered_type(make_struct_type(fields))
             Error:
                 let code = try self.lower_mir_type(resolve_builtin_type(BuiltinType.error_code))
-                let fields = [code, self.byte_string_type()]
+                let fields = [code, self.string_type()]
                 return self.intern_lowered_type(make_struct_type(fields))
             Tuple(elements):
                 let field_types = list[TypeId]()
@@ -3462,10 +3601,42 @@ pub class Lowerer:
                 return none
             else: return none
 
-    # `str` and `bytes` share one shape: a pointer to the bytes and their count.
-    func byte_string_type() -> TypeId:
+    # Text literals remain allocation-free borrowed program data. Immutable
+    # bytes add an opaque owner so a slice can safely escape dynamic storage.
+    func string_type() -> TypeId:
         let fields = [builtin_mir_type(BuiltinMirType.pointer), builtin_mir_type(BuiltinMirType.unsigned_u64)]
         return self.intern_lowered_type(make_struct_type(fields))
+
+    func bytes_type() -> TypeId:
+        let fields = [
+            builtin_mir_type(BuiltinMirType.byte_owner),
+            builtin_mir_type(BuiltinMirType.pointer),
+            builtin_mir_type(BuiltinMirType.unsigned_u64),
+        ]
+        return self.intern_lowered_type(make_struct_type(fields))
+
+    func is_bytes_mir_type(value_type: TypeId) -> bool:
+        match mir_type(self.types, value_type):
+            Struct(fields):
+                if len(fields) != 3: return false
+                match mir_type(self.types, fields[0].value_type):
+                    ByteOwner: pass
+                    else: return false
+                if not is_ptr_type(self.types, fields[1].value_type): return false
+                return fields[2].value_type.value == builtin_mir_type(BuiltinMirType.unsigned_u64).value
+            else: return false
+
+    func byte_data_field(value_type: TypeId) -> i64:
+        if self.is_bytes_mir_type(value_type): return self.bytes_data_field()
+        return 0
+
+    func byte_length_field(value_type: TypeId) -> i64:
+        if self.is_bytes_mir_type(value_type): return self.bytes_length_field()
+        return 1
+
+    func bytes_owner_field() -> i64: return 0
+    func bytes_data_field() -> i64: return 1
+    func bytes_length_field() -> i64: return 2
 
     func fallible_inner(value: ir.TypeId) -> ir.TypeId?:
         if i64(value.value) >= len(self.program.types.definitions): return none

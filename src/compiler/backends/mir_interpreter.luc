@@ -72,6 +72,8 @@ pub let extern_address_base: i64 = 0x2000000
 pub let list_address_base: i64 = 0x3000000
 ## Immutable slice handles occupy a fourth disjoint address range.
 pub let slice_address_base: i64 = 0x4000000
+## Opaque immutable byte owners occupy a fifth disjoint address range.
+pub let byte_owner_address_base: i64 = 0x5000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -129,18 +131,32 @@ class MirList:
         self.active_iterations = 0
         self.is_alive = true
 
-class MirSlice:
-    let element_type: TypeId
-    let buffer: MirListBuffer
-    let start: i64
+class MirByteBuffer:
+    let data: i64
     let length: i64
     var references: i64
     var is_alive: bool
 
-    pub init(element_type: TypeId, buffer: MirListBuffer, start: i64, length: i64):
+    pub init(data: i64, length: i64):
+        self.data = data
+        self.length = length
+        self.references = 1
+        self.is_alive = true
+
+union MirSliceBacking:
+    List(buffer: MirListBuffer, start: i64)
+    Bytes(owner: i64, data: i64)
+
+class MirSlice:
+    let element_type: TypeId
+    let backing: MirSliceBacking
+    let length: i64
+    var references: i64
+    var is_alive: bool
+
+    pub init(element_type: TypeId, backing: MirSliceBacking, length: i64):
         self.element_type = element_type
-        self.buffer = buffer
-        self.start = start
+        self.backing = backing
         self.length = length
         self.references = 1
         self.is_alive = true
@@ -190,6 +206,7 @@ pub class MirInterpreter: MirExternMemory:
     let data_addresses: list[i64]
     let global_addresses: list[i64]
     let lists: list[MirList]
+    let byte_buffers: list[MirByteBuffer]
     let slices: list[MirSlice]
     var arena_address: i64
     var arena_committed: i64
@@ -210,6 +227,7 @@ pub class MirInterpreter: MirExternMemory:
         self.data_addresses = list[i64]()
         self.global_addresses = list[i64]()
         self.lists = list[MirList]()
+        self.byte_buffers = list[MirByteBuffer]()
         self.slices = list[MirSlice]()
         self.arena_address = 0
         self.arena_committed = 0
@@ -589,7 +607,42 @@ pub class MirInterpreter: MirExternMemory:
                 let upper = int_of(frame.registers[end.value])
                 if lower < 0 or lower > upper or upper > len(storage.buffer.elements): error("mir interpreter: trap: slice bounds out of range")
                 storage.buffer.references += 1
-                self.slices.append(MirSlice(element_type, storage.buffer, lower, upper - lower))
+                self.slices.append(MirSlice(element_type, MirSliceBacking.List(buffer = storage.buffer, start = lower), upper - lower))
+                frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+            BytesRetain(value):
+                let owner = ptr_of(frame.registers[value.value])
+                if owner != 0:
+                    let storage = try self.byte_buffer_at(owner)
+                    storage.references += 1
+            BytesRelease(value):
+                try self.release_byte_buffer(ptr_of(frame.registers[value.value]))
+            BytesConcat(result, left_data, left_length, right_data, right_length):
+                let left_count = int_of(frame.registers[left_length.value])
+                let right_count = int_of(frame.registers[right_length.value])
+                if left_count < 0 or right_count < 0 or left_count > i64_maximum - right_count:
+                    error("mir interpreter: trap: integer overflow")
+                let total = left_count + right_count
+                let data = self.allocate(total, 1)
+                let left_address = ptr_of(frame.registers[left_data.value])
+                let right_address = ptr_of(frame.registers[right_data.value])
+                for offset in range(0, left_count): self.memory[data + offset] = self.memory[left_address + offset]
+                for offset in range(0, right_count): self.memory[data + left_count + offset] = self.memory[right_address + offset]
+                self.byte_buffers.append(MirByteBuffer(data, total))
+                frame.registers[result.value] = MirValue.Ptr(value = byte_owner_address_base + len(self.byte_buffers) - 1)
+            BytesData(result, owner):
+                let storage = try self.byte_buffer_at(ptr_of(frame.registers[owner.value]))
+                frame.registers[result.value] = MirValue.Ptr(value = storage.data)
+            BytesSlice(result, owner, data, length, start, end):
+                let owner_value = ptr_of(frame.registers[owner.value])
+                let source_length = int_of(frame.registers[length.value])
+                let lower = int_of(frame.registers[start.value])
+                let upper = int_of(frame.registers[end.value])
+                if lower < 0 or lower > upper or upper > source_length: error("mir interpreter: trap: slice bounds out of range")
+                if owner_value != 0:
+                    let storage = try self.byte_buffer_at(owner_value)
+                    storage.references += 1
+                let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+                self.slices.append(MirSlice(byte_type, MirSliceBacking.Bytes(owner = owner_value, data = ptr_of(frame.registers[data.value]) + lower), upper - lower))
                 frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
             SliceLength(result, value):
                 let storage = try self.slice_at(frame.registers[value.value])
@@ -604,7 +657,9 @@ pub class MirInterpreter: MirExternMemory:
                     if storage.references <= 0: trap("slice reference count underflow")
                     storage.references -= 1
                     if storage.references == 0:
-                        try self.release_list_buffer(storage.buffer, element_release)
+                        match storage.backing:
+                            List(buffer, start): try self.release_list_buffer(buffer, element_release)
+                            Bytes(owner, data): try self.release_byte_buffer(owner)
                         storage.is_alive = false
             SliceElementAddress(result, value, index):
                 let element_type = self.slice_element_type(frame.function, value)
@@ -612,7 +667,9 @@ pub class MirInterpreter: MirExternMemory:
                 if storage.element_type.value != element_type.value: trap("verified slice index changed element type")
                 let position = int_of(frame.registers[index.value])
                 if position < 0 or position >= storage.length: error("mir interpreter: trap: index out of bounds")
-                frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[storage.start + position])
+                match storage.backing:
+                    List(buffer, start): frame.registers[result.value] = MirValue.Ptr(value = buffer.elements[start + position])
+                    Bytes(owner, data): frame.registers[result.value] = MirValue.Ptr(value = data + position)
             DataAddress(result, data):
                 frame.registers[result.value] = MirValue.Ptr(value = self.data_addresses[data.value])
             GlobalAddress(result, global):
@@ -688,6 +745,20 @@ pub class MirInterpreter: MirExternMemory:
         let storage = self.slices[index]
         if not storage.is_alive: error("mir interpreter: trap: released slice handle")
         return storage
+
+    func byte_buffer_at(owner: i64) -> MirByteBuffer!:
+        let index = owner - byte_owner_address_base
+        if index < 0 or index >= len(self.byte_buffers): error("mir interpreter: trap: invalid byte owner")
+        let storage = self.byte_buffers[index]
+        if not storage.is_alive: error("mir interpreter: trap: released byte owner")
+        return storage
+
+    func release_byte_buffer(owner: i64) -> !:
+        if owner == 0: return
+        let storage = try self.byte_buffer_at(owner)
+        if storage.references <= 0: trap("byte owner reference count underflow")
+        storage.references -= 1
+        if storage.references == 0: storage.is_alive = false
 
     func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, function.registers[value.value]):

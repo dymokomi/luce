@@ -411,7 +411,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   canonical request retains `TypeId`/count, backends derive matching physical
   classes, and allocator policy remains compiled Luce. Structural list/slice
   ownership services and managed element destruction are complete too
-  (`done.md` §2). `write`, `trap`, and string/bytes primitives remain.
+  (`done.md` §2). `write`, `trap`, and the remaining string primitives remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
@@ -423,16 +423,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   too. Ordered list iteration and alias-wide shape-invalidation traps are
   complete, as are recursive list/slice ARC, copy-on-write buffer ownership,
   managed element destruction, and reclamation through QBE and Wasm
-  (`done.md` §2). Continue with maps, sets, strings/bytes builders,
-  ownership-retaining bytes slices, and formatted
-  strings. Structural list equality also waits for a cycle-aware comparison
+  (`done.md` §2). Immutable `bytes` concatenation, lexicographic comparison,
+  and ownership-retaining `slice[u8]` views are complete through both semantic
+  oracles, QBE, and Wasm (`done.md` §2). Continue with maps, sets, text/bytes
+  builders, and formatted strings. Structural list equality also waits for a cycle-aware comparison
   context: recursive value/list graphs are already constructible, so an
   acyclic inline element loop would be an incorrect partial implementation.
-  Do not implement bytes slicing only for static literals: §12.6
-  requires every escaping safe slice to retain hidden ownership. Its backing
-  owner belongs in the forthcoming runtime text/bytes storage model; the
-  current literal `{data, length}` value deliberately cannot forge one. Do not
-  promote the broad §12 row until every operation has its own conformance
+  The bytes implementation follows §12.6 for both static and dynamic sources:
+  `{ByteOwner, data, length}` keeps literal owners inert and dynamic owners
+  retainable without exposing runtime layout. Do not promote the broad §12
+  row until every operation has its own conformance
   evidence.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
 - [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.
