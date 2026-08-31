@@ -105,15 +105,15 @@ examples and tests link back here rather than restating it.
   literals, identity, checked access and shape mutation, aggregate elements,
   growth, shallow copies, immutable snapshot slices, ordered list iteration
   with alias-wide shape-mutation invalidation, and collection-recursive
-  value shapes on the QBE path, direct
+  value shapes with structural retain/release and storage reclamation, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,
   and `print` of a
   literal or a `str` value — is lowered to canonical
-  MIR and encoded as WebAssembly and QBE IL. Wasm independently validates the
-  canonical list operations; the complete list runtime currently executes
-  through QBE because its stable-arena host is native-only.
+  MIR and encoded as WebAssembly and QBE IL. The complete list runtime executes
+  through QBE and Wasm; each backend supplies its stable arena and legalizes
+  target layout only after canonical MIR.
   The complete differential corpus is compiled, linked, and executed through
   QBE 1.3 as both the native oracle and the product native path. QBE IL and
   assembly travel through memory; only a candidate executable is written in a

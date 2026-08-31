@@ -56,7 +56,7 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, ConvertOp, FunctionId, InstructionForm, MirFunction, MirInstruction
+from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirFunction, MirInstruction
 from compiler.mir.canonical import MirProgram, MirTypeTable, RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
 from compiler.mir.canonical import find_runtime_binding, int_maximum, int_minimum, mir_type
@@ -144,6 +144,8 @@ let opcode_f32_store: u8 = 0x38
 let opcode_f64_store: u8 = 0x39
 let opcode_i32_store8: u8 = 0x3A
 let opcode_i32_store16: u8 = 0x3B
+let opcode_memory_size: u8 = 0x3F
+let opcode_memory_grow: u8 = 0x40
 # Constants
 let opcode_i32_const: u8 = 0x41
 let opcode_i64_const: u8 = 0x42
@@ -343,15 +345,14 @@ func encode_table_entry(program: MirProgram, plan: ModulePlan) -> list[u8]:
     append_unsigned(entries, len(program.functions) + len(plan.table_imports))
     return entries
 
-# One memory with no maximum. It holds the scratch area and the data items
-# placed by the data section; with a shadow stack it grows to sixteen pages
-# so the stack has room above the data, otherwise one page (64 KiB) is
-# enough.
+# One memory with no maximum. The shadow stack occupies the first sixteen
+# pages. When the sealed runtime requests its stable arena, that arena begins
+# immediately above those pages and grows memory on demand.
 func encode_memory_entry(plan: ModulePlan) -> list[u8]:
     let entries = list[u8]()
     append_unsigned(entries, 1)
     entries.append(0x00)
-    if plan.has_stack: append_unsigned(entries, stack_pages)
+    if plan.has_stack or plan.has_runtime_arena: append_unsigned(entries, stack_pages)
     else:
         var pages = (plan.data_end + page_size - 1) // page_size
         if pages < 1: pages = 1
@@ -765,22 +766,38 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
-        ListCopy(result, value):
+        ListRetain(value):
+            let service = find_runtime_binding(program, RuntimeService.list_retain) else error("wasm backend: verified `ListRetain` has no runtime binding")
+            local_get(body, value)
+            body.append(opcode_call)
+            append_unsigned(body, defined_function_index(plan, i64(service.value)))
+        ListRelease(value, element_release):
+            let element_type = try list_element_type(types, function, value)
+            let service = find_runtime_binding(program, RuntimeService.list_release) else error("wasm backend: verified `ListRelease` has no runtime binding")
+            local_get(body, value)
+            append_constant(body, plan.layout.size_of(element_type), true)
+            append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_release.value), false)
+            body.append(opcode_call)
+            append_unsigned(body, defined_function_index(plan, i64(service.value)))
+        ListCopy(result, value, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_copy) else error("wasm backend: verified `ListCopy` has no runtime binding")
             local_get(body, value)
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
-        ListConcat(result, left, right):
+        ListConcat(result, left, right, element_retain):
             let element_type = try list_element_type(types, function, left)
             let service = find_runtime_binding(program, RuntimeService.list_concat) else error("wasm backend: verified `ListConcat` has no runtime binding")
             local_get(body, left)
             local_get(body, right)
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
@@ -801,17 +818,18 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             local_get(body, value)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
-        ListAppendSlot(result, value):
+        ListAppendSlot(result, value, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_append_slot) else error("wasm backend: verified `ListAppendSlot` has no runtime binding")
             try encode_list_shape_guard(program, plan, body, value)
             local_get(body, value)
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
-        ListInsertSlot(result, value, index):
+        ListInsertSlot(result, value, index, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_insert_slot) else error("wasm backend: verified `ListInsertSlot` has no runtime binding")
             try encode_list_index_guard(program, plan, body, value, index, true)
@@ -820,10 +838,11 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
             local_get(body, index)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
-        ListRemoveAt(value, index):
+        ListRemoveAt(value, index, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_remove_at) else error("wasm backend: verified `ListRemoveAt` has no runtime binding")
             try encode_list_index_guard(program, plan, body, value, index, false)
@@ -832,26 +851,32 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
             local_get(body, index)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
-        ListClear(value):
+        ListClear(value, element_release):
+            let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_clear) else error("wasm backend: verified `ListClear` has no runtime binding")
             try encode_list_shape_guard(program, plan, body, value)
             local_get(body, value)
+            append_constant(body, plan.layout.size_of(element_type), true)
+            append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_release.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
-        ListReserve(value, minimum_capacity):
+        ListReserve(value, minimum_capacity, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_reserve) else error("wasm backend: verified `ListReserve` has no runtime binding")
             local_get(body, value)
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
             local_get(body, minimum_capacity)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
         ListElementAddress(result, value, index):
             try encode_list_element_address(program, plan, function, body, result, value, index)
-        ListMutableElementAddress(result, value, index):
+        ListMutableElementAddress(result, value, index, element_retain):
             let element_type = try list_element_type(types, function, value)
             let service = find_runtime_binding(program, RuntimeService.list_mutable_element_address) else error("wasm backend: verified `ListMutableElementAddress` has no runtime binding")
             try encode_list_index_guard(program, plan, body, value, index, false)
@@ -859,6 +884,7 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             append_constant(body, plan.layout.size_of(element_type), true)
             append_constant(body, storage_alignment(plan, element_type), true)
             local_get(body, index)
+            append_constant(body, i64(element_retain.value), false)
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
@@ -889,6 +915,20 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             body.append(opcode_call)
             append_unsigned(body, defined_function_index(plan, i64(service.value)))
             local_set(body, result)
+        SliceRetain(value):
+            let service = find_runtime_binding(program, RuntimeService.slice_retain) else error("wasm backend: verified `SliceRetain` has no runtime binding")
+            local_get(body, value)
+            body.append(opcode_call)
+            append_unsigned(body, defined_function_index(plan, i64(service.value)))
+        SliceRelease(value, element_release):
+            let element_type = try slice_element_type(types, function, value)
+            let service = find_runtime_binding(program, RuntimeService.slice_release) else error("wasm backend: verified `SliceRelease` has no runtime binding")
+            local_get(body, value)
+            append_constant(body, plan.layout.size_of(element_type), true)
+            append_constant(body, storage_alignment(plan, element_type), true)
+            append_constant(body, i64(element_release.value), false)
+            body.append(opcode_call)
+            append_unsigned(body, defined_function_index(plan, i64(service.value)))
         SliceElementAddress(result, value, index):
             let element_type = try slice_element_type(types, function, value)
             let length_service = find_runtime_binding(program, RuntimeService.slice_length) else error("wasm backend: verified `SliceElementAddress` has no length binding")
@@ -996,32 +1036,35 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                 local_set(body, register_at(function, results, index))
                 index -= 1
         CallExtern(results, external, arguments):
-            var import_index = -1
-            for index in range(0, len(plan.imports)):
-                if plan.imports[index].external == i64(external.value): import_index = index
-            if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
             let declaration = program.externs[external.value]
-            match declaration.convention:
-                runtime:
-                    # Runtime services are legalized to their Wasm host
-                    # contracts; today only write is implemented.
-                    if declaration.name != "luce_rt_write":
-                        error("wasm backend does not implement runtime service `" + declaration.name + "`")
-                    encode_write(body, import_index, register_at(function, arguments, 0), register_at(function, arguments, 1))
-                c:
-                    for index in range(0, i64(arguments.count)):
-                        local_get(body, register_at(function, arguments, index))
-                    body.append(opcode_call)
-                    append_unsigned(body, import_index)
-                    # Multi-results leave the last value on top. Restore MIR
-                    # locals in reverse and canonicalize narrow C integers.
-                    var index = i64(results.count) - 1
-                    while index >= 0:
-                        let result = register_at(function, results, index)
-                        append_canonicalise(body, try register_kind(types, function, result))
-                        local_set(body, result)
-                        index -= 1
-                luce: error("wasm backend found a Luce-convention extern call")
+            if declaration.convention == CallingConvention.runtime and declaration.name == "luce_rt_arena":
+                try encode_runtime_arena(function, body, results, arguments)
+            else:
+                var import_index = -1
+                for index in range(0, len(plan.imports)):
+                    if plan.imports[index].external == i64(external.value): import_index = index
+                if import_index < 0: error("wasm backend has no import for extern " + str(external.value))
+                match declaration.convention:
+                    runtime:
+                        # Host-facing runtime services are legalized to their
+                        # Wasm contracts. The arena above is backend-provided.
+                        if declaration.name != "luce_rt_write":
+                            error("wasm backend does not implement runtime service `" + declaration.name + "`")
+                        encode_write(body, import_index, register_at(function, arguments, 0), register_at(function, arguments, 1))
+                    c:
+                        for index in range(0, i64(arguments.count)):
+                            local_get(body, register_at(function, arguments, index))
+                        body.append(opcode_call)
+                        append_unsigned(body, import_index)
+                        # Multi-results leave the last value on top. Restore MIR
+                        # locals in reverse and canonicalize narrow C integers.
+                        var index = i64(results.count) - 1
+                        while index >= 0:
+                            let result = register_at(function, results, index)
+                            append_canonicalise(body, try register_kind(types, function, result))
+                            local_set(body, result)
+                            index -= 1
+                    else: error("wasm backend found a Luce-convention extern call")
         Br(depth, values):
             let target = try region_at(regions, depth)
             try set_region_results(body, function, target, values, "`Br`")
@@ -1062,6 +1105,50 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             body.append(opcode_unreachable)
         else:
             error("wasm backend does not support `" + str(instruction.form) + "` yet")
+
+# The sealed arena is a backend capability, not a WASI import. Its stable base
+# is the first byte above the shadow-stack reservation. Each request grows the
+# one linear memory to cover the requested prefix and traps cleanly when the
+# Wasm32 address space or host memory cannot satisfy it.
+func encode_runtime_arena(function: MirFunction, body: list[u8], results: RegisterRun, arguments: RegisterRun) -> !:
+    if results.count != 1 or arguments.count != 1:
+        error("wasm backend: verified arena service has an invalid call shape")
+    let requested_end = register_at(function, arguments, 0)
+    let result = register_at(function, results, 0)
+    let maximum_prefix = 4294967296 - stack_top
+
+    local_get(body, requested_end)
+    append_constant(body, maximum_prefix, true)
+    body.append(opcode_i64_gt_u)
+    append_trap_if_true(body)
+
+    # required_pages = ceil((stack_top + requested_end) / 64 KiB)
+    local_get(body, requested_end)
+    append_constant(body, stack_top + page_size - 1, true)
+    body.append(opcode_i64_add)
+    append_constant(body, 16, true)
+    body.append(opcode_i64_shr_u)
+    body.append(opcode_i32_wrap_i64)
+    body.append(opcode_local_tee)
+    append_unsigned(body, i64(result.value))
+    body.append(opcode_memory_size)
+    body.append(0)
+    body.append(opcode_i32_gt_u)
+    body.append(opcode_if)
+    body.append(empty_block_type)
+    local_get(body, result)
+    body.append(opcode_memory_size)
+    body.append(0)
+    body.append(opcode_i32_sub)
+    body.append(opcode_memory_grow)
+    body.append(0)
+    append_constant(body, -1, false)
+    body.append(opcode_i32_eq)
+    append_trap_if_true(body)
+    body.append(opcode_end)
+
+    append_constant(body, stack_top, false)
+    local_set(body, result)
 
 # `count == 0 ? null : allocator(count * size, align)`. Wasm arithmetic
 # wraps, so the multiplication is guarded before it is emitted. The bound

@@ -23,12 +23,15 @@
 #       structs with memberwise and custom initializers, fields, methods,
 #       `mutating` methods and type functions,
 #       exact named function values and indirect calls,
-#       terminal output of a literal or a `str` value, and returning. The slice boundary lives
-#       here, not in canonical MIR — failure, classes, and collections reach
-#       the lowerer as HIR and stop with "does not support ... yet" until this
-#       file emits the instructions for them. `main(arguments: slice[str])`
-#       is the 1.0 entry signature (docs/language/1.0.md §23); its argument
-#       is dropped until slices exist, so the MIR entry is `() -> i32`.
+#       terminal output of a literal or a `str` value, caller-owned failure,
+#       runtime-backed lists and immutable slices with recursive ownership,
+#       and returning. The slice boundary lives here, not in canonical MIR:
+#       classes, closures, interfaces, generics, maps/sets, and runtime-backed
+#       text still fail with "does not support ... yet" until shared lowering
+#       emits their target-neutral meaning. `main(arguments: slice[str])` is
+#       the 1.0 entry signature (docs/language/1.0.md §23); the current artifact
+#       entry supplies an empty argument slice and therefore exposes `() -> i32`
+#       to the host.
 #
 #       Aggregates — tuples, optionals, `str`, `bytes` — never sit in a
 #       register. A value of aggregate type lives in memory, and the register
@@ -180,12 +183,22 @@ struct ExternalGlobalContract:
     let name: str
     let value_type: ir.TypeId
 
+# One shared pair of structural actions for a canonical value type. Collection
+# runtime services receive these exact private function identities whenever a
+# raw element representation is copied or destroyed.
+struct OwnershipHelper:
+    let value_type: TypeId
+    let retain: FunctionId
+    let release: FunctionId
+
 # Source `defer` statements and semantic compiler cleanups share one lexical
 # LIFO. The latter are explicit canonical MIR actions rather than synthetic
 # HIR nodes, so HIR remains an exact representation of the source program.
 union DeferredAction:
     Source(statement: NodeId)
     ListIteration(value: RegisterId, span: SourceSpan)
+    DestroyAddress(address: RegisterId, value_type: TypeId, span: SourceSpan)
+    OwnedValue(value: RegisterId, value_type: TypeId, span: SourceSpan)
 
 let unlowered_nominal_type: u32 = 4294967295
 
@@ -209,6 +222,8 @@ pub class Lowerer:
     let active_nominal_types: list[u32]
     let c_wrappers: list[CWrapper]
     let c_extern_contracts: list[CExternContract]
+    let ownership_helpers: list[OwnershipHelper]
+    var next_generated_function: u32
     # The register table, slots, live locals, and parameter registers of the
     # function being lowered.
     var registers: list[TypeId]
@@ -247,6 +262,8 @@ pub class Lowerer:
         self.active_nominal_types = list[u32]()
         self.c_wrappers = list[CWrapper]()
         self.c_extern_contracts = list[CExternContract]()
+        self.ownership_helpers = list[OwnershipHelper]()
+        self.next_generated_function = 0
         self.registers = list[TypeId]()
         self.slots = list[MirSlot]()
         self.locals = list[Local]()
@@ -289,6 +306,7 @@ pub class Lowerer:
                         next_definition += 1
                     else:
                         self.c_wrappers.append(CWrapper.Absent)
+        self.next_generated_function = next_definition
         # C objects share the linker namespace with C functions. Equal
         # declarations in several raw modules share one canonical identity.
         for variable in self.program.extern_variables:
@@ -314,6 +332,13 @@ pub class Lowerer:
                     match self.c_wrappers[self.function_index_of(function.symbol)]:
                         Present(wrapper): functions.append(try self.lower_c_wrapper(module, function, false))
                         Absent: pass
+        var helper_index = 0
+        while helper_index < len(self.ownership_helpers):
+            let helper = self.ownership_helpers[helper_index]
+            if len(functions) != i64(helper.retain.value): trap("ownership helper function identities lost declaration order")
+            functions.append(self.lower_ownership_helper(helper.value_type, true, helper.retain))
+            functions.append(self.lower_ownership_helper(helper.value_type, false, helper.release))
+            helper_index += 1
         let entry = self.find_entry(functions)
         let runtime_bindings = self.lower_runtime_bindings()
         return MirProgram(
@@ -550,6 +575,235 @@ pub class Lowerer:
         self.operands = OperandBuilder()
         self.error_slot = -1
         self.result_slot = -1
+
+    # mark: Ownership helpers ==================================================================
+
+    # Reserve both identities before generating either body. Recursive value
+    # shapes can then refer back through list/slice element callbacks without
+    # late patching or backend discovery.
+    func ownership_helper_for(value_type: TypeId) -> OwnershipHelper:
+        for helper in self.ownership_helpers:
+            if helper.value_type.value == value_type.value: return helper
+        let retain = FunctionId(value = self.next_generated_function)
+        let release = FunctionId(value = self.next_generated_function + 1)
+        self.next_generated_function += 2
+        let helper = OwnershipHelper(value_type = value_type, retain = retain, release = release)
+        self.ownership_helpers.append(helper)
+        return helper
+
+    func lower_ownership_helper(value_type: TypeId, retaining: bool, identity: FunctionId) -> MirFunction:
+        self.begin_function()
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let address = self.new_register(pointer)
+        let body = list[MirInstruction]()
+        let span = SourceSpan(start = 0, end = 0, line = 1, column = 1)
+        self.emit_ownership_at(value_type, address, retaining, span, body)
+        body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
+        var operation = "retain"
+        if not retaining: operation = "release"
+        return MirFunction(
+            name = ".luce_" + operation + "_t" + str(value_type.value),
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = [pointer], results = list[TypeId](), is_fallible = false),
+            registers = self.registers,
+            slots = self.slots,
+            body = body,
+            operands = self.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = span,
+        )
+
+    func type_needs_ownership(value_type: TypeId) -> bool:
+        match mir_type(self.types, value_type):
+            List(element): return true
+            Slice(element): return true
+            Struct(fields):
+                for field in fields:
+                    if self.type_needs_ownership(field.value_type): return true
+                return false
+            Array(element, count): return count > 0 and self.type_needs_ownership(element)
+            Enum(tag, cases):
+                for case_type in cases:
+                    if self.type_needs_ownership(case_type): return true
+                return false
+            else: return false
+
+    func emit_ownership_call(value_type: TypeId, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
+        if not self.type_needs_ownership(value_type): return
+        let helper = self.ownership_helper_for(value_type)
+        var target = helper.retain
+        if not retaining: target = helper.release
+        body.append(MirInstruction(form = InstructionForm.Call(results = no_registers(), function = target, arguments = self.operands.run([address])), span = span))
+
+    # Scalar collection handles travel in registers; structural values travel
+    # by address. This is the single bridge from that MIR value protocol to
+    # the shared address-based ownership helpers.
+    func emit_value_ownership(value_type: TypeId, value: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
+        if not self.type_needs_ownership(value_type): return
+        if self.is_aggregate(value_type):
+            self.emit_ownership_call(value_type, value, retaining, span, body)
+            return
+        match mir_type(self.types, value_type):
+            List(element):
+                if retaining: body.append(MirInstruction(form = InstructionForm.ListRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.ListRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
+            Slice(element):
+                if retaining: body.append(MirInstruction(form = InstructionForm.SliceRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.SliceRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
+            else: trap("managed scalar has no ownership operation")
+
+    # Every managed expression result owns one structural reference. A value
+    # copied from existing storage first retains that reference; a constructor
+    # or call already produces it. Full-expression cleanup consumes any value
+    # not transferred into longer-lived storage.
+    func remember_owned_value(value: RegisterId, value_type: TypeId, span: SourceSpan):
+        self.defers.append(DeferredAction.OwnedValue(value = value, value_type = value_type, span = span))
+
+    func take_owned_value(value: RegisterId) -> bool:
+        var index = len(self.defers) - 1
+        while index >= 0:
+            match self.defers[index]:
+                OwnedValue(candidate, value_type, span):
+                    if candidate.value == value.value:
+                        self.defers.remove(index)
+                        return true
+                else: pass
+            index -= 1
+        return false
+
+    # Initialize unowned storage by moving an expression's +1 when possible;
+    # a raw borrowed value is retained before the byte/register copy.
+    func initialize_owned_value(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        if self.type_needs_ownership(value_type) and not self.take_owned_value(value):
+            self.emit_value_ownership(value_type, value, true, span, body)
+        self.store_value(value_type, address, value, span, body)
+
+    # Assignment establishes the incoming +1 before dropping the old one, so
+    # self-assignment and references into the destination remain valid.
+    func replace_owned_value(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        if not self.type_needs_ownership(value_type):
+            self.store_value(value_type, address, value, span, body)
+            return
+        if not self.take_owned_value(value): self.emit_value_ownership(value_type, value, true, span, body)
+        self.emit_ownership_call(value_type, address, false, span, body)
+        self.store_value(value_type, address, value, span, body)
+
+    # Recursion follows only by-value structure. List and slice handles stop
+    # the walk and delegate their identity/buffer counts to the sealed runtime.
+    func emit_ownership_at(value_type: TypeId, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
+        match mir_type(self.types, value_type):
+            List(element):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining:
+                    body.append(MirInstruction(form = InstructionForm.ListRetain(value = value), span = span))
+                else:
+                    let element_release = self.ownership_helper_for(element).release
+                    body.append(MirInstruction(form = InstructionForm.ListRelease(value = value, element_release = element_release), span = span))
+            Slice(element):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining:
+                    body.append(MirInstruction(form = InstructionForm.SliceRetain(value = value), span = span))
+                else:
+                    let element_release = self.ownership_helper_for(element).release
+                    body.append(MirInstruction(form = InstructionForm.SliceRelease(value = value, element_release = element_release), span = span))
+            Struct(fields):
+                if retaining:
+                    for index in range(0, len(fields)):
+                        let field = fields[index]
+                        self.emit_ownership_call(field.value_type, self.field_address(value_type, address, index, span, body), true, span, body)
+                else:
+                    var index = len(fields) - 1
+                    while index >= 0:
+                        let field = fields[index]
+                        self.emit_ownership_call(field.value_type, self.field_address(value_type, address, index, span, body), false, span, body)
+                        index -= 1
+            Array(element, count):
+                if count > 0 and self.type_needs_ownership(element):
+                    self.emit_array_ownership(value_type, element, count, address, retaining, span, body)
+            Enum(tag, cases):
+                let selected = self.load_tag(address, span, body)
+                for index in range(0, len(cases)):
+                    let case_type = cases[index]
+                    if self.type_needs_ownership(case_type):
+                        let wanted = self.integer_constant(tag, index, span, body)
+                        let matches = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                        body.append(MirInstruction(form = InstructionForm.Binary(result = matches, operation = BinaryOp.eq, left = selected, right = wanted), span = span))
+                        self.open_if(matches, list[RegisterId](), span, body)
+                        self.emit_ownership_call(case_type, self.payload_address(value_type, address, span, body), retaining, span, body)
+                        self.emit_end(span, body)
+            else: pass
+
+    # Fresh custom-initializer storage has no source value yet. Initialize
+    # only its ownership-bearing representation so ordinary field assignment
+    # may replace null handles safely and a failed initializer can destroy the
+    # complete partial value without target layout or a per-field bit mask.
+    func initialize_ownership_at(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        match mir_type(self.types, value_type):
+            List(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Slice(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Struct(fields):
+                for index in range(0, len(fields)):
+                    let field = fields[index]
+                    if self.type_needs_ownership(field.value_type):
+                        self.initialize_ownership_at(field.value_type, self.field_address(value_type, address, index, span, body), span, body)
+            Array(element, count):
+                if count > 0 and self.type_needs_ownership(element):
+                    self.initialize_array_ownership(element, count, address, span, body)
+            Enum(tag, cases):
+                self.store_tag(address, 0, span, body)
+                if len(cases) > 0 and self.type_needs_ownership(cases[0]):
+                    self.initialize_ownership_at(cases[0], self.payload_address(value_type, address, span, body), span, body)
+            else: pass
+
+    func initialize_array_ownership(element_type: TypeId, count: i64, address: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = self.integer_constant(index_type, count, span, body)), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+        self.initialize_ownership_at(element_type, self.element_address(element_type, address, index, span, body), span, body)
+        let next = self.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+    func emit_array_ownership(array_type: TypeId, element_type: TypeId, count: i64, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let counter = self.new_temp(index_type, span, body)
+        var initial = 0
+        if not retaining: initial = count
+        self.store_value(index_type, counter, self.integer_constant(index_type, initial, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        var index = self.load_value(index_type, counter, span, body)
+        var boundary_value = 0
+        if retaining: boundary_value = count
+        let boundary = self.integer_constant(index_type, boundary_value, span, body)
+        let done = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        var operation = BinaryOp.eq
+        if retaining: operation = BinaryOp.ge
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = operation, left = index, right = boundary), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+        if not retaining:
+            let previous = self.new_register(index_type)
+            body.append(MirInstruction(form = InstructionForm.Binary(result = previous, operation = BinaryOp.sub, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+            index = previous
+            self.store_value(index_type, counter, index, span, body)
+        self.emit_ownership_call(element_type, self.element_address(element_type, address, index, span, body), retaining, span, body)
+        if retaining:
+            let next = self.new_register(index_type)
+            body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+            self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
 
     # One target-neutral C adapter. The source body remains an ordinary
     # Luce-convention function so source calls never acquire boundary traps or
@@ -794,6 +1048,7 @@ pub class Lowerer:
     # Append the instructions for one HIR statement. For example, `return 7`
     # emits a constant into a fresh register and returns that register.
     func lower_statement(module: HirModule, function: HirFunction, statement: NodeId, body: list[MirInstruction]) -> !:
+        let temporary_start = len(self.defers)
         let span = node_span(self.program, statement)
         match node_form(self.program, statement):
             PrintText(value):
@@ -814,8 +1069,11 @@ pub class Lowerer:
                 if self.result_slot >= 0:
                     # The caller owns the result's memory; fill it and return nothing.
                     let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
-                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.result_slot)), source = register, value_type = value_type), span = span))
+                    self.initialize_owned_value(value_type, RegisterId(value = u32(self.result_slot)), register, span, body)
                 else:
+                    let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
+                    if self.type_needs_ownership(value_type) and not self.take_owned_value(register):
+                        self.emit_value_ownership(value_type, register, true, span, body)
                     returned.append(register)
                 try self.emit_deferred_from(module, function, 0, body)
                 if self.error_slot >= 0: returned.append(self.null_constant(span, body))
@@ -836,7 +1094,9 @@ pub class Lowerer:
                 let local = try self.local_of(module, function, span, symbol)
                 let register = try self.lower_expression(module, function, value, body)
                 let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
-                self.store_value(value_type, local.address, register, span, body)
+                self.initialize_owned_value(value_type, local.address, register, span, body)
+                if self.type_needs_ownership(value_type):
+                    self.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = value_type, span = span))
             Assignment(symbol, operation, value):
                 let address = try self.address_of(module, function, span, symbol)
                 let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
@@ -878,6 +1138,7 @@ pub class Lowerer:
                 try self.emit_loop_deferred(module, function, span, body)
                 body.append(MirInstruction(form = InstructionForm.Br(depth = try self.continue_depth(module, function, span), values = no_registers()), span = span))
             else: try self.fail_unsupported(module, function, span, "an expression node where a statement was expected")
+        try self.emit_temporaries_from(temporary_start, body)
 
     # Walk one resolved target-neutral field/element path from either a local
     # slot or sealed-runtime global, then perform the shared store protocol.
@@ -911,8 +1172,9 @@ pub class Lowerer:
                 match self.program.types.definitions[place_type.value].form:
                     List(element): element_type = element
                     else: trap("list assignment step has a non-list HIR type")
+                let mir_element = try self.mir_type_of(module, function, span, element_type)
                 address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = index), span = span))
+                body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = index, element_retain = self.ownership_helper_for(mir_element).retain), span = span))
                 place_type = element_type
             else: trap("place assignment has an unknown step")
         let value_type = try self.mir_type_of(module, function, span, place_type)
@@ -928,7 +1190,7 @@ pub class Lowerer:
                 let current = self.new_register(value_type)
                 body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = address), span = span))
                 stored = try self.lower_binary_operation(module, function, span, binary, value_type, current, register, body)
-        self.store_value(value_type, address, stored, span, body)
+        self.replace_owned_value(value_type, address, stored, span, body)
 
     # The address a mutable binding lives at: a local's slot, or — for `self`
     # in a mutating method — the pointer the caller passed.
@@ -972,7 +1234,9 @@ pub class Lowerer:
     # fallback. Each arm is its own region, so registers defined inside stay
     # inside; locals reach across through their slots.
     func lower_if(module: HirModule, function: HirFunction, span: SourceSpan, branches: Operands, index: i64, has_fallback: bool, fallback: Operands, body: list[MirInstruction]) -> !:
+        let condition_start = len(self.defers)
         let condition = try self.lower_expression(module, function, self.branch_condition(branches, index), body)
+        try self.emit_temporaries_from(condition_start, body)
         self.open_if(condition, list[RegisterId](), span, body)
         try self.lower_region(module, function, Region.if_arm, self.branch_body(branches, index), body)
         if index + 1 < i64(branches.count) // 3:
@@ -994,10 +1258,12 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.Loop, span = span))
         self.regions.append(Region.block)
         self.regions.append(Region.loop_body)
+        let condition_start = len(self.defers)
         let tested = try self.lower_expression(module, function, condition, body)
         let failed = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
         let condition_span = node_span(self.program, condition)
         body.append(MirInstruction(form = InstructionForm.Unary(result = failed, operation = UnaryOp.bool_not, operand = tested), span = condition_span))
+        try self.emit_temporaries_from(condition_start, body)
         body.append(MirInstruction(form = InstructionForm.BrIf(condition = failed, depth = 1, values = no_registers()), span = condition_span))
         try self.lower_loop_scope(module, function, statements, body)
         body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
@@ -1113,11 +1379,18 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = element_address, value = list_value, index = index), span = span))
         let element = self.load_value(element_type, element_address, span, body)
         let binding = (try self.local_of(module, function, span, symbol)).address
-        self.store_value(element_type, binding, element, span, body)
+        self.initialize_owned_value(element_type, binding, element, span, body)
 
         body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
         self.regions.append(Region.for_continue)
-        try self.lower_loop_scope(module, function, statements, body)
+        let iteration_start = len(self.defers)
+        if self.type_needs_ownership(element_type):
+            self.defers.append(DeferredAction.DestroyAddress(address = binding, value_type = element_type, span = span))
+        self.loop_defer_starts.append(iteration_start)
+        try self.lower_scope(module, function, statements, body)
+        self.loop_defer_starts.remove(len(self.loop_defer_starts) - 1)
+        try self.emit_deferred_from(module, function, iteration_start, body)
+        while len(self.defers) > iteration_start: self.defers.remove(len(self.defers) - 1)
         self.regions.remove(len(self.regions) - 1)
         self.emit_end(span, body)
 
@@ -1145,6 +1418,12 @@ pub class Lowerer:
     # before their branch or return.
     func lower_scope(module: HirModule, function: HirFunction, statements: Operands, body: list[MirInstruction]) -> !:
         let start = len(self.defers)
+        try self.lower_scope_from(module, function, statements, start, body)
+
+    # Lower a suite whose active lifetime began before its first statement.
+    # Match payload bindings use this form because their storage belongs to
+    # the selected arm and must be destroyed with the arm's local bindings.
+    func lower_scope_from(module: HirModule, function: HirFunction, statements: Operands, start: i64, body: list[MirInstruction]) -> !:
         for position in range(0, i64(statements.count)):
             try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         try self.emit_deferred_from(module, function, start, body)
@@ -1165,6 +1444,20 @@ pub class Lowerer:
             match self.defers[index]:
                 Source(statement): try self.lower_statement(module, function, statement, body)
                 ListIteration(value, span): body.append(MirInstruction(form = InstructionForm.ListIterationEnd(value = value), span = span))
+                DestroyAddress(address, value_type, span): self.emit_ownership_call(value_type, address, false, span, body)
+                OwnedValue(value, value_type, span): self.emit_value_ownership(value_type, value, false, span, body)
+            index -= 1
+
+    # End a full expression without disturbing lexical source/compiler
+    # cleanups registered by the statement itself.
+    func emit_temporaries_from(start: i64, body: list[MirInstruction]) -> !:
+        var index = len(self.defers) - 1
+        while index >= start:
+            match self.defers[index]:
+                OwnedValue(value, value_type, span):
+                    self.emit_value_ownership(value_type, value, false, span, body)
+                    self.defers.remove(index)
+                else: pass
             index -= 1
 
     func emit_loop_deferred(module: HirModule, function: HirFunction, span: SourceSpan, body: list[MirInstruction]) -> !:
@@ -1236,10 +1529,35 @@ pub class Lowerer:
 
     # mark: Expressions =========================================================================
 
-    # Lower one expression and return the register holding its value.
+    # Lower one expression and return an owned managed result. Scalar values
+    # need no lifetime bookkeeping. A read from existing storage retains its
+    # recursive value; constructors, collection operations, and calls already
+    # produce the +1 which this full expression owns.
+    func lower_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let value = try self.lower_expression_form(module, function, expression, body)
+        if value.value == no_register: return value
+        let span = node_span(self.program, expression)
+        let value_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
+        if not self.type_needs_ownership(value_type): return value
+        if self.expression_borrows_ownership(expression):
+            self.emit_value_ownership(value_type, value, true, span, body)
+        self.remember_owned_value(value, value_type, span)
+        return value
+
+    func expression_borrows_ownership(expression: NodeId) -> bool:
+        match node_form(self.program, expression):
+            Reference(symbol): return true
+            ExternLoad(variable): return true
+            GlobalLoad(global): return true
+            NativeLoad(pointer): return true
+            SequenceIndex(value, index): return true
+            Element(value, index): return true
+            FieldAccess(value, field): return true
+            else: return false
+
     # Operands are lowered left to right, so `2 + 3` defines the register for
     # 2, then 3, then their sum.
-    func lower_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
+    func lower_expression_form(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId!:
         # A call may produce `unit`, which has no machine type; every other
         # expression form has a scalar type or is refused below.
         match node_form(self.program, expression):
@@ -1260,7 +1578,7 @@ pub class Lowerer:
                 let address = try self.lower_expression(module, function, pointer, body)
                 let value = try self.lower_expression(module, function, stored, body)
                 let stored_type = try self.mir_type_of(module, function, node_span(self.program, stored), node_type(self.program, stored))
-                self.store_value(stored_type, address, value, span, body)
+                self.replace_owned_value(stored_type, address, value, span, body)
                 return RegisterId(value = no_register)
             NativeMove(destination, source, count):
                 let span = node_span(self.program, expression)
@@ -1306,7 +1624,8 @@ pub class Lowerer:
         let source = try self.lower_expression(module, function, value, body)
         let result_type = try self.mir_type_of(module, function, node_span(self.program, expression), node_type(self.program, expression))
         let result = self.new_register(result_type)
-        body.append(MirInstruction(form = InstructionForm.ListCopy(result = result, value = source), span = node_span(self.program, expression)))
+        let element_type = self.list_element_mir_type(result_type)
+        body.append(MirInstruction(form = InstructionForm.ListCopy(result = result, value = source, element_retain = self.ownership_helper_for(element_type).retain), span = node_span(self.program, expression)))
         return result
 
     # Preserve concatenation as one typed semantic operation. Backends alone
@@ -1315,7 +1634,8 @@ pub class Lowerer:
     func lower_list_concatenation(module: HirModule, function: HirFunction, span: SourceSpan, hir_list_type: ir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
         let list_type = try self.mir_type_of(module, function, span, hir_list_type)
         let result = self.new_register(list_type)
-        body.append(MirInstruction(form = InstructionForm.ListConcat(result = result, left = left, right = right), span = span))
+        let element_type = self.list_element_mir_type(list_type)
+        body.append(MirInstruction(form = InstructionForm.ListConcat(result = result, left = left, right = right, element_retain = self.ownership_helper_for(element_type).retain), span = span))
         return result
 
     func lower_list_slice(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, start: NodeId, end: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -1339,8 +1659,8 @@ pub class Lowerer:
         let stored = try self.lower_expression(module, function, element, body)
         let element_type = try self.mir_type_of(module, function, span, node_type(self.program, element))
         let slot = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-        body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = list_value), span = span))
-        self.store_value(element_type, slot, stored, span, body)
+        body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = list_value, element_retain = self.ownership_helper_for(element_type).retain), span = span))
+        self.initialize_owned_value(element_type, slot, stored, span, body)
         return RegisterId(value = no_register)
 
     func lower_list_insert(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, index: NodeId, element: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -1351,8 +1671,8 @@ pub class Lowerer:
         let stored = try self.lower_expression(module, function, element, body)
         let element_type = try self.mir_type_of(module, function, span, node_type(self.program, element))
         let slot = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-        body.append(MirInstruction(form = InstructionForm.ListInsertSlot(result = slot, value = list_value, index = position), span = span))
-        self.store_value(element_type, slot, stored, span, body)
+        body.append(MirInstruction(form = InstructionForm.ListInsertSlot(result = slot, value = list_value, index = position, element_retain = self.ownership_helper_for(element_type).retain), span = span))
+        self.initialize_owned_value(element_type, slot, stored, span, body)
         return RegisterId(value = no_register)
 
     func lower_list_remove_at(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, index: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -1369,18 +1689,22 @@ pub class Lowerer:
             let copy = self.new_temp(element_type, span, body)
             body.append(MirInstruction(form = InstructionForm.Memcpy(destination = copy, source = address, value_type = element_type), span = span))
             removed = copy
-        body.append(MirInstruction(form = InstructionForm.ListRemoveAt(value = list_value, index = position), span = span))
+        body.append(MirInstruction(form = InstructionForm.ListRemoveAt(value = list_value, index = position, element_retain = self.ownership_helper_for(element_type).retain), span = span))
         return removed
 
     func lower_list_clear(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let list_value = try self.lower_expression(module, function, value, body)
-        body.append(MirInstruction(form = InstructionForm.ListClear(value = list_value), span = node_span(self.program, expression)))
+        let list_type = try self.mir_type_of(module, function, node_span(self.program, expression), node_type(self.program, value))
+        let element_type = self.list_element_mir_type(list_type)
+        body.append(MirInstruction(form = InstructionForm.ListClear(value = list_value, element_release = self.ownership_helper_for(element_type).release), span = node_span(self.program, expression)))
         return RegisterId(value = no_register)
 
     func lower_list_reserve(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, minimum_capacity: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let list_value = try self.lower_expression(module, function, value, body)
         let minimum = try self.lower_expression(module, function, minimum_capacity, body)
-        body.append(MirInstruction(form = InstructionForm.ListReserve(value = list_value, minimum_capacity = minimum), span = node_span(self.program, expression)))
+        let list_type = try self.mir_type_of(module, function, node_span(self.program, expression), node_type(self.program, value))
+        let element_type = self.list_element_mir_type(list_type)
+        body.append(MirInstruction(form = InstructionForm.ListReserve(value = list_value, minimum_capacity = minimum, element_retain = self.ownership_helper_for(element_type).retain), span = node_span(self.program, expression)))
         return RegisterId(value = no_register)
 
     # Fill this function's caller-owned Error and leave through `Raise r0`.
@@ -1579,7 +1903,7 @@ pub class Lowerer:
                     let element = try self.lower_expression(module, function, element_node, body)
                     let element_type = try self.mir_type_of(module, function, node_span(self.program, element_node), node_type(self.program, element_node))
                     let field = self.field_address(value_type, temp, index, span, body)
-                    self.store_value(element_type, field, element, span, body)
+                    self.initialize_owned_value(element_type, field, element, span, body)
                 return temp
             Array(elements):
                 let temp = self.new_temp(value_type, span, body)
@@ -1592,7 +1916,7 @@ pub class Lowerer:
                     let element = try self.lower_expression(module, function, element_node, body)
                     let position = self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), index, span, body)
                     let address = self.element_address(element_type, temp, position, span, body)
-                    self.store_value(element_type, address, element, span, body)
+                    self.initialize_owned_value(element_type, address, element, span, body)
                 return temp
             List(elements):
                 var hir_element = resolve_builtin_type(BuiltinType.unit)
@@ -1606,8 +1930,8 @@ pub class Lowerer:
                     let element_node = node_at(self.program, elements, index)
                     let element = try self.lower_expression(module, function, element_node, body)
                     let slot = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                    body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = result), span = node_span(self.program, element_node)))
-                    self.store_value(element_type, slot, element, node_span(self.program, element_node), body)
+                    body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = result, element_retain = self.ownership_helper_for(element_type).retain), span = node_span(self.program, element_node)))
+                    self.initialize_owned_value(element_type, slot, element, node_span(self.program, element_node), body)
                 return result
             Range(lower, upper, inclusive):
                 let temp = self.new_temp(value_type, span, body)
@@ -1631,7 +1955,7 @@ pub class Lowerer:
                     let element = try self.lower_expression(module, function, field_node, body)
                     let element_type = try self.mir_type_of(module, function, node_span(self.program, field_node), node_type(self.program, field_node))
                     let field = self.field_address(value_type, temp, index, span, body)
-                    self.store_value(element_type, field, element, span, body)
+                    self.initialize_owned_value(element_type, field, element, span, body)
                 return temp
             FieldAccess(record, field_index):
                 let base = try self.lower_expression(module, function, record, body)
@@ -1648,7 +1972,7 @@ pub class Lowerer:
                 let payload = try self.lower_expression(module, function, inner, body)
                 let payload_type = try self.mir_type_of(module, function, node_span(self.program, inner), node_type(self.program, inner))
                 let payload_address = self.payload_address(value_type, temp, span, body)
-                self.store_value(payload_type, payload_address, payload, span, body)
+                self.initialize_owned_value(payload_type, payload_address, payload, span, body)
                 return temp
             EnumValue(enum_index, case_index, payload):
                 # Tag first, then the case's payload struct after it.
@@ -1662,7 +1986,7 @@ pub class Lowerer:
                         let element = try self.lower_expression(module, function, field_node, body)
                         let element_type = try self.mir_type_of(module, function, node_span(self.program, field_node), node_type(self.program, field_node))
                         let field = self.field_address(case_type, payload_base, index, span, body)
-                        self.store_value(element_type, field, element, span, body)
+                        self.initialize_owned_value(element_type, field, element, span, body)
                 return temp
             Match(subject, arms, has_result):
                 return try self.lower_match(module, function, expression, subject, arms, true, body)
@@ -1674,11 +1998,17 @@ pub class Lowerer:
                 let present = self.load_present(optional, span, body)
                 let result = self.new_register(self.register_type_for(value_type))
                 self.open_if(present, [result], span, body)
+                let present_start = len(self.defers)
                 let payload_address = self.payload_address(optional_type, optional, span, body)
                 let payload = self.load_value(value_type, payload_address, span, body)
+                if self.type_needs_ownership(value_type): self.emit_value_ownership(value_type, payload, true, span, body)
+                try self.emit_temporaries_from(present_start, body)
                 self.emit_yield(payload, span, body)
                 self.emit_else(span, body)
+                let fallback_start = len(self.defers)
                 let fallback = try self.lower_expression(module, function, arm, body)
+                if self.type_needs_ownership(value_type): discard(self.take_owned_value(fallback))
+                try self.emit_temporaries_from(fallback_start, body)
                 self.emit_yield(fallback, span, body)
                 self.emit_end(span, body)
                 return result
@@ -1714,13 +2044,21 @@ pub class Lowerer:
                             return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
                         return try self.lower_binary_operation(module, function, span, operation, operand_type, left_register, right_register, body)
             Conditional(value, condition, alternative):
+                let condition_start = len(self.defers)
                 let condition_register = try self.lower_expression(module, function, condition, body)
+                try self.emit_temporaries_from(condition_start, body)
                 let result = self.new_register(self.register_type_for(value_type))
                 self.open_if(condition_register, [result], span, body)
+                let chosen_start = len(self.defers)
                 let chosen = try self.lower_expression(module, function, value, body)
+                if self.type_needs_ownership(value_type): discard(self.take_owned_value(chosen))
+                try self.emit_temporaries_from(chosen_start, body)
                 self.emit_yield(chosen, span, body)
                 self.emit_else(span, body)
+                let fallback_start = len(self.defers)
                 let fallback = try self.lower_expression(module, function, alternative, body)
+                if self.type_needs_ownership(value_type): discard(self.take_owned_value(fallback))
+                try self.emit_temporaries_from(fallback_start, body)
                 self.emit_yield(fallback, span, body)
                 self.emit_end(span, body)
                 return result
@@ -1739,7 +2077,9 @@ pub class Lowerer:
             Match(subject, arms, has_result): return try self.lower_fallible_match(module, function, expression, subject, arms, body)
             Conditional(value, condition, alternative):
                 let successful = self.fallible_inner(node_type(self.program, expression)) else error(self.unsupported(module, function, span, "a non-fallible expression in fallible lowering"))
+                let condition_start = len(self.defers)
                 let condition_value = try self.lower_expression(module, function, condition, body)
+                try self.emit_temporaries_from(condition_start, body)
                 var result_value = RegisterId(value = no_register)
                 let results = list[RegisterId]()
                 if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
@@ -1749,10 +2089,14 @@ pub class Lowerer:
                 let result_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 results.append(result_error)
                 self.open_if(condition_value, results, span, body)
+                let chosen_start = len(self.defers)
                 let chosen = try self.lower_fallible_expression(module, function, value, body)
+                try self.emit_temporaries_from(chosen_start, body)
                 self.emit_fallible_yield(chosen, span, body)
                 self.emit_else(span, body)
+                let fallback_start = len(self.defers)
                 let fallback = try self.lower_fallible_expression(module, function, alternative, body)
+                try self.emit_temporaries_from(fallback_start, body)
                 self.emit_fallible_yield(fallback, span, body)
                 self.emit_end(span, body)
                 return FallibleResult(value = result_value, error_value = result_error)
@@ -1784,8 +2128,7 @@ pub class Lowerer:
         self.emit_end(span, body)
         return FallibleResult(value = result_value, error_value = result_error)
 
-    func lower_fallible_arm_body(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
-        let defer_start = len(self.defers)
+    func lower_fallible_arm_body(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, defer_start: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
         for position in range(0, i64(statements.count)):
             try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         let result = try self.lower_fallible_expression(module, function, value, body)
@@ -1844,8 +2187,9 @@ pub class Lowerer:
                     List(element):
                         let list_value = try self.lower_expression(module, function, inner, body)
                         let position = try self.lower_expression(module, function, index, body)
+                        let element_type = try self.mir_type_of(module, function, span, element)
                         let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                        body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = position), span = span))
+                        body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = position, element_retain = self.ownership_helper_for(element_type).retain), span = span))
                         return address
                     else: error(self.unsupported(module, function, span, "a mutating receiver that is not a resolved mutable place"))
             else: error(self.unsupported(module, function, span, "a mutating receiver that is not a resolved mutable place"))
@@ -2013,6 +2357,7 @@ pub class Lowerer:
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         let value_type = try self.mir_type_of(module, function, span, receiver.owner)
         let value = self.new_temp(value_type, span, body)
+        self.initialize_ownership_at(value_type, value, span, body)
         placed[0] = value
         let error_type = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
         let error_temp = self.new_temp(error_type, span, body)
@@ -2020,6 +2365,14 @@ pub class Lowerer:
         for argument in placed: call_arguments.append(argument)
         let reported_error = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
         self.emit_call(target, [reported_error], call_arguments, span, body)
+        # The caller owns fresh receiver storage on both outcomes. A failed
+        # initializer may have completed only some managed fields; their
+        # null-initialized remainder makes one structural release exact.
+        if self.type_needs_ownership(value_type):
+            let failed = self.error_is_present(reported_error, span, body)
+            self.open_if(failed, list[RegisterId](), span, body)
+            self.emit_ownership_call(value_type, value, false, span, body)
+            self.emit_end(span, body)
         return FallibleResult(value = value, error_value = reported_error)
 
     # Arguments are lowered in the order they were written, then placed by
@@ -2165,6 +2518,7 @@ pub class Lowerer:
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         let value_type = try self.mir_type_of(module, function, span, receiver.owner)
         let value = self.new_temp(value_type, span, body)
+        self.initialize_ownership_at(value_type, value, span, body)
         placed[0] = value
         self.emit_call(target, list[RegisterId](), placed, span, body)
         return value
@@ -2186,12 +2540,16 @@ pub class Lowerer:
     func lower_short_circuit(module: HirModule, function: HirFunction, expression: NodeId, left: NodeId, right: NodeId, is_and: bool, body: list[MirInstruction]) -> RegisterId!:
         let boolean = builtin_mir_type(BuiltinMirType.boolean)
         let expression_span = node_span(self.program, expression)
+        let left_start = len(self.defers)
         let left_register = try self.lower_expression(module, function, left, body)
+        try self.emit_temporaries_from(left_start, body)
         let result = self.new_register(boolean)
         self.open_if(left_register, [result], expression_span, body)
         # `and`: the left decided only when false; `or`: only when true.
         if is_and:
+            let right_start = len(self.defers)
             let right_register = try self.lower_expression(module, function, right, body)
+            try self.emit_temporaries_from(right_start, body)
             self.emit_yield(right_register, expression_span, body)
             self.emit_else(expression_span, body)
             let decided = self.bool_constant(false, expression_span, body)
@@ -2200,7 +2558,9 @@ pub class Lowerer:
             let decided = self.bool_constant(true, expression_span, body)
             self.emit_yield(decided, expression_span, body)
             self.emit_else(expression_span, body)
+            let right_start = len(self.defers)
             let right_register = try self.lower_expression(module, function, right, body)
+            try self.emit_temporaries_from(right_start, body)
             self.emit_yield(right_register, expression_span, body)
         self.emit_end(expression_span, body)
         return result
@@ -2304,12 +2664,13 @@ pub class Lowerer:
                             let test = try self.lower_pattern_test(module, function, pattern, selected, subject_type, body)
                             self.open_if(test, list[RegisterId](), span, body)
                             self.regions.append(Region.if_arm)
+                            let defer_start = len(self.defers)
                             try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
-                            try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
+                            try self.lower_selected_match_arm(module, function, statements, value, arm_exit, defer_start, span, body)
                             self.emit_else(span, body)
                             open_arms += 1
                     elif self.arm_is_wildcard(patterns):
-                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
+                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, len(self.defers), span, body)
                         closed = true
                     else:
                         var test = try self.lower_pattern_test(module, function, node_at(self.program, patterns, 0), selected, subject_type, body)
@@ -2318,7 +2679,7 @@ pub class Lowerer:
                             test = self.lower_or(test, next, span, body)
                         self.open_if(test, list[RegisterId](), span, body)
                         self.regions.append(Region.if_arm)
-                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, span, body)
+                        try self.lower_selected_match_arm(module, function, statements, value, arm_exit, len(self.defers), span, body)
                         self.emit_else(span, body)
                         open_arms += 1
                 else: try self.fail_unsupported(module, function, span, "a match arm that is not a `MatchArm` node")
@@ -2327,19 +2688,20 @@ pub class Lowerer:
             self.regions.remove(len(self.regions) - 1)
             self.emit_end(span, body)
 
-    func lower_selected_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, arm_exit: MatchExit, span: SourceSpan, body: list[MirInstruction]) -> !:
+    func lower_selected_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, arm_exit: MatchExit, defer_start: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
         match arm_exit:
-            Statement: try self.lower_scope(module, function, statements, body)
-            Value(block_depth): try self.lower_value_match_arm(module, function, statements, value, block_depth, span, body)
-            Fallible(block_depth): try self.lower_fallible_arm_body(module, function, statements, value, block_depth, span, body)
+            Statement: try self.lower_scope_from(module, function, statements, defer_start, body)
+            Value(block_depth): try self.lower_value_match_arm(module, function, statements, value, block_depth, defer_start, span, body)
+            Fallible(block_depth): try self.lower_fallible_arm_body(module, function, statements, value, block_depth, defer_start, span, body)
 
     # A value arm branches to the match's result block through every pattern
     # region opened since the block.
-    func lower_value_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
-        let defer_start = len(self.defers)
+    func lower_value_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, block_depth: i64, defer_start: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
         for position in range(0, i64(statements.count)):
             try self.lower_statement(module, function, node_at(self.program, statements, position), body)
         let register = try self.lower_expression(module, function, value, body)
+        let value_type = try self.mir_type_of(module, function, span, node_type(self.program, value))
+        if self.type_needs_ownership(value_type): discard(self.take_owned_value(register))
         try self.emit_deferred_from(module, function, defer_start, body)
         while len(self.defers) > defer_start: self.defers.remove(len(self.defers) - 1)
         let depth = len(self.regions) - 1 - block_depth
@@ -2407,7 +2769,9 @@ pub class Lowerer:
                 return same
             else: error(self.unsupported(module, function, span, "a pattern that is not a pattern node"))
 
-    # After a case test succeeds: copy each payload field into its binding's slot.
+    # After a case test succeeds, each payload binding takes an independent
+    # owned value from the borrowed subject storage. The selected arm's
+    # lifetime boundary destroys these bindings on every exit path.
     func lower_pattern_bindings(module: HirModule, function: HirFunction, pattern: NodeId, selected: RegisterId, subject_type: ir.TypeId, body: list[MirInstruction]) -> !:
         let span = node_span(self.program, pattern)
         match node_form(self.program, pattern):
@@ -2421,7 +2785,9 @@ pub class Lowerer:
                         let inner_type = try self.mir_type_of(module, function, span, inner)
                         let symbol = SymbolId(value = u32(entry_at(self.program, bindings, 0)))
                         let local = try self.local_of(module, function, span, symbol)
-                        self.store_value(inner_type, local.address, self.load_value(inner_type, payload_base, span, body), span, body)
+                        self.initialize_owned_value(inner_type, local.address, self.load_value(inner_type, payload_base, span, body), span, body)
+                        if self.type_needs_ownership(inner_type):
+                            self.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = inner_type, span = span))
                     Enum(enum_index):
                         let case_type = self.case_struct_type(enum_type, case_index)
                         let fields = self.program.enums[enum_index].cases[case_index].payload
@@ -2430,7 +2796,9 @@ pub class Lowerer:
                             let local = try self.local_of(module, function, span, symbol)
                             let field_type = try self.mir_type_of(module, function, span, fields[index].value_type)
                             let field = self.field_address(case_type, payload_base, index, span, body)
-                            self.store_value(field_type, local.address, self.load_value(field_type, field, span, body), span, body)
+                            self.initialize_owned_value(field_type, local.address, self.load_value(field_type, field, span, body), span, body)
+                            if self.type_needs_ownership(field_type):
+                                self.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = field_type, span = span))
                     else: try self.fail_unsupported(module, function, span, "payload bindings on `" + describe_type(self.program.types, subject_type) + "`")
             else: return
 
@@ -2497,6 +2865,11 @@ pub class Lowerer:
             Enum(tag, cases): return true
             Array(element, count): return true
             else: return false
+
+    func list_element_mir_type(value_type: TypeId) -> TypeId:
+        match mir_type(self.types, value_type):
+            List(element): return element
+            else: trap("list element type requested from a non-list MIR type")
 
     # The type of the register holding a value of `value_type`.
     func register_type_for(value_type: TypeId) -> TypeId:
@@ -2649,7 +3022,10 @@ pub class Lowerer:
         return register
 
     func null_constant(span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
-        let register = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        return self.typed_null_constant(builtin_mir_type(BuiltinMirType.pointer), span, body)
+
+    func typed_null_constant(value_type: TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let register = self.new_register(value_type)
         body.append(MirInstruction(form = InstructionForm.Const(result = register, value = MirConstant.Null), span = span))
         return register
 

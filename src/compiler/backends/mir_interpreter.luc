@@ -30,7 +30,7 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, InstructionForm
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, FunctionId, InstructionForm
 from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirFunction, MirInstruction, MirProgram, MirSignature, MirType
 from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, find_mir_function, int_maximum
@@ -107,35 +107,43 @@ struct FreedStorage:
 ## One backing buffer retained by a list or immutable slices.
 class MirListBuffer:
     let elements: list[i64]
+    var references: i64
 
     pub init():
         self.elements = list[i64]()
+        self.references = 1
 
 ## Semantic list identity for this oracle. Independent typed element cells are
 ## sufficient here: contiguity and growth are compiled-runtime policy.
 class MirList:
     let element_type: TypeId
     var buffer: MirListBuffer
-    var has_snapshot: bool
+    var references: i64
     var active_iterations: i64
+    var is_alive: bool
 
     pub init(element_type: TypeId):
         self.element_type = element_type
         self.buffer = MirListBuffer()
-        self.has_snapshot = false
+        self.references = 1
         self.active_iterations = 0
+        self.is_alive = true
 
 class MirSlice:
     let element_type: TypeId
     let buffer: MirListBuffer
     let start: i64
     let length: i64
+    var references: i64
+    var is_alive: bool
 
     pub init(element_type: TypeId, buffer: MirListBuffer, start: i64, length: i64):
         self.element_type = element_type
         self.buffer = buffer
         self.start = start
         self.length = length
+        self.references = 1
+        self.is_alive = true
 
 # One call: its registers and the addresses of its slots.
 class Frame:
@@ -461,17 +469,30 @@ pub class MirInterpreter: MirExternMemory:
                 let element_type = self.list_element_type(frame.function, result)
                 self.lists.append(MirList(element_type))
                 frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
-            ListCopy(result, value):
+            ListRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.list_at(frame.registers[value.value])
+                    storage.references += 1
+            ListRelease(value, element_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.list_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("list reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        if storage.active_iterations != 0: trap("released a list during active iteration")
+                        try self.release_list_buffer(storage.buffer, element_release)
+                        storage.is_alive = false
+            ListCopy(result, value, element_retain):
                 let element_type = self.list_element_type(frame.function, value)
                 let source = try self.list_at(frame.registers[value.value])
                 if source.element_type.value != element_type.value: trap("verified list copy changed element type")
                 let copied = MirList(element_type)
                 let size = self.layout.size_of(element_type)
                 let alignment = self.layout.align_of(element_type)
-                self.append_copied_list_elements(copied, source, size, alignment)
+                try self.append_copied_list_elements(copied, source, size, alignment, element_retain)
                 self.lists.append(copied)
                 frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
-            ListConcat(result, left, right):
+            ListConcat(result, left, right, element_retain):
                 let element_type = self.list_element_type(frame.function, left)
                 let left_list = try self.list_at(frame.registers[left.value])
                 let right_list = try self.list_at(frame.registers[right.value])
@@ -480,8 +501,8 @@ pub class MirInterpreter: MirExternMemory:
                 let joined = MirList(element_type)
                 let size = self.layout.size_of(element_type)
                 let alignment = self.layout.align_of(element_type)
-                self.append_copied_list_elements(joined, left_list, size, alignment)
-                self.append_copied_list_elements(joined, right_list, size, alignment)
+                try self.append_copied_list_elements(joined, left_list, size, alignment, element_retain)
+                try self.append_copied_list_elements(joined, right_list, size, alignment, element_retain)
                 self.lists.append(joined)
                 frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
             ListLength(result, value):
@@ -495,23 +516,23 @@ pub class MirInterpreter: MirExternMemory:
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.active_iterations <= 0: error("mir interpreter: trap: list iteration depth underflow")
                 storage.active_iterations -= 1
-            ListAppendSlot(result, value):
+            ListAppendSlot(result, value, element_retain):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified list append changed element type")
                 try self.require_list_shape_mutable(storage)
-                self.detach_list(storage)
+                try self.detach_list(storage, element_retain)
                 let address = self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
                 storage.buffer.elements.append(address)
                 frame.registers[result.value] = MirValue.Ptr(value = address)
-            ListInsertSlot(result, value, index):
+            ListInsertSlot(result, value, index, element_retain):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified list insert changed element type")
                 let position = int_of(frame.registers[index.value])
                 if position < 0 or position > len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
                 try self.require_list_shape_mutable(storage)
-                self.detach_list(storage)
+                try self.detach_list(storage, element_retain)
                 let address = self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
                 storage.buffer.elements.append(address)
                 var current = len(storage.buffer.elements) - 1
@@ -520,24 +541,32 @@ pub class MirInterpreter: MirExternMemory:
                     current -= 1
                 storage.buffer.elements[position] = address
                 frame.registers[result.value] = MirValue.Ptr(value = address)
-            ListRemoveAt(value, index):
+            ListRemoveAt(value, index, element_retain):
                 let storage = try self.list_at(frame.registers[value.value])
                 let position = int_of(frame.registers[index.value])
                 if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
                 try self.require_list_shape_mutable(storage)
-                self.detach_list(storage)
+                try self.detach_list(storage, element_retain)
                 for current in range(position, len(storage.buffer.elements) - 1):
                     storage.buffer.elements[current] = storage.buffer.elements[current + 1]
                 storage.buffer.elements.remove(len(storage.buffer.elements) - 1)
-            ListClear(value):
+            ListClear(value, element_release):
                 let storage = try self.list_at(frame.registers[value.value])
                 try self.require_list_shape_mutable(storage)
-                storage.buffer = MirListBuffer()
-                storage.has_snapshot = false
-            ListReserve(value, minimum_capacity):
+                if storage.buffer.references > 1:
+                    storage.buffer.references -= 1
+                    storage.buffer = MirListBuffer()
+                else:
+                    var position = len(storage.buffer.elements) - 1
+                    while position >= 0:
+                        discard(try self.call(i64(element_release.value), [MirValue.Ptr(value = storage.buffer.elements[position])]))
+                        position -= 1
+                    storage.buffer.elements.clear()
+            ListReserve(value, minimum_capacity, element_retain):
                 # Capacity is deliberately unobservable in canonical MIR.
-                discard(try self.list_at(frame.registers[value.value]))
+                let storage = try self.list_at(frame.registers[value.value])
                 discard(int_of(frame.registers[minimum_capacity.value]))
+                try self.detach_list(storage, element_retain)
             ListElementAddress(result, value, index):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
@@ -545,13 +574,13 @@ pub class MirInterpreter: MirExternMemory:
                 let position = int_of(frame.registers[index.value])
                 if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
                 frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
-            ListMutableElementAddress(result, value, index):
+            ListMutableElementAddress(result, value, index, element_retain):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified mutable list index changed element type")
                 let position = int_of(frame.registers[index.value])
                 if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
-                self.detach_list(storage)
+                try self.detach_list(storage, element_retain)
                 frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
             ListSlice(result, value, start, end):
                 let element_type = self.list_element_type(frame.function, value)
@@ -559,12 +588,24 @@ pub class MirInterpreter: MirExternMemory:
                 let lower = int_of(frame.registers[start.value])
                 let upper = int_of(frame.registers[end.value])
                 if lower < 0 or lower > upper or upper > len(storage.buffer.elements): error("mir interpreter: trap: slice bounds out of range")
-                storage.has_snapshot = true
+                storage.buffer.references += 1
                 self.slices.append(MirSlice(element_type, storage.buffer, lower, upper - lower))
                 frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
             SliceLength(result, value):
                 let storage = try self.slice_at(frame.registers[value.value])
                 frame.registers[result.value] = MirValue.Int(value = storage.length)
+            SliceRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.slice_at(frame.registers[value.value])
+                    storage.references += 1
+            SliceRelease(value, element_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.slice_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("slice reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        try self.release_list_buffer(storage.buffer, element_release)
+                        storage.is_alive = false
             SliceElementAddress(result, value, index):
                 let element_type = self.slice_element_type(frame.function, value)
                 let storage = try self.slice_at(frame.registers[value.value])
@@ -633,7 +674,9 @@ pub class MirInterpreter: MirExternMemory:
     func list_at(value: MirValue) -> MirList!:
         let index = ptr_of(value) - list_address_base
         if index < 0 or index >= len(self.lists): error("mir interpreter: trap: invalid list handle")
-        return self.lists[index]
+        let storage = self.lists[index]
+        if not storage.is_alive: error("mir interpreter: trap: released list handle")
+        return storage
 
     func require_list_shape_mutable(storage: MirList) -> !:
         if storage.active_iterations > 0:
@@ -642,7 +685,9 @@ pub class MirInterpreter: MirExternMemory:
     func slice_at(value: MirValue) -> MirSlice!:
         let index = ptr_of(value) - slice_address_base
         if index < 0 or index >= len(self.slices): error("mir interpreter: trap: invalid slice handle")
-        return self.slices[index]
+        let storage = self.slices[index]
+        if not storage.is_alive: error("mir interpreter: trap: released slice handle")
+        return storage
 
     func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, function.registers[value.value]):
@@ -657,23 +702,34 @@ pub class MirInterpreter: MirExternMemory:
     # Append independent value slots while preserving any references encoded
     # inside those values. List copy and both concatenation halves share this
     # shallow-copy rule.
-    func append_copied_list_elements(destination: MirList, source: MirList, size: i64, alignment: i64):
+    func append_copied_list_elements(destination: MirList, source: MirList, size: i64, alignment: i64, element_retain: FunctionId) -> !:
         for source_address in source.buffer.elements:
             let destination_address = self.allocate(size, alignment)
             self.copy_bytes(source_address, destination_address, size)
+            discard(try self.call(i64(element_retain.value), [MirValue.Ptr(value = destination_address)]))
             destination.buffer.elements.append(destination_address)
 
-    func detach_list(storage: MirList):
-        if not storage.has_snapshot: return
+    func detach_list(storage: MirList, element_retain: FunctionId) -> !:
+        if storage.buffer.references == 1: return
         let copied = MirListBuffer()
         let size = self.layout.size_of(storage.element_type)
         let alignment = self.layout.align_of(storage.element_type)
         for source in storage.buffer.elements:
             let destination = self.allocate(size, alignment)
             self.copy_bytes(source, destination, size)
+            discard(try self.call(i64(element_retain.value), [MirValue.Ptr(value = destination)]))
             copied.elements.append(destination)
+        storage.buffer.references -= 1
         storage.buffer = copied
-        storage.has_snapshot = false
+
+    func release_list_buffer(buffer: MirListBuffer, element_release: FunctionId) -> !:
+        if buffer.references <= 0: trap("list buffer reference count underflow")
+        buffer.references -= 1
+        if buffer.references != 0: return
+        var position = len(buffer.elements) - 1
+        while position >= 0:
+            discard(try self.call(i64(element_release.value), [MirValue.Ptr(value = buffer.elements[position])]))
+            position -= 1
 
     func copy_bytes(source: i64, destination: i64, size: i64):
         for offset in range(0, size):

@@ -409,8 +409,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Complete `libluce_rt` in freestanding Luce**. Typed deallocation and
   power-of-two intrusive free-list reuse are complete (`done.md` §2): the
   canonical request retains `TypeId`/count, backends derive matching physical
-  classes, and allocator policy remains compiled Luce. Ownership services,
-  element destruction, `write`, `trap`, and string/bytes primitives remain.
+  classes, and allocator policy remains compiled Luce. Structural list/slice
+  ownership services and managed element destruction are complete too
+  (`done.md` §2). `write`, `trap`, and string/bytes primitives remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
@@ -420,13 +421,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   through HIR, canonical MIR, and QBE (`done.md` §2). Shallow `copy` with
   independent collection storage and shallow `+` concatenation are complete
   too. Ordered list iteration and alias-wide shape-invalidation traps are
-  complete (`done.md` §2). Finish list ARC/reclamation, then maps, sets,
-  strings/bytes builders, ownership-retaining bytes slices, and formatted
+  complete, as are recursive list/slice ARC, copy-on-write buffer ownership,
+  managed element destruction, and reclamation through QBE and Wasm
+  (`done.md` §2). Continue with maps, sets, strings/bytes builders,
+  ownership-retaining bytes slices, and formatted
   strings. Structural list equality also waits for a cycle-aware comparison
   context: recursive value/list graphs are already constructible, so an
   acyclic inline element loop would be an incorrect partial implementation.
   Do not implement bytes slicing only for static literals: §12.6
-  requires every escaping safe slice to retain hidden ownership. Do not
+  requires every escaping safe slice to retain hidden ownership. Its backing
+  owner belongs in the forthcoming runtime text/bytes storage model; the
+  current literal `{data, length}` value deliberately cannot forge one. Do not
   promote the broad §12 row until every operation has its own conformance
   evidence.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.

@@ -70,202 +70,287 @@ func deallocate_storage(value: native_mut_ptr[u8], byte_count: u64, byte_alignme
 
 # mark: Lists and immutable slices =============================================================
 
-# A list handle points at this private header. Its layout is ordinary Luce
-# structure chosen by each backend; neither HIR nor MIR knows these fields.
-struct ListHeader:
+# List identities and immutable slices retain a separately counted buffer.
+# A list mutates a buffer only while it is the sole owner; otherwise it copies
+# the live prefix and invokes the compiler-generated structural retain action
+# once per copied element. The matching release action is called exactly once
+# before the last buffer owner reclaims that element's storage.
+struct ListBuffer:
+    var references: u64
     var data: native_mut_ptr[u8]
     var length: u64
     var capacity: u64
-    var has_snapshot: bool
+
+struct ListHeader:
+    var references: u64
+    var buffer: native_mut_ptr[ListBuffer]
     var active_iterations: u64
 
 struct SliceHeader:
-    let data: native_mut_ptr[u8]
+    var references: u64
+    let buffer: native_mut_ptr[ListBuffer]
+    let start: u64
     let length: u64
 
-func list_create() -> native_mut_ptr[u8]:
-    let header = native.allocate[ListHeader](1u64)
+func create_list_buffer() -> native_mut_ptr[ListBuffer]:
+    let buffer = native.allocate[ListBuffer](1u64)
     let empty = native.allocate[u8](0u64)
-    native.store(header, ListHeader(data = empty, length = 0u64, capacity = 0u64, has_snapshot = false, active_iterations = 0u64))
-    return native.rebind(header)
+    native.store(buffer, ListBuffer(references = 1u64, data = empty, length = 0u64, capacity = 0u64))
+    return buffer
 
-func list_length(value: native_mut_ptr[u8]) -> u64:
-    let header: native_mut_ptr[ListHeader] = native.rebind(value)
-    return native.load(header).length
+func retain_list_buffer(pointer: native_mut_ptr[ListBuffer]):
+    var buffer = native.load(pointer)
+    buffer.references += 1u64
+    native.store(pointer, buffer)
 
-# Active traversal belongs to the list identity, so every alias observes the
-# same shape-mutation barrier. Begin returns the captured length atomically
-# with registration; nested read-only traversals simply increase the depth.
-func list_iteration_begin(value: native_mut_ptr[u8]) -> u64:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    var header = native.load(header_pointer)
-    header.active_iterations += 1u64
-    native.store(header_pointer, header)
-    return header.length
+func release_list_buffer(pointer: native_mut_ptr[ListBuffer], element_size: u64, element_alignment: u64, release_element: func(native_mut_ptr[u8]) -> unit):
+    var buffer = native.load(pointer)
+    buffer.references -= 1u64
+    if buffer.references > 0u64:
+        native.store(pointer, buffer)
+        return
 
-func list_iteration_end(value: native_mut_ptr[u8]):
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    var header = native.load(header_pointer)
-    header.active_iterations -= 1u64
-    native.store(header_pointer, header)
+    var remaining = buffer.length
+    while remaining > 0u64:
+        remaining -= 1u64
+        release_element(native.advance(buffer.data, remaining * element_size))
+    if buffer.capacity > 0u64:
+        deallocate_storage(buffer.data, buffer.capacity * element_size, element_alignment)
+    native.deallocate(pointer, 1u64)
 
-func list_iteration_active(value: native_mut_ptr[u8]) -> bool:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    return native.load(header_pointer).active_iterations > 0u64
+func retain_elements(buffer: ListBuffer, element_size: u64, retain_element: func(native_mut_ptr[u8]) -> unit):
+    var index = 0u64
+    while index < buffer.length:
+        retain_element(native.advance(buffer.data, index * element_size))
+        index += 1u64
 
-# Return a header with room for at least `minimum_capacity` elements. Growth
-# policy and byte layout remain private runtime/backend concerns; the updated
-# header is stored by the caller only after allocation and copying succeed.
-func grow_list(header_value: ListHeader, element_size: u64, element_alignment: u64, minimum_capacity: u64) -> ListHeader:
-    var header = header_value
-    if header.capacity >= minimum_capacity: return header
+func grow_list_buffer(pointer: native_mut_ptr[ListBuffer], element_size: u64, element_alignment: u64, minimum_capacity: u64):
+    var buffer = native.load(pointer)
+    if buffer.capacity >= minimum_capacity: return
 
-    var capacity = header.capacity
+    var capacity = buffer.capacity
     if capacity == 0u64: capacity = 4u64
     while capacity < minimum_capacity:
-        # Luce's current `u64` execution ceiling is i64.max. Avoid overflow
-        # while retaining geometric growth; an impossible final allocation
-        # still traps through the checked allocator without committing state.
         if capacity > 4611686018427387903u64: capacity = minimum_capacity
         else: capacity *= 2u64
 
     let data = allocate_storage(capacity * element_size, element_alignment)
-    if header.length > 0u64:
-        native.move(data, header.data, header.length * element_size)
-    header.data = data
-    header.capacity = capacity
-    header.has_snapshot = false
-    return header
+    if buffer.length > 0u64:
+        native.move(data, buffer.data, buffer.length * element_size)
+    if buffer.capacity > 0u64:
+        deallocate_storage(buffer.data, buffer.capacity * element_size, element_alignment)
+    buffer.data = data
+    buffer.capacity = capacity
+    native.store(pointer, buffer)
 
-# Copy the live prefix before its first write after a slice captured it. The
-# slice retains the old arena storage; every alias of the list shares this
-# updated header and therefore observes the same subsequent mutation.
-func detach_list(header_value: ListHeader, element_size: u64, element_alignment: u64) -> ListHeader:
-    var header = header_value
-    if not header.has_snapshot: return header
-    let data = allocate_storage(header.capacity * element_size, element_alignment)
-    if header.length > 0u64:
-        native.move(data, header.data, header.length * element_size)
-    header.data = data
-    header.has_snapshot = false
-    return header
+func list_create() -> native_mut_ptr[u8]:
+    let header = native.allocate[ListHeader](1u64)
+    native.store(header, ListHeader(references = 1u64, buffer = create_list_buffer(), active_iterations = 0u64))
+    return native.rebind(header)
 
-# Create a new list identity and independent element storage. Copying bytes is
-# shallow by design: value elements retain their value representation and
-# reference elements retain the same referenced identity.
-func list_copy(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64) -> native_mut_ptr[u8]:
-    let source_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    let source = native.load(source_pointer)
-    let result = list_create()
-    let result_pointer: native_mut_ptr[ListHeader] = native.rebind(result)
-    var copied = grow_list(native.load(result_pointer), element_size, element_alignment, source.length)
+func list_retain(value: native_mut_ptr[u8]):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references += 1u64
+    native.store(pointer, header)
+
+func list_release(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, release_element: func(native_mut_ptr[u8]) -> unit):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references -= 1u64
+    if header.references > 0u64:
+        native.store(pointer, header)
+        return
+    release_list_buffer(header.buffer, element_size, element_alignment, release_element)
+    native.deallocate(pointer, 1u64)
+
+func list_length(value: native_mut_ptr[u8]) -> u64:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    return native.load(native.load(pointer).buffer).length
+
+# Active traversal belongs to the list identity, so every alias observes the
+# same shape-mutation barrier. Begin returns the captured length atomically.
+func list_iteration_begin(value: native_mut_ptr[u8]) -> u64:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.active_iterations += 1u64
+    native.store(pointer, header)
+    return native.load(header.buffer).length
+
+func list_iteration_end(value: native_mut_ptr[u8]):
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.active_iterations -= 1u64
+    native.store(pointer, header)
+
+func list_iteration_active(value: native_mut_ptr[u8]) -> bool:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    return native.load(pointer).active_iterations > 0u64
+
+# Return a unique buffer for a write. A shared snapshot keeps the old buffer;
+# the list's copied representation becomes an additional element owner.
+func detach_list(pointer: native_mut_ptr[ListHeader], element_size: u64, element_alignment: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[ListBuffer]:
+    var header = native.load(pointer)
+    var source = native.load(header.buffer)
+    if source.references == 1u64: return header.buffer
+
+    let copied_pointer = create_list_buffer()
+    grow_list_buffer(copied_pointer, element_size, element_alignment, source.capacity)
+    var copied = native.load(copied_pointer)
     if source.length > 0u64:
         native.move(copied.data, source.data, source.length * element_size)
     copied.length = source.length
-    native.store(result_pointer, copied)
+    native.store(copied_pointer, copied)
+    retain_elements(copied, element_size, retain_element)
+
+    source.references -= 1u64
+    native.store(header.buffer, source)
+    header.buffer = copied_pointer
+    native.store(pointer, header)
+    return copied_pointer
+
+# Explicit list copy and concatenation own their copied element representations
+# independently, while reference elements continue to name the same identity.
+func list_copy(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let source_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let source = native.load(native.load(source_pointer).buffer)
+    let result = list_create()
+    let result_pointer: native_mut_ptr[ListHeader] = native.rebind(result)
+    let result_buffer = native.load(result_pointer).buffer
+    grow_list_buffer(result_buffer, element_size, element_alignment, source.length)
+    var copied = native.load(result_buffer)
+    if source.length > 0u64:
+        native.move(copied.data, source.data, source.length * element_size)
+    copied.length = source.length
+    native.store(result_buffer, copied)
+    retain_elements(copied, element_size, retain_element)
     return result
 
-# Concatenate with one fresh header and one result buffer. Both input headers
-# and exact live-prefix sizes are settled before allocation; `grow_list` then
-# owns its ordinary checked capacity arithmetic.
-func list_concat(left_value: native_mut_ptr[u8], right_value: native_mut_ptr[u8], element_size: u64, element_alignment: u64) -> native_mut_ptr[u8]:
+func list_concat(left_value: native_mut_ptr[u8], right_value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
     let left_pointer: native_mut_ptr[ListHeader] = native.rebind(left_value)
     let right_pointer: native_mut_ptr[ListHeader] = native.rebind(right_value)
-    let left = native.load(left_pointer)
-    let right = native.load(right_pointer)
+    let left = native.load(native.load(left_pointer).buffer)
+    let right = native.load(native.load(right_pointer).buffer)
     let total_length = left.length + right.length
-    let left_bytes = left.length * element_size
-    let right_bytes = right.length * element_size
 
     let result = list_create()
     let result_pointer: native_mut_ptr[ListHeader] = native.rebind(result)
-    var joined = grow_list(native.load(result_pointer), element_size, element_alignment, total_length)
-    if left.length > 0u64: native.move(joined.data, left.data, left_bytes)
+    let result_buffer = native.load(result_pointer).buffer
+    grow_list_buffer(result_buffer, element_size, element_alignment, total_length)
+    var joined = native.load(result_buffer)
+    if left.length > 0u64:
+        native.move(joined.data, left.data, left.length * element_size)
     if right.length > 0u64:
-        native.move(native.advance(joined.data, left_bytes), right.data, right_bytes)
+        native.move(native.advance(joined.data, left.length * element_size), right.data, right.length * element_size)
     joined.length = total_length
-    native.store(result_pointer, joined)
+    native.store(result_buffer, joined)
+    retain_elements(joined, element_size, retain_element)
     return result
 
-# Open an uninitialised slot and shift the tail overlap-safely. Passing the
-# already-loaded header lets append and insert share policy without a second
-# header read. Backends have already enforced `index <= length`.
-func open_list_slot(header_pointer: native_mut_ptr[ListHeader], header_value: ListHeader, element_size: u64, element_alignment: u64, index: u64) -> native_mut_ptr[u8]:
-    var header = detach_list(header_value, element_size, element_alignment)
-    header = grow_list(header, element_size, element_alignment, header.length + 1u64)
-    let slot = native.advance(header.data, index * element_size)
-    if index < header.length:
-        let destination = native.advance(slot, element_size)
-        native.move(destination, slot, (header.length - index) * element_size)
-    header.length += 1u64
-    native.store(header_pointer, header)
+func open_list_slot(header_pointer: native_mut_ptr[ListHeader], element_size: u64, element_alignment: u64, index: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let buffer_pointer = detach_list(header_pointer, element_size, element_alignment, retain_element)
+    var buffer = native.load(buffer_pointer)
+    grow_list_buffer(buffer_pointer, element_size, element_alignment, buffer.length + 1u64)
+    buffer = native.load(buffer_pointer)
+    let slot = native.advance(buffer.data, index * element_size)
+    if index < buffer.length:
+        native.move(native.advance(slot, element_size), slot, (buffer.length - index) * element_size)
+    buffer.length += 1u64
+    native.store(buffer_pointer, buffer)
     return slot
 
-# Insert and append each load the header exactly once, then share all growth,
-# movement, and commit logic through `open_list_slot`.
-func list_insert_slot(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    return open_list_slot(header_pointer, native.load(header_pointer), element_size, element_alignment, index)
+func list_insert_slot(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    return open_list_slot(pointer, element_size, element_alignment, index, retain_element)
 
-func list_append_slot(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    let header = native.load(header_pointer)
-    return open_list_slot(header_pointer, header, element_size, element_alignment, header.length)
+func list_append_slot(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let length = native.load(native.load(pointer).buffer).length
+    return open_list_slot(pointer, element_size, element_alignment, length, retain_element)
 
-# Remove one existing element and close its slot. The compiler copies the
-# result out before this service runs; backends independently enforce bounds.
-func list_remove_at(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64):
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    var header = detach_list(native.load(header_pointer), element_size, element_alignment)
-    let tail = header.length - index - 1u64
+# The lowerer copies the removed element out before this operation. Detachment
+# retains a second representation first, so removing from the new buffer
+# transfers precisely that ownership to the result.
+func list_remove_at(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64, retain_element: func(native_mut_ptr[u8]) -> unit):
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let buffer_pointer = detach_list(pointer, element_size, element_alignment, retain_element)
+    var buffer = native.load(buffer_pointer)
+    let tail = buffer.length - index - 1u64
     if tail > 0u64:
-        let destination = native.advance(header.data, index * element_size)
-        let source = native.advance(destination, element_size)
-        native.move(destination, source, tail * element_size)
-    header.length -= 1u64
-    native.store(header_pointer, header)
+        let destination = native.advance(buffer.data, index * element_size)
+        native.move(destination, native.advance(destination, element_size), tail * element_size)
+    buffer.length -= 1u64
+    native.store(buffer_pointer, buffer)
 
-func list_clear(value: native_mut_ptr[u8]):
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    var header = native.load(header_pointer)
-    header.length = 0u64
-    native.store(header_pointer, header)
+func list_clear(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, release_element: func(native_mut_ptr[u8]) -> unit):
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    var buffer = native.load(header.buffer)
+    if buffer.references > 1u64:
+        buffer.references -= 1u64
+        native.store(header.buffer, buffer)
+        header.buffer = create_list_buffer()
+        native.store(pointer, header)
+        return
 
-func list_reserve(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, minimum_capacity: u64):
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    let header = grow_list(native.load(header_pointer), element_size, element_alignment, minimum_capacity)
-    native.store(header_pointer, header)
+    var remaining = buffer.length
+    while remaining > 0u64:
+        remaining -= 1u64
+        release_element(native.advance(buffer.data, remaining * element_size))
+    buffer.length = 0u64
+    native.store(header.buffer, buffer)
 
-# Bounds remain part of canonical ListElementAddress. Backends check them via
-# list_length before entering this private unchecked address calculation.
+func list_reserve(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, minimum_capacity: u64, retain_element: func(native_mut_ptr[u8]) -> unit):
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    if native.load(native.load(pointer).buffer).capacity >= minimum_capacity: return
+    let buffer = detach_list(pointer, element_size, element_alignment, retain_element)
+    grow_list_buffer(buffer, element_size, element_alignment, minimum_capacity)
+
+# Bounds remain canonical; private address services receive only checked indices.
 func list_element_address(value: native_mut_ptr[u8], element_size: u64, index: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    let header = native.load(header_pointer)
-    return native.advance(header.data, index * element_size)
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let buffer = native.load(native.load(pointer).buffer)
+    return native.advance(buffer.data, index * element_size)
 
-# A mutable address is a semantic write barrier: preserve any existing slice
-# before exposing storage that the following canonical store may change.
-func list_mutable_element_address(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    let header = detach_list(native.load(header_pointer), element_size, element_alignment)
-    native.store(header_pointer, header)
-    return native.advance(header.data, index * element_size)
+func list_mutable_element_address(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, index: u64, retain_element: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let buffer_pointer = detach_list(pointer, element_size, element_alignment, retain_element)
+    return native.advance(native.load(buffer_pointer).data, index * element_size)
 
 func list_slice(value: native_mut_ptr[u8], element_size: u64, start: u64, end: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[ListHeader] = native.rebind(value)
-    var header = native.load(header_pointer)
+    let pointer: native_mut_ptr[ListHeader] = native.rebind(value)
+    let buffer = native.load(pointer).buffer
+    retain_list_buffer(buffer)
     let slice = native.allocate[SliceHeader](1u64)
-    native.store(slice, SliceHeader(data = native.advance(header.data, start * element_size), length = end - start))
-    header.has_snapshot = true
-    native.store(header_pointer, header)
+    native.store(slice, SliceHeader(references = 1u64, buffer = buffer, start = start, length = end - start))
     return native.rebind(slice)
 
-func slice_length(value: native_mut_ptr[u8]) -> u64:
-    let header: native_mut_ptr[SliceHeader] = native.rebind(value)
-    return native.load(header).length
+func slice_retain(value: native_mut_ptr[u8]):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[SliceHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references += 1u64
+    native.store(pointer, header)
 
-# Bounds remain canonical; this service receives only a verified index.
+func slice_release(value: native_mut_ptr[u8], element_size: u64, element_alignment: u64, release_element: func(native_mut_ptr[u8]) -> unit):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[SliceHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references -= 1u64
+    if header.references > 0u64:
+        native.store(pointer, header)
+        return
+    release_list_buffer(header.buffer, element_size, element_alignment, release_element)
+    native.deallocate(pointer, 1u64)
+
+func slice_length(value: native_mut_ptr[u8]) -> u64:
+    let pointer: native_mut_ptr[SliceHeader] = native.rebind(value)
+    return native.load(pointer).length
+
 func slice_element_address(value: native_mut_ptr[u8], element_size: u64, index: u64) -> native_mut_ptr[u8]:
-    let header_pointer: native_mut_ptr[SliceHeader] = native.rebind(value)
-    let header = native.load(header_pointer)
-    return native.advance(header.data, index * element_size)
+    let pointer: native_mut_ptr[SliceHeader] = native.rebind(value)
+    let header = native.load(pointer)
+    let buffer = native.load(header.buffer)
+    return native.advance(buffer.data, (header.start + index) * element_size)
