@@ -36,6 +36,8 @@ from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType
 from compiler.hir.ir import HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
 from compiler.hir.ir import HirEnum, HirEnumCase, HirExternRepresentation, HirExternType, HirExternVariable, HirField, HirGlobal, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
 from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, PackageRole, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
+from compiler.hir.ir import HirRuntimeBinding
+from compiler.runtime_contract import RuntimeService
 from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir.ir import describe_type, integer_maximum, integer_minimum
 from compiler.hir.ir import is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
@@ -51,6 +53,13 @@ pub struct SourceModule:
     pub let path: str
     pub let authority: ModuleAuthority
     pub let syntax: ModuleSyntax
+
+# A package-descriptor entry before its module and function spellings resolve
+# to the identities HIR retains.
+struct RuntimeBindingRequest:
+    let service: RuntimeService
+    let module_name: str
+    let function_name: str
 
 # One collected function signature: everything a call site or a body check
 # needs to know about a function before its own body is checked.
@@ -244,12 +253,14 @@ struct NativePointerType:
     let is_mutable: bool
 
 ## Generates typed HIR for one whole program. Collection is internal so
-## callers cannot run a partial generation; public use begins and ends at
-## `HirGenerator.generate`.
+## callers cannot run a partial generation. A sealed package may first bind
+## its descriptor's runtime services; `generate` then performs the one whole
+## source-to-HIR transaction.
 pub class HirGenerator:
     let package_identity: str
     let package_role: PackageRole
     let sources: list[SourceModule]
+    let runtime_binding_requests: list[RuntimeBindingRequest]
     let types: TypeTable
     let symbols: list[HirSymbol]
     let aliases: list[CollectedAlias]
@@ -293,6 +304,7 @@ pub class HirGenerator:
         self.package_identity = package_identity
         self.package_role = package_role
         self.sources = sources
+        self.runtime_binding_requests = list[RuntimeBindingRequest]()
         self.types = create_builtin_type_table()
         self.symbols = list[HirSymbol]()
         self.aliases = list[CollectedAlias]()
@@ -321,6 +333,16 @@ pub class HirGenerator:
         self.node_spans = list[SourceSpan]()
         self.extra = list[u32]()
         self.values = list[Value]()
+
+    ## Select one private function from a sealed runtime package as the exact
+    ## implementation of a semantic service. Resolution and contract checks
+    ## happen during generation, alongside every other source identity.
+    pub func bind_runtime_service(service: RuntimeService, module_name: str, function_name: str):
+        self.runtime_binding_requests.append(RuntimeBindingRequest(
+            service = service,
+            module_name = module_name,
+            function_name = function_name,
+        ))
 
     # mark: Node table ==========================================================================
 
@@ -364,6 +386,7 @@ pub class HirGenerator:
         try self.collect_module_bindings()
         try self.resolve_aliases()
         try self.validate_native_boundaries()
+        let runtime_bindings = try self.resolve_runtime_bindings()
         try self.check_constants()
 
         let modules = list[HirModule]()
@@ -449,6 +472,7 @@ pub class HirGenerator:
         return HirProgram(
             package_identity = self.package_identity,
             package_role = self.package_role,
+            runtime_bindings = runtime_bindings,
             types = self.types,
             symbols = self.symbols,
             modules = modules,
@@ -465,6 +489,46 @@ pub class HirGenerator:
             extra = self.extra,
             values = self.values,
         )
+
+    # Resolve descriptor spellings exactly once. The selected definition is
+    # private, native, infallible, and byte-shaped at the source boundary;
+    # canonical MIR independently verifies the erased machine signature.
+    func resolve_runtime_bindings() -> list[HirRuntimeBinding]!:
+        let bindings = list[HirRuntimeBinding]()
+        if len(self.runtime_binding_requests) > 0 and self.package_role != PackageRole.sealed_runtime:
+            error("runtime service bindings require the sealed runtime package role")
+        for request in self.runtime_binding_requests:
+            for existing in bindings:
+                if existing.service == request.service:
+                    error("duplicate runtime binding for `" + str(request.service) + "`")
+            let module_index = self.find_source(request.module_name)
+            if module_index < 0:
+                error("runtime binding `" + str(request.service) + "` names missing module `" + request.module_name + "`")
+            let function_index = self.find_function_in_module(module_index, request.function_name)
+            if function_index < 0:
+                error("runtime binding `" + str(request.service) + "` names missing function `" + request.module_name + "." + request.function_name + "`")
+            let function = self.functions[function_index]
+            if function.is_public or self.sources[module_index].authority != ModuleAuthority.native:
+                try self.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must name a private native function")
+            match function.source:
+                Defined(syntax): pass
+                else: try self.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must name a Luce definition")
+            match request.service:
+                storage_allocator:
+                    if not self.is_storage_allocator(function):
+                        try self.fail_at(module_index, function.span, "runtime binding `storage_allocator` must have signature `(u64, u64) -> native_mut_ptr[u8]`")
+            bindings.append(HirRuntimeBinding(service = request.service, function = function.symbol))
+        return bindings
+
+    func is_storage_allocator(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 2: return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if not types_match(function.parameters[0].value_type, u64_type) or not types_match(function.parameters[1].value_type, u64_type): return false
+        if function.parameters[0].default_value.value != no_node or function.parameters[1].default_value.value != no_node: return false
+        match self.types.definitions[function.result.value].form:
+            NativePointer(pointee, is_mutable):
+                return is_mutable and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
 
     # mark: Modules and imports =================================================================
 

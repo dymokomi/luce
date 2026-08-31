@@ -7,7 +7,8 @@
 from luce.compiler.backends.qbe import QbeBackend
 from luce.compiler.backends.qbe_toolchain import QbeToolchain
 from luce.compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, FunctionId, GlobalId, InstructionForm
-from luce.compiler.mir.canonical import MirConstant, MirData, MirFunction, MirGlobal, MirInstruction, MirProgram, MirRuntimeBinding, MirRuntimeService, MirSignature, MirSlot, MirType, OperandBuilder, RegisterId, TypeId
+from luce.compiler.mir.canonical import MirConstant, MirData, MirFunction, MirGlobal, MirInstruction, MirProgram, MirRuntimeBinding, MirSignature, MirSlot, MirType, OperandBuilder, RegisterId, TypeId
+from luce.compiler.runtime_contract import RuntimeService
 from luce.compiler.mir.canonical import builtin_mir_type, create_empty_mir_program, intern_mir_type, make_struct_type
 from luce.compiler.mir.verifier import MirVerifier
 from luce.compiler.frontend.source import SourceSpan
@@ -17,6 +18,9 @@ from luce.compiler.hir.analyzer import SemanticAnalyzer
 from luce.compiler.hir.generator import HirGenerator, SourceModule
 from luce.compiler.hir.ir import ModuleAuthority, PackageRole
 from luce.compiler.mir.lowerer import Lowerer
+from luce.compiler.mir.composer import compose_runtime
+from luce.compiler.mir.optimizer import Optimizer
+from luce.compiler.pipeline import RuntimeBindingInput, RuntimePackageInput, compile_runtime
 import std.files
 import std.os
 import std.paths
@@ -78,7 +82,7 @@ func storage_program(count: i64, zero_sized: bool, uses_storage: bool) -> MirPro
         ins(InstructionForm.DataAddress(result = r(2), data = DataId(value = 0))),
         ins(InstructionForm.Return(values = allocator_ops.run([r(2)]))),
     ]))
-    program.runtime_bindings.append(MirRuntimeBinding(service = MirRuntimeService.storage_allocator, function = FunctionId(value = 0)))
+    program.runtime_bindings.append(MirRuntimeBinding(service = RuntimeService.storage_allocator, function = FunctionId(value = 0)))
     if uses_storage:
         program.functions.append(function(entry_ops, "main.main", [], [i32_t()], [u64_t(), ptr_t(), u64_t(), ptr_t(), i32_t(), i32_t()], [
             ins(InstructionForm.Const(result = r(0), value = MirConstant.Int(value = count))),
@@ -99,6 +103,48 @@ func storage_program(count: i64, zero_sized: bool, uses_storage: bool) -> MirPro
         ]))
     program.entry = FunctionId(value = 1)
     return program
+
+# Compile the real sealed runtime source and compose it with the smallest
+# target-neutral application that makes two typed storage requests.
+func runtime_storage_program(first_count: i64) -> MirProgram:
+    let ops = OperandBuilder()
+    var application = create_empty_mir_program()
+    application.functions.append(function(ops, "main.main", [], [i32_t()], [
+        u64_t(), ptr_t(), i32_t(), u64_t(), ptr_t(), i32_t(), i32_t(), i32_t(), i32_t(),
+    ], [
+        ins(InstructionForm.Const(result = r(0), value = MirConstant.Int(value = first_count))),
+        ins(InstructionForm.AllocateStorage(result = r(1), element_type = i32_t(), count = r(0))),
+        ins(InstructionForm.Const(result = r(2), value = MirConstant.Int(value = 40))),
+        ins(InstructionForm.Store(value_type = i32_t(), address = r(1), value = r(2))),
+        ins(InstructionForm.Const(result = r(3), value = MirConstant.Int(value = 1))),
+        ins(InstructionForm.AllocateStorage(result = r(4), element_type = i32_t(), count = r(3))),
+        ins(InstructionForm.Const(result = r(5), value = MirConstant.Int(value = 2))),
+        ins(InstructionForm.Store(value_type = i32_t(), address = r(4), value = r(5))),
+        ins(InstructionForm.Load(result = r(6), value_type = i32_t(), address = r(1))),
+        ins(InstructionForm.Load(result = r(7), value_type = i32_t(), address = r(4))),
+        ins(InstructionForm.Binary(result = r(8), operation = BinaryOp.add, left = r(6), right = r(7))),
+        ins(InstructionForm.Return(values = ops.run([r(8)]))),
+    ]))
+    application.entry = FunctionId(value = 0)
+
+    let runtime = compile_runtime(RuntimePackageInput(
+        identity = "org.luce.runtime",
+        source_paths = ["src/runtime/allocator.native.luc"],
+        bindings = [RuntimeBindingInput(
+            service = RuntimeService.storage_allocator,
+            module_name = "allocator",
+            function_name = "allocate_storage",
+        )],
+    )) catch reason:
+        trap(reason)
+    let combined = compose_runtime(application, runtime) catch reason:
+        trap(reason)
+    MirVerifier(combined).verify() catch reason:
+        trap(reason)
+    let optimized = Optimizer(combined).optimize()
+    MirVerifier(optimized).verify() catch reason:
+        trap(reason)
+    return optimized
 
 func emit(program: MirProgram) -> str:
     MirVerifier(program).verify() catch reason:
@@ -290,6 +336,21 @@ pub func test_qbe_supplies_the_sealed_stable_arena_without_a_mir_target_fact():
 
     let overflow = lower_runtime_native_source("pub func main(arguments: slice[str]) -> i32:\n    let base = native.arena(67108865u64)\n    return 0 if native.load(base) == 0u8 else 1\n")
     assert(qbe_run(overflow).status != 0)
+
+pub func test_qbe_executes_the_compiled_freestanding_luce_allocator():
+    let program = runtime_storage_program(1)
+    let text = emit(program)
+    assert(strings.contains(text, "$luce_rt_arena_storage"))
+    let allocator = program.runtime_bindings[0].function
+    assert(program.functions[allocator.value].name == "allocator.allocate_storage")
+    qbe_accepts("compiled Luce allocator", text)
+    if not has_qbe(): return
+    # Distinct aligned allocations retain both stores; aliasing would return 4.
+    assert(qbe_run(program).status == 42)
+
+    # 16,777,217 i32 values exceed the QBE provider's 64 MiB arena after
+    # checked byte legalization and the allocator's byte-zero reservation.
+    assert(qbe_run(runtime_storage_program(16777217)).status != 0)
 
 pub func test_qbe_runtime_services_do_not_capture_c_symbols_with_the_same_spelling():
     let source = "extern func luce_rt_arena(end: u64) -> u64\nextern func luce_rt_write(value: i32) -> i32\npub func probe() -> u64: return luce_rt_arena(1u64)\npub func main(arguments: slice[str]) -> i32: return luce_rt_write(1i32)\n"

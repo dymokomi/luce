@@ -311,6 +311,14 @@ runtime entry, public function or artifact export, preserving the sealed
 boundary structurally. The combined program alone then enters verification,
 reachability and backend encoding.
 
+The source package descriptor makes the first identity selection explicitly:
+`(RuntimeService, module, function)` is resolved during sealed-runtime HIR
+generation to a private native `SymbolId` with the service's checked source
+signature. Lowering maps that symbol through the ordinary callable table to a
+`FunctionId`. Composition, optimization and backends therefore never repeat
+the spelling lookup. The shared `runtime_contract.luc` vocabulary contains no
+ABI, layout, capacity or platform information.
+
 The source side of runtime state is equally closed. An explicit
 `PackageRole.sealed_runtime` compilation may declare private
 `var next_offset: u64` cells with structural zero initialization. HIR keeps

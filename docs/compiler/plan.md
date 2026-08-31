@@ -378,10 +378,19 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   contract while allowing the host loader to commit pages lazily. Wasm is not
   required for this QBE-complete slice and may later legalize the same service
   with memory growth.
-- [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
-  backend-provided storage, `write`, `trap`, string/bytes primitives; through
-  the MIR interpreter's stub runtime first, then compiled. This starts only
-  after the audited substrate above can express the implementation honestly.
+- [x] **Compile the first freestanding Luce allocator through QBE**
+  (2026-08-30). A shared target-neutral `RuntimeService` contract lets the
+  sealed package descriptor resolve one private native source function to a
+  HIR `SymbolId`; lowering preserves it as the exact MIR `FunctionId` without
+  name lookup. The pipeline independently compiles and composes
+  `src/runtime/allocator.native.luc`. Its checked aligned bump policy reserves
+  byte zero and commits state only after arena success. Verification and
+  reachability retain the binding, function, global and provider as one unit;
+  real QBE proves distinct typed allocations and exhaustion.
+- [ ] **Complete `libluce_rt` in freestanding Luce**: reclamation/free-list
+  reuse, ownership services, `write`, `trap`, and string/bytes primitives.
+  Extend the checked allocator module as those semantic services become
+  expressible; do not move policy into the compiler or a backend.
 - [ ] **Lists, maps, sets and strings via the runtime**; formatted strings.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
 - [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.

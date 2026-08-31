@@ -163,11 +163,15 @@ Read in this order; each stop hands off to the next.
 - `src/compiler/frontend/` owns source spans, tokens, syntax, and parsing.
 - `src/compiler/hir/` turns syntax into resolved, typed program meaning and
   owns semantic flow analysis.
+- `src/compiler/runtime_contract.luc` is the target-neutral service vocabulary
+  shared by sealed-package binding, HIR, and MIR.
 - `src/compiler/backends/interpreter.luc` runs typed HIR directly.
 - `src/compiler/mir/` owns lowering, canonical MIR, verification, and
   target-independent optimization.
 - `src/compiler/backends/` contains the Wasm emitter, QBE emitter and host
   materializer, backend-owned layout, and the two semantic execution engines.
+- `src/runtime/` is the separately compiled freestanding Luce runtime; it owns
+  allocator and future ownership/collection policy above the backend arena.
 
 ## Contributing constraints
 
