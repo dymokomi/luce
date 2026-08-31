@@ -233,6 +233,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Lowering evaluates the operand once and then uses the existing
   full-expression ownership cleanup; there is deliberately no MIR/backend
   discard instruction.
+- [x] **Dynamic source `trap(message)`** (2026-08-31, `done.md` §2). One
+  never-valued HIR form evaluates an ordinary `str` and terminates without
+  lexical cleanup. Shared lowering uses the existing target-neutral
+  `luce_rt_trap(Ptr, u64)` contract followed by canonical `Unreachable`; QBE
+  and Wasm alone choose stderr and their terminating instruction. Complete
+  source-location/stack diagnostics remain part of the §13 audit.
 - [ ] **Complete explicit numeric construction.** Checked integer-to-integer
   construction is complete. Integer/float and float/integer MIR operations
   already exist, but source completion also needs float-width conversion. The
@@ -515,15 +521,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Give every cohesive source/test region a `# mark:` heading as it is touched.
   File length is reviewed at each vertical-slice audit; roughly 2,000 lines
   triggers an ownership review, not an arbitrary mechanical split. Wasm
-  module planning now has its own 227-line owner, leaving the related
-  instruction/section encoder cohesive at 1,728 lines; its byte plumbing is
+  module planning now has its own 263-line owner, leaving the related
+  instruction/section encoder cohesive at 1,977 lines; its byte plumbing is
   too small to justify another module today.
   HIR generation now separates program declarations from mutually recursive
   body semantics over one typed transaction. MIR lowering separates the
   whole-program coordinator and shared identity/type transaction from one
   cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. The remaining 2,396-line HIR body checker
-  and 2,937-line MIR function lowerer stay intact until a language family
+  forwarding-only collaborators. The remaining 2,432-line HIR body checker
+  and 3,064-line MIR function lowerer stay intact until a language family
   establishes a narrower ownership boundary. Parser grammar is already
   frozen; separate its byte/token plumbing only where one owner can retain
   the cursor and diagnostic state.

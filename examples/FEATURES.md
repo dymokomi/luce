@@ -40,7 +40,7 @@ column because it does not determine stage-1 completion.
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Close the remaining synthesized/custom initialization, enum, and structural-operation rules as one audited set. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | syntax | — | — | syntax | HIR ownership model and semantic oracle. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
-| §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Error context, assertions/fatal surface, and an exhaustive trap/diagnostic audit. |
+| §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` reaches both oracles and QBE/Wasm with no deferred cleanup. Error context, assertions/fatal surface, and an exhaustive source-location/stack diagnostic audit remain. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | syntax | — | — | syntax | Managed function environments and capture/ownership analysis. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | syntax | — | — | syntax | HIR generic identities and bounded monomorphization. |
 | §16 | Interfaces, conformance, static use, interface values | complete | syntax | — | — | syntax | HIR requirements/conformance and witness representation. |
@@ -148,6 +148,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `lists.luc` | Shared list identity, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `strings.luc` | Raw/escaped text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
+| `traps.luc` | Dynamic owned diagnostic text and nonrecoverable termination without deferred cleanup | HIR oracle plus native QBE and Wasm execution, including captured stderr. |
 | `language_tour.luc` | Broad 1.0 declaration/control/managed surface | Parser only; each section migrates into focused executable examples as it lands. |
 | `operators_and_literals.luc` | Literal, collection, type, and operator surface | Parser only beyond the already executable scalar subset. |
 | `checkout/` | Multi-module application shape | Parser only until collections/strings are complete. |

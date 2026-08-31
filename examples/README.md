@@ -59,6 +59,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   owned concatenation and explicit disposal of an owned temporary, distinct
   byte/scalar lengths, Unicode scalar iteration, and lexicographic ordering
   through both compiled backends and the semantic oracles.
+- `traps.luc` proves that a nonrecoverable source trap accepts dynamically
+  owned text, reports it through each execution path, and does not run
+  deferred cleanup.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the

@@ -850,6 +850,10 @@ luce_rt_spawn(function, input) -> Ptr    luce_rt_wait(Ptr) -> Ptr    luce_rt_can
 luce_rt_transfer(value, type_info) -> Ptr                             value-graph copy (§19.2)
 ```
 
+A source trap calls the target-neutral `luce_rt_trap` contract and then ends
+its canonical region with `Unreachable`. Only the backend chooses the
+diagnostic channel and concrete terminating instruction.
+
 ### What the verifier proves
 
 - every register is defined once, before use, with its declared type;
