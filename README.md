@@ -132,10 +132,11 @@ examples and tests link back here rather than restating it.
   through QBE and Wasm; each backend supplies its stable arena and legalizes
   target layout only after canonical MIR.
   The complete differential corpus is compiled, linked, and executed through
-  QBE 1.3 as both the native oracle and the product native path. QBE IL and
-  assembly travel through memory; only a candidate executable is written in a
-  uniquely owned same-directory scratch area, then atomically renamed over the
-  destination. Native executables start at `main`; MIR keeps package `pub`
+  QBE 1.3 as both the native oracle and the product native path. QBE IL,
+  assembly, diagnostics, and the candidate executable stay inside a uniquely
+  owned same-directory scratch area; regular files connect the host tools
+  without a bidirectional-pipe deadlock, and only the candidate is atomically
+  renamed over the destination. Native executables start at `main`; MIR keeps package `pub`
   visibility separate from explicit artifact exports. Wasm exposes the
   package API, while QBE exports only the entry and explicit C boundaries.
 - The test suite exercises the frontend, semantic model, both interpreters,

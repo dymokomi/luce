@@ -512,10 +512,11 @@ backend translates canonical MIR directly into QBE IL:
 The QBE backend owns target layout, lowers
 structured control flow to QBE's graph, and relies on QBE for ABI lowering,
 instruction selection, and register allocation. The first implementation
-uses the real QBE toolchain as both oracle and product native path. IL is fed
-to QBE over stdin and its assembly is fed to the host C driver over stdin. The
-linked candidate is the only intermediate file; it lives in an atomically
-owned directory beside the requested output and replaces that output by an
+uses the real QBE toolchain as both oracle and product native path. IL,
+assembly, diagnostics, and the linked candidate live in an atomically owned
+directory beside the requested output. Regular files connect the host tools:
+fully feeding one pipe before draining the other can deadlock once both fill.
+Only the linked candidate leaves scratch, replacing the requested output by an
 atomic same-filesystem rename. A later Luce-native backend can be
 differential-tested against this baseline. Both paths consume the same
 canonical MIR; neither adds target-specific lowering before the backend
