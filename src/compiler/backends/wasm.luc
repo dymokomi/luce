@@ -47,26 +47,23 @@
 #       `r0..rN-1` are exactly wasm's parameter locals `0..N-1`, so registers
 #       map onto locals without renumbering; only the remainder are declared.
 #
-#       Read `emit` top-down: it writes the sections in the order the binary
-#       format requires — type, import, function, optional table, memory,
-#       global, export, optional elements, code, data — and each `encode_*`
-#       payload. The function index space is: imports first (in extern order,
-#       then `proc_exit`), then every defined MIR function in program order,
-#       then `_start` when present. The instruction encoders follow, grouped
-#       by family; the float-constant and LEB128 helpers at the end are the
-#       only byte-level plumbing.
+#       `wasm_plan.luc` first settles types, index spaces, table membership,
+#       and concrete memory offsets. Read `emit` top-down from that immutable
+#       plan: it writes type, import, function, optional table, memory, global,
+#       export, optional elements, code, and data sections in binary order.
+#       Instruction encoders follow by family; float-constant and LEB128
+#       helpers at the end are the only byte-level plumbing.
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirData, MirFunction, MirInstruction
-from compiler.mir.canonical import MirProgram, MirSignature, MirTypeTable, RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
+from compiler.mir.canonical import BinaryOp, ConvertOp, FunctionId, InstructionForm, MirFunction, MirInstruction
+from compiler.mir.canonical import MirProgram, MirTypeTable, RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
-from compiler.mir.canonical import describe_mir_type, find_runtime_binding, int_maximum, int_minimum, mir_type
-from compiler.backends.layout import LayoutRules, TypeLayout, align_up
+from compiler.mir.canonical import find_runtime_binding, int_maximum, int_minimum, mir_type
+from compiler.backends.layout import TypeLayout, align_up
+from compiler.backends.wasm_plan import ModulePlan, defined_function_index, frame_alignment, has_start, i32_value_type
+from compiler.backends.wasm_plan import plan_module, signature_index, stack_top, start_function_index, wasm_signature, wasm_value_type
 import std.strings
-
-func wasm_layout() -> LayoutRules:
-    return LayoutRules(pointer_size = 4, pointer_align = 4)
 
 # mark: WebAssembly binary format names =======================================================
 
@@ -82,7 +79,6 @@ let code_section: u8 = 0x0A
 let data_section: u8 = 0x0B
 
 let function_type_tag: u8 = 0x60
-let i32_value_type: u8 = 0x7F
 let i64_value_type: u8 = 0x7E
 let f32_value_type: u8 = 0x7D
 let f64_value_type: u8 = 0x7C
@@ -106,7 +102,6 @@ let wasi_stdout: i64 = 1
 let scratch_iovec_buffer: i64 = 0     # iovec.buf: i32 offset of the bytes
 let scratch_iovec_length: i64 = 4     # iovec.buf_len: i32 byte count
 let scratch_written: i64 = 8          # where fd_write stores the count written
-let scratch_size: i64 = 16            # data items pack after this
 
 # The shadow stack pointer follows imported external globals in Wasm's global
 # index space, starts at the top of a sixteen-page memory, and grows down
@@ -114,8 +109,6 @@ let scratch_size: i64 = 16            # data items pack after this
 # 16-byte aligned. A memory without a stack stays one page.
 let page_size: i64 = 65536
 let stack_pages: i64 = 16
-let stack_top: i64 = 1048576
-let frame_alignment: i64 = 16
 
 # Control
 let opcode_unreachable: u8 = 0x00
@@ -293,210 +286,6 @@ pub class WasmBackend:
         if data_segment_count(program) > 0:
             append_section(output, data_section, try encode_data_entries(program, plan))
         return output
-
-# mark: Module layout =========================================================================
-
-# One wasm function type: parameter and result value types.
-struct WasmSignature:
-    let parameters: list[u8]
-    let results: list[u8]
-
-# One import: which runtime extern it binds, and its wasm type index.
-struct WasmImport:
-    let external: i64
-    let module_name: str
-    let field_name: str
-    let type_index: i64
-
-struct WasmGlobalImport:
-    let module_name: str
-    let field_name: str
-    let value_type: u8
-
-# Everything decided before any byte is written: the type table, the
-# imports (which take the first function indices), the type index of every
-# defined function, where each data item lands in memory, whether the
-# module has a memory and a shadow stack at all, and the `_start` wrapper
-# when there is an entry. `proc_exit_import` and `start_type` are -1
-# without an entry.
-struct ModulePlan:
-    let layout: TypeLayout
-    let signatures: list[WasmSignature]
-    let imports: list[WasmImport]
-    let global_imports: list[WasmGlobalImport]
-    let function_types: list[i64]
-    # Wasm function indices of only the C imports whose addresses are used.
-    let table_imports: list[i64]
-    let data_offsets: list[i64]
-    let global_offsets: list[i64]
-    # First byte past data and internal globals, rounded to a frame boundary:
-    # the lowest address the shadow stack may reach.
-    let data_end: i64
-    let has_memory: bool
-    let has_stack: bool
-    let has_function_table: bool
-    let proc_exit_import: i64
-    let start_type: i64
-
-func plan_module(program: MirProgram) -> ModulePlan!:
-    let layout = TypeLayout(program.types, wasm_layout())
-    let signatures = list[WasmSignature]()
-    let imports = list[WasmImport]()
-    let global_imports = list[WasmGlobalImport]()
-    for index in range(0, len(program.externs)):
-        let external = program.externs[index]
-        match external.convention:
-            runtime:
-                # The only runtime service the slice needs. WASI's `fd_write`
-                # takes (fd, iovs, iovs_len, nwritten) and returns an errno.
-                if external.name != "luce_rt_write":
-                    error("wasm backend does not support runtime extern `" + external.name + "` yet")
-                let type_index = intern_signature(signatures, WasmSignature(parameters = [i32_value_type, i32_value_type, i32_value_type, i32_value_type], results = [i32_value_type]))
-                imports.append(WasmImport(external = index, module_name = wasi_module, field_name = wasi_fd_write, type_index = type_index))
-            c:
-                let type_index = intern_signature(signatures, try wasm_signature(program.types, external.signature))
-                imports.append(WasmImport(external = index, module_name = c_import_module, field_name = external.name, type_index = type_index))
-            luce: error("wasm backend found a Luce-convention extern `" + external.name + "`")
-    for global in program.external_globals:
-        global_imports.append(WasmGlobalImport(
-            module_name = c_import_module,
-            field_name = global.name,
-            value_type = try wasm_value_type(program.types, global.value_type),
-        ))
-
-    # An entry gets `_start`, which needs `proc_exit(i32)` to report the
-    # exit status. The import is not tied to a MIR extern.
-    var proc_exit_import = -1
-    var start_type = -1
-    let entry = program.entry
-    if entry != none:
-        let exit_type = intern_signature(signatures, WasmSignature(parameters = [i32_value_type], results = list[u8]()))
-        proc_exit_import = len(imports)
-        imports.append(WasmImport(external = -1, module_name = wasi_module, field_name = wasi_proc_exit, type_index = exit_type))
-        start_type = intern_signature(signatures, WasmSignature(parameters = list[u8](), results = list[u8]()))
-
-    let function_types = list[i64]()
-    let table_imports = list[i64]()
-    var has_stack = false
-    var has_function_table = false
-    var allocates_storage = false
-    for function in program.functions:
-        let function_signature = try wasm_signature(program.types, function.signature)
-        function_types.append(intern_signature(signatures, function_signature))
-        if len(function.slots) > 0: has_stack = true
-        for instruction in function.body:
-            match instruction.form:
-                AllocateStorage(result, element_type, count): allocates_storage = true
-                FunctionAddress(result, target): has_function_table = true
-                ExternAddress(result, target):
-                    has_function_table = true
-                    var import_index = -1
-                    for index in range(0, len(imports)):
-                        if imports[index].external == i64(target.value): import_index = index
-                    if import_index < 0: error("wasm backend has no import address for extern " + str(target.value))
-                    if not contains_index(table_imports, import_index): table_imports.append(import_index)
-                CallIndirect(results, indirect_signature, convention, target, arguments):
-                    has_function_table = true
-                    discard(intern_signature(signatures, try wasm_signature(program.types, indirect_signature)))
-                else: pass
-
-    # Immutable data and mutable Luce globals share linear memory but receive
-    # disjoint aligned cells. Their concrete offsets exist only in this plan.
-    let data_offsets = list[i64]()
-    var offset = scratch_size
-    for item in program.data:
-        offset = align_up(offset, item.align)
-        data_offsets.append(offset)
-        offset += len(item.bytes)
-    let global_offsets = list[i64]()
-    for global in program.globals:
-        offset = align_up(offset, layout.align_of(global.value_type))
-        global_offsets.append(offset)
-        offset += layout.size_of(global.value_type)
-    let data_end = align_up(offset, frame_alignment)
-
-    # `fd_write` reads its iovec from memory, so importing it needs a memory
-    # even when the program has no data of its own; so does a shadow stack.
-    let has_memory = len(program.data) > 0 or len(program.globals) > 0 or len(imports) > 0 or has_stack or allocates_storage
-    if has_stack and data_end > stack_top:
-        error("wasm backend: static data and globals overlap the shadow stack")
-    return ModulePlan(
-        layout = layout,
-        signatures = signatures,
-        imports = imports,
-        global_imports = global_imports,
-        function_types = function_types,
-        table_imports = table_imports,
-        data_offsets = data_offsets,
-        global_offsets = global_offsets,
-        data_end = data_end,
-        has_memory = has_memory,
-        has_stack = has_stack,
-        has_function_table = has_function_table,
-        proc_exit_import = proc_exit_import,
-        start_type = start_type,
-    )
-
-func intern_signature(signatures: list[WasmSignature], signature: WasmSignature) -> i64:
-    for index in range(0, len(signatures)):
-        if wasm_signatures_match(signatures[index], signature): return index
-    signatures.append(signature)
-    return len(signatures) - 1
-
-func contains_index(values: list[i64], sought: i64) -> bool:
-    for value in values:
-        if value == sought: return true
-    return false
-
-func wasm_signatures_match(left: WasmSignature, right: WasmSignature) -> bool:
-    if len(left.parameters) != len(right.parameters) or len(left.results) != len(right.results): return false
-    for index in range(0, len(left.parameters)):
-        if left.parameters[index] != right.parameters[index]: return false
-    for index in range(0, len(left.results)):
-        if left.results[index] != right.results[index]: return false
-    return true
-
-func signature_index(signatures: list[WasmSignature], signature: WasmSignature) -> i64:
-    for index in range(0, len(signatures)):
-        if wasm_signatures_match(signatures[index], signature): return index
-    trap("wasm module plan omitted an instruction signature")
-
-func wasm_signature(types: MirTypeTable, signature: MirSignature) -> WasmSignature!:
-    let parameters = list[u8]()
-    for parameter in signature.parameters:
-        parameters.append(try wasm_value_type(types, parameter))
-    let results = list[u8]()
-    for result in signature.results:
-        results.append(try wasm_value_type(types, result))
-    return WasmSignature(parameters = parameters, results = results)
-
-# Every register-sized MIR type has one wasm value type: integers up to 32
-# bits and `bool` are i32, 64-bit integers are i64, floats keep their width,
-# and a pointer is an i32 offset into the module's single memory.
-func wasm_value_type(types: MirTypeTable, id: TypeId) -> u8!:
-    match mir_type(types, id):
-        Int(bits, is_signed):
-            if bits <= 32: return i32_value_type
-            return i64_value_type
-        Float(bits):
-            if bits == 32: return f32_value_type
-            return f64_value_type
-        Bool: return i32_value_type
-        Ptr: return i32_value_type
-        List(element): return i32_value_type
-        Slice(element): return i32_value_type
-        else: error("wasm backend cannot place `" + describe_mir_type(types, id) + "` in a register")
-
-# Defined functions follow the imports in the function index space.
-func defined_function_index(plan: ModulePlan, function: i64) -> i64:
-    return len(plan.imports) + function
-
-# `_start`, when present, is defined after every MIR function.
-func has_start(plan: ModulePlan) -> bool:
-    return plan.start_type >= 0
-
-func start_function_index(program: MirProgram, plan: ModulePlan) -> i64:
-    return defined_function_index(plan, len(program.functions))
 
 # mark: Sections ==============================================================================
 

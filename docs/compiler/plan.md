@@ -417,8 +417,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   through HIR, canonical MIR, and QBE (`done.md` §2). Shallow `copy` with
   independent collection storage is complete too. Finish list
   iteration-invalidation traps and ARC/reclamation, then maps, sets,
-  strings/bytes builders, and formatted strings. Do not promote the broad
-  §12 row until every operation has its own conformance evidence.
+  strings/bytes builders, ownership-retaining bytes slices, and formatted
+  strings. Do not implement bytes slicing only for static literals: §12.6
+  requires every escaping safe slice to retain hidden ownership. Do not
+  promote the broad §12 row until every operation has its own conformance
+  evidence.
 - [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
 - [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.
 
@@ -447,9 +450,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Decompose stable pass ownership before large files become permanent.**
   Give every cohesive source/test region a `# mark:` heading as it is touched.
   File length is reviewed at each vertical-slice audit; roughly 2,000 lines
-  triggers an ownership review, not an arbitrary mechanical split. The
-  low-level Wasm binary writer is already stable enough to extract from
-  semantic encoding.
+  triggers an ownership review, not an arbitrary mechanical split. Wasm
+  module planning now has its own 227-line owner, leaving the related
+  instruction/section encoder cohesive at 1,728 lines; its byte plumbing is
+  too small to justify another module today.
   HIR generation and MIR lowering still change across collections, text, and
   ownership, so split them at the next stable boundary—after collections/text
   and before classes/ARC—into independently testable declaration/type,

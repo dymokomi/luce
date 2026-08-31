@@ -20,7 +20,7 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, direct and exact Luce/C indirect calls, constants, tuples, fixed arrays, typed reference lists, optionals, `str`/`bytes` values, structural equality, lengths and checked sequence indexing, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, mixed aggregate/reference places, direct scalar C imports/exports and external variables, exact sealed-runtime bindings, globals and arena service, typed native operations, nominal handle erasure, pointer/null and output-slot boundary adapters, demand-generated cfunc adapters, and shared C-export wrappers, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect calls, WASI preview 1, C imports/globals, backend-laid-out internal globals, exports, shadow stack, aggregate copies, overflow-checked typed moves, and backend-local legalization of typed list handles. The production list runtime still depends on the native arena provider, so only the canonical list operations—not the complete source example—are claimed for Wasm. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, direct/indirect calls, memory and typed overlapping moves, internal globals, a stable guarded runtime arena, the compiled Luce allocator and first list runtime, aggregate operations, QBE C ABI extension types, exact C function/object symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 508 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 509 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -332,6 +332,13 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   aggregate mutation, both semantic oracles, Wasm legalization, and real QBE
   execution are covered. General bytes slicing, list iteration invalidation,
   ARC, and reclamation remain separate work.
+- [x] **WebAssembly module planning has one backend-local owner**
+  (2026-08-30). `backends/wasm_plan.luc` now settles Wasm signatures,
+  imports, function/table indices, 32-bit type layout, and aligned static
+  addresses before encoding begins. The 1,728-line semantic encoder consumes
+  that complete immutable plan without forwarding wrappers or duplicated
+  pass state. A focused plan test pins index/layout/address ownership while
+  the complete Wasm execution suite continues to validate emitted bytes.
 - [x] **Exact ordinary function values reuse the canonical callable model**
   (2026-08-30). A named, capture-free Luce declaration has an exact `func`
   type and explicit `FunctionAddress` HIR form; calls through values are
