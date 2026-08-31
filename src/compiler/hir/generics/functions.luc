@@ -16,13 +16,18 @@ from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgum
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generics.inference import GenericInference
 from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, GenericRequirementUse, HirGenerationState, HirSemanticChecker, TypeBinding
-from compiler.hir.ir import BuiltinType, HirInterfaceRequirement, HirNodeForm, HirParameter, HirReceiver, NodeId, SymbolId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import BuiltinType, HirInterfaceRequirement, HirNodeForm, HirParameter, HirReceiver, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import resolve_builtin_type, types_match
 
 struct ResolvedRequirement:
     let requirement: HirInterfaceRequirement
     let interface_type: TypeId
     let requirement_index: i64
+
+struct PreparedGenericCall:
+    let function_index: i64
+    let type_arguments: list[TypeId]
+    let arguments: Operands
 
 ## Coordinates generic semantics with the ordinary body checker through the
 ## narrow operations that require expression or closure knowledge.
@@ -137,6 +142,65 @@ pub class GenericFunctionChecker:
 
     pub func check_call(semantics: HirSemanticChecker, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         let generic = self.state.generic_functions[generic_index]
+        let prepared = try self.prepare_call(
+            semantics,
+            generic_index,
+            type_arguments,
+            arguments,
+            0,
+            none,
+            none,
+            "generic function `" + generic.name + "`",
+            "function `" + generic.name + "`",
+            "call to `" + generic.name + "`",
+            generic.name,
+            span,
+        )
+        let function = self.state.functions[prepared.function_index]
+        let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = prepared.arguments), function.result, span)
+        return try semantics.require_type_for_feature(typed, expected)
+
+    ## Construct one generic class through its specialized initializer. The
+    ## initializer remains an ordinary generic callable, while this operation
+    ## substitutes the successful result with the concrete class identity.
+    pub func check_class_initializer(semantics: HirSemanticChecker, owner_name: str, owner_template: TypeId, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let generic = self.state.generic_functions[generic_index]
+        if generic.module_index != self.state.current_module and not generic.is_public:
+            try self.fail(span, "initializer `init` is private to module `" + self.state.sources[generic.module_index].name + "`")
+        var contextual = expected
+        if contextual != none:
+            let optional = self.state.optional_inner(contextual)
+            if optional != none: contextual = optional
+            let fallible = self.state.fallible_inner(contextual)
+            if fallible != none: contextual = fallible
+        let prepared = try self.prepare_call(
+            semantics,
+            generic_index,
+            type_arguments,
+            arguments,
+            1,
+            owner_template,
+            contextual,
+            "type `" + owner_name + "`",
+            "initializer for `" + owner_name + "`",
+            "construction of `" + owner_name + "`",
+            owner_name,
+            span,
+        )
+        let function = self.state.functions[prepared.function_index]
+        let owner_type = self.state.substitute_type(owner_template, generic.generic_id, prepared.type_arguments)
+        var construction_type = owner_type
+        if self.state.fallible_inner(function.result) != none:
+            construction_type = self.state.intern_fallible(owner_type)
+        let typed = self.state.push_node(HirNodeForm.Initialize(function = function.symbol, arguments = prepared.arguments), construction_type, span)
+        return try semantics.require_type_for_feature(typed, expected)
+
+    ## Infer, specialize, and place one generic callable's source arguments.
+    ## Class construction skips hidden `self` but otherwise shares exactly the
+    ## same labels, defaults, evaluation order, and conversion transaction as
+    ## a free generic call.
+    func prepare_call(semantics: HirSemanticChecker, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], first_source_parameter: i64, context_pattern: TypeId?, context_value: TypeId?, type_subject: str, call_subject: str, missing_subject: str, inference_subject: str, span: SourceSpan) -> PreparedGenericCall!:
+        let generic = self.state.generic_functions[generic_index]
         let inferred = list[TypeId]()
         let bound = list[bool]()
         for parameter in generic.type_parameters:
@@ -144,18 +208,22 @@ pub class GenericFunctionChecker:
             bound.append(false)
         if len(type_arguments) > 0:
             if len(type_arguments) != len(generic.type_parameters):
-                try self.fail(span, "generic function `" + generic.name + "` needs " + str(len(generic.type_parameters)) + " type argument(s), got " + str(len(type_arguments)))
+                try self.fail(span, type_subject + " needs " + str(len(generic.type_parameters)) + " type argument(s), got " + str(len(type_arguments)))
             for index in range(0, len(type_arguments)):
                 match type_arguments[index]:
                     TypeArgument(value): inferred[index] = try self.declarations.resolve_type(self.state.current_module, value)
-                    IntegerArgument(token): try self.fail(token.span, "generic function type arguments must be types")
+                    IntegerArgument(token): try self.fail(token.span, "generic callable type arguments must be types")
                 bound[index] = true
 
+        if context_pattern != none and context_value != none:
+            try self.inference.infer(context_pattern, context_value, generic.generic_id, inferred, bound, span)
+
         let assigned = list[bool]()
-        for parameter in generic.signature.parameters: assigned.append(false)
+        for parameter_index in range(0, len(generic.signature.parameters)):
+            assigned.append(parameter_index < first_source_parameter)
         let placed_parameters = list[i64]()
         let placed_nodes = list[NodeId]()
-        var positional_index = 0
+        var positional_index = first_source_parameter
         var saw_named = false
         for argument in arguments:
             var parameter_index = -1
@@ -167,10 +235,10 @@ pub class GenericFunctionChecker:
             else:
                 saw_named = true
                 parameter_index = self.find_parameter(generic.signature, label)
-                if parameter_index < 0:
-                    try self.fail(argument.span, "function `" + generic.name + "` has no parameter `" + label + "`")
+                if parameter_index < first_source_parameter:
+                    try self.fail(argument.span, call_subject + " has no parameter `" + label + "`")
             if parameter_index >= len(generic.signature.parameters):
-                try self.fail(argument.span, "function `" + generic.name + "` accepts " + str(len(generic.signature.parameters)) + " argument(s)")
+                try self.fail(argument.span, call_subject + " accepts " + str(len(generic.signature.parameters) - first_source_parameter) + " argument(s)")
             if assigned[parameter_index]:
                 try self.fail(argument.span, "parameter `" + generic.signature.parameters[parameter_index].name + "` is supplied more than once")
             assigned[parameter_index] = true
@@ -183,7 +251,7 @@ pub class GenericFunctionChecker:
 
         for index in range(0, len(bound)):
             if not bound[index]:
-                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + generic.name + "`; supply explicit type arguments")
+                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + inference_subject + "`; supply explicit type arguments")
 
         let function_index = try self.instantiate(semantics, generic_index, inferred, span)
         let function = self.state.functions[function_index]
@@ -193,15 +261,20 @@ pub class GenericFunctionChecker:
             let converted = try semantics.require_type_for_feature(placed_nodes[index], function.parameters[parameter_index].value_type)
             placed.append(u32(parameter_index))
             placed.append(converted.value)
-        for parameter_index in range(0, len(function.parameters)):
+        for parameter_index in range(first_source_parameter, len(function.parameters)):
             if assigned[parameter_index]: continue
             let default_value = function.parameters[parameter_index].default_value
             if default_value.value == no_node:
-                try self.fail(span, "call to `" + generic.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
+                try self.fail(span, missing_subject + " is missing argument `" + function.parameters[parameter_index].name + "`")
             placed.append(u32(parameter_index))
             placed.append(default_value.value)
-        let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.state.push_run(placed)), function.result, span)
-        return try semantics.require_type_for_feature(typed, expected)
+        let copied_arguments = list[TypeId]()
+        for argument in inferred: copied_arguments.append(argument)
+        return PreparedGenericCall(
+            function_index = function_index,
+            type_arguments = copied_arguments,
+            arguments = self.state.push_run(placed),
+        )
 
     ## Infer a concrete specialization from an expected function type.
     pub func check_function_address(semantics: HirSemanticChecker, generic_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:

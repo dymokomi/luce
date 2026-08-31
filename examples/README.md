@@ -54,6 +54,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   matching, conformance witnesses and existential dispatch; and source-order
   evaluation of named payloads through both semantic oracles, Wasm, and native
   QBE.
+- `generic_classes.luc` proves inferred, explicit and contextual managed
+  applications with substituted fields and lifecycle methods, distinct
+  concrete identity, weak recursive references, fallible construction,
+  conformance witnesses and existential dispatch through both semantic
+  oracles, Wasm, and native QBE.
 - `interfaces.luc` proves existential conversion and dynamic dispatch for
   value and class conformers. Value payload mutation detaches with copy-on-
   write, class payload mutation preserves shared identity, and infallible

@@ -129,10 +129,10 @@ pub func node_span(program: HirProgram, id: NodeId) -> SourceSpan:
 ## Return the concrete fields of one struct or class application.
 pub func nominal_fields(program: HirProgram, value_type: TypeId) -> list[HirNominalField]:
     if i64(value_type.value) >= len(program.nominal_applications): trap("nominal TypeId has no application metadata")
-    let application = program.nominal_applications[value_type.value] else trap("type has no nominal application metadata")
-    match application:
+    let nominal = program.nominal_applications[value_type.value] else trap("type has no nominal application metadata")
+    match nominal:
         StructApplication(fields): return fields
-        ClassApplication(fields): return fields
+        ClassApplication(class_value): return class_value.fields
         EnumApplication(cases): trap("enum application has cases, not fields")
 
 ## Return the concrete, fully substituted cases of one enum application.
@@ -140,11 +140,21 @@ pub func nominal_fields(program: HirProgram, value_type: TypeId) -> list[HirNomi
 ## applications of the same generic enum may have different payload shapes.
 pub func nominal_cases(program: HirProgram, value_type: TypeId) -> list[HirEnumCase]:
     if i64(value_type.value) >= len(program.nominal_applications): trap("nominal TypeId has no application metadata")
-    let application = program.nominal_applications[value_type.value] else trap("type has no nominal application metadata")
-    match application:
+    let nominal = program.nominal_applications[value_type.value] else trap("type has no nominal application metadata")
+    match nominal:
         EnumApplication(cases): return cases
         StructApplication(fields): trap("struct application has fields, not cases")
-        ClassApplication(fields): trap("class application has fields, not cases")
+        ClassApplication(class_value): trap("class application has fields, not cases")
+
+## Return the concrete payload and lifecycle identities of one class
+## application. A generic declaration has one abstract schema, but every
+## executable application owns a distinct specialized deinitializer.
+pub func class_application(program: HirProgram, value_type: TypeId) -> HirClassApplication:
+    if i64(value_type.value) >= len(program.nominal_applications): trap("class TypeId has no application metadata")
+    let application = program.nominal_applications[value_type.value] else trap("class type has no application metadata")
+    match application:
+        ClassApplication(value): return value
+        else: trap("class application requested from a non-class type")
 
 ## One declared struct. `TypeForm.Struct(index, arguments)` names its
 ## declaration and concrete generic arguments by position here.
@@ -163,8 +173,11 @@ pub struct HirStruct:
     pub let span: SourceSpan
 
 ## One declared identity type. `TypeForm.Class(index, arguments)` names its
-## declaration and concrete generic arguments here. Fields describe the object payload; allocation and reference counts
-## are semantic operations, never HIR layout.
+## declaration and concrete generic arguments here. Fields and lifecycle
+## symbols are the declaration schema; generic entries may therefore name
+## abstract types and generic-function symbols. `HirClassApplication` owns the
+## executable substituted payload and deinitializer for each concrete TypeId.
+## Allocation and reference counts are semantic operations, never HIR layout.
 pub struct HirClass:
     pub let module: ModuleId
     pub let name: str
@@ -195,8 +208,15 @@ pub struct HirEnum:
 ## types have `none` in `HirProgram.nominal_applications`.
 pub union HirNominalApplication:
     StructApplication(fields: list[HirNominalField])
-    ClassApplication(fields: list[HirNominalField])
+    ClassApplication(application: HirClassApplication)
     EnumApplication(cases: list[HirEnumCase])
+
+pub struct HirClassApplication:
+    ## Semantic declaration order only; physical layout is backend-owned.
+    pub let fields: list[HirNominalField]
+    ## Exact concrete function, or none. Construction already records its
+    ## concrete initializer directly on each `Initialize` node.
+    pub let deinitializer: SymbolId?
 
 ## One callable requirement in declaration order. The receiver is implicit
 ## in this record: `parameters` contains only the arguments after `self`.
@@ -1011,6 +1031,52 @@ func type_definition(types: TypeTable, value: TypeId) -> TypeDefinition?:
     if i64(value.value) >= len(types.definitions): return none
     return types.definitions[value.value]
 
+## Report whether a canonical type still contains an abstract generic
+## parameter. Consumers use this to exclude declaration schemas from
+## executable application tables without learning anything about lowering.
+pub func type_contains_parameter(types: TypeTable, value: TypeId) -> bool:
+    return type_contains_parameter_once(types, value, list[TypeId]())
+
+func type_contains_parameter_once(types: TypeTable, value: TypeId, visited: list[TypeId]) -> bool:
+    for previous in visited:
+        if types_match(previous, value): return false
+    visited.append(value)
+    match types.definitions[value.value].form:
+        TypeParameter(generic, position): return true
+        Slice(element): return type_contains_parameter_once(types, element, visited)
+        List(element): return type_contains_parameter_once(types, element, visited)
+        Weak(element): return type_contains_parameter_once(types, element, visited)
+        Range(element): return type_contains_parameter_once(types, element, visited)
+        Optional(element): return type_contains_parameter_once(types, element, visited)
+        Fallible(element): return type_contains_parameter_once(types, element, visited)
+        Array(element, count): return type_contains_parameter_once(types, element, visited)
+        NativePointer(element, is_mutable): return type_contains_parameter_once(types, element, visited)
+        Tuple(elements):
+            for element in elements:
+                if type_contains_parameter_once(types, element, visited): return true
+        Function(parameters, result):
+            for parameter in parameters:
+                if type_contains_parameter_once(types, parameter, visited): return true
+            return type_contains_parameter_once(types, result, visited)
+        CFunction(parameters, result):
+            for parameter in parameters:
+                if type_contains_parameter_once(types, parameter, visited): return true
+            return type_contains_parameter_once(types, result, visited)
+        Interface(index, arguments):
+            for argument in arguments:
+                if type_contains_parameter_once(types, argument, visited): return true
+        Struct(index, arguments):
+            for argument in arguments:
+                if type_contains_parameter_once(types, argument, visited): return true
+        Class(index, arguments):
+            for argument in arguments:
+                if type_contains_parameter_once(types, argument, visited): return true
+        Enum(index, arguments):
+            for argument in arguments:
+                if type_contains_parameter_once(types, argument, visited): return true
+        else: pass
+    return false
+
 ## Report whether a type is an implemented integer width.
 pub func is_integer_type(types: TypeTable, value: TypeId) -> bool:
     let definition = type_definition(types, value)
@@ -1145,13 +1211,13 @@ pub class BoxedValue:
 ## execution policy out of the HIR data model while allowing deterministic
 ## host ARC to trigger the language's final-release semantics.
 pub interface ClassFinalizer:
-    func finalize(class_index: i64, fields: list[BoxedValue], run_deinitializer: bool)
+    func finalize(class_type: TypeId, fields: list[BoxedValue], run_deinitializer: bool)
 
-## Shared identity behind one interpreted class value. The class index names
-## semantic payload metadata in HirProgram; neither target layout nor an ARC
+## Shared identity behind one interpreted class value. The concrete TypeId
+## names semantic application metadata in HirProgram; neither target layout nor an ARC
 ## header is represented here. The finalizer runs while fields are still live.
 pub class ClassStorage:
-    pub let class_index: i64
+    pub let class_type: TypeId
     pub let fields: list[BoxedValue]
     ## False only for the borrowed, non-finalizing semantic proxy supplied to
     ## `deinit`; weak promotion must already observe that identity as dead.
@@ -1160,8 +1226,8 @@ pub class ClassStorage:
     let finalizer: ClassFinalizer
     let calls_finalizer: bool
 
-    pub init(class_index: i64, fields: list[BoxedValue], finalizer: ClassFinalizer, calls_finalizer: bool, is_alive: bool, is_initialized: bool):
-        self.class_index = class_index
+    pub init(class_type: TypeId, fields: list[BoxedValue], finalizer: ClassFinalizer, calls_finalizer: bool, is_alive: bool, is_initialized: bool):
+        self.class_type = class_type
         self.fields = fields
         self.finalizer = finalizer
         self.calls_finalizer = calls_finalizer
@@ -1170,7 +1236,7 @@ pub class ClassStorage:
 
     deinit:
         if self.calls_finalizer:
-            self.finalizer.finalize(self.class_index, self.fields, self.is_initialized)
+            self.finalizer.finalize(self.class_type, self.fields, self.is_initialized)
 
 ## One non-owning class slot. The host weak edge is an implementation of the
 ## HIR oracle only: canonical MIR will retain an abstract weak-slot operation,
@@ -1338,7 +1404,7 @@ pub union Value:
                     text = text + field.value.render()
                     index += 1
                 return text + "}"
-            Class(storage): return "<class#" + str(storage.class_index) + ">"
+            Class(storage): return "<class-type#" + str(storage.class_type.value) + ">"
             WeakClass(storage): return "<weak-class>"
             CapturedCell(storage): return "<captured-cell>"
             Function(symbol): return "<function>"

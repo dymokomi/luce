@@ -158,6 +158,14 @@ pub class MirLoweringState:
     pub let data: list[MirData]
     pub let lowered_functions: list[LoweredFunction]
     pub let classes: list[MirClass]
+    ## Concrete HIR class application in the same order as canonical
+    ## `classes`. Source declaration indices are deliberately insufficient:
+    ## `Box[i64]` and `Box[str]` have distinct payload and lifecycle identity.
+    pub let class_hir_types: list[ir.TypeId]
+    ## HIR TypeId-aligned reverse map to the canonical class table. Concrete
+    ## application lookup stays constant-time while `class_hir_types` retains
+    ## the inverse mapping needed to build payloads and destroyers.
+    pub let class_identities: list[u32]
     pub let class_destroyers: list[FunctionId]
     pub let interfaces: list[MirInterface]
     pub let conformances: list[MirConformance]
@@ -214,6 +222,9 @@ pub class MirLoweringState:
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
         self.classes = list[MirClass]()
+        self.class_hir_types = list[ir.TypeId]()
+        self.class_identities = list[u32]()
+        for definition in self.program.types.definitions: self.class_identities.append(unlowered_nominal_type)
         self.class_destroyers = list[FunctionId]()
         self.interfaces = list[MirInterface]()
         self.conformances = list[MirConformance]()
@@ -226,7 +237,7 @@ pub class MirLoweringState:
         self.lowered_struct_types = list[u32]()
         for definition in self.program.types.definitions: self.lowered_struct_types.append(unlowered_nominal_type)
         self.lowered_class_types = list[u32]()
-        for index in range(0, len(self.program.classes)): self.lowered_class_types.append(unlowered_nominal_type)
+        for definition in self.program.types.definitions: self.lowered_class_types.append(unlowered_nominal_type)
         self.lowered_enum_types = list[u32]()
         for definition in self.program.types.definitions: self.lowered_enum_types.append(unlowered_nominal_type)
         self.lowered_interface_types = list[u32]()
@@ -516,19 +527,19 @@ pub class MirLoweringState:
                 if completed != result.value: trap("nominal MIR type reservations are not nested")
                 return result
             Class(index, arguments):
-                let existing = self.lowered_class_types[index]
+                let existing = self.lowered_class_types[value.value]
                 if existing != unlowered_nominal_type: return TypeId(value = existing)
+                let identity = self.class_identity(value)
+                if identity == none: trap("concrete HIR class application was not reserved")
                 let result = TypeId(value = u32(len(self.types.definitions)))
-                self.lowered_class_types[index] = result.value
-                self.types.definitions.append(MirType.Class(identity = ClassId(value = u32(index))))
+                self.lowered_class_types[value.value] = result.value
+                self.types.definitions.append(MirType.Class(identity = identity))
                 return result
             Weak(inner):
-                var class_index = -1
-                match self.program.types.definitions[inner.value].form:
-                    Class(index, type_arguments): class_index = index
+                let class_type = try self.lower_mir_type(inner)
+                match mir_type(self.types, class_type):
+                    Class(identity): return self.intern_lowered_type(MirType.WeakClass(identity = identity))
                     else: trap("HIR `Weak[T]` referent is not a class")
-                discard(try self.lower_mir_type(inner))
-                return self.intern_lowered_type(MirType.WeakClass(identity = ClassId(value = u32(class_index))))
             Interface(declaration, arguments):
                 let existing = self.lowered_interface_types[value.value]
                 if existing != unlowered_nominal_type: return TypeId(value = existing)
@@ -590,6 +601,21 @@ pub class MirLoweringState:
                     Integer(representation): return try self.lower_mir_type(representation)
             else: error("type `" + describe_type(self.program.types, value) + "`")
 
+    ## Reserve one concrete class application and its generated destroyer.
+    ## Reservation precedes type/body lowering so every implicit release edge
+    ## refers to stable canonical identities.
+    pub func reserve_class(value_type: ir.TypeId, destroyer: FunctionId):
+        if self.class_identities[value_type.value] != unlowered_nominal_type: trap("class application was reserved more than once")
+        self.class_identities[value_type.value] = u32(len(self.class_hir_types))
+        self.class_hir_types.append(value_type)
+        self.class_destroyers.append(destroyer)
+
+    pub func class_identity(value_type: ir.TypeId) -> ClassId?:
+        if i64(value_type.value) >= len(self.class_identities): return none
+        let identity = self.class_identities[value_type.value]
+        if identity == unlowered_nominal_type: return none
+        return ClassId(value = identity)
+
     # Function values retain the same hidden result/error protocol as direct
     # Luce calls. Their aggregate handle is separate from this invocation
     # signature, so backends can keep capture layout private.
@@ -644,23 +670,22 @@ pub class MirLoweringState:
     ## identities have been reserved. Weak fields deliberately lower to a
     ## distinct storage handle rather than their source optional type.
     pub func lower_classes() -> !:
-        if len(self.class_destroyers) != len(self.program.classes): trap("class destroyer identities were not reserved")
-        for class_index in range(0, len(self.program.classes)):
-            let class_value = self.program.classes[class_index]
+        if len(self.class_destroyers) != len(self.class_hir_types): trap("class destroyer identities were not reserved")
+        for class_index in range(0, len(self.class_hir_types)):
+            let class_type = self.class_hir_types[class_index]
             let fields = list[MirClassField]()
-            for field in class_value.fields:
+            for field in nominal_fields(self.program, class_type):
                 var storage_type = try self.lower_mir_type(field.value_type)
                 if field.is_weak:
-                    var referent = -1
+                    var referent_type: ir.TypeId? = none
                     match self.program.types.definitions[field.value_type.value].form:
-                        Optional(inner):
-                            match self.program.types.definitions[inner.value].form:
-                                Class(index, arguments): referent = index
-                                else: pass
+                        Optional(inner): referent_type = inner
                         else: pass
-                    if referent < 0: trap("HIR weak field does not contain an optional class")
-                    discard(try self.lower_mir_type(self.class_hir_type(referent)))
-                    storage_type = self.intern_lowered_type(MirType.WeakClass(identity = ClassId(value = u32(referent))))
+                    let referent_hir_type = referent_type else trap("HIR weak field is not optional")
+                    let referent = try self.lower_mir_type(referent_hir_type)
+                    match mir_type(self.types, referent):
+                        Class(identity): storage_type = self.intern_lowered_type(MirType.WeakClass(identity = identity))
+                        else: trap("HIR weak field does not contain an optional class")
                 fields.append(MirClassField(storage_type = storage_type))
             self.classes.append(MirClass(fields = fields, destroyer = self.class_destroyers[class_index]))
 
@@ -680,16 +705,15 @@ pub class MirLoweringState:
                     let cell = self.cell_for_hir_type(capture.value_type) else trap("shared HIR capture has no reserved MIR cell")
                     storage_type = cell.cell_type
                 elif capture.kind == HirCaptureKind.weak_capture:
-                    var class_index: i64 = -1
+                    var referent_type: ir.TypeId? = none
                     match self.program.types.definitions[capture.value_type.value].form:
-                        Optional(inner):
-                            match self.program.types.definitions[inner.value].form:
-                                Class(index, arguments): class_index = index
-                                else: pass
+                        Optional(inner): referent_type = inner
                         else: pass
-                    if class_index < 0: trap("weak HIR closure capture is not an optional class")
-                    discard(try self.lower_mir_type(self.class_hir_type(class_index)))
-                    storage_type = self.intern_lowered_type(MirType.WeakClass(identity = ClassId(value = u32(class_index))))
+                    let referent_hir_type = referent_type else trap("weak HIR closure capture is not optional")
+                    let referent = try self.lower_mir_type(referent_hir_type)
+                    match mir_type(self.types, referent):
+                        Class(identity): storage_type = self.intern_lowered_type(MirType.WeakClass(identity = identity))
+                        else: trap("weak HIR closure capture is not an optional class")
                 fields.append(MirField(value_type = storage_type))
             let function_index = self.function_index_of(source.function)
             if function_index < 0: trap("HIR closure body has no function identity")
@@ -711,15 +735,6 @@ pub class MirLoweringState:
             ))
             allocating_index += 1
         if allocating_index != len(self.closure_destroyers): trap("closure destroyer reservation count does not match allocating closures")
-
-    ## Recover the canonical HIR type identity naming one class table entry.
-    func class_hir_type(class_index: i64) -> ir.TypeId:
-        for definition in self.program.types.definitions:
-            match definition.form:
-                Class(index, arguments):
-                    if index == class_index: return definition.id
-                else: pass
-        trap("HIR class has no canonical type definition")
 
     # Nominal aggregates reserve a valid empty definition so collection
     # references can point back to them. Structural interning skips only the

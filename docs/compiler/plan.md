@@ -198,13 +198,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   corpus, and require the checksum-pinned QBE 1.3 tool in the full test gate.
   No target IR or platform layout was added before the backend boundary
   (`facc3c3`).
-- [x] **QBE product materialization** (2026-08-30): `--target native` streams
-  canonical-MIR-derived IL into QBE and QBE assembly into the host C driver.
-  Only the linked candidate touches disk, inside an atomically unique,
-  owner-only directory beside the output; same-filesystem rename installs it
-  atomically. QBE and linker stderr become explicit diagnostics, failed builds
-  preserve the prior artifact, and the product path owns no `.ssa` or `.s`
-  files. The complete differential corpus and native smoke gate use this path.
+- [x] **QBE product materialization** (2026-08-30, hardened 2026-08-31):
+  `--target native` writes canonical-MIR-derived IL, QBE assembly, diagnostics,
+  and the linked candidate inside an atomically unique, owner-only directory
+  beside the output. Regular files connect QBE and the host C driver because
+  feeding one child pipe completely before draining the other can deadlock on
+  large programs. Same-filesystem rename installs only the finished candidate
+  atomically; failures preserve the prior artifact and remove all scratch.
+  The complete differential corpus and native smoke gate use this path.
 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
@@ -581,11 +582,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   executable interface example agree on generic interfaces, struct/class/enum
   conformers, nested ownership, returned existentials, mutation, fallibility
   adaptation, and propagation (`done.md` §2).
-- [ ] **Finish the remaining generic surface.** Memberwise generic structs and
-  enums, including their owner-parameterized value/mutating methods and
-  concrete conformances, are complete through both oracles and artifact
-  backends (`done.md` §2). Generic classes come next; independently generic methods, custom
-  generic-nominal initializers/type functions, serialized typed bodies,
+- [ ] **Finish the remaining generic surface.** Memberwise generic structs,
+  enums, and classes, including their owner-parameterized
+  value/mutating/lifecycle methods and concrete conformances, are complete
+  through both oracles and artifact backends (`done.md` §2). Independently
+  generic methods, custom generic-nominal initializers/type functions,
+  serialized typed bodies,
   package/CLI budget configuration,
   origin/size/time expansion accounting, and path-rich budget diagnostics also
   remain. Keep monomorphization out of canonical MIR.

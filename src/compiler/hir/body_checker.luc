@@ -22,7 +22,7 @@ from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 from compiler.hir.declarations import DeclarationCollector
-from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, CollectedFunctionSource
+from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedClassMethod, CollectedConstant, CollectedFunctionSource
 from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, HirGenerationState, HirSemanticChecker, ImportedModule, ImportedValue, ImportedValueBinding
 from compiler.hir.generation_model import LocalBinding, LocalStorage, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
 from compiler.hir.generics.functions import GenericFunctionChecker
@@ -70,6 +70,22 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     pub func instantiate_generic_method_for_feature(owner_type: TypeId, name: str, span: SourceSpan) -> i64!:
         return try self.generics.instantiate_method(self, owner_type, name, span)
+
+    ## A concrete generic class may be consumed without being constructed in
+    ## this package, yet releasing such a value still needs its exact
+    ## specialized deinitializer. Materialize that implicit lifecycle edge at
+    ## the same type-table fixed point as generic conformances.
+    pub func materialize_generic_class_lifecycle_for_feature(value_type: TypeId) -> !:
+        if self.state.contains_type_parameter(value_type): return
+        let class_index = self.declarations.class_of(value_type)
+        if class_index < 0: return
+        let item = self.state.classes[class_index]
+        if len(item.type_parameters) == 0: return
+        if item.deinitializer == none: return
+        let deinitializer = item.deinitializer else trap("class deinitializer disappeared")
+        match deinitializer:
+            Generic(index): discard(try self.generics.instantiate_method(self, value_type, "deinit", item.span))
+            Concrete(index): trap("generic class deinitializer has a concrete callable identity")
 
     pub func require_mutable_receiver_for_feature(value: NodeId, span: SourceSpan) -> !:
         try self.require_mutable_place(value, span, true)
@@ -559,7 +575,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                 if class_index >= 0:
                     let field_index = self.declarations.find_class_field(class_index, name)
                     if field_index < 0: try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
-                    let field = self.state.classes[class_index].fields[field_index]
+                    let field = self.declarations.class_field(place.value_type, field_index)
                     if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
                         try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.classes[class_index].module_index].name + "`")
                     let initializing_this_field = place.initializer_field and len(place.steps) == 0
@@ -1943,22 +1959,46 @@ pub class HirBodyChecker: HirSemanticChecker:
     # `new Document("Notes")`: classes have one explicit initializer and
     # construction is the only operation that creates a fresh identity.
     func check_class_new(value_syntax: TypeSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
-        let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
-        let class_index = self.declarations.class_of(value_type)
+        let class_index = try self.declarations.class_constructor_declaration(self.state.current_module, value_syntax)
         if class_index < 0:
+            let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
             try self.fail(value_syntax.span, "`new` requires a class type, found `" + self.describe_type(value_type) + "`")
         let item = self.state.classes[class_index]
         if item.module_index != self.state.current_module and not item.is_public:
             try self.fail(value_syntax.span, "class `" + item.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
-        return try self.check_initializer_call(
-            item.name,
-            item.type_id,
-            item.module_index,
-            item.initializer,
-            arguments,
-            span,
-            expected,
-        )
+        let initializer = item.initializer else trap("class has no initializer after declaration collection")
+        if len(item.type_parameters) > 0:
+            let type_arguments = list[TypeArgumentSyntax]()
+            match value_syntax.form:
+                Applied(path, applied_arguments):
+                    for argument in applied_arguments: type_arguments.append(argument)
+                else: pass
+            match initializer:
+                Generic(index):
+                    return try self.generics.check_class_initializer(
+                        self,
+                        item.name,
+                        item.type_id,
+                        index,
+                        type_arguments,
+                        arguments,
+                        span,
+                        expected,
+                    )
+                Concrete(index): trap("generic class initializer has a concrete callable identity")
+        let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
+        match initializer:
+            Concrete(index):
+                return try self.check_initializer_call(
+                    item.name,
+                    item.type_id,
+                    item.module_index,
+                    index,
+                    arguments,
+                    span,
+                    expected,
+                )
+            Generic(index): trap("non-generic class initializer has a generic callable identity")
 
     # Custom initializers remain ordinary functions. Memberwise construction
     # delegates to the nominal generic owner so this general expression
@@ -2112,7 +2152,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                 if self.declarations.find_method(self.state.classes[class_index].type_id, name) >= 0 or self.declarations.find_generic_method(checked_type, name) >= 0:
                     try self.fail(span, "`" + name + "` is a method of `" + self.state.classes[class_index].name + "`; call it with `(...)`")
                 try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
-            let field = self.state.classes[class_index].fields[field_index]
+            let field = self.declarations.class_field(checked_type, field_index)
             if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
                 try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.classes[class_index].module_index].name + "`")
             let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
@@ -2192,7 +2232,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             FieldAccess(inner, field):
                 let class_index = self.declarations.class_of(self.state.type_of(inner))
                 if class_index >= 0:
-                    let stored = self.state.classes[class_index].fields[field]
+                    let stored = self.declarations.class_field(self.state.type_of(inner), field)
                     if mutate_value and not stored.is_mutable:
                         try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
                     return
