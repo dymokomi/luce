@@ -205,6 +205,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
+- [x] **Conditional binding** (2026-08-30, `done.md` §2). `if let`
+  checks its optional subject once and canonicalizes directly to the existing
+  exhaustive optional `Match` HIR. Payload scope, ownership, flow analysis,
+  MIR lowering, and backend behavior therefore have one implementation rather
+  than a conditional-binding-specific path.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

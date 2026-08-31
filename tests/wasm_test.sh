@@ -443,6 +443,12 @@ pub func optional_loop() -> i64:
         if i == 3: best = i
         i += 1
     return best else -1
+func conditional_read(value: i64?) -> i64:
+    if let present = value:
+        return present
+    else:
+        return 5
+pub func conditional_binding() -> i64: return conditional_read(37) + conditional_read(none)
 pub func string_equality() -> i64:
     let a = "hello"
     let b = "hello"
@@ -476,6 +482,7 @@ composite optional_else 73
 composite optional_equality 111
 composite optional_tuple 21
 composite optional_loop 3
+composite conditional_binding 42
 composite string_equality 1011
 composite string_values 1
 composite string_in_tuple 1

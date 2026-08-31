@@ -36,7 +36,7 @@ column because it does not determine stage-1 completion.
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Definite initialization for class/custom-construction and future managed places. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Dynamic sequence operations, identity for future shared-reference kinds, and capability-dependent conversions. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Generic functions and managed function environments; audit all default-argument rules. |
-| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Conditional binding, protocol iteration/`try for`, and the remaining pattern families. |
+| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Protocol iteration/`try for` and the remaining pattern families. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Close the remaining synthesized/custom initialization, enum, and structural-operation rules as one audited set. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | syntax | — | — | syntax | HIR ownership model and semantic oracle. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, and owned bytes with escaping slices reach QBE and Wasm. Maps/sets, structural list equality, builders, and full Unicode text semantics remain. |
@@ -128,6 +128,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `stage0_brainfuck.luc` | Bytes, nested flow/match, bounded interpreter | HIR, MIR, Wasm, and native QBE execution. |
 | `function_values.luc` | Exact named function values and indirect calls | HIR, MIR, Wasm, and native QBE execution. |
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
+| `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |
 | `lists.luc` | Shared list identity, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `language_tour.luc` | Broad 1.0 declaration/control/managed surface | Parser only; each section migrates into focused executable examples as it lands. |

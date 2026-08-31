@@ -2087,9 +2087,20 @@ pub class HirGenerator:
         let checked = try self.check_expression(value, successful_result)
         return self.push_statement(HirNodeForm.ReturnStatement(value = checked), span)
 
-    # Each `if`/`elif` condition must be bool; every branch body is its own
-    # lexical scope.
+    # Ordinary `if`/`elif` conditions are bool. A conditional binding is the
+    # source shorthand for the same exhaustive optional selection HIR already
+    # uses for `match`: `.some(name)` executes the successful suite and
+    # `.none` executes the fallback (or an empty suite). Keeping one resolved
+    # shape gives both spellings identical scoping, ownership, and lowering.
     func check_if(branches: list[IfBranchSyntax], fallback: SuiteSyntax?, span: SourceSpan) -> NodeId!:
+        if len(branches) > 0:
+            match branches[0].condition.form:
+                Binding(name, value):
+                    if len(branches) != 1:
+                        try self.fail(branches[1].span, "a conditional binding cannot have an `elif` branch")
+                    return try self.check_conditional_binding(name, value, branches[0].body, branches[0].span, branches[0].condition.span, fallback, span)
+                else: pass
+
         # One triple per branch: condition node, body run start, body run count.
         let triples = list[u32]()
         for branch in branches:
@@ -2108,6 +2119,50 @@ pub class HirGenerator:
             has_fallback = true
             typed_fallback = self.push_nodes(try self.check_suite(fallback.statements))
         return self.push_statement(HirNodeForm.IfStatement(branches = self.push_run(triples), has_fallback = has_fallback, fallback = typed_fallback), span)
+
+    func check_conditional_binding(name: str, value: ExpressionSyntax, body: SuiteSyntax, branch_span: SourceSpan, condition_span: SourceSpan, fallback: SuiteSyntax?, span: SourceSpan) -> NodeId!:
+        let subject = try self.check_expression(value, none)
+        let subject_type = self.type_of(subject)
+        let inner = self.optional_inner(subject_type) else error(self.diagnostic(condition_span, "`if let` requires an optional value, found `" + self.describe_type(subject_type) + "`"))
+
+        try self.require_free_local_name(name, condition_span)
+        let symbol = self.make_symbol(name, SymbolKind.local, inner)
+        self.locals.append(LocalBinding(symbol = symbol, name = name, value_type = inner, is_mutable = false))
+        let present_body = self.push_nodes(try self.check_suite(body.statements))
+        self.locals.remove(len(self.locals) - 1)
+
+        let present_pattern = self.push_node(
+            HirNodeForm.PatternCase(case_index = 1, bindings = self.push_run([symbol.value])),
+            subject_type,
+            condition_span,
+        )
+        let present_arm = self.push_statement(HirNodeForm.MatchArm(
+            patterns = self.push_nodes([present_pattern]),
+            statements = present_body,
+            value = NodeId(value = no_node),
+        ), branch_span)
+
+        var absent_body = Operands(start = 0, count = 0)
+        var absent_span = span
+        if fallback != none:
+            absent_body = self.push_nodes(try self.check_suite(fallback.statements))
+            absent_span = fallback.span
+        let absent_pattern = self.push_node(
+            HirNodeForm.PatternCase(case_index = 0, bindings = self.push_run(list[u32]())),
+            subject_type,
+            condition_span,
+        )
+        let absent_arm = self.push_statement(HirNodeForm.MatchArm(
+            patterns = self.push_nodes([absent_pattern]),
+            statements = absent_body,
+            value = NodeId(value = no_node),
+        ), absent_span)
+
+        return self.push_statement(HirNodeForm.Match(
+            subject = subject,
+            arms = self.push_nodes([present_arm, absent_arm]),
+            has_result = false,
+        ), span)
 
     # The loop depth makes `break` and `continue` valid inside the body.
     func check_while(condition: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
@@ -2304,15 +2359,19 @@ pub class HirGenerator:
             let typed = self.push_node(HirNodeForm.Try(value = checked), successful, span)
             return try self.require_type(typed, expected)
 
+        # Numeric unary operators produce a non-optional value even when the
+        # surrounding context will promote that result to `T?`.
+        let operand_context = self.optional_value_context(expected)
+
         # `-9223372036854775808` must fold as one negative literal: its
         # magnitude does not fit positive i64, so negate-after-check would
         # reject the minimum. Other operands take the general path below.
-        if operator == "-" and expected != none and is_unsigned_integer_type(self.types, expected):
-            try self.fail(span, "`-` is invalid for `" + self.describe_type(expected) + "`")
-        if operator == "-" and (expected == none or is_integer_type(self.types, expected)):
+        if operator == "-" and operand_context != none and is_unsigned_integer_type(self.types, operand_context):
+            try self.fail(span, "`-` is invalid for `" + self.describe_type(operand_context) + "`")
+        if operator == "-" and (operand_context == none or is_integer_type(self.types, operand_context)):
             let literal = find_literal_token(operand)
             if literal != none and literal.kind == TokenKind.int_lit:
-                let integer_type = try self.integer_literal_type(literal, expected)
+                let integer_type = try self.integer_literal_type(literal, operand_context)
                 if is_unsigned_integer_type(self.types, integer_type):
                     try self.fail(span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
                 let integer = try self.decode_negative_integer(literal)
@@ -2320,7 +2379,7 @@ pub class HirGenerator:
                 let value = Value.Integer(value = integer)
                 return try self.require_type(self.push_constant(value, integer_type, span), expected)
 
-        let checked = try self.check_expression(operand, expected)
+        let checked = try self.check_expression(operand, operand_context)
         let checked_type = self.type_of(checked)
         var operation = UnaryOperation.NumericIdentity(operand_type = checked_type)
         if operator == "~":
@@ -2346,7 +2405,7 @@ pub class HirGenerator:
         # must not.
         var operand_context: TypeId? = none
         if is_arithmetic_operator(operator) and expected != none:
-            operand_context = expected
+            operand_context = self.optional_value_context(expected)
 
         let operands = try self.check_binary_operands(left, right, operand_context)
         let resolved = try self.resolve_binary_operation(self.type_of(operands.left), operator, self.type_of(operands.right), span)
@@ -2358,7 +2417,8 @@ pub class HirGenerator:
     # or from an expected `range[T]`.
     func check_range(left: ExpressionSyntax, operator: str, right: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         var element_context: TypeId? = none
-        if expected != none: element_context = self.range_inner(expected)
+        let range_context = self.optional_value_context(expected)
+        if range_context != none: element_context = self.range_inner(range_context)
         let operands = try self.check_binary_operands(left, right, element_context)
         let element = self.type_of(operands.left)
         if not types_match(element, self.type_of(operands.right)):
@@ -3880,6 +3940,15 @@ pub class HirGenerator:
         if inner != none and types_match(found, inner):
             return self.push_node(HirNodeForm.Some(value = value), expected, self.span_of(value))
         error(self.diagnostic(self.span_of(value), "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(found) + "`"))
+
+    # Operators and other intrinsically non-optional expressions receive the
+    # value inside an expected `T?` as their contextual type. `require_type`
+    # then inserts the one explicit `Some` node around the completed result.
+    func optional_value_context(expected: TypeId?) -> TypeId?:
+        if expected == none: return none
+        let inner = self.optional_inner(expected)
+        if inner != none: return inner
+        return expected
 
     # Spec §8.5 permits this one function conversion. It cannot be represented
     # by an exact code address alone for an arbitrary stored function value:
