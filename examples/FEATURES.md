@@ -81,7 +81,8 @@ working list path from being mistaken for the complete §12.4 contract.
 | Shallow `+` concatenation with fresh identity, ordered operands/elements, and independent slots | yes | yes | yes | `lists.luc` | complete |
 | Immutable snapshot slicing | yes | yes | yes, including bounds traps | `lists.luc` | complete for lists |
 | Ordered iteration; nested reads; alias-wide shape mutation trap; cleanup on exhaustion/continue/break/return/error | yes | yes | yes, including mutation traps | `lists.luc` | complete for built-in lists |
-| ARC ownership and reclamation of header/storage/elements | no | no | no | no | classes/ARC runtime pending |
+| Typed storage reclamation and allocator block reuse | runtime HIR | yes | yes, real exhaustion/reuse gate | internal runtime fixture | storage substrate complete |
+| ARC ownership and reclamation of header/storage/elements | no | no | no | no | managed-value cleanup pending |
 
 ## Reserved and contextual words
 

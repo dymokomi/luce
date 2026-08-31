@@ -180,7 +180,8 @@ Read in this order; each stop hands off to the next.
 - `src/compiler/backends/` contains the Wasm emitter, QBE emitter and host
   materializer, backend-owned layout, and the two semantic execution engines.
 - `src/runtime/` is the separately compiled freestanding Luce runtime; it owns
-  allocator and future ownership/collection policy above the backend arena.
+  checked allocation, typed reclamation and block reuse, plus the ownership
+  and collection policy being built above the backend arena.
 
 ## Contributing constraints
 

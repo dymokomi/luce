@@ -406,10 +406,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   call it, and no other native operation accepts generic arguments. This is
   the source bridge needed by runtime collection headers; it adds no layout,
   byte arithmetic, allocator policy, collection operation, or new MIR form.
-- [ ] **Complete `libluce_rt` in freestanding Luce**: reclamation/free-list
-  reuse, ownership services, `write`, `trap`, and string/bytes primitives.
-  Extend the checked allocator module as those semantic services become
-  expressible; do not move policy into the compiler or a backend.
+- [ ] **Complete `libluce_rt` in freestanding Luce**. Typed deallocation and
+  power-of-two intrusive free-list reuse are complete (`done.md` §2): the
+  canonical request retains `TypeId`/count, backends derive matching physical
+  classes, and allocator policy remains compiled Luce. Ownership services,
+  element destruction, `write`, `trap`, and string/bytes primitives remain.
+  Extend the checked runtime as those semantic services become expressible;
+  do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
   `list[T]` construction, identity, indexed access, append, insert,
   `remove_at`, clear, reserve, aggregate elements, growth, and immutable list

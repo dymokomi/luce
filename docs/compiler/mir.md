@@ -386,6 +386,15 @@ shape to `Ptr`, while the stored `TypeId` and element count remain structural.
 The verifier requires the exact private storage-allocator binding, and each
 backend alone legalizes the request using its layout rules.
 
+`native.deallocate(pointer, count)` is its structural inverse:
+`DeallocateStorage(pointer, T, count)`. The verifier requires the exact private
+deallocator binding, the MIR oracle reuses blocks under its explicit test
+layout, and each artifact backend derives the same physical byte count and a
+pointer-safe recycling alignment it used for allocation. Count zero performs
+no call. The runtime therefore owns size classes and free lists without a
+source `sizeof`, while canonical MIR retains no byte count, pointer width, or
+target alignment.
+
 The sealed arena adds no memory-layout instruction. HIR admits
 `native.arena(end)` only for a native module in the runtime package and lowers
 it to the verified runtime-convention service `(u64) -> Ptr`. Canonical MIR
@@ -795,6 +804,8 @@ knows their signatures and bindings.
 ```
 AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
   bound private function: (u64 byte_count, u64 byte_align) -> Ptr
+DeallocateStorage(Ptr, TypeId, u64 count)      canonical typed release
+  bound private function: (Ptr, u64 byte_count, u64 byte_align) -> unit
 ListCreate() -> List(T)                      typed semantic handle
 ListCopy(List(T)) -> List(T)                 backend supplies size/alignment
 ListConcat(List(T), List(T)) -> List(T)       backend supplies size/alignment
