@@ -20,7 +20,7 @@ from compiler.hir.ir import HirRuntimeBinding, ModuleAuthority, ModuleId, NodeId
 from compiler.hir.ir import is_floating_type, is_integer_type, resolve_builtin_type, types_match
 from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource, CollectedInterface
 from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, FunctionSymbol, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
-from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, PendingInterfaceApplication, RuntimeBindingRequest, builtin_type_id
+from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, PendingGenericApplication, RuntimeBindingRequest, builtin_type_id
 from compiler.hir.generation_model import TypeBinding
 from compiler.runtime_contract import RuntimeService
 
@@ -501,7 +501,7 @@ pub class DeclarationCollector:
                     ExternStruct(extern_struct):
                         try self.state.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
         try self.collect_conformances()
-        try self.validate_interface_applications()
+        try self.validate_generic_applications()
 
     func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, type_alias.name, span)
@@ -1063,7 +1063,7 @@ pub class DeclarationCollector:
                 if len(item.type_parameters) != 0:
                     try self.state.fail_at(module_index, value.span, "interface `" + item.name + "` needs " + str(len(item.type_parameters)) + " type argument(s)")
                 let resolved = self.state.intern_interface(interface_index, list[TypeId]())
-                self.state.interface_applications.append(PendingInterfaceApplication(module_index = module_index, value_type = resolved, span = value.span))
+                self.state.pending_generic_applications.append(PendingGenericApplication(module_index = module_index, value_type = resolved, span = value.span))
                 return resolved
             Applied(path, arguments):
                 let interface_index = try self.resolve_interface_path(module_index, path.parts, path.span)
@@ -1076,7 +1076,7 @@ pub class DeclarationCollector:
                         TypeArgument(argument_type): resolved.append(try self.resolve_type(module_index, argument_type))
                         IntegerArgument(token): try self.state.fail_at(module_index, token.span, "interface arguments must be types")
                 let applied = self.state.intern_interface(interface_index, resolved)
-                self.state.interface_applications.append(PendingInterfaceApplication(module_index = module_index, value_type = applied, span = value.span))
+                self.state.pending_generic_applications.append(PendingGenericApplication(module_index = module_index, value_type = applied, span = value.span))
                 return applied
             else: try self.state.fail_at(module_index, value.span, "an interface reference must name a declared interface")
         trap("interface reference resolution did not return")
@@ -1109,34 +1109,52 @@ pub class DeclarationCollector:
         for item in self.state.enums:
             try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
 
-    func validate_interface_applications() -> !:
-        for application in self.state.interface_applications:
-            var interface_index = -1
+    ## Prove every source-written generic application after conformances are
+    ## complete. Interface and nominal bounds follow one algorithm; only the
+    ## declaration owning the parameters differs.
+    func validate_generic_applications() -> !:
+        for application in self.state.pending_generic_applications:
+            var generic_id: u32 = 0
+            var parameters = list[HirTypeParameter]()
             let arguments = list[TypeId]()
+            var description = "type"
             match self.state.types.definitions[application.value_type.value].form:
                 Interface(index, values):
-                    interface_index = index
+                    let declaration = self.state.interfaces[index]
+                    generic_id = declaration.generic_id
+                    parameters = declaration.type_parameters
                     for value in values: arguments.append(value)
-                else: trap("pending interface application is not an interface")
-            let contract = self.state.interfaces[interface_index]
-            for index in range(0, len(contract.type_parameters)):
-                for constraint in contract.type_parameters[index].constraints:
-                    let required = self.state.substitute_type(constraint, contract.generic_id, arguments)
+                    description = "interface"
+                Struct(index, values):
+                    let declaration = self.state.structs[index]
+                    generic_id = declaration.generic_id
+                    parameters = declaration.type_parameters
+                    for value in values: arguments.append(value)
+                Class(index, values):
+                    let declaration = self.state.classes[index]
+                    generic_id = declaration.generic_id
+                    parameters = declaration.type_parameters
+                    for value in values: arguments.append(value)
+                Enum(index, values):
+                    let declaration = self.state.enums[index]
+                    generic_id = declaration.generic_id
+                    parameters = declaration.type_parameters
+                    for value in values: arguments.append(value)
+                else: trap("pending generic application is not a generic declaration")
+            for index in range(0, len(parameters)):
+                for constraint in parameters[index].constraints:
+                    let required = self.state.substitute_type(constraint, generic_id, arguments)
                     if not self.type_satisfies_interface(arguments[index], required):
-                        try self.state.fail_at(application.module_index, application.span, "interface argument `" + self.state.describe_type(arguments[index]) + "` does not conform to `" + self.state.describe_type(required) + "` required by `" + contract.type_parameters[index].name + "`")
+                        try self.state.fail_at(application.module_index, application.span, description + " argument `" + self.state.describe_type(arguments[index]) + "` does not conform to `" + self.state.describe_type(required) + "` required by `" + parameters[index].name + "`")
 
     func type_satisfies_interface(value_type: TypeId, constraint: TypeId) -> bool:
         if self.state.find_conformance(value_type, constraint) >= 0: return true
         match self.state.types.definitions[value_type.value].form:
             TypeParameter(generic_id, position):
-                for generic in self.state.generic_functions:
-                    if generic.generic_id != generic_id: continue
-                    for available in generic.type_parameters[position].constraints:
-                        if types_match(available, constraint): return true
-                for contract in self.state.interfaces:
-                    if contract.generic_id != generic_id: continue
-                    for available in contract.type_parameters[position].constraints:
-                        if types_match(available, constraint): return true
+                let inherited = self.state.type_parameter_constraints(generic_id, position)
+                if inherited == none: return false
+                for available in inherited:
+                    if types_match(available, constraint): return true
             else: pass
         return false
 
@@ -1336,8 +1354,6 @@ pub class DeclarationCollector:
 
     func collect_struct_name(module_index: i64, is_public: bool, documentation: list[str], nominal: NominalTypeSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, nominal.name, span)
-        if len(nominal.generic_parameters) > 0:
-            try self.state.fail_at(module_index, span, "generic structs are not implemented yet")
         let declared = try self.declare_type_parameters(module_index, nominal.generic_parameters)
         let arguments = list[TypeId]()
         for parameter in declared.parameters: arguments.append(parameter.value_type)
@@ -1363,6 +1379,8 @@ pub class DeclarationCollector:
     func collect_struct_members(checker: HirSemanticChecker, module_index: i64, nominal: NominalTypeSyntax) -> !:
         let struct_index = self.find_struct_in_module(module_index, nominal.name)
         let item = self.state.structs[struct_index]
+        if len(item.type_parameters) > 0 and len(nominal.interfaces) > 0:
+            try self.state.fail_at(module_index, item.span, "conformances on generic structs are not implemented yet")
         let declared = DeclaredTypeParameters(generic_id = item.generic_id, parameters = item.type_parameters, bindings = item.type_bindings)
         let type_parameters = try self.resolve_type_parameter_constraints(module_index, nominal.generic_parameters, declared)
         let saved_type_bindings = self.state.current_type_bindings
@@ -1395,6 +1413,8 @@ pub class DeclarationCollector:
                         default_value = default_value,
                     ))
                 Function(function):
+                    if len(item.type_parameters) > 0:
+                        try self.state.fail_at(module_index, member.span, "methods on generic structs are not implemented yet")
                     if self.find_method(self.state.structs[struct_index].type_id, function.name) >= 0:
                         try self.state.fail_at(module_index, member.span, "duplicate method `" + function.name + "` in `" + nominal.name + "`")
                     for field in fields:
@@ -1437,10 +1457,26 @@ pub class DeclarationCollector:
     # Does a value of `value_type` store `target` inline? Follows tuples,
     # optionals, structs, and enum payloads.
     func contains_type(value_type: TypeId, target: TypeId) -> bool:
+        # Any application of the declaration being defined is recursive
+        # inline storage. Comparing only exact TypeIds misses expanding forms
+        # such as `Node[list[T]]` and can recurse forever while substituting.
+        match self.state.types.definitions[target.value].form:
+            Struct(target_index, target_arguments):
+                match self.state.types.definitions[value_type.value].form:
+                    Struct(index, arguments):
+                        if index == target_index: return true
+                    else: pass
+            Enum(target_index, target_arguments):
+                match self.state.types.definitions[value_type.value].form:
+                    Enum(index, arguments):
+                        if index == target_index: return true
+                    else: pass
+            else: pass
         if types_match(value_type, target): return true
         match self.state.types.definitions[value_type.value].form:
             Struct(index, arguments):
-                for field in self.state.structs[index].fields:
+                for field_index in range(0, len(self.state.structs[index].fields)):
+                    let field = self.struct_field(value_type, field_index)
                     if self.contains_type(field.value_type, target): return true
                 return false
             Enum(index, arguments):
@@ -1479,7 +1515,8 @@ pub class DeclarationCollector:
                     if not self.is_equatable_type(element): return false
                 return true
             Struct(index, arguments):
-                for field in self.state.structs[index].fields:
+                for field_index in range(0, len(self.state.structs[index].fields)):
+                    let field = self.struct_field(value_type, field_index)
                     if not self.is_equatable_type(field.value_type): return false
                 return true
             Enum(index, arguments):
@@ -1629,6 +1666,25 @@ pub class DeclarationCollector:
             if fields[index].name == name: return index
         return -1
 
+    ## Materialize one field of a canonical struct application. Declaration
+    ## metadata stays abstract; body checking performs no independent
+    ## substitution at access or construction sites.
+    pub func struct_field(value_type: TypeId, field_index: i64) -> HirField:
+        match self.state.types.definitions[value_type.value].form:
+            Struct(index, arguments):
+                let item = self.state.structs[index]
+                let field = item.fields[field_index]
+                return HirField(
+                    name = field.name,
+                    value_type = self.state.substitute_type(field.value_type, item.generic_id, arguments),
+                    is_mutable = field.is_mutable,
+                    is_weak = field.is_weak,
+                    is_public = field.is_public,
+                    documentation = field.documentation,
+                    default_value = field.default_value,
+                )
+            else: trap("struct field requested from a non-struct type")
+
     pub func find_class_field(class_index: i64, name: str) -> i64:
         let fields = self.state.classes[class_index].fields
         for index in range(0, len(fields)):
@@ -1680,10 +1736,13 @@ pub class DeclarationCollector:
             match argument:
                 TypeArgument(argument_type): resolved.append(try self.resolve_type(module_index, argument_type))
                 IntegerArgument(token): try self.state.fail_at(module_index, token.span, "generic nominal arguments must be types")
+        var applied = resolve_builtin_type(BuiltinType.unit)
         match value:
-            StructType(index): return self.state.intern_struct(index, resolved)
-            ClassType(index): return self.state.intern_class(index, resolved)
-            EnumType(index): return self.state.intern_enum(index, resolved)
+            StructType(index): applied = self.state.intern_struct(index, resolved)
+            ClassType(index): applied = self.state.intern_class(index, resolved)
+            EnumType(index): applied = self.state.intern_enum(index, resolved)
+        self.state.pending_generic_applications.append(PendingGenericApplication(module_index = module_index, value_type = applied, span = span))
+        return applied
 
     func resolve_nominal_path(module_index: i64, parts: list[str], span: SourceSpan) -> NominalTypeDeclaration?!:
         var owner_module = module_index

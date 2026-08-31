@@ -1,0 +1,185 @@
+#==============================================================================================
+#
+#   generic_nominals - Applied nominal construction and field inference
+#
+#   DESCRIPTION:
+#       Owns memberwise struct argument placement, generic argument inference,
+#       bound validation, and construction of one concrete nominal HIR value.
+#       Declaration schemas remain abstract; every executable node receives a
+#       canonical applied TypeId before it leaves this component.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generics.inference import GenericInference
+from compiler.hir.generation_model import CollectedStruct, HirGenerationState, HirSemanticChecker, TypeBinding
+from compiler.hir.ir import BuiltinType, HirNodeForm, NodeId, TypeForm, TypeId, no_node, resolve_builtin_type
+
+struct PlacedStructArgument:
+    let field_index: i64
+    let argument: ArgumentSyntax
+
+## Coordinates nominal-specific inference with the expression checker through
+## the same narrow semantic interface used by generic functions.
+pub class GenericNominalChecker:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+    let inference: GenericInference
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector):
+        self.state = state
+        self.declarations = declarations
+        self.inference = GenericInference(state)
+
+    # mark: Memberwise construction ============================================================
+
+    ## Construct a non-generic struct after the body checker has ruled out a
+    ## custom initializer.
+    pub func check_concrete(semantics: HirSemanticChecker, struct_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.state.structs[struct_index]
+        let placed = try self.place_arguments(item, arguments, span)
+        let values = self.empty_field_values(item)
+        for placement in placed:
+            let field = self.declarations.struct_field(item.type_id, placement.field_index)
+            values[placement.field_index] = try semantics.check_expression_for_feature(placement.argument.value, field.value_type)
+        return try self.finish_construction(semantics, item, item.type_id, values, span, expected)
+
+    ## Infer or accept the generic arguments of a memberwise struct initializer,
+    ## prove its bounds, and publish only the resulting concrete application.
+    pub func check_generic(semantics: HirSemanticChecker, struct_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.state.structs[struct_index]
+        let inferred = list[TypeId]()
+        let bound = list[bool]()
+        for parameter in item.type_parameters:
+            inferred.append(resolve_builtin_type(BuiltinType.unit))
+            bound.append(false)
+        if len(type_arguments) > 0:
+            if len(type_arguments) != len(item.type_parameters):
+                try self.fail(span, "type `" + item.name + "` needs " + str(len(item.type_parameters)) + " type argument(s), got " + str(len(type_arguments)))
+            for index in range(0, len(type_arguments)):
+                match type_arguments[index]:
+                    TypeArgument(value): inferred[index] = try self.declarations.resolve_type(self.state.current_module, value)
+                    IntegerArgument(token): try self.fail(token.span, "generic nominal arguments must be types")
+                bound[index] = true
+
+        var contextual = expected
+        if contextual != none:
+            let optional = self.state.optional_inner(contextual)
+            if optional != none: contextual = optional
+            match self.state.types.definitions[contextual.value].form:
+                Struct(expected_index, expected_arguments):
+                    if expected_index == struct_index:
+                        try self.inference.infer(item.type_id, contextual, item.generic_id, inferred, bound, span)
+                else: pass
+
+        let placed = try self.place_arguments(item, arguments, span)
+        let values = self.empty_field_values(item)
+        for placement in placed:
+            let pattern = item.fields[placement.field_index].value_type
+            let context = self.inference.contextual_type(pattern, item.generic_id, inferred, bound)
+            let checked = try semantics.check_expression_for_feature(placement.argument.value, context)
+            try self.inference.infer(pattern, self.state.type_of(checked), item.generic_id, inferred, bound, placement.argument.span)
+            values[placement.field_index] = checked
+
+        try self.require_complete_arguments(item, inferred, bound, span)
+        let value_type = self.state.intern_struct(struct_index, inferred)
+        return try self.finish_construction(semantics, item, value_type, values, span, expected)
+
+    func empty_field_values(item: CollectedStruct) -> list[NodeId]:
+        let values = list[NodeId]()
+        for field in item.fields: values.append(NodeId(value = no_node))
+        return values
+
+    func finish_construction(semantics: HirSemanticChecker, item: CollectedStruct, value_type: TypeId, values: list[NodeId], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let fields = list[NodeId]()
+        for field_index in range(0, len(item.fields)):
+            let field = self.declarations.struct_field(value_type, field_index)
+            if values[field_index].value != no_node:
+                fields.append(try semantics.require_type_for_feature(values[field_index], field.value_type))
+                continue
+            if field.default_value.value == no_node:
+                try self.fail(span, "construction of `" + item.name + "` is missing field `" + field.name + "`")
+            var default_value = field.default_value
+            if len(item.type_parameters) > 0:
+                let default_syntax = self.field_default_syntax(item, field_index) else trap("generic field default lost its source expression")
+                let saved_type_bindings = self.state.current_type_bindings
+                self.state.current_type_bindings = self.application_bindings(item, value_type)
+                default_value = try semantics.check_constant_expression(
+                    item.module_index,
+                    default_syntax,
+                    field.value_type,
+                    "default of field `" + field.name + "`",
+                )
+                self.state.current_type_bindings = saved_type_bindings
+            fields.append(default_value)
+        let typed = self.state.push_node(HirNodeForm.StructValue(
+            struct_index = self.declarations.struct_of(value_type),
+            fields = self.state.push_nodes(fields),
+        ), value_type, span)
+        return try semantics.require_type_for_feature(typed, expected)
+
+    # mark: Argument placement and bounds ======================================================
+
+    func place_arguments(item: CollectedStruct, arguments: list[ArgumentSyntax], span: SourceSpan) -> list[PlacedStructArgument]!:
+        let foreign = item.module_index != self.state.current_module
+        if foreign and not item.is_public:
+            try self.fail(span, "`" + item.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+        let supplied = list[bool]()
+        for field in item.fields: supplied.append(false)
+        let placed = list[PlacedStructArgument]()
+        var positional_index = 0
+        var saw_named = false
+        for argument in arguments:
+            let label = argument.label
+            var field_index = -1
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                field_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                field_index = self.declarations.find_field(self.declarations.struct_of(item.type_id), label)
+                if field_index < 0: try self.fail(argument.span, "struct `" + item.name + "` has no field `" + label + "`")
+            if field_index >= len(item.fields):
+                try self.fail(argument.span, "struct `" + item.name + "` has " + str(len(item.fields)) + " field(s)")
+            let field = item.fields[field_index]
+            if supplied[field_index]: try self.fail(argument.span, "field `" + field.name + "` is supplied more than once")
+            if foreign and not field.is_public:
+                try self.fail(argument.span, "field `" + field.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+            supplied[field_index] = true
+            placed.append(PlacedStructArgument(field_index = field_index, argument = argument))
+        return placed
+
+    func field_default_syntax(item: CollectedStruct, field_index: i64) -> ExpressionSyntax?:
+        var current = 0
+        for member in item.syntax.members:
+            match member.value:
+                Field(field):
+                    if current == field_index: return field.default_value
+                    current += 1
+                else: pass
+        trap("collected struct field has no source member")
+
+    func application_bindings(item: CollectedStruct, value_type: TypeId) -> list[TypeBinding]:
+        let bindings = list[TypeBinding]()
+        match self.state.types.definitions[value_type.value].form:
+            Struct(index, arguments):
+                if index != self.declarations.struct_of(item.type_id): trap("struct application belongs to another declaration")
+                for parameter_index in range(0, len(item.type_parameters)):
+                    bindings.append(TypeBinding(name = item.type_parameters[parameter_index].name, value_type = arguments[parameter_index]))
+            else: trap("generic struct default has a non-struct application")
+        return bindings
+
+    func require_complete_arguments(item: CollectedStruct, inferred: list[TypeId], bound: list[bool], span: SourceSpan) -> !:
+        for index in range(0, len(bound)):
+            if not bound[index]:
+                try self.fail(span, "cannot infer generic parameter `" + item.type_parameters[index].name + "` of `" + item.name + "`; supply explicit type arguments")
+            for constraint in item.type_parameters[index].constraints:
+                let required = self.state.substitute_type(constraint, item.generic_id, inferred)
+                if not self.inference.satisfies_constraint(inferred[index], required):
+                    try self.fail(span, "type `" + self.state.describe_type(inferred[index]) + "` does not conform to `" + self.state.describe_type(required) + "` required by `" + item.type_parameters[index].name + "`")
+
+    func fail(span: SourceSpan, message: str) -> !:
+        try self.state.fail_at(self.state.current_module, span, message)

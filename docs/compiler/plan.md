@@ -581,10 +581,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   executable interface example agree on generic interfaces, struct/class/enum
   conformers, nested ownership, returned existentials, mutation, fallibility
   adaptation, and propagation (`done.md` §2).
-- [ ] **Finish the remaining generic surface.** Generic nominal types,
-  serialized typed bodies, package/CLI budget configuration, origin/size/time
-  expansion accounting, and path-rich budget diagnostics remain. Keep
-  monomorphization out of canonical MIR.
+- [ ] **Finish the remaining generic surface.** Memberwise generic structs are
+  concrete through both oracles and artifact backends (`done.md` §2). Generic
+  nominal methods and conformances come next, followed by generic classes and
+  enums; serialized typed bodies, package/CLI budget configuration,
+  origin/size/time expansion accounting, and path-rich budget diagnostics also
+  remain. Keep monomorphization out of canonical MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
