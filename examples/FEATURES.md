@@ -41,7 +41,7 @@ column because it does not determine stage-1 completion.
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core classes, strong ARC, weak fields and `Weak[T]` collections, failed initialization, and `deinit` reach both oracles, QBE, and Wasm. Proven-cycle diagnostics/leak tooling and the remaining resource/reentrancy rules remain. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
-| §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The complete executable capture/lifting/storage/direct-cycle matrix reaches QBE and Wasm; the shared-cell advisory and worker sendability remain. |
+| §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | syntax | — | — | syntax | HIR generic identities and bounded monomorphization. |
 | §16 | Interfaces, conformance, static use, interface values | complete | syntax | — | — | syntax | HIR requirements/conformance and witness representation. |
 | §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Closed protocol model beyond built-in range/list iteration and value equality. |
@@ -51,7 +51,7 @@ column because it does not determine stage-1 completion.
 | §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | FIIR generation, extern structs/richer boundary adapters, and remaining callback/lifetime rules. |
 | §22 | Compiler/runtime versus standard-library boundary | complete | partial | partial | partial | partial | Implement and execute the standard modules required by the language examples. |
 | §23 | Semantic pipeline, runtime services, ABI, artifacts, backends | complete | partial | partial | partial | partial | Arena/runtime completion and full-language QBE artifact proof. Deferred subsections stay deferred by the spec. |
-| §24 | Command/diagnostic contract, formatter, source `test` declarations | complete | syntax | — | — | syntax | Source tests, formatter, and the remaining stable CLI/diagnostic contracts; spec-deferred subsections remain deferred. |
+| §24 | Command/diagnostic contract, formatter, source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, and the remaining stable diagnostic contracts remain. |
 | §25 | Deliberate exclusions | partial | partial | n/a | n/a | partial | Map every exclusion to a stable negative fixture; do not infer coverage from lack of implementation. |
 | §28 | Compact declarations/statements/expressions/operators/grammar reference | complete | partial | partial | partial | partial | This surface closes only when the semantic rows above close. |
 
@@ -97,14 +97,14 @@ slice protocol; it never leaks a frame address or introduces target layout.
 ## Current closure evidence
 
 Core §14 has one target-neutral managed representation and its executable
-conversion/storage matrix is complete. The broad row stays partial for the
-non-fatal shared-cell advisory and worker sendability.
+conversion/storage/diagnostic matrix is complete. The broad row stays partial
+only for worker sendability.
 
 | §14 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
 | Capture-free expression/block closures become allocation-free function values | yes | yes | yes, plus Wasm | `closures.luc` and differential corpus | complete |
 | Default immutable and explicit `copy` captures snapshot at formation in source order | yes | yes | yes, plus Wasm | `closures.luc` | complete |
-| Captured `var` is one shared ARC cell visible to the scope and every closure | yes | yes | yes, plus Wasm | `closures.luc` | complete core behavior; accidental-cell diagnostic open |
+| Captured `var` is one shared ARC cell visible to the scope and every closure | yes, plus structured `L1401` advisory | yes | yes, plus Wasm | `closures.luc` | complete |
 | Nested environments escape without backend facts in HIR/MIR | yes | yes | yes, plus Wasm | `closures.luc` | complete |
 | Weak class capture does not retain and promotes to an owned optional | yes | yes | yes, plus Wasm | `closures.luc` | complete for named locals and `weak self` |
 | Fallible closures and infallible-to-fallible function lift | yes | yes | yes, plus Wasm | `closures.luc` and differential corpus | complete |

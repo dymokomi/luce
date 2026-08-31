@@ -118,6 +118,7 @@ from compiler.mir.verifier import MirVerifier
 from compiler.mir.optimizer import Optimizer
 from compiler.frontend.parser import Parser
 from compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
+from compiler.frontend.source import Diagnostic
 from compiler.frontend.tokenizer import Token, Tokenizer
 from compiler.hir.ir import ModuleAuthority, PackageRole, Value
 from compiler.runtime_contract import RuntimeService
@@ -152,21 +153,40 @@ pub enum BuildTarget:
     wasm
     native
 
+## Result of artifact production. Successful builds can still carry advisory
+## diagnostics discovered before lowering.
+pub struct BuildResult:
+    pub let diagnostics: list[Diagnostic]
+
+## Result of reference execution plus the analysis reports for that program.
+pub struct RunResult:
+    pub let value: Value
+    pub let diagnostics: list[Diagnostic]
+
+## Verified canonical MIR paired with the reports from every analyzed package
+## that contributed to it. Backends consume only `program`; callers retain
+## the source-level facts.
+pub struct CompiledProgram:
+    pub let program: MirProgram
+    pub let diagnostics: list[Diagnostic]
+
 # mark: Commands ===============================================================================
 
 ## Compile source files through every build stage and install the completed
 ## artifact at `output`. Native artifacts use the QBE host toolchain; QBE owns
 ## its scratch and replaces the destination only after linking succeeds.
-pub func build(target: BuildTarget, output: str, package: PackageInput) -> !:
-    let optimized_program = try lower_and_verify(package)
-    try materialize(target, output, optimized_program)
+pub func build(target: BuildTarget, output: str, package: PackageInput) -> BuildResult!:
+    let compiled = try lower_and_verify(package)
+    try materialize(target, output, compiled.program)
+    return BuildResult(diagnostics = compiled.diagnostics)
 
 ## Build with an explicitly supplied sealed runtime package. Keeping the
 ## package input visible makes deployment/package lookup a caller concern,
 ## while every compiler stage still consumes one composed canonical MIR.
-pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput) -> !:
-    let optimized_program = try compile_with_runtime(package, runtime)
-    try materialize(target, output, optimized_program)
+pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput) -> BuildResult!:
+    let compiled = try compile_with_runtime(package, runtime)
+    try materialize(target, output, compiled.program)
+    return BuildResult(diagnostics = compiled.diagnostics)
 
 func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> !:
     match target:
@@ -181,8 +201,10 @@ pub func check(package: PackageInput) -> AnalyzedProgram!:
 ## Analyze source files and run one public, parameterless function through the
 ## typed-HIR reference interpreter; for example,
 ## `run(package, "main", "answer")`.
-pub func run(package: PackageInput, module_name: str, function_name: str) -> Value!:
-    return try HirInterpreter().run(try analyze_sources(package), module_name, function_name)
+pub func run(package: PackageInput, module_name: str, function_name: str) -> RunResult!:
+    let analyzed = try analyze_sources(package)
+    let value = try HirInterpreter().run(analyzed, module_name, function_name)
+    return RunResult(value = value, diagnostics = analyzed.diagnostics)
 
 # mark: Stage values ===========================================================================
 
@@ -208,15 +230,18 @@ struct TokenizedFile:
 
 ## Run the analyzed typed HIR with a caller-provided execution backend. This
 ## keeps custom interpreters on the same semantic path as the built-in one.
-pub func run_with_backend(backend: HirExecutionBackend, package: PackageInput, module_name: str, function_name: str) -> Value!:
-    return try backend.run(try analyze_sources(package), module_name, function_name)
+pub func run_with_backend(backend: HirExecutionBackend, package: PackageInput, module_name: str, function_name: str) -> RunResult!:
+    let analyzed = try analyze_sources(package)
+    let value = try backend.run(analyzed, module_name, function_name)
+    return RunResult(value = value, diagnostics = analyzed.diagnostics)
 
 # mark: Sealed runtime =========================================================================
 
-## Compile the sealed runtime source to verified, target-neutral canonical MIR.
-## Keeping this entry explicit lets packaging choose where the shipped runtime
-## sources live without granting runtime authority to ordinary packages.
-pub func compile_runtime(package: RuntimePackageInput) -> MirProgram!:
+## Compile the sealed runtime source to verified, target-neutral canonical MIR
+## and retain its analysis reports. Keeping this entry explicit lets packaging
+## choose where the shipped runtime sources live without granting runtime
+## authority to ordinary packages.
+pub func compile_runtime(package: RuntimePackageInput) -> CompiledProgram!:
     let analyzed = try analyze_package(
         PackageInput(identity = package.identity, source_paths = package.source_paths),
         PackageRole.sealed_runtime,
@@ -224,15 +249,20 @@ pub func compile_runtime(package: RuntimePackageInput) -> MirProgram!:
     )
     let program = try Lowerer(analyzed).lower()
     try MirVerifier(program).verify()
-    return program
+    return CompiledProgram(program = program, diagnostics = analyzed.diagnostics)
 
-## Compile application and sealed runtime sources independently, compose their
-## canonical MIR, then verify and optimize the one closed program every
-## artifact backend consumes.
-pub func compile_with_runtime(application: PackageInput, runtime: RuntimePackageInput) -> MirProgram!:
-    let application_program = try Lowerer(try analyze_sources(application)).lower()
-    let runtime_program = try compile_runtime(runtime)
-    return try verify_and_optimize(try compose_runtime(application_program, runtime_program))
+## Compile application and sealed runtime sources independently, preserve both
+## diagnostic streams, compose their canonical MIR, then verify and optimize
+## the one closed program every artifact backend consumes.
+pub func compile_with_runtime(application: PackageInput, runtime: RuntimePackageInput) -> CompiledProgram!:
+    let analyzed_application = try analyze_sources(application)
+    let application_program = try Lowerer(analyzed_application).lower()
+    let compiled_runtime = try compile_runtime(runtime)
+    let program = try verify_and_optimize(try compose_runtime(application_program, compiled_runtime.program))
+    return CompiledProgram(
+        program = program,
+        diagnostics = combine_diagnostics(analyzed_application.diagnostics, compiled_runtime.diagnostics),
+    )
 
 # mark: Shared stages ==========================================================================
 
@@ -252,10 +282,19 @@ func analyze_package(package: PackageInput, role: PackageRole, bindings: list[Ru
     return try SemanticAnalyzer(hir_program).analyze()
 
 # Analysis through optimized, verified target-neutral MIR.
-func lower_and_verify(package: PackageInput) -> MirProgram!:
+func lower_and_verify(package: PackageInput) -> CompiledProgram!:
     let analyzed_hir = try analyze_sources(package)
     let canonical_program = try Lowerer(analyzed_hir).lower()
-    return try verify_and_optimize(canonical_program)
+    return CompiledProgram(
+        program = try verify_and_optimize(canonical_program),
+        diagnostics = analyzed_hir.diagnostics,
+    )
+
+func combine_diagnostics(first: list[Diagnostic], second: list[Diagnostic]) -> list[Diagnostic]:
+    let combined = list[Diagnostic]()
+    for diagnostic in first: combined.append(diagnostic)
+    for diagnostic in second: combined.append(diagnostic)
+    return combined
 
 func verify_and_optimize(canonical_program: MirProgram) -> MirProgram!:
     try MirVerifier(canonical_program).verify()

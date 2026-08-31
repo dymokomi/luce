@@ -553,13 +553,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `examples/closures.luc`. MIR retains only typed descriptor/environment
   contracts; physical layout begins in each backend. *Gate passed: capture
   rule.*
-- [ ] **Finish the remaining §14 diagnostic and worker contract.** Fallible
+- [ ] **Finish the remaining §14 worker contract.** Fallible
   invocation, infallible-to-fallible function lifting, `weak self`, managed
   values in fields/collections, and directly provable stored strong cycles are
-  complete (`done.md` §2). Add the accidental shared-cell advisory through the
-  common structured non-fatal diagnostic channel required by §24; a valid
-  default mutable capture must not become an error or print from inside HIR
-  generation. Sendability closes with workers.
+  complete (`done.md` §2). The accidental shared-cell advisory now flows as a
+  structured, non-fatal analysis result through check, run, compilation, build,
+  and CLI presentation; it neither changes valid capture semantics nor prints
+  from HIR generation. Sendability closes with workers.
 - [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
