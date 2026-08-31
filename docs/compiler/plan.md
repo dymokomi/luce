@@ -228,6 +228,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   exhaustive optional `Match` HIR. Payload scope, ownership, flow analysis,
   MIR lowering, and backend behavior therefore have one implementation rather
   than a conditional-binding-specific path.
+- [x] **Explicit `discard[T]`** (2026-08-31, `done.md` §2). One compiler-known
+  HIR node records intent, rejects unhandled `T!`, and preserves `never` flow.
+  Lowering evaluates the operand once and then uses the existing
+  full-expression ownership cleanup; there is deliberately no MIR/backend
+  discard instruction.
+- [ ] **Complete explicit numeric construction.** Checked integer-to-integer
+  construction is complete. Integer/float and float/integer MIR operations
+  already exist, but source completion also needs float-width conversion. The
+  §7.5 phrase “not representable” must first settle whether `f64` to `f32`
+  narrowing requires exact preservation or only a finite in-range result;
+  those policies produce materially different constant errors and runtime
+  traps, so do not infer one from backend defaults.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung
