@@ -582,11 +582,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   conformers, nested ownership, returned existentials, mutation, fallibility
   adaptation, and propagation (`done.md` §2).
 - [ ] **Finish the remaining generic surface.** Memberwise generic structs and
-  their owner-parameterized value/mutating methods are concrete through both
-  oracles and artifact backends (`done.md` §2). Generic struct conformances
-  come next, followed by generic classes and enums; independently generic
-  methods, custom generic-nominal initializers/type functions, serialized
-  typed bodies, package/CLI budget configuration,
+  their owner-parameterized value/mutating methods and concrete conformances
+  are complete through both oracles and artifact backends (`done.md` §2).
+  Generic classes and enums come next; independently generic methods, custom
+  generic-nominal initializers/type functions, serialized typed bodies,
+  package/CLI budget configuration,
   origin/size/time expansion accounting, and path-rich budget diagnostics also
   remain. Keep monomorphization out of canonical MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
@@ -621,12 +621,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   honest boundary: abstract probing, structural inference, and concrete
   function/method specialization live in `hir/generics/functions.luc` and
   borrow a narrow semantic interface without duplicating the generation
-  transaction. The 1,992-line declaration collector now owns one cohesive, marked interface
-  declaration/conformance section because it directly shares name, type, and
-  method resolution; splitting it today would create a forwarding cycle.
+  transaction. The 2,121-line declaration collector now owns one cohesive,
+  marked interface declaration/conformance section because it directly shares
+  name, type, method, visibility, generic-specialization, and adapter
+  resolution; its generic-conformance threshold review found that splitting
+  it today would create a forwarding cycle rather than a new owner.
   Existential representation and dynamic calls established the focused
-  105-line `hir/interfaces/values.luc` owner rather than extending the
-  declaration collector. The remaining 2,919-line HIR body checker and
+  108-line `hir/interfaces/values.luc` owner rather than extending the
+  declaration collector. The remaining 2,922-line HIR body checker and
   3,923-line MIR function lowerer stay intact only until another language
   family establishes a similarly cohesive owner; the lowerer's next major
   slice must include a fresh transaction-boundary review. The 2,219-line HIR interpreter

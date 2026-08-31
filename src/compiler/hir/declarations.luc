@@ -19,7 +19,7 @@ from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirConformance,
 from compiler.hir.ir import HirRuntimeBinding, ModuleAuthority, ModuleId, NodeId, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import is_floating_type, is_integer_type, resolve_builtin_type, types_match
 from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource, CollectedInterface
-from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, FunctionSymbol, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
+from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, ConformanceMethodAdaptation, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
 from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, PendingGenericApplication, RuntimeBindingRequest, builtin_type_id
 from compiler.hir.generation_model import TypeBinding
 from compiler.runtime_contract import RuntimeService
@@ -37,12 +37,18 @@ union NominalTypeDeclaration:
     ClassType(index: i64)
     EnumType(index: i64)
 
+struct ConformanceMaterialization:
+    let value_type: TypeId
+    let interface_type: TypeId
+
 ## Collects every program-wide source identity into one generation transaction.
 pub class DeclarationCollector:
     let state: HirGenerationState
+    let materializing_conformances: list[ConformanceMaterialization]
 
     pub init(state: HirGenerationState):
         self.state = state
+        self.materializing_conformances = list[ConformanceMaterialization]()
 
     # mark: Runtime binding validation ==========================================================
     pub func resolve_runtime_bindings() -> list[HirRuntimeBinding]!:
@@ -501,7 +507,6 @@ pub class DeclarationCollector:
                     ExternStruct(extern_struct):
                         try self.state.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
         try self.collect_conformances()
-        try self.validate_generic_applications()
 
     func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, type_alias.name, span)
@@ -1126,20 +1131,34 @@ pub class DeclarationCollector:
         return interface_index
 
     ## Validate every explicit conformance only after all nominal methods are
-    ## known. The resulting flat mapping is sufficient for static dispatch
-    ## now and for witness construction later.
+    ## known. Non-generic declarations publish concrete HIR immediately;
+    ## generic declarations retain one abstract schema for later applications.
     func collect_conformances() -> !:
+        let saved_type_bindings = self.state.current_type_bindings
         for item in self.state.structs:
-            try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
+            if len(item.type_parameters) == 0:
+                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
+            else:
+                self.state.current_type_bindings = item.type_bindings
+                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, false)
         for item in self.state.classes:
-            try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, true)
+            if len(item.type_parameters) == 0:
+                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, true)
+            else:
+                self.state.current_type_bindings = item.type_bindings
+                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, true)
         for item in self.state.enums:
-            try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
+            if len(item.type_parameters) == 0:
+                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
+            else:
+                self.state.current_type_bindings = item.type_bindings
+                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, false)
+        self.state.current_type_bindings = saved_type_bindings
 
     ## Prove every source-written generic application after conformances are
     ## complete. Interface and nominal bounds follow one algorithm; only the
     ## declaration owning the parameters differs.
-    func validate_generic_applications() -> !:
+    pub func validate_generic_applications(semantics: HirSemanticChecker) -> !:
         for application in self.state.pending_generic_applications:
             var generic_id: u32 = 0
             var parameters = list[HirTypeParameter]()
@@ -1171,10 +1190,10 @@ pub class DeclarationCollector:
             for index in range(0, len(parameters)):
                 for constraint in parameters[index].constraints:
                     let required = self.state.substitute_type(constraint, generic_id, arguments)
-                    if not self.type_satisfies_interface(arguments[index], required):
+                    if not try self.type_satisfies_interface(semantics, arguments[index], required, application.span):
                         try self.state.fail_at(application.module_index, application.span, description + " argument `" + self.state.describe_type(arguments[index]) + "` does not conform to `" + self.state.describe_type(required) + "` required by `" + parameters[index].name + "`")
 
-    func type_satisfies_interface(value_type: TypeId, constraint: TypeId) -> bool:
+    pub func type_satisfies_interface(semantics: HirSemanticChecker, value_type: TypeId, constraint: TypeId, span: SourceSpan) -> bool!:
         if self.state.find_conformance(value_type, constraint) >= 0: return true
         match self.state.types.definitions[value_type.value].form:
             TypeParameter(generic_id, position):
@@ -1183,7 +1202,125 @@ pub class DeclarationCollector:
                 for available in inherited:
                     if types_match(available, constraint): return true
             else: pass
-        return false
+        let template_index = try self.find_generic_conformance_template(value_type, constraint, span)
+        if template_index < 0: return false
+        if self.state.contains_type_parameter(value_type) or self.state.contains_type_parameter(constraint): return true
+        return try self.materialize_generic_conformance(semantics, template_index, value_type, constraint, span) >= 0
+
+    ## Resolve an exact conformance identity for an operation that must retain
+    ## it in HIR, such as existential packaging. Abstract probe identities are
+    ## permitted here because the generic checker rolls them back afterward.
+    pub func ensure_conformance(semantics: HirSemanticChecker, value_type: TypeId, interface_type: TypeId, span: SourceSpan) -> i64!:
+        let existing = self.state.find_conformance(value_type, interface_type)
+        if existing >= 0: return existing
+        let template_index = try self.find_generic_conformance_template(value_type, interface_type, span)
+        if template_index < 0: return -1
+        return try self.materialize_generic_conformance(semantics, template_index, value_type, interface_type, span)
+
+    ## Complete every concrete generic conformance carried by one nominal
+    ## application. Generator's type/function fixed point calls this even when
+    ## no constraint or existential conversion demanded the witness first.
+    pub func materialize_generic_conformances_for_type(semantics: HirSemanticChecker, value_type: TypeId) -> !:
+        if self.state.contains_type_parameter(value_type): return
+        for template_index in range(0, len(self.state.generic_conformances)):
+            let template = self.state.generic_conformances[template_index]
+            let arguments = self.state.nominal_application_arguments(template.value_type, value_type)
+            if arguments == none: continue
+            let interface_type = self.state.substitute_type(template.interface_type, template.generic_id, arguments)
+            discard(try self.materialize_generic_conformance(semantics, template_index, value_type, interface_type, template.span))
+
+    func collect_generic_nominal_conformances(module_index: i64, generic_id: u32, value_type: TypeId, declarations: list[TypeSyntax], name: str, is_class: bool) -> !:
+        for declaration in declarations:
+            let interface_type = try self.resolve_interface_reference(module_index, declaration)
+            for existing in self.state.generic_conformances:
+                if types_match(existing.value_type, value_type) and types_match(existing.interface_type, interface_type):
+                    try self.state.fail_at(module_index, declaration.span, "duplicate conformance of `" + name + "` to `" + self.state.describe_type(interface_type) + "`")
+            var interface_index = -1
+            let interface_arguments = list[TypeId]()
+            match self.state.types.definitions[interface_type.value].form:
+                Interface(index, arguments):
+                    interface_index = index
+                    for argument in arguments: interface_arguments.append(argument)
+                else: trap("resolved interface reference is not an interface type")
+            let contract = self.state.interfaces[interface_index]
+            let adaptations = list[ConformanceMethodAdaptation]()
+            for requirement in contract.requirements:
+                let method_index = self.find_generic_method(value_type, requirement.name)
+                if method_index < 0:
+                    try self.state.fail_at(module_index, declaration.span, "type `" + name + "` does not implement requirement `" + requirement.name + "` of `" + self.state.describe_type(interface_type) + "`")
+                adaptations.append(try self.validate_conformance_method(
+                    module_index,
+                    name,
+                    self.state.generic_functions[method_index].signature,
+                    requirement,
+                    contract.generic_id,
+                    interface_arguments,
+                    is_class,
+                    declaration.span,
+                ))
+            self.state.generic_conformances.append(GenericConformanceTemplate(
+                module_index = module_index,
+                generic_id = generic_id,
+                value_type = value_type,
+                interface_type = interface_type,
+                is_class = is_class,
+                adaptations = adaptations,
+                span = declaration.span,
+            ))
+
+    func find_generic_conformance_template(value_type: TypeId, interface_type: TypeId, span: SourceSpan) -> i64!:
+        var found = -1
+        for index in range(0, len(self.state.generic_conformances)):
+            let template = self.state.generic_conformances[index]
+            let arguments = self.state.nominal_application_arguments(template.value_type, value_type)
+            if arguments == none: continue
+            let applied_interface = self.state.substitute_type(template.interface_type, template.generic_id, arguments)
+            if not types_match(applied_interface, interface_type): continue
+            if found >= 0:
+                try self.state.fail_at(self.state.current_module, span, "conformance of `" + self.state.describe_type(value_type) + "` to `" + self.state.describe_type(interface_type) + "` is ambiguous")
+            found = index
+        return found
+
+    func materialize_generic_conformance(semantics: HirSemanticChecker, template_index: i64, value_type: TypeId, interface_type: TypeId, span: SourceSpan) -> i64!:
+        let existing = self.state.find_conformance(value_type, interface_type)
+        if existing >= 0: return existing
+        for active in self.materializing_conformances:
+            if types_match(active.value_type, value_type) and types_match(active.interface_type, interface_type):
+                try self.state.fail_at(self.state.current_module, span, "cyclic conformance materialization for `" + self.state.describe_type(value_type) + "` to `" + self.state.describe_type(interface_type) + "`")
+        self.materializing_conformances.append(ConformanceMaterialization(value_type = value_type, interface_type = interface_type))
+
+        let template = self.state.generic_conformances[template_index]
+        var interface_index = -1
+        let interface_arguments = list[TypeId]()
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(index, arguments):
+                interface_index = index
+                for argument in arguments: interface_arguments.append(argument)
+            else: trap("generic conformance did not produce an interface application")
+        let contract = self.state.interfaces[interface_index]
+        let implementations = list[SymbolId]()
+        for requirement_index in range(0, len(contract.requirements)):
+            let requirement = contract.requirements[requirement_index]
+            let method_index = try semantics.instantiate_generic_method_for_feature(value_type, requirement.name, span)
+            if method_index < 0: trap("validated generic conformance lost its method template")
+            let method = self.state.functions[method_index]
+            let adaptation = try self.validate_conformance_method(
+                template.module_index,
+                self.state.describe_type(value_type),
+                method,
+                requirement,
+                contract.generic_id,
+                interface_arguments,
+                template.is_class,
+                template.span,
+            )
+            if adaptation != template.adaptations[requirement_index]:
+                trap("generic conformance adaptation changed during substitution")
+            implementations.append(self.conformance_implementation(template.module_index, method, adaptation, requirement, contract.generic_id, interface_arguments, template.span))
+        let conformance_index = len(self.state.conformances)
+        self.state.conformances.append(HirConformance(value_type = value_type, interface_type = interface_type, implementations = implementations))
+        self.materializing_conformances.remove(len(self.materializing_conformances) - 1)
+        return conformance_index
 
     func collect_nominal_conformances(module_index: i64, value_type: TypeId, declarations: list[TypeSyntax], name: str, is_class: bool) -> !:
         for declaration in declarations:
@@ -1204,10 +1341,11 @@ pub class DeclarationCollector:
                 if method_index < 0:
                     try self.state.fail_at(module_index, declaration.span, "type `" + name + "` does not implement requirement `" + requirement.name + "` of `" + self.state.describe_type(interface_type) + "`")
                 let method = self.state.functions[method_index]
-                implementations.append(try self.validate_conformance_method(module_index, name, method, requirement, contract.generic_id, interface_arguments, is_class, declaration.span))
+                let adaptation = try self.validate_conformance_method(module_index, name, method, requirement, contract.generic_id, interface_arguments, is_class, declaration.span)
+                implementations.append(self.conformance_implementation(module_index, method, adaptation, requirement, contract.generic_id, interface_arguments, declaration.span))
             self.state.conformances.append(HirConformance(value_type = value_type, interface_type = interface_type, implementations = implementations))
 
-    func validate_conformance_method(module_index: i64, owner_name: str, method: FunctionSymbol, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], is_class: bool, span: SourceSpan) -> SymbolId!:
+    func validate_conformance_method(module_index: i64, owner_name: str, method: FunctionSymbol, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], is_class: bool, span: SourceSpan) -> ConformanceMethodAdaptation!:
         let receiver = method.receiver else trap("conformance method has no receiver")
         if receiver.kind == HirReceiverKind.type_function or receiver.kind == HirReceiverKind.initializer or receiver.kind == HirReceiverKind.deinitializer:
             try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` is not an instance method required by the interface")
@@ -1216,7 +1354,7 @@ pub class DeclarationCollector:
                 try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` must be `mutating` to satisfy the interface")
         elif receiver.kind == HirReceiverKind.mutating_method:
             try self.state.fail_at(module_index, span, "mutating method `" + owner_name + "." + method.name + "` cannot satisfy a non-mutating interface requirement")
-        if not method.is_public:
+        if not self.method_is_public(method):
             try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` must be public to satisfy an interface")
         if len(method.parameters) != len(requirement.parameters) + 1:
             try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` has the wrong number of parameters for the interface")
@@ -1226,12 +1364,21 @@ pub class DeclarationCollector:
             if actual.name != requirement.parameters[index].name or not types_match(actual.value_type, expected):
                 try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` does not match parameter `" + requirement.parameters[index].name + "` of the interface")
         let expected_result = self.state.substitute_type(requirement.result, generic_id, arguments)
-        if types_match(method.result, expected_result): return method.symbol
+        if types_match(method.result, expected_result): return ConformanceMethodAdaptation.direct
         let successful = self.state.fallible_inner(expected_result)
         if successful != none and types_match(method.result, successful):
-            return self.make_fallible_requirement_adapter(module_index, method, expected_result, span)
+            return ConformanceMethodAdaptation.fallible_lift
         try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` returns `" + self.state.describe_type(method.result) + "`, but the interface requires `" + self.state.describe_type(expected_result) + "`")
         trap("invalid conformance result did not fail")
+
+    func method_is_public(method: FunctionSymbol) -> bool:
+        if method.generic_origin >= 0: return self.state.generic_functions[method.generic_origin].is_public
+        return method.is_public
+
+    func conformance_implementation(module_index: i64, method: FunctionSymbol, adaptation: ConformanceMethodAdaptation, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], span: SourceSpan) -> SymbolId:
+        if adaptation == ConformanceMethodAdaptation.direct: return method.symbol
+        let result = self.state.substitute_type(requirement.result, generic_id, arguments)
+        return self.make_fallible_requirement_adapter(module_index, method, result, span)
 
     ## A non-fallible implementation may satisfy a fallible requirement. The
     ## conformance points at this ordinary Luce wrapper, so static calls and
@@ -1406,8 +1553,6 @@ pub class DeclarationCollector:
     func collect_struct_members(checker: HirSemanticChecker, module_index: i64, nominal: NominalTypeSyntax) -> !:
         let struct_index = self.find_struct_in_module(module_index, nominal.name)
         let item = self.state.structs[struct_index]
-        if len(item.type_parameters) > 0 and len(nominal.interfaces) > 0:
-            try self.state.fail_at(module_index, item.span, "conformances on generic structs are not implemented yet")
         let declared = DeclaredTypeParameters(generic_id = item.generic_id, parameters = item.type_parameters, bindings = item.type_bindings)
         let type_parameters = try self.resolve_type_parameter_constraints(module_index, nominal.generic_parameters, declared)
         # Publish resolved owner constraints before method signatures inherit
@@ -1604,24 +1749,8 @@ pub class DeclarationCollector:
             if generic.name != name: continue
             let receiver = generic.signature.receiver
             if receiver == none: continue
-            if self.same_nominal_declaration(receiver.owner, owner): return index
+            if self.state.nominal_application_arguments(receiver.owner, owner) != none: return index
         return -1
-
-    func same_nominal_declaration(left: TypeId, right: TypeId) -> bool:
-        match self.state.types.definitions[left.value].form:
-            Struct(left_index, left_arguments):
-                match self.state.types.definitions[right.value].form:
-                    Struct(right_index, right_arguments): return left_index == right_index
-                    else: return false
-            Class(left_index, left_arguments):
-                match self.state.types.definitions[right.value].form:
-                    Class(right_index, right_arguments): return left_index == right_index
-                    else: return false
-            Enum(left_index, left_arguments):
-                match self.state.types.definitions[right.value].form:
-                    Enum(right_index, right_arguments): return left_index == right_index
-                    else: return false
-            else: return false
 
     # mark: Enums ===============================================================================
 

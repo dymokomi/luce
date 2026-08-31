@@ -45,11 +45,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   implied by this example.
 - `constrained_generics.luc` proves nominal interface requirements, explicit
   conformance, statically dispatched generic constraints, a constrained
-  generic-struct method specialized from its applied receiver, and the safe
-  lift from an infallible implementation to a fallible requirement through
-  both semantic oracles, Wasm, and native QBE. It deliberately does not claim
-  generic nominal conformance, existential values, or witness-table dynamic
-  dispatch.
+  generic-struct method specialized from its applied receiver, concrete
+  generic-struct conformance and existential dispatch, and the safe lift from
+  an infallible implementation to a fallible requirement through both
+  semantic oracles, Wasm, and native QBE.
 - `interfaces.luc` proves existential conversion and dynamic dispatch for
   value and class conformers. Value payload mutation detaches with copy-on-
   write, class payload mutation preserves shared identity, and infallible
