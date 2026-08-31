@@ -310,6 +310,15 @@ runtime entry, public function or artifact export, preserving the sealed
 boundary structurally. The combined program alone then enters verification,
 reachability and backend encoding.
 
+Native source authority is already resolved metadata before HIR generation.
+HIR keeps `native_ptr[T]` and `native_mut_ptr[T]` distinct, including the
+pointee `TypeId`, so native operations can be checked structurally without
+knowing a pointer width or layout. Public source shapes cannot contain either
+form. When HIR becomes canonical MIR, the address value itself maps to `Ptr`;
+the typed operations that consume it retain their structural value type. Thus
+authority checking ends before MIR while layout still begins only in a
+backend.
+
 Retain and release calls are placed by the lowerer using the ownership facts
 that `SemanticAnalyzer` will attach to HIR (§11.3). Until that analysis
 exists, the lowerer uses the simplest rule that is never wrong — retain on

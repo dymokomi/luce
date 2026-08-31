@@ -35,7 +35,7 @@ from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType
 from compiler.hir.ir import HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNode, HirNodeForm, NodeId, Operands, no_node
 from compiler.hir.ir import HirEnum, HirEnumCase, HirExternRepresentation, HirExternType, HirExternVariable, HirField, HirModule, HirParameter, HirPayloadField, HirProgram, HirReceiver, HirReceiverKind, HirStruct
-from compiler.hir.ir import HirSymbol, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
+from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable
 from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir.ir import describe_type, integer_maximum, integer_minimum
 from compiler.hir.ir import is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
@@ -49,6 +49,7 @@ from compiler.hir.ir import place_element_step, place_field_step
 pub struct SourceModule:
     pub let name: str
     pub let path: str
+    pub let authority: ModuleAuthority
     pub let syntax: ModuleSyntax
 
 # One collected function signature: everything a call site or a body check
@@ -344,12 +345,13 @@ pub class HirGenerator:
         try self.collect_declarations()
         try self.collect_module_bindings()
         try self.resolve_aliases()
+        try self.validate_native_boundaries()
         try self.check_constants()
 
         let modules = list[HirModule]()
         for module_index in range(0, len(self.sources)):
             let source = self.sources[module_index]
-            modules.append(HirModule(id = ModuleId(value = u32(module_index)), name = source.name, path = source.path, documentation = source.syntax.documentation))
+            modules.append(HirModule(id = ModuleId(value = u32(module_index)), name = source.name, path = source.path, authority = source.authority, documentation = source.syntax.documentation))
 
         let hir_functions = list[HirFunction]()
         for module_index in range(0, len(self.sources)):
@@ -462,6 +464,33 @@ pub class HirGenerator:
                                             try self.fail_at(module_index, member.span, "class methods do not use `mutating`; class identity already permits field mutation")
                                     else: pass
                     else: pass
+
+    # Native authority permits implementation details, never an API leak.
+    # Following structural values here prevents a public wrapper from hiding a
+    # raw pointer inside an alias, tuple, function value, struct, or enum.
+    func validate_native_boundaries() -> !:
+        for item in self.aliases:
+            let resolved = item.resolved else trap("alias was not resolved")
+            if item.is_public and self.contains_native_pointer(resolved):
+                try self.fail_at(item.module_index, item.span, "public type alias `" + item.name + "` cannot expose native pointers")
+        for item in self.structs:
+            if not item.is_public: continue
+            for field in item.fields:
+                if self.contains_native_pointer(field.value_type):
+                    try self.fail_at(item.module_index, item.span, "public struct `" + item.name + "` cannot store native pointers")
+        for item in self.enums:
+            if not item.is_public: continue
+            for case_value in item.cases:
+                for field in case_value.payload:
+                    if self.contains_native_pointer(field.value_type):
+                        try self.fail_at(item.module_index, item.span, "public enum `" + item.name + "` cannot store native pointers")
+        for function in self.functions:
+            if not function.is_public: continue
+            for parameter in function.parameters:
+                if self.contains_native_pointer(parameter.value_type):
+                    try self.fail_at(function.module_index, function.span, "public function `" + function.name + "` cannot expose native pointers")
+            if self.contains_native_pointer(function.result):
+                try self.fail_at(function.module_index, function.span, "public function `" + function.name + "` cannot expose native pointers")
 
     # Turn one module's import lines into name bindings, checking that every
     # imported module exists, every selected function exists and is public,
@@ -1265,6 +1294,19 @@ pub class HirGenerator:
                     error(self.diagnostic_at(module_index, path.span, "type `" + name + "` is not implemented yet"))
                 error(self.diagnostic_at(module_index, path.span, "unknown type `" + path.dotted() + "`"))
             Applied(path, arguments):
+                if path.dotted() == "native_ptr" or path.dotted() == "native_mut_ptr":
+                    if self.sources[module_index].authority != ModuleAuthority.native:
+                        try self.fail_at(module_index, value.span, "native pointer types require a `.native.luc` module")
+                    if len(arguments) != 1:
+                        try self.fail_at(module_index, value.span, "`" + path.dotted() + "` needs exactly one pointee type")
+                    match arguments[0]:
+                        TypeArgument(pointee):
+                            let pointee_type = try self.resolve_type(module_index, pointee)
+                            if self.contains_fallible(pointee_type):
+                                try self.fail_at(module_index, pointee.span, "a native pointer pointee cannot store a fallible type; `T!` is a function-result effect")
+                            return self.intern_native_pointer(pointee_type, path.dotted() == "native_mut_ptr")
+                        else:
+                            try self.fail_at(module_index, value.span, "`" + path.dotted() + "` needs exactly one pointee type")
                 if path.dotted() == "slice" and len(arguments) == 1:
                     match arguments[0]:
                         TypeArgument(element):
@@ -2995,6 +3037,11 @@ pub class HirGenerator:
             index += 1
         return self.intern_named(name + ") -> " + self.describe_type(result), TypeForm.CFunction(parameters = parameters, result = result))
 
+    func intern_native_pointer(pointee: TypeId, is_mutable: bool) -> TypeId:
+        var name = "native_ptr["
+        if is_mutable: name = "native_mut_ptr["
+        return self.intern_named(name + self.describe_type(pointee) + "]", TypeForm.NativePointer(pointee = pointee, is_mutable = is_mutable))
+
     # Unwrap only the contextual optional injection that `require_type`
     # already owns. This lets `Some(c_callback)` choose C conversion without
     # duplicating optional construction here.
@@ -3417,6 +3464,41 @@ pub class HirGenerator:
                 for case_value in self.enums[index].cases:
                     for field in case_value.payload:
                         if self.contains_fallible(field.value_type): return true
+                return false
+            else: return false
+
+    # Whether a value shape directly or transitively stores a native pointer.
+    # The pointer itself is the boundary: its pointee is a type description,
+    # not another value stored inline.
+    func contains_native_pointer(value: TypeId) -> bool:
+        if i64(value.value) >= len(self.types.definitions): return false
+        match self.types.definitions[value.value].form:
+            NativePointer(pointee, is_mutable): return true
+            Optional(inner): return self.contains_native_pointer(inner)
+            Fallible(inner): return self.contains_native_pointer(inner)
+            Slice(inner): return self.contains_native_pointer(inner)
+            Range(inner): return self.contains_native_pointer(inner)
+            Array(inner, count): return self.contains_native_pointer(inner)
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_native_pointer(element): return true
+                return false
+            Function(parameters, result):
+                for parameter in parameters:
+                    if self.contains_native_pointer(parameter): return true
+                return self.contains_native_pointer(result)
+            CFunction(parameters, result):
+                for parameter in parameters:
+                    if self.contains_native_pointer(parameter): return true
+                return self.contains_native_pointer(result)
+            Struct(index):
+                for field in self.structs[index].fields:
+                    if self.contains_native_pointer(field.value_type): return true
+                return false
+            Enum(index):
+                for case_value in self.enums[index].cases:
+                    for field in case_value.payload:
+                        if self.contains_native_pointer(field.value_type): return true
                 return false
             else: return false
 

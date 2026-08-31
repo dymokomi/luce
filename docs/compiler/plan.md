@@ -308,6 +308,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   closed world, where live allocation is the edge that retains its allocator.
   This proves the composition mechanism with hand-built MIR; loading and
   compiling the production sealed source package remains the next rung.
+- [x] **Make native source authority an explicit frontend fact** (2026-08-30).
+  The package reader alone recognizes `.native.luc`, removes the authority
+  suffix from module identity, and carries a closed `ModuleAuthority` through
+  parsed source into HIR. `native_ptr[T]` and `native_mut_ptr[T]` retain their
+  pointee and mutability in HIR, are unavailable in safe modules, and cannot
+  escape through a public alias, aggregate or function signature. Importing a
+  safe wrapper does not transfer authority. The target-neutral address token
+  erases to canonical MIR `Ptr` only in the shared lowerer. Typed native
+  operations and the sealed arena capability remain the next slice.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only
