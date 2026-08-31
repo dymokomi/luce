@@ -397,6 +397,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   byte zero and commits state only after arena success. Verification and
   reachability retain the binding, function, global and provider as one unit;
   real QBE proves distinct typed allocations and exhaustion.
+- [x] **Expose typed allocation only to reviewed runtime source**
+  (2026-08-30). `native.allocate[T](count)` requires both native module
+  authority and the sealed runtime package role, preserves `T` and the `u64`
+  element count in HIR, and produces a typed mutable native pointer. Shared
+  lowering maps it directly to the already-verified target-neutral
+  `AllocateStorage(TypeId, u64)` contract. Application native modules cannot
+  call it, and no other native operation accepts generic arguments. This is
+  the source bridge needed by runtime collection headers; it adds no layout,
+  byte arithmetic, allocator policy, collection operation, or new MIR form.
 - [ ] **Complete `libluce_rt` in freestanding Luce**: reclamation/free-list
   reuse, ownership services, `write`, `trap`, and string/bytes primitives.
   Extend the checked allocator module as those semantic services become

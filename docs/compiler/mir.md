@@ -348,6 +348,13 @@ checker proves address mutability and matching pointees before pointer-type
 erasure. No native-operation symbol, byte offset, pointer width, or target
 layout survives into MIR.
 
+The sealed-runtime-only `native.allocate[T](count)` becomes the existing
+`AllocateStorage(T, count)` instruction. Its HIR result keeps the typed mutable
+pointer needed by reviewed runtime source; lowering erases only that address
+shape to `Ptr`, while the stored `TypeId` and element count remain structural.
+The verifier requires the exact private storage-allocator binding, and each
+backend alone legalizes the request using its layout rules.
+
 The sealed arena adds no memory-layout instruction. HIR admits
 `native.arena(end)` only for a native module in the runtime package and lowers
 it to the verified runtime-convention service `(u64) -> Ptr`. Canonical MIR
