@@ -39,7 +39,7 @@ column because it does not determine stage-1 completion.
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Conditional binding, protocol iteration/`try for`, and the remaining pattern families. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Close the remaining synthesized/custom initialization, enum, and structural-operation rules as one audited set. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | syntax | — | — | syntax | HIR ownership model and semantic oracle. |
-| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Dynamic collections, slicing, full string semantics, and allocator reclamation; the sealed arena and compiled aligned Luce bump allocator reach QBE. |
+| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Dynamic collections, slicing, full string semantics, and allocator reclamation; typed reinterpretation and overlapping movement now reach both artifact backends without target facts in MIR. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Error context, assertions/fatal surface, and an exhaustive trap/diagnostic audit. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | syntax | — | — | syntax | Managed function environments and capture/ownership analysis. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | syntax | — | — | syntax | HIR generic identities and bounded monomorphization. |
@@ -99,7 +99,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `checkout/` | Multi-module application shape | Parser only until collections/strings are complete. |
 | `c_api.luc` | C export surface | Parser only as a whole; focused C function export tests execute elsewhere. |
 | `c_import/` | Manifest-generated C import architecture | Parser/C-source checks; FIIR generation and end-to-end linking pending. |
-| `native_interop.native.luc` | `extern` type/function/global/struct, `blocking`, `out` | Parser conformance; supported pieces execute in focused compiler tests. |
+| `native_interop.native.luc` | `extern` declarations plus audited pointer rebind/move | Parser conformance as a whole; supported pointer operations execute in focused compiler tests. |
 
 ## Stage-0 corpus
 

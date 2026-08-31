@@ -339,10 +339,14 @@ backend.
 
 The first closed operations reuse MIR that already expresses their complete
 meaning: `native.load` becomes typed `Load`, `native.store` becomes typed
-`Store`, and element-count `native.advance` becomes `ElementAddress`. The HIR
-checker proves address mutability before that erasure. No native-operation
-symbol, byte offset or second memory instruction family survives into MIR;
-typed bulk copy will extend this same rule.
+`Store`, and element-count `native.advance` becomes `ElementAddress`. A
+contextually typed `native.rebind` changes only the audited HIR pointee view
+and therefore erases to its unchanged `Ptr` register. Overlap-safe
+`native.move` becomes `MoveElements`, retaining one element `TypeId` and a
+`u64` count so each backend alone computes and checks its byte count. The HIR
+checker proves address mutability and matching pointees before pointer-type
+erasure. No native-operation symbol, byte offset, pointer width, or target
+layout survives into MIR.
 
 The sealed arena adds no memory-layout instruction. HIR admits
 `native.arena(end)` only for a native module in the runtime package and lowers
@@ -661,6 +665,7 @@ FieldAddress(struct_type, base, index)    -> r: Ptr
 EnumPayloadAddress(enum_type, base)       -> r: Ptr
 ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
+MoveElements(destination, source, element_type, count)  overlap-safe typed range move
 AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr

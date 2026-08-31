@@ -353,8 +353,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   immutable stores, labels, wrong arity and non-pointer operands fail before
   lowering. They become the existing canonical `Load`, `Store` and
   `ElementAddress` instructions, so all backends consume one representation
-  and choose layout only at their existing boundary. Typed bulk copy, checked
-  pointer conversion and the sealed arena provider remain pending.
+  and choose layout only at their existing boundary. The sealed arena
+  provider remains the next runtime capability.
+- [x] **Keep native reinterpretation and overlapping moves structural through
+  MIR** (2026-08-30). Contextual `native.rebind` changes an audited HIR pointee
+  view without changing an address or escalating mutability, then erases to
+  the same canonical `Ptr`. `native.move` checks equal pointees and a mutable
+  destination, and lowers to `MoveElements(TypeId, u64)` with overlap-safe
+  semantics. QBE alone scales the count and calls `memmove`; Wasm independently
+  bounds the backend-computed byte count to its 32-bit address space before
+  `memory.copy`. Both execute overlapping ranges, and MIR composition remaps
+  the retained structural type. This is the last pointer substrate needed by
+  runtime-backed contiguous collections; it does not implement a collection.
 - [x] **Give sealed runtime state an explicit source-to-QBE path**
   (2026-08-30). `PackageRole` is a compiler input rather than a package-name
   convention. Only that role may declare private, structurally zeroable
