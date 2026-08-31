@@ -241,7 +241,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   HIR node records intent, rejects unhandled `T!`, and preserves `never` flow.
   Lowering evaluates the operand once and then uses the existing
   full-expression ownership cleanup; there is deliberately no MIR/backend
-  discard instruction.
+  discard instruction. The matching §7.8 `L0701` advisory now reports every
+  silently discarded non-`unit` result and points intentional code to the
+  explicit spelling. Flat HIR carries one cold source-module identity beside
+  each node's type/span, so this and future advisories remain linear scans
+  with exact file provenance rather than duplicate recursive walkers.
 - [x] **Dynamic source `trap(message)`** (2026-08-31, `done.md` §2). One
   never-valued HIR form evaluates an ordinary `str` and terminates without
   lexical cleanup. Shared lowering uses the existing target-neutral

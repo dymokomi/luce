@@ -444,6 +444,14 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   backends need no discard opcode or special lifetime path. Scalar, fallible,
   and owned-string fixtures agree through both oracles, real QBE, Wasm, and
   `examples/strings.luc`.
+- [x] **Silently discarded results are structured advisories** (2026-08-31).
+  Semantic analysis emits `L0701` for every non-`unit`, non-diverging
+  expression statement and suggests `discard(...)`; unit calls, explicit
+  discard, and `never` termination remain quiet. Each flat HIR node now keeps
+  its cold source `ModuleId` parallel to type and span, making the diagnostic
+  a cache-friendly linear scan with exact multi-module paths and no duplicate
+  statement walker. Exact rendering and positive/negative cases are pinned;
+  execution and canonical MIR are unchanged.
 - [x] **Source traps carry dynamic diagnostics through one semantic path**
   (2026-08-31). Compiler-known `trap(message)` eagerly checks and evaluates
   one ordinary `str`, has type `never`, and terminates without running
