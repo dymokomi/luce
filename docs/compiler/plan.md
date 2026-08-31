@@ -200,6 +200,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   preserve the prior artifact, and the product path owns no `.ssa` or `.s`
   files. The complete differential corpus and native smoke gate use this path.
 
+- [ ] **Finish decomposing the stateful compiler passes before the next major
+  managed-language family.** The HIR audit found one 4,299-line class mixing
+  program-wide declaration collection with per-function checking. Its shared
+  typed transaction and flat arenas now live in `hir/generation_model.luc`;
+  declaration collection and body checking must become cohesive consumers of
+  that one state without duplicating type, symbol, or node tables. Apply the
+  same program-versus-function-state test to the 3,659-line MIR lowerer. Keep
+  the 2,121-line parser sectioned until new grammar work establishes a real
+  component boundary; do not split any pass into arbitrary helper files just
+  to lower a line count.
+
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
