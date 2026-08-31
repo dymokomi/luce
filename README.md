@@ -78,8 +78,9 @@ examples and tests link back here rather than restating it.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, parameter
   defaults, bindings, assignment, scalars, strings, checked byte indexing and
-  byte-sequence lengths, fixed arrays, the first reference-list slice
-  (literals, shared identity, length, checked get/set, and append), tuples, optionals,
+  byte-sequence lengths, fixed arrays, reference lists (literals, shared
+  identity, length, checked get/set, append, insert, removal, clear, and
+  reserve), tuples, optionals,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
@@ -100,8 +101,8 @@ examples and tests link back here rather than restating it.
   equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, fixed
   value arrays with contextual literals, structural equality, copies,
   checked indexing and nested mutable places, plus runtime-backed list
-  literals, identity, checked mutation, append, aggregate elements, growth,
-  and collection-recursive value shapes on the QBE path, direct
+  literals, identity, checked access and shape mutation, aggregate elements,
+  growth, and collection-recursive value shapes on the QBE path, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,

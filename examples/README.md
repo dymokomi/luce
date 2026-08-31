@@ -46,10 +46,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   boundary work.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases and `let` fields, checked indexed mutation,
-  typed list parameters/results, mutating aggregate elements, and geometric
-  growth through the HIR and MIR oracles and a real native QBE artifact.
-  `insert`, removal, copying, slicing, iteration invalidation, ARC, and
-  reclamation remain explicit later list slices.
+  typed list parameters/results, mutating aggregate elements, insertion,
+  removal, clearing, reservation, evaluation order, and geometric growth
+  through the HIR and MIR oracles and a real native QBE artifact. Copying,
+  slicing, iteration invalidation, ARC, and reclamation remain explicit later
+  list slices.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the

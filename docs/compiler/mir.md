@@ -264,7 +264,8 @@ is what a backend actually needs. Language reference handles are different:
 `List(element)` retains the source element identity in canonical MIR even
 though each backend represents the handle with pointer-sized bits. It is not
 interchangeable with `Ptr`, cannot be forged by a null constant, and lets the
-verifier prove that create/append/index all use one canonical element type.
+verifier prove that every creation, access, and shape mutation uses one
+canonical element type.
 Type identities may therefore point forward. The verifier walks the layout
 dependency graph and rejects only a genuine by-value cycle; a reference break
 such as `Node { children: list[Node] }` is well-founded.
@@ -300,12 +301,13 @@ for Wasm and QBE.
 
 Lists follow the same separation without duplicating the element type on each
 instruction. A `List(T)` register is the semantic handle; `ListCreate`,
-`ListLength`, `ListAppendSlot`, and `ListElementAddress` derive `T` from that
-register. The last two ask the backend to pass its computed size/alignment to
-the exact composed runtime service. Bounds checking is part of
-`ListElementAddress`; the private runtime function only performs the unchecked
-address calculation after the backend guard. Capacity, header layout, and
-growth remain ordinary freestanding Luce runtime policy.
+`ListLength`, slot insertion/removal, reservation, clearing, and
+`ListElementAddress` derive `T` from that register. Operations that move or
+address elements ask the backend to pass its computed size/alignment to the
+exact composed runtime service. Bounds checking is part of canonical list
+indexing, insertion, and removal; private runtime functions perform only the
+unchecked storage operation after the backend guard. Capacity, header layout,
+and geometric growth remain ordinary freestanding Luce runtime policy.
 
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
@@ -695,6 +697,10 @@ AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (�
 ListCreate()                            -> r: List(T)    T is the result-register type
 ListLength(value: List(T))              -> r: u64
 ListAppendSlot(value: List(T))          -> r: Ptr       uninitialized typed slot
+ListInsertSlot(value: List(T), index: u64) -> r: Ptr    checked uninitialized slot
+ListRemoveAt(value: List(T), index: u64)                 checked shape mutation
+ListClear(value: List(T))
+ListReserve(value: List(T), minimum_capacity: u64)
 ListElementAddress(value: List(T), index: u64) -> r: Ptr checked element address
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
@@ -768,6 +774,10 @@ AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
 ListCreate() -> List(T)                      typed semantic handle
 ListLength(List(T)) -> u64
 ListAppendSlot(List(T)) -> Ptr               backend supplies size/alignment
+ListInsertSlot(List(T), u64) -> Ptr           backend checks index <= length
+ListRemoveAt(List(T), u64)                    backend checks index < length
+ListClear(List(T))
+ListReserve(List(T), u64)                     backend supplies size/alignment
 ListElementAddress(List(T), u64) -> Ptr       backend checks bounds, supplies size
 luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
