@@ -41,8 +41,13 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `generic_functions.luc` proves abstract body checking, argument inference,
   explicit structural specialization, contextual generic function values,
   defaults, recursion, and memoized monomorphization through both semantic
-  oracles, Wasm, and native QBE. Constraints and generic nominal types remain
-  open and are not implied by this example.
+  oracles, Wasm, and native QBE. Generic nominal types remain open and are not
+  implied by this example.
+- `constrained_generics.luc` proves nominal interface requirements, explicit
+  conformance, statically dispatched generic constraints, and the safe lift
+  from an infallible implementation to a fallible requirement through both
+  semantic oracles, Wasm, and native QBE. It deliberately does not claim
+  existential interface values or witness-table dynamic dispatch.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership

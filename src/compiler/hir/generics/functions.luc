@@ -14,9 +14,14 @@
 from compiler.frontend.source import SourceSpan
 from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax
 from compiler.hir.declarations import DeclarationCollector
-from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, HirGenerationState, HirSemanticChecker, TypeBinding
-from compiler.hir.ir import BuiltinType, HirNodeForm, HirParameter, NodeId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, GenericRequirementUse, HirGenerationState, HirSemanticChecker, TypeBinding
+from compiler.hir.ir import BuiltinType, HirInterfaceRequirement, HirNodeForm, HirParameter, NodeId, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import resolve_builtin_type, types_match
+
+struct ResolvedRequirement:
+    let requirement: HirInterfaceRequirement
+    let interface_type: TypeId
+    let requirement_index: i64
 
 ## Coordinates generic semantics with the ordinary body checker through the
 ## narrow operations that require expression or closure knowledge.
@@ -58,6 +63,7 @@ pub class GenericFunctionChecker:
             let saved_loop_depth = self.state.loop_depth
             let saved_recovery_types = self.state.recovery_types
             let saved_type_bindings = self.state.current_type_bindings
+            let saved_generic_origin = self.state.current_generic_origin
 
             self.declarations.enter_module(generic.module_index)
             self.state.current_type_bindings = generic.signature.type_bindings
@@ -98,6 +104,7 @@ pub class GenericFunctionChecker:
             self.state.loop_depth = saved_loop_depth
             self.state.recovery_types = saved_recovery_types
             self.state.current_type_bindings = saved_type_bindings
+            self.state.current_generic_origin = saved_generic_origin
             self.probing = false
 
     # mark: Call resolution and inference =======================================================
@@ -163,9 +170,9 @@ pub class GenericFunctionChecker:
                 try self.fail(argument.span, "parameter `" + generic.signature.parameters[parameter_index].name + "` is supplied more than once")
             assigned[parameter_index] = true
             let pattern = generic.signature.parameters[parameter_index].value_type
-            let context = self.inferred_type(pattern, generic_index, inferred, bound)
+            let context = self.inferred_type(pattern, generic.generic_id, inferred, bound)
             let checked = try semantics.check_expression_for_generic(argument.value, context)
-            try self.infer_type_arguments(pattern, self.state.type_of(checked), generic_index, inferred, bound, argument.span)
+            try self.infer_type_arguments(pattern, self.state.type_of(checked), generic.generic_id, inferred, bound, argument.span)
             placed_parameters.append(parameter_index)
             placed_nodes.append(checked)
 
@@ -216,84 +223,224 @@ pub class GenericFunctionChecker:
             inferred.append(resolve_builtin_type(BuiltinType.unit))
             bound.append(false)
         for index in range(0, len(expected_parameters)):
-            try self.infer_type_arguments(generic.signature.parameters[index].value_type, expected_parameters[index], generic_index, inferred, bound, span)
-        try self.infer_type_arguments(generic.signature.result, expected_result, generic_index, inferred, bound, span)
+            try self.infer_type_arguments(generic.signature.parameters[index].value_type, expected_parameters[index], generic.generic_id, inferred, bound, span)
+        try self.infer_type_arguments(generic.signature.result, expected_result, generic.generic_id, inferred, bound, span)
         for index in range(0, len(bound)):
             if not bound[index]:
                 try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + generic.name + "` from the expected function type")
         return try semantics.check_function_address_for_generic(try self.instantiate(semantics, generic_index, inferred, span), span, expected)
 
+    ## Type-check a method selected from an abstract parameter's written
+    ## constraints. The abstract decision is retained by source identity and
+    ## replayed against the conformance during every concrete specialization.
+    pub func check_requirement_call(semantics: HirSemanticChecker, owner_type: TypeId, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if not self.probing and self.state.current_generic_origin >= 0:
+            let use = self.find_requirement_use(self.state.current_generic_origin, callee_span)
+            if use != none:
+                return try self.check_concrete_requirement_call(semantics, use, receiver, name, arguments, callee_span, span, expected)
+        let resolved = try self.find_requirement(owner_type, name, callee_span)
+        if resolved == none: return none
+        if self.probing and self.state.current_generic_origin >= 0:
+            self.state.generic_requirement_uses.append(GenericRequirementUse(
+                generic_index = self.state.current_generic_origin,
+                span = callee_span,
+                interface_type = resolved.interface_type,
+                requirement_index = resolved.requirement_index,
+            ))
+        let abstract_result = self.interface_requirement_result(resolved.requirement, resolved.interface_type)
+        return try self.check_requirement_arguments(semantics, resolved.requirement, resolved.interface_type, resolved.requirement.symbol, abstract_result, receiver, name, arguments, callee_span, span, expected)
+
+    func check_concrete_requirement_call(semantics: HirSemanticChecker, use: GenericRequirementUse, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let generic = self.state.generic_functions[use.generic_index]
+        let generic_arguments = list[TypeId]()
+        for parameter in generic.type_parameters:
+            var found = false
+            for binding in self.state.current_type_bindings:
+                if binding.name == parameter.name:
+                    generic_arguments.append(binding.value_type)
+                    found = true
+                    break
+            if not found: trap("concrete generic binding is missing")
+        let interface_type = self.state.substitute_type(use.interface_type, generic.generic_id, generic_arguments)
+        var interface_index = -1
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(index, values): interface_index = index
+            else: trap("concrete constraint is not an interface")
+        let contract = self.state.interfaces[interface_index]
+        let requirement = contract.requirements[use.requirement_index]
+        var conformance_index = -1
+        for index in range(0, len(self.state.conformances)):
+            let conformance = self.state.conformances[index]
+            if types_match(conformance.value_type, self.state.type_of(receiver)) and types_match(conformance.interface_type, interface_type):
+                conformance_index = index
+                break
+        if conformance_index < 0: trap("validated generic constraint has no conformance")
+        let implementation_symbol = self.state.conformances[conformance_index].implementations[use.requirement_index]
+        let required_result = self.interface_requirement_result(requirement, interface_type)
+        let implementation_result = self.state.symbols[implementation_symbol.value].value_type
+        return try self.check_requirement_arguments(semantics, requirement, interface_type, implementation_symbol, implementation_result, receiver, name, arguments, callee_span, span, expected, required_result)
+
+    func check_requirement_arguments(semantics: HirSemanticChecker, requirement: HirInterfaceRequirement, interface_type: TypeId, function: SymbolId, call_result: TypeId, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?, required_result: TypeId? = none) -> NodeId!:
+        var interface_index = -1
+        let interface_arguments = list[TypeId]()
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(index, values):
+                interface_index = index
+                for value in values: interface_arguments.append(value)
+            else: trap("constraint requirement owner is not an interface")
+        let contract = self.state.interfaces[interface_index]
+        if requirement.is_mutating: try semantics.require_mutable_receiver_for_generic(receiver, callee_span)
+        if len(arguments) != len(requirement.parameters):
+            try self.fail(span, "interface method `" + name + "` accepts " + str(len(requirement.parameters)) + " argument(s), got " + str(len(arguments)))
+        let placed = list[u32]()
+        placed.append(0)
+        placed.append(receiver.value)
+        for index in range(0, len(arguments)):
+            let parameter = requirement.parameters[index]
+            let label = arguments[index].label
+            if label != none and label != parameter.name:
+                try self.fail(arguments[index].span, "interface method `" + name + "` has no parameter `" + label + "`")
+            let parameter_type = self.state.substitute_type(parameter.value_type, contract.generic_id, interface_arguments)
+            let checked = try semantics.check_expression_for_generic(arguments[index].value, parameter_type)
+            placed.append(u32(index + 1))
+            placed.append(checked.value)
+        let call = self.state.push_node(HirNodeForm.Call(function = function, arguments = self.state.push_run(placed)), call_result, span)
+        var adapted = call
+        if required_result != none: adapted = try semantics.require_type_for_generic(call, required_result)
+        return try semantics.require_type_for_generic(adapted, expected)
+
+    func interface_requirement_result(requirement: HirInterfaceRequirement, interface_type: TypeId) -> TypeId:
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(index, arguments): return self.state.substitute_type(requirement.result, self.state.interfaces[index].generic_id, arguments)
+            else: trap("requirement owner is not an interface")
+
+    func find_requirement(owner_type: TypeId, name: str, span: SourceSpan) -> ResolvedRequirement?!:
+        let constraints = self.constraints_of(owner_type)
+        if constraints == none: return none
+        var found: ResolvedRequirement? = none
+        for constraint in constraints:
+            var interface_index = -1
+            match self.state.types.definitions[constraint.value].form:
+                Interface(index, arguments): interface_index = index
+                else: continue
+            for requirement_index in range(0, len(self.state.interfaces[interface_index].requirements)):
+                let requirement = self.state.interfaces[interface_index].requirements[requirement_index]
+                if requirement.name != name: continue
+                if found != none:
+                    if not self.requirements_match(found, requirement, constraint):
+                        try self.fail(span, "method `" + name + "` is ambiguous across generic constraints")
+                    continue
+                found = ResolvedRequirement(requirement = requirement, interface_type = constraint, requirement_index = requirement_index)
+        return found
+
+    func requirements_match(left: ResolvedRequirement, right: HirInterfaceRequirement, right_interface: TypeId) -> bool:
+        if left.requirement.is_mutating != right.is_mutating: return false
+        if len(left.requirement.parameters) != len(right.parameters): return false
+        for index in range(0, len(right.parameters)):
+            if left.requirement.parameters[index].name != right.parameters[index].name: return false
+            let left_type = self.interface_requirement_parameter(left.requirement, left.interface_type, index)
+            let right_type = self.interface_requirement_parameter(right, right_interface, index)
+            if not types_match(left_type, right_type): return false
+        return types_match(
+            self.interface_requirement_result(left.requirement, left.interface_type),
+            self.interface_requirement_result(right, right_interface),
+        )
+
+    func interface_requirement_parameter(requirement: HirInterfaceRequirement, interface_type: TypeId, index: i64) -> TypeId:
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(interface_index, arguments):
+                return self.state.substitute_type(requirement.parameters[index].value_type, self.state.interfaces[interface_index].generic_id, arguments)
+            else: trap("requirement owner is not an interface")
+
+    func find_requirement_use(generic_index: i64, span: SourceSpan) -> GenericRequirementUse?:
+        for use in self.state.generic_requirement_uses:
+            if use.generic_index == generic_index and self.spans_match(use.span, span): return use
+        return none
+
+    func spans_match(left: SourceSpan, right: SourceSpan) -> bool:
+        return left.start == right.start and left.end == right.end and left.line == right.line and left.column == right.column
+
+    func constraints_of(value_type: TypeId) -> list[TypeId]?:
+        match self.state.types.definitions[value_type.value].form:
+            TypeParameter(generic_id, position):
+                for generic in self.state.generic_functions:
+                    if generic.generic_id == generic_id: return generic.type_parameters[position].constraints
+                for contract in self.state.interfaces:
+                    if contract.generic_id == generic_id: return contract.type_parameters[position].constraints
+                return none
+            else: return none
+
     # mark: Structural type inference ===========================================================
 
-    func inferred_type(pattern: TypeId, generic_index: i64, arguments: list[TypeId], bound: list[bool]) -> TypeId?:
+    func inferred_type(pattern: TypeId, generic_id: u32, arguments: list[TypeId], bound: list[bool]) -> TypeId?:
         match self.state.types.definitions[pattern.value].form:
             TypeParameter(owner, position):
-                if i64(owner) != generic_index: return pattern
+                if owner != generic_id: return pattern
                 if not bound[position]: return none
                 return arguments[position]
             Slice(element):
-                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                let inner = self.inferred_type(element, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_slice(inner)
             List(element):
-                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                let inner = self.inferred_type(element, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_list(inner)
             Weak(value):
-                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                let inner = self.inferred_type(value, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_weak(inner)
             Range(element):
-                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                let inner = self.inferred_type(element, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_range(inner)
             Array(element, count):
-                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                let inner = self.inferred_type(element, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_array(inner, count)
             Optional(value):
-                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                let inner = self.inferred_type(value, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_optional(inner)
             Fallible(value):
-                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                let inner = self.inferred_type(value, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_fallible(inner)
             Tuple(elements):
                 let values = list[TypeId]()
                 for element in elements:
-                    let item = self.inferred_type(element, generic_index, arguments, bound)
+                    let item = self.inferred_type(element, generic_id, arguments, bound)
                     if item == none: return none
                     values.append(item)
                 return self.state.intern_tuple(values)
             Function(parameters, result):
                 let values = list[TypeId]()
                 for parameter in parameters:
-                    let item = self.inferred_type(parameter, generic_index, arguments, bound)
+                    let item = self.inferred_type(parameter, generic_id, arguments, bound)
                     if item == none: return none
                     values.append(item)
-                let result_type = self.inferred_type(result, generic_index, arguments, bound)
+                let result_type = self.inferred_type(result, generic_id, arguments, bound)
                 if result_type == none: return none
                 return self.state.intern_function_type(values, result_type)
             CFunction(parameters, result):
                 let values = list[TypeId]()
                 for parameter in parameters:
-                    let item = self.inferred_type(parameter, generic_index, arguments, bound)
+                    let item = self.inferred_type(parameter, generic_id, arguments, bound)
                     if item == none: return none
                     values.append(item)
-                let result_type = self.inferred_type(result, generic_index, arguments, bound)
+                let result_type = self.inferred_type(result, generic_id, arguments, bound)
                 if result_type == none: return none
                 return self.state.intern_c_function_type(values, result_type)
             NativePointer(pointee, is_mutable):
-                let inner = self.inferred_type(pointee, generic_index, arguments, bound)
+                let inner = self.inferred_type(pointee, generic_id, arguments, bound)
                 if inner == none: return none
                 return self.state.intern_native_pointer(inner, is_mutable)
             else: return pattern
 
-    func infer_type_arguments(pattern: TypeId, actual: TypeId, generic_index: i64, arguments: list[TypeId], bound: list[bool], span: SourceSpan) -> !:
+    func infer_type_arguments(pattern: TypeId, actual: TypeId, generic_id: u32, arguments: list[TypeId], bound: list[bool], span: SourceSpan) -> !:
         match self.state.types.definitions[pattern.value].form:
             TypeParameter(owner, position):
-                if i64(owner) != generic_index:
+                if owner != generic_id:
                     if not types_match(pattern, actual): try self.inference_mismatch(span, pattern, actual)
                     return
                 if bound[position]:
@@ -304,44 +451,44 @@ pub class GenericFunctionChecker:
                 return
             Optional(inner):
                 match self.state.types.definitions[actual.value].form:
-                    Optional(actual_inner): try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
-                    else: try self.infer_type_arguments(inner, actual, generic_index, arguments, bound, span)
+                    Optional(actual_inner): try self.infer_type_arguments(inner, actual_inner, generic_id, arguments, bound, span)
+                    else: try self.infer_type_arguments(inner, actual, generic_id, arguments, bound, span)
                 return
             Fallible(inner):
                 match self.state.types.definitions[actual.value].form:
                     Fallible(actual_inner):
-                        try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
+                        try self.infer_type_arguments(inner, actual_inner, generic_id, arguments, bound, span)
                         return
                     else: pass
             Slice(element):
                 match self.state.types.definitions[actual.value].form:
                     Slice(actual_element):
-                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        try self.infer_type_arguments(element, actual_element, generic_id, arguments, bound, span)
                         return
                     else: pass
             List(element):
                 match self.state.types.definitions[actual.value].form:
                     List(actual_element):
-                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        try self.infer_type_arguments(element, actual_element, generic_id, arguments, bound, span)
                         return
                     else: pass
             Weak(inner):
                 match self.state.types.definitions[actual.value].form:
                     Weak(actual_inner):
-                        try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
+                        try self.infer_type_arguments(inner, actual_inner, generic_id, arguments, bound, span)
                         return
                     else: pass
             Range(element):
                 match self.state.types.definitions[actual.value].form:
                     Range(actual_element):
-                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        try self.infer_type_arguments(element, actual_element, generic_id, arguments, bound, span)
                         return
                     else: pass
             Array(element, count):
                 match self.state.types.definitions[actual.value].form:
                     Array(actual_element, actual_count):
                         if count == actual_count:
-                            try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                            try self.infer_type_arguments(element, actual_element, generic_id, arguments, bound, span)
                             return
                     else: pass
             Tuple(elements):
@@ -349,7 +496,7 @@ pub class GenericFunctionChecker:
                     Tuple(actual_elements):
                         if len(elements) == len(actual_elements):
                             for index in range(0, len(elements)):
-                                try self.infer_type_arguments(elements[index], actual_elements[index], generic_index, arguments, bound, span)
+                                try self.infer_type_arguments(elements[index], actual_elements[index], generic_id, arguments, bound, span)
                             return
                     else: pass
             Function(parameters, result):
@@ -357,8 +504,8 @@ pub class GenericFunctionChecker:
                     Function(actual_parameters, actual_result):
                         if len(parameters) == len(actual_parameters):
                             for index in range(0, len(parameters)):
-                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_index, arguments, bound, span)
-                            try self.infer_type_arguments(result, actual_result, generic_index, arguments, bound, span)
+                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_id, arguments, bound, span)
+                            try self.infer_type_arguments(result, actual_result, generic_id, arguments, bound, span)
                             return
                     else: pass
             CFunction(parameters, result):
@@ -366,15 +513,15 @@ pub class GenericFunctionChecker:
                     CFunction(actual_parameters, actual_result):
                         if len(parameters) == len(actual_parameters):
                             for index in range(0, len(parameters)):
-                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_index, arguments, bound, span)
-                            try self.infer_type_arguments(result, actual_result, generic_index, arguments, bound, span)
+                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_id, arguments, bound, span)
+                            try self.infer_type_arguments(result, actual_result, generic_id, arguments, bound, span)
                             return
                     else: pass
             NativePointer(pointee, is_mutable):
                 match self.state.types.definitions[actual.value].form:
                     NativePointer(actual_pointee, actual_mutable):
                         if is_mutable == actual_mutable:
-                            try self.infer_type_arguments(pointee, actual_pointee, generic_index, arguments, bound, span)
+                            try self.infer_type_arguments(pointee, actual_pointee, generic_id, arguments, bound, span)
                             return
                     else: pass
             else:
@@ -389,6 +536,11 @@ pub class GenericFunctionChecker:
         if not self.probing and len(self.state.generic_instances) >= self.state.monomorphization_budget:
             try self.fail(span, "generic specialization budget of " + str(self.state.monomorphization_budget) + " was exceeded")
         let generic = self.state.generic_functions[generic_index]
+        for index in range(0, len(generic.type_parameters)):
+            for constraint in generic.type_parameters[index].constraints:
+                let required = self.state.substitute_type(constraint, generic.generic_id, arguments)
+                if not self.satisfies_constraint(arguments[index], required):
+                    try self.fail(span, "type `" + self.state.describe_type(arguments[index]) + "` does not conform to `" + self.state.describe_type(required) + "` required by `" + generic.type_parameters[index].name + "`")
         let bindings = list[TypeBinding]()
         var specialized_name = generic.name + "["
         for index in range(0, len(arguments)):
@@ -402,7 +554,7 @@ pub class GenericFunctionChecker:
         let parameters = list[HirParameter]()
         for index in range(0, len(generic.signature.parameters)):
             let template_parameter = generic.signature.parameters[index]
-            let value_type = self.state.substitute_type(template_parameter.value_type, generic_index, arguments)
+            let value_type = self.state.substitute_type(template_parameter.value_type, generic.generic_id, arguments)
             var default_value = NodeId(value = no_node)
             let default_syntax = generic.syntax.parameters[index].default_value
             if default_syntax != none:
@@ -413,7 +565,7 @@ pub class GenericFunctionChecker:
                 value_type = value_type,
                 default_value = default_value,
             ))
-        let result = self.state.substitute_type(generic.signature.result, generic_index, arguments)
+        let result = self.state.substitute_type(generic.signature.result, generic.generic_id, arguments)
         let symbol = self.state.make_symbol(specialized_name, SymbolKind.function, result)
         let function_index = len(self.state.functions)
         self.state.functions.append(FunctionSymbol(
@@ -427,6 +579,7 @@ pub class GenericFunctionChecker:
             result = result,
             source = CollectedFunctionSource.Defined(syntax = generic.syntax),
             span = generic.span,
+            generic_origin = generic_index,
             type_bindings = bindings,
         ))
         let key_arguments = list[TypeId]()
@@ -434,6 +587,15 @@ pub class GenericFunctionChecker:
         self.state.generic_instances.append(GenericFunctionInstance(generic_index = generic_index, arguments = key_arguments, function_index = function_index))
         self.state.current_type_bindings = saved_bindings
         return function_index
+
+    func satisfies_constraint(value_type: TypeId, constraint: TypeId) -> bool:
+        for conformance in self.state.conformances:
+            if types_match(conformance.value_type, value_type) and types_match(conformance.interface_type, constraint): return true
+        let inherited = self.constraints_of(value_type)
+        if inherited != none:
+            for available in inherited:
+                if types_match(available, constraint): return true
+        return false
 
     func find_parameter(function: FunctionSymbol, name: str) -> i64:
         for index in range(0, len(function.parameters)):

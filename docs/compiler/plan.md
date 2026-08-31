@@ -569,12 +569,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   structured, non-fatal analysis result through check, run, compilation, build,
   and CLI presentation; it neither changes valid capture semantics nor prints
   from HIR generation. Sendability closes with workers.
-- [ ] **Interfaces** (data pointer + witness table) and the remaining generic
-  surface. Unconstrained generic functions now have abstract HIR checking,
-  structural inference, memoized concrete instances, and an explicit
-  generator budget through QBE (`done.md` §2). Next: interface constraints,
-  generic nominal types, serialized typed bodies, package/CLI budget
-  configuration, and expansion accounting.
+- [ ] **Interface values** (data pointer + witness table) and the remaining
+  generic surface. Nominal interface declarations, generic interface
+  arguments and constraints, explicit struct/class/enum conformances,
+  constraint intersections, static requirement dispatch, and safe
+  infallible-to-fallible adapters now reach QBE (`done.md` §2). HIR retains
+  target-neutral requirement/conformance identity and canonical MIR remains
+  generic-free. Next: existential interface values with boxing/COW and dynamic
+  witnesses; then generic nominal types, serialized typed bodies, package/CLI
+  budget configuration, and expansion accounting.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
@@ -607,7 +610,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   honest boundary: abstract probing, structural inference, and concrete
   specialization live in `hir/generics/functions.luc` and borrow a narrow
   semantic interface without duplicating the generation transaction. The
-  remaining 2,901-line HIR body checker and 3,514-line MIR function lowerer
+  1,680-line declaration collector now owns one cohesive, marked interface
+  declaration/conformance section because it directly shares name, type, and
+  method resolution; splitting it today would create a forwarding cycle.
+  Existential representation and dynamic calls are a distinct concern and
+  must get their own owner rather than extending that section past the review
+  threshold. The
+  remaining 2,907-line HIR body checker and 3,514-line MIR function lowerer
   stay intact until another language family establishes a similarly cohesive
   owner. The 2,219-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
