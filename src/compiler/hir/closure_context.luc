@@ -5,14 +5,15 @@
 #   DESCRIPTION:
 #       Turns references to outer locals into explicit closure-environment
 #       fields and constructs the one environment-bearing function conversion.
-#       It owns capture identity and storage policy; expression and statement
-#       typing remain in HirBodyChecker.
+#       It owns capture identity, source-local value provenance, and the direct
+#       ownership cycles those facts can prove while a body is checked;
+#       expression and statement typing remain in HirBodyChecker.
 #
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan
 from compiler.hir.generation_model import HirGenerationState, LocalBinding, LocalStorage
-from compiler.hir.ir import HirCapture, HirCaptureKind, HirClosure, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, ModuleId, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import HirCapture, HirCaptureKind, HirClosure, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiverKind, ModuleId, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import place_class_field_step
 
 # mark: Capture frames ========================================================================
@@ -204,21 +205,67 @@ pub class ClosureContext:
 
     # mark: Stored cycle diagnostics ===========================================================
 
-    ## Reject the direct ARC cycle the source rule can prove locally: a class
-    ## stores a closure in its own payload while that closure strongly retains
-    ## the same class binding. More dynamic graph cycles remain leak-tool work.
+    ## Reject a direct ARC cycle when a class-owned field stores its own root
+    ## through a value or closure environment. More dynamic graph cycles remain
+    ## leak-tool work because their edges depend on control flow and aliases.
     pub func reject_direct_class_cycle(root: SymbolId, steps: list[u32], value: NodeId, span: SourceSpan) -> !:
+        if self.in_deinitializer(): return
         if len(steps) < 2 or steps[0] != place_class_field_step: return
         match self.state.types.definitions[self.state.symbols[root.value].value_type.value].form:
             Class(index): pass
             else: return
-        if not self.strongly_retains(value, root): return
+        let name = self.state.symbols[root.value].name
+        if self.strongly_retains(value, root):
+            error(self.state.diagnostic_at(
+                self.state.current_module,
+                span,
+                "storing this closure on `" + name + "` creates a strong reference cycle; capture it with `weak " + name + "`",
+            ))
+        if self.value_retains_root(value, root, true, list[SymbolId]()):
+            error(self.state.diagnostic_at(
+                self.state.current_module,
+                span,
+                "storing `" + name + "` through its own strong field creates a reference cycle; declare the back edge with `weak var`",
+            ))
+
+    ## A class can own a reference list that is mutated through its field or
+    ## an immutable alias. Inserting the same class root is the collection form
+    ## of the direct self-field cycle and has the same static certainty.
+    pub func reject_direct_collection_cycle(collection: NodeId, element: NodeId, span: SourceSpan) -> !:
+        if self.in_deinitializer(): return
+        let root = self.class_storage_root(collection, list[SymbolId]())
+        if root == none: return
+        if not self.value_retains_root(element, root, true, list[SymbolId]()): return
         let name = self.state.symbols[root.value].name
         error(self.state.diagnostic_at(
             self.state.current_module,
             span,
-            "storing this closure on `" + name + "` creates a strong reference cycle; capture it with `weak " + name + "`",
+            "inserting `" + name + "` into a collection it owns creates a strong reference cycle; store `Weak[" + self.state.types.definitions[self.state.symbols[root.value].value_type.value].name + "]` for the back edge",
         ))
+
+    func class_storage_root(value: NodeId, visiting: list[SymbolId]) -> SymbolId?:
+        match self.state.node_form(value):
+            FieldAccess(inner, field): return self.class_storage_root(inner, visiting)
+            Element(inner, index): return self.class_storage_root(inner, visiting)
+            Reference(symbol):
+                match self.state.types.definitions[self.state.symbols[symbol.value].value_type.value].form:
+                    Class(index): return symbol
+                    else: pass
+                for visited in visiting:
+                    if visited.value == symbol.value: return none
+                for binding in self.immutable_values:
+                    if binding.symbol.value != symbol.value: continue
+                    visiting.append(symbol)
+                    let root = self.class_storage_root(binding.value, visiting)
+                    visiting.remove(len(visiting) - 1)
+                    return root
+                return none
+            else: return none
+
+    func in_deinitializer() -> bool:
+        let receiver = self.state.current_receiver
+        if receiver == none: return false
+        return receiver.kind == HirReceiverKind.deinitializer
 
     # Follow value-forming wrappers and immutable aliases. A mutable alias has
     # control-flow-dependent provenance and is deliberately left to runtime
@@ -262,8 +309,10 @@ pub class ClosureContext:
             List(values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
             StructValue(index, values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
             EnumValue(enum_index, case_index, values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
-            Element(inner, index): return self.value_retains_root(inner, root, direct_reference_retains, visiting)
-            FieldAccess(inner, field): return self.value_retains_root(inner, root, direct_reference_retains, visiting)
+            # Reading a field or element copies the selected value; it does
+            # not retain the aggregate or class identity used to reach it.
+            Element(inner, index): return false
+            FieldAccess(inner, field): return false
             Match(subject, arms, has_result):
                 for position in range(0, i64(arms.count)):
                     match self.state.node_form(self.node_in(arms, position)):
