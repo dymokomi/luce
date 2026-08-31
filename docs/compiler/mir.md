@@ -428,8 +428,8 @@ balanced pairs.
 A few language features never reach MIR at all; they are rewritten into
 things MIR already has.
 
-- **Generics** are monomorphized (§15): each use with concrete types becomes
-  its own plain function.
+- **Generics** are monomorphized (§15): each free-function or nominal-method
+  use with concrete types becomes its own plain function.
 - **Closure syntax and capture resolution** are gone, but their semantic
   contract remains explicit. `MirClosure` names a hidden body, source-visible
   signature, typed capture schema, and destroyer. A captured `var` is a typed

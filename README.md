@@ -93,6 +93,7 @@ examples and tests link back here rather than restating it.
   deterministic destruction, and initialization/resurrection analysis,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, generic functions with interface constraints,
+  memberwise generic structs with specialized value/mutating methods,
   nominal interface declarations, explicit struct/class/enum conformance,
   statically dispatched requirement calls, and existential interface values
   with dynamic calls and value/class mutation semantics; exhaustive `match`,
@@ -123,7 +124,7 @@ examples and tests link back here rather than restating it.
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,
-  monomorphized generic functions, constrained interface calls, existential
+  monomorphized generic functions and nominal methods, constrained interface calls, existential
   interface ownership/COW and descriptor-backed dynamic dispatch, and
   `print` of a literal or a `str` value — is lowered to canonical
   MIR and encoded as WebAssembly and QBE IL. The complete list runtime executes
