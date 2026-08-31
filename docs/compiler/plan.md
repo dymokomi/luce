@@ -209,16 +209,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
-  343-line orchestration facade, a 2,251-line program-wide declaration
-  collector, a 1,149-line shared typed transaction/model, a 3,005-line body
-  checker, and focused 658- and 291-line generic function/nominal owners.
+  369-line orchestration facade, a 2,253-line program-wide declaration
+  collector, a 1,192-line shared typed transaction/model, a 3,006-line body
+  checker, and focused 707- and 291-line generic function/nominal owners.
   Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
   MIR lowerer is likewise a 186-line whole-program coordinator, one 865-line
-  identity/type/state transaction, and one 3,955-line function walk.
+  identity/type/state transaction, and one 3,952-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
   transaction. The class slice completed that ownership review: class ARC,
@@ -229,11 +229,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   existential interface resolution established an independently testable HIR
   boundary. Independently generic methods reused the generic-function owner
   and the existing declaration transaction rather than adding another pass.
-  The declaration collector and now 3,955-line function walk must be reviewed
+  Generic accounting established a separate 263-line cross-stage reporting
+  owner and a 28-line backend emission record instead of coupling presentation
+  to HIR, MIR, QBE, or Wasm. Its out-of-band function provenance follows
+  package composition and optimizer remapping without adding source or generic
+  facts to canonical MIR. The declaration collector and now 3,952-line
+  function walk must be reviewed
   again before the next major language family; their current growth remains
   cohesive but is at the threshold where a real ownership boundary should be
   extracted when that family makes one visible. Keep the parser and
-  2,281-line Wasm encoder sectioned
+  2,305-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -592,10 +597,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   value/mutating/lifecycle methods, independently generic instance methods,
   custom initializers and type functions, and concrete conformances are
   complete through both oracles and artifact backends (`done.md` §2).
-  Serialized typed bodies,
-  package/CLI budget configuration,
-  origin/size/time expansion accounting, and path-rich budget diagnostics also
-  remain. Keep monomorphization out of canonical MIR.
+  Package/CLI budget configuration, immediate infinite-expansion detection,
+  source-parent paths, HIR/MIR size, check/codegen timing, backend code-size
+  accounting, `luce explain`, and `build --time-report` are also complete.
+  Serialized typed bodies in package artifacts remain and belong to the
+  package-artifact owner, not HIR or canonical MIR. Keep monomorphization out
+  of canonical MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
@@ -604,7 +611,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **C import (FIIR)** from headers via Clang, for Cocoa/Metal, OpenSSL/Monocypher, wasm3 during transition.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
-- [ ] **`luce api diff`** and **`luce describe`** as compiler products; `luce build --time-report` once generics exist.
+- [x] **`luce build --time-report` for generics** (2026-08-31). Report source
+  expansion paths and front-end cost before backend selection, then join
+  optimized MIR size and backend-local function emission bytes/time by
+  concrete executable identity (`done.md` §2).
+- [ ] **`luce api diff`** and **`luce describe`** as compiler products.
 - [ ] **Fuel/preemption as a wasm backend option** (when guests need it and the engine is not ours).
 
 ### Self-hosting and compile speed
@@ -618,7 +629,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   File length is reviewed at each vertical-slice audit; roughly 2,000 lines
   triggers an ownership review, not an arbitrary mechanical split. Wasm
   module planning has its own owner, leaving the related instruction/section
-  encoder cohesive at 2,085 lines; its byte plumbing is
+  encoder cohesive at 2,305 lines; its byte plumbing is
   too small to justify another module today.
   HIR generation now separates program declarations from mutually recursive
   body semantics over one typed transaction. MIR lowering separates the
@@ -628,17 +639,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   honest boundary: abstract probing, structural inference, and concrete
   function/method specialization live in `hir/generics/functions.luc` and
   borrow a narrow semantic interface without duplicating the generation
-  transaction. The 2,121-line declaration collector now owns one cohesive,
+  transaction. The 2,253-line declaration collector now owns one cohesive,
   marked interface declaration/conformance section because it directly shares
   name, type, method, visibility, generic-specialization, and adapter
   resolution; its generic-conformance threshold review found that splitting
   it today would create a forwarding cycle rather than a new owner.
   Existential representation and dynamic calls established the focused
   108-line `hir/interfaces/values.luc` owner rather than extending the
-  declaration collector. The remaining 2,922-line HIR body checker and
-  3,923-line MIR function lowerer stay intact only until another language
+  declaration collector. The remaining 3,006-line HIR body checker and
+  3,952-line MIR function lowerer stay intact only until another language
   family establishes a similarly cohesive owner; the lowerer's next major
-  slice must include a fresh transaction-boundary review. The 2,219-line HIR interpreter
+  slice must include a fresh transaction-boundary review. The 2,376-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.

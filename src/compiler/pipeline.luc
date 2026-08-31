@@ -111,11 +111,13 @@ from compiler.mir.composer import compose_runtime
 from compiler.backends.interpreter import HirInterpreter
 from compiler.backends.qbe_toolchain import QbeToolchain
 from compiler.backends.wasm import WasmBackend
+from compiler.backends.emission import FunctionEmission
 from compiler.hir.generator import HirGenerator
 from compiler.hir.generation_model import SourceModule
+from compiler.reporting.generics import GenericReport, bind_lowered_functions, offset_functions, remap_optimized_functions, report_generics, with_compilation_metrics
 from compiler.mir.lowerer import Lowerer
 from compiler.mir.verifier import MirVerifier
-from compiler.mir.optimizer import Optimizer
+from compiler.mir.optimizer import OptimizationResult, Optimizer
 from compiler.frontend.parser import Parser
 from compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
 from compiler.frontend.source import Diagnostic
@@ -123,6 +125,7 @@ from compiler.frontend.tokenizer import Token, Tokenizer
 from compiler.hir.ir import ModuleAuthority, PackageRole, Value
 from compiler.runtime_contract import RuntimeService
 import std.files
+import std.os
 import std.paths
 
 # mark: Targets ===============================================================================
@@ -133,6 +136,11 @@ import std.paths
 pub struct PackageInput:
     pub let identity: str
     pub let source_paths: list[str]
+
+## Operational limits for one package compilation. These are compiler-product
+## policy, never source semantics or MIR facts.
+pub struct CompilationOptions:
+    pub let generic_specialization_budget: i64 = 256
 
 ## One semantic service named by a sealed package descriptor. The source
 ## spelling is resolved once to a HIR identity; it is not a linker convention.
@@ -157,11 +165,19 @@ pub enum BuildTarget:
 ## diagnostics discovered before lowering.
 pub struct BuildResult:
     pub let diagnostics: list[Diagnostic]
+    pub let generic_reports: list[GenericReport]
 
 ## Result of reference execution plus the analysis reports for that program.
 pub struct RunResult:
     pub let value: Value
     pub let diagnostics: list[Diagnostic]
+
+## Source-level specialization report plus every advisory produced while
+## analyzing the same program. Explain must not become a warning-suppressing
+## alternate frontend path.
+pub struct ExplainResult:
+    pub let diagnostics: list[Diagnostic]
+    pub let generic_report: GenericReport
 
 ## Verified canonical MIR paired with the reports from every analyzed package
 ## that contributed to it. Backends consume only `program`; callers retain
@@ -169,42 +185,62 @@ pub struct RunResult:
 pub struct CompiledProgram:
     pub let program: MirProgram
     pub let diagnostics: list[Diagnostic]
+    pub let generic_reports: list[GenericReport]
 
 # mark: Commands ===============================================================================
 
 ## Compile source files through every build stage and install the completed
 ## artifact at `output`. Native artifacts use the QBE host toolchain; QBE owns
 ## its scratch and replaces the destination only after linking succeeds.
-pub func build(target: BuildTarget, output: str, package: PackageInput) -> BuildResult!:
-    let compiled = try lower_and_verify(package)
-    try materialize(target, output, compiled.program)
-    return BuildResult(diagnostics = compiled.diagnostics)
+pub func build(target: BuildTarget, output: str, package: PackageInput, options: CompilationOptions = CompilationOptions()) -> BuildResult!:
+    let compiled = try lower_and_verify(package, options)
+    let emissions = try materialize(target, output, compiled.program)
+    return BuildResult(
+        diagnostics = compiled.diagnostics,
+        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, emissions),
+    )
 
 ## Build with an explicitly supplied sealed runtime package. Keeping the
 ## package input visible makes deployment/package lookup a caller concern,
 ## while every compiler stage still consumes one composed canonical MIR.
-pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput) -> BuildResult!:
-    let compiled = try compile_with_runtime(package, runtime)
-    try materialize(target, output, compiled.program)
-    return BuildResult(diagnostics = compiled.diagnostics)
+pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions()) -> BuildResult!:
+    let compiled = try compile_with_runtime(package, runtime, options)
+    let emissions = try materialize(target, output, compiled.program)
+    return BuildResult(
+        diagnostics = compiled.diagnostics,
+        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, emissions),
+    )
 
-func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> !:
+func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> list[FunctionEmission]!:
     match target:
-        wasm:   try files.write_bytes(output, try WasmBackend().emit(optimized_program))
-        native: try QbeToolchain().materialize(optimized_program, output)
+        wasm:
+            let emission = try WasmBackend(os.clock_ms).emit_with_report(optimized_program)
+            try files.write_bytes(output, emission.bytes)
+            return emission.functions
+        native:
+            return try QbeToolchain().materialize_with_report(optimized_program, output)
 
 ## Run the complete frontend and semantic analysis, returning analyzed typed
 ## HIR. For example, editor tooling can call this without choosing a target.
-pub func check(package: PackageInput) -> AnalyzedProgram!:
-    return try analyze_sources(package)
+pub func check(package: PackageInput, options: CompilationOptions = CompilationOptions()) -> AnalyzedProgram!:
+    return try analyze_sources(package, options)
 
 ## Analyze source files and run one public, parameterless function through the
 ## typed-HIR reference interpreter; for example,
 ## `run(package, "main", "answer")`.
-pub func run(package: PackageInput, module_name: str, function_name: str) -> RunResult!:
-    let analyzed = try analyze_sources(package)
+pub func run(package: PackageInput, module_name: str, function_name: str, options: CompilationOptions = CompilationOptions()) -> RunResult!:
+    let analyzed = try analyze_sources(package, options)
     let value = try HirInterpreter().run(analyzed, module_name, function_name)
     return RunResult(value = value, diagnostics = analyzed.diagnostics)
+
+## Analyze one package and expose the specialization provenance/cost report
+## used by `luce explain` without selecting or invoking an artifact backend.
+pub func explain(package: PackageInput, options: CompilationOptions = CompilationOptions()) -> ExplainResult!:
+    let analyzed = try analyze_sources(package, options)
+    return ExplainResult(
+        diagnostics = analyzed.diagnostics,
+        generic_report = report_generics(analyzed.hir),
+    )
 
 # mark: Stage values ===========================================================================
 
@@ -230,8 +266,8 @@ struct TokenizedFile:
 
 ## Run the analyzed typed HIR with a caller-provided execution backend. This
 ## keeps custom interpreters on the same semantic path as the built-in one.
-pub func run_with_backend(backend: HirExecutionBackend, package: PackageInput, module_name: str, function_name: str) -> RunResult!:
-    let analyzed = try analyze_sources(package)
+pub func run_with_backend(backend: HirExecutionBackend, package: PackageInput, module_name: str, function_name: str, options: CompilationOptions = CompilationOptions()) -> RunResult!:
+    let analyzed = try analyze_sources(package, options)
     let value = try backend.run(analyzed, module_name, function_name)
     return RunResult(value = value, diagnostics = analyzed.diagnostics)
 
@@ -241,53 +277,68 @@ pub func run_with_backend(backend: HirExecutionBackend, package: PackageInput, m
 ## and retain its analysis reports. Keeping this entry explicit lets packaging
 ## choose where the shipped runtime sources live without granting runtime
 ## authority to ordinary packages.
-pub func compile_runtime(package: RuntimePackageInput) -> CompiledProgram!:
+pub func compile_runtime(package: RuntimePackageInput, options: CompilationOptions = CompilationOptions()) -> CompiledProgram!:
     let analyzed = try analyze_package(
         PackageInput(identity = package.identity, source_paths = package.source_paths),
         PackageRole.sealed_runtime,
         package.bindings,
+        options,
     )
     let program = try Lowerer(analyzed).lower()
     try MirVerifier(program).verify()
-    return CompiledProgram(program = program, diagnostics = analyzed.diagnostics)
+    return CompiledProgram(
+        program = program,
+        diagnostics = analyzed.diagnostics,
+        generic_reports = [bind_lowered_functions(report_generics(analyzed.hir), program)],
+    )
 
 ## Compile application and sealed runtime sources independently, preserve both
 ## diagnostic streams, compose their canonical MIR, then verify and optimize
 ## the one closed program every artifact backend consumes.
-pub func compile_with_runtime(application: PackageInput, runtime: RuntimePackageInput) -> CompiledProgram!:
-    let analyzed_application = try analyze_sources(application)
+pub func compile_with_runtime(application: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions()) -> CompiledProgram!:
+    let analyzed_application = try analyze_sources(application, options)
     let application_program = try Lowerer(analyzed_application).lower()
-    let compiled_runtime = try compile_runtime(runtime)
-    let program = try verify_and_optimize(try compose_runtime(application_program, compiled_runtime.program))
+    let compiled_runtime = try compile_runtime(runtime, options)
+    let composed = try compose_runtime(application_program, compiled_runtime.program)
+    let optimized = try verify_and_optimize(composed)
+    let reports = list[GenericReport]()
+    reports.append(bind_lowered_functions(report_generics(analyzed_application.hir), application_program))
+    for report in compiled_runtime.generic_reports:
+        reports.append(offset_functions(report, len(application_program.functions)))
     return CompiledProgram(
-        program = program,
+        program = optimized.program,
         diagnostics = combine_diagnostics(analyzed_application.diagnostics, compiled_runtime.diagnostics),
+        generic_reports = remap_optimized_functions(reports, optimized.function_remap),
     )
 
 # mark: Shared stages ==========================================================================
 
 # Frontend through semantic analysis. `check`, `run`, and `build` all start here.
-func analyze_sources(package: PackageInput) -> AnalyzedProgram!:
-    return try analyze_package(package, PackageRole.application, list[RuntimeBindingInput]())
+func analyze_sources(package: PackageInput, options: CompilationOptions) -> AnalyzedProgram!:
+    return try analyze_package(package, PackageRole.application, list[RuntimeBindingInput](), options)
 
-func analyze_package(package: PackageInput, role: PackageRole, bindings: list[RuntimeBindingInput]) -> AnalyzedProgram!:
+func analyze_package(package: PackageInput, role: PackageRole, bindings: list[RuntimeBindingInput], options: CompilationOptions) -> AnalyzedProgram!:
     if len(package.identity) == 0: error("package identity cannot be empty")
+    if options.generic_specialization_budget <= 0: error("generic specialization budget must be positive")
     let sources = try read_sources(package.source_paths)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
-    let generator = HirGenerator(package.identity, modules, role)
+    let generator = HirGenerator(package.identity, modules, role, options.generic_specialization_budget, os.clock_ms)
     for binding in bindings:
         generator.bind_runtime_service(binding.service, binding.module_name, binding.function_name)
     let hir_program = try generator.generate()
     return try SemanticAnalyzer(hir_program).analyze()
 
 # Analysis through optimized, verified target-neutral MIR.
-func lower_and_verify(package: PackageInput) -> CompiledProgram!:
-    let analyzed_hir = try analyze_sources(package)
+func lower_and_verify(package: PackageInput, options: CompilationOptions) -> CompiledProgram!:
+    let analyzed_hir = try analyze_sources(package, options)
     let canonical_program = try Lowerer(analyzed_hir).lower()
+    let report = bind_lowered_functions(report_generics(analyzed_hir.hir), canonical_program)
+    let optimized = try verify_and_optimize(canonical_program)
     return CompiledProgram(
-        program = try verify_and_optimize(canonical_program),
+        program = optimized.program,
         diagnostics = analyzed_hir.diagnostics,
+        generic_reports = remap_optimized_functions([report], optimized.function_remap),
     )
 
 func combine_diagnostics(first: list[Diagnostic], second: list[Diagnostic]) -> list[Diagnostic]:
@@ -296,11 +347,11 @@ func combine_diagnostics(first: list[Diagnostic], second: list[Diagnostic]) -> l
     for diagnostic in second: combined.append(diagnostic)
     return combined
 
-func verify_and_optimize(canonical_program: MirProgram) -> MirProgram!:
+func verify_and_optimize(canonical_program: MirProgram) -> OptimizationResult!:
     try MirVerifier(canonical_program).verify()
-    let optimized_program = Optimizer(canonical_program).optimize()
-    try MirVerifier(optimized_program).verify()
-    return optimized_program
+    let optimized = Optimizer(canonical_program).optimize()
+    try MirVerifier(optimized.program).verify()
+    return optimized
 
 # mark: Source stages =========================================================================
 

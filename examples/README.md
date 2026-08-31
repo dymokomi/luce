@@ -41,7 +41,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `generic_functions.luc` proves abstract body checking, argument inference,
   explicit structural specialization, contextual generic function values,
   defaults, recursion, and memoized monomorphization through both semantic
-  oracles, Wasm, and native QBE.
+  oracles, Wasm, and native QBE. It is also the compact input used to inspect
+  expansion provenance with `luce explain` and HIR/MIR/backend costs with
+  `luce build --time-report`, including one checked specialization removed by
+  closed-world reachability before backend emission.
 - `generic_methods.luc` proves that an applied receiver fixes its generic-owner
   arguments while independently declared method parameters are inferred or
   supplied explicitly. Owner-dependent constraints, defaults, recursion,

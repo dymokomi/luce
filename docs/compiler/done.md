@@ -20,7 +20,7 @@ Last updated: 2026-08-31 (Stage-0 0.28).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations are fully specialized before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect and interface calls, backend-owned witness descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, and managed-class examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned aggregate/class/interface layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 655 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 659 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -732,8 +732,8 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   checker from absorbing this concern and borrows semantic services without a
   reference cycle. HIR/MIR oracles, Wasm, native QBE, and
   `examples/generic_functions.luc` agree. Generic nominals, conformances, and
-  independently generic methods are recorded in later milestones below;
-  serialized typed bodies and detailed expansion accounting remain.
+  independently generic methods and detailed expansion accounting are
+  recorded in later milestones below; serialized typed bodies remain.
 
 - [x] **Memberwise generic structs** (2026-08-31). One abstract declaration
   schema now produces canonical applied HIR TypeIds with structurally inferred
@@ -861,6 +861,23 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   semantic oracles, native QBE, Wasm, focused lowering checks, and
   `examples/generic_construction.luc` agree.
 
+- [x] **Generic specialization budgets and accounting** (2026-08-31).
+  Every concrete instance retains its declaration, source origin, parent
+  instance, checked HIR-node count, and monotonic checking duration in
+  target-neutral HIR reporting metadata. Re-entering an active template with
+  a fresh type key is diagnosed immediately as infinite structural expansion;
+  the package-wide fallback budget is configurable through the pipeline and
+  raw CLI, and both failures print the complete source call/type path.
+  `luce explain` presents those facts without selecting a backend.
+  `luce build --time-report` carries each concrete function identity through
+  package composition and reachability outside canonical MIR, then joins the
+  surviving identity to backend-owned emission measurements:
+  exact Wasm function-body bytes or QBE IL-function bytes plus translation
+  time. Closed-world-eliminated instances stay visible without invented code
+  sizes. The backends report only `FunctionId`, bytes, and time; generic/source
+  meaning remains outside canonical MIR and the backend boundary. Serialized
+  typed bodies remain with the future package-artifact owner.
+
 - [x] **Interfaces and constrained static generics** (2026-08-31). Interface
   declarations retain nominal, generic requirement identities in HIR; explicit
   struct, class, and enum conformances are validated package-wide after every
@@ -875,8 +892,8 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   still ordinary functions, so HIR/MIR oracles, Wasm, native QBE, and
   `examples/constrained_generics.luc` agree without adding interface or target
   concepts to canonical MIR. Independently generic methods are recorded above
-  and existential values separately below; serialized bodies and detailed
-  expansion accounting remain on the generic side.
+  and existential values separately below; serialized typed bodies remain on
+  the generic/package-artifact boundary.
 
 - [x] **Existential interface values and dynamic witnesses** (2026-08-31).
   Contextual conversion requires one explicit concrete conformance and HIR

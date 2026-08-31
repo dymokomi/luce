@@ -1,0 +1,263 @@
+#==============================================================================================
+#
+#   generic_reporting - Specialization provenance and compiler cost presentation
+#
+#   DESCRIPTION:
+#       Turns target-neutral HIR specialization facts into one product-facing
+#       report. HIR owns declaration/call provenance and checking cost; MIR and
+#       artifact backends enrich the same rows with instruction and code
+#       generation measurements without changing generic semantics.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.backends.emission import FunctionEmission
+from compiler.hir.ir import HirFunction, HirGenericInstance, HirProgram, SymbolId, executable_function_name
+from compiler.mir.canonical import FunctionId, MirProgram
+
+## One concrete specialization, including its complete source expansion path.
+pub struct GenericSpecializationReport:
+    pub let name: str
+    pub let executable_name: str
+    ## Bound after package-local lowering, then remapped out of band through
+    ## composition/reachability. `none` after optimization means eliminated.
+    pub let mir_function: FunctionId?
+    pub let declaration: str
+    pub let origin: str
+    pub let expansion_path: list[str]
+    pub let checked_nodes: u32
+    pub let check_time_ms: i64
+    pub let mir_instructions: u32?
+    pub let backend_code_bytes: u64?
+    pub let codegen_time_ms: i64?
+
+## Package-wide generic specialization accounting.
+pub struct GenericReport:
+    pub let package_identity: str
+    pub let budget: i64
+    pub let specializations: list[GenericSpecializationReport]
+    pub let checked_nodes: u64
+    pub let check_time_ms: i64
+    pub let has_compilation: bool
+    pub let mir_instructions: u64
+    pub let backend_code_bytes: u64
+    pub let codegen_time_ms: i64
+
+    ## Stable plain text used by `luce explain` and build time reports.
+    pub func render() -> str:
+        var text = "generic specializations for `" + self.package_identity + "`: " + str(len(self.specializations)) + "/" + str(self.budget)
+        for item in self.specializations:
+            text = text + "\n" + item.name
+            text = text + "\n  declaration: " + item.declaration
+            text = text + "\n  origin: " + item.origin
+            text = text + "\n  expansion path:"
+            for entry in item.expansion_path: text = text + "\n    " + entry
+            text = text + "\n  HIR: " + str(u64(item.checked_nodes)) + " node(s), " + str(item.check_time_ms) + " ms check"
+            if self.has_compilation:
+                if item.mir_instructions == none:
+                    text = text + "\n  artifact: eliminated before backend emission"
+                else:
+                    text = text + "\n  MIR: " + str(u64(item.mir_instructions else 0)) + " instruction(s)"
+                    text = text + "\n  backend code: " + str(item.backend_code_bytes else 0) + " byte(s), " + str(item.codegen_time_ms else 0) + " ms codegen"
+        text = text + "\ntotal: " + str(self.checked_nodes) + " HIR node(s), " + str(self.check_time_ms) + " ms check"
+        if self.has_compilation:
+            text = text + ", " + str(self.mir_instructions) + " MIR instruction(s), " + str(self.backend_code_bytes) + " backend-code byte(s), " + str(self.codegen_time_ms) + " ms codegen"
+        return text
+
+# mark: HIR accounting =======================================================================
+
+## Build the report once, after HIR generation has closed every concrete body.
+pub func report_generics(program: HirProgram) -> GenericReport:
+    let specializations = list[GenericSpecializationReport]()
+    var checked_nodes: u64 = 0
+    var check_time_ms: i64 = 0
+    for index in range(0, len(program.generic_instances)):
+        let instance = program.generic_instances[index]
+        let generic = program.generic_functions[instance.generic]
+        let function = find_function(program, instance.function)
+        let declaration_module = program.modules[generic.module.value]
+        let origin_module = program.modules[instance.origin_module.value]
+        let path = expansion_path(program, index)
+        specializations.append(GenericSpecializationReport(
+            name = program.symbols[instance.function.value].name,
+            executable_name = executable_function_name(program, function),
+            mir_function = none,
+            declaration = location(declaration_module.path, generic.span),
+            origin = location(origin_module.path, instance.origin_span),
+            expansion_path = path,
+            checked_nodes = instance.checked_nodes,
+            check_time_ms = instance.check_time_ms,
+            mir_instructions = none,
+            backend_code_bytes = none,
+            codegen_time_ms = none,
+        ))
+        checked_nodes += u64(instance.checked_nodes)
+        check_time_ms += instance.check_time_ms
+    return GenericReport(
+        package_identity = program.package_identity,
+        budget = program.generic_specialization_budget,
+        specializations = specializations,
+        checked_nodes = checked_nodes,
+        check_time_ms = check_time_ms,
+        has_compilation = false,
+        mir_instructions = 0,
+        backend_code_bytes = 0,
+        codegen_time_ms = 0,
+    )
+
+# mark: MIR and backend accounting ============================================================
+
+## Bind source specializations to package-local MIR identities before two
+## independently lowered packages can contain the same private diagnostic
+## name. A concrete generic body must lower exactly once in its own package.
+pub func bind_lowered_functions(report: GenericReport, program: MirProgram) -> GenericReport:
+    let specializations = list[GenericSpecializationReport]()
+    for item in report.specializations:
+        let function_index = find_unique_mir_function(program, item.executable_name)
+        if function_index < 0:
+            trap("generic specialization omitted from package-local MIR `" + item.executable_name + "`")
+        specializations.append(with_function(item, FunctionId(value = u32(function_index))))
+    return with_specializations(report, specializations)
+
+## Shift package-local identities by the exact function-table offset used by
+## MIR composition. This side table follows composition without entering MIR.
+pub func offset_functions(report: GenericReport, offset: i64) -> GenericReport:
+    let specializations = list[GenericSpecializationReport]()
+    for item in report.specializations:
+        let function = item.mir_function else trap("generic report was not bound before MIR composition")
+        specializations.append(with_function(item, FunctionId(value = u32(i64(function.value) + offset))))
+    return with_specializations(report, specializations)
+
+## Apply target-neutral reachability's old-to-new function map. Discarded
+## functions deliberately become `none` so reporting never invents code size.
+pub func remap_optimized_functions(reports: list[GenericReport], remap: list[i64]) -> list[GenericReport]:
+    let remapped_reports = list[GenericReport]()
+    for report in reports:
+        let specializations = list[GenericSpecializationReport]()
+        for item in report.specializations:
+            let function = item.mir_function else trap("generic report was not bound before MIR optimization")
+            if i64(function.value) >= len(remap): trap("generic report function lies outside the optimizer remap")
+            let mapped = remap[function.value]
+            var optimized: FunctionId? = none
+            if mapped >= 0: optimized = FunctionId(value = u32(mapped))
+            specializations.append(with_function(item, optimized))
+        remapped_reports.append(with_specializations(report, specializations))
+    return remapped_reports
+
+## Join backend-local measurements to source specialization rows only after
+## optimized MIR and artifact emission exist. Eliminated instances remain in
+## the report with no fabricated code size.
+pub func with_compilation_metrics(reports: list[GenericReport], program: MirProgram, emissions: list[FunctionEmission]) -> list[GenericReport]:
+    let enriched = list[GenericReport]()
+    for report in reports:
+        let specializations = list[GenericSpecializationReport]()
+        var mir_instructions: u64 = 0
+        var backend_code_bytes: u64 = 0
+        var codegen_time_ms: i64 = 0
+        for item in report.specializations:
+            var instruction_count: u32? = none
+            var code_bytes: u64? = none
+            var emission_time: i64? = none
+            let function = item.mir_function
+            if function != none:
+                let function_index = i64(function.value)
+                if function_index >= len(program.functions): trap("generic report function lies outside optimized MIR")
+                instruction_count = u32(len(program.functions[function.value].body))
+                mir_instructions += u64(len(program.functions[function.value].body))
+                for emission in emissions:
+                    if emission.function.value != function.value: continue
+                    code_bytes = emission.code_bytes
+                    emission_time = emission.codegen_time_ms
+                    backend_code_bytes += emission.code_bytes
+                    codegen_time_ms += emission.codegen_time_ms
+                    break
+                if code_bytes == none:
+                    trap("backend emission report omitted MIR function `" + item.executable_name + "`")
+            specializations.append(GenericSpecializationReport(
+                name = item.name,
+                executable_name = item.executable_name,
+                mir_function = item.mir_function,
+                declaration = item.declaration,
+                origin = item.origin,
+                expansion_path = item.expansion_path,
+                checked_nodes = item.checked_nodes,
+                check_time_ms = item.check_time_ms,
+                mir_instructions = instruction_count,
+                backend_code_bytes = code_bytes,
+                codegen_time_ms = emission_time,
+            ))
+        enriched.append(GenericReport(
+            package_identity = report.package_identity,
+            budget = report.budget,
+            specializations = specializations,
+            checked_nodes = report.checked_nodes,
+            check_time_ms = report.check_time_ms,
+            has_compilation = true,
+            mir_instructions = mir_instructions,
+            backend_code_bytes = backend_code_bytes,
+            codegen_time_ms = codegen_time_ms,
+        ))
+    return enriched
+
+# mark: Helpers ===============================================================================
+
+func expansion_path(program: HirProgram, instance_index: i64) -> list[str]:
+    let ancestry = list[i64]()
+    var current = instance_index
+    while current >= 0:
+        ancestry.append(current)
+        let parent = program.generic_instances[current].parent
+        if parent == none: current = -1
+        else: current = i64(parent)
+    let path = list[str]()
+    var index = len(ancestry) - 1
+    while index >= 0:
+        let instance = program.generic_instances[ancestry[index]]
+        let module = program.modules[instance.origin_module.value]
+        path.append(location(module.path, instance.origin_span) + ": " + program.symbols[instance.function.value].name)
+        index -= 1
+    return path
+
+func location(path: str, span: SourceSpan) -> str:
+    return path + ":" + str(i64(span.line)) + ":" + str(i64(span.column))
+
+func find_function(program: HirProgram, symbol: SymbolId) -> HirFunction:
+    for function in program.functions:
+        if function.symbol.value == symbol.value: return function
+    trap("generic specialization names a missing concrete HIR function")
+
+func find_unique_mir_function(program: MirProgram, name: str) -> i64:
+    var found = -1
+    for index in range(0, len(program.functions)):
+        if program.functions[index].name != name: continue
+        if found >= 0: trap("package-local MIR contains duplicate generic function name `" + name + "`")
+        found = index
+    return found
+
+func with_function(item: GenericSpecializationReport, function: FunctionId?) -> GenericSpecializationReport:
+    return GenericSpecializationReport(
+        name = item.name,
+        executable_name = item.executable_name,
+        mir_function = function,
+        declaration = item.declaration,
+        origin = item.origin,
+        expansion_path = item.expansion_path,
+        checked_nodes = item.checked_nodes,
+        check_time_ms = item.check_time_ms,
+        mir_instructions = item.mir_instructions,
+        backend_code_bytes = item.backend_code_bytes,
+        codegen_time_ms = item.codegen_time_ms,
+    )
+
+func with_specializations(report: GenericReport, specializations: list[GenericSpecializationReport]) -> GenericReport:
+    return GenericReport(
+        package_identity = report.package_identity,
+        budget = report.budget,
+        specializations = specializations,
+        checked_nodes = report.checked_nodes,
+        check_time_ms = report.check_time_ms,
+        has_compilation = report.has_compilation,
+        mir_instructions = report.mir_instructions,
+        backend_code_bytes = report.backend_code_bytes,
+        codegen_time_ms = report.codegen_time_ms,
+    )
