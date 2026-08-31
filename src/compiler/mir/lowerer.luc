@@ -696,6 +696,10 @@ pub class Lowerer:
                     try self.lower_prologue_node(module, function, node_at(self.program, elements, position), body)
             List(elements): try self.lower_prologue_run(module, function, elements, body)
             ListCopy(value): try self.lower_prologue_node(module, function, value, body)
+            ListSlice(value, start, end):
+                try self.lower_prologue_node(module, function, value, body)
+                if start.value != no_node: try self.lower_prologue_node(module, function, start, body)
+                if end.value != no_node: try self.lower_prologue_node(module, function, end, body)
             ListAppend(value, element):
                 try self.lower_prologue_node(module, function, value, body)
                 try self.lower_prologue_node(module, function, element, body)
@@ -868,7 +872,7 @@ pub class Lowerer:
                             List(element): element_type = element
                             else: trap("list assignment step has a non-list HIR type")
                         address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
-                        body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = address, value = list_value, index = index), span = span))
+                        body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = index), span = span))
                         place_type = element_type
                     else: trap("place assignment has an unknown step")
                 let value_type = try self.mir_type_of(module, function, span, place_type)
@@ -1183,6 +1187,7 @@ pub class Lowerer:
                 body.append(MirInstruction(form = InstructionForm.MoveElements(destination = to, source = from, element_type = element_type, count = element_count), span = span))
                 return RegisterId(value = no_register)
             ListCopy(value): return try self.lower_list_copy(module, function, expression, value, body)
+            ListSlice(value, start, end): return try self.lower_list_slice(module, function, expression, value, start, end, body)
             ListAppend(value, element): return try self.lower_list_append(module, function, expression, value, element, body)
             ListInsert(value, index, element): return try self.lower_list_insert(module, function, expression, value, index, element, body)
             ListRemoveAt(value, index): return try self.lower_list_remove_at(module, function, expression, value, index, body)
@@ -1193,11 +1198,28 @@ pub class Lowerer:
             Catch(value, failure, catch_body): return try self.lower_catch(module, function, expression, value, failure, catch_body, body)
             else: return try self.lower_typed_expression(module, function, expression, body)
 
+    # mark: Runtime-backed collections =========================================================
+
     func lower_list_copy(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let source = try self.lower_expression(module, function, value, body)
         let result_type = try self.mir_type_of(module, function, node_span(self.program, expression), node_type(self.program, expression))
         let result = self.new_register(result_type)
         body.append(MirInstruction(form = InstructionForm.ListCopy(result = result, value = source), span = node_span(self.program, expression)))
+        return result
+
+    func lower_list_slice(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, start: NodeId, end: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let source = try self.lower_expression(module, function, value, body)
+        var lower = self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), 0, span, body)
+        if start.value != no_node: lower = try self.lower_expression(module, function, start, body)
+        var upper = lower
+        if end.value != no_node: upper = try self.lower_expression(module, function, end, body)
+        else:
+            upper = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+            body.append(MirInstruction(form = InstructionForm.ListLength(result = upper, value = source), span = span))
+        let result_type = try self.mir_type_of(module, function, span, node_type(self.program, expression))
+        let result = self.new_register(result_type)
+        body.append(MirInstruction(form = InstructionForm.ListSlice(result = result, value = source, start = lower, end = upper), span = span))
         return result
 
     func lower_list_append(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, element: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -1428,6 +1450,10 @@ pub class Lowerer:
                     List(element):
                         let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                         body.append(MirInstruction(form = InstructionForm.ListLength(result = length, value = sequence), span = span))
+                        return length
+                    Slice(element):
+                        let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                        body.append(MirInstruction(form = InstructionForm.SliceLength(result = length, value = sequence), span = span))
                         return length
                     else:
                         let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
@@ -1665,11 +1691,47 @@ pub class Lowerer:
     func lower_placed_arguments(module: HirModule, function: HirFunction, called: HirFunction, arguments: Operands, body: list[MirInstruction]) -> list[RegisterId]!:
         let placed = list[RegisterId]()
         for parameter in called.parameters: placed.append(RegisterId(value = no_register))
+        var has_mutating_receiver = false
+        let receiver = called.receiver
+        if receiver != none: has_mutating_receiver = receiver.kind == HirReceiverKind.mutating_method
         for pair in range(0, i64(arguments.count) // 2):
             let parameter_index = entry_at(self.program, arguments, pair * 2)
             let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
-            placed[parameter_index] = try self.lower_expression(module, function, argument, body)
+            if parameter_index == 0 and has_mutating_receiver:
+                placed[parameter_index] = try self.lower_mutable_place_address(module, function, argument, body)
+            else:
+                placed[parameter_index] = try self.lower_expression(module, function, argument, body)
         return placed
+
+    # A mutating value receiver is passed by address. Walking its resolved HIR
+    # place here keeps field/array addressing structural and makes crossing a
+    # list element the one canonical snapshot write barrier. Reference-valued
+    # elements are loaded normally: mutating the referenced identity does not
+    # replace the containing list slot and therefore must not detach it.
+    func lower_mutable_place_address(module: HirModule, function: HirFunction, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, value)
+        match node_form(self.program, value):
+            Reference(symbol): return try self.address_of(module, function, span, symbol)
+            FieldAccess(inner, field):
+                let base = try self.lower_mutable_place_address(module, function, inner, body)
+                let owner_type = try self.mir_type_of(module, function, span, node_type(self.program, inner))
+                return self.field_address(owner_type, base, field, span, body)
+            SequenceIndex(inner, index):
+                let sequence_type = node_type(self.program, inner)
+                match self.program.types.definitions[sequence_type.value].form:
+                    Array(element, count):
+                        let base = try self.lower_mutable_place_address(module, function, inner, body)
+                        let position = try self.lower_expression(module, function, index, body)
+                        let element_type = try self.mir_type_of(module, function, span, element)
+                        return self.checked_element_address(element_type, base, position, count, span, body)
+                    List(element):
+                        let list_value = try self.lower_expression(module, function, inner, body)
+                        let position = try self.lower_expression(module, function, index, body)
+                        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                        body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = position), span = span))
+                        return address
+                    else: error(self.unsupported(module, function, span, "a mutating receiver that is not a resolved mutable place"))
+            else: error(self.unsupported(module, function, span, "a mutating receiver that is not a resolved mutable place"))
 
     # Canonical calling shape for either callable type. Luce values reuse the
     # direct-call hidden result/error protocol; cfunc values use the closed raw
@@ -2425,6 +2487,11 @@ pub class Lowerer:
                 let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = address, value = sequence, index = position), span = span))
                 return self.load_value(element_type, address, span, body)
+            Slice(element):
+                let element_type = try self.mir_type_of(module, function, span, element)
+                let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.SliceElementAddress(result = address, value = sequence, index = position), span = span))
+                return self.load_value(element_type, address, span, body)
             else:
                 let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
                 let length = try self.load_field(sequence_type, sequence, 1, span, body)
@@ -2808,6 +2875,9 @@ pub class Lowerer:
             List(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.List(element = element_type))
+            Slice(element):
+                let element_type = try self.lower_mir_type(element)
+                return self.intern_lowered_type(MirType.Slice(element = element_type))
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
                 # declared target-neutral token representation; ABI placement

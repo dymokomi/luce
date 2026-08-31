@@ -538,6 +538,8 @@ symbol).
 | `Float(bits)` | `f32`, `f64` |
 | `Bool` | one byte, 0 or 1 |
 | `Ptr` | abstract address, untyped; its width is a backend fact |
+| `List(element)` | typed mutable reference collection handle |
+| `Slice(element)` | typed immutable snapshot handle |
 | `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
 | `Array(element, count)` | fixed arrays |
 | `Enum(tag, cases)` | tag is an `Int`; each case is a `Struct` payload |
@@ -545,8 +547,10 @@ symbol).
 
 How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
 unsigned)`; `str` and `bytes` → a `{Ptr, u64}` `Struct` (address and
-length; a literal's bytes are a data item); `list`, `map`, `set` → `Ptr` to
-runtime storage; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
+length; a literal's bytes are a data item); `list[T]` → `List(T)` and
+`slice[T]` → `Slice(T)`, both opaque reference-sized handles whose concrete
+headers are runtime/backend facts; future `map` and `set` handles follow the
+same typed-reference rule; `T?` → a two-case `Enum` with a `u8` tag (a null niche for
 future managed class references is still open, but foreign handles stay
 tagged internally); a scalar `T!` result → a scalar and error pointer, never a
 type;
@@ -703,6 +707,10 @@ ListRemoveAt(value: List(T), index: u64)                 checked shape mutation
 ListClear(value: List(T))
 ListReserve(value: List(T), minimum_capacity: u64)
 ListElementAddress(value: List(T), index: u64) -> r: Ptr checked element address
+ListMutableElementAddress(value: List(T), index: u64) -> r: Ptr checked write barrier
+ListSlice(value: List(T), start: u64, end: u64) -> r: Slice(T) checked O(1) snapshot
+SliceLength(value: Slice(T))             -> r: u64
+SliceElementAddress(value: Slice(T), index: u64) -> r: Ptr checked read-only address
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
 LoadExternalGlobal(ExternalGlobalId)      -> r: type
@@ -781,6 +789,10 @@ ListRemoveAt(List(T), u64)                    backend checks index < length
 ListClear(List(T))
 ListReserve(List(T), u64)                     backend supplies size/alignment
 ListElementAddress(List(T), u64) -> Ptr       backend checks bounds, supplies size
+ListMutableElementAddress(List(T), u64) -> Ptr backend checks bounds, supplies size/alignment; runtime detaches a captured buffer
+ListSlice(List(T), u64, u64) -> Slice(T)      backend checks start <= end <= length and supplies size
+SliceLength(Slice(T)) -> u64
+SliceElementAddress(Slice(T), u64) -> Ptr     backend checks bounds and supplies size
 luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)

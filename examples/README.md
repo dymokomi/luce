@@ -47,10 +47,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases and `let` fields, checked indexed mutation,
   typed list parameters/results, mutating aggregate elements, insertion,
-  removal, clearing, reservation, shallow independent copying, evaluation
-  order, and geometric growth through the HIR and MIR oracles and a real
-  native QBE artifact. Slicing, iteration invalidation, ARC, and reclamation
-  remain explicit later list slices.
+  removal, clearing, reservation, shallow independent copying, O(1) immutable
+  snapshot slicing, evaluation order, and geometric growth through the HIR
+  and MIR oracles and a real native QBE artifact. Iteration invalidation, ARC,
+  and reclamation remain explicit later list slices.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the
@@ -82,7 +82,7 @@ artifacts are never imported.
 The fixed-array slice, Brainfuck gate, and first runtime-backed list slice
 remove allocation-free dense storage, nontrivial byte-driven interpreter
 control flow, and basic growable sequence storage from this map. The remaining
-small and medium programs still need collection iteration/removal, slicing,
+small and medium programs still need collection iteration, maps/sets, bytes slicing,
 text construction, files, and host services. Canonical MIR never manufactures
 target byte sizes or prescribes memory growth; allocator and collection policy
 remain in the runtime rather than HIR, MIR, or the compiler itself.
