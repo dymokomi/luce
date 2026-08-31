@@ -55,6 +55,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   geometric growth through the HIR
   and MIR oracles and a real native QBE artifact. ARC and reclamation remain
   explicit later list slices.
+- `strings.luc` proves escaping owned concatenation, distinct byte/scalar
+  lengths, Unicode scalar iteration, and lexicographic ordering through both
+  compiled backends and the semantic oracles.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the

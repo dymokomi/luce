@@ -14,13 +14,13 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`) | Functions, direct calls, exact named `func`/`cfunc` values and shared indirect calls, parameter defaults, locals, assignment, all scalar types, `str`/`bytes`/`char` literals, `bytes.length`, checked indexing, concatenation, lexicographic comparison, ownership-safe byte slicing, `str.byte_count`, fixed value arrays with contextual literals/copies/equality/length/checked access, reference lists with literals/construction, identity, `length`, checked get/set, `append`, `insert`, `remove_at`, `clear`, `reserve`, shallow independent `copy` and `+` concatenation, immutable snapshot slicing, ordered alias-invalidating iteration, and aggregate element mutation, mixed field/element assignment places, tuples, optionals with `else`, conditional binding, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access, `match` (statement and expression, exhaustive), restricted module constants, type aliases, direct scalar `extern func`/`export c func`, ordered C `out` results, nominal integer- and pointer-represented extern handles, observable scalar `extern var` state, explicit sealed-runtime service identities, module state and arena access, and non-transitive `.native.luc` authority with typed non-exportable native pointers and typed load/store/advance/rebind/move/allocation/deallocation, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closure environments and infallible-function lifting, interfaces, generics, executable `try for`, maps/sets, formatted strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`) | Functions, direct calls, exact named `func`/`cfunc` values and shared indirect calls, parameter defaults, locals, assignment, all scalar types, checked integer construction, `str`/`bytes`/`char` literals, owned string/byte concatenation and ordering, Unicode scalar string length/iteration, `bytes.length`, checked indexing, ownership-safe byte slicing, `str.byte_count`, fixed value arrays with contextual literals/copies/equality/length/checked access, reference lists with literals/construction, identity, `length`, checked get/set, `append`, `insert`, `remove_at`, `clear`, `reserve`, shallow independent `copy` and `+` concatenation, immutable snapshot slicing, ordered alias-invalidating iteration, and aggregate element mutation, mixed field/element assignment places, tuples, optionals with `else`, conditional binding, integer ranges and `for`, lexical `defer`, `ErrorCode`/`Error` with `try`/`catch`, structs and enums with custom initialization, methods/`mutating`/type functions, field access, `match` (statement and expression, exhaustive), restricted module constants, type aliases, direct scalar `extern func`/`export c func`, ordered C `out` results, nominal integer- and pointer-represented extern handles, observable scalar `extern var` state, explicit sealed-runtime service identities, module state and arena access, and non-transitive `.native.luc` authority with typed non-exportable native pointers and typed load/store/advance/rebind/move/allocation/deallocation, `if`/`elif`/`else`, `while`, `break`/`continue`, `return`, `print` of a literal or `str` value; documentation and defaults retained. **Not yet**: classes, closure environments and infallible-function lifting, interfaces, generics, executable `try for`, maps/sets, formatted strings, floating-point construction, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation plus isolated sealed-runtime global state. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`); verifier (`mir/verifier.luc`) proves every rule; target-neutral reachability removes unreachable closed-world functions and their resources before backends; MIR interpreter (`backends/mir_interpreter.luc`) executes every instruction under explicit backend layout rules. |
-| Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, direct and exact Luce/C indirect calls, constants, tuples, fixed arrays, typed reference lists including shallow concatenation, optionals, borrowed `str` and owner-backed `bytes` values with concatenation/comparison/escaping slices, structural equality, lengths and checked sequence indexing, integer ranges and `for`, lexical `defer`, recursive collection/byte ownership on every value transfer and exit, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, mixed aggregate/reference places, direct scalar C imports/exports and external variables, exact sealed-runtime bindings, globals and arena service, typed native operations, nominal handle erasure, pointer/null and output-slot boundary adapters, demand-generated cfunc adapters, and shared C-export wrappers, `print` of a value. |
+| Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates: scalars and checked integer construction, locals, control flow, direct and exact Luce/C indirect calls, constants, tuples, fixed arrays, typed reference lists including shallow concatenation, optionals, owner-backed `str`/`bytes` values with concatenation/comparison, Unicode scalar string length/iteration, and escaping byte slices, structural equality, lengths and checked sequence indexing, integer ranges and `for`, lexical `defer`, recursive collection/buffer ownership on every value transfer and exit, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, mixed aggregate/reference places, direct scalar C imports/exports and external variables, exact sealed-runtime bindings, globals and arena service, typed native operations, nominal handle erasure, pointer/null and output-slot boundary adapters, demand-generated cfunc adapters, and shared C-export wrappers, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect calls, WASI preview 1, C imports/globals, backend-laid-out internal globals, exports, shadow stack, aggregate copies, overflow-checked typed moves, backend-local legalization of typed list handles and ownership callbacks, and an on-demand stable arena above the shadow stack. The complete reclaiming list runtime and source example execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, direct/indirect calls, memory and typed overlapping moves, internal globals, a stable guarded runtime arena, the compiled reclaiming Luce allocator and ownership-complete list/slice runtime, aggregate operations, QBE C ABI extension types, exact C function/object symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 527 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 533 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -109,7 +109,7 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 - [x] **The first adopted Stage-0 program is a native QBE execution gate**
   (2026-08-30). Core byte access uses two explicit HIR nodes for sequence
   length and checked indexing; lowering reads the existing structural
-  `{Ptr, u64}` representation, compares a `u64` index, and reaches the byte
+  `{BufferOwner, Ptr, u64}` representation, compares a `u64` index, and reaches the byte
   through `ElementAddress` with an explicit trap arm. No byte offset or target
   fact entered HIR/MIR, and `str` integer indexing remains deliberately
   rejected. The calculator was adapted to scan UTF-8 `bytes`, typed errors and
@@ -193,6 +193,14 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   input immutability, service identity, external interning and sealed-boundary
   diagnostics. Production runtime source and its freestanding analysis are
   still pending.
+- [x] **CLI runtime composition is explicit and location-only** (2026-08-31).
+  Repeated `luce build --runtime FILE` inputs name the reviewed sealed runtime
+  sources; the compiler-owned descriptor still fixes every permitted service,
+  module, and function identity. Both product backends consume the same
+  composed, verified, optimized MIR, and reachability removes unused runtime
+  services. The CLI does not embed a checkout path, environment convention,
+  or platform lookup. Automatic installed-resource discovery remains a host
+  capability/package-layout task, not compiler semantics.
 - [x] **Native authority is source metadata, not a second language mode**
   (2026-08-30). The package reader marks `.native.luc` before parsing and
   keeps its ordinary module name; `SourceModule` and `HirModule` carry the
@@ -348,7 +356,7 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   aggregate mutation, both semantic oracles, Wasm legalization, and real QBE
   execution are covered. Byte-backed slices are recorded separately below.
 - [x] **Immutable bytes own dynamic storage without burdening literals**
-  (2026-08-30). Canonical bytes are `{ByteOwner, Ptr, u64}`: static literals
+  (2026-08-30). Canonical bytes are `{BufferOwner, Ptr, u64}`: static literals
   carry a null inert owner, while `+` allocates one immutable sealed-runtime
   buffer and ordinary structural ownership retains/releases its opaque handle.
   `bytes` comparisons are unsigned lexicographic operations. Half-open slices
@@ -360,6 +368,24 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   dynamic, prefix-ordering, reversed/past-end, and escaping-owner cases agree
   through HIR, MIR, QBE, and Wasm. `examples/bytes.luc` is the executable
   conformance example.
+- [x] **Strings own dynamic UTF-8 storage and expose scalar semantics**
+  (2026-08-31). `str` and `bytes` share the target-neutral
+  `{BufferOwner, Ptr, u64 byte_length}` storage protocol without sharing HIR
+  operations. Literals retain an inert owner; concatenation allocates once,
+  and an owned result can cross calls and aggregate lifetimes. `byte_count`
+  remains O(1), while `length()` and `for character in text` decode valid
+  UTF-8 into Unicode scalar values. Exact equality, scalar-preserving UTF-8
+  lexicographic ordering, prefix ordering, no integer indexing/slicing, and
+  continuation/break behavior have positive and negative HIR evidence,
+  malformed MIR evidence, both semantic oracles, and real QBE and Wasm
+  execution. `examples/strings.luc` is the product conformance example.
+- [x] **Explicit integer construction is checked end to end** (2026-08-31).
+  `Destination(value)` for every implemented integer source/destination pair
+  is one `IntegerConvert` HIR node. MIR compares against the destination
+  interval before narrowing or changing signedness, then uses canonical
+  `extend`, `wrap`, or equal-width `int_reinterpret`; out-of-range values trap
+  consistently through the oracles, QBE, and Wasm. Floating-point conversion
+  constructors remain a separate open §7.5 slice.
 - [x] **WebAssembly module planning has one backend-local owner**
   (2026-08-30). `backends/wasm_plan.luc` now settles Wasm signatures,
   imports, function/table indices, 32-bit type layout, and aligned static

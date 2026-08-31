@@ -41,6 +41,13 @@ function through the HIR interpreter, or build an artifact:
 The package identity is explicit because it is embedded in stable `ErrorCode`
 values. It must remain the same when the source tree moves.
 
+Features backed by the reviewed Luce runtime pass its source explicitly; the
+compiler owns the sealed service manifest, so callers provide locations only:
+
+```sh
+./build/luce build --package org.luce.examples --runtime src/runtime/allocator.native.luc build/strings.wasm examples/strings.luc
+```
+
 Native output uses the pinned QBE toolchain for the current host:
 
 ```sh

@@ -20,7 +20,10 @@ from luce.compiler.hir.ir import ModuleAuthority, PackageRole, TypeForm, Value
 from luce.compiler.hir.generator import HirGenerator
 from luce.compiler.hir.generation_model import SourceModule
 from luce.compiler.mir.lowerer import Lowerer
+from luce.compiler.mir.composer import compose_runtime
 from luce.compiler.mir.verifier import MirVerifier
+from luce.compiler.pipeline import compile_runtime
+from luce.compiler.runtime_package import sealed_runtime_package
 from luce.compiler.runtime_contract import RuntimeService
 from luce.compiler.frontend.parser import Parser
 from luce.compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
@@ -263,9 +266,35 @@ pub func test_runtime_globals_are_zero_initialized_and_persistent_in_both_oracle
 pub func lowered(source: str) -> MirProgram:
     let program = Lowerer(checked(source)).lower() catch reason:
         trap(reason)
-    MirVerifier(program).verify() catch reason:
-        trap(reason)
+    verify_application(program)
     return program
+
+# Application MIR intentionally precedes sealed-runtime composition. Verify
+# its original inspectable shape directly when self-contained, or verify the
+# composed product when immutable-buffer ownership needs runtime identities.
+func verify_application(program: MirProgram):
+    var needs_runtime = false
+    for function in program.functions:
+        for instruction in function.body:
+            match instruction.form:
+                BufferRetain(value): needs_runtime = true
+                BufferRelease(value): needs_runtime = true
+                BufferConcat(result, left_data, left_length, right_data, right_length): needs_runtime = true
+                BufferData(result, owner): needs_runtime = true
+                StringScalarCount(result, data, length): needs_runtime = true
+                StringDecode(character, width, data, length, offset): needs_runtime = true
+                BytesSlice(result, owner, data, length, start, end): needs_runtime = true
+                else: pass
+    if not needs_runtime:
+        MirVerifier(program).verify() catch reason:
+            trap(reason)
+        return
+    let runtime = compile_runtime(sealed_runtime_package(["src/runtime/allocator.native.luc"])) catch reason:
+        trap(reason)
+    let product = compose_runtime(program, runtime) catch reason:
+        trap(reason)
+    MirVerifier(product).verify() catch reason:
+        trap(reason)
 
 # Return one lowering diagnostic, or an empty string when the fixture lowers.
 pub func lowering_failure(source: str) -> str:
@@ -303,8 +332,7 @@ pub func agree_modules(modules: list[SourceModule]) -> str:
         trap(reason)
     let mir = Lowerer(program).lower() catch reason:
         trap(reason)
-    MirVerifier(mir).verify() catch reason:
-        trap(reason)
+    verify_application(mir)
     let results = MirInterpreter(mir, interpreter_layout()).run("main.answer", list[MirValue]()) catch reason:
         trap(reason)
     assert(oracle.render() == render_mir(results))
@@ -879,7 +907,7 @@ pub func test_slice_parameters_and_results_are_canonical_reference_handles():
     assert(len(function.signature.parameters) == 1)
     assert(len(function.signature.results) == 1)
     assert(function.signature.parameters[0].value == function.signature.results[0].value)
-    assert(describe_mir_type(program.types, function.signature.parameters[0]) == "slice[{ptr, u64}]")
+    assert(describe_mir_type(program.types, function.signature.parameters[0]) == "slice[{buffer-owner, ptr, u64}]")
     assert(len(function.slots) == 0)
     assert(len(function.registers) == 1)
     match function.body[1].form:
@@ -1419,9 +1447,49 @@ pub func test_optionals_are_structural_tagged_enums():
             assert(len(cases) == 2)
         else: assert(false)
 
+pub func test_checked_integer_construction_lowers_to_guards_then_conversion():
+    let widening = lowered("pub func answer() -> u64:\n    let value: u8 = 42u8\n    return u64(value)\n")
+    let wide_function = widening.functions[find_mir_function(widening, "main.answer")]
+    var saw_extend = false
+    for instruction in wide_function.body:
+        match instruction.form:
+            Convert(result, operation, operand):
+                match operation:
+                    extend: saw_extend = true
+                    else: pass
+            else: pass
+    assert(saw_extend)
+    assert(agree("pub func answer() -> u64:\n    let value: u8 = 42u8\n    return u64(value)\n") == "42")
+
+    let narrowing = lowered("pub func answer() -> u8:\n    let value: u16 = 42u16\n    return u8(value)\n")
+    let narrow_function = narrowing.functions[find_mir_function(narrowing, "main.answer")]
+    var saw_guard = false
+    var saw_wrap = false
+    for instruction in narrow_function.body:
+        match instruction.form:
+            Trap(reason): saw_guard = true
+            Convert(result, operation, operand):
+                match operation:
+                    wrap: saw_wrap = true
+                    else: pass
+            else: pass
+    assert(saw_guard and saw_wrap)
+
+    let reinterpreted = lowered("pub func answer() -> u8:\n    let value: i8 = 42i8\n    return u8(value)\n")
+    let reinterpret_function = reinterpreted.functions[find_mir_function(reinterpreted, "main.answer")]
+    var saw_reinterpret = false
+    for instruction in reinterpret_function.body:
+        match instruction.form:
+            Convert(result, operation, operand):
+                match operation:
+                    int_reinterpret: saw_reinterpret = true
+                    else: pass
+            else: pass
+    assert(saw_reinterpret)
+
 pub func test_strings_are_pointer_and_length_from_a_data_item():
     let program = lowered("pub func answer() -> i64:\n    let s = \"abc\"\n    print(s)\n    return 0\n")
-    let function = only_function(program)
+    let function = program.functions[find_mir_function(program, "main.answer")]
     assert(len(program.data) == 2)
     assert(len(program.data[0].bytes) == 3)
     assert(len(program.data[1].bytes) == 1)
@@ -1433,20 +1501,39 @@ pub func test_strings_are_pointer_and_length_from_a_data_item():
     assert(writes == 2)
     match program.types.definitions[i64(function.slots[0].value_type.value)]:
         Struct(fields):
-            assert(len(fields) == 2)
-            assert(is_type(fields[0].value_type, BuiltinMirType.pointer))
-            assert(is_type(fields[1].value_type, BuiltinMirType.unsigned_u64))
+            assert(len(fields) == 3)
+            assert(is_type(fields[0].value_type, BuiltinMirType.buffer_owner))
+            assert(is_type(fields[1].value_type, BuiltinMirType.pointer))
+            assert(is_type(fields[2].value_type, BuiltinMirType.unsigned_u64))
         else: assert(false)
 
 pub func test_string_mir_contains_structure_but_no_target_layout():
     let source = "pub func answer() -> i64:\n    let s = \"abc\"\n    return 0\n"
     let program = lowered(source)
-    match program.types.definitions[i64(only_function(program).slots[0].value_type.value)]:
+    let function = program.functions[find_mir_function(program, "main.answer")]
+    match program.types.definitions[i64(function.slots[0].value_type.value)]:
         Struct(fields):
-            assert(len(fields) == 2)
-            assert(is_type(fields[0].value_type, BuiltinMirType.pointer))
-            assert(is_type(fields[1].value_type, BuiltinMirType.unsigned_u64))
+            assert(len(fields) == 3)
+            assert(is_type(fields[0].value_type, BuiltinMirType.buffer_owner))
+            assert(is_type(fields[1].value_type, BuiltinMirType.pointer))
+            assert(is_type(fields[2].value_type, BuiltinMirType.unsigned_u64))
         else: assert(false)
+
+pub func test_string_operations_keep_owned_bytes_and_unicode_semantics_explicit():
+    let source = "func joined(left: str, right: str) -> str: return left + right\npub func answer() -> u64:\n    let text = joined(\"a\", \"λ😀\")\n    var count = text.length()\n    for character in text:\n        if character == 'λ': count += 10u64\n    return count\n"
+    let program = lowered(source)
+    var saw_concat = false
+    var saw_count = false
+    var saw_decode = false
+    for function in program.functions:
+        for instruction in function.body:
+            match instruction.form:
+                BufferConcat(result, left_data, left_length, right_data, right_length): saw_concat = true
+                StringScalarCount(result, data, length): saw_count = true
+                StringDecode(character, width, data, length, offset): saw_decode = true
+                else: pass
+    assert(saw_concat and saw_count and saw_decode)
+    assert(agree(source) == "13")
 
 pub func test_bytes_index_lowers_to_structural_bounds_check_and_element_address():
     # Runtime composition happens after application lowering. Inspect this

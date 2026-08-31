@@ -437,11 +437,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   (`done.md` §2). One compiler-owned sealed-runtime descriptor now maps the
   closed service vocabulary to source identities; callers supply only the
   resource location, so tests and future installations cannot drift into
-  separate manifests. Product CLI discovery of that resource awaits a
-  Stage-0 host `std.os.executable_path()` capability rather than embedding a
+  separate manifests. The CLI accepts repeated explicit `--runtime FILE`
+  inputs and composes that reviewed package before either backend. Automatic
+  discovery in an installed toolchain still awaits a Stage-0 host
+  `std.os.executable_path()` capability rather than embedding a
   checkout-relative path, environment convention, or platform syscall in the
-  compiler. This does not block explicit composition or semantic work.
-  `write`, `trap`, and the remaining string primitives remain.
+  compiler.
+  `write`, `trap`, and future builder/codec primitives remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
@@ -455,12 +457,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   managed element destruction, and reclamation through QBE and Wasm
   (`done.md` §2). Immutable `bytes` concatenation, lexicographic comparison,
   and ownership-retaining `slice[u8]` views are complete through both semantic
-  oracles, QBE, and Wasm (`done.md` §2). Continue with maps, sets, text/bytes
+  oracles, QBE, and Wasm (`done.md` §2). Immutable `str` now shares that owned
+  buffer substrate; escaping concatenation, scalar length and iteration, and
+  deterministic scalar ordering are complete through the same gates. Continue
+  with maps, sets, text/bytes
   builders, and formatted strings. Structural list equality also waits for a cycle-aware comparison
   context: recursive value/list graphs are already constructible, so an
   acyclic inline element loop would be an incorrect partial implementation.
   The bytes implementation follows §12.6 for both static and dynamic sources:
-  `{ByteOwner, data, length}` keeps literal owners inert and dynamic owners
+  `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners
   retainable without exposing runtime layout. Do not promote the broad §12
   row until every operation has its own conformance
   evidence.

@@ -559,7 +559,7 @@ symbol).
 | `Float(bits)` | `f32`, `f64` |
 | `Bool` | one byte, 0 or 1 |
 | `Ptr` | abstract address, untyped; its width is a backend fact |
-| `ByteOwner` | opaque immutable-byte storage owner; pointer-shaped only after backend legalization |
+| `BufferOwner` | opaque immutable string/byte storage owner; pointer-shaped only after backend legalization |
 | `List(element)` | typed mutable reference collection handle |
 | `Slice(element)` | typed immutable snapshot handle |
 | `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
@@ -568,9 +568,11 @@ symbol).
 | `Func(signature)` | what a function pointer points at |
 
 How language types map onto them: `bool` → `Bool`; `char` → `Int(32,
-unsigned)`; `str` → a borrowed `{Ptr, u64}` `Struct`; `bytes` → an owning
-`{ByteOwner, Ptr, u64}` `Struct`. A literal's payload is a data item with an
-inert null owner, while a dynamic value names sealed-runtime storage.
+unsigned)`; both `str` and `bytes` → an owning
+`{BufferOwner, Ptr, u64 byte_length}` `Struct`. A literal's payload is a data
+item with an inert null owner, while a dynamic value names sealed-runtime
+storage. HIR retains the language distinction; semantic string and byte MIR
+operations do not reinterpret one as the other.
 `list[T]` → `List(T)` and
 `slice[T]` → `Slice(T)`, both opaque reference-sized handles whose concrete
 headers are runtime/backend facts; future `map` and `set` handles follow the
@@ -704,7 +706,8 @@ ShiftLeft ShiftRight           ints; trap on out-of-range count; signed right sh
 Eq Ne                          ints, floats, Bool, Ptr
 Lt Le Gt Ge                    ints, floats
 BoolNot                        Bool
-Extend(r, to)  Wrap(r, to)     integer width changes; Wrap is emitted only where the language allows truncation
+Extend(r, to)  Wrap(r, to)     integer width changes; checked construction guards before Wrap
+IntReinterpret(r, to)          equal-width signedness change after representability guards
 IntToFloat  FloatToInt         explicit; FloatToInt traps out of range
 ```
 
@@ -736,11 +739,13 @@ ListReserve(value: List(T), minimum_capacity: u64)
 ListElementAddress(value: List(T), index: u64) -> r: Ptr checked element address
 ListMutableElementAddress(value: List(T), index: u64) -> r: Ptr checked write barrier
 ListSlice(value: List(T), start: u64, end: u64) -> r: Slice(T) checked O(1) snapshot
-BytesRetain(value: ByteOwner)
-BytesRelease(value: ByteOwner)
-BytesConcat(left_data: Ptr, left_length: u64, right_data: Ptr, right_length: u64) -> r: ByteOwner
-BytesData(owner: ByteOwner)                 -> r: Ptr
-BytesSlice(owner: ByteOwner, data: Ptr, length: u64, start: u64, end: u64) -> r: Slice(u8)
+BufferRetain(value: BufferOwner)
+BufferRelease(value: BufferOwner)
+BufferConcat(left_data: Ptr, left_length: u64, right_data: Ptr, right_length: u64) -> r: BufferOwner
+BufferData(owner: BufferOwner)                 -> r: Ptr
+StringScalarCount(data: Ptr, byte_length: u64) -> r: u64
+StringDecode(data: Ptr, byte_length: u64, offset: u64) -> character: u32, width: u64
+BytesSlice(owner: BufferOwner, data: Ptr, length: u64, start: u64, end: u64) -> r: Slice(u8)
 SliceLength(value: Slice(T))             -> r: u64
 SliceElementAddress(value: Slice(T), index: u64) -> r: Ptr checked read-only address
 DataAddress(DataId)                       -> r: Ptr
@@ -828,10 +833,12 @@ ListReserve(List(T), u64)                     backend supplies size/alignment
 ListElementAddress(List(T), u64) -> Ptr       backend checks bounds, supplies size
 ListMutableElementAddress(List(T), u64) -> Ptr backend checks bounds, supplies size/alignment; runtime detaches a captured buffer
 ListSlice(List(T), u64, u64) -> Slice(T)      backend checks start <= end <= length and supplies size
-BytesRetain(ByteOwner) / BytesRelease(ByteOwner)
-BytesConcat(Ptr, u64, Ptr, u64) -> ByteOwner
-BytesData(ByteOwner) -> Ptr
-BytesSlice(ByteOwner, Ptr, u64, u64, u64) -> Slice(u8)  backend checks start <= end <= length
+BufferRetain(BufferOwner) / BufferRelease(BufferOwner)
+BufferConcat(Ptr, u64, Ptr, u64) -> BufferOwner
+BufferData(BufferOwner) -> Ptr
+StringScalarCount(Ptr, u64) -> u64
+StringDecode(Ptr, u64, u64) -> (u32 scalar, u64 byte_width)
+BytesSlice(BufferOwner, Ptr, u64, u64, u64) -> Slice(u8)  backend checks start <= end <= length
 SliceLength(Slice(T)) -> u64
 SliceElementAddress(Slice(T), u64) -> Ptr     backend checks bounds and supplies size
 list_iteration_active(List(T)) -> bool        backend guards every shape mutation

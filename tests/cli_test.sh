@@ -47,6 +47,7 @@ expect 2 "expected \`--package ID\`" "$cli" check
 expect 2 "check: expected at least one FILE" "$cli" check --package org.luce.tests
 expect 2 "run: entry must be MODULE.FUNCTION" "$cli" run --package org.luce.tests main "$test_dir/main.luc"
 expect 2 "build: unknown target" "$cli" build --package org.luce.tests --target z80 out "$test_dir/main.luc"
+expect 2 "build: --runtime expects a source path" "$cli" build --package org.luce.tests --runtime
 
 expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests "$test_dir/main.luc"
 expect 1 "cannot read" "$cli" check --package org.luce.tests "$test_dir/missing.luc"
@@ -57,6 +58,7 @@ expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luc
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests other.main "$test_dir/main.luc"
 
 expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests "$test_dir/out.wasm" examples/compiled_core/main.luc
+expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --runtime src/runtime/allocator.native.luc "$test_dir/strings.wasm" examples/strings.luc
 expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --target native "$test_dir/out" examples/compiled_core/main.luc
 
 expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --target native "$test_dir/native" examples/hello.luc
