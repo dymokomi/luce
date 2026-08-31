@@ -5,7 +5,8 @@ example is parser-checked; `semantic_core/` also passes through HIR
 generation and the interpreter, and `compiled_core/` and `hello.luc` compile
 to artifacts. "What works today" in the [top-level README](../README.md)
 defines those slices; each example's leading comment names the slice it
-belongs to.
+belongs to. [`FEATURES.md`](FEATURES.md) is the authoritative conformance
+ledger: parser coverage alone never counts as source-to-QBE completion.
 
 - `hello.luc` is the smallest native executable; it also builds as WebAssembly.
 - `semantic_core/` is the small multi-module function-and-control-flow slice
@@ -43,6 +44,10 @@ belongs to.
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
   same example. Dynamic and nullable pointers arriving from C remain later
   boundary work.
+- `native_interop.native.luc` is the focused parser-conformance example for
+  raw `extern` types, blocking functions, output parameters, variables, and
+  structs. Implemented boundary pieces have separate executable tests; the
+  whole example advances only with FIIR and richer C layout support.
 
 ## Stage-0 example corpus as a progress gate
 
@@ -76,9 +81,9 @@ settled: canonical MIR cannot manufacture target byte sizes or prescribe
 WebAssembly linear-memory growth. Allocator policy does not belong in HIR,
 MIR, or the compiler itself.
 
-`FEATURES.md` maps the complete parser-supported 1.0 source surface to
-these files. Payload enums are Luce's tagged unions; there is intentionally no
-second `union` declaration.
+`FEATURES.md` maps the complete 1.0 contract to frontend, HIR, MIR, QBE, and
+example evidence. Payload enums are Luce's tagged unions; there is
+intentionally no second `union` declaration.
 
 Declarations without `pub` are intentionally module-private. Build the
 1.0 compiler, then exercise the semantic slice or all parser fixtures:

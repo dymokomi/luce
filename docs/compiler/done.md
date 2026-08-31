@@ -20,7 +20,7 @@ Last updated: 2026-08-30 (Stage-0 0.28).
 | Lowerer (`mir/lowerer.luc`) | Everything HIR generates: scalars and locals, control flow, direct and exact Luce/C indirect calls, constants, tuples, fixed arrays, optionals, `str`/`bytes` values, structural equality, lengths and checked sequence indexing, integer ranges and `for`, lexical `defer`, caller-owned failure propagation and recovery, structs, enums, `match`, methods, `mutating`, mixed aggregate places, direct scalar C imports/exports and external variables, sealed-runtime globals, typed native operations, nominal handle erasure, pointer/null and output-slot boundary adapters, demand-generated cfunc adapters, and shared C-export wrappers, `print` of a value. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect calls, WASI preview 1, C imports/globals, backend-laid-out internal globals, exports, shadow stack and aggregate copies. It is not the stage-1 portability boundary and does not gate future QBE-complete language slices. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned 64-bit layout, structured-control flattening, checked arithmetic, direct/indirect calls, memory, internal globals and aggregate operations, QBE C ABI extension types, exact C function/object symbols, and a private caller-owned fallible-result ABI. The product path streams IL and assembly through memory, links in secure same-directory scratch, and atomically installs the executable. The complete differential corpus uses this path. |
-| Tests | 478 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 480 unit tests across 15 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -222,6 +222,17 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   additionally lays globals out after data in linear memory, copies explicit
   initializers into disjoint cells, and sizes its static memory from the same
   backend-owned layout. No platform fact enters frontend, HIR or MIR.
+- [x] **The 1.0 completion claim has an explicit conformance ledger**
+  (2026-08-30). `examples/FEATURES.md` now separates frontend syntax, HIR
+  semantics, canonical MIR, real QBE artifacts and human-readable examples,
+  and records the first missing stage instead of treating parser coverage as
+  implementation. One automated example inventory exercises all 42 reserved
+  words and the seven contextual grammar words in parser-valid modules;
+  another rejects every reserved word at the shared identifier boundary. A
+  focused native example adds the previously absent `extern`, `blocking` and
+  `out` surface. Broad partial rows must split into named positive/negative
+  rules before they can close, and complete stage 1 requires every executable
+  1.0 capability to run through QBE with checked observable behavior.
 - [x] **Exact ordinary function values reuse the canonical callable model**
   (2026-08-30). A named, capture-free Luce declaration has an exact `func`
   type and explicit `FunctionAddress` HIR form; calls through values are
