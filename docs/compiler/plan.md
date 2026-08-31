@@ -366,6 +366,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   QBE lays out and mutates the same program successfully. Wasm also places
   cells after immutable data in linear memory as a supporting regression,
   without leaking an offset or pointer width before its backend plan.
+- [x] **Give the sealed runtime one stable arena capability** (2026-08-30).
+  `native.arena(end)` requires both native module authority and the explicit
+  runtime package role. Its HIR result retains `native_mut_ptr[u8]`; shared
+  lowering emits one verified `(u64) -> Ptr` runtime-convention call, with no
+  capacity, page, pointer width or host API in canonical MIR. The MIR oracle
+  supplies a deterministic fixed test arena. QBE alone reserves a 64 MiB
+  zero-filled BSS region, guards the requested prefix and returns its stable
+  base; repeated calls observe the same storage and over-capacity terminates.
+  A fully precommitted BSS reservation satisfies the monotonic-prefix
+  contract while allowing the host loader to commit pages lazily. Wasm is not
+  required for this QBE-complete slice and may later legalize the same service
+  with memory growth.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only

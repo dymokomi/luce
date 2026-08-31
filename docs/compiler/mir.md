@@ -334,7 +334,16 @@ meaning: `native.load` becomes typed `Load`, `native.store` becomes typed
 `Store`, and element-count `native.advance` becomes `ElementAddress`. The HIR
 checker proves address mutability before that erasure. No native-operation
 symbol, byte offset or second memory instruction family survives into MIR;
-typed bulk copy and the sealed arena capability will extend this same rule.
+typed bulk copy will extend this same rule.
+
+The sealed arena adds no memory-layout instruction. HIR admits
+`native.arena(end)` only for a native module in the runtime package and lowers
+it to the verified runtime-convention service `(u64) -> Ptr`. Canonical MIR
+therefore records only a stable-base/prefix request. The MIR oracle chooses a
+small deterministic capacity; QBE reserves backend-owned zero-filled storage
+and guards the requested end. A future Wasm implementation may grow linear
+memory. Capacity, page size, reservation API and commit granularity never
+appear before a backend.
 
 Retain and release calls are placed by the lowerer using the ownership facts
 that `SemanticAnalyzer` will attach to HIR (§11.3). Until that analysis
