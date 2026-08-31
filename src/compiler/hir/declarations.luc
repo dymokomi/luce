@@ -1,0 +1,1098 @@
+#==============================================================================================
+#
+#   declarations - Program-wide source declaration collection
+#
+#   DESCRIPTION:
+#       Registers module names, imports, aliases, constants, globals, callable
+#       signatures, nominal types, and sealed-runtime bindings before any
+#       function body is checked. Every identity is written into the one
+#       HirGenerationState shared with body checking. Only constant default
+#       expressions cross that boundary, through DeclarationValueChecker.
+#
+#==============================================================================================
+
+from compiler.core_types import is_core_type_name
+from compiler.frontend.source import SourceSpan
+from compiler.frontend.syntax import ConstantSyntax, EnumSyntax, ExternFunctionSyntax, ExternTypeSyntax, ExternVariableSyntax, FunctionSyntax, NominalTypeKind, NominalTypeSyntax
+from compiler.frontend.syntax import RuntimeGlobalSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
+from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirEnumCase, HirExternRepresentation, HirField, HirParameter, HirPayloadField, HirReceiver, HirReceiverKind
+from compiler.hir.ir import HirRuntimeBinding, ModuleAuthority, NodeId, PackageRole, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import is_floating_type, is_integer_type, resolve_builtin_type, types_match
+from compiler.hir.generation_model import CollectedAlias, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource
+from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, DeclarationValueChecker, FunctionSymbol, HirGenerationState, ImportedModule
+from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, RuntimeBindingRequest, builtin_type_id
+from compiler.runtime_contract import RuntimeService
+
+## Collects every program-wide source identity into one generation transaction.
+pub class DeclarationCollector:
+    let state: HirGenerationState
+
+    pub init(state: HirGenerationState):
+        self.state = state
+
+    # mark: Runtime binding validation ==========================================================
+    pub func resolve_runtime_bindings() -> list[HirRuntimeBinding]!:
+        let bindings = list[HirRuntimeBinding]()
+        if len(self.state.runtime_binding_requests) > 0 and self.state.package_role != PackageRole.sealed_runtime:
+            error("runtime service bindings require the sealed runtime package role")
+        for request in self.state.runtime_binding_requests:
+            for existing in bindings:
+                if existing.service == request.service:
+                    error("duplicate runtime binding for `" + str(request.service) + "`")
+            let module_index = self.state.find_source(request.module_name)
+            if module_index < 0:
+                error("runtime binding `" + str(request.service) + "` names missing module `" + request.module_name + "`")
+            let function_index = self.state.find_function_in_module(module_index, request.function_name)
+            if function_index < 0:
+                error("runtime binding `" + str(request.service) + "` names missing function `" + request.module_name + "." + request.function_name + "`")
+            let function = self.state.functions[function_index]
+            if function.is_public or self.state.sources[module_index].authority != ModuleAuthority.native:
+                try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must name a private native function")
+            match function.source:
+                Defined(syntax): pass
+                else: try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must name a Luce definition")
+            match request.service:
+                storage_allocator:
+                    if not self.is_storage_allocator(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `storage_allocator` must have signature `(u64, u64) -> native_mut_ptr[u8]`")
+                storage_deallocator:
+                    if not self.is_storage_deallocator(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `storage_deallocator` must have signature `(native_mut_ptr[u8], u64, u64) -> unit`")
+                list_create:
+                    if not self.is_list_create(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_create` must have signature `() -> native_mut_ptr[u8]`")
+                list_retain, slice_retain:
+                    if not self.is_list_unit_service(function, 0):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8]) -> unit`")
+                list_release, slice_release:
+                    if not self.is_list_action_service(function, 1, 2, false):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8], u64, u64, func(native_mut_ptr[u8]) -> unit) -> unit`")
+                list_copy:
+                    if not self.is_list_action_service(function, 1, 2, true):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_copy` must have signature `(native_mut_ptr[u8], u64, u64, func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]`")
+                list_concat:
+                    if not self.is_list_action_service(function, 2, 2, true):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_concat` must have signature `(native_mut_ptr[u8], native_mut_ptr[u8], u64, u64, func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]`")
+                list_length, list_iteration_begin, slice_length:
+                    if not self.is_list_length(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8]) -> u64`")
+                list_iteration_active:
+                    if not self.is_list_bool_service(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_iteration_active` must have signature `(native_mut_ptr[u8]) -> bool`")
+                list_append_slot:
+                    if not self.is_list_action_service(function, 1, 2, true):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_append_slot` must have signature `(native_mut_ptr[u8], u64, u64, func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]`")
+                list_element_address, slice_element_address:
+                    if not self.is_list_pointer_service(function, 2):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8], u64, u64) -> native_mut_ptr[u8]`")
+                list_insert_slot, list_mutable_element_address:
+                    if not self.is_list_action_service(function, 1, 3, true):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8], u64, u64, u64, func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]`")
+                list_slice:
+                    if not self.is_list_pointer_service(function, 3):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8], u64, u64, u64) -> native_mut_ptr[u8]`")
+                bytes_retain, bytes_release:
+                    if not self.is_list_unit_service(function, 0):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8]) -> unit`")
+                bytes_concat:
+                    if not self.is_bytes_concat_service(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `bytes_concat` must have signature `(native_mut_ptr[u8], u64, native_mut_ptr[u8], u64) -> native_mut_ptr[u8]`")
+                bytes_data:
+                    if not self.is_list_pointer_service(function, 0):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `bytes_data` must have signature `(native_mut_ptr[u8]) -> native_mut_ptr[u8]`")
+                bytes_slice:
+                    if not self.is_bytes_slice_service(function):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `bytes_slice` must have signature `(native_mut_ptr[u8], native_mut_ptr[u8], u64, u64) -> native_mut_ptr[u8]`")
+                list_remove_at:
+                    if not self.is_list_action_service(function, 1, 3, false):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_remove_at` must have signature `(native_mut_ptr[u8], u64, u64, u64, func(native_mut_ptr[u8]) -> unit) -> unit`")
+                list_clear:
+                    if not self.is_list_action_service(function, 1, 2, false):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_clear` must have signature `(native_mut_ptr[u8], u64, u64, func(native_mut_ptr[u8]) -> unit) -> unit`")
+                list_iteration_end:
+                    if not self.is_list_unit_service(function, 0):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must have signature `(native_mut_ptr[u8]) -> unit`")
+                list_reserve:
+                    if not self.is_list_action_service(function, 1, 3, false):
+                        try self.state.fail_at(module_index, function.span, "runtime binding `list_reserve` must have signature `(native_mut_ptr[u8], u64, u64, u64, func(native_mut_ptr[u8]) -> unit) -> unit`")
+            bindings.append(HirRuntimeBinding(service = request.service, function = function.symbol))
+        return bindings
+
+    func is_storage_allocator(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 2: return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if not types_match(function.parameters[0].value_type, u64_type) or not types_match(function.parameters[1].value_type, u64_type): return false
+        if function.parameters[0].default_value.value != no_node or function.parameters[1].default_value.value != no_node: return false
+        match self.state.types.definitions[function.result.value].form:
+            NativePointer(pointee, is_mutable):
+                return is_mutable and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
+
+    func is_storage_deallocator(function: FunctionSymbol) -> bool:
+        return self.has_byte_pointer_parameters(function, 2) and types_match(function.result, resolve_builtin_type(BuiltinType.unit))
+
+    func is_list_create(function: FunctionSymbol) -> bool:
+        return function.receiver == none and len(function.parameters) == 0 and self.is_mutable_byte_pointer(function.result)
+
+    func is_list_length(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 1: return false
+        let value = function.parameters[0]
+        return value.default_value.value == no_node and self.is_mutable_byte_pointer(value.value_type) and types_match(function.result, resolve_builtin_type(BuiltinType.unsigned_u64))
+
+    func is_list_bool_service(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 1: return false
+        let value = function.parameters[0]
+        return value.default_value.value == no_node and self.is_mutable_byte_pointer(value.value_type) and types_match(function.result, resolve_builtin_type(BuiltinType.boolean))
+
+    func is_list_action_service(function: FunctionSymbol, pointer_count: i64, u64_count: i64, returns_pointer: bool) -> bool:
+        if function.receiver != none or len(function.parameters) != pointer_count + u64_count + 1: return false
+        for index in range(0, pointer_count):
+            if function.parameters[index].default_value.value != no_node or not self.is_mutable_byte_pointer(function.parameters[index].value_type): return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        for index in range(pointer_count, pointer_count + u64_count):
+            if not self.is_plain_parameter(function.parameters[index], u64_type): return false
+        let action = function.parameters[len(function.parameters) - 1]
+        if action.default_value.value != no_node or not self.is_element_action(action.value_type): return false
+        if returns_pointer: return self.is_mutable_byte_pointer(function.result)
+        return types_match(function.result, resolve_builtin_type(BuiltinType.unit))
+
+    func is_element_action(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Function(parameters, result):
+                return len(parameters) == 1 and self.is_mutable_byte_pointer(parameters[0]) and types_match(result, resolve_builtin_type(BuiltinType.unit))
+            else: return false
+
+    func has_byte_pointer_parameters(function: FunctionSymbol, u64_count: i64) -> bool:
+        if function.receiver != none or len(function.parameters) != u64_count + 1: return false
+        if function.parameters[0].default_value.value != no_node or not self.is_mutable_byte_pointer(function.parameters[0].value_type): return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        for index in range(1, len(function.parameters)):
+            if not self.is_plain_parameter(function.parameters[index], u64_type): return false
+        return true
+
+    func is_list_pointer_service(function: FunctionSymbol, u64_count: i64) -> bool:
+        return self.has_byte_pointer_parameters(function, u64_count) and self.is_mutable_byte_pointer(function.result)
+
+    func is_bytes_concat_service(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 4 or not self.is_mutable_byte_pointer(function.result): return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if not self.is_plain_byte_pointer_parameter(function.parameters[0]): return false
+        if not self.is_plain_parameter(function.parameters[1], u64_type): return false
+        if not self.is_plain_byte_pointer_parameter(function.parameters[2]): return false
+        return self.is_plain_parameter(function.parameters[3], u64_type)
+
+    func is_bytes_slice_service(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 4 or not self.is_mutable_byte_pointer(function.result): return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if not self.is_plain_byte_pointer_parameter(function.parameters[0]): return false
+        if not self.is_plain_byte_pointer_parameter(function.parameters[1]): return false
+        if not self.is_plain_parameter(function.parameters[2], u64_type): return false
+        return self.is_plain_parameter(function.parameters[3], u64_type)
+
+    func is_plain_byte_pointer_parameter(parameter: HirParameter) -> bool:
+        return parameter.default_value.value == no_node and self.is_mutable_byte_pointer(parameter.value_type)
+
+    func is_list_unit_service(function: FunctionSymbol, u64_count: i64) -> bool:
+        return self.has_byte_pointer_parameters(function, u64_count) and types_match(function.result, resolve_builtin_type(BuiltinType.unit))
+
+    func is_plain_parameter(parameter: HirParameter, expected: TypeId) -> bool:
+        return parameter.default_value.value == no_node and types_match(parameter.value_type, expected)
+
+    func is_mutable_byte_pointer(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            NativePointer(pointee, is_mutable): return is_mutable and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
+
+    # mark: Modules and imports =================================================================
+
+    # Two files may not claim the same module name; the second one loses.
+    pub func validate_module_names() -> !:
+        for index in range(0, len(self.state.sources)):
+            for previous in range(0, index):
+                if self.state.sources[previous].name == self.state.sources[index].name:
+                    try self.state.fail_at(index, self.state.sources[index].syntax.span, "duplicate module `" + self.state.sources[index].name + "`")
+
+    # `mutating` describes replacement of a value receiver. Module functions
+    # have no receiver, while classes already mutate through shared identity;
+    # structs, enums, and interface requirements retain the modifier.
+    pub func validate_mutating_placements() -> !:
+        for module_index in range(0, len(self.state.sources)):
+            for declaration in self.state.sources[module_index].syntax.declarations:
+                match declaration.value:
+                    Function(function):
+                        if function.is_mutating:
+                            try self.state.fail_at(module_index, declaration.span, "`mutating` is valid only on value-type methods")
+                    NominalType(nominal):
+                        if nominal.kind == NominalTypeKind.class_type:
+                            for member in nominal.members:
+                                match member.value:
+                                    Function(function):
+                                        if function.is_mutating:
+                                            try self.state.fail_at(module_index, member.span, "class methods do not use `mutating`; class identity already permits field mutation")
+                                    else: pass
+                    else: pass
+
+    # Native authority permits implementation details, never an API leak.
+    # Following structural values here prevents a public wrapper from hiding a
+    # raw pointer inside an alias, tuple, function value, struct, or enum.
+    pub func validate_native_boundaries() -> !:
+        for item in self.state.aliases:
+            let resolved = item.resolved else trap("alias was not resolved")
+            if item.is_public and self.state.contains_native_pointer(resolved):
+                try self.state.fail_at(item.module_index, item.span, "public type alias `" + item.name + "` cannot expose native pointers")
+        for item in self.state.structs:
+            if not item.is_public: continue
+            for field in item.fields:
+                if self.state.contains_native_pointer(field.value_type):
+                    try self.state.fail_at(item.module_index, item.span, "public struct `" + item.name + "` cannot store native pointers")
+        for item in self.state.enums:
+            if not item.is_public: continue
+            for case_value in item.cases:
+                for field in case_value.payload:
+                    if self.state.contains_native_pointer(field.value_type):
+                        try self.state.fail_at(item.module_index, item.span, "public enum `" + item.name + "` cannot store native pointers")
+        for function in self.state.functions:
+            if not function.is_public: continue
+            for parameter in function.parameters:
+                if self.state.contains_native_pointer(parameter.value_type):
+                    try self.state.fail_at(function.module_index, function.span, "public function `" + function.name + "` cannot expose native pointers")
+            if self.state.contains_native_pointer(function.result):
+                try self.state.fail_at(function.module_index, function.span, "public function `" + function.name + "` cannot expose native pointers")
+
+    # Turn one module's import lines into name bindings, checking that every
+    # imported module exists, every selected function exists and is public,
+    # and no two imports land on the same local name.
+    func resolve_imports(module_index: i64) -> ModuleBindings!:
+        let bindings = ModuleBindings(modules = list[ImportedModule](), values = list[ImportedValueBinding]())
+        for imported in self.state.sources[module_index].syntax.imports:
+            let imported_name = imported.path.dotted()
+            let imported_module = self.state.find_source(imported_name)
+            if imported_module < 0:
+                try self.state.fail_at(module_index, imported.path.span, "unknown module `" + imported_name + "`")
+            if imported_module == module_index:
+                try self.state.fail_at(module_index, imported.path.span, "a module cannot import itself")
+
+            if len(imported.names) == 0:
+                let local_name = imported.alias_name else imported.path.last()
+                try self.require_free_import_name(module_index, bindings, local_name, imported.span)
+                bindings.modules.append(ImportedModule(name = local_name, module_index = imported_module))
+            else:
+                for selected in imported.names:
+                    try self.require_free_import_name(module_index, bindings, selected.name, selected.span)
+                    let function_index = self.state.find_function_in_module(imported_module, selected.name)
+                    if function_index >= 0:
+                        if not self.state.functions[function_index].is_public:
+                            try self.state.fail_at(module_index, selected.span, "`" + selected.name + "` is private to module `" + imported_name + "`")
+                        bindings.values.append(ImportedValueBinding(name = selected.name, value = ImportedValue.Function(function_index = function_index)))
+                        continue
+                    let variable_index = self.state.find_extern_variable_in_module(imported_module, selected.name)
+                    if variable_index < 0:
+                        try self.state.fail_at(module_index, selected.span, "module `" + imported_name + "` has no value `" + selected.name + "`")
+                    if not self.state.extern_variables[variable_index].is_public:
+                        try self.state.fail_at(module_index, selected.span, "`" + selected.name + "` is private to module `" + imported_name + "`")
+                    bindings.values.append(ImportedValueBinding(name = selected.name, value = ImportedValue.ExternalVariable(variable_index = variable_index)))
+        return bindings
+
+    # An imported name may not collide with a declaration or another import.
+    func require_free_import_name(module_index: i64, bindings: ModuleBindings, name: str, span: SourceSpan) -> !:
+        if self.state.find_function_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.state.find_constant_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.state.find_alias_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.find_struct_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.find_enum_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.state.find_extern_type_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.state.find_extern_variable_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        if self.state.find_global_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        for imported in bindings.modules:
+            if imported.name == name:
+                try self.state.fail_at(module_index, span, "duplicate imported name `" + name + "`")
+        for imported in bindings.values:
+            if imported.name == name:
+                try self.state.fail_at(module_index, span, "duplicate imported name `" + name + "`")
+
+    # mark: Signature collection ================================================================
+
+    # The first pass: record aliases, constants, and function signatures so
+    # later bodies can see every module-level name.
+    pub func collect_declarations(checker: DeclarationValueChecker) -> !:
+        # Struct names first, so a field or signature anywhere may name a
+        # struct declared later or in another module.
+        for module_index in range(0, len(self.state.sources)):
+            for declaration in self.state.sources[module_index].syntax.declarations:
+                match declaration.value:
+                    NominalType(nominal):
+                        if nominal.kind == NominalTypeKind.class_type:
+                            try self.state.fail_at(module_index, declaration.span, "class types are not implemented yet")
+                        try self.collect_struct_name(module_index, declaration.is_public, declaration.documentation, nominal, declaration.span)
+                    Enumeration(enumeration):
+                        try self.collect_enum_name(module_index, declaration.is_public, declaration.documentation, enumeration, declaration.span)
+                    ExternType(extern_type):
+                        try self.collect_extern_type_name(module_index, declaration.is_public, declaration.documentation, extern_type, declaration.span)
+                    else: pass
+        for module_index in range(0, len(self.state.sources)):
+            for declaration in self.state.sources[module_index].syntax.declarations:
+                match declaration.value:
+                    Constant(constant):
+                        try self.collect_constant(module_index, declaration.is_public, constant, declaration.span)
+                    RuntimeGlobal(global):
+                        try self.collect_global(module_index, declaration.is_public, global, declaration.span)
+                    TypeAlias(type_alias):
+                        try self.collect_alias(module_index, declaration.is_public, type_alias, declaration.span)
+                    Function(function):
+                        try self.collect_function(checker, module_index, declaration.is_public, declaration.documentation, none, function, false, declaration.span)
+                    NominalType(nominal):
+                        try self.collect_struct_members(checker, module_index, nominal)
+                    Enumeration(enumeration):
+                        try self.collect_enum_members(checker, module_index, enumeration)
+                    InterfaceType(interface_type):
+                        try self.state.fail_at(module_index, declaration.span, "interfaces are not implemented yet")
+                    TestDeclaration(test_declaration):
+                        try self.state.fail_at(module_index, declaration.span, "test declarations are not implemented yet")
+                    ExportStruct(export_struct):
+                        try self.state.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
+                    ExportEnum(export_enum):
+                        try self.state.fail_at(module_index, declaration.span, "export declarations are not implemented yet")
+                    ExportFunction(export_function):
+                        try self.collect_function(checker, module_index, true, declaration.documentation, none, export_function, true, declaration.span)
+                    ExternType(extern_type):
+                        pass
+                    ExternFunction(extern_function):
+                        try self.collect_extern_function(module_index, declaration.is_public, declaration.documentation, extern_function, declaration.span)
+                    ExternVariable(extern_variable):
+                        try self.collect_extern_variable(module_index, declaration.is_public, declaration.documentation, extern_variable, declaration.span)
+                    ExternStruct(extern_struct):
+                        try self.state.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
+
+    func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, type_alias.name, span)
+        self.state.aliases.append(CollectedAlias(
+            module_index = module_index,
+            name = type_alias.name,
+            is_public = is_public,
+            syntax = type_alias,
+            span = span,
+            resolved = none,
+        ))
+
+    func collect_constant(module_index: i64, is_public: bool, constant: ConstantSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, constant.name, span)
+        let placeholder = resolve_builtin_type(BuiltinType.unit)
+        let symbol = self.state.make_symbol(constant.name, SymbolKind.constant, placeholder)
+        self.state.constants.append(CollectedConstant(
+            symbol = symbol,
+            module_index = module_index,
+            name = constant.name,
+            is_public = is_public,
+            annotation = constant.annotation,
+            value = constant.value,
+            span = span,
+            typed = NodeId(value = no_node),
+        ))
+
+    func collect_global(module_index: i64, is_public: bool, global: RuntimeGlobalSyntax, span: SourceSpan) -> !:
+        if self.state.package_role != PackageRole.sealed_runtime:
+            try self.state.fail_at(module_index, span, "mutable module globals are reserved for the sealed runtime package")
+        if is_public:
+            try self.state.fail_at(module_index, span, "a sealed runtime global must be module-private")
+        try self.require_free_module_name(module_index, global.name, span)
+        let value_type = try self.resolve_type(module_index, global.value_type)
+        if self.state.contains_fallible(value_type):
+            try self.state.fail_at(module_index, global.value_type.span, "runtime global `" + global.name + "` cannot store a fallible type")
+        if not self.state.has_structural_zero(value_type):
+            try self.state.fail_at(module_index, global.value_type.span, "runtime global `" + global.name + "` needs a structurally zero-initializable value type")
+        let symbol = self.state.make_symbol(global.name, SymbolKind.global, value_type)
+        self.state.globals.append(CollectedGlobal(symbol = symbol, module_index = module_index, name = global.name, value_type = value_type, span = span))
+
+    # C globals are mutable source values but not Luce-owned storage. Keep the
+    # closed one-word vocabulary here so every later stage receives a valid,
+    # already resolved contract.
+    func collect_extern_variable(module_index: i64, is_public: bool, documentation: list[str], syntax: ExternVariableSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, syntax.name, span)
+        let value_type = try self.resolve_type(module_index, syntax.value_type)
+        if not self.is_c_variable_value(value_type):
+            try self.state.fail_at(module_index, syntax.value_type.span, "extern variable `" + syntax.name + "` has unsupported boundary type `" + self.state.describe_type(value_type) + "`")
+        self.state.extern_variables.append(CollectedExternVariable(
+            module_index = module_index,
+            name = syntax.name,
+            is_public = is_public,
+            documentation = documentation,
+            value_type = value_type,
+            span = span,
+        ))
+
+    func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
+        if self.state.find_function_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_struct_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.find_enum_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.state.find_extern_type_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.state.find_alias_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.state.find_constant_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.state.find_extern_variable_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+        if self.state.find_global_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "duplicate declaration `" + name + "`")
+
+    pub func collect_module_bindings() -> !:
+        for module_index in range(0, len(self.state.sources)):
+            self.state.module_bindings.append(try self.resolve_imports(module_index))
+
+    pub func enter_module(module_index: i64):
+        self.state.current_module = module_index
+        self.state.bindings = self.state.module_bindings[module_index]
+
+    pub func resolve_aliases() -> !:
+        for index in range(0, len(self.state.aliases)):
+            discard(try self.resolve_alias(index))
+
+    func resolve_alias(index: i64) -> TypeId!:
+        let item = self.state.aliases[index]
+        let already = item.resolved
+        if already != none: return already
+        let key = str(item.module_index) + "." + item.name
+        for previous in self.state.alias_stack:
+            if previous == key:
+                try self.state.fail_at(item.module_index, item.span, "type alias `" + item.name + "` is recursive")
+        self.state.alias_stack.append(key)
+        self.state.current_module = item.module_index
+        let resolved = try self.resolve_type(item.module_index, item.syntax.value)
+        self.state.alias_stack.remove(len(self.state.alias_stack) - 1)
+        self.state.aliases[index] = CollectedAlias(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            syntax = item.syntax,
+            span = item.span,
+            resolved = resolved,
+        )
+        return resolved
+
+
+    func collect_function(checker: DeclarationValueChecker, module_index: i64, is_public: bool, documentation: list[str], receiver: HirReceiver?, function: FunctionSyntax, is_exported_c: bool, span: SourceSpan) -> !:
+        if receiver == none: try self.require_free_module_name(module_index, function.name, span)
+        if len(function.generic_parameters) > 0:
+            try self.state.fail_at(module_index, span, "generic functions are not implemented yet")
+        if is_exported_c and receiver != none:
+            try self.state.fail_at(module_index, span, "an exported C function cannot be a method")
+
+        let parameters = list[HirParameter]()
+        var has_self = false
+        var saw_default = false
+        for parameter in function.parameters:
+            for previous in parameters:
+                if previous.name == parameter.name:
+                    try self.state.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
+            var parameter_type = resolve_builtin_type(BuiltinType.unit)
+            if parameter.name == "self":
+                let owner = receiver else error(self.state.diagnostic_at(module_index, parameter.span, "`self` is the receiver of a method; only a type member declares it"))
+                if len(parameters) > 0: try self.state.fail_at(module_index, parameter.span, "`self` must be the first parameter")
+                if parameter.annotation != none: try self.state.fail_at(module_index, parameter.span, "`self` does not take a type annotation")
+                if parameter.default_value != none: try self.state.fail_at(module_index, parameter.span, "`self` does not take a default value")
+                parameter_type = owner.owner
+                has_self = true
+            else:
+                let annotation = parameter.annotation else error(self.state.diagnostic_at(
+                    module_index,
+                    parameter.span,
+                    "parameter `" + parameter.name + "` requires a type",
+                ))
+                parameter_type = try self.resolve_type(module_index, annotation)
+                if self.state.contains_fallible(parameter_type):
+                    try self.state.fail_at(module_index, parameter.span, "parameter `" + parameter.name + "` cannot store a fallible type; `T!` is a function-result effect")
+            var default_value = NodeId(value = no_node)
+            let default_syntax = parameter.default_value
+            if is_exported_c and default_syntax != none:
+                try self.state.fail_at(module_index, parameter.span, "an exported C parameter takes no default")
+            if default_syntax != none:
+                default_value = try checker.check_constant_expression(module_index, default_syntax, parameter_type, "default of parameter `" + parameter.name + "`")
+                saw_default = true
+            elif saw_default:
+                try self.state.fail_at(module_index, parameter.span, "parameter `" + parameter.name + "` follows a parameter with a default and needs one too")
+            let parameter_symbol = self.state.make_symbol(parameter.name, SymbolKind.parameter, parameter_type)
+            parameters.append(HirParameter(symbol = parameter_symbol, name = parameter.name, value_type = parameter_type, default_value = default_value))
+
+        var result = resolve_builtin_type(BuiltinType.unit)
+        let result_syntax = function.result
+        if result_syntax != none:
+            result = try self.resolve_type(module_index, result_syntax)
+        try self.state.validate_function_result(module_index, result, span)
+        if is_exported_c and self.state.contains_fallible(result):
+            try self.state.fail_at(module_index, span, "an exported C function cannot be fallible")
+        if is_exported_c:
+            try self.require_c_function_type(module_index, parameters, result, span, "exported C function `" + function.name + "`")
+        var checked_receiver: HirReceiver? = none
+        if receiver != none:
+            if receiver.kind == HirReceiverKind.initializer:
+                if not has_self:
+                    try self.state.fail_at(module_index, span, "initializer `init` requires `self` as its first parameter")
+                var successful = result
+                let fallible = self.state.fallible_inner(result)
+                if fallible != none: successful = fallible
+                if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+                    try self.state.fail_at(module_index, span, "initializer `init` must return `unit` or `unit!`")
+                checked_receiver = receiver
+            elif function.is_mutating and not has_self:
+                try self.state.fail_at(module_index, span, "`mutating` requires a `self` parameter")
+            else:
+                var kind = HirReceiverKind.type_function
+                if has_self:
+                    kind = HirReceiverKind.value_method
+                    if function.is_mutating: kind = HirReceiverKind.mutating_method
+                checked_receiver = HirReceiver(owner = receiver.owner, kind = kind)
+        let function_symbol = self.state.make_symbol(function.name, SymbolKind.function, result)
+        var source = CollectedFunctionSource.Defined(syntax = function)
+        if is_exported_c: source = CollectedFunctionSource.ExportedC(syntax = function)
+        self.state.functions.append(FunctionSymbol(
+            symbol = function_symbol,
+            module_index = module_index,
+            name = function.name,
+            is_public = is_public,
+            documentation = documentation,
+            receiver = checked_receiver,
+            parameters = parameters,
+            result = result,
+            source = source,
+            span = span,
+        ))
+
+    # Collect a host-supplied C function into the same callable table as a
+    # definition. Inputs become ordinary source parameters. Outputs remain in
+    # the ordered C contract and become source result components, so calls do
+    # not grow a parallel argument-placement path.
+    func collect_extern_function(module_index: i64, is_public: bool, documentation: list[str], function: ExternFunctionSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, function.name, span)
+        let parameters = list[HirParameter]()
+        let slots = list[HirCSlot]()
+        let names = list[str]()
+        for parameter in function.parameters:
+            for previous in names:
+                if previous == parameter.name:
+                    try self.state.fail_at(module_index, parameter.span, "duplicate parameter `" + parameter.name + "`")
+            names.append(parameter.name)
+            let value_type = try self.resolve_type(module_index, parameter.value_type)
+            var supported = self.is_c_function_value(value_type)
+            if parameter.is_out: supported = self.is_c_function_component(value_type)
+            if not supported:
+                var kind = "parameter"
+                if parameter.is_out: kind = "out parameter"
+                try self.state.fail_at(module_index, parameter.span, "extern function `" + function.name + "` " + kind + " `" + parameter.name + "` has unsupported boundary type `" + self.state.describe_type(value_type) + "`")
+            if parameter.is_out:
+                slots.append(HirCSlot.Output(name = parameter.name, value_type = value_type))
+                continue
+            let symbol = self.state.make_symbol(parameter.name, SymbolKind.parameter, value_type)
+            slots.append(HirCSlot.Input(parameter = u32(len(parameters))))
+            parameters.append(HirParameter(symbol = symbol, name = parameter.name, value_type = value_type, default_value = NodeId(value = no_node)))
+        var declared_result = resolve_builtin_type(BuiltinType.unit)
+        let result_syntax = function.result
+        if result_syntax != none: declared_result = try self.resolve_type(module_index, result_syntax)
+        if self.state.contains_fallible(declared_result):
+            try self.state.fail_at(module_index, span, "an extern function cannot be fallible")
+        if not types_match(declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(declared_result):
+            try self.state.fail_at(module_index, span, "extern function `" + function.name + "` has unsupported result type `" + self.state.describe_type(declared_result) + "`")
+        let contract = HirCFunction(is_blocking = function.is_blocking, slots = slots, declared_result = declared_result)
+        let result = self.c_source_result(contract)
+        let function_symbol = self.state.make_symbol(function.name, SymbolKind.function, result)
+        self.state.functions.append(FunctionSymbol(
+            symbol = function_symbol,
+            module_index = module_index,
+            name = function.name,
+            is_public = is_public,
+            documentation = documentation,
+            receiver = none,
+            parameters = parameters,
+            result = result,
+            source = CollectedFunctionSource.ExternalC(contract = contract),
+            span = span,
+        ))
+
+    # A void C result contributes no source component. One remaining value is
+    # returned directly; two or more use the language's ordinary tuple. This
+    # is the only result-shaping rule for `out` declarations.
+    func c_source_result(contract: HirCFunction) -> TypeId:
+        let components = list[TypeId]()
+        if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
+            components.append(contract.declared_result)
+        for slot in contract.slots:
+            match slot:
+                Output(name, value_type): components.append(value_type)
+                Input(parameter): pass
+        if len(components) == 0: return resolve_builtin_type(BuiltinType.unit)
+        if len(components) == 1: return components[0]
+        return self.state.intern_tuple(components)
+
+    # Register a pointer- or integer-shaped handle as a nominal HIR type. The
+    # representation records only its source contract; null translation and
+    # ABI placement happen later at the C boundary and in a backend.
+    func collect_extern_type_name(module_index: i64, is_public: bool, documentation: list[str], syntax: ExternTypeSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, syntax.name, span)
+        var representation = HirExternRepresentation.Pointer
+        let representation_name = syntax.representation
+        if representation_name != none:
+            let value_type = builtin_type_id(representation_name) else trap("parser admitted an invalid extern type representation")
+            representation = HirExternRepresentation.Integer(value_type = value_type)
+        let index = len(self.state.extern_types)
+        let type_id = self.state.intern_named(syntax.name, TypeForm.Extern(index = index))
+        self.state.extern_types.append(CollectedExternType(
+            module_index = module_index,
+            name = syntax.name,
+            is_public = is_public,
+            documentation = documentation,
+            type_id = type_id,
+            representation = representation,
+            span = span,
+        ))
+
+    # An exported function receives values from C, so its current vocabulary
+    # excludes cfunc pointers until the foreign-pointer oracle exists. Extern
+    # calls use the direction-aware checks in `collect_extern_function`: an
+    # exact named callback may flow out as an input, but arbitrary pointers do
+    # not yet flow back through results or `out` slots.
+    func require_c_function_type(module_index: i64, parameters: list[HirParameter], result: TypeId, span: SourceSpan, what: str) -> !:
+        for parameter in parameters:
+            if not self.is_c_function_component(parameter.value_type):
+                try self.state.fail_at(module_index, span, what + " parameter `" + parameter.name + "` has unsupported boundary type `" + self.state.describe_type(parameter.value_type) + "`")
+        if not types_match(result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(result):
+            try self.state.fail_at(module_index, span, what + " has unsupported result type `" + self.state.describe_type(result) + "`")
+
+    # An outbound extern-call input may additionally carry one complete cfunc:
+    # the value must already name a Luce adapter or exact extern symbol.
+    func is_c_function_value(value: TypeId) -> bool:
+        if self.is_c_scalar_or_handle(value): return true
+        match self.state.types.definitions[value.value].form:
+            CFunction(parameters, result): return true
+            Optional(inner): return self.is_pointer_extern_type(inner)
+            else: return false
+
+    # A component inside a `cfunc` signature cannot itself be a function
+    # pointer. This enforces the deliberately closed, non-recursive callback
+    # vocabulary while ordinary extern slots may carry one complete cfunc.
+    pub func is_c_function_component(value: TypeId) -> bool:
+        if self.is_c_scalar_or_handle(value): return true
+        match self.state.types.definitions[value.value].form:
+            Optional(inner): return self.is_pointer_extern_type(inner)
+            else: return false
+
+    # An external variable is exactly one C scalar or opaque handle. Unlike a
+    # call slot it admits no optional encoding and applies no null translation.
+    func is_c_variable_value(value: TypeId) -> bool:
+        return self.is_c_scalar_or_handle(value)
+
+    # The common direct C vocabulary before a particular boundary position
+    # decides whether pointer-shaped optional translation is meaningful.
+    func is_c_scalar_or_handle(value: TypeId) -> bool:
+        if types_match(value, resolve_builtin_type(BuiltinType.boolean)) or is_integer_type(self.state.types, value) or is_floating_type(self.state.types, value): return true
+        match self.state.types.definitions[value.value].form:
+            Extern(index): return true
+            else: return false
+
+    func is_pointer_extern_type(value: TypeId) -> bool:
+        match self.state.types.definitions[value.value].form:
+            Extern(index):
+                match self.state.extern_types[index].representation:
+                    Pointer: return true
+                    Integer(value_type): return false
+            else: return false
+
+    # A field default or parameter default: checked in an empty scope, so it
+    # cannot name a local or `self`, and required to be a literal tree
+    # (optionally wrapped, grouped, or negated) so it is embeddable anywhere.
+
+    # mark: Structs =============================================================================
+
+    func collect_struct_name(module_index: i64, is_public: bool, documentation: list[str], nominal: NominalTypeSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, nominal.name, span)
+        if len(nominal.generic_parameters) > 0:
+            try self.state.fail_at(module_index, span, "generic structs are not implemented yet")
+        if len(nominal.interfaces) > 0:
+            try self.state.fail_at(module_index, span, "interfaces are not implemented yet")
+        let index = len(self.state.structs)
+        let type_id = self.state.intern_named(nominal.name, TypeForm.Struct(index = index))
+        self.state.structs.append(CollectedStruct(
+            module_index = module_index,
+            name = nominal.name,
+            is_public = is_public,
+            documentation = documentation,
+            type_id = type_id,
+            fields = list[HirField](),
+            initializer = -1,
+            syntax = nominal,
+            span = span,
+        ))
+
+    # Fields are resolved in declaration order and methods are collected as
+    # functions with a receiver. A struct may not contain itself by value.
+    func collect_struct_members(checker: DeclarationValueChecker, module_index: i64, nominal: NominalTypeSyntax) -> !:
+        let struct_index = self.find_struct_in_module(module_index, nominal.name)
+        let fields = list[HirField]()
+        var initializer = -1
+        for member in nominal.members:
+            match member.value:
+                Field(field):
+                    for previous in fields:
+                        if previous.name == field.name:
+                            try self.state.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
+                    if self.find_method(self.state.structs[struct_index].type_id, field.name) >= 0:
+                        try self.state.fail_at(module_index, field.span, "`" + field.name + "` is both a field and a method of `" + nominal.name + "`")
+                    if field.is_weak: try self.state.fail_at(module_index, field.span, "`weak` fields belong to classes, not structs")
+                    let field_type = try self.resolve_type(module_index, field.value_type)
+                    if self.state.contains_fallible(field_type):
+                        try self.state.fail_at(module_index, field.span, "field `" + field.name + "` cannot store a fallible type; `T!` is a function-result effect")
+                    var default_value = NodeId(value = no_node)
+                    let default_syntax = field.default_value
+                    if default_syntax != none:
+                        default_value = try checker.check_constant_expression(module_index, default_syntax, field_type, "default of field `" + field.name + "`")
+                    fields.append(HirField(
+                        name = field.name,
+                        value_type = field_type,
+                        is_mutable = field.is_mutable,
+                        is_public = member.is_public,
+                        documentation = member.documentation,
+                        default_value = default_value,
+                    ))
+                Function(function):
+                    if self.find_method(self.state.structs[struct_index].type_id, function.name) >= 0:
+                        try self.state.fail_at(module_index, member.span, "duplicate method `" + function.name + "` in `" + nominal.name + "`")
+                    for field in fields:
+                        if field.name == function.name:
+                            try self.state.fail_at(module_index, member.span, "`" + function.name + "` is both a field and a method of `" + nominal.name + "`")
+                    var receiver_kind = HirReceiverKind.type_function
+                    if function.name == "init":
+                        if function.is_mutating:
+                            try self.state.fail_at(module_index, member.span, "an initializer does not use `mutating`; initialization already writes `self`")
+                        receiver_kind = HirReceiverKind.initializer
+                    let receiver = HirReceiver(owner = self.state.structs[struct_index].type_id, kind = receiver_kind)
+                    try self.collect_function(checker, module_index, member.is_public, member.documentation, receiver, function, false, member.span)
+                    if receiver_kind == HirReceiverKind.initializer: initializer = len(self.state.functions) - 1
+        let item = self.state.structs[struct_index]
+        self.state.structs[struct_index] = CollectedStruct(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            documentation = item.documentation,
+            type_id = item.type_id,
+            fields = fields,
+            initializer = initializer,
+            syntax = item.syntax,
+            span = item.span,
+        )
+        for field in fields:
+            if self.contains_struct(field.value_type, struct_index):
+                try self.state.fail_at(module_index, item.span, "struct `" + item.name + "` contains itself through field `" + field.name + "`; use a class or a collection for recursive data")
+
+    # Does a value of `value_type` store a `target` struct inline? Follows
+    # tuples, optionals, and other structs, whose fields were resolved
+    # earlier or are being resolved now (an empty field list is a struct
+    # still being collected, which cannot be the target).
+    func contains_struct(value_type: TypeId, target: i64) -> bool:
+        return self.contains_type(value_type, self.state.structs[target].type_id)
+
+    # Does a value of `value_type` store `target` inline? Follows tuples,
+    # optionals, structs, and enum payloads.
+    func contains_type(value_type: TypeId, target: TypeId) -> bool:
+        if types_match(value_type, target): return true
+        match self.state.types.definitions[value_type.value].form:
+            Struct(index):
+                for field in self.state.structs[index].fields:
+                    if self.contains_type(field.value_type, target): return true
+                return false
+            Enum(index):
+                for case_value in self.state.enums[index].cases:
+                    for field in case_value.payload:
+                        if self.contains_type(field.value_type, target): return true
+                return false
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_type(element, target): return true
+                return false
+            Array(element, count): return self.contains_type(element, target)
+            Optional(inner): return self.contains_type(inner, target)
+            else: return false
+
+    # Equality is structural for value aggregates and exists exactly when
+    # every stored component is itself equatable. This keeps unsupported
+    # slice/function comparisons out of HIR instead of failing in lowering.
+    pub func is_equatable_type(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Unit: return true
+            Boolean: return true
+            Integer(bits, is_signed): return true
+            Floating(bits): return true
+            Character: return true
+            String: return true
+            Bytes: return true
+            ErrorCode: return true
+            Error: return true
+            Extern(index): return true
+            Range(inner): return self.is_equatable_type(inner)
+            Array(element, count): return self.is_equatable_type(element)
+            Optional(inner): return self.is_equatable_type(inner)
+            Tuple(elements):
+                for element in elements:
+                    if not self.is_equatable_type(element): return false
+                return true
+            Struct(index):
+                for field in self.state.structs[index].fields:
+                    if not self.is_equatable_type(field.value_type): return false
+                return true
+            Enum(index):
+                for case_value in self.state.enums[index].cases:
+                    for field in case_value.payload:
+                        if not self.is_equatable_type(field.value_type): return false
+                return true
+            else: return false
+
+    pub func find_struct_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.state.structs)):
+            if self.state.structs[index].module_index == module_index and self.state.structs[index].name == name: return index
+        return -1
+
+    pub func find_method(owner: TypeId, name: str) -> i64:
+        for index in range(0, len(self.state.functions)):
+            let receiver = self.state.functions[index].receiver
+            if receiver == none: continue
+            if types_match(receiver.owner, owner) and self.state.functions[index].name == name: return index
+        return -1
+
+    # mark: Enums ===============================================================================
+
+    func collect_enum_name(module_index: i64, is_public: bool, documentation: list[str], enumeration: EnumSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, enumeration.name, span)
+        if len(enumeration.generic_parameters) > 0:
+            try self.state.fail_at(module_index, span, "generic enums are not implemented yet")
+        if len(enumeration.interfaces) > 0:
+            try self.state.fail_at(module_index, span, "interfaces are not implemented yet")
+        let index = len(self.state.enums)
+        let type_id = self.state.intern_named(enumeration.name, TypeForm.Enum(index = index))
+        self.state.enums.append(CollectedEnum(
+            module_index = module_index,
+            name = enumeration.name,
+            is_public = is_public,
+            documentation = documentation,
+            type_id = type_id,
+            cases = list[HirEnumCase](),
+            syntax = enumeration,
+            span = span,
+        ))
+
+    # Cases in declaration order (the order is the tag); methods are functions
+    # with the enum as receiver. An enum may not hold itself by value.
+    func collect_enum_members(checker: DeclarationValueChecker, module_index: i64, enumeration: EnumSyntax) -> !:
+        let enum_index = self.find_enum_in_module(module_index, enumeration.name)
+        let cases = list[HirEnumCase]()
+        for case_syntax in enumeration.cases:
+            for previous in cases:
+                if previous.name == case_syntax.name:
+                    try self.state.fail_at(module_index, case_syntax.span, "duplicate case `" + case_syntax.name + "`")
+            let payload = list[HirPayloadField]()
+            for field in case_syntax.payload:
+                for previous in payload:
+                    if previous.name == field.name:
+                        try self.state.fail_at(module_index, case_syntax.span, "duplicate payload field `" + field.name + "` in case `" + case_syntax.name + "`")
+                payload.append(HirPayloadField(name = field.name, value_type = try self.resolve_type(module_index, field.value_type)))
+                if self.state.contains_fallible(payload[len(payload) - 1].value_type):
+                    try self.state.fail_at(module_index, case_syntax.span, "case payload `" + field.name + "` cannot store a fallible type; `T!` is a function-result effect")
+            cases.append(HirEnumCase(name = case_syntax.name, documentation = case_syntax.documentation, payload = payload))
+        let item = self.state.enums[enum_index]
+        self.state.enums[enum_index] = CollectedEnum(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            documentation = item.documentation,
+            type_id = item.type_id,
+            cases = cases,
+            syntax = item.syntax,
+            span = item.span,
+        )
+        for case_value in cases:
+            for field in case_value.payload:
+                if self.contains_type(field.value_type, item.type_id):
+                    try self.state.fail_at(module_index, item.span, "enum `" + item.name + "` contains itself through case `" + case_value.name + "`; use a class or a collection for recursive data")
+        for member in enumeration.methods:
+            match member.value:
+                Function(function):
+                    if self.find_method(item.type_id, function.name) >= 0:
+                        try self.state.fail_at(module_index, member.span, "duplicate method `" + function.name + "` in `" + enumeration.name + "`")
+                    for case_value in cases:
+                        if case_value.name == function.name:
+                            try self.state.fail_at(module_index, member.span, "`" + function.name + "` is both a case and a method of `" + enumeration.name + "`")
+                    let receiver = HirReceiver(owner = item.type_id, kind = HirReceiverKind.type_function)
+                    try self.collect_function(checker, module_index, member.is_public, member.documentation, receiver, function, false, member.span)
+                else: try self.state.fail_at(module_index, member.span, "an enum declares cases and methods only")
+
+    pub func find_enum_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.state.enums)):
+            if self.state.enums[index].module_index == module_index and self.state.enums[index].name == name: return index
+        return -1
+
+    pub func enum_of(value_type: TypeId) -> i64:
+        if value_type.value < 0 or i64(value_type.value) >= len(self.state.types.definitions): return -1
+        match self.state.types.definitions[value_type.value].form:
+            Enum(index): return index
+            else: return -1
+
+    pub func find_case(enum_index: i64, name: str) -> i64:
+        let cases = self.state.enums[enum_index].cases
+        for index in range(0, len(cases)):
+            if cases[index].name == name: return index
+        return -1
+
+    # The module that declared a struct or enum type.
+    pub func owner_module(owner: TypeId) -> i64:
+        let struct_index = self.struct_of(owner)
+        if struct_index >= 0: return self.state.structs[struct_index].module_index
+        let enum_index = self.enum_of(owner)
+        if enum_index >= 0: return self.state.enums[enum_index].module_index
+        return self.state.current_module
+
+    pub func struct_of(value_type: TypeId) -> i64:
+        if i64(value_type.value) >= len(self.state.types.definitions): return -1
+        match self.state.types.definitions[value_type.value].form:
+            Struct(index): return index
+            else: return -1
+
+    pub func find_field(struct_index: i64, name: str) -> i64:
+        let fields = self.state.structs[struct_index].fields
+        for index in range(0, len(fields)):
+            if fields[index].name == name: return index
+        return -1
+
+    # Turn a type spelling into a checked value type. A known-but-unimplemented
+    # core type earns "not implemented yet".
+    pub func resolve_type(module_index: i64, value: TypeSyntax) -> TypeId!:
+        match value.form:
+            Named(path):
+                if len(path.parts) == 2:
+                    # `module.Struct` through an imported module.
+                    let imported = self.state.find_imported_module_of(module_index, path.parts[0])
+                    if imported < 0: try self.state.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
+                    let foreign = self.find_struct_in_module(imported, path.parts[1])
+                    if foreign >= 0:
+                        if not self.state.structs[foreign].is_public:
+                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                        return self.state.structs[foreign].type_id
+                    let foreign_enum = self.find_enum_in_module(imported, path.parts[1])
+                    if foreign_enum >= 0:
+                        if not self.state.enums[foreign_enum].is_public:
+                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                        return self.state.enums[foreign_enum].type_id
+                    let foreign_extern = self.state.find_extern_type_in_module(imported, path.parts[1])
+                    if foreign_extern < 0: try self.state.fail_at(module_index, path.span, "module `" + self.state.sources[imported].name + "` has no type `" + path.parts[1] + "`")
+                    if not self.state.extern_types[foreign_extern].is_public:
+                        try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                    return self.state.extern_types[foreign_extern].type_id
+                if len(path.parts) != 1:
+                    try self.state.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
+                let name = path.parts[0]
+                let alias_index = self.state.find_alias_in_module(module_index, name)
+                if alias_index >= 0: return try self.resolve_alias(alias_index)
+                let builtin = builtin_type_id(name)
+                if builtin != none: return builtin
+                let struct_index = self.find_struct_in_module(module_index, name)
+                if struct_index >= 0: return self.state.structs[struct_index].type_id
+                let enum_index = self.find_enum_in_module(module_index, name)
+                if enum_index >= 0: return self.state.enums[enum_index].type_id
+                let extern_index = self.state.find_extern_type_in_module(module_index, name)
+                if extern_index >= 0: return self.state.extern_types[extern_index].type_id
+                if is_core_type_name(name):
+                    error(self.state.diagnostic_at(module_index, path.span, "type `" + name + "` is not implemented yet"))
+                error(self.state.diagnostic_at(module_index, path.span, "unknown type `" + path.dotted() + "`"))
+            Applied(path, arguments):
+                if path.dotted() == "native_ptr" or path.dotted() == "native_mut_ptr":
+                    if self.state.sources[module_index].authority != ModuleAuthority.native:
+                        try self.state.fail_at(module_index, value.span, "native pointer types require a `.native.luc` module")
+                    if len(arguments) != 1:
+                        try self.state.fail_at(module_index, value.span, "`" + path.dotted() + "` needs exactly one pointee type")
+                    match arguments[0]:
+                        TypeArgument(pointee):
+                            let pointee_type = try self.resolve_type(module_index, pointee)
+                            if self.state.contains_fallible(pointee_type):
+                                try self.state.fail_at(module_index, pointee.span, "a native pointer pointee cannot store a fallible type; `T!` is a function-result effect")
+                            return self.state.intern_native_pointer(pointee_type, path.dotted() == "native_mut_ptr")
+                        else:
+                            try self.state.fail_at(module_index, value.span, "`" + path.dotted() + "` needs exactly one pointee type")
+                if path.dotted() == "slice" and len(arguments) == 1:
+                    match arguments[0]:
+                        TypeArgument(element):
+                            let inner = try self.resolve_type(module_index, element)
+                            return self.state.intern_slice(inner)
+                        else:
+                            error(self.state.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
+                if path.dotted() == "list" and len(arguments) == 1:
+                    match arguments[0]:
+                        TypeArgument(element):
+                            let inner = try self.resolve_type(module_index, element)
+                            if self.state.contains_fallible(inner):
+                                try self.state.fail_at(module_index, element.span, "a list cannot store a fallible type; `T!` is a function-result effect")
+                            return self.state.intern_list(inner)
+                        else:
+                            error(self.state.diagnostic_at(module_index, value.span, "`list` needs exactly one element type"))
+                if path.dotted() == "list":
+                    error(self.state.diagnostic_at(module_index, value.span, "`list` needs exactly one element type"))
+                if path.dotted() == "range" and len(arguments) == 1:
+                    match arguments[0]:
+                        TypeArgument(element):
+                            let inner = try self.resolve_type(module_index, element)
+                            if not is_integer_type(self.state.types, inner):
+                                error(self.state.diagnostic_at(module_index, value.span, "`range` needs an integer element type"))
+                            return self.state.intern_range(inner)
+                        else:
+                            error(self.state.diagnostic_at(module_index, value.span, "`range` needs one type argument"))
+                if path.dotted() == "array" and len(arguments) == 2:
+                    var element_type = resolve_builtin_type(BuiltinType.unit)
+                    var count = -1
+                    match arguments[0]:
+                        TypeArgument(element): element_type = try self.resolve_type(module_index, element)
+                        else: error(self.state.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
+                    match arguments[1]:
+                        IntegerArgument(token): count = try self.state.decode_integer_at(module_index, token)
+                        else: error(self.state.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
+                    if count < 0: error(self.state.diagnostic_at(module_index, value.span, "`array` length cannot be negative"))
+                    return self.state.intern_array(element_type, count)
+                if path.dotted() == "array":
+                    error(self.state.diagnostic_at(module_index, value.span, "`array` needs an element type followed by a nonnegative integer length"))
+                error(self.state.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
+            GroupedType(grouped):
+                return try self.resolve_type(module_index, grouped)
+            TupleType(elements):
+                let parts = list[TypeId]()
+                for element in elements:
+                    parts.append(try self.resolve_type(module_index, element))
+                return self.state.intern_tuple(parts)
+            FunctionType(parameters, result):
+                let parts = list[TypeId]()
+                for parameter in parameters:
+                    let parameter_type = try self.resolve_type(module_index, parameter)
+                    if self.state.contains_fallible(parameter_type):
+                        try self.state.fail_at(module_index, parameter.span, "a function-type parameter cannot store a fallible type; `T!` is a function-result effect")
+                    parts.append(parameter_type)
+                let result_type = try self.resolve_type(module_index, result)
+                try self.state.validate_function_result(module_index, result_type, result.span)
+                return self.state.intern_function_type(parts, result_type)
+            CFunctionType(parameters, result):
+                let parts = list[TypeId]()
+                for parameter in parameters:
+                    let parameter_type = try self.resolve_type(module_index, parameter)
+                    if not self.is_c_function_component(parameter_type):
+                        try self.state.fail_at(module_index, parameter.span, "a `cfunc` parameter has unsupported C boundary type `" + self.state.describe_type(parameter_type) + "`")
+                    parts.append(parameter_type)
+                let result_type = try self.resolve_type(module_index, result)
+                if not types_match(result_type, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(result_type):
+                    try self.state.fail_at(module_index, result.span, "a `cfunc` result has unsupported C boundary type `" + self.state.describe_type(result_type) + "`")
+                return self.state.intern_c_function_type(parts, result_type)
+            OptionalType(optional_value):
+                return self.state.intern_optional(try self.resolve_type(module_index, optional_value))
+            FallibleType(successful_value):
+                return self.state.intern_fallible(try self.resolve_type(module_index, successful_value))

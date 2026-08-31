@@ -12,6 +12,7 @@
 
 from compiler.frontend.source import SourceSpan, format_diagnostic
 from compiler.frontend.syntax import EnumSyntax, ExpressionSyntax, FunctionSyntax, ModuleSyntax, NominalTypeSyntax, TypeAliasSyntax, TypeSyntax
+from compiler.frontend.tokenizer import Token
 from compiler.hir.ir import BinaryOperation, BuiltinType, HirCFunction, HirEnumCase, HirExternRepresentation, HirField, HirNode, HirNodeForm, HirParameter, HirReceiver
 from compiler.hir.ir import HirSymbol, ModuleAuthority, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable, Value
 from compiler.hir.ir import create_builtin_type_table, describe_type, resolve_builtin_type, type_forms_match
@@ -227,6 +228,11 @@ pub struct NativePointerType:
     pub let pointee: TypeId
     pub let is_mutable: bool
 
+## The sole body-semantics operation declaration collection needs: defaults
+## become ordinary typed HIR nodes in the same arena as function bodies.
+pub interface DeclarationValueChecker:
+    func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> NodeId!
+
 # mark: Generation transaction ================================================================
 
 ## Owns every table and cursor in one source-to-HIR transaction. Declaration
@@ -363,7 +369,7 @@ pub class HirGenerationState:
         if imported >= 0: return imported
         return self.find_function_in_module(self.current_module, name)
 
-    pub func find_imported_function(name: str) -> i64:
+    func find_imported_function(name: str) -> i64:
         for imported in self.bindings.values:
             if imported.name != name: continue
             match imported.value:
@@ -371,7 +377,7 @@ pub class HirGenerationState:
                 ExternalVariable(variable_index): return -1
         return -1
 
-    pub func find_imported_extern_variable(name: str) -> i64:
+    func find_imported_extern_variable(name: str) -> i64:
         for imported in self.bindings.values:
             if imported.name != name: continue
             match imported.value:
@@ -545,14 +551,197 @@ pub class HirGenerationState:
     pub func describe_type(value: TypeId) -> str:
         return describe_type(self.types, value)
 
-    pub func diagnostic(span: SourceSpan, message: str) -> str:
+    func diagnostic(span: SourceSpan, message: str) -> str:
         return format_diagnostic(self.sources[self.current_module].path, span, message)
 
     pub func diagnostic_at(module_index: i64, span: SourceSpan, message: str) -> str:
         return format_diagnostic(self.sources[module_index].path, span, message)
 
-    pub func fail(span: SourceSpan, message: str) -> !:
+    func fail(span: SourceSpan, message: str) -> !:
         error(self.diagnostic(span, message))
 
     pub func fail_at(module_index: i64, span: SourceSpan, message: str) -> !:
         error(self.diagnostic_at(module_index, span, message))
+
+    pub func fallible_inner(value: TypeId) -> TypeId?:
+        if i64(value.value) >= len(self.types.definitions): return none
+        match self.types.definitions[value.value].form:
+            Fallible(inner): return inner
+            else: return none
+
+    # Fallibility is control flow, not a source-level value representation.
+    # Follow value containers so aliases cannot hide it in storage; function
+    # types are a boundary because their result may itself declare an effect.
+    pub func contains_fallible(value: TypeId) -> bool:
+        let visited = list[bool]()
+        for index in range(0, len(self.types.definitions)): visited.append(false)
+        return self.contains_fallible_once(value, visited)
+
+    func contains_fallible_once(value: TypeId, visited: list[bool]) -> bool:
+        if i64(value.value) >= len(self.types.definitions): return false
+        if visited[value.value]: return false
+        visited[value.value] = true
+        match self.types.definitions[value.value].form:
+            Fallible(inner): return true
+            Optional(inner): return self.contains_fallible_once(inner, visited)
+            Slice(inner): return self.contains_fallible_once(inner, visited)
+            List(inner): return self.contains_fallible_once(inner, visited)
+            Range(inner): return self.contains_fallible_once(inner, visited)
+            Array(inner, count): return self.contains_fallible_once(inner, visited)
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_fallible_once(element, visited): return true
+                return false
+            Struct(index):
+                for field in self.structs[index].fields:
+                    if self.contains_fallible_once(field.value_type, visited): return true
+                return false
+            Enum(index):
+                for case_value in self.enums[index].cases:
+                    for field in case_value.payload:
+                        if self.contains_fallible_once(field.value_type, visited): return true
+                return false
+            else: return false
+
+    # Whether a value shape directly or transitively stores a native pointer.
+    # The pointer itself is the boundary: its pointee is a type description,
+    # not another value stored inline.
+    pub func contains_native_pointer(value: TypeId) -> bool:
+        let visited = list[bool]()
+        for index in range(0, len(self.types.definitions)): visited.append(false)
+        return self.contains_native_pointer_once(value, visited)
+
+    func contains_native_pointer_once(value: TypeId, visited: list[bool]) -> bool:
+        if i64(value.value) >= len(self.types.definitions): return false
+        if visited[value.value]: return false
+        visited[value.value] = true
+        match self.types.definitions[value.value].form:
+            NativePointer(pointee, is_mutable): return true
+            Optional(inner): return self.contains_native_pointer_once(inner, visited)
+            Fallible(inner): return self.contains_native_pointer_once(inner, visited)
+            Slice(inner): return self.contains_native_pointer_once(inner, visited)
+            List(inner): return self.contains_native_pointer_once(inner, visited)
+            Range(inner): return self.contains_native_pointer_once(inner, visited)
+            Array(inner, count): return self.contains_native_pointer_once(inner, visited)
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_native_pointer_once(element, visited): return true
+                return false
+            Function(parameters, result):
+                for parameter in parameters:
+                    if self.contains_native_pointer_once(parameter, visited): return true
+                return self.contains_native_pointer_once(result, visited)
+            CFunction(parameters, result):
+                for parameter in parameters:
+                    if self.contains_native_pointer_once(parameter, visited): return true
+                return self.contains_native_pointer_once(result, visited)
+            Struct(index):
+                for field in self.structs[index].fields:
+                    if self.contains_native_pointer_once(field.value_type, visited): return true
+                return false
+            Enum(index):
+                for case_value in self.enums[index].cases:
+                    for field in case_value.payload:
+                        if self.contains_native_pointer_once(field.value_type, visited): return true
+                return false
+            else: return false
+
+    # Runtime globals have no source initializer. Admit exactly the value
+    # shapes whose all-zero canonical storage has a well-defined HIR value;
+    # native pointers use their documented inert/null zero only inside this
+    # sealed state; callable tokens and foreign handles still require their
+    # explicit capabilities instead of being forged as zero.
+    pub func has_structural_zero(value: TypeId) -> bool:
+        match self.types.definitions[value.value].form:
+            Boolean: return true
+            Integer(bits, is_signed): return true
+            Floating(bits): return true
+            Character: return true
+            String: return true
+            Bytes: return true
+            NativePointer(pointee, is_mutable): return true
+            Range(element): return self.has_structural_zero(element)
+            Array(element, count): return self.has_structural_zero(element)
+            Optional(inner): return self.has_structural_zero(inner)
+            Tuple(elements):
+                for element in elements:
+                    if not self.has_structural_zero(element): return false
+                return true
+            else: return false
+
+    pub func validate_function_result(module_index: i64, result: TypeId, span: SourceSpan) -> !:
+        let successful = self.fallible_inner(result)
+        if successful != none:
+            if self.contains_fallible(successful):
+                try self.fail_at(module_index, span, "fallibility cannot nest; a function result has at most one outer `!`")
+        elif self.contains_fallible(result):
+            try self.fail_at(module_index, span, "fallibility must be the outermost function-result effect")
+
+    # `never` is structural but created lazily because no source spelling can
+
+
+    # Integer spelling is needed while resolving array types as well as while
+    # checking expressions, so it belongs to the shared source transaction.
+    pub func decode_integer_at(module_index: i64, token: Token) -> i64!:
+        let value = try self.decode_negative_integer_at(module_index, token)
+        if value == -9223372036854775807 - 1:
+            try self.fail_at(module_index, token.span, "integer literal is outside the representable integer range")
+        return -value
+
+    # Accumulating below zero leaves room for the minimum signed magnitude,
+    # which positive i64 cannot represent.
+    pub func decode_negative_integer_at(module_index: i64, token: Token) -> i64!:
+        let text_end = len(token.text) - len(token.suffix)
+        var base = 10
+        var position = 0
+        if text_end >= 2 and token.text[0] == '0':
+            match token.text[1]:
+                'b', 'B': base = 2
+                'o', 'O': base = 8
+                'x', 'X': base = 16
+                else: base = 10
+            if base != 10: position = 2
+
+        var value = 0
+        while position < text_end:
+            let c = token.text[position]
+            if c != '_':
+                let digit = decode_digit(c)
+                let minimum = -9223372036854775807 - 1
+                let numerator = minimum + digit
+                var threshold = numerator // base
+                if numerator % base != 0: threshold += 1
+                if value < threshold:
+                    try self.fail_at(module_index, token.span, "integer literal is outside the representable integer range")
+                value = value * base - digit
+            position += 1
+        return value
+
+func decode_digit(c: char) -> i64:
+    let code = u32(c)
+    if c <= '9': return i64(code - u32('0'))
+    if c <= 'F': return i64(code - u32('A')) + 10
+    return i64(code - u32('a')) + 10
+
+## The implemented built-in type-name table shared by signature collection
+## and expression literal suffixes.
+pub func builtin_type_id(name: str) -> TypeId?:
+    return match name:
+        "unit" => resolve_builtin_type(BuiltinType.unit)
+        "bool" => resolve_builtin_type(BuiltinType.boolean)
+        "i8" => resolve_builtin_type(BuiltinType.signed_i8)
+        "i16" => resolve_builtin_type(BuiltinType.signed_i16)
+        "i32" => resolve_builtin_type(BuiltinType.signed_i32)
+        "i64" => resolve_builtin_type(BuiltinType.signed_i64)
+        "u8" => resolve_builtin_type(BuiltinType.unsigned_u8)
+        "u16" => resolve_builtin_type(BuiltinType.unsigned_u16)
+        "u32" => resolve_builtin_type(BuiltinType.unsigned_u32)
+        "u64" => resolve_builtin_type(BuiltinType.unsigned_u64)
+        "f32" => resolve_builtin_type(BuiltinType.float32)
+        "f64" => resolve_builtin_type(BuiltinType.float64)
+        "char" => resolve_builtin_type(BuiltinType.character)
+        "str" => resolve_builtin_type(BuiltinType.string)
+        "bytes" => resolve_builtin_type(BuiltinType.byte_string)
+        "ErrorCode" => resolve_builtin_type(BuiltinType.error_code)
+        "Error" => resolve_builtin_type(BuiltinType.error_value)
+        else => none

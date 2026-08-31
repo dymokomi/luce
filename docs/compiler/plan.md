@@ -201,13 +201,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   files. The complete differential corpus and native smoke gate use this path.
 
 - [ ] **Finish decomposing the stateful compiler passes before the next major
-  managed-language family.** The HIR audit found one 4,299-line class mixing
-  program-wide declaration collection with per-function checking. Its shared
-  typed transaction and flat arenas now live in `hir/generation_model.luc`;
-  declaration collection and body checking must become cohesive consumers of
-  that one state without duplicating type, symbol, or node tables. Apply the
-  same program-versus-function-state test to the 3,659-line MIR lowerer. Keep
-  the 2,121-line parser sectioned until new grammar work establishes a real
+  managed-language family.** The HIR half is complete: the former 4,299-line
+  class is now a 166-line orchestration facade, a 1,099-line program-wide
+  declaration collector, a 747-line shared typed transaction/model, and one
+  2,396-line body checker. Declaration defaults cross that boundary through
+  one constant-expression contract; type, symbol, and node tables remain
+  singular. Statements, expressions, and patterns remain together because
+  their traversal is mutually recursive; splitting them today would add a
+  callback graph rather than a responsibility boundary. Apply the same
+  program-versus-function-state test to the 3,659-line MIR lowerer. Keep the
+  2,121-line parser sectioned until new grammar work establishes a real
   component boundary; do not split any pass into arbitrary helper files just
   to lower a line count.
 

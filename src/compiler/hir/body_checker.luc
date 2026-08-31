@@ -1,0 +1,2396 @@
+#==============================================================================================
+#
+#   body_checker - Constants and function bodies into typed HIR
+#
+#   DESCRIPTION:
+#       Checks constant initializers and one function body at a time after
+#       DeclarationCollector has fixed every program-wide identity. It owns
+#       lexical scopes, statement/expression typing, patterns, and diagnostics
+#       while writing nodes into the same HirGenerationState transaction.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan, format_diagnostic
+from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax, FunctionSyntax, IfBranchSyntax, StatementSyntax
+from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
+from compiler.frontend.tokenizer import Token, TokenKind
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiverKind
+from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import describe_type
+from compiler.hir.ir import integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
+from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
+from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, CollectedFunctionSource
+from compiler.hir.generation_model import DeclarationValueChecker, DeclaredErrorCode, FunctionSymbol, HirGenerationState, ImportedModule, ImportedValue, ImportedValueBinding
+from compiler.hir.generation_model import LocalBinding, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
+
+## Checks constants and function-local semantics against collected declarations.
+pub class HirBodyChecker: DeclarationValueChecker:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector):
+        self.state = state
+        self.declarations = declarations
+
+    # mark: Constants and bodies ================================================================
+
+    pub func check_constants() -> !:
+        for index in range(0, len(self.state.constants)):
+            try self.resolve_constant(index)
+
+    # Type one constant's initializer, resolving other constants as needed.
+    # Cycles (`let a = a`, or `let a = b` / `let b = a`) fail as recursion.
+    func resolve_constant(index: i64) -> !:
+        let item = self.state.constants[index]
+        if item.typed.value != no_node: return
+        let key = str(item.module_index) + "." + item.name
+        for previous in self.state.constant_stack:
+            if previous == key:
+                try self.fail_at(item.module_index, item.span, "constant `" + item.name + "` is recursive")
+        self.state.constant_stack.append(key)
+        let saved_constant = self.state.current_constant
+        self.state.current_constant = index
+        let saved_module = self.state.current_module
+        let saved_bindings = self.state.bindings
+        self.declarations.enter_module(item.module_index)
+        var expected: TypeId? = none
+        let annotation = item.annotation
+        if annotation != none:
+            expected = try self.declarations.resolve_type(item.module_index, annotation)
+        let typed = try self.check_expression(item.value, expected)
+        if self.state.contains_fallible(self.state.type_of(typed)):
+            try self.fail_at(item.module_index, item.span, "a fallible value cannot be stored in a constant; handle it with `try` or `catch`")
+        if not self.is_constant_expression(typed):
+            try self.fail_at(item.module_index, item.value.span, "initializer of constant `" + item.name + "` must be a constant expression")
+        self.state.current_constant = saved_constant
+        self.state.constant_stack.remove(len(self.state.constant_stack) - 1)
+        self.state.current_module = saved_module
+        self.state.bindings = saved_bindings
+        self.state.symbols[item.symbol.value] = HirSymbol(
+            id = item.symbol,
+            name = item.name,
+            kind = SymbolKind.constant,
+            value_type = self.state.type_of(typed),
+        )
+        self.state.constants[index] = CollectedConstant(
+            symbol = item.symbol,
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            annotation = item.annotation,
+            value = item.value,
+            span = item.span,
+            typed = typed,
+        )
+
+    # Record one function's signature: resolved parameter and result types,
+    # a fresh symbol per parameter, and a fresh symbol for the function itself.
+    # A method passes its struct as `receiver`; `self` then takes the struct's
+    # type, and every following parameter is ordinary. A default is checked
+    # once here as a constant expression and embedded at each call site that
+    # omits the argument.
+    pub func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> NodeId!:
+        let saved_module = self.state.current_module
+        let saved_bindings = self.state.bindings
+        let saved_locals = self.state.locals
+        # Signatures are collected before import bindings exist; a default
+        # may not name imports then, and sees an empty binding set.
+        self.state.current_module = module_index
+        self.state.bindings = ModuleBindings(modules = list[ImportedModule](), values = list[ImportedValueBinding]())
+        if module_index < len(self.state.module_bindings): self.declarations.enter_module(module_index)
+        self.state.locals = list[LocalBinding]()
+        let checked = try self.check_expression(value, expected)
+        self.state.locals = saved_locals
+        self.state.current_module = saved_module
+        self.state.bindings = saved_bindings
+        if not self.is_constant_expression(checked):
+            try self.fail_at(module_index, value.span, what + " must be a constant expression")
+        return checked
+
+    # mark: Functions and statements ============================================================
+
+    # The second pass, one function at a time: parameters enter scope, the body
+    # is checked statement by statement, and a non-unit function must provably
+    # return on every path.
+    pub func check_function(function: FunctionSymbol) -> HirFunction!:
+        var source: FunctionSyntax? = none
+        var is_exported_c = false
+        match function.source:
+            Defined(syntax): source = syntax
+            ExportedC(syntax):
+                source = syntax
+                is_exported_c = true
+            ExternalC(contract):
+                return HirFunction(
+                    symbol = function.symbol,
+                    module = ModuleId(value = u32(function.module_index)),
+                    name = function.name,
+                    is_public = function.is_public,
+                    documentation = function.documentation,
+                    receiver = none,
+                    parameters = function.parameters,
+                    result = function.result,
+                    implementation = HirFunctionImplementation.ExternalC(contract = contract),
+                    span = function.span,
+                )
+        self.state.current_result = function.result
+        self.state.current_receiver = function.receiver
+        self.state.locals = list[LocalBinding]()
+        self.state.loop_depth = 0
+        self.state.recovery_types = list[TypeId]()
+
+        # Whole-value `self` is assignable only in a mutating method. An
+        # initializer writes individual fields through its dedicated path;
+        # definite initialization is proved by SemanticAnalyzer.
+        var self_is_mutable = false
+        let receiver = function.receiver
+        if receiver != none: self_is_mutable = receiver.kind == HirReceiverKind.mutating_method
+        for parameter in function.parameters:
+            try self.state.require_free_local_name(parameter.name, function.span)
+            let is_mutable = parameter.name == "self" and self_is_mutable
+            self.state.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = is_mutable))
+
+        let definition = source else trap("defined function lost its syntax")
+        let body_syntax = definition.body else trap("function definition has no body")
+        let body = try self.check_suite(body_syntax.statements)
+        var successful_result = function.result
+        let fallible_result = self.state.fallible_inner(function.result)
+        if fallible_result != none: successful_result = fallible_result
+        if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(body):
+            try self.fail(function.span, "function `" + function.name + "` may finish without returning `" + self.describe_type(function.result) + "`")
+        let body_run = self.state.push_nodes(body)
+        var implementation = HirFunctionImplementation.Defined(body = body_run)
+        if is_exported_c: implementation = HirFunctionImplementation.ExportedC(body = body_run)
+        return HirFunction(
+            symbol = function.symbol,
+            module = ModuleId(value = u32(function.module_index)),
+            name = function.name,
+            is_public = function.is_public,
+            documentation = function.documentation,
+            receiver = function.receiver,
+            parameters = function.parameters,
+            result = function.result,
+            implementation = implementation,
+            span = function.span,
+        )
+
+    # A suite is one lexical scope: bindings made inside it end with it.
+    func check_suite(statements: list[StatementSyntax]) -> list[NodeId]!:
+        let outer_count = len(self.state.locals)
+        let typed = list[NodeId]()
+        for statement in statements:
+            for item in try self.check_statement(statement):
+                typed.append(item)
+        while len(self.state.locals) > outer_count:
+            self.state.locals.remove(len(self.state.locals) - 1)
+        return typed
+
+    # Check one statement. Each statement family owns its detailed rules below.
+    func check_statement(statement: StatementSyntax) -> list[NodeId]!:
+        match statement.form:
+            BreakStatement:
+                if self.state.loop_depth == 0: try self.fail(statement.span, "`break` is only valid inside a loop")
+                return [self.state.push_statement(HirNodeForm.BreakStatement, statement.span)]
+            ContinueStatement:
+                if self.state.loop_depth == 0: try self.fail(statement.span, "`continue` is only valid inside a loop")
+                return [self.state.push_statement(HirNodeForm.ContinueStatement, statement.span)]
+            Binding(is_mutable, pattern, annotation, value):
+                return try self.check_binding(is_mutable, pattern, annotation, value, statement.span)
+            Assignment(target, operator, value):
+                return [try self.check_assignment(target, operator, value, statement.span)]
+            ReturnStatement(value):
+                return [try self.check_return(value, statement.span)]
+            ExpressionStatement(value):
+                let printed = try self.check_print_call(value)
+                if printed != none: return [printed]
+                let checked = try self.check_expression(value, none)
+                if self.state.fallible_inner(self.state.type_of(checked)) != none:
+                    try self.fail(statement.span, "a fallible value must be handled with `try` or `catch`")
+                return [self.state.push_statement(HirNodeForm.ExpressionStatement(value = checked), statement.span)]
+            IfStatement(branches, fallback):
+                return [try self.check_if(branches, fallback, statement.span)]
+            WhileStatement(condition, body):
+                return [try self.check_while(condition, body, statement.span)]
+            DeferStatement(value):
+                return try self.check_defer(value, statement.span)
+            RecoverStatement(value):
+                if len(self.state.recovery_types) == 0:
+                    try self.fail(statement.span, "`recover` is only valid inside a `catch` handler")
+                let recovered = try self.check_expression(value, self.state.recovery_types[len(self.state.recovery_types) - 1])
+                return [self.state.push_statement(HirNodeForm.RecoverStatement(value = recovered), statement.span)]
+            ForStatement(is_fallible, name, iterable, body):
+                return [try self.check_for(is_fallible, name, iterable, body, statement.span)]
+            MatchStatement(subject, arms):
+                return [try self.check_match_statement(subject, arms, statement.span)]
+
+    # Recognize a bare `print(...)` statement so it can take the special path
+    # below; anything else falls through to ordinary expression checking.
+    func check_print_call(value: ExpressionSyntax) -> NodeId?!:
+        match value.form:
+            Call(callee, type_arguments, arguments):
+                match callee.form:
+                    Name(name):
+                        if name == "print": return try self.check_print(type_arguments, arguments, value.span)
+                        return none
+                    else: return none
+            else: return none
+
+    # `print` is the first terminal operation in the executable slice. A
+    # string literal becomes `PrintText`, whose bytes are known now; any other
+    # `str` expression becomes `PrintValue` and is written at run time.
+    func check_print(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan) -> NodeId!:
+        if len(type_arguments) > 0 or len(arguments) != 1 or arguments[0].label != none:
+            try self.fail(span, "`print` expects one positional string")
+        var literal: Token? = none
+        match arguments[0].value.form:
+            Literal(token):
+                if token.kind == TokenKind.str_lit: literal = token
+            else: literal = none
+        if literal != none:
+            let text = try self.decode_print_text(literal)
+            return self.state.push_statement(HirNodeForm.PrintText(value = text), span)
+        let printed = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.string))
+        return self.state.push_statement(HirNodeForm.PrintValue(value = printed), span)
+
+    # `defer` captures a call's receiver and arguments now, then records the
+    # action for the enclosing lexical scope. Hidden bindings make capture
+    # timing explicit in HIR, so neither interpreter nor lowerer re-evaluates
+    # source expressions during cleanup.
+    func check_defer(value: ExpressionSyntax, span: SourceSpan) -> list[NodeId]!:
+        let printed = try self.check_print_call(value)
+        if printed != none: return self.capture_deferred_action(printed, span)
+        let checked = try self.check_expression(value, none)
+        match self.state.node_form(checked):
+            Call(function, arguments):
+                if not types_match(self.state.type_of(checked), resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`defer` requires a unit-producing call")
+                let action = self.state.push_statement(HirNodeForm.ExpressionStatement(value = checked), span)
+                return self.capture_deferred_action(action, span)
+            IndirectCall(callee, arguments):
+                if not types_match(self.state.type_of(checked), resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`defer` requires a unit-producing call")
+                let action = self.state.push_statement(HirNodeForm.ExpressionStatement(value = checked), span)
+                return self.capture_deferred_action(action, span)
+            else: error(self.diagnostic(span, "`defer` requires a call"))
+
+    # Return the hidden capture bindings followed by one `DeferStatement`.
+    func capture_deferred_action(action: NodeId, span: SourceSpan) -> list[NodeId]:
+        let statements = list[NodeId]()
+        var captured_action = action
+        match self.state.node_form(action):
+            PrintText(value): pass
+            PrintValue(value):
+                let reference = self.capture_defer_value(value, statements)
+                captured_action = self.state.push_statement(HirNodeForm.PrintValue(value = reference), span)
+            ExpressionStatement(value):
+                match self.state.node_form(value):
+                    Call(function, arguments):
+                        let captured_arguments = list[u32]()
+                        for pair in range(0, i64(arguments.count) // 2):
+                            captured_arguments.append(self.state.extra[i64(arguments.start) + pair * 2])
+                            let argument = NodeId(value = self.state.extra[i64(arguments.start) + pair * 2 + 1])
+                            captured_arguments.append(self.capture_defer_value(argument, statements).value)
+                        let captured_call = self.state.push_node(HirNodeForm.Call(function = function, arguments = self.state.push_run(captured_arguments)), resolve_builtin_type(BuiltinType.unit), span)
+                        captured_action = self.state.push_statement(HirNodeForm.ExpressionStatement(value = captured_call), span)
+                    IndirectCall(callee, arguments):
+                        let captured_callee = self.capture_defer_value(callee, statements)
+                        let captured_arguments = list[NodeId]()
+                        for position in range(0, i64(arguments.count)):
+                            let argument = NodeId(value = self.state.extra[i64(arguments.start) + position])
+                            captured_arguments.append(self.capture_defer_value(argument, statements))
+                        let captured_call = self.state.push_node(HirNodeForm.IndirectCall(callee = captured_callee, arguments = self.state.push_nodes(captured_arguments)), resolve_builtin_type(BuiltinType.unit), span)
+                        captured_action = self.state.push_statement(HirNodeForm.ExpressionStatement(value = captured_call), span)
+                    else: pass
+            else: pass
+        statements.append(self.state.push_statement(HirNodeForm.DeferStatement(action = captured_action), span))
+        return statements
+
+    # One hidden mutable binding. Mutability matters for a deferred mutating
+    # value receiver; ordinary captured arguments remain unreachable by name.
+    func capture_defer_value(value: NodeId, statements: list[NodeId]) -> NodeId:
+        let value_type = self.state.type_of(value)
+        # `$` cannot occur in a source identifier, so this bookkeeping can
+        # never make an otherwise-valid user binding look like a duplicate.
+        let name = "$defer_capture_" + str(self.state.next_symbol)
+        let symbol = self.state.make_symbol(name, SymbolKind.local, value_type)
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = true))
+        statements.append(self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = true, value = value), self.state.span_of(value)))
+        return self.state.push_node(HirNodeForm.Reference(symbol = symbol), value_type, self.state.span_of(value))
+
+    # Turn a plain `"..."` spelling into the bytes `print` will write, decoding
+    # the handful of escapes the slice supports.
+    func decode_print_text(token: Token) -> str!:
+        if len(token.text) < 2 or token.text[0] != '"' or token.text[len(token.text) - 1] != '"':
+            try self.fail(token.span, "prefixed and triple-quoted strings are not implemented by `print` yet")
+        if len(token.text) >= 3 and token.text[1] == '"':
+            try self.fail(token.span, "prefixed and triple-quoted strings are not implemented by `print` yet")
+
+        var decoded = ""
+        var position = 1
+        while position < len(token.text) - 1:
+            let c = token.text[position]
+            if c != '\\':
+                decoded = decoded + str(c)
+            else:
+                position += 1
+                if position >= len(token.text) - 1: try self.fail(token.span, "incomplete string escape")
+                match token.text[position]:
+                    'n': decoded = decoded + "\n"
+                    'r': decoded = decoded + "\r"
+                    't': decoded = decoded + "\t"
+                    '\\': decoded = decoded + "\\"
+                    '"': decoded = decoded + "\""
+                    else: try self.fail(token.span, "this string escape is not implemented by `print` yet")
+            position += 1
+        return decoded
+
+    # `let name = value` or `var name: T = value` — the annotation, when
+    # present, becomes the expected type of the initializer.
+    func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> list[NodeId]!:
+        match pattern:
+            Name(name, name_span):
+                try self.state.require_free_local_name(name, name_span)
+                var expected: TypeId? = none
+                if annotation != none:
+                    expected = try self.declarations.resolve_type(self.state.current_module, annotation)
+                let checked = try self.check_expression(value, expected)
+                let checked_type = self.state.type_of(checked)
+                if self.state.contains_fallible(checked_type):
+                    try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
+                let symbol = self.state.make_symbol(name, SymbolKind.local, checked_type)
+                self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked_type, is_mutable = is_mutable))
+                return [self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = checked), span)]
+            TupleNames(names, pattern_span):
+                # Duplicate names report at the binding statement; the pattern
+                # stores names without per-name spans.
+                var expected: TypeId? = none
+                if annotation != none:
+                    expected = try self.declarations.resolve_type(self.state.current_module, annotation)
+                let checked = try self.check_expression(value, expected)
+                let checked_type = self.state.type_of(checked)
+                if self.state.contains_fallible(checked_type):
+                    try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
+                let elements = self.state.tuple_elements(checked_type) else error(self.diagnostic(span, "tuple binding requires a tuple value, found `" + self.describe_type(checked_type) + "`"))
+                if len(names) != len(elements):
+                    try self.fail(span, "tuple binding has " + str(len(names)) + " name(s), value has " + str(len(elements)))
+                let tuple_symbol = self.state.make_symbol("_tuple", SymbolKind.local, checked_type)
+                let statements = list[NodeId]()
+                statements.append(self.state.push_statement(HirNodeForm.Binding(symbol = tuple_symbol, is_mutable = false, value = checked), span))
+                var index = 0
+                while index < len(names):
+                    let name = names[index].text
+                    try self.state.require_free_local_name(name, names[index].span)
+                    let element_type = elements[index]
+                    let symbol = self.state.make_symbol(name, SymbolKind.local, element_type)
+                    self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = is_mutable))
+                    let tuple_ref = self.state.push_node(HirNodeForm.Reference(symbol = tuple_symbol), checked_type, span)
+                    let element = self.state.push_node(HirNodeForm.Element(value = tuple_ref, index = index), element_type, span)
+                    statements.append(self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = element), names[index].span))
+                    index += 1
+                return statements
+
+    # `name = value` and the augmented forms; only mutable local names are
+    # assignable in the current slice.
+    func check_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        var name = ""
+        match target.form:
+            Name(value_name):
+                name = value_name
+                if self.state.find_local(name) < 0:
+                    let global_index = self.state.find_global_in_module(self.state.current_module, name)
+                    if global_index >= 0: return try self.check_global_assignment(global_index, operator, value, span)
+                    let variable_index = self.state.find_visible_extern_variable(name)
+                    if variable_index >= 0: return try self.check_extern_assignment(variable_index, operator, value, span)
+            Member(member_value, field_name):
+                match member_value.form:
+                    Name(module_name):
+                        if self.state.find_local(module_name) < 0:
+                            let imported_module = self.state.find_imported_module(module_name)
+                            if imported_module >= 0:
+                                let variable_index = self.state.find_extern_variable_in_module(imported_module, field_name)
+                                if variable_index < 0:
+                                    try self.fail(span, "module `" + self.state.sources[imported_module].name + "` has no external variable `" + field_name + "`")
+                                if not self.state.extern_variables[variable_index].is_public:
+                                    try self.fail(span, "`" + field_name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+                                return try self.check_extern_assignment(variable_index, operator, value, span)
+                    else: pass
+                return try self.check_place_assignment(target, operator, value, span)
+            Index(indexed, subscript): return try self.check_place_assignment(target, operator, value, span)
+            Group(grouped): return try self.check_assignment(grouped, operator, value, span)
+            else: error(self.diagnostic(span, "assignment needs a named mutable place"))
+        let local_index = self.state.find_local(name)
+        if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
+        let local = self.state.locals[local_index]
+        if not local.is_mutable:
+            if name == "self": try self.fail(span, "cannot assign to `self` in a non-mutating method; declare the method `mutating`")
+            try self.fail(span, "cannot assign to immutable binding `" + name + "`; declare it with `var`")
+        let checked = try self.check_expression(value, local.value_type)
+        # `value += delta` must leave `value` its own type, so the compound
+        # operator is checked as the binary operation it abbreviates.
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(local.value_type, binary_operator, self.state.type_of(checked), span)
+            if not types_match(resolved.result, local.value_type):
+                try self.fail(
+                    span,
+                    "assignment changes `" + name + "` from `" + self.describe_type(local.value_type) + "` to `" + self.describe_type(resolved.result) + "`",
+                )
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        return self.state.push_statement(HirNodeForm.Assignment(symbol = local.symbol, operation = operation, value = checked), span)
+
+    # C-owned globals are always mutable, and every read/write remains an
+    # observable HIR operation. Compound assignment is one read followed by
+    # one write, expressed by the same resolved operation as local assignment.
+    func check_extern_assignment(variable_index: i64, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let variable = self.state.extern_variables[variable_index]
+        let checked = try self.check_expression(value, variable.value_type)
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(variable.value_type, binary_operator, self.state.type_of(checked), span)
+            if not types_match(resolved.result, variable.value_type):
+                try self.fail(span, "assignment changes `" + variable.name + "` from `" + self.describe_type(variable.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        return self.state.push_statement(HirNodeForm.ExternStore(variable = u32(variable_index), operation = operation, value = checked), span)
+
+    func check_global_assignment(global_index: i64, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let global = self.state.globals[global_index]
+        let checked = try self.check_expression(value, global.value_type)
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(global.value_type, binary_operator, self.state.type_of(checked), span)
+            if not types_match(resolved.result, global.value_type):
+                try self.fail(span, "assignment changes runtime global `" + global.name + "` from `" + self.describe_type(global.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        return self.state.push_statement(HirNodeForm.GlobalStore(global = u32(global_index), operation = operation, value = checked), span)
+
+    # Resolve every field name and index expression in an assignment target
+    # once. The resulting path is target-neutral and can mix value fields,
+    # fixed arrays, and shared list storage; consumers never walk source
+    # syntax or repeat type checks.
+    func check_place_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let place = try self.resolve_assignment_place(target, span, true)
+        if len(place.steps) == 0: trap("place assignment has no path steps")
+        let checked = try self.check_expression(value, place.value_type)
+        var operation: AssignmentOperation = AssignmentOperation.Replace
+        if operator != "=":
+            let binary_operator = operator[0:len(operator) - 1]
+            let resolved = try self.resolve_binary_operation(place.value_type, binary_operator, self.state.type_of(checked), span)
+            if not types_match(resolved.result, place.value_type):
+                try self.fail(span, "assignment changes the place from `" + self.describe_type(place.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
+            operation = AssignmentOperation.Combine(operation = resolved.operation)
+        let steps = self.state.push_run(place.steps)
+        if place.global >= 0:
+            return self.state.push_statement(HirNodeForm.GlobalPlaceAssignment(global = u32(place.global), steps = steps, operation = operation, value = checked), span)
+        return self.state.push_statement(HirNodeForm.PlaceAssignment(symbol = place.symbol, steps = steps, operation = operation, value = checked), span)
+
+    # `mutate_value` is false while merely reaching a reference collection.
+    # A `let` binding or field may expose a mutable list even though the value
+    # containing that reference cannot itself be replaced.
+    func resolve_assignment_place(target: ExpressionSyntax, span: SourceSpan, mutate_value: bool) -> CheckedPlace!:
+        match target.form:
+            Group(grouped): return try self.resolve_assignment_place(grouped, span, mutate_value)
+            Name(root_name):
+                let local_index = self.state.find_local(root_name)
+                if local_index < 0:
+                    let global_index = self.state.find_global_in_module(self.state.current_module, root_name)
+                    if global_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
+                    let global = self.state.globals[global_index]
+                    return CheckedPlace(
+                        symbol = SymbolId(value = no_node),
+                        global = global_index,
+                        value_type = global.value_type,
+                        steps = list[u32](),
+                        initializer_field = false,
+                    )
+                let local = self.state.locals[local_index]
+                var initializer_field = false
+                let active_receiver = self.state.current_receiver
+                if root_name == "self" and active_receiver != none:
+                    initializer_field = active_receiver.kind == HirReceiverKind.initializer
+                if mutate_value and not local.is_mutable and not initializer_field:
+                    if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
+                    try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
+                return CheckedPlace(symbol = local.symbol, global = -1, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
+            Member(base, name):
+                let place = try self.resolve_assignment_place(base, span, mutate_value)
+                let struct_index = self.declarations.struct_of(place.value_type)
+                if struct_index < 0: try self.fail(span, "`" + self.describe_type(place.value_type) + "` has no field `" + name + "`")
+                let field_index = self.declarations.find_field(struct_index, name)
+                if field_index < 0: try self.fail(span, "struct `" + self.state.structs[struct_index].name + "` has no field `" + name + "`")
+                let field = self.state.structs[struct_index].fields[field_index]
+                if not field.is_public and self.state.structs[struct_index].module_index != self.state.current_module:
+                    try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.structs[struct_index].module_index].name + "`")
+                if mutate_value and not field.is_mutable and not place.initializer_field:
+                    try self.fail(span, "cannot assign to `let` field `" + name + "`; declare it with `var`")
+                place.steps.append(place_field_step)
+                place.steps.append(u32(field_index))
+                return CheckedPlace(symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
+            Index(base, subscript):
+                let inspected = try self.resolve_assignment_place(base, span, false)
+                var element_type = resolve_builtin_type(BuiltinType.unit)
+                var step = place_element_step
+                match self.state.types.definitions[inspected.value_type.value].form:
+                    Array(element, count): element_type = element
+                    List(element):
+                        element_type = element
+                        step = place_list_element_step
+                    else: try self.fail(span, "`" + self.describe_type(inspected.value_type) + "` does not support mutable indexing")
+                var place = inspected
+                if step == place_element_step:
+                    place = try self.resolve_assignment_place(base, span, true)
+                let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
+                place.steps.append(step)
+                place.steps.append(index.value)
+                return CheckedPlace(symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
+            else: error(self.diagnostic(span, "assignment needs a named mutable place"))
+
+    # A return must match the enclosing function's contract: a value
+    # for a value-returning function, nothing for a unit function.
+    func check_return(value: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
+        var successful_result = self.state.current_result
+        let fallible_result = self.state.fallible_inner(self.state.current_result)
+        if fallible_result != none: successful_result = fallible_result
+        if value == none:
+            if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)):
+                try self.fail(span, "return requires a `" + self.describe_type(successful_result) + "` value")
+            return self.state.push_statement(HirNodeForm.ReturnStatement(value = NodeId(value = no_node)), span)
+        if types_match(successful_result, resolve_builtin_type(BuiltinType.unit)):
+            try self.fail(span, "a `unit` function cannot return a value")
+        let checked = try self.check_expression(value, successful_result)
+        return self.state.push_statement(HirNodeForm.ReturnStatement(value = checked), span)
+
+    # Ordinary `if`/`elif` conditions are bool. A conditional binding is the
+    # source shorthand for the same exhaustive optional selection HIR already
+    # uses for `match`: `.some(name)` executes the successful suite and
+    # `.none` executes the fallback (or an empty suite). Keeping one resolved
+    # shape gives both spellings identical scoping, ownership, and lowering.
+    func check_if(branches: list[IfBranchSyntax], fallback: SuiteSyntax?, span: SourceSpan) -> NodeId!:
+        if len(branches) > 0:
+            match branches[0].condition.form:
+                Binding(name, value):
+                    if len(branches) != 1:
+                        try self.fail(branches[1].span, "a conditional binding cannot have an `elif` branch")
+                    return try self.check_conditional_binding(name, value, branches[0].body, branches[0].span, branches[0].condition.span, fallback, span)
+                else: pass
+
+        # One triple per branch: condition node, body run start, body run count.
+        let triples = list[u32]()
+        for branch in branches:
+            match branch.condition.form:
+                Expression(condition):
+                    let checked = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
+                    let body = self.state.push_nodes(try self.check_suite(branch.body.statements))
+                    triples.append(checked.value)
+                    triples.append(body.start)
+                    triples.append(body.count)
+                else:
+                    try self.fail(branch.span, "conditional bindings are not implemented yet")
+        var has_fallback = false
+        var typed_fallback = Operands(start = 0, count = 0)
+        if fallback != none:
+            has_fallback = true
+            typed_fallback = self.state.push_nodes(try self.check_suite(fallback.statements))
+        return self.state.push_statement(HirNodeForm.IfStatement(branches = self.state.push_run(triples), has_fallback = has_fallback, fallback = typed_fallback), span)
+
+    func check_conditional_binding(name: str, value: ExpressionSyntax, body: SuiteSyntax, branch_span: SourceSpan, condition_span: SourceSpan, fallback: SuiteSyntax?, span: SourceSpan) -> NodeId!:
+        let subject = try self.check_expression(value, none)
+        let subject_type = self.state.type_of(subject)
+        let inner = self.state.optional_inner(subject_type) else error(self.diagnostic(condition_span, "`if let` requires an optional value, found `" + self.describe_type(subject_type) + "`"))
+
+        try self.state.require_free_local_name(name, condition_span)
+        let symbol = self.state.make_symbol(name, SymbolKind.local, inner)
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = inner, is_mutable = false))
+        let present_body = self.state.push_nodes(try self.check_suite(body.statements))
+        self.state.locals.remove(len(self.state.locals) - 1)
+
+        let present_pattern = self.state.push_node(
+            HirNodeForm.PatternCase(case_index = 1, bindings = self.state.push_run([symbol.value])),
+            subject_type,
+            condition_span,
+        )
+        let present_arm = self.state.push_statement(HirNodeForm.MatchArm(
+            patterns = self.state.push_nodes([present_pattern]),
+            statements = present_body,
+            value = NodeId(value = no_node),
+        ), branch_span)
+
+        var absent_body = Operands(start = 0, count = 0)
+        var absent_span = span
+        if fallback != none:
+            absent_body = self.state.push_nodes(try self.check_suite(fallback.statements))
+            absent_span = fallback.span
+        let absent_pattern = self.state.push_node(
+            HirNodeForm.PatternCase(case_index = 0, bindings = self.state.push_run(list[u32]())),
+            subject_type,
+            condition_span,
+        )
+        let absent_arm = self.state.push_statement(HirNodeForm.MatchArm(
+            patterns = self.state.push_nodes([absent_pattern]),
+            statements = absent_body,
+            value = NodeId(value = no_node),
+        ), absent_span)
+
+        return self.state.push_statement(HirNodeForm.Match(
+            subject = subject,
+            arms = self.state.push_nodes([present_arm, absent_arm]),
+            has_result = false,
+        ), span)
+
+    # The loop depth makes `break` and `continue` valid inside the body.
+    func check_while(condition: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
+        let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
+        self.state.loop_depth += 1
+        let checked_body = try self.check_suite(body.statements)
+        self.state.loop_depth -= 1
+        return self.state.push_statement(HirNodeForm.WhileStatement(condition = checked_condition, body = self.state.push_nodes(checked_body)), span)
+
+    # Built-in ranges and lists share one HIR loop shape. User-defined
+    # `Iterable[T]` dispatch joins it when interfaces land; `try for` remains
+    # reserved for the fallible protocol path.
+    func check_for(is_fallible: bool, name: str, iterable: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
+        if is_fallible:
+            try self.fail(span, "`try for` needs fallible iteration, which is not implemented yet")
+        let checked_iterable = try self.check_expression(iterable, none)
+        var element: TypeId? = none
+        match self.state.types.definitions[self.state.type_of(checked_iterable).value].form:
+            Range(inner): element = inner
+            List(inner): element = inner
+            else: pass
+        let element_type = element else error(self.diagnostic(iterable.span, "`for` needs an iterable value, found `" + self.describe_type(self.state.type_of(checked_iterable)) + "`"))
+        try self.state.require_free_local_name(name, span)
+        let symbol = self.state.make_symbol(name, SymbolKind.local, element_type)
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = false))
+        self.state.loop_depth += 1
+        let checked_body = self.check_suite(body.statements) catch reason:
+            self.state.loop_depth -= 1
+            self.state.locals.remove(len(self.state.locals) - 1)
+            error(reason)
+        self.state.loop_depth -= 1
+        self.state.locals.remove(len(self.state.locals) - 1)
+        return self.state.push_statement(HirNodeForm.ForStatement(symbol = symbol, iterable = checked_iterable, body = self.state.push_nodes(checked_body)), span)
+
+    # mark: Expressions =========================================================================
+
+    # Check one expression. `expected` is the type the surrounding context
+    # requires, or none where any type is welcome; every produced expression
+    # passes `require_type` on its way out.
+    func check_expression(value: ExpressionSyntax, expected: TypeId?) -> NodeId!:
+        match value.form:
+            Literal(token): return try self.check_literal(token, expected)
+            Name(name):
+                let local_index = self.state.find_local(name)
+                if local_index >= 0:
+                    let local = self.state.locals[local_index]
+                    let reference = self.state.push_node(HirNodeForm.Reference(symbol = local.symbol), local.value_type, value.span)
+                    return try self.require_type(reference, expected)
+                let constant_index = self.state.find_constant_in_module(self.state.current_module, name)
+                if constant_index >= 0:
+                    try self.resolve_constant(constant_index)
+                    let constant = self.state.constants[constant_index]
+                    if constant.typed.value == no_node: trap("constant was not typed")
+                    let reference = self.state.push_node(HirNodeForm.Reference(symbol = constant.symbol), self.state.type_of(constant.typed), value.span)
+                    return try self.require_type(reference, expected)
+                let global_index = self.state.find_global_in_module(self.state.current_module, name)
+                if global_index >= 0:
+                    let global = self.state.globals[global_index]
+                    let load = self.state.push_node(HirNodeForm.GlobalLoad(global = u32(global_index)), global.value_type, value.span)
+                    return try self.require_type(load, expected)
+                let variable_index = self.state.find_visible_extern_variable(name)
+                if variable_index >= 0:
+                    let variable = self.state.extern_variables[variable_index]
+                    let load = self.state.push_node(HirNodeForm.ExternLoad(variable = u32(variable_index)), variable.value_type, value.span)
+                    return try self.require_type(load, expected)
+                let function_index = self.state.find_visible_function(name)
+                if function_index >= 0:
+                    return try self.check_function_address(function_index, value.span, expected)
+                if self.declarations.find_struct_in_module(self.state.current_module, name) >= 0:
+                    try self.fail(value.span, "`" + name + "` is a type; construct a value with `" + name + "(...)` or call a type function with `" + name + ".name(...)`")
+                if self.declarations.find_enum_in_module(self.state.current_module, name) >= 0:
+                    try self.fail(value.span, "`" + name + "` is a type; name a case with `" + name + ".case`")
+                error(self.diagnostic(value.span, "unknown name `" + name + "`"))
+            Group(grouped): return try self.check_expression(grouped, expected)
+            TupleValue(elements):
+                return try self.check_tuple(elements, value.span, expected)
+            Unary(operator, operand): return try self.check_unary(operator, operand, value.span, expected)
+            Binary(left, operator, right): return try self.check_binary(left, operator, right, value.span, expected)
+            Conditional(selected, condition, alternative):
+                let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
+                let checked_value = try self.check_expression(selected, expected)
+                let checked_alternative = try self.check_expression(alternative, self.state.type_of(checked_value))
+                let typed = self.state.push_node(
+                    HirNodeForm.Conditional(value = checked_value, condition = checked_condition, alternative = checked_alternative),
+                    self.state.type_of(checked_value),
+                    value.span,
+                )
+                return try self.require_type(typed, expected)
+            Call(callee, type_arguments, arguments):
+                return try self.check_call(callee, type_arguments, arguments, value.span, expected)
+            ElseValue(optional_value, arm):
+                return try self.check_else(optional_value, arm, value.span, expected)
+            FormattedString(start, parts):
+                error(self.diagnostic(value.span, "formatted strings are not implemented yet"))
+            CaseValue(name, arguments):
+                # `.case(...)`: the enum comes from context, looking through
+                # an optional (`let s: Shape? = .dot`).
+                let needed = expected else error(self.diagnostic(value.span, "`." + name + "` needs an enum type from context"))
+                var target = needed
+                let inner = self.state.optional_inner(needed)
+                if inner != none and self.declarations.enum_of(inner) >= 0: target = inner
+                let enum_index = self.declarations.enum_of(target)
+                if enum_index < 0: try self.fail(value.span, "expected `" + self.describe_type(needed) + "`, found the case spelling `." + name + "`")
+                let case_index = self.declarations.find_case(enum_index, name)
+                if case_index < 0: try self.fail(value.span, "enum `" + self.state.enums[enum_index].name + "` has no case `" + name + "`")
+                return try self.check_enum_value(enum_index, case_index, arguments, value.span, expected)
+            ListValue(elements):
+                return try self.check_array_literal(elements, value.span, expected)
+            MapValue(entries):
+                error(self.diagnostic(value.span, "map literals are not implemented yet"))
+            Member(member_value, name):
+                return try self.check_field_access(member_value, name, value.span, expected)
+            Index(indexed, subscript):
+                return try self.check_index(indexed, subscript, value.span, expected)
+            Slice(sliced, start, operator, end):
+                return try self.check_slice(sliced, start, end, value.span, expected)
+            Lambda(parameters, body):
+                error(self.diagnostic(value.span, "lambdas are not implemented yet"))
+            Closure(captures, parameters, result, body):
+                error(self.diagnostic(value.span, "closures are not implemented yet"))
+            MatchValue(subject, arms):
+                return try self.check_match_value(subject, arms, value.span, expected)
+            NewValue(value_type, arguments):
+                error(self.diagnostic(value.span, "`new` is not implemented yet"))
+            SpawnValue(function, arguments):
+                error(self.diagnostic(value.span, "`spawn` is not implemented yet"))
+            CatchValue(caught, failure_name, body):
+                return try self.check_catch(caught, failure_name, body, value.span, expected)
+
+    # A bare literal becomes a constant. An unsuffixed integer is i64 unless
+    # the context asks for another integer width, e.g. `let count: i32 = 7`.
+    func check_literal(token: Token, expected: TypeId?) -> NodeId!:
+        var value_type = resolve_builtin_type(BuiltinType.unit)
+        var value = Value.Unit
+        if token.kind == TokenKind.int_lit:
+            let integer_type = try self.integer_literal_type(token, expected)
+            let integer = try self.decode_integer(token)
+            try self.require_integer_range(token.span, integer, integer_type)
+            value_type = integer_type
+            value = Value.Integer(value = integer)
+        elif token.kind == TokenKind.float_lit:
+            if token.suffix == "f32":
+                value_type = resolve_builtin_type(BuiltinType.float32)
+            elif token.suffix == "" or token.suffix == "f64":
+                value_type = resolve_builtin_type(BuiltinType.float64)
+            else:
+                try self.fail(token.span, "float type `" + token.suffix + "` is not implemented yet")
+            value = Value.Floating(value = try self.decode_float(token))
+        elif token.text == "true" or token.text == "false":
+            value_type = resolve_builtin_type(BuiltinType.boolean)
+            value = Value.Boolean(value = token.text == "true")
+        elif token.text == "none":
+            let needed = expected else error(self.diagnostic(token.span, "`none` needs an optional type from context"))
+            if self.state.optional_inner(needed) == none:
+                try self.fail(token.span, "expected `" + self.describe_type(needed) + "`, found `none`")
+            return self.state.push_node(HirNodeForm.NoneLiteral, needed, token.span)
+        elif token.kind == TokenKind.char_lit:
+            value_type = resolve_builtin_type(BuiltinType.character)
+            value = Value.Character(value = try self.decode_character(token))
+        elif token.kind == TokenKind.str_lit:
+            value_type = resolve_builtin_type(BuiltinType.string)
+            value = Value.Text(value = try self.decode_print_text(token))
+        elif token.kind == TokenKind.byte_lit:
+            value_type = resolve_builtin_type(BuiltinType.byte_string)
+            value = Value.Bytes(value = try self.decode_bytes(token))
+        else:
+            error(self.diagnostic(token.span, "this literal is not implemented yet"))
+        return try self.require_type(self.push_constant(value, value_type, token.span), expected)
+
+    func integer_literal_type(token: Token, expected: TypeId?) -> TypeId!:
+        if token.suffix != "":
+            let suffix_type = builtin_type_id(token.suffix) else error(self.diagnostic(token.span, "integer type `" + token.suffix + "` is not implemented yet"))
+            if not is_integer_type(self.state.types, suffix_type):
+                try self.fail(token.span, "integer type `" + token.suffix + "` is not implemented yet")
+            return suffix_type
+        if expected != none and is_integer_type(self.state.types, expected): return expected
+        return resolve_builtin_type(BuiltinType.signed_i64)
+
+    func require_integer_range(span: SourceSpan, value: i64, value_type: TypeId) -> !:
+        if value < integer_minimum(self.state.types, value_type) or value > integer_maximum(self.state.types, value_type):
+            try self.fail(span, "integer literal is outside `" + self.describe_type(value_type) + "` range")
+
+    func check_unary(operator: str, operand: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if operator == "not":
+            let boolean_type = resolve_builtin_type(BuiltinType.boolean)
+            let checked = try self.check_expression(operand, boolean_type)
+            let expression = self.state.push_node(HirNodeForm.Unary(operation = UnaryOperation.LogicalNot, operand = checked), boolean_type, span)
+            return try self.require_type(expression, expected)
+        if operator == "try":
+            let checked = try self.check_expression(operand, none)
+            let successful = self.state.fallible_inner(self.state.type_of(checked)) else error(self.diagnostic(span, "`try` needs a fallible expression"))
+            if self.state.fallible_inner(self.state.current_result) == none:
+                try self.fail(span, "`try` can propagate failure only from a fallible function")
+            let typed = self.state.push_node(HirNodeForm.Try(value = checked), successful, span)
+            return try self.require_type(typed, expected)
+
+        # Numeric unary operators produce a non-optional value even when the
+        # surrounding context will promote that result to `T?`.
+        let operand_context = self.optional_value_context(expected)
+
+        # `-9223372036854775808` must fold as one negative literal: its
+        # magnitude does not fit positive i64, so negate-after-check would
+        # reject the minimum. Other operands take the general path below.
+        if operator == "-" and operand_context != none and is_unsigned_integer_type(self.state.types, operand_context):
+            try self.fail(span, "`-` is invalid for `" + self.describe_type(operand_context) + "`")
+        if operator == "-" and (operand_context == none or is_integer_type(self.state.types, operand_context)):
+            let literal = find_literal_token(operand)
+            if literal != none and literal.kind == TokenKind.int_lit:
+                let integer_type = try self.integer_literal_type(literal, operand_context)
+                if is_unsigned_integer_type(self.state.types, integer_type):
+                    try self.fail(span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
+                let integer = try self.decode_negative_integer(literal)
+                try self.require_integer_range(literal.span, integer, integer_type)
+                let value = Value.Integer(value = integer)
+                return try self.require_type(self.push_constant(value, integer_type, span), expected)
+
+        let checked = try self.check_expression(operand, operand_context)
+        let checked_type = self.state.type_of(checked)
+        var operation = UnaryOperation.NumericIdentity(operand_type = checked_type)
+        if operator == "~":
+            if not is_integer_type(self.state.types, checked_type):
+                try self.fail(span, "`~` requires an integer, found `" + self.describe_type(checked_type) + "`")
+            operation = UnaryOperation.IntegerBitwiseNot(operand_type = checked_type)
+        elif operator == "+" or operator == "-":
+            if not is_numeric_type(self.state.types, checked_type):
+                try self.fail(span, "`" + operator + "` requires a number, found `" + self.describe_type(checked_type) + "`")
+            if operator == "-" and is_unsigned_integer_type(self.state.types, checked_type):
+                try self.fail(span, "`-` is invalid for `" + self.describe_type(checked_type) + "`")
+            if operator == "-": operation = UnaryOperation.NumericNegate(operand_type = checked_type)
+        else:
+            error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
+        let expression = self.state.push_node(HirNodeForm.Unary(operation = operation, operand = checked), checked_type, span)
+        return try self.require_type(expression, expected)
+
+    func check_binary(left: ExpressionSyntax, operator: str, right: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if operator == "..<" or operator == "..=":
+            return try self.check_range(left, operator, right, span, expected)
+        # An arithmetic result has its operands' type, so the expected type
+        # reaches down into the operands; comparisons produce bool, so it
+        # must not.
+        var operand_context: TypeId? = none
+        if is_arithmetic_operator(operator) and expected != none:
+            operand_context = self.optional_value_context(expected)
+
+        let operands = try self.check_binary_operands(left, right, operand_context)
+        let resolved = try self.resolve_binary_operation(self.state.type_of(operands.left), operator, self.state.type_of(operands.right), span)
+        let typed = self.state.push_node(HirNodeForm.Binary(left = operands.left, operation = resolved.operation, right = operands.right), resolved.result, span)
+        return try self.require_type(typed, expected)
+
+    # A range keeps equal-width integer bounds and whether its upper endpoint
+    # is included. Unsuffixed literals take their width from either neighbor
+    # or from an expected `range[T]`.
+    func check_range(left: ExpressionSyntax, operator: str, right: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var element_context: TypeId? = none
+        let range_context = self.optional_value_context(expected)
+        if range_context != none: element_context = self.state.range_inner(range_context)
+        let operands = try self.check_binary_operands(left, right, element_context)
+        let element = self.state.type_of(operands.left)
+        if not types_match(element, self.state.type_of(operands.right)):
+            try self.fail(span, "range bounds must have one type, found `" + self.describe_type(element) + "` and `" + self.describe_type(self.state.type_of(operands.right)) + "`")
+        if not is_integer_type(self.state.types, element):
+            try self.fail(span, "range bounds need integers, found `" + self.describe_type(element) + "`")
+        let value_type = self.state.intern_range(element)
+        let typed = self.state.push_node(HirNodeForm.Range(lower = operands.left, upper = operands.right, inclusive = operator == "..="), value_type, span)
+        return try self.require_type(typed, expected)
+
+    # Give an unsuffixed integer literal context from either neighbor. For
+    # `5 * count`, the informative right side is checked first, but the returned
+    # HIR operands remain in source order and therefore execute left-to-right.
+    func check_binary_operands(left: ExpressionSyntax, right: ExpressionSyntax, context: TypeId?) -> CheckedBinaryOperands!:
+        if context == none and is_contextual_integer_expression(left) and not is_contextual_integer_expression(right):
+            let checked_right = try self.check_expression(right, none)
+            let checked_left = try self.check_expression(left, self.state.type_of(checked_right))
+            return CheckedBinaryOperands(left = checked_left, right = checked_right)
+
+        let checked_left = try self.check_expression(left, context)
+        let checked_right = try self.check_expression(right, self.state.type_of(checked_left))
+        return CheckedBinaryOperands(left = checked_left, right = checked_right)
+
+    # The operator table: what each binary operator accepts and what it
+    # produces. Both sides must already have the same type; there are no
+    # implicit conversions anywhere in the language.
+    func resolve_binary_operation(left: TypeId, operator: str, right: TypeId, span: SourceSpan) -> ResolvedBinary!:
+        if not types_match(left, right):
+            try self.fail(span, "`" + operator + "` has `" + self.describe_type(left) + "` on the left and `" + self.describe_type(right) + "` on the right")
+        let boolean_type = resolve_builtin_type(BuiltinType.boolean)
+        if operator == "and" or operator == "or":
+            if not types_match(left, boolean_type): try self.fail(span, "`" + operator + "` requires `bool` operands")
+            if operator == "and": return ResolvedBinary(operation = BinaryOperation.LogicalAnd, result = boolean_type)
+            return ResolvedBinary(operation = BinaryOperation.LogicalOr, result = boolean_type)
+        if operator == "==" or operator == "!=":
+            if not self.declarations.is_equatable_type(left): try self.fail(span, "`" + operator + "` cannot compare `" + self.describe_type(left) + "`")
+            if operator == "==": return ResolvedBinary(operation = BinaryOperation.Equal(operand_type = left), result = boolean_type)
+            return ResolvedBinary(operation = BinaryOperation.NotEqual(operand_type = left), result = boolean_type)
+        if operator == "is" or operator == "is not":
+            match self.state.types.definitions[left.value].form:
+                List(element): pass
+                else: try self.fail(span, "`" + operator + "` requires shared reference operands, found `" + self.describe_type(left) + "`")
+            if operator == "is": return ResolvedBinary(operation = BinaryOperation.Identity(operand_type = left), result = boolean_type)
+            return ResolvedBinary(operation = BinaryOperation.NotIdentity(operand_type = left), result = boolean_type)
+        if operator == "<" or operator == "<=" or operator == ">" or operator == ">=":
+            if not is_ordered_type(self.state.types, left): try self.fail(span, "`" + operator + "` does not order `" + self.describe_type(left) + "`")
+            if operator == "<": return ResolvedBinary(operation = BinaryOperation.Less(operand_type = left), result = boolean_type)
+            if operator == "<=": return ResolvedBinary(operation = BinaryOperation.LessEqual(operand_type = left), result = boolean_type)
+            if operator == ">": return ResolvedBinary(operation = BinaryOperation.Greater(operand_type = left), result = boolean_type)
+            return ResolvedBinary(operation = BinaryOperation.GreaterEqual(operand_type = left), result = boolean_type)
+        if operator == "/":
+            if not is_floating_type(self.state.types, left): try self.fail(span, "`/` requires floating-point operands")
+            return ResolvedBinary(operation = BinaryOperation.Divide(operand_type = left), result = left)
+        if operator == "//" or operator == "%":
+            if not is_integer_type(self.state.types, left): try self.fail(span, "`" + operator + "` requires integer operands")
+            if operator == "//": return ResolvedBinary(operation = BinaryOperation.FloorDivide(operand_type = left), result = left)
+            return ResolvedBinary(operation = BinaryOperation.Remainder(operand_type = left), result = left)
+        if operator == "+":
+            match self.state.types.definitions[left.value].form:
+                List(element): return ResolvedBinary(operation = BinaryOperation.Add(operand_type = left), result = left)
+                Bytes: return ResolvedBinary(operation = BinaryOperation.Add(operand_type = left), result = left)
+                else: pass
+        if operator == "+" or operator == "-" or operator == "*":
+            if not is_numeric_type(self.state.types, left): try self.fail(span, "`" + operator + "` requires numeric operands")
+            if operator == "+": return ResolvedBinary(operation = BinaryOperation.Add(operand_type = left), result = left)
+            if operator == "-": return ResolvedBinary(operation = BinaryOperation.Subtract(operand_type = left), result = left)
+            return ResolvedBinary(operation = BinaryOperation.Multiply(operand_type = left), result = left)
+        if operator == "&" or operator == "|" or operator == "^" or operator == "<<" or operator == ">>":
+            if not is_integer_type(self.state.types, left): try self.fail(span, "`" + operator + "` requires integer operands")
+            if operator == "&": return ResolvedBinary(operation = BinaryOperation.BitwiseAnd(operand_type = left), result = left)
+            if operator == "|": return ResolvedBinary(operation = BinaryOperation.BitwiseOr(operand_type = left), result = left)
+            if operator == "^": return ResolvedBinary(operation = BinaryOperation.BitwiseXor(operand_type = left), result = left)
+            if operator == "<<": return ResolvedBinary(operation = BinaryOperation.ShiftLeft(operand_type = left), result = left)
+            return ResolvedBinary(operation = BinaryOperation.ShiftRight(operand_type = left), result = left)
+        error(self.diagnostic(span, "operator `" + operator + "` is not implemented yet"))
+
+    # Check one call: each parameter must be supplied once.
+    func check_call(callee: ExpressionSyntax, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        match callee.form:
+            Name(name):
+                if name == "error" and self.state.find_local(name) < 0:
+                    return try self.check_error_call(arguments, span, expected)
+                if name == "list" and self.state.find_local(name) < 0:
+                    return try self.check_list_constructor(type_arguments, arguments, span, expected)
+            Member(owner, name):
+                match owner.form:
+                    Name(owner_name):
+                        if owner_name == "native":
+                            return try self.check_native_call(name, type_arguments, arguments, span, expected)
+                        if owner_name == "ErrorCode" and name == "package" and self.state.find_local(owner_name) < 0:
+                            return try self.check_error_code_package(arguments, span, expected)
+                    else: pass
+            else: pass
+        if len(type_arguments) > 0: try self.fail(span, "generic calls are not implemented yet")
+        match callee.form:
+            Name(name):
+                if self.state.find_local(name) >= 0 or self.state.find_constant_in_module(self.state.current_module, name) >= 0 or self.state.find_global_in_module(self.state.current_module, name) >= 0 or self.state.find_visible_extern_variable(name) >= 0:
+                    let checked = try self.check_expression(callee, none)
+                    return try self.check_indirect_call_node(checked, arguments, span, expected)
+            Member(owner, name):
+                return try self.check_member_call(owner, name, arguments, callee.span, span, expected)
+            else:
+                let checked = try self.check_expression(callee, none)
+                return try self.check_indirect_call_node(checked, arguments, span, expected)
+        return try self.check_resolved_call(try self.resolve_callee(callee), arguments, callee.span, span, expected)
+
+    # Native intrinsics are ordinary typed HIR nodes, not calls or backend
+    # names. Their source order is explicit and every operation learns layout
+    # only after the shared lowerer has preserved the pointee TypeId in MIR.
+    # Storage capabilities are narrower still: native authority is necessary,
+    # but only the sealed runtime package may request typed blocks or the
+    # process arena that its allocator manages.
+    func check_native_call(name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if self.state.sources[self.state.current_module].authority != ModuleAuthority.native:
+            try self.fail(span, "native operations require a `.native.luc` module")
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "native operations use positional arguments")
+        if name == "allocate":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.allocate` is reserved for the sealed runtime package")
+            if len(type_arguments) != 1:
+                try self.fail(span, "`native.allocate[T]` needs exactly one stored type")
+            var element_type = resolve_builtin_type(BuiltinType.unit)
+            match type_arguments[0]:
+                TypeArgument(element): element_type = try self.declarations.resolve_type(self.state.current_module, element)
+                else: try self.fail(span, "`native.allocate[T]` needs exactly one stored type")
+            if self.state.contains_fallible(element_type):
+                try self.fail(span, "`native.allocate` cannot store a fallible type; `T!` is a function-result effect")
+            if len(arguments) != 1: try self.fail(span, "`native.allocate[T]` takes one `u64` element count")
+            let count = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            let result_type = self.state.intern_native_pointer(element_type, true)
+            let typed = self.state.push_node(HirNodeForm.NativeAllocate(element_type = element_type, count = count), result_type, span)
+            return try self.require_type(typed, expected)
+        if name == "deallocate":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.deallocate` is reserved for the sealed runtime package")
+            if len(type_arguments) > 0:
+                try self.fail(span, "`native.deallocate` infers its stored type from the pointer")
+            if len(arguments) != 2:
+                try self.fail(span, "`native.deallocate` takes a mutable typed pointer and one `u64` element count")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            let pointer_type = try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.deallocate`")
+            if not pointer_type.is_mutable:
+                try self.fail(arguments[0].span, "`native.deallocate` needs `native_mut_ptr`, found `" + self.describe_type(self.state.type_of(pointer)) + "`")
+            let count = try self.check_expression(arguments[1].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            let typed = self.state.push_node(
+                HirNodeForm.NativeDeallocate(pointer = pointer, element_type = pointer_type.pointee, count = count),
+                resolve_builtin_type(BuiltinType.unit),
+                span,
+            )
+            return try self.require_type(typed, expected)
+        if len(type_arguments) > 0: try self.fail(span, "`native." + name + "` does not take type arguments")
+        if name == "load":
+            if len(arguments) != 1: try self.fail(span, "`native.load` takes one typed pointer")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            let pointer_type = try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.load`")
+            let typed = self.state.push_node(HirNodeForm.NativeLoad(pointer = pointer), pointer_type.pointee, span)
+            return try self.require_type(typed, expected)
+        if name == "store":
+            if len(arguments) != 2: try self.fail(span, "`native.store` takes a mutable typed pointer and one value")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            let pointer_type = try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.store`")
+            if not pointer_type.is_mutable: try self.fail(arguments[0].span, "`native.store` needs `native_mut_ptr`, found `" + self.describe_type(self.state.type_of(pointer)) + "`")
+            let stored = try self.check_expression(arguments[1].value, pointer_type.pointee)
+            let typed = self.state.push_node(HirNodeForm.NativeStore(pointer = pointer, value = stored), resolve_builtin_type(BuiltinType.unit), span)
+            return try self.require_type(typed, expected)
+        if name == "advance":
+            if len(arguments) != 2: try self.fail(span, "`native.advance` takes a typed pointer and a `u64` element count")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            discard(try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.advance`"))
+            let count = try self.check_expression(arguments[1].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            let typed = self.state.push_node(HirNodeForm.NativeAdvance(pointer = pointer, count = count), self.state.type_of(pointer), span)
+            return try self.require_type(typed, expected)
+        if name == "rebind":
+            if len(arguments) != 1: try self.fail(span, "`native.rebind` takes one typed pointer and needs a contextual result type")
+            let target = expected else error(self.diagnostic(span, "`native.rebind` needs a contextual native pointer result type"))
+            let target_pointer = try self.require_native_pointer(target, span, "`native.rebind` result")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            let source_pointer = try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.rebind`")
+            if target_pointer.is_mutable and not source_pointer.is_mutable:
+                try self.fail(arguments[0].span, "`native.rebind` cannot add pointer mutability")
+            return self.state.push_node(HirNodeForm.NativeRebind(pointer = pointer), target, span)
+        if name == "move":
+            if len(arguments) != 3: try self.fail(span, "`native.move` takes destination, source, and an element count")
+            let destination = try self.check_expression(arguments[0].value, none)
+            let destination_pointer = try self.require_native_pointer(self.state.type_of(destination), arguments[0].span, "`native.move` destination")
+            if not destination_pointer.is_mutable: try self.fail(arguments[0].span, "`native.move` needs a mutable destination")
+            let source = try self.check_expression(arguments[1].value, none)
+            let source_pointer = try self.require_native_pointer(self.state.type_of(source), arguments[1].span, "`native.move` source")
+            if not types_match(destination_pointer.pointee, source_pointer.pointee):
+                try self.fail(span, "`native.move` has `" + self.describe_type(destination_pointer.pointee) + "` destination elements and `" + self.describe_type(source_pointer.pointee) + "` source elements")
+            let count = try self.check_expression(arguments[2].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            let typed = self.state.push_node(HirNodeForm.NativeMove(destination = destination, source = source, count = count), resolve_builtin_type(BuiltinType.unit), span)
+            return try self.require_type(typed, expected)
+        if name == "is_null":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.is_null` is reserved for the sealed runtime package")
+            if len(arguments) != 1: try self.fail(span, "`native.is_null` takes one typed pointer")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            discard(try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.is_null`"))
+            let typed = self.state.push_node(HirNodeForm.NativeIsNull(pointer = pointer), resolve_builtin_type(BuiltinType.boolean), span)
+            return try self.require_type(typed, expected)
+        if name == "arena":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.arena` is reserved for the sealed runtime package")
+            if len(arguments) != 1: try self.fail(span, "`native.arena` takes one `u64` committed-prefix end")
+            let end = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            let byte_pointer = self.state.intern_native_pointer(resolve_builtin_type(BuiltinType.unsigned_u8), true)
+            let typed = self.state.push_node(HirNodeForm.NativeArena(end = end), byte_pointer, span)
+            return try self.require_type(typed, expected)
+        error(self.diagnostic(span, "unknown native operation `native." + name + "`"))
+
+    func require_native_pointer(value_type: TypeId, span: SourceSpan, operation: str) -> NativePointerType!:
+        match self.state.types.definitions[value_type.value].form:
+            NativePointer(pointee, is_mutable): return NativePointerType(pointee = pointee, is_mutable = is_mutable)
+            else: error(self.diagnostic(span, operation + " needs a typed native pointer, found `" + self.describe_type(value_type) + "`"))
+
+    # Resolve the three meanings of `owner.name(...)` once: a module/type
+    # declaration path, an instance method, or a function-valued field. A
+    # value receiver is evaluated exactly once before the latter two diverge.
+    func check_member_call(owner: ExpressionSyntax, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let named = try self.resolve_named_callee(owner, name, callee_span)
+        if named != none: return try self.check_resolved_call(named, arguments, callee_span, span, expected)
+
+        let receiver = try self.check_expression(owner, none)
+        let owner_type = self.state.type_of(receiver)
+        match self.state.types.definitions[owner_type.value].form:
+            List(element_type):
+                return try self.check_list_call(receiver, owner_type, element_type, name, arguments, callee_span, span, expected)
+            else: pass
+        let method_index = self.declarations.find_method(owner_type, name)
+        if method_index >= 0:
+            let method = self.state.functions[method_index]
+            let method_receiver = method.receiver else trap("method without a receiver")
+            if method_receiver.kind == HirReceiverKind.type_function:
+                try self.fail(callee_span, "`" + name + "` is a type function; call it as `" + self.describe_type(owner_type) + "." + name + "(...)`")
+            if method_receiver.kind == HirReceiverKind.initializer:
+                try self.fail(callee_span, "initializer `init` is called by constructing a `" + self.describe_type(owner_type) + "` value")
+            try self.require_method_visible(method_index, owner_type, callee_span)
+            let resolved = ResolvedCallee(function_index = method_index, receiver = receiver, struct_index = -1, enum_index = -1, case_index = -1)
+            return try self.check_resolved_call(resolved, arguments, callee_span, span, expected)
+        let selected = try self.check_field_access_node(receiver, name, callee_span, none)
+        return try self.check_indirect_call_node(selected, arguments, span, expected)
+
+    func check_list_call(receiver: NodeId, owner_type: TypeId, element_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "append" and name != "insert" and name != "remove_at" and name != "clear" and name != "reserve":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`list." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        let index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`list.copy` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.ListCopy(value = receiver), owner_type, span), expected)
+        if name == "append":
+            if len(arguments) != 1: try self.fail(span, "`list.append` takes one element")
+            let element = try self.check_expression(arguments[0].value, element_type)
+            return try self.require_type(self.state.push_node(HirNodeForm.ListAppend(value = receiver, element = element), unit_type, span), expected)
+        if name == "insert":
+            if len(arguments) != 2: try self.fail(span, "`list.insert` takes an index and one element")
+            let index = try self.check_expression(arguments[0].value, index_type)
+            let element = try self.check_expression(arguments[1].value, element_type)
+            return try self.require_type(self.state.push_node(HirNodeForm.ListInsert(value = receiver, index = index, element = element), unit_type, span), expected)
+        if name == "remove_at":
+            if len(arguments) != 1: try self.fail(span, "`list.remove_at` takes one index")
+            let index = try self.check_expression(arguments[0].value, index_type)
+            return try self.require_type(self.state.push_node(HirNodeForm.ListRemoveAt(value = receiver, index = index), element_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`list.clear` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.ListClear(value = receiver), unit_type, span), expected)
+        if name == "reserve":
+            if len(arguments) != 1: try self.fail(span, "`list.reserve` takes one minimum capacity")
+            let minimum = try self.check_expression(arguments[0].value, index_type)
+            return try self.require_type(self.state.push_node(HirNodeForm.ListReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+        trap("recognized list method did not return a checked HIR node")
+
+    # Apply declaration labels/defaults and the hidden receiver protocol after
+    # call-head resolution has decided that this is a direct declaration call.
+    func check_resolved_call(resolved: ResolvedCallee, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if resolved.struct_index >= 0:
+            return try self.check_struct_value(resolved.struct_index, arguments, span, expected)
+        if resolved.enum_index >= 0:
+            return try self.check_enum_value(resolved.enum_index, resolved.case_index, arguments, span, expected)
+        let function = self.state.functions[resolved.function_index]
+
+        # Pairs of (parameter index, argument node), in source order.
+        let typed_arguments = list[u32]()
+        var first_source_parameter = 0
+        let receiver_value = resolved.receiver
+        if receiver_value.value != no_node:
+            let method = function.receiver else trap("a receiver was resolved for a function without one")
+            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee_span, true)
+            typed_arguments.append(0)
+            typed_arguments.append(receiver_value.value)
+            first_source_parameter = 1
+        let placed = try self.check_function_arguments(
+            function,
+            arguments,
+            first_source_parameter,
+            typed_arguments,
+            span,
+            "function `" + function.name + "`",
+            "call to `" + function.name + "`",
+        )
+        let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = placed), function.result, span)
+        return try self.require_type(typed, expected)
+
+    # Calls through `func` and `cfunc` values share one semantic operation.
+    # Neither type carries declaration labels or defaults; the convention is
+    # a type fact consumed only when canonical MIR is built.
+    func check_indirect_call_node(checked_callee: NodeId, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let parameters = list[TypeId]()
+        var result = resolve_builtin_type(BuiltinType.unit)
+        match self.state.types.definitions[self.state.type_of(checked_callee).value].form:
+            Function(function_parameters, function_result):
+                for parameter in function_parameters: parameters.append(parameter)
+                result = function_result
+            CFunction(function_parameters, function_result):
+                for parameter in function_parameters: parameters.append(parameter)
+                result = function_result
+            else: try self.fail(self.state.span_of(checked_callee), "`" + self.describe_type(self.state.type_of(checked_callee)) + "` is not callable")
+        if len(arguments) != len(parameters):
+            try self.fail(span, "function value accepts " + str(len(parameters)) + " argument(s), got " + str(len(arguments)))
+        let checked_arguments = list[NodeId]()
+        for index in range(0, len(arguments)):
+            if arguments[index].label != none:
+                try self.fail(arguments[index].span, "function-value calls use positional arguments because labels are not part of the type")
+            checked_arguments.append(try self.check_expression(arguments[index].value, parameters[index]))
+        let typed = self.state.push_node(HirNodeForm.IndirectCall(callee = checked_callee, arguments = self.state.push_nodes(checked_arguments)), result, span)
+        return try self.require_type(typed, expected)
+
+    # A declaration name becomes a capture-free callable value. A Luce
+    # definition normally uses its exact `func` type, but a matching `cfunc`
+    # context selects a C adapter. An extern declaration has only a `cfunc`
+    # identity and cannot be converted when `out` changes its source shape.
+    func check_function_address(function_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let function = self.state.functions[function_index]
+        if function.receiver != none:
+            try self.fail(span, "method values are not supported; pass an explicit capture-free function")
+        let parameters = list[TypeId]()
+        for parameter in function.parameters: parameters.append(parameter.value_type)
+        let c_context = self.state.c_function_context(expected)
+        match function.source:
+            ExternalC(contract):
+                for slot in contract.slots:
+                    match slot:
+                        Output(name, value_type): try self.fail(span, "extern function `" + function.name + "` has `out` slots and cannot become a `cfunc` value")
+                        Input(parameter): pass
+                for parameter in function.parameters:
+                    if not self.declarations.is_c_function_component(parameter.value_type):
+                        try self.fail(span, "extern function `" + function.name + "` parameter `" + parameter.name + "` cannot appear in a `cfunc` signature as `" + self.describe_type(parameter.value_type) + "`")
+                if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.declarations.is_c_function_component(contract.declared_result):
+                    try self.fail(span, "extern function `" + function.name + "` result cannot appear in a `cfunc` signature as `" + self.describe_type(contract.declared_result) + "`")
+                let function_type = self.state.intern_c_function_type(parameters, contract.declared_result)
+                let address = self.state.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+                return try self.require_type(address, expected)
+            else: pass
+        if c_context != none:
+            for parameter in function.parameters:
+                if not self.declarations.is_c_function_component(parameter.value_type):
+                    try self.fail(span, "function `" + function.name + "` parameter `" + parameter.name + "` cannot cross a C callback boundary as `" + self.describe_type(parameter.value_type) + "`")
+            if self.state.contains_fallible(function.result):
+                try self.fail(span, "fallible function `" + function.name + "` cannot become a `cfunc` value")
+            if not types_match(function.result, resolve_builtin_type(BuiltinType.unit)) and not self.declarations.is_c_function_component(function.result):
+                try self.fail(span, "function `" + function.name + "` result cannot cross a C callback boundary as `" + self.describe_type(function.result) + "`")
+            let function_type = self.state.intern_c_function_type(parameters, function.result)
+            let address = self.state.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+            return try self.require_type(address, expected)
+        let function_type = self.state.intern_function_type(parameters, function.result)
+        let address = self.state.push_node(HirNodeForm.FunctionAddress(function = function.symbol), function_type, span)
+        return try self.require_type(address, expected)
+
+    # Positional arguments fill source-visible parameters left to right;
+    # named arguments then land anywhere, each exactly once. Hidden receiver
+    # parameters are already present in `placed` and occupy the prefix before
+    # `first_source_parameter`. Defaults are appended after explicit source
+    # arguments, preserving their evaluation order without repeating this
+    # protocol for calls and construction.
+    func check_function_arguments(function: FunctionSymbol, arguments: list[ArgumentSyntax], first_source_parameter: i64, placed: list[u32], span: SourceSpan, subject: str, missing_subject: str) -> Operands!:
+        let assigned = list[bool]()
+        for parameter_index in range(0, len(function.parameters)):
+            assigned.append(parameter_index < first_source_parameter)
+        var positional_index = first_source_parameter
+        var saw_named = false
+        for argument in arguments:
+            var parameter_index = -1
+            let label = argument.label
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                parameter_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                parameter_index = find_parameter(function, label)
+                if parameter_index < first_source_parameter:
+                    try self.fail(argument.span, subject + " has no parameter `" + label + "`")
+            if parameter_index >= len(function.parameters):
+                try self.fail(argument.span, subject + " accepts " + str(len(function.parameters) - first_source_parameter) + " argument(s)")
+            if assigned[parameter_index]:
+                try self.fail(argument.span, "parameter `" + function.parameters[parameter_index].name + "` is supplied more than once")
+            assigned[parameter_index] = true
+            let checked = try self.check_expression(argument.value, function.parameters[parameter_index].value_type)
+            placed.append(u32(parameter_index))
+            placed.append(checked.value)
+
+        for parameter_index in range(first_source_parameter, len(function.parameters)):
+            if assigned[parameter_index]: continue
+            let default_value = function.parameters[parameter_index].default_value
+            if default_value.value != no_node:
+                placed.append(u32(parameter_index))
+                placed.append(default_value.value)
+                continue
+            try self.fail(span, missing_subject + " is missing argument `" + function.parameters[parameter_index].name + "`")
+        return self.state.push_run(placed)
+
+    # `ErrorCode.package(n)` is a declaration-only compiler constructor. The
+    # full package identity lives once on HirProgram; this node stores only
+    # the package-local numeric component.
+    func check_error_code_package(arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if self.state.current_constant < 0:
+            try self.fail(span, "`ErrorCode.package` is valid only as a top-level constant initializer")
+        let declaration = self.state.constants[self.state.current_constant]
+        if not error_code_call_is_whole_initializer(declaration.value, span):
+            try self.fail(span, "`ErrorCode.package` must be the whole top-level constant initializer")
+        if len(arguments) != 1 or arguments[0].label != none:
+            try self.fail(span, "`ErrorCode.package` takes one positional constant `u32`")
+        let number = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u32))
+        if not self.is_constant_expression(number):
+            try self.fail(arguments[0].span, "`ErrorCode.package` needs a constant `u32` expression")
+        let code = try self.evaluate_constant_u32(number)
+        for previous in self.state.error_codes:
+            if previous.value == code:
+                try self.fail(span, "package error code " + str(code) + " is already declared as `" + self.state.sources[previous.module_index].name + "." + previous.name + "`")
+        self.state.error_codes.append(DeclaredErrorCode(value = code, module_index = declaration.module_index, name = declaration.name))
+        let typed = self.state.push_node(HirNodeForm.ErrorCodeLiteral(value = code), resolve_builtin_type(BuiltinType.error_code), span)
+        return try self.require_type(typed, expected)
+
+    # Evaluate the deliberately small constant language admitted inside an
+    # ErrorCode declaration. Type checking has already fixed every operand to
+    # u32; this pass applies the language's checked arithmetic and shift rules
+    # without executing arbitrary source code.
+    func evaluate_constant_u32(id: NodeId) -> u32!:
+        let span = self.state.span_of(id)
+        match self.state.node_form(id):
+            Constant(index):
+                match self.state.values[index]:
+                    Integer(value): return u32(value)
+                    else: pass
+            Reference(symbol):
+                let referenced = self.constant_node(symbol)
+                if referenced.value != no_node: return try self.evaluate_constant_u32(referenced)
+            Unary(operation, operand):
+                let value = try self.evaluate_constant_u32(operand)
+                match operation:
+                    NumericIdentity(operand_type): return value
+                    IntegerBitwiseNot(operand_type): return u32(4294967295) - value
+                    else: pass
+            Binary(left, operation, right):
+                let a = i64(try self.evaluate_constant_u32(left))
+                let b = i64(try self.evaluate_constant_u32(right))
+                match operation:
+                    Add(operand_type):
+                        if a > 4294967295 - b: try self.fail(span, "constant `u32` addition overflows")
+                        return u32(a + b)
+                    Subtract(operand_type):
+                        if a < b: try self.fail(span, "constant `u32` subtraction overflows")
+                        return u32(a - b)
+                    Multiply(operand_type):
+                        if a != 0 and b > 4294967295 // a: try self.fail(span, "constant `u32` multiplication overflows")
+                        return u32(a * b)
+                    FloorDivide(operand_type):
+                        if b == 0: try self.fail(span, "constant integer division by zero")
+                        return u32(a // b)
+                    Remainder(operand_type):
+                        if b == 0: try self.fail(span, "constant integer remainder by zero")
+                        return u32(a % b)
+                    BitwiseAnd(operand_type): return u32(a & b)
+                    BitwiseOr(operand_type): return u32(a | b)
+                    BitwiseXor(operand_type): return u32(a ^ b)
+                    ShiftLeft(operand_type): return try self.constant_shift_left(u32(a), b, span)
+                    ShiftRight(operand_type):
+                        if b < 0 or b >= 32: try self.fail(span, "constant `u32` shift count must be smaller than 32")
+                        var shifted = a
+                        for step in range(0, b): shifted //= 2
+                        return u32(shifted)
+                    else: pass
+            Conditional(value, condition, alternative):
+                if try self.evaluate_constant_bool(condition): return try self.evaluate_constant_u32(value)
+                return try self.evaluate_constant_u32(alternative)
+            else: pass
+        error(self.diagnostic(span, "`ErrorCode.package` needs a constant `u32` expression"))
+
+    func constant_shift_left(value: u32, count: i64, span: SourceSpan) -> u32!:
+        if count < 0 or count >= 32: try self.fail(span, "constant `u32` shift count must be smaller than 32")
+        var shifted = i64(value)
+        for step in range(0, count): shifted = (shifted * 2) % 4294967296
+        return u32(shifted)
+
+    func evaluate_constant_bool(id: NodeId) -> bool!:
+        let span = self.state.span_of(id)
+        match self.state.node_form(id):
+            Constant(index):
+                match self.state.values[index]:
+                    Boolean(value): return value
+                    else: pass
+            Reference(symbol):
+                let referenced = self.constant_node(symbol)
+                if referenced.value != no_node: return try self.evaluate_constant_bool(referenced)
+            Unary(operation, operand):
+                match operation:
+                    LogicalNot: return not try self.evaluate_constant_bool(operand)
+                    else: pass
+            Binary(left, operation, right):
+                match operation:
+                    LogicalAnd: return try self.evaluate_constant_bool(left) and try self.evaluate_constant_bool(right)
+                    LogicalOr: return try self.evaluate_constant_bool(left) or try self.evaluate_constant_bool(right)
+                    Equal(operand_type):
+                        if types_match(operand_type, resolve_builtin_type(BuiltinType.boolean)):
+                            return try self.evaluate_constant_bool(left) == try self.evaluate_constant_bool(right)
+                        return try self.evaluate_constant_u32(left) == try self.evaluate_constant_u32(right)
+                    NotEqual(operand_type):
+                        if types_match(operand_type, resolve_builtin_type(BuiltinType.boolean)):
+                            return try self.evaluate_constant_bool(left) != try self.evaluate_constant_bool(right)
+                        return try self.evaluate_constant_u32(left) != try self.evaluate_constant_u32(right)
+                    Less(operand_type): return try self.evaluate_constant_u32(left) < try self.evaluate_constant_u32(right)
+                    LessEqual(operand_type): return try self.evaluate_constant_u32(left) <= try self.evaluate_constant_u32(right)
+                    Greater(operand_type): return try self.evaluate_constant_u32(left) > try self.evaluate_constant_u32(right)
+                    GreaterEqual(operand_type): return try self.evaluate_constant_u32(left) >= try self.evaluate_constant_u32(right)
+                    else: pass
+            Conditional(value, condition, alternative):
+                if try self.evaluate_constant_bool(condition): return try self.evaluate_constant_bool(value)
+                return try self.evaluate_constant_bool(alternative)
+            else: pass
+        error(self.diagnostic(span, "conditional ErrorCode expression needs a constant `bool` condition"))
+
+    func constant_node(symbol: SymbolId) -> NodeId:
+        for constant in self.state.constants:
+            if constant.symbol.value == symbol.value: return constant.typed
+        return NodeId(value = no_node)
+
+    # `error(code, message)` creates ordinary Error data in the current
+    # function's caller-owned slot, then transfers control. A catch handler
+    # does not catch its own failures, so its surrounding function must also
+    # be fallible before an error can escape from the handler.
+    func check_error_call(arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if self.state.fallible_inner(self.state.current_result) == none:
+            try self.fail(span, "`error` can escape only from a fallible function")
+        if len(arguments) != 2 or arguments[0].label != none or arguments[1].label != none:
+            try self.fail(span, "`error` takes an `ErrorCode` and a `str`")
+        let code = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.error_code))
+        let message = try self.check_expression(arguments[1].value, resolve_builtin_type(BuiltinType.string))
+        let typed = self.state.push_node(HirNodeForm.Raise(code = code, message = message), self.never_type(), span)
+        return try self.require_type(typed, expected)
+
+    # `value catch failure: ...` unwraps one fallible expression. The handler
+    # is a lexical scope with an immutable Error binding and must transfer on
+    # every path through recover, error/trap, or a surrounding return.
+    func check_catch(caught: ExpressionSyntax, failure_name: str, body: SuiteSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked = try self.check_expression(caught, none)
+        let successful = self.state.fallible_inner(self.state.type_of(checked)) else error(self.diagnostic(caught.span, "`catch` needs a fallible expression"))
+        try self.state.require_free_local_name(failure_name, span)
+        let failure = self.state.make_symbol(failure_name, SymbolKind.local, resolve_builtin_type(BuiltinType.error_value))
+        let outer_count = len(self.state.locals)
+        self.state.locals.append(LocalBinding(symbol = failure, name = failure_name, value_type = resolve_builtin_type(BuiltinType.error_value), is_mutable = false))
+        self.state.recovery_types.append(successful)
+        let statements = try self.check_suite(body.statements)
+        self.state.recovery_types.remove(len(self.state.recovery_types) - 1)
+        while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+        if not self.statements_return(statements):
+            try self.fail(body.span, "every `catch` path must `recover`, return, or terminate")
+        let typed = self.state.push_node(HirNodeForm.Catch(value = checked, failure = failure, body = self.state.push_nodes(statements)), successful, span)
+        return try self.require_type(typed, expected)
+
+    # `Point(x: 1.0, y: 2.0)`: the synthesized memberwise initializer. Fields
+    # fill like parameters and defaults cover omissions. From another module
+    # the struct and every field *given* must be public; a private field may
+    # still be omitted when it has a default.
+    func check_struct_value(struct_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.state.structs[struct_index]
+        let foreign = item.module_index != self.state.current_module
+        if foreign and not item.is_public:
+            try self.fail(span, "`" + item.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+        let initializer = item.initializer
+        if initializer >= 0:
+            return try self.check_custom_initializer(struct_index, initializer, arguments, span, expected)
+        # Given values by field position; `no_node` marks one not yet given.
+        let values = list[NodeId]()
+        for field in item.fields:
+            values.append(NodeId(value = no_node))
+        var positional_index = 0
+        var saw_named = false
+        for argument in arguments:
+            var field_index = -1
+            let label = argument.label
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                field_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                field_index = self.declarations.find_field(struct_index, label)
+                if field_index < 0: try self.fail(argument.span, "struct `" + item.name + "` has no field `" + label + "`")
+            if field_index >= len(item.fields):
+                try self.fail(argument.span, "struct `" + item.name + "` has " + str(len(item.fields)) + " field(s)")
+            let field = item.fields[field_index]
+            if values[field_index].value != no_node:
+                try self.fail(argument.span, "field `" + field.name + "` is supplied more than once")
+            if foreign and not field.is_public:
+                try self.fail(argument.span, "field `" + field.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+            values[field_index] = try self.check_expression(argument.value, field.value_type)
+        let fields = list[NodeId]()
+        for field_index in range(0, len(item.fields)):
+            let field = item.fields[field_index]
+            if values[field_index].value != no_node:
+                fields.append(values[field_index])
+                continue
+            # A private field with a default is not *required*, so it does
+            # not make the initializer private (spec §10.1).
+            if field.default_value.value == no_node:
+                try self.fail(span, "construction of `" + item.name + "` is missing field `" + field.name + "`")
+            fields.append(field.default_value)
+        let typed = self.state.push_node(HirNodeForm.StructValue(struct_index = struct_index, fields = self.state.push_nodes(fields)), item.type_id, span)
+        return try self.require_type(typed, expected)
+
+    # A custom initializer keeps its source-level `unit`/`unit!` result on the
+    # function, while construction changes only the successful side to the
+    # fresh struct value. Parameter zero is `self`; it is supplied by
+    # execution, never by source syntax.
+    func check_custom_initializer(struct_index: i64, function_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.state.structs[struct_index]
+        let function = self.state.functions[function_index]
+        let foreign = item.module_index != self.state.current_module
+        if foreign and not function.is_public:
+            try self.fail(span, "initializer `init` is private to module `" + self.state.sources[item.module_index].name + "`")
+
+        let typed_arguments = list[u32]()
+        let placed = try self.check_function_arguments(
+            function,
+            arguments,
+            1,
+            typed_arguments,
+            span,
+            "initializer for `" + item.name + "`",
+            "construction of `" + item.name + "`",
+        )
+
+        var construction_type = item.type_id
+        if self.state.fallible_inner(function.result) != none:
+            construction_type = self.state.intern_fallible(item.type_id)
+        let typed = self.state.push_node(HirNodeForm.Initialize(function = function.symbol, arguments = placed), construction_type, span)
+        return try self.require_type(typed, expected)
+
+    # `value.field`: the value must be a struct with that field, visible here.
+    func check_field_access(member_value: ExpressionSyntax, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var root_name = ""
+        var module_name = ""
+        var type_name = ""
+        match member_value.form:
+            Name(candidate): root_name = candidate
+            Member(inner, inner_name):
+                match inner.form:
+                    Name(candidate):
+                        module_name = candidate
+                        type_name = inner_name
+                    else: module_name = ""
+            else: root_name = ""
+        # `module.Enum.case`
+        if module_name != "" and self.state.find_local(module_name) < 0:
+            let imported_module = self.state.find_imported_module(module_name)
+            if imported_module >= 0:
+                let enum_index = self.declarations.find_enum_in_module(imported_module, type_name)
+                if enum_index >= 0:
+                    let case_index = self.declarations.find_case(enum_index, name)
+                    if case_index < 0: try self.fail(span, "enum `" + type_name + "` has no case `" + name + "`")
+                    return try self.check_enum_value(enum_index, case_index, list[ArgumentSyntax](), span, expected)
+        if root_name != "" and self.state.find_local(root_name) < 0:
+            let imported_module = self.state.find_imported_module(root_name)
+            if imported_module >= 0:
+                let function_index = self.state.find_function_in_module(imported_module, name)
+                if function_index >= 0:
+                    if not self.state.functions[function_index].is_public:
+                        try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+                    return try self.check_function_address(function_index, span, expected)
+                let variable_index = self.state.find_extern_variable_in_module(imported_module, name)
+                if variable_index >= 0:
+                    let variable = self.state.extern_variables[variable_index]
+                    if not variable.is_public:
+                        try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+                    let load = self.state.push_node(HirNodeForm.ExternLoad(variable = u32(variable_index)), variable.value_type, span)
+                    return try self.require_type(load, expected)
+                try self.fail(span, "module `" + self.state.sources[imported_module].name + "` has no value `" + name + "`")
+            if self.declarations.find_struct_in_module(self.state.current_module, root_name) >= 0:
+                try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
+            let enum_index = self.declarations.find_enum_in_module(self.state.current_module, root_name)
+            if enum_index >= 0:
+                let case_index = self.declarations.find_case(enum_index, name)
+                if case_index < 0:
+                    if self.declarations.find_method(self.state.enums[enum_index].type_id, name) >= 0:
+                        try self.fail(span, "`" + root_name + "." + name + "` is a type function; call it with `(...)`")
+                    try self.fail(span, "enum `" + root_name + "` has no case `" + name + "`")
+                return try self.check_enum_value(enum_index, case_index, list[ArgumentSyntax](), span, expected)
+        let checked = try self.check_expression(member_value, none)
+        return try self.check_field_access_node(checked, name, span, expected)
+
+    # Complete value-member selection from an already evaluated receiver. This
+    # is shared with function-valued field calls so computed receivers retain
+    # source-order, single-evaluation semantics.
+    func check_field_access_node(checked: NodeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked_type = self.state.type_of(checked)
+        if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
+            let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+            return try self.require_type(length, expected)
+        match self.state.types.definitions[checked_type.value].form:
+            Array(element, count):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
+            List(element):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
+            Slice(element):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
+            else: pass
+        if types_match(checked_type, resolve_builtin_type(BuiltinType.string)) and name == "byte_count":
+            let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+            return try self.require_type(length, expected)
+        if types_match(self.state.type_of(checked), resolve_builtin_type(BuiltinType.error_value)):
+            var field = -1
+            var field_type = resolve_builtin_type(BuiltinType.unit)
+            if name == "code":
+                field = 0
+                field_type = resolve_builtin_type(BuiltinType.error_code)
+            elif name == "message":
+                field = 1
+                field_type = resolve_builtin_type(BuiltinType.string)
+            else:
+                try self.fail(span, "`Error` has no field `" + name + "`")
+            let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field), field_type, span)
+            return try self.require_type(typed, expected)
+        let struct_index = self.declarations.struct_of(self.state.type_of(checked))
+        if struct_index < 0:
+            try self.fail(span, "`" + self.describe_type(self.state.type_of(checked)) + "` has no field `" + name + "`")
+        let field_index = self.declarations.find_field(struct_index, name)
+        if field_index < 0:
+            if self.declarations.find_method(self.state.structs[struct_index].type_id, name) >= 0:
+                try self.fail(span, "`" + name + "` is a method of `" + self.state.structs[struct_index].name + "`; call it with `(...)`")
+            try self.fail(span, "struct `" + self.state.structs[struct_index].name + "` has no field `" + name + "`")
+        let field = self.state.structs[struct_index].fields[field_index]
+        if not field.is_public and self.state.structs[struct_index].module_index != self.state.current_module:
+            try self.fail(span, "field `" + name + "` is private to module `" + self.state.sources[self.state.structs[struct_index].module_index].name + "`")
+        let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
+        return try self.require_type(typed, expected)
+
+    # mark: Sequence operations ================================================================
+
+    # Fixed arrays and `bytes` use checked `u64` indices. String integer
+    # indexing is intentionally absent because byte and Unicode-scalar indices
+    # are different domains (§12.7).
+    func check_index(indexed: ExpressionSyntax, subscript: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let value = try self.check_expression(indexed, none)
+        let value_type = self.state.type_of(value)
+        var element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+        if types_match(value_type, resolve_builtin_type(BuiltinType.byte_string)):
+            element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+        else:
+            match self.state.types.definitions[value_type.value].form:
+                Array(element, count): element_type = element
+                List(element): element_type = element
+                Slice(element): element_type = element
+                else:
+                    if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
+                        try self.fail(span, "`str` does not support integer indexing; iterate characters or encode UTF-8 bytes")
+                    try self.fail(span, "`" + self.describe_type(value_type) + "` does not support indexing yet")
+        let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
+        let result = self.state.push_node(HirNodeForm.SequenceIndex(value = value, index = index), element_type, span)
+        return try self.require_type(result, expected)
+
+    # Safe contiguous sequences capture one immutable half-open snapshot.
+    # Missing bounds remain explicit so the receiver is evaluated exactly once
+    # before any source bound and length is read only when needed.
+    func check_slice(sliced: ExpressionSyntax, start: ExpressionSyntax?, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let value = try self.check_expression(sliced, none)
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        let value_type = self.state.type_of(value)
+        match self.state.types.definitions[value_type.value].form:
+            List(element): element_type = element
+            Bytes: element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+            else: try self.fail(span, "`" + self.describe_type(value_type) + "` does not support slicing yet")
+        let index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        var lower = NodeId(value = no_node)
+        let start_value = start
+        if start_value != none: lower = try self.check_expression(start_value, index_type)
+        var upper = NodeId(value = no_node)
+        let end_value = end
+        if end_value != none: upper = try self.check_expression(end_value, index_type)
+        let result_type = self.state.intern_slice(element_type)
+        let result = self.state.push_node(HirNodeForm.SequenceSlice(value = value, start = lower, end = upper), result_type, span)
+        return try self.require_type(result, expected)
+
+    # A mutating value method needs a stable place. Value fields and arrays
+    # require mutation all the way to a `var` root; crossing a reference list
+    # changes that requirement because its element slot is shared storage.
+    func require_mutable_place(value: NodeId, span: SourceSpan, mutate_value: bool) -> !:
+        match self.state.node_form(value):
+            Reference(symbol):
+                for local in self.state.locals:
+                    if local.symbol.value == symbol.value:
+                        if local.is_mutable or not mutate_value: return
+                        try self.fail(span, "mutating method needs a `var` receiver; `" + local.name + "` is immutable")
+                try self.fail(span, "mutating method needs a `var` receiver")
+            FieldAccess(inner, field):
+                let struct_index = self.declarations.struct_of(self.state.type_of(inner))
+                let stored = self.state.structs[struct_index].fields[field]
+                if mutate_value and not stored.is_mutable:
+                    try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
+                try self.require_mutable_place(inner, span, mutate_value)
+            SequenceIndex(inner, index):
+                match self.state.types.definitions[self.state.type_of(inner).value].form:
+                    Array(element, count): try self.require_mutable_place(inner, span, true)
+                    List(element): try self.require_mutable_place(inner, span, false)
+                    else: try self.fail(span, "mutating method needs a mutable array or list element receiver")
+            else: try self.fail(span, "mutating method needs a `var` receiver, not a temporary value")
+
+    # Resolve the bare declaration spellings left after value and member calls
+    # have been separated above: a free function or struct construction.
+    func resolve_callee(callee: ExpressionSyntax) -> ResolvedCallee!:
+        match callee.form:
+            Name(name):
+                let local_index = self.state.find_local(name)
+                if local_index >= 0:
+                    try self.fail(callee.span, "`" + name + "` has type `" + self.describe_type(self.state.locals[local_index].value_type) + "` and is not callable")
+                let function_index = self.state.find_visible_function(name)
+                if function_index >= 0: return ResolvedCallee(function_index = function_index, receiver = NodeId(value = no_node), struct_index = -1, enum_index = -1, case_index = -1)
+                let struct_index = self.declarations.find_struct_in_module(self.state.current_module, name)
+                if struct_index >= 0: return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index, enum_index = -1, case_index = -1)
+                error(self.diagnostic(callee.span, "unknown function `" + name + "`"))
+            else:
+                trap("non-name call head reached declaration resolution")
+
+    # The spellings whose head is a module or type name rather than a value:
+    # `module.f`, `module.Type`, `Type.f`, `module.Type.f`. Absent when the
+    # head is a value, so the caller treats the call as a method call.
+    func resolve_named_callee(value: ExpressionSyntax, name: str, span: SourceSpan) -> ResolvedCallee?!:
+        var head = ""
+        var type_name = ""
+        var is_two_level = false
+        match value.form:
+            Name(candidate): head = candidate
+            Member(inner, inner_name):
+                match inner.form:
+                    Name(module_name):
+                        head = module_name
+                        type_name = inner_name
+                        is_two_level = true
+                    else: head = ""
+            else: head = ""
+        if head == "" or self.state.find_local(head) >= 0: return none
+        if not is_two_level:
+            let imported_module = self.state.find_imported_module(head)
+            if imported_module >= 0: return try self.resolve_module_member_callee(imported_module, name, span)
+            let struct_index = self.declarations.find_struct_in_module(self.state.current_module, head)
+            if struct_index >= 0: return try self.resolve_type_function(self.state.structs[struct_index].type_id, name, span)
+            let enum_index = self.declarations.find_enum_in_module(self.state.current_module, head)
+            if enum_index >= 0: return try self.resolve_enum_member(enum_index, name, span)
+            return none
+        let imported_module = self.state.find_imported_module(head)
+        if imported_module < 0: return none
+        let struct_index = self.declarations.find_struct_in_module(imported_module, type_name)
+        if struct_index >= 0:
+            if not self.state.structs[struct_index].is_public:
+                try self.fail(span, "`" + type_name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+            return try self.resolve_type_function(self.state.structs[struct_index].type_id, name, span)
+        let enum_index = self.declarations.find_enum_in_module(imported_module, type_name)
+        if enum_index < 0: return none
+        if not self.state.enums[enum_index].is_public:
+            try self.fail(span, "`" + type_name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+        return try self.resolve_enum_member(enum_index, name, span)
+
+    # `Enum.case(...)` constructs; `Enum.function(...)` calls a type function.
+    func resolve_enum_member(enum_index: i64, name: str, span: SourceSpan) -> ResolvedCallee!:
+        let case_index = self.declarations.find_case(enum_index, name)
+        if case_index >= 0: return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = -1, enum_index = enum_index, case_index = case_index)
+        return try self.resolve_type_function(self.state.enums[enum_index].type_id, name, span)
+
+    func resolve_module_member_callee(imported_module: i64, name: str, span: SourceSpan) -> ResolvedCallee!:
+        let function_index = self.state.find_function_in_module(imported_module, name)
+        if function_index >= 0:
+            if not self.state.functions[function_index].is_public:
+                try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+            return ResolvedCallee(function_index = function_index, receiver = NodeId(value = no_node), struct_index = -1, enum_index = -1, case_index = -1)
+        let struct_index = self.declarations.find_struct_in_module(imported_module, name)
+        if struct_index >= 0:
+            if not self.state.structs[struct_index].is_public:
+                try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[imported_module].name + "`")
+            return ResolvedCallee(function_index = -1, receiver = NodeId(value = no_node), struct_index = struct_index, enum_index = -1, case_index = -1)
+        error(self.diagnostic(span, "module `" + self.state.sources[imported_module].name + "` has no function `" + name + "`"))
+
+    # `Type.function(...)`: a method without `self`.
+    func resolve_type_function(owner: TypeId, name: str, span: SourceSpan) -> ResolvedCallee!:
+        let method_index = self.declarations.find_method(owner, name)
+        if method_index < 0:
+            try self.fail(span, "`" + self.describe_type(owner) + "` has no type function `" + name + "`")
+        let receiver = self.state.functions[method_index].receiver else trap("method without a receiver")
+        if receiver.kind != HirReceiverKind.type_function:
+            try self.fail(span, "`" + name + "` takes `self`; call it through a `" + self.describe_type(owner) + "` value")
+        try self.require_method_visible(method_index, owner, span)
+        return ResolvedCallee(function_index = method_index, receiver = NodeId(value = no_node), struct_index = -1, enum_index = -1, case_index = -1)
+
+    func require_method_visible(method_index: i64, owner: TypeId, span: SourceSpan) -> !:
+        let owner_module = self.declarations.owner_module(owner)
+        if owner_module != self.state.current_module and not self.state.functions[method_index].is_public:
+            try self.fail(span, "`" + self.state.functions[method_index].name + "` is private to module `" + self.state.sources[owner_module].name + "`")
+
+    func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var expected_parts: list[TypeId]? = none
+        if expected != none:
+            expected_parts = self.state.tuple_elements(expected)
+            if expected_parts != none and len(expected_parts) != len(elements):
+                try self.fail(span, "tuple has " + str(len(elements)) + " element(s), expected `" + self.describe_type(expected) + "`")
+        let checked = list[NodeId]()
+        var index = 0
+        for element in elements:
+            var part_expected: TypeId? = none
+            if expected_parts != none:
+                part_expected = expected_parts[index]
+            checked.append(try self.check_expression(element, part_expected))
+            index += 1
+        let parts = list[TypeId]()
+        for item in checked:
+            parts.append(self.state.type_of(item))
+        let tuple_type = self.state.intern_tuple(parts)
+        return try self.require_type(self.state.push_node(HirNodeForm.Tuple(elements = self.state.push_nodes(checked)), tuple_type, span), expected)
+
+    # Brackets construct a fresh reference list by default. An expected fixed
+    # array type selects the allocation-free value form and supplies both its
+    # element type and exact count.
+    func check_array_literal(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if expected != none:
+            match self.state.types.definitions[expected.value].form:
+                Array(element_type, count):
+                    if len(elements) != count:
+                        try self.fail(span, "fixed-array literal has " + str(len(elements)) + " element(s), expected `" + self.describe_type(expected) + "`")
+                    let checked = list[NodeId]()
+                    for element in elements: checked.append(try self.check_expression(element, element_type))
+                    return self.state.push_node(HirNodeForm.Array(elements = self.state.push_nodes(checked)), expected, span)
+                List(element_type): return try self.check_list_literal(elements, element_type, expected, span)
+                else: pass
+        if len(elements) == 0:
+            error(self.diagnostic(span, "an empty list literal needs a `list[T]` context"))
+        let first = try self.check_expression(elements[0], none)
+        let element_type = self.state.type_of(first)
+        let checked = [first]
+        for index in range(1, len(elements)):
+            checked.append(try self.check_expression(elements[index], element_type))
+        let list_type = self.state.intern_list(element_type)
+        return try self.require_type(self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(checked)), list_type, span), expected)
+
+    func check_list_literal(elements: list[ExpressionSyntax], element_type: TypeId, list_type: TypeId, span: SourceSpan) -> NodeId!:
+        let checked = list[NodeId]()
+        for element in elements: checked.append(try self.check_expression(element, element_type))
+        return self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(checked)), list_type, span)
+
+    func check_list_constructor(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 1: try self.fail(span, "`list[T]()` needs exactly one element type")
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(element): element_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`list[T]()` needs exactly one element type")
+        if self.state.contains_fallible(element_type):
+            try self.fail(span, "a list cannot store a fallible type; `T!` is a function-result effect")
+        if len(arguments) != 0: try self.fail(span, "`list[T]()` takes no arguments")
+        let list_type = self.state.intern_list(element_type)
+        let value = self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(list[NodeId]())), list_type, span)
+        return try self.require_type(value, expected)
+
+    func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked_optional = try self.check_expression(optional_value, none)
+        let inner = self.state.optional_inner(self.state.type_of(checked_optional)) else error(self.diagnostic(span, "`else` requires an optional value, found `" + self.describe_type(self.state.type_of(checked_optional)) + "`"))
+        let checked_arm = try self.check_expression(arm, inner)
+        let typed = self.state.push_node(HirNodeForm.ElseFallback(value = checked_optional, arm = checked_arm), inner, span)
+        return try self.require_type(typed, expected)
+
+    # mark: Literal decoding ====================================================================
+    #
+    # The tokenizer keeps every literal's exact source spelling; here that
+    # spelling becomes a value, with range failures reported at the token.
+
+    func decode_integer(token: Token) -> i64!:
+        return try self.state.decode_integer_at(self.state.current_module, token)
+
+    # Accumulating below zero leaves room for the minimum signed magnitude,
+    # which positive i64 cannot represent.
+    func decode_negative_integer(token: Token) -> i64!:
+        return try self.state.decode_negative_integer_at(self.state.current_module, token)
+
+    func decode_float(token: Token) -> f64!:
+        let text_end = len(token.text) - len(token.suffix)
+        var text = ""
+        var position = 0
+        while position < text_end:
+            if token.text[position] != '_': text = text + str(token.text[position])
+            position += 1
+        return parse_f64(text) else error(self.diagnostic(token.span, "floating-point literal is outside `f64` range"))
+
+    func decode_character(token: Token) -> char!:
+        if len(token.text) < 3 or token.text[0] != '\'':
+            try self.fail(token.span, "malformed character literal")
+        if token.text[1] != '\\':
+            if len(token.text) != 3: try self.fail(token.span, "character literal must contain one character")
+            return token.text[1]
+        if len(token.text) < 4: try self.fail(token.span, "incomplete character escape")
+        match token.text[2]:
+            'n': return '\n'
+            'r': return '\r'
+            't': return '\t'
+            '\\': return '\\'
+            '\'': return '\''
+            '0': return char(0)
+            else: error(self.diagnostic(token.span, "this character escape is not implemented yet"))
+
+    func decode_bytes(token: Token) -> list[u8]!:
+        if len(token.text) < 3 or token.text[0] != 'b':
+            try self.fail(token.span, "malformed byte literal")
+        let inner = Token(kind = TokenKind.str_lit, text = token.text[1:], suffix = "", span = token.span)
+        let decoded = try self.decode_print_text(inner)
+        let payload = list[u8]()
+        for c in decoded:
+            payload.append(u8(u32(c)))
+        return payload
+
+    # mark: Diagnostics =========================================================================
+
+    # `Command.open(path: "x")`, `.open("x")`, or `Direction.north`: every
+    # payload field is required, positional or named. From another module the
+    # enum must be public.
+    func check_enum_value(enum_index: i64, case_index: i64, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let item = self.state.enums[enum_index]
+        if item.module_index != self.state.current_module and not item.is_public:
+            try self.fail(span, "`" + item.name + "` is private to module `" + self.state.sources[item.module_index].name + "`")
+        let case_value = item.cases[case_index]
+        let values = list[NodeId]()
+        for field in case_value.payload:
+            values.append(NodeId(value = no_node))
+        var positional_index = 0
+        var saw_named = false
+        for argument in arguments:
+            var field_index = -1
+            let label = argument.label
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                field_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                for index in range(0, len(case_value.payload)):
+                    if case_value.payload[index].name == label: field_index = index
+                if field_index < 0: try self.fail(argument.span, "case `" + case_value.name + "` has no payload field `" + label + "`")
+            if field_index >= len(case_value.payload):
+                try self.fail(argument.span, "case `" + case_value.name + "` carries " + str(len(case_value.payload)) + " value(s)")
+            if values[field_index].value != no_node:
+                try self.fail(argument.span, "payload field `" + case_value.payload[field_index].name + "` is supplied more than once")
+            values[field_index] = try self.check_expression(argument.value, case_value.payload[field_index].value_type)
+        for index in range(0, len(case_value.payload)):
+            if values[index].value == no_node: try self.fail(span, "case `" + case_value.name + "` is missing payload field `" + case_value.payload[index].name + "`")
+        let typed = self.state.push_node(HirNodeForm.EnumValue(enum_index = enum_index, case_index = case_index, payload = self.state.push_nodes(values)), item.type_id, span)
+        return try self.require_type(typed, expected)
+
+    # mark: Match ===============================================================================
+
+    func check_match_statement(subject: ExpressionSyntax, arms: list[MatchStatementArmSyntax], span: SourceSpan) -> NodeId!:
+        let checked_subject = try self.check_expression(subject, none)
+        let subject_type = self.state.type_of(checked_subject)
+        let coverage = MatchCoverage()
+        let arm_nodes = list[NodeId]()
+        for arm in arms:
+            let outer_count = len(self.state.locals)
+            let bindings = list[ArmBinding]()
+            let patterns = try self.check_patterns(arm.patterns, subject_type, coverage, bindings, arm.span)
+            let statements = list[NodeId]()
+            for statement in arm.body.statements:
+                for item in try self.check_statement(statement): statements.append(item)
+            while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+            arm_nodes.append(self.state.push_statement(HirNodeForm.MatchArm(patterns = patterns, statements = self.state.push_nodes(statements), value = NodeId(value = no_node)), arm.span))
+        try self.require_exhaustive(subject_type, coverage, span)
+        return self.state.push_statement(HirNodeForm.Match(subject = checked_subject, arms = self.state.push_nodes(arm_nodes), has_result = false), span)
+
+    # The expression form: every arm yields a value of one type, taken from
+    # the context or from the first arm.
+    func check_match_value(subject: ExpressionSyntax, arms: list[MatchValueArmSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked_subject = try self.check_expression(subject, none)
+        let subject_type = self.state.type_of(checked_subject)
+        let coverage = MatchCoverage()
+        let arm_nodes = list[NodeId]()
+        var result_type: TypeId? = expected
+        for arm in arms:
+            let outer_count = len(self.state.locals)
+            let bindings = list[ArmBinding]()
+            let patterns = try self.check_patterns(arm.patterns, subject_type, coverage, bindings, arm.span)
+            let value = try self.check_expression(arm.value, result_type)
+            if result_type == none: result_type = self.state.type_of(value)
+            while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+            arm_nodes.append(self.state.push_statement(HirNodeForm.MatchArm(patterns = patterns, statements = Operands(start = 0, count = 0), value = value), arm.span))
+        try self.require_exhaustive(subject_type, coverage, span)
+        let settled = result_type else error(self.diagnostic(span, "`match` needs at least one arm"))
+        let typed = self.state.push_node(HirNodeForm.Match(subject = checked_subject, arms = self.state.push_nodes(arm_nodes), has_result = true), settled, span)
+        return try self.require_type(typed, expected)
+
+    # Check one arm's alternatives against the subject type, recording what
+    # they cover and declaring the arm's bindings as locals. Every alternative
+    # must bind the same names with the same types (spec §9.6), so they share
+    # symbols.
+    func check_patterns(patterns: list[PatternSyntax], subject_type: TypeId, coverage: MatchCoverage, bindings: list[ArmBinding], span: SourceSpan) -> Operands!:
+        if coverage.saw_wildcard: try self.fail(span, "this arm is unreachable; an earlier `_` matches everything")
+        let nodes = list[NodeId]()
+        var alternative = 0
+        for pattern in patterns:
+            let is_first = alternative == 0
+            let bound = list[str]()
+            match pattern:
+                Wildcard(pattern_span):
+                    if len(patterns) > 1: try self.fail(pattern_span, "`_` cannot share an arm with other patterns")
+                    coverage.saw_wildcard = true
+                    nodes.append(self.state.push_node(HirNodeForm.PatternWildcard, subject_type, pattern_span))
+                Literal(literal):
+                    let value = try self.check_pattern_literal(literal, subject_type)
+                    for previous in coverage.literals:
+                        if values_equal(previous, self.state.values[value]): try self.fail(literal.span, "duplicate pattern")
+                    for index in range(0, len(coverage.ranges) // 2):
+                        if value_in_range(self.state.values[value], coverage.ranges[index * 2], coverage.ranges[index * 2 + 1]):
+                            try self.fail(literal.span, "pattern is already covered by an earlier range")
+                    coverage.literals.append(self.state.values[value])
+                    nodes.append(self.state.push_node(HirNodeForm.PatternLiteral(value = value), subject_type, literal.span))
+                RangePattern(lower, operator, upper, pattern_span):
+                    if not is_integer_type(self.state.types, subject_type) and not types_match(subject_type, resolve_builtin_type(BuiltinType.character)):
+                        try self.fail(pattern_span, "range patterns need an integer or `char` subject, found `" + self.describe_type(subject_type) + "`")
+                    let low = try self.check_pattern_literal(lower, subject_type)
+                    let high = try self.check_pattern_literal(upper, subject_type)
+                    let inclusive = operator == "..="
+                    let low_value = self.state.values[low]
+                    var high_value = self.state.values[high]
+                    if not value_less_or_equal(low_value, high_value) or (not inclusive and values_equal(low_value, high_value)):
+                        try self.fail(pattern_span, "range pattern needs its lower bound below its upper bound")
+                    # Coverage stores every range as an inclusive pair.
+                    if not inclusive: high_value = predecessor(high_value)
+                    for previous in coverage.literals:
+                        if value_in_range(previous, low_value, high_value): try self.fail(pattern_span, "range overlaps an earlier pattern")
+                    for index in range(0, len(coverage.ranges) // 2):
+                        if ranges_overlap(low_value, high_value, coverage.ranges[index * 2], coverage.ranges[index * 2 + 1]):
+                            try self.fail(pattern_span, "range overlaps an earlier pattern")
+                    coverage.ranges.append(low_value)
+                    coverage.ranges.append(high_value)
+                    nodes.append(self.state.push_node(HirNodeForm.PatternRange(lower = low, upper = high, inclusive = inclusive), subject_type, pattern_span))
+                CasePattern(name, names, pattern_span):
+                    let case_index = try self.resolve_case_pattern(name, subject_type, pattern_span)
+                    for previous in coverage.cases:
+                        if previous == case_index: try self.fail(pattern_span, "duplicate case pattern `." + name + "`")
+                    coverage.cases.append(case_index)
+                    let payload_types = self.case_payload_types(subject_type, case_index)
+                    if len(names) != len(payload_types):
+                        try self.fail(pattern_span, "`." + name + "` carries " + str(len(payload_types)) + " value(s), the pattern binds " + str(len(names)))
+                    let symbols = list[u32]()
+                    for index in range(0, len(names)):
+                        let symbol = try self.bind_pattern_name(names[index], payload_types[index], is_first, bindings, bound, pattern_span)
+                        symbols.append(symbol.value)
+                    nodes.append(self.state.push_node(HirNodeForm.PatternCase(case_index = case_index, bindings = self.state.push_run(symbols)), subject_type, pattern_span))
+            if not is_first and len(bound) != len(bindings):
+                try self.fail(span, "every alternative of an arm must bind the same names")
+            alternative += 1
+        return self.state.push_nodes(nodes)
+
+    # The first alternative declares a binding; later ones must repeat it.
+    func bind_pattern_name(name: str, value_type: TypeId, is_first: bool, bindings: list[ArmBinding], bound: list[str], span: SourceSpan) -> SymbolId!:
+        for previous in bound:
+            if previous == name: try self.fail(span, "`" + name + "` is bound twice in one pattern")
+        bound.append(name)
+        if is_first:
+            try self.state.require_free_local_name(name, span)
+            let symbol = self.state.make_symbol(name, SymbolKind.local, value_type)
+            self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = false))
+            bindings.append(ArmBinding(name = name, symbol = symbol, value_type = value_type))
+            return symbol
+        for binding in bindings:
+            if binding.name == name:
+                if not types_match(binding.value_type, value_type):
+                    try self.fail(span, "`" + name + "` has type `" + self.describe_type(value_type) + "` here and `" + self.describe_type(binding.value_type) + "` in an earlier alternative")
+                return binding.symbol
+        error(self.diagnostic(span, "every alternative of an arm must bind the same names; `" + name + "` is new here"))
+
+    # `.name` against an enum names a case; against an optional, `.none` is
+    # case 0 and `.some` case 1.
+    func resolve_case_pattern(name: str, subject_type: TypeId, span: SourceSpan) -> i64!:
+        let enum_index = self.declarations.enum_of(subject_type)
+        if enum_index >= 0:
+            let case_index = self.declarations.find_case(enum_index, name)
+            if case_index < 0: try self.fail(span, "enum `" + self.state.enums[enum_index].name + "` has no case `" + name + "`")
+            return case_index
+        if self.state.optional_inner(subject_type) != none:
+            if name == "none": return 0
+            if name == "some": return 1
+            try self.fail(span, "an optional matches `.none` or `.some(value)`, not `." + name + "`")
+        error(self.diagnostic(span, "case patterns need an enum or optional subject, found `" + self.describe_type(subject_type) + "`"))
+
+    func case_payload_types(subject_type: TypeId, case_index: i64) -> list[TypeId]:
+        let enum_index = self.declarations.enum_of(subject_type)
+        if enum_index >= 0:
+            let payload_types = list[TypeId]()
+            for field in self.state.enums[enum_index].cases[case_index].payload: payload_types.append(field.value_type)
+            return payload_types
+        let inner = self.state.optional_inner(subject_type) else trap("case payload of a non-enum, non-optional subject")
+        if case_index == 1: return [inner]
+        return list[TypeId]()
+
+    # A literal pattern: the subject's type is the context, a leading `-`
+    # folds into an integer literal exactly as in an expression.
+    func check_pattern_literal(literal: PatternLiteralSyntax, subject_type: TypeId) -> u32!:
+        if self.state.optional_inner(subject_type) != none or self.declarations.enum_of(subject_type) >= 0:
+            try self.fail(literal.span, "literal patterns need a scalar or string subject, found `" + self.describe_type(subject_type) + "`")
+        var node = NodeId(value = no_node)
+        if literal.is_negative:
+            if literal.token.kind != TokenKind.int_lit: try self.fail(literal.span, "`-` in a pattern needs an integer literal")
+            let integer_type = try self.integer_literal_type(literal.token, subject_type)
+            if is_unsigned_integer_type(self.state.types, integer_type): try self.fail(literal.span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
+            let integer = try self.decode_negative_integer(literal.token)
+            try self.require_integer_range(literal.span, integer, integer_type)
+            node = try self.require_type(self.push_constant(Value.Integer(value = integer), integer_type, literal.span), subject_type)
+        else:
+            node = try self.check_literal(literal.token, subject_type)
+        match self.state.node_form(node):
+            Constant(value): return value
+            else: error(self.diagnostic(literal.span, "pattern must be a literal of `" + self.describe_type(subject_type) + "`"))
+
+    # Every `match` is exhaustive: enums, optionals, and bools by their cases,
+    # anything else by a `_` arm.
+    func require_exhaustive(subject_type: TypeId, coverage: MatchCoverage, span: SourceSpan) -> !:
+        if coverage.saw_wildcard: return
+        let enum_index = self.declarations.enum_of(subject_type)
+        if enum_index >= 0:
+            let missing = list[str]()
+            for index in range(0, len(self.state.enums[enum_index].cases)):
+                var covered = false
+                for case_index in coverage.cases:
+                    if case_index == index: covered = true
+                if not covered: missing.append("." + self.state.enums[enum_index].cases[index].name)
+            if len(missing) > 0: try self.fail(span, "`match` does not cover " + join_names(missing))
+            return
+        if self.state.optional_inner(subject_type) != none:
+            var has_none = false
+            var has_some = false
+            for case_index in coverage.cases:
+                if case_index == 0: has_none = true
+                if case_index == 1: has_some = true
+            if not has_none: try self.fail(span, "`match` does not cover `.none`")
+            if not has_some: try self.fail(span, "`match` does not cover `.some`")
+            return
+        if types_match(subject_type, resolve_builtin_type(BuiltinType.boolean)):
+            var has_true = false
+            var has_false = false
+            for literal in coverage.literals:
+                match literal:
+                    Boolean(item):
+                        if item: has_true = true
+                        else: has_false = true
+                    else: pass
+            if not has_true: try self.fail(span, "`match` does not cover `true`")
+            if not has_false: try self.fail(span, "`match` does not cover `false`")
+            return
+        try self.fail(span, "`match` on `" + self.describe_type(subject_type) + "` needs a `_` arm")
+
+    # The one gate every checked expression passes: its type must satisfy the
+    # context that asked for it.
+    func require_type(value: NodeId, expected: TypeId?) -> NodeId!:
+        if expected == none: return value
+        let found = self.state.type_of(value)
+        match self.state.types.definitions[found.value].form:
+            Never: return value
+            else: pass
+        if types_match(found, expected): return value
+        if self.is_function_fallibility_lift(found, expected):
+            error(self.diagnostic(self.state.span_of(value), "infallible-to-fallible function conversion is not implemented until managed function environments exist"))
+        let inner = self.state.optional_inner(expected)
+        if inner != none and types_match(found, inner):
+            return self.state.push_node(HirNodeForm.Some(value = value), expected, self.state.span_of(value))
+        error(self.diagnostic(self.state.span_of(value), "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(found) + "`"))
+
+    # Operators and other intrinsically non-optional expressions receive the
+    # value inside an expected `T?` as their contextual type. `require_type`
+    # then inserts the one explicit `Some` node around the completed result.
+    func optional_value_context(expected: TypeId?) -> TypeId?:
+        if expected == none: return none
+        let inner = self.state.optional_inner(expected)
+        if inner != none: return inner
+        return expected
+
+    # Spec §8.5 permits this one function conversion. It cannot be represented
+    # by an exact code address alone for an arbitrary stored function value:
+    # the adapter must retain that value as an environment. Recognize it
+    # explicitly so valid future work never masquerades as a type mismatch.
+    func is_function_fallibility_lift(found: TypeId, expected: TypeId) -> bool:
+        match self.state.types.definitions[found.value].form:
+            Function(found_parameters, found_result):
+                match self.state.types.definitions[expected.value].form:
+                    Function(expected_parameters, expected_result):
+                        if len(found_parameters) != len(expected_parameters): return false
+                        for index in range(0, len(found_parameters)):
+                            if not types_match(found_parameters[index], expected_parameters[index]): return false
+                        if self.state.fallible_inner(found_result) != none: return false
+                        let success = self.state.fallible_inner(expected_result)
+                        if success == none: return false
+                        return types_match(found_result, success)
+                    else: return false
+            else: return false
+
+    # A literal: its value goes into the value table, the node names it.
+    func push_constant(value: Value, value_type: TypeId, span: SourceSpan) -> NodeId:
+        self.state.values.append(value)
+        return self.state.push_node(HirNodeForm.Constant(value = u32(len(self.state.values) - 1)), value_type, span)
+
+    # A literal tree: constants, tuples and optionals of constants, and unary
+    # or binary operators over them. Constant references are allowed because
+    # a module constant is itself such a tree.
+    func is_constant_expression(id: NodeId) -> bool:
+        match self.state.node_form(id):
+            Constant(item): return true
+            NoneLiteral: return true
+            Some(inner): return self.is_constant_expression(inner)
+            Tuple(elements): return self.run_is_constant(elements)
+            Array(elements): return self.run_is_constant(elements)
+            StructValue(struct_index, fields): return self.run_is_constant(fields)
+            EnumValue(enum_index, case_index, payload): return self.run_is_constant(payload)
+            ErrorCodeLiteral(value): return true
+            FunctionAddress(function): return true
+            Unary(operation, operand): return self.is_constant_expression(operand)
+            Binary(left, operation, right): return self.is_constant_expression(left) and self.is_constant_expression(right)
+            Range(lower, upper, inclusive): return self.is_constant_expression(lower) and self.is_constant_expression(upper)
+            Conditional(chosen, condition, alternative):
+                return self.is_constant_expression(chosen) and self.is_constant_expression(condition) and self.is_constant_expression(alternative)
+            Reference(symbol): return true
+            else: return false
+
+    func run_is_constant(run: Operands) -> bool:
+        for index in range(0, i64(run.count)):
+            if not self.is_constant_expression(NodeId(value = self.state.extra[i64(run.start) + index])): return false
+        return true
+
+    # Conservative: a suite definitely transfers only when a statement is a
+    # return/recover/terminating expression, or every arm of a closed branch
+    # definitely transfers. Function completion and catch handlers share this
+    # structural proof even though the destination differs.
+    func statements_return(statements: list[NodeId]) -> bool:
+        for statement in statements:
+            match self.state.node_form(statement):
+                ReturnStatement(value): return true
+                RecoverStatement(value): return true
+                ExpressionStatement(value):
+                    match self.state.types.definitions[self.state.type_of(value).value].form:
+                        Never: return true
+                        else: pass
+                IfStatement(branches, has_fallback, fallback):
+                    if has_fallback:
+                        var every_branch_returns = true
+                        for branch in range(0, i64(branches.count) // 3):
+                            let body = Operands(start = self.state.extra[i64(branches.start) + branch * 3 + 1], count = self.state.extra[i64(branches.start) + branch * 3 + 2])
+                            if not self.statements_return(self.run_nodes(body)): every_branch_returns = false
+                        if every_branch_returns and self.statements_return(self.run_nodes(fallback)): return true
+                Match(subject, arms, has_result):
+                    # Exhaustive, so returning in every arm returns.
+                    var every_arm_returns = true
+                    for position in range(0, i64(arms.count)):
+                        match self.state.node_form(NodeId(value = self.state.extra[i64(arms.start) + position])):
+                            MatchArm(patterns, arm_statements, value):
+                                if not self.statements_return(self.run_nodes(arm_statements)): every_arm_returns = false
+                            else: every_arm_returns = false
+                    if every_arm_returns: return true
+                else: pass
+        return false
+
+    func run_nodes(run: Operands) -> list[NodeId]:
+        let ids = list[NodeId]()
+        for index in range(0, i64(run.count)):
+            ids.append(NodeId(value = self.state.extra[i64(run.start) + index]))
+        return ids
+
+    # Render a TypeId only when producing a diagnostic. Semantic decisions use
+    # identity and type forms, never this human-readable spelling.
+    func describe_type(value: TypeId) -> str:
+        return describe_type(self.state.types, value)
+
+    # The successful side of `T!`, or none for an ordinary type.
+    # name it; compiler-known terminators are its only producers.
+    func never_type() -> TypeId:
+        return self.state.intern_named("never", TypeForm.Never)
+
+    # `path:line:column: message` for the current module, or a chosen one.
+    func diagnostic(span: SourceSpan, message: str) -> str:
+        return format_diagnostic(self.state.sources[self.state.current_module].path, span, message)
+
+    func diagnostic_at(module_index: i64, span: SourceSpan, message: str) -> str:
+        return format_diagnostic(self.state.sources[module_index].path, span, message)
+
+    func fail(span: SourceSpan, message: str) -> !:
+        error(self.diagnostic(span, message))
+
+    func fail_at(module_index: i64, span: SourceSpan, message: str) -> !:
+        error(self.diagnostic_at(module_index, span, message))
+
+
+# mark: Type and operator tables ==============================================================
+
+func find_literal_token(value: ExpressionSyntax) -> Token?:
+    match value.form:
+        Literal(token): return token
+        else: return none
+
+# Parentheses do not stop a compiler constructor from being the whole
+# initializer; every other syntax wrapper would make ErrorCode a subvalue.
+func error_code_call_is_whole_initializer(value: ExpressionSyntax, call_span: SourceSpan) -> bool:
+    match value.form:
+        Group(grouped): return error_code_call_is_whole_initializer(grouped, call_span)
+        Call(callee, type_arguments, arguments):
+            return value.span.start == call_span.start and value.span.end == call_span.end
+        else: return false
+
+# Report whether an integer expression still needs a type from its context.
+# Examples: `5`, `-5`, and `(5)` qualify; `5i64` and `count` do not.
+func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
+    match value.form:
+        Literal(token): return token.kind == TokenKind.int_lit and token.suffix == ""
+        Group(grouped): return is_contextual_integer_expression(grouped)
+        Unary(operator, operand):
+            return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
+        else: return false
+
+# Structural comparison of pattern literals; only scalars and strings appear.
+func values_equal(left: Value, right: Value) -> bool:
+    match left:
+        Integer(a):
+            match right:
+                Integer(b): return a == b
+                else: return false
+        Boolean(a):
+            match right:
+                Boolean(b): return a == b
+                else: return false
+        Character(a):
+            match right:
+                Character(b): return a == b
+                else: return false
+        Text(a):
+            match right:
+                Text(b): return a == b
+                else: return false
+        else: return false
+
+func value_less_or_equal(left: Value, right: Value) -> bool:
+    match left:
+        Integer(a):
+            match right:
+                Integer(b): return a <= b
+                else: return false
+        Character(a):
+            match right:
+                Character(b): return u32(a) <= u32(b)
+                else: return false
+        else: return false
+
+# The value just below a range's exclusive upper bound.
+func predecessor(value: Value) -> Value:
+    match value:
+        Integer(a): return Value.Integer(value = a - 1)
+        Character(a): return Value.Character(value = char(u32(a) - 1))
+        else: return value
+
+func value_in_range(value: Value, low: Value, high: Value) -> bool:
+    return value_less_or_equal(low, value) and value_less_or_equal(value, high)
+
+func ranges_overlap(low: Value, high: Value, other_low: Value, other_high: Value) -> bool:
+    return value_less_or_equal(low, other_high) and value_less_or_equal(other_low, high)
+
+func join_names(names: list[str]) -> str:
+    var text = ""
+    for index in range(0, len(names)):
+        if index > 0: text = text + ", "
+        text = text + "`" + names[index] + "`"
+    return text
+
+func find_parameter(function: FunctionSymbol, name: str) -> i64:
+    for index in range(0, len(function.parameters)):
+        if function.parameters[index].name == name: return index
+    return -1
+
+func is_arithmetic_operator(operator: str) -> bool:
+    return match operator:
+        "+", "-", "*", "/", "//", "%" => true
+        "&", "|", "^", "<<", ">>" => true
+        else => false
