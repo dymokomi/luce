@@ -17,7 +17,7 @@ from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiverKind
 from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import describe_type
-from compiler.hir.ir import integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
+from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
 from compiler.hir.declarations import DeclarationCollector
@@ -25,6 +25,9 @@ from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, Che
 from compiler.hir.generation_model import DeclarationValueChecker, DeclaredErrorCode, FunctionSymbol, HirGenerationState, ImportedModule, ImportedValue, ImportedValueBinding
 from compiler.hir.generation_model import LocalBinding, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
 from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_text_literal
+
+# Largest finite IEEE binary32 value, represented exactly in binary64.
+let maximum_f32_value: f64 = 3.4028234663852886e38
 
 ## Checks constants and function-local semantics against collected declarations.
 pub class HirBodyChecker: DeclarationValueChecker:
@@ -761,13 +764,13 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 try self.require_integer_range(token.span, integer, integer_type)
                 value = Value.SignedInteger(value = integer)
         elif token.kind == TokenKind.float_lit:
-            if token.suffix == "f32":
-                value_type = resolve_builtin_type(BuiltinType.float32)
-            elif token.suffix == "" or token.suffix == "f64":
-                value_type = resolve_builtin_type(BuiltinType.float64)
-            else:
-                try self.fail(token.span, "float type `" + token.suffix + "` is not implemented yet")
-            value = Value.Floating(value = try self.decode_float(token))
+            value_type = try self.floating_literal_type(token, self.optional_value_context(expected))
+            let decoded = try self.decode_float(token)
+            if floating_bit_width(self.state.types, value_type) == 32:
+                if decoded > maximum_f32_value or decoded < 0.0 - maximum_f32_value:
+                    try self.fail(token.span, "floating-point literal is outside `f32` range")
+                value = Value.Floating(value = f64(f32(decoded)))
+            else: value = Value.Floating(value = decoded)
         elif token.text == "true" or token.text == "false":
             value_type = resolve_builtin_type(BuiltinType.boolean)
             value = Value.Boolean(value = token.text == "true")
@@ -797,6 +800,15 @@ pub class HirBodyChecker: DeclarationValueChecker:
             return suffix_type
         if expected != none and is_integer_type(self.state.types, expected): return expected
         return resolve_builtin_type(BuiltinType.signed_i64)
+
+    func floating_literal_type(token: Token, expected: TypeId?) -> TypeId!:
+        if token.suffix != "":
+            let suffix_type = builtin_type_id(token.suffix) else error(self.diagnostic(token.span, "float type `" + token.suffix + "` is not implemented yet"))
+            if not is_floating_type(self.state.types, suffix_type):
+                try self.fail(token.span, "float type `" + token.suffix + "` is not implemented yet")
+            return suffix_type
+        if expected != none and is_floating_type(self.state.types, expected): return expected
+        return resolve_builtin_type(BuiltinType.float64)
 
     func require_integer_range(span: SourceSpan, value: i64, value_type: TypeId) -> !:
         if value < integer_minimum(self.state.types, value_type) or value > integer_maximum(self.state.types, value_type):
@@ -974,8 +986,8 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 if name == "list" and self.state.find_local(name) < 0:
                     return try self.check_list_constructor(type_arguments, arguments, span, expected)
                 let conversion_type = builtin_type_id(name)
-                if conversion_type != none and is_integer_type(self.state.types, conversion_type) and self.state.find_local(name) < 0:
-                    return try self.check_integer_conversion(conversion_type, type_arguments, arguments, span, expected)
+                if conversion_type != none and is_numeric_type(self.state.types, conversion_type) and self.state.find_local(name) < 0:
+                    return try self.check_numeric_conversion(conversion_type, type_arguments, arguments, span, expected)
             Member(owner, name):
                 match owner.form:
                     Name(owner_name):
@@ -1015,40 +1027,60 @@ pub class HirBodyChecker: DeclarationValueChecker:
         let discarded = self.state.push_node(HirNodeForm.Discard(value = value), resolve_builtin_type(BuiltinType.unit), span)
         return try self.require_type(discarded, expected)
 
-    # Integer construction is the language's explicit checked conversion.
-    # Constants and runtime values share the same HIR node so the semantic
-    # oracle and canonical lowerer enforce one representability rule.
-    func check_integer_conversion(destination: TypeId, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
-        if len(type_arguments) > 0: try self.fail(span, "integer conversion does not take type arguments")
-        if len(arguments) != 1: try self.fail(span, "integer conversion takes exactly one positional value")
-        if arguments[0].label != none: try self.fail(arguments[0].span, "integer conversion uses one positional value")
+    # mark: Numeric construction ===============================================================
+
+    # Numeric construction owns all explicit scalar conversions. Constants
+    # fail here when their checked result is already known to be invalid;
+    # runtime values retain one typed HIR operation for the semantic oracle
+    # and canonical lowerer.
+    func check_numeric_conversion(destination: TypeId, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) > 0: try self.fail(span, "numeric conversion does not take type arguments")
+        if len(arguments) != 1: try self.fail(span, "numeric conversion takes exactly one positional value")
+        if arguments[0].label != none: try self.fail(arguments[0].span, "numeric conversion uses one positional value")
         let value = try self.check_expression(arguments[0].value, none)
-        if not is_integer_type(self.state.types, self.state.type_of(value)):
+        if not is_numeric_type(self.state.types, self.state.type_of(value)):
             try self.fail(arguments[0].span, "cannot convert `" + self.describe_type(self.state.type_of(value)) + "` to `" + self.describe_type(destination) + "`")
         match self.state.node_form(value):
             Constant(index):
-                match self.state.values[index]:
-                    SignedInteger(integer):
-                        var outside = false
-                        if is_unsigned_integer_type(self.state.types, destination):
-                            outside = integer < 0
-                            if not outside: outside = u64(integer) > unsigned_integer_maximum(self.state.types, destination)
-                        else:
-                            outside = integer < integer_minimum(self.state.types, destination) or integer > integer_maximum(self.state.types, destination)
-                        if outside:
-                            try self.fail(arguments[0].span, "constant " + str(integer) + " is outside `" + self.describe_type(destination) + "` range")
-                    UnsignedInteger(integer):
-                        var outside = false
-                        if is_unsigned_integer_type(self.state.types, destination):
-                            outside = integer > unsigned_integer_maximum(self.state.types, destination)
-                        else:
-                            outside = integer > u64(integer_maximum(self.state.types, destination))
-                        if outside:
-                            try self.fail(arguments[0].span, "constant " + str(integer) + " is outside `" + self.describe_type(destination) + "` range")
-                    else: pass
+                try self.require_numeric_constant_conversion(arguments[0].span, self.state.values[index], destination)
             else: pass
-        let converted = self.state.push_node(HirNodeForm.IntegerConvert(value = value), destination, span)
+        let converted = self.state.push_node(HirNodeForm.NumericConvert(value = value), destination, span)
         return try self.require_type(converted, expected)
+
+    func require_numeric_constant_conversion(span: SourceSpan, value: Value, destination: TypeId) -> !:
+        match value:
+            SignedInteger(integer):
+                if is_integer_type(self.state.types, destination):
+                    var outside = false
+                    if is_unsigned_integer_type(self.state.types, destination):
+                        outside = integer < 0
+                        if not outside: outside = u64(integer) > unsigned_integer_maximum(self.state.types, destination)
+                    else:
+                        outside = integer < integer_minimum(self.state.types, destination) or integer > integer_maximum(self.state.types, destination)
+                    if outside: try self.fail(span, "constant " + str(integer) + " is outside `" + self.describe_type(destination) + "` range")
+            UnsignedInteger(integer):
+                if is_integer_type(self.state.types, destination):
+                    var outside = false
+                    if is_unsigned_integer_type(self.state.types, destination): outside = integer > unsigned_integer_maximum(self.state.types, destination)
+                    else: outside = integer > u64(integer_maximum(self.state.types, destination))
+                    if outside: try self.fail(span, "constant " + str(integer) + " is outside `" + self.describe_type(destination) + "` range")
+            Floating(item):
+                if is_integer_type(self.state.types, destination):
+                    if item != item: try self.fail(span, "cannot convert NaN to `" + self.describe_type(destination) + "`")
+                    var outside = false
+                    if is_unsigned_integer_type(self.state.types, destination):
+                        outside = item < 0.0 or item >= f64(unsigned_integer_maximum(self.state.types, destination)) + 1.0
+                    else:
+                        outside = item < f64(integer_minimum(self.state.types, destination)) or item >= f64(integer_maximum(self.state.types, destination)) + 1.0
+                    if outside: try self.fail(span, "constant " + str(item) + " is outside `" + self.describe_type(destination) + "` range")
+                elif floating_bit_width(self.state.types, destination) == 32:
+                    let difference = item - item
+                    let finite_overflow = (item > maximum_f32_value or item < 0.0 - maximum_f32_value) and difference == difference
+                    if finite_overflow:
+                        try self.fail(span, "constant " + str(item) + " is outside `f32` range")
+            else: trap("numeric conversion constant has a non-numeric value")
+
+    # mark: Native intrinsics ==================================================================
 
     # Native intrinsics are ordinary typed HIR nodes, not calls or backend
     # names. Their source order is explicit and every operation learns layout
@@ -2314,6 +2346,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
             ErrorCodeLiteral(value): return true
             FunctionAddress(function): return true
             Unary(operation, operand): return self.is_constant_expression(operand)
+            NumericConvert(value): return self.is_constant_expression(value)
             Binary(left, operation, right): return self.is_constant_expression(left) and self.is_constant_expression(right)
             Range(lower, upper, inclusive): return self.is_constant_expression(lower) and self.is_constant_expression(upper)
             Conditional(chosen, condition, alternative):

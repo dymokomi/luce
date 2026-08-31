@@ -65,6 +65,21 @@ As implementation advances, broad `partial` rows are split until every
 normative rule has a named positive and negative fixture. No broad row may be
 promoted merely because its common case works.
 
+## Current numeric-construction evidence
+
+The broad §7 row remains partial. Explicit construction now has one resolved
+HIR identity and one canonical MIR conversion family; width, signedness, and
+IEEE rounding remain semantic facts while only instruction selection belongs
+to QBE or Wasm.
+
+| §7.5 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Every signed/unsigned integer pair checks the destination interval | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and differential boundaries | complete |
+| Integer-to-float rounds to nearest, ties to even | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete for f32/f64 |
+| Float-to-integer truncates toward zero and traps NaN/infinity/out-of-range | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and trapping corpus | complete for f32/f64 |
+| f32/f64 widening and checked narrowing; contextual f32 literals and per-operation f32 rounding | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete |
+| f16 construction and arithmetic | rejected at first missing stage | n/a | n/a | focused negative fixture | open with f16 |
+
 ## Current `list[T]` evidence
 
 The broad §12 row remains partial. This smaller matrix prevents the first
@@ -145,6 +160,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `function_values.luc` | Exact named function values and indirect calls | HIR, MIR, Wasm, and native QBE execution. |
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |
+| `numeric_conversions.luc` | Checked integer/float construction, binary32 contextual rounding, width conversion, and truncation | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `lists.luc` | Shared list identity, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `strings.luc` | Raw/escaped text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |

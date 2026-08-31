@@ -20,10 +20,11 @@
 #       Every integer operation is checked against the register's type before
 #       the host computes it, so overflow, a zero divisor, `minimum // -1`, and
 #       an out-of-range shift count trap here exactly as the language says
-#       (section 7) and never reach Stage-0's own trap. Two representation
-#       shortcuts: `f32` values are stored as `f64`, and floats in memory live
-#       in a side table keyed by address because Stage-0 offers no float-to-
-#       bits conversion; a `Load` of a float address never written reads 0.0.
+#       (section 7) and never reach Stage-0's own trap. An `f32` is carried in
+#       an `f64` host slot only after every producing operation has rounded it
+#       with Stage-0's real binary32 arithmetic. Floats in memory live in a
+#       side table keyed by address because Stage-0 offers no float-to-bits
+#       conversion; a `Load` of a float address never written reads 0.0.
 #
 #       The walk is: `run` -> `call` (one frame) -> `execute_body` -> one
 #       instruction. Control flow returns a `Flow` value that regions consume.
@@ -298,7 +299,7 @@ pub class MirInterpreter: MirExternMemory:
         for register_type in function.registers:
             registers.append(self.default_value(register_type))
         for position in range(0, len(arguments)):
-            registers[position] = arguments[position]
+            registers[position] = self.canonical_external_value(arguments[position], function.signature.parameters[position])
         let slots = list[i64]()
         for slot in function.slots:
             slots.append(self.allocate(self.layout.size_of(slot.value_type), self.layout.align_of(slot.value_type)))
@@ -416,7 +417,7 @@ pub class MirInterpreter: MirExternMemory:
                 match value:
                     SignedInt(item): frame.registers[result.value] = MirValue.SignedInt(value = item)
                     UnsignedInt(item): frame.registers[result.value] = MirValue.UnsignedInt(value = item)
-                    Float(item): frame.registers[result.value] = MirValue.Float(value = item)
+                    Float(item): frame.registers[result.value] = MirValue.Float(value = normalize_mir_float(item, frame.function.registers[result.value], types))
                     Bool(item): frame.registers[result.value] = MirValue.Bool(value = item)
                     Null: frame.registers[result.value] = MirValue.Ptr(value = 0)
             Copy(result, source):
@@ -702,14 +703,14 @@ pub class MirInterpreter: MirExternMemory:
                 let value = try host.load(global)
                 if not self.external_value_matches(value, global.value_type):
                     error("mir interpreter: external global `" + global.name + "` has an incompatible host value")
-                frame.registers[result.value] = value
+                frame.registers[result.value] = self.canonical_external_value(value, global.value_type)
             StoreExternalGlobal(global_index, value_register):
                 let global = self.program.external_globals[global_index.value]
                 let value = frame.registers[value_register.value]
                 if not self.external_value_matches(value, global.value_type):
                     error("mir interpreter: external global `" + global.name + "` received an incompatible value")
                 let host = self.external_global_host else error("mir interpreter: external global `" + global.name + "` is not available")
-                try host.store(global, value)
+                try host.store(global, self.canonical_external_value(value, global.value_type))
             FunctionAddress(result, function):
                 frame.registers[result.value] = MirValue.Ptr(value = function_address_base + i64(function.value))
             ExternAddress(result, external):
@@ -838,7 +839,7 @@ pub class MirInterpreter: MirExternMemory:
     func evaluate_binary(operation: BinaryOp, operand_type: TypeId, left: MirValue, right: MirValue) -> MirValue!:
         let types = self.program.types
         if is_float_type(types, operand_type):
-            return try evaluate_float_binary(operation, float_of(left), float_of(right))
+            return try evaluate_float_binary(operation, operand_type, float_of(left), float_of(right), types)
         if is_bool_type(types, operand_type):
             if operation == BinaryOp.eq: return MirValue.Bool(value = bool_of(left) == bool_of(right))
             if operation == BinaryOp.ne: return MirValue.Bool(value = bool_of(left) != bool_of(right))
@@ -935,7 +936,9 @@ pub class MirInterpreter: MirExternMemory:
         let types = self.program.types
         match operation:
             neg:
-                if is_float_type(types, operand_type): return MirValue.Float(value = 0.0 - float_of(operand))
+                if is_float_type(types, operand_type):
+                    if bits_of(types, operand_type) == 32: return MirValue.Float(value = f64(-f32(float_of(operand))))
+                    return MirValue.Float(value = -float_of(operand))
                 let value = signed_int_of(operand)
                 if value == int_minimum(types, operand_type): try trap_overflow()
                 return MirValue.SignedInt(value = 0 - value)
@@ -955,8 +958,8 @@ pub class MirInterpreter: MirExternMemory:
             int_reinterpret:
                 return integer_from_low_bits(operand, result_type, types)
             int_to_float:
-                if is_signed_int_type(types, operand_type): return MirValue.Float(value = f64(signed_int_of(operand)))
-                return MirValue.Float(value = f64(unsigned_int_of(operand)))
+                if is_signed_int_type(types, operand_type): return MirValue.Float(value = normalize_mir_float(f64(signed_int_of(operand)), result_type, types))
+                return MirValue.Float(value = normalize_mir_float(f64(unsigned_int_of(operand)), result_type, types))
             float_to_int:
                 let value = float_of(operand)
                 if value != value: error("mir interpreter: trap: float to integer conversion of NaN")
@@ -968,6 +971,8 @@ pub class MirInterpreter: MirExternMemory:
                 if value < 0.0 or value >= upper:
                     error("mir interpreter: trap: float to integer conversion is outside the integer range")
                 return MirValue.UnsignedInt(value = u64(value))
+            float_resize:
+                return MirValue.Float(value = normalize_mir_float(float_of(operand), result_type, types))
 
     # mark: Memory ==============================================================================
 
@@ -1001,7 +1006,7 @@ pub class MirInterpreter: MirExternMemory:
     func store(value_type: TypeId, address: i64, value: MirValue):
         let types = self.program.types
         if is_float_type(types, value_type):
-            self.set_float_cell(address, float_of(value))
+            self.set_float_cell(address, normalize_mir_float(float_of(value), value_type, types))
             return
         if is_bool_type(types, value_type):
             if bool_of(value): self.memory[address] = u8(1)
@@ -1087,6 +1092,7 @@ pub class MirInterpreter: MirExternMemory:
             for index in range(0, len(results)):
                 if not self.external_value_matches(results[index], external.signature.results[index]):
                     error("mir interpreter: extern `" + external.name + "` returned a value incompatible with result " + str(index))
+                results[index] = self.canonical_external_value(results[index], external.signature.results[index])
             return results
         let name = external.name
         if name == "luce_rt_arena":
@@ -1128,6 +1134,13 @@ pub class MirInterpreter: MirExternMemory:
                 UnsignedInt(item): return item <= uint_maximum(self.program.types, value_type)
                 else: return false
         return false
+
+    func canonical_external_value(value: MirValue, value_type: TypeId) -> MirValue:
+        if is_float_type(self.program.types, value_type):
+            match value:
+                Float(item): return MirValue.Float(value = normalize_mir_float(item, value_type, self.program.types))
+                else: return value
+        return value
 
     func text_at(address: i64, length: i64) -> str:
         let payload = list[u8]()
@@ -1367,11 +1380,19 @@ func checked_multiply(left: i64, right: i64) -> i64!:
         try trap_overflow()
     return left * right
 
-func evaluate_float_binary(operation: BinaryOp, left: f64, right: f64) -> MirValue!:
-    if operation == BinaryOp.add: return MirValue.Float(value = left + right)
-    if operation == BinaryOp.sub: return MirValue.Float(value = left - right)
-    if operation == BinaryOp.mul: return MirValue.Float(value = left * right)
-    if operation == BinaryOp.div: return MirValue.Float(value = left / right)
+func evaluate_float_binary(operation: BinaryOp, operand_type: TypeId, left: f64, right: f64, types: MirTypeTable) -> MirValue!:
+    if operation == BinaryOp.add:
+        if bits_of(types, operand_type) == 32: return MirValue.Float(value = f64(f32(left) + f32(right)))
+        return MirValue.Float(value = left + right)
+    if operation == BinaryOp.sub:
+        if bits_of(types, operand_type) == 32: return MirValue.Float(value = f64(f32(left) - f32(right)))
+        return MirValue.Float(value = left - right)
+    if operation == BinaryOp.mul:
+        if bits_of(types, operand_type) == 32: return MirValue.Float(value = f64(f32(left) * f32(right)))
+        return MirValue.Float(value = left * right)
+    if operation == BinaryOp.div:
+        if bits_of(types, operand_type) == 32: return MirValue.Float(value = f64(f32(left) / f32(right)))
+        return MirValue.Float(value = left / right)
     if operation == BinaryOp.eq: return MirValue.Bool(value = left == right)
     if operation == BinaryOp.ne: return MirValue.Bool(value = left != right)
     if operation == BinaryOp.lt: return MirValue.Bool(value = left < right)
@@ -1379,3 +1400,7 @@ func evaluate_float_binary(operation: BinaryOp, left: f64, right: f64) -> MirVal
     if operation == BinaryOp.gt: return MirValue.Bool(value = left > right)
     if operation == BinaryOp.ge: return MirValue.Bool(value = left >= right)
     trap("verified float operands reached an integer-only operation")
+
+func normalize_mir_float(value: f64, value_type: TypeId, types: MirTypeTable) -> f64:
+    if bits_of(types, value_type) == 32: return f64(f32(value))
+    return value

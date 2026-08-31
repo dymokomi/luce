@@ -19,7 +19,7 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
-from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_ptr_type, is_signed_int_type, mir_type, no_register, no_registers, uint_maximum
+from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_int_type, is_ptr_type, is_signed_int_type, mir_type, no_register, no_registers, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
@@ -491,7 +491,7 @@ pub class FunctionLowerer:
                 try self.lower_prologue_node(module, function, count, body)
             NativeIsNull(pointer): try self.lower_prologue_node(module, function, pointer, body)
             NativeArena(end): try self.lower_prologue_node(module, function, end, body)
-            IntegerConvert(value): try self.lower_prologue_node(module, function, value, body)
+            NumericConvert(value): try self.lower_prologue_node(module, function, value, body)
             Discard(value): try self.lower_prologue_node(module, function, value, body)
             Trap(message): try self.lower_prologue_node(module, function, message, body)
             Assert(condition, message):
@@ -1552,7 +1552,7 @@ pub class FunctionLowerer:
                 let results = self.state.operands.run([result])
                 body.append(MirInstruction(form = InstructionForm.CallExtern(results = results, external = provider, arguments = arguments), span = span))
                 return result
-            IntegerConvert(value): return try self.lower_integer_conversion(module, function, expression, value, body)
+            NumericConvert(value): return try self.lower_numeric_conversion(module, function, expression, value, body)
             SequenceLength(value):
                 let hir_sequence_type = node_type(self.state.program, value)
                 # A fixed array's length is static, but its receiver remains
@@ -2266,6 +2266,34 @@ pub class FunctionLowerer:
 
     # mark: Numeric construction ===============================================================
 
+    # Preserve one HIR numeric construction while selecting the canonical MIR
+    # conversion family from its resolved source and destination types.
+    func lower_numeric_conversion(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let hir_source = node_type(self.state.program, value)
+        let hir_destination = node_type(self.state.program, expression)
+        if ir.is_integer_type(self.state.program.types, hir_source) and ir.is_integer_type(self.state.program.types, hir_destination):
+            return try self.lower_integer_conversion(module, function, expression, value, body)
+
+        let span = node_span(self.state.program, expression)
+        let operand = try self.lower_expression(module, function, value, body)
+        let source_type = try self.state.mir_type_of(module, function, span, hir_source)
+        let destination_type = try self.state.mir_type_of(module, function, span, hir_destination)
+        if source_type.value == destination_type.value: return operand
+
+        let result = self.state.new_register(destination_type)
+        var operation = ConvertOp.float_resize
+        if is_int_type(self.state.types, source_type): operation = ConvertOp.int_to_float
+        elif is_int_type(self.state.types, destination_type): operation = ConvertOp.float_to_int
+        else:
+            # IEEE narrowing rounds, but a finite value outside binary32's
+            # finite range must not silently become infinity. NaN and existing
+            # infinities remain IEEE values of the narrower type.
+            if bits_of(self.state.types, source_type) == 64 and bits_of(self.state.types, destination_type) == 32:
+                self.emit_float_conversion_bound(operand, source_type, BinaryOp.gt, 3.4028234663852886e38, span, body)
+                self.emit_float_conversion_bound(operand, source_type, BinaryOp.lt, -3.4028234663852886e38, span, body)
+        body.append(MirInstruction(form = InstructionForm.Convert(result = result, operation = operation, operand = operand), span = span))
+        return result
+
     # Explicit integer construction checks the destination interval before
     # MIR changes representation. Widening uses the source signedness;
     # narrowing wraps only after the guards prove that no bits are lost.
@@ -2329,6 +2357,27 @@ pub class FunctionLowerer:
     func emit_integer_conversion_guard(invalid: RegisterId, span: SourceSpan, body: list[MirInstruction]):
         self.open_if(invalid, list[RegisterId](), span, body)
         body.append(MirInstruction(form = InstructionForm.Trap(reason = "integer conversion out of range"), span = span))
+        self.emit_else(span, body)
+        self.emit_end(span, body)
+
+    func emit_float_conversion_bound(operand: RegisterId, source_type: TypeId, operation: BinaryOp, bound: f64, span: SourceSpan, body: list[MirInstruction]):
+        let constant = self.state.new_register(source_type)
+        body.append(MirInstruction(form = InstructionForm.Const(result = constant, value = MirConstant.Float(value = bound)), span = span))
+        let invalid = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = invalid, operation = operation, left = operand, right = constant), span = span))
+        self.open_if(invalid, list[RegisterId](), span, body)
+        # `x - x` is NaN only for an existing infinity or NaN. The ordered
+        # bound above is false for NaN, so this inner test distinguishes an
+        # infinity (representable) from a finite overflow (must trap) without
+        # adding a target-specific classification operation to MIR.
+        let difference = self.state.new_register(source_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = difference, operation = BinaryOp.sub, left = operand, right = operand), span = span))
+        let non_finite = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = non_finite, operation = BinaryOp.ne, left = difference, right = difference), span = span))
+        self.open_if(non_finite, list[RegisterId](), span, body)
+        self.emit_else(span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "floating-point conversion out of range"), span = span))
+        self.emit_end(span, body)
         self.emit_else(span, body)
         self.emit_end(span, body)
 

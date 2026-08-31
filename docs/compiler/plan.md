@@ -248,13 +248,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   there is no assertion MIR instruction or backend-specific lowering. The
   remaining effect-free-condition proof waits for real operational summaries,
   and source-location/stack reporting remains in the §13 diagnostic audit.
-- [ ] **Complete explicit numeric construction.** Checked integer-to-integer
-  construction is complete. Integer/float and float/integer MIR operations
-  already exist, but source completion also needs float-width conversion. The
-  §7.5 phrase “not representable” must first settle whether `f64` to `f32`
-  narrowing requires exact preservation or only a finite in-range result;
-  those policies produce materially different constant errors and runtime
-  traps, so do not infer one from backend defaults.
+- [x] **Complete explicit numeric construction for the implemented scalar
+  widths** (2026-08-31). One `NumericConvert` HIR node covers every
+  integer/integer, integer/float, float/integer, and f32/f64 pair without
+  source-family duplication. §7.5 now states the policy explicitly:
+  integer-to-float and float narrowing round to nearest/ties-to-even,
+  float-to-integer truncates toward zero after rejecting NaN, infinity, and
+  values outside the destination interval, and only finite floating narrowing
+  overflow traps. HIR constants and every f32 operation round at binary32;
+  canonical MIR retains typed `Convert` operations and target-independent
+  guards. QBE supplies explicit invalid-conversion guards plus `truncd`/`exts`;
+  Wasm uses its trapping conversions and promote/demote instructions. Both
+  oracles, external host seams, the full differential corpus, and
+  `examples/numeric_conversions.luc` agree through native QBE and Wasm. `f16`
+  remains a separate missing scalar width, not an ambiguity in construction.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung
