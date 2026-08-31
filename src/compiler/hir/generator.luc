@@ -42,7 +42,7 @@ from compiler.hir.ir import UnaryOperation, Value, create_builtin_type_table
 from compiler.hir.ir import describe_type, integer_maximum, integer_minimum
 from compiler.hir.ir import is_floating_type, is_integer_type, is_numeric_type, is_ordered_type
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, type_forms_match, types_match
-from compiler.hir.ir import place_element_step, place_field_step
+from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
 
 # mark: HirGenerator state ====================================================================
 
@@ -517,6 +517,18 @@ pub class HirGenerator:
                 storage_allocator:
                     if not self.is_storage_allocator(function):
                         try self.fail_at(module_index, function.span, "runtime binding `storage_allocator` must have signature `(u64, u64) -> native_mut_ptr[u8]`")
+                list_create:
+                    if not self.is_list_create(function):
+                        try self.fail_at(module_index, function.span, "runtime binding `list_create` must have signature `() -> native_mut_ptr[u8]`")
+                list_length:
+                    if not self.is_list_length(function):
+                        try self.fail_at(module_index, function.span, "runtime binding `list_length` must have signature `(native_mut_ptr[u8]) -> u64`")
+                list_append_slot:
+                    if not self.is_list_address_service(function):
+                        try self.fail_at(module_index, function.span, "runtime binding `list_append_slot` must have signature `(native_mut_ptr[u8], u64, u64) -> native_mut_ptr[u8]`")
+                list_element_address:
+                    if not self.is_list_address_service(function):
+                        try self.fail_at(module_index, function.span, "runtime binding `list_element_address` must have signature `(native_mut_ptr[u8], u64, u64) -> native_mut_ptr[u8]`")
             bindings.append(HirRuntimeBinding(service = request.service, function = function.symbol))
         return bindings
 
@@ -528,6 +540,29 @@ pub class HirGenerator:
         match self.types.definitions[function.result.value].form:
             NativePointer(pointee, is_mutable):
                 return is_mutable and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
+
+    func is_list_create(function: FunctionSymbol) -> bool:
+        return function.receiver == none and len(function.parameters) == 0 and self.is_mutable_byte_pointer(function.result)
+
+    func is_list_length(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 1: return false
+        let value = function.parameters[0]
+        return value.default_value.value == no_node and self.is_mutable_byte_pointer(value.value_type) and types_match(function.result, resolve_builtin_type(BuiltinType.unsigned_u64))
+
+    func is_list_address_service(function: FunctionSymbol) -> bool:
+        if function.receiver != none or len(function.parameters) != 3: return false
+        let u64_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if function.parameters[0].default_value.value != no_node or not self.is_mutable_byte_pointer(function.parameters[0].value_type): return false
+        if not self.is_plain_parameter(function.parameters[1], u64_type) or not self.is_plain_parameter(function.parameters[2], u64_type): return false
+        return self.is_mutable_byte_pointer(function.result)
+
+    func is_plain_parameter(parameter: HirParameter, expected: TypeId) -> bool:
+        return parameter.default_value.value == no_node and types_match(parameter.value_type, expected)
+
+    func is_mutable_byte_pointer(value_type: TypeId) -> bool:
+        match self.types.definitions[value_type.value].form:
+            NativePointer(pointee, is_mutable): return is_mutable and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
             else: return false
 
     # mark: Modules and imports =================================================================
@@ -1428,6 +1463,17 @@ pub class HirGenerator:
                             return self.intern_slice(inner)
                         else:
                             error(self.diagnostic_at(module_index, value.span, "applied types are not implemented yet"))
+                if path.dotted() == "list" and len(arguments) == 1:
+                    match arguments[0]:
+                        TypeArgument(element):
+                            let inner = try self.resolve_type(module_index, element)
+                            if self.contains_fallible(inner):
+                                try self.fail_at(module_index, element.span, "a list cannot store a fallible type; `T!` is a function-result effect")
+                            return self.intern_list(inner)
+                        else:
+                            error(self.diagnostic_at(module_index, value.span, "`list` needs exactly one element type"))
+                if path.dotted() == "list":
+                    error(self.diagnostic_at(module_index, value.span, "`list` needs exactly one element type"))
                 if path.dotted() == "range" and len(arguments) == 1:
                     match arguments[0]:
                         TypeArgument(element):
@@ -1844,10 +1890,11 @@ pub class HirGenerator:
         return self.push_statement(HirNodeForm.GlobalStore(global = u32(global_index), operation = operation, value = checked), span)
 
     # Resolve every field name and index expression in an assignment target
-    # once. The resulting path is target-neutral and can mix field and array
-    # steps; consumers never walk source syntax or repeat mutability checks.
+    # once. The resulting path is target-neutral and can mix value fields,
+    # fixed arrays, and shared list storage; consumers never walk source
+    # syntax or repeat type checks.
     func check_place_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
-        let place = try self.resolve_assignment_place(target, span)
+        let place = try self.resolve_assignment_place(target, span, true)
         if len(place.steps) == 0: trap("place assignment has no path steps")
         let checked = try self.check_expression(value, place.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
@@ -1859,9 +1906,12 @@ pub class HirGenerator:
             operation = AssignmentOperation.Combine(operation = resolved.operation)
         return self.push_statement(HirNodeForm.PlaceAssignment(symbol = place.symbol, steps = self.push_run(place.steps), operation = operation, value = checked), span)
 
-    func resolve_assignment_place(target: ExpressionSyntax, span: SourceSpan) -> CheckedPlace!:
+    # `mutate_value` is false while merely reaching a reference collection.
+    # A `let` binding or field may expose a mutable list even though the value
+    # containing that reference cannot itself be replaced.
+    func resolve_assignment_place(target: ExpressionSyntax, span: SourceSpan, mutate_value: bool) -> CheckedPlace!:
         match target.form:
-            Group(grouped): return try self.resolve_assignment_place(grouped, span)
+            Group(grouped): return try self.resolve_assignment_place(grouped, span, mutate_value)
             Name(root_name):
                 let local_index = self.find_local(root_name)
                 if local_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
@@ -1870,12 +1920,12 @@ pub class HirGenerator:
                 let active_receiver = self.current_receiver
                 if root_name == "self" and active_receiver != none:
                     initializer_field = active_receiver.kind == HirReceiverKind.initializer
-                if not local.is_mutable and not initializer_field:
+                if mutate_value and not local.is_mutable and not initializer_field:
                     if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
                     try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
                 return CheckedPlace(symbol = local.symbol, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
             Member(base, name):
-                let place = try self.resolve_assignment_place(base, span)
+                let place = try self.resolve_assignment_place(base, span, mutate_value)
                 let struct_index = self.struct_of(place.value_type)
                 if struct_index < 0: try self.fail(span, "`" + self.describe_type(place.value_type) + "` has no field `" + name + "`")
                 let field_index = self.find_field(struct_index, name)
@@ -1883,19 +1933,26 @@ pub class HirGenerator:
                 let field = self.structs[struct_index].fields[field_index]
                 if not field.is_public and self.structs[struct_index].module_index != self.current_module:
                     try self.fail(span, "field `" + name + "` is private to module `" + self.sources[self.structs[struct_index].module_index].name + "`")
-                if not field.is_mutable and not place.initializer_field:
+                if mutate_value and not field.is_mutable and not place.initializer_field:
                     try self.fail(span, "cannot assign to `let` field `" + name + "`; declare it with `var`")
                 place.steps.append(place_field_step)
                 place.steps.append(u32(field_index))
                 return CheckedPlace(symbol = place.symbol, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
             Index(base, subscript):
-                let place = try self.resolve_assignment_place(base, span)
+                let inspected = try self.resolve_assignment_place(base, span, false)
                 var element_type = resolve_builtin_type(BuiltinType.unit)
-                match self.types.definitions[place.value_type.value].form:
+                var step = place_element_step
+                match self.types.definitions[inspected.value_type.value].form:
                     Array(element, count): element_type = element
-                    else: try self.fail(span, "`" + self.describe_type(place.value_type) + "` does not support mutable indexing")
+                    List(element):
+                        element_type = element
+                        step = place_list_element_step
+                    else: try self.fail(span, "`" + self.describe_type(inspected.value_type) + "` does not support mutable indexing")
+                var place = inspected
+                if step == place_element_step:
+                    place = try self.resolve_assignment_place(base, span, true)
                 let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
-                place.steps.append(place_element_step)
+                place.steps.append(step)
                 place.steps.append(index.value)
                 return CheckedPlace(symbol = place.symbol, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
@@ -2253,6 +2310,8 @@ pub class HirGenerator:
             Name(name):
                 if name == "error" and self.find_local(name) < 0:
                     return try self.check_error_call(arguments, span, expected)
+                if name == "list" and self.find_local(name) < 0:
+                    return try self.check_list_constructor(type_arguments, arguments, span, expected)
             Member(owner, name):
                 match owner.form:
                     Name(owner_name):
@@ -2369,6 +2428,15 @@ pub class HirGenerator:
 
         let receiver = try self.check_expression(owner, none)
         let owner_type = self.type_of(receiver)
+        match self.types.definitions[owner_type.value].form:
+            List(element_type):
+                if name != "append": try self.fail(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`")
+                if len(arguments) != 1: try self.fail(span, "`list.append` takes one element")
+                if arguments[0].label != none: try self.fail(arguments[0].span, "`list.append` uses a positional element")
+                let element = try self.check_expression(arguments[0].value, element_type)
+                let appended = self.push_node(HirNodeForm.ListAppend(value = receiver, element = element), resolve_builtin_type(BuiltinType.unit), span)
+                return try self.require_type(appended, expected)
+            else: pass
         let method_index = self.find_method(owner_type, name)
         if method_index >= 0:
             let method = self.functions[method_index]
@@ -2398,7 +2466,7 @@ pub class HirGenerator:
         let receiver_value = resolved.receiver
         if receiver_value.value != no_node:
             let method = function.receiver else trap("a receiver was resolved for a function without one")
-            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee_span)
+            if method.kind == HirReceiverKind.mutating_method: try self.require_mutable_place(receiver_value, callee_span, true)
             typed_arguments.append(0)
             typed_arguments.append(receiver_value.value)
             first_source_parameter = 1
@@ -2824,6 +2892,10 @@ pub class HirGenerator:
                 if name == "length":
                     let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
                     return try self.require_type(length, expected)
+            List(element):
+                if name == "length":
+                    let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
             else: pass
         if types_match(checked_type, resolve_builtin_type(BuiltinType.string)) and name == "byte_count":
             let length = self.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
@@ -2867,6 +2939,7 @@ pub class HirGenerator:
         else:
             match self.types.definitions[value_type.value].form:
                 Array(element, count): element_type = element
+                List(element): element_type = element
                 else:
                     if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
                         try self.fail(span, "`str` does not support integer indexing; iterate characters or encode UTF-8 bytes")
@@ -2875,26 +2948,28 @@ pub class HirGenerator:
         let result = self.push_node(HirNodeForm.SequenceIndex(value = value, index = index), element_type, span)
         return try self.require_type(result, expected)
 
-    # A mutating method needs somewhere to write: a `var` local, `self` in a
-    # mutating method, or a mutable field/array element reached through one.
-    func require_mutable_place(value: NodeId, span: SourceSpan) -> !:
+    # A mutating value method needs a stable place. Value fields and arrays
+    # require mutation all the way to a `var` root; crossing a reference list
+    # changes that requirement because its element slot is shared storage.
+    func require_mutable_place(value: NodeId, span: SourceSpan, mutate_value: bool) -> !:
         match self.node_form(value):
             Reference(symbol):
                 for local in self.locals:
                     if local.symbol.value == symbol.value:
-                        if local.is_mutable: return
+                        if local.is_mutable or not mutate_value: return
                         try self.fail(span, "mutating method needs a `var` receiver; `" + local.name + "` is immutable")
                 try self.fail(span, "mutating method needs a `var` receiver")
             FieldAccess(inner, field):
                 let struct_index = self.struct_of(self.type_of(inner))
                 let stored = self.structs[struct_index].fields[field]
-                if not stored.is_mutable:
+                if mutate_value and not stored.is_mutable:
                     try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
-                try self.require_mutable_place(inner, span)
+                try self.require_mutable_place(inner, span, mutate_value)
             SequenceIndex(inner, index):
                 match self.types.definitions[self.type_of(inner).value].form:
-                    Array(element, count): try self.require_mutable_place(inner, span)
-                    else: try self.fail(span, "mutating method needs a mutable fixed-array element receiver")
+                    Array(element, count): try self.require_mutable_place(inner, span, true)
+                    List(element): try self.require_mutable_place(inner, span, false)
+                    else: try self.fail(span, "mutating method needs a mutable array or list element receiver")
             else: try self.fail(span, "mutating method needs a `var` receiver, not a temporary value")
 
     # Resolve the bare declaration spellings left after value and member calls
@@ -3007,24 +3082,47 @@ pub class HirGenerator:
         let tuple_type = self.intern_tuple(parts)
         return try self.require_type(self.push_node(HirNodeForm.Tuple(elements = self.push_nodes(checked)), tuple_type, span), expected)
 
-    # Brackets remain the list-literal syntax by default. An expected fixed
+    # Brackets construct a fresh reference list by default. An expected fixed
     # array type selects the allocation-free value form and supplies both its
     # element type and exact count.
     func check_array_literal(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
-        let needed = expected else error(self.diagnostic(span, "list literals are not implemented yet; a fixed-array literal needs an `array[T, N]` context"))
-        var element_type = resolve_builtin_type(BuiltinType.unit)
-        var count = -1
-        match self.types.definitions[needed.value].form:
-            Array(element, array_count):
-                element_type = element
-                count = array_count
-            else: error(self.diagnostic(span, "list literals are not implemented yet"))
-        if len(elements) != count:
-            try self.fail(span, "fixed-array literal has " + str(len(elements)) + " element(s), expected `" + self.describe_type(needed) + "`")
+        if expected != none:
+            match self.types.definitions[expected.value].form:
+                Array(element_type, count):
+                    if len(elements) != count:
+                        try self.fail(span, "fixed-array literal has " + str(len(elements)) + " element(s), expected `" + self.describe_type(expected) + "`")
+                    let checked = list[NodeId]()
+                    for element in elements: checked.append(try self.check_expression(element, element_type))
+                    return self.push_node(HirNodeForm.Array(elements = self.push_nodes(checked)), expected, span)
+                List(element_type): return try self.check_list_literal(elements, element_type, expected, span)
+                else: pass
+        if len(elements) == 0:
+            error(self.diagnostic(span, "an empty list literal needs a `list[T]` context"))
+        let first = try self.check_expression(elements[0], none)
+        let element_type = self.type_of(first)
+        let checked = [first]
+        for index in range(1, len(elements)):
+            checked.append(try self.check_expression(elements[index], element_type))
+        let list_type = self.intern_list(element_type)
+        return try self.require_type(self.push_node(HirNodeForm.List(elements = self.push_nodes(checked)), list_type, span), expected)
+
+    func check_list_literal(elements: list[ExpressionSyntax], element_type: TypeId, list_type: TypeId, span: SourceSpan) -> NodeId!:
         let checked = list[NodeId]()
-        for element in elements:
-            checked.append(try self.check_expression(element, element_type))
-        return self.push_node(HirNodeForm.Array(elements = self.push_nodes(checked)), needed, span)
+        for element in elements: checked.append(try self.check_expression(element, element_type))
+        return self.push_node(HirNodeForm.List(elements = self.push_nodes(checked)), list_type, span)
+
+    func check_list_constructor(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 1: try self.fail(span, "`list[T]()` needs exactly one element type")
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(element): element_type = try self.resolve_type(self.current_module, element)
+            else: try self.fail(span, "`list[T]()` needs exactly one element type")
+        if self.contains_fallible(element_type):
+            try self.fail(span, "a list cannot store a fallible type; `T!` is a function-result effect")
+        if len(arguments) != 0: try self.fail(span, "`list[T]()` takes no arguments")
+        let list_type = self.intern_list(element_type)
+        let value = self.push_node(HirNodeForm.List(elements = self.push_nodes(list[NodeId]())), list_type, span)
+        return try self.require_type(value, expected)
 
     func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let checked_optional = try self.check_expression(optional_value, none)
@@ -3230,6 +3328,9 @@ pub class HirGenerator:
 
     func intern_slice(inner: TypeId) -> TypeId:
         return self.intern_named("slice[" + self.describe_type(inner) + "]", TypeForm.Slice(element = inner))
+
+    func intern_list(inner: TypeId) -> TypeId:
+        return self.intern_named("list[" + self.describe_type(inner) + "]", TypeForm.List(element = inner))
 
     func intern_range(inner: TypeId) -> TypeId:
         return self.intern_named("range[" + self.describe_type(inner) + "]", TypeForm.Range(element = inner))
@@ -3672,25 +3773,33 @@ pub class HirGenerator:
     # Follow value containers so aliases cannot hide it in storage; function
     # types are a boundary because their result may itself declare an effect.
     func contains_fallible(value: TypeId) -> bool:
+        let visited = list[bool]()
+        for index in range(0, len(self.types.definitions)): visited.append(false)
+        return self.contains_fallible_once(value, visited)
+
+    func contains_fallible_once(value: TypeId, visited: list[bool]) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
+        if visited[value.value]: return false
+        visited[value.value] = true
         match self.types.definitions[value.value].form:
             Fallible(inner): return true
-            Optional(inner): return self.contains_fallible(inner)
-            Slice(inner): return self.contains_fallible(inner)
-            Range(inner): return self.contains_fallible(inner)
-            Array(inner, count): return self.contains_fallible(inner)
+            Optional(inner): return self.contains_fallible_once(inner, visited)
+            Slice(inner): return self.contains_fallible_once(inner, visited)
+            List(inner): return self.contains_fallible_once(inner, visited)
+            Range(inner): return self.contains_fallible_once(inner, visited)
+            Array(inner, count): return self.contains_fallible_once(inner, visited)
             Tuple(elements):
                 for element in elements:
-                    if self.contains_fallible(element): return true
+                    if self.contains_fallible_once(element, visited): return true
                 return false
             Struct(index):
                 for field in self.structs[index].fields:
-                    if self.contains_fallible(field.value_type): return true
+                    if self.contains_fallible_once(field.value_type, visited): return true
                 return false
             Enum(index):
                 for case_value in self.enums[index].cases:
                     for field in case_value.payload:
-                        if self.contains_fallible(field.value_type): return true
+                        if self.contains_fallible_once(field.value_type, visited): return true
                 return false
             else: return false
 
@@ -3698,34 +3807,42 @@ pub class HirGenerator:
     # The pointer itself is the boundary: its pointee is a type description,
     # not another value stored inline.
     func contains_native_pointer(value: TypeId) -> bool:
+        let visited = list[bool]()
+        for index in range(0, len(self.types.definitions)): visited.append(false)
+        return self.contains_native_pointer_once(value, visited)
+
+    func contains_native_pointer_once(value: TypeId, visited: list[bool]) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
+        if visited[value.value]: return false
+        visited[value.value] = true
         match self.types.definitions[value.value].form:
             NativePointer(pointee, is_mutable): return true
-            Optional(inner): return self.contains_native_pointer(inner)
-            Fallible(inner): return self.contains_native_pointer(inner)
-            Slice(inner): return self.contains_native_pointer(inner)
-            Range(inner): return self.contains_native_pointer(inner)
-            Array(inner, count): return self.contains_native_pointer(inner)
+            Optional(inner): return self.contains_native_pointer_once(inner, visited)
+            Fallible(inner): return self.contains_native_pointer_once(inner, visited)
+            Slice(inner): return self.contains_native_pointer_once(inner, visited)
+            List(inner): return self.contains_native_pointer_once(inner, visited)
+            Range(inner): return self.contains_native_pointer_once(inner, visited)
+            Array(inner, count): return self.contains_native_pointer_once(inner, visited)
             Tuple(elements):
                 for element in elements:
-                    if self.contains_native_pointer(element): return true
+                    if self.contains_native_pointer_once(element, visited): return true
                 return false
             Function(parameters, result):
                 for parameter in parameters:
-                    if self.contains_native_pointer(parameter): return true
-                return self.contains_native_pointer(result)
+                    if self.contains_native_pointer_once(parameter, visited): return true
+                return self.contains_native_pointer_once(result, visited)
             CFunction(parameters, result):
                 for parameter in parameters:
-                    if self.contains_native_pointer(parameter): return true
-                return self.contains_native_pointer(result)
+                    if self.contains_native_pointer_once(parameter, visited): return true
+                return self.contains_native_pointer_once(result, visited)
             Struct(index):
                 for field in self.structs[index].fields:
-                    if self.contains_native_pointer(field.value_type): return true
+                    if self.contains_native_pointer_once(field.value_type, visited): return true
                 return false
             Enum(index):
                 for case_value in self.enums[index].cases:
                     for field in case_value.payload:
-                        if self.contains_native_pointer(field.value_type): return true
+                        if self.contains_native_pointer_once(field.value_type, visited): return true
                 return false
             else: return false
 

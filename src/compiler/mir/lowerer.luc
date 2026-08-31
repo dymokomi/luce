@@ -84,12 +84,12 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import InstructionForm, MirConstant, MirData, MirExtern, MirExternalGlobal, MirFunction, MirGlobal, MirInstruction
 from compiler.mir.canonical import MirProgram, MirRuntimeBinding, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
-from compiler.mir.canonical import find_runtime_symbol, intern_mir_type, make_enum_type
-from compiler.mir.canonical import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, no_register, no_registers, signatures_match
+from compiler.mir.canonical import find_runtime_symbol, make_enum_type
+from compiler.mir.canonical import OperandBuilder, RegisterRun, is_ptr_type, make_struct_type, mir_type, mir_types_match, no_register, no_registers, signatures_match
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, HirProgram, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_element_step, place_field_step
+from compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
 import compiler.hir.ir
 from compiler.mir.verifier import terminates
 from compiler.hir.analyzer import AnalyzedProgram
@@ -180,6 +180,8 @@ struct ExternalGlobalContract:
     let name: str
     let value_type: ir.TypeId
 
+let unlowered_nominal_type: u32 = 4294967295
+
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
 pub class Lowerer:
     let program: HirProgram
@@ -192,6 +194,12 @@ pub class Lowerer:
     let globals: list[MirGlobal]
     let data: list[MirData]
     let lowered_functions: list[LoweredFunction]
+    # Nominal aggregates reserve their MIR identity before lowering fields.
+    # A collection reference may point back to that identity without making
+    # the aggregate's byte layout recursive.
+    let lowered_struct_types: list[u32]
+    let lowered_enum_types: list[u32]
+    let active_nominal_types: list[u32]
     let c_wrappers: list[CWrapper]
     let c_extern_contracts: list[CExternContract]
     # The register table, slots, live locals, and parameter registers of the
@@ -225,6 +233,11 @@ pub class Lowerer:
         self.globals = list[MirGlobal]()
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
+        self.lowered_struct_types = list[u32]()
+        for index in range(0, len(self.program.structs)): self.lowered_struct_types.append(unlowered_nominal_type)
+        self.lowered_enum_types = list[u32]()
+        for index in range(0, len(self.program.enums)): self.lowered_enum_types.append(unlowered_nominal_type)
+        self.active_nominal_types = list[u32]()
         self.c_wrappers = list[CWrapper]()
         self.c_extern_contracts = list[CExternContract]()
         self.registers = list[TypeId]()
@@ -659,7 +672,8 @@ pub class Lowerer:
             NativeArena(end): try self.lower_prologue_node(module, function, end, body)
             PlaceAssignment(symbol, steps, operation, value):
                 for position in range(0, i64(steps.count) // 2):
-                    if u32(entry_at(self.program, steps, position * 2)) == place_element_step:
+                    let step = u32(entry_at(self.program, steps, position * 2))
+                    if step == place_element_step or step == place_list_element_step:
                         try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.program, steps, position * 2 + 1))), body)
                 try self.lower_prologue_node(module, function, value, body)
             PrintValue(value): try self.lower_prologue_node(module, function, value, body)
@@ -680,6 +694,10 @@ pub class Lowerer:
             Array(elements):
                 for position in range(0, i64(elements.count)):
                     try self.lower_prologue_node(module, function, node_at(self.program, elements, position), body)
+            List(elements): try self.lower_prologue_run(module, function, elements, body)
+            ListAppend(value, element):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, element, body)
             Unary(operation, operand): try self.lower_prologue_node(module, function, operand, body)
             Binary(left, operation, right):
                 try self.lower_prologue_node(module, function, left, body)
@@ -828,6 +846,17 @@ pub class Lowerer:
                             else: trap("element assignment step has a non-array HIR type")
                         let mir_element = try self.mir_type_of(module, function, span, element_type)
                         address = self.checked_element_address(mir_element, address, index, count, span, body)
+                        place_type = element_type
+                    elif kind == place_list_element_step:
+                        let list_type = try self.mir_type_of(module, function, span, place_type)
+                        let list_value = self.load_value(list_type, address, span, body)
+                        let index = try self.lower_expression(module, function, NodeId(value = u32(payload)), body)
+                        var element_type = resolve_builtin_type(BuiltinType.unit)
+                        match self.program.types.definitions[place_type.value].form:
+                            List(element): element_type = element
+                            else: trap("list assignment step has a non-list HIR type")
+                        address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                        body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = address, value = list_value, index = index), span = span))
                         place_type = element_type
                     else: trap("place assignment has an unknown step")
                 let value_type = try self.mir_type_of(module, function, span, place_type)
@@ -1141,10 +1170,21 @@ pub class Lowerer:
                 let element_type = try self.mir_type_of(module, function, span, pointee)
                 body.append(MirInstruction(form = InstructionForm.MoveElements(destination = to, source = from, element_type = element_type, count = element_count), span = span))
                 return RegisterId(value = no_register)
+            ListAppend(value, element): return try self.lower_list_append(module, function, expression, value, element, body)
             Raise(code, message): return try self.lower_raise(module, function, expression, code, message, body)
             Try(value): return try self.lower_try(module, function, expression, value, body)
             Catch(value, failure, catch_body): return try self.lower_catch(module, function, expression, value, failure, catch_body, body)
             else: return try self.lower_typed_expression(module, function, expression, body)
+
+    func lower_list_append(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, element: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.program, expression)
+        let list_value = try self.lower_expression(module, function, value, body)
+        let stored = try self.lower_expression(module, function, element, body)
+        let element_type = try self.mir_type_of(module, function, span, node_type(self.program, element))
+        let slot = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = list_value), span = span))
+        self.store_value(element_type, slot, stored, span, body)
+        return RegisterId(value = no_register)
 
     # Fill this function's caller-owned Error and leave through `Raise r0`.
     # The code and message are ordinary aggregate values copied fieldwise.
@@ -1321,6 +1361,10 @@ pub class Lowerer:
                         let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                         body.append(MirInstruction(form = InstructionForm.Const(result = length, value = MirConstant.Int(value = count)), span = span))
                         return length
+                    List(element):
+                        let length = self.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                        body.append(MirInstruction(form = InstructionForm.ListLength(result = length, value = sequence), span = span))
+                        return length
                     else:
                         let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
                         return try self.load_field(sequence_type, sequence, 1, span, body)
@@ -1349,6 +1393,21 @@ pub class Lowerer:
                     let address = self.element_address(element_type, temp, position, span, body)
                     self.store_value(element_type, address, element, span, body)
                 return temp
+            List(elements):
+                var hir_element = resolve_builtin_type(BuiltinType.unit)
+                match self.program.types.definitions[node_type(self.program, expression).value].form:
+                    List(element): hir_element = element
+                    else: trap("list HIR node has a non-list type")
+                let element_type = try self.mir_type_of(module, function, span, hir_element)
+                let result = self.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.ListCreate(result = result), span = span))
+                for index in range(0, i64(elements.count)):
+                    let element_node = node_at(self.program, elements, index)
+                    let element = try self.lower_expression(module, function, element_node, body)
+                    let slot = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                    body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = result), span = node_span(self.program, element_node)))
+                    self.store_value(element_type, slot, element, node_span(self.program, element_node), body)
+                return result
             Range(lower, upper, inclusive):
                 let temp = self.new_temp(value_type, span, body)
                 let lower_value = try self.lower_expression(module, function, lower, body)
@@ -2297,6 +2356,11 @@ pub class Lowerer:
                 let element_type = try self.mir_type_of(module, function, span, element)
                 let address = self.checked_element_address(element_type, sequence, position, count, span, body)
                 return self.load_value(element_type, address, span, body)
+            List(element):
+                let element_type = try self.mir_type_of(module, function, span, element)
+                let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = address, value = sequence, index = position), span = span))
+                return self.load_value(element_type, address, span, body)
             else:
                 let sequence_type = try self.mir_type_of(module, function, span, hir_sequence_type)
                 let length = try self.load_field(sequence_type, sequence, 1, span, body)
@@ -2606,8 +2670,9 @@ pub class Lowerer:
             error(self.unsupported(module, function, span, feature))
         return lowered
 
-    # Structural HIR-to-MIR type lowering is context-free. The function and
-    # global wrappers add source context only if this shared conversion fails.
+    # HIR-to-MIR type lowering is program-wide and backend-independent. The
+    # function and global wrappers add source context only if this shared
+    # conversion fails.
     func lower_mir_type(value: ir.TypeId) -> TypeId!:
         let scalar = self.scalar_mir_type(value)
         if scalar != none: return scalar
@@ -2618,46 +2683,67 @@ pub class Lowerer:
             Bytes: return self.byte_string_type()
             ErrorCode:
                 let fields = [self.byte_string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
-                return intern_mir_type(self.types, make_struct_type(fields))
+                return self.intern_lowered_type(make_struct_type(fields))
             Error:
                 let code = try self.lower_mir_type(resolve_builtin_type(BuiltinType.error_code))
                 let fields = [code, self.byte_string_type()]
-                return intern_mir_type(self.types, make_struct_type(fields))
+                return self.intern_lowered_type(make_struct_type(fields))
             Tuple(elements):
                 let field_types = list[TypeId]()
                 for element in elements:
                     field_types.append(try self.lower_mir_type(element))
-                return intern_mir_type(self.types, make_struct_type(field_types))
+                return self.intern_lowered_type(make_struct_type(field_types))
             Array(element, count):
                 let element_type = try self.lower_mir_type(element)
-                return intern_mir_type(self.types, MirType.Array(element = element_type, count = count))
+                return self.intern_lowered_type(MirType.Array(element = element_type, count = count))
             Range(element):
                 let element_type = try self.lower_mir_type(element)
                 let field_types = [element_type, element_type, builtin_mir_type(BuiltinMirType.boolean)]
-                return intern_mir_type(self.types, make_struct_type(field_types))
+                return self.intern_lowered_type(make_struct_type(field_types))
             Struct(index):
+                let existing = self.lowered_struct_types[index]
+                if existing != unlowered_nominal_type: return TypeId(value = existing)
+                let result = TypeId(value = u32(len(self.types.definitions)))
+                self.lowered_struct_types[index] = result.value
+                self.types.definitions.append(make_struct_type(list[TypeId]()))
+                self.active_nominal_types.append(result.value)
                 let field_types = list[TypeId]()
                 for field in self.program.structs[index].fields:
                     field_types.append(try self.lower_mir_type(field.value_type))
-                return intern_mir_type(self.types, make_struct_type(field_types))
+                self.types.definitions[result.value] = make_struct_type(field_types)
+                let completed = self.active_nominal_types.pop()
+                if completed != result.value: trap("nominal MIR type reservations are not nested")
+                return result
             Enum(index):
                 # One payload struct per case, in case order; the tag is a `u8`.
                 if len(self.program.enums[index].cases) > 256:
                     error("enums with more than 256 cases")
+                let existing = self.lowered_enum_types[index]
+                if existing != unlowered_nominal_type: return TypeId(value = existing)
+                let result = TypeId(value = u32(len(self.types.definitions)))
+                self.lowered_enum_types[index] = result.value
+                self.types.definitions.append(MirType.Enum(tag = builtin_mir_type(BuiltinMirType.unsigned_u8), cases = list[TypeId]()))
+                self.active_nominal_types.append(result.value)
                 let case_types = list[TypeId]()
                 for case_value in self.program.enums[index].cases:
                     let field_types = list[TypeId]()
                     for field in case_value.payload:
                         field_types.append(try self.lower_mir_type(field.value_type))
-                    case_types.append(intern_mir_type(self.types, make_struct_type(field_types)))
-                return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), case_types))
+                    case_types.append(self.intern_lowered_type(make_struct_type(field_types)))
+                self.types.definitions[result.value] = make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), case_types)
+                let completed = self.active_nominal_types.pop()
+                if completed != result.value: trap("nominal MIR type reservations are not nested")
+                return result
             Optional(inner):
-                let absent = intern_mir_type(self.types, make_struct_type(list[TypeId]()))
+                let absent = self.intern_lowered_type(make_struct_type(list[TypeId]()))
                 let present = try self.lower_mir_type(inner)
-                return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
+                return self.intern_lowered_type(make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
             Function(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             CFunction(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             NativePointer(pointee, is_mutable): return builtin_mir_type(BuiltinMirType.pointer)
+            List(element):
+                let element_type = try self.lower_mir_type(element)
+                return self.intern_lowered_type(MirType.List(element = element_type))
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
                 # declared target-neutral token representation; ABI placement
@@ -2666,6 +2752,19 @@ pub class Lowerer:
                     Pointer: return builtin_mir_type(BuiltinMirType.pointer)
                     Integer(representation): return try self.lower_mir_type(representation)
             else: error("type `" + describe_type(self.program.types, value) + "`")
+
+    # Nominal aggregates reserve a valid empty definition so collection
+    # references can point back to them. Structural interning skips only the
+    # active reservations; no malformed sentinel type ever enters the table.
+    func intern_lowered_type(value: MirType) -> TypeId:
+        for index in range(0, len(self.types.definitions)):
+            var active = false
+            for reserved in self.active_nominal_types:
+                if reserved == u32(index): active = true
+            if not active and mir_types_match(self.types.definitions[index], value):
+                return TypeId(value = u32(index))
+        self.types.definitions.append(value)
+        return TypeId(value = u32(len(self.types.definitions) - 1))
 
     func global_mir_type(global: ir.HirGlobal) -> TypeId!:
         let module = self.program.modules[global.module.value]
@@ -2733,7 +2832,7 @@ pub class Lowerer:
     # `str` and `bytes` share one shape: a pointer to the bytes and their count.
     func byte_string_type() -> TypeId:
         let fields = [builtin_mir_type(BuiltinMirType.pointer), builtin_mir_type(BuiltinMirType.unsigned_u64)]
-        return intern_mir_type(self.types, make_struct_type(fields))
+        return self.intern_lowered_type(make_struct_type(fields))
 
     func fallible_inner(value: ir.TypeId) -> ir.TypeId?:
         if i64(value.value) >= len(self.program.types.definitions): return none

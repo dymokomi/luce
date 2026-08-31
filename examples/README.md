@@ -44,6 +44,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
   same example. Dynamic and nullable pointers arriving from C remain later
   boundary work.
+- `lists.luc` is the first runtime-backed collection example. It proves
+  shared identity through aliases and `let` fields, checked indexed mutation,
+  typed list parameters/results, mutating aggregate elements, and geometric
+  growth through the HIR and MIR oracles and a real native QBE artifact.
+  `insert`, removal, copying, slicing, iteration invalidation, ARC, and
+  reclamation remain explicit later list slices.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the
@@ -62,7 +68,7 @@ artifacts are never imported.
 |---|---|---|
 | `hello` | entry arguments, strings, output | Intent represented by `hello.luc`; compiled on both artifact paths. |
 | `calc` | byte scanning, checked indexing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; native QBE execution green. |
-| `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` adopted as allocation-free `stage0_sort.luc` using fixed arrays; the growable-list form and `stats` still wait for collections/runtime. |
+| `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` remains adopted as the fixed-array `stage0_sort.luc`; growable list storage now works, while list iteration/removal and the numeric library still block the original shape and `stats`. |
 | `bf` | arrays, byte indexing, nested loops/match, wrapping cells, output construction | Adopted as allocation-free `stage0_brainfuck.luc`; the interpreter executes through every current product path, while general builders still wait for the runtime. |
 | `dice` | RNG, arrays/lists, formatted strings, files | Catalogued; waits for collections, formatting, and the standard runtime. |
 | `life` | two-dimensional arrays, terminal input/output, timing | Fixed-array storage is now covered; the full program still waits for terminal and timing host services. |
@@ -72,14 +78,13 @@ artifacts are never imported.
 | `editor` | classes/ARC, closures, collections, terminal UI, files, LSP client | Catalogued for the host proving-program phase. |
 | `lsp` | interfaces, classes, JSON, byte framing, I/O, processes | Catalogued for the host proving-program phase. |
 
-The fixed-array slice and the Brainfuck gate remove allocation-free dense
-storage and nontrivial byte-driven interpreter control flow from this map.
-The remaining small and medium programs are dominated by growable
-collections, slicing, text construction, files, and host services. Their
-runtime work starts only after the target-neutral allocation contract is
-settled: canonical MIR cannot manufacture target byte sizes or prescribe
-WebAssembly linear-memory growth. Allocator policy does not belong in HIR,
-MIR, or the compiler itself.
+The fixed-array slice, Brainfuck gate, and first runtime-backed list slice
+remove allocation-free dense storage, nontrivial byte-driven interpreter
+control flow, and basic growable sequence storage from this map. The remaining
+small and medium programs still need collection iteration/removal, slicing,
+text construction, files, and host services. Canonical MIR never manufactures
+target byte sizes or prescribes memory growth; allocator and collection policy
+remain in the runtime rather than HIR, MIR, or the compiler itself.
 
 `FEATURES.md` maps the complete 1.0 contract to frontend, HIR, MIR, QBE, and
 example evidence. Payload enums are Luce's tagged unions; there is

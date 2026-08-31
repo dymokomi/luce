@@ -72,13 +72,14 @@ A few terms recur in the source and in this README:
 This section is the single description of what each stage implements; the
 examples and tests link back here rather than restating it.
 
-- The tokenizer and parser cover most of the planned 1.0 grammar, including
+- The tokenizer and parser cover the planned 1.0 grammar, including
   indentation-based layout, declarations, types, control flow, patterns,
   closures, generics, and the C boundary syntax.
 - HirGenerator produces typed HIR with stable symbol and type identities. The
   currently executable language slice includes functions, calls, parameter
   defaults, bindings, assignment, scalars, strings, checked byte indexing and
-  byte-sequence lengths, tuples, optionals,
+  byte-sequence lengths, fixed arrays, the first reference-list slice
+  (literals, shared identity, length, checked get/set, and append), tuples, optionals,
   structs with memberwise or custom (including fallible) initialization,
   enums, methods and `mutating`, exhaustive `match`,
   constants, type aliases, conditionals, integer ranges and `for`, lexical
@@ -98,13 +99,17 @@ examples and tests link back here rather than restating it.
   caller-owned failure propagation and recovery, `str`/`bytes` values with
   equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, fixed
   value arrays with contextual literals, structural equality, copies,
-  checked indexing and nested mutable places, direct
+  checked indexing and nested mutable places, plus runtime-backed list
+  literals, identity, checked mutation, append, aggregate elements, growth,
+  and collection-recursive value shapes on the QBE path, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
   exact named C-callable values with generated adapters or extern addresses,
   and `print` of a
   literal or a `str` value — is lowered to canonical
-  MIR and encoded as WebAssembly (executed under `wasmtime` in the tests) and QBE IL.
+  MIR and encoded as WebAssembly and QBE IL. Wasm independently validates the
+  canonical list operations; the complete list runtime currently executes
+  through QBE because its stable-arena host is native-only.
   The complete differential corpus is compiled, linked, and executed through
   QBE 1.3 as both the native oracle and the product native path. QBE IL and
   assembly travel through memory; only a candidate executable is written in a

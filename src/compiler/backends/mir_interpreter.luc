@@ -34,7 +34,7 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirFunction, MirInstruction, MirProgram, MirSignature, MirType
 from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, find_mir_function, int_maximum
-from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_int_type, is_ptr_type
+from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_int_type, is_ptr_type, is_reference_type
 from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
 import std.strings
@@ -68,6 +68,8 @@ pub let function_address_base: i64 = 0x1000000
 ## `ExternAddress` uses a disjoint range so an indirect C call can route to
 ## the explicit host without confusing an extern identity with artifact code.
 pub let extern_address_base: i64 = 0x2000000
+## Opaque list handles occupy a third disjoint address range.
+pub let list_address_base: i64 = 0x3000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -95,6 +97,16 @@ struct RunRegion:
 struct FloatCell:
     let address: i64
     let value: f64
+
+## Semantic list storage for this oracle. Independent typed element cells are
+## sufficient here: contiguity and growth are compiled-runtime policy.
+class MirList:
+    let element_type: TypeId
+    let elements: list[i64]
+
+    pub init(element_type: TypeId):
+        self.element_type = element_type
+        self.elements = list[i64]()
 
 # One call: its registers and the addresses of its slots.
 class Frame:
@@ -130,6 +142,7 @@ pub class MirInterpreter: MirExternMemory:
     let float_cells: list[FloatCell]
     let data_addresses: list[i64]
     let global_addresses: list[i64]
+    let lists: list[MirList]
     var arena_address: i64
     var arena_committed: i64
     var external_host: MirExternHost?
@@ -147,6 +160,7 @@ pub class MirInterpreter: MirExternMemory:
         self.float_cells = list[FloatCell]()
         self.data_addresses = list[i64]()
         self.global_addresses = list[i64]()
+        self.lists = list[MirList]()
         self.arena_address = 0
         self.arena_committed = 0
         self.external_host = none
@@ -241,7 +255,7 @@ pub class MirInterpreter: MirExternMemory:
         let types = self.program.types
         if is_float_type(types, id): return MirValue.Float(value = 0.0)
         if is_bool_type(types, id): return MirValue.Bool(value = false)
-        if is_ptr_type(types, id): return MirValue.Ptr(value = 0)
+        if is_reference_type(types, id): return MirValue.Ptr(value = 0)
         return MirValue.Int(value = 0)
 
     # mark: Bodies and regions ==================================================================
@@ -388,6 +402,27 @@ pub class MirInterpreter: MirExternMemory:
                 for offset in range(0, byte_count): self.memory[to + offset] = moved[offset]
                 self.clear_float_cells(to, byte_count)
                 for cell in moved_float_cells: self.set_float_cell(to + cell.address, cell.value)
+            ListCreate(result):
+                let element_type = self.list_element_type(frame.function, result)
+                self.lists.append(MirList(element_type))
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            ListLength(result, value):
+                let storage = try self.list_at(frame.registers[value.value])
+                frame.registers[result.value] = MirValue.Int(value = len(storage.elements))
+            ListAppendSlot(result, value):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified list append changed element type")
+                let address = self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+                storage.elements.append(address)
+                frame.registers[result.value] = MirValue.Ptr(value = address)
+            ListElementAddress(result, value, index):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified list index changed element type")
+                let position = int_of(frame.registers[index.value])
+                if position < 0 or position >= len(storage.elements): error("mir interpreter: trap: index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.elements[position])
             DataAddress(result, data):
                 frame.registers[result.value] = MirValue.Ptr(value = self.data_addresses[data.value])
             GlobalAddress(result, global):
@@ -445,6 +480,16 @@ pub class MirInterpreter: MirExternMemory:
         for position in range(0, i64(registers.count)):
             values.append(frame.registers[register_at(frame.function, registers, position).value])
         return values
+
+    func list_at(value: MirValue) -> MirList!:
+        let index = ptr_of(value) - list_address_base
+        if index < 0 or index >= len(self.lists): error("mir interpreter: trap: invalid list handle")
+        return self.lists[index]
+
+    func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
+        match mir_type(self.program.types, function.registers[value.value]):
+            List(element): return element
+            else: trap("verified list instruction has a non-list handle")
 
     # mark: Arithmetic ==========================================================================
     #
@@ -565,7 +610,7 @@ pub class MirInterpreter: MirExternMemory:
                 if cell.address == address: return MirValue.Float(value = cell.value)
             return MirValue.Float(value = 0.0)
         if is_bool_type(types, value_type): return MirValue.Bool(value = self.memory[address] != 0)
-        if is_ptr_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.layout.pointer_size(), false))
+        if is_reference_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.layout.pointer_size(), false))
         return MirValue.Int(value = self.read_int(address, bits_of(types, value_type) // 8, is_signed_int_type(types, value_type)))
 
     func store(value_type: TypeId, address: i64, value: MirValue):
@@ -577,7 +622,7 @@ pub class MirInterpreter: MirExternMemory:
             if bool_of(value): self.memory[address] = u8(1)
             else: self.memory[address] = u8(0)
             return
-        if is_ptr_type(types, value_type):
+        if is_reference_type(types, value_type):
             self.write_int(address, self.layout.pointer_size(), ptr_of(value))
             return
         self.write_int(address, bits_of(types, value_type) // 8, int_of(value))

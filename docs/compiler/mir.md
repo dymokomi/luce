@@ -258,15 +258,23 @@ the C-representable shape and the backend applies that target's ABI and data
 layout. Target names, ABI placement, and byte layout never occur in HIR or
 MIR.
 
-Pointers themselves are untyped: `Ptr` is just an address. The type travels
-on the `Load`, `Store`, or `FieldAddress` that uses it, which is what a
-backend actually needs, and typed pointers would only say it twice.
+Raw storage pointers are untyped: `Ptr` is just address authority. The stored
+type travels on the `Load`, `Store`, or address operation that uses it, which
+is what a backend actually needs. Language reference handles are different:
+`List(element)` retains the source element identity in canonical MIR even
+though each backend represents the handle with pointer-sized bits. It is not
+interchangeable with `Ptr`, cannot be forged by a null constant, and lets the
+verifier prove that create/append/index all use one canonical element type.
+Type identities may therefore point forward. The verifier walks the layout
+dependency graph and rejects only a genuine by-value cycle; a reference break
+such as `Node { children: list[Node] }` is well-founded.
 
 ### The runtime: explicit calls and typed service bindings
 
-The typed allocation substrate is canonical MIR now. The source lowerer does
-not emit it until a managed language operation owns its lifetime protocol, but
-all MIR consumers already implement and test the operation itself.
+The typed allocation substrate and first list operations are canonical MIR
+now. Application lowering emits list operations only after HIR has established
+the collection's element identity; reviewed runtime source emits typed storage
+requests while implementing the private header and growth policy.
 
 Where does memory for a `list` come from? Who counts references for a
 class? Who prints? Ownership and I/O remain **calls to a small, fixed set of
@@ -289,6 +297,15 @@ layout cache and calls that definition directly. It never searches a function
 or linker name. This is the same boundary that already turns `FieldAddress`
 into a target byte offset; the lowerer and canonical program remain identical
 for Wasm and QBE.
+
+Lists follow the same separation without duplicating the element type on each
+instruction. A `List(T)` register is the semantic handle; `ListCreate`,
+`ListLength`, `ListAppendSlot`, and `ListElementAddress` derive `T` from that
+register. The last two ask the backend to pass its computed size/alignment to
+the exact composed runtime service. Bounds checking is part of
+`ListElementAddress`; the private runtime function only performs the unchecked
+address calculation after the backend guard. Capacity, header layout, and
+growth remain ordinary freestanding Luce runtime policy.
 
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
@@ -446,6 +463,7 @@ backend translates canonical MIR directly into QBE IL:
 | `convention = c` | QBE ABI extension types and platform ABI lowering | scalar and nominal-handle imports/exports complete; richer translations remain |
 | `CallExtern`, `FunctionAddress`, `ExternAddress`, `DataAddress` | direct C call, defined/imported callable tokens, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
+| typed `List(T)` operations | `l` handle plus direct calls to exact composed runtime functions | QBE layout supplies `sizeof(T)`/alignment; MIR stays structural |
 | fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
 | narrow integer types | `w` temporaries plus explicit extension, guards, and sub-word memory operations | direct legalization |
 
@@ -674,6 +692,10 @@ ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
 MoveElements(destination, source, element_type, count)  overlap-safe typed range move
 AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
+ListCreate()                            -> r: List(T)    T is the result-register type
+ListLength(value: List(T))              -> r: u64
+ListAppendSlot(value: List(T))          -> r: Ptr       uninitialized typed slot
+ListElementAddress(value: List(T), index: u64) -> r: Ptr checked element address
 DataAddress(DataId)                       -> r: Ptr
 GlobalAddress(GlobalId)                   -> r: Ptr
 LoadExternalGlobal(ExternalGlobalId)      -> r: type
@@ -743,6 +765,10 @@ knows their signatures and bindings.
 ```
 AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
   bound private function: (u64 byte_count, u64 byte_align) -> Ptr
+ListCreate() -> List(T)                      typed semantic handle
+ListLength(List(T)) -> u64
+ListAppendSlot(List(T)) -> Ptr               backend supplies size/alignment
+ListElementAddress(List(T), u64) -> Ptr       backend checks bounds, supplies size
 luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
@@ -757,7 +783,8 @@ luce_rt_transfer(value, type_info) -> Ptr                             value-grap
 - every operand type matches the instruction;
 - `Br`/`BrIf` depths are in range, and `Block`/`If` result registers are
   defined on every path to the join;
-- aggregate type references point backward, so by-value types are finite;
+- every type identity exists and the layout-dependency graph has no by-value
+  cycle; forward references through pointer-shaped handles are valid;
 - a fallible signature takes a `Ptr` as parameter 0 and returns a `Ptr` last;
   fallible calls pass the caller-owned error slot and define the reported
   error pointer; a fallible `Return` reports null and `Raise` returns r0;
