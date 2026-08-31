@@ -1,0 +1,447 @@
+#==============================================================================================
+#
+#   generic_functions - Abstract checking and concrete generic-function instances
+#
+#   DESCRIPTION:
+#       Owns free generic-function lookup, structural inference, contextual
+#       function values, abstract declaration probes, and memoized concrete
+#       specialization. It writes ordinary concrete FunctionSymbols into the
+#       shared HIR generation transaction; MIR and backends never see an
+#       abstract executable function.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, HirGenerationState, HirSemanticChecker, TypeBinding
+from compiler.hir.ir import BuiltinType, HirNodeForm, HirParameter, NodeId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import resolve_builtin_type, types_match
+
+## Coordinates generic semantics with the ordinary body checker through the
+## narrow operations that require expression or closure knowledge.
+pub class GenericFunctionChecker:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+    var probing: bool
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector):
+        self.state = state
+        self.declarations = declarations
+        self.probing = false
+
+    # mark: Abstract declaration checking ======================================================
+
+    ## Validate every generic definition using only its declared abstract
+    ## types. All probe artifacts are removed afterward, so only signature
+    ## metadata retains abstract type identities.
+    pub func check_templates(semantics: HirSemanticChecker) -> !:
+        for generic in self.state.generic_functions:
+            let type_count = len(self.state.types.definitions)
+            let symbol_count = len(self.state.symbols)
+            let function_count = len(self.state.functions)
+            let instance_count = len(self.state.generic_instances)
+            let closure_count = len(self.state.closures)
+            let shared_cell_count = len(self.state.shared_cells)
+            let generated_function_count = len(self.state.generated_functions)
+            let error_code_count = len(self.state.error_codes)
+            let node_count = len(self.state.nodes)
+            let extra_count = len(self.state.extra)
+            let value_count = len(self.state.values)
+            let next_symbol = self.state.next_symbol
+            let closure_checkpoint = semantics.checkpoint_generic_closures()
+            let saved_module = self.state.current_module
+            let saved_module_bindings = self.state.bindings
+            let saved_locals = self.state.locals
+            let saved_result = self.state.current_result
+            let saved_receiver = self.state.current_receiver
+            let saved_loop_depth = self.state.loop_depth
+            let saved_recovery_types = self.state.recovery_types
+            let saved_type_bindings = self.state.current_type_bindings
+
+            self.declarations.enter_module(generic.module_index)
+            self.state.current_type_bindings = generic.signature.type_bindings
+            self.probing = true
+            for index in range(0, len(generic.signature.parameters)):
+                let default_syntax = generic.syntax.parameters[index].default_value
+                if default_syntax != none:
+                    discard(try semantics.check_constant_expression(
+                        generic.module_index,
+                        default_syntax,
+                        generic.signature.parameters[index].value_type,
+                        "default of parameter `" + generic.signature.parameters[index].name + "`",
+                    ))
+            discard(try semantics.check_function(generic.signature))
+
+            while len(self.state.types.definitions) > type_count: self.state.types.definitions.remove(len(self.state.types.definitions) - 1)
+            while len(self.state.symbols) > symbol_count: self.state.symbols.remove(len(self.state.symbols) - 1)
+            while len(self.state.functions) > function_count: self.state.functions.remove(len(self.state.functions) - 1)
+            while len(self.state.generic_instances) > instance_count: self.state.generic_instances.remove(len(self.state.generic_instances) - 1)
+            while len(self.state.closures) > closure_count: self.state.closures.remove(len(self.state.closures) - 1)
+            while len(self.state.shared_cells) > shared_cell_count: self.state.shared_cells.remove(len(self.state.shared_cells) - 1)
+            while len(self.state.generated_functions) > generated_function_count: self.state.generated_functions.remove(len(self.state.generated_functions) - 1)
+            while len(self.state.error_codes) > error_code_count: self.state.error_codes.remove(len(self.state.error_codes) - 1)
+            while len(self.state.nodes) > node_count:
+                self.state.nodes.remove(len(self.state.nodes) - 1)
+                self.state.node_types.remove(len(self.state.node_types) - 1)
+                self.state.node_modules.remove(len(self.state.node_modules) - 1)
+                self.state.node_spans.remove(len(self.state.node_spans) - 1)
+            while len(self.state.extra) > extra_count: self.state.extra.remove(len(self.state.extra) - 1)
+            while len(self.state.values) > value_count: self.state.values.remove(len(self.state.values) - 1)
+            self.state.next_symbol = next_symbol
+            semantics.restore_generic_closures(closure_checkpoint)
+            self.state.current_module = saved_module
+            self.state.bindings = saved_module_bindings
+            self.state.locals = saved_locals
+            self.state.current_result = saved_result
+            self.state.current_receiver = saved_receiver
+            self.state.loop_depth = saved_loop_depth
+            self.state.recovery_types = saved_recovery_types
+            self.state.current_type_bindings = saved_type_bindings
+            self.probing = false
+
+    # mark: Call resolution and inference =======================================================
+
+    ## Resolve only free generic functions. Methods and nominal generic types
+    ## can join this path without changing inference or specialization.
+    pub func resolve_callee(callee: ExpressionSyntax) -> i64!:
+        match callee.form:
+            Name(name):
+                if self.state.find_local(name) >= 0: return -1
+                return self.state.find_visible_generic_function(name)
+            Member(owner, name):
+                match owner.form:
+                    Name(module_name):
+                        if self.state.find_local(module_name) >= 0: return -1
+                        let module_index = self.state.find_imported_module(module_name)
+                        if module_index < 0: return -1
+                        let generic_index = self.state.find_generic_function_in_module(module_index, name)
+                        if generic_index < 0: return -1
+                        if not self.state.generic_functions[generic_index].is_public:
+                            try self.fail(callee.span, "`" + name + "` is private to module `" + self.state.sources[module_index].name + "`")
+                        return generic_index
+                    else: return -1
+            else: return -1
+
+    pub func check_call(semantics: HirSemanticChecker, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let generic = self.state.generic_functions[generic_index]
+        let inferred = list[TypeId]()
+        let bound = list[bool]()
+        for parameter in generic.type_parameters:
+            inferred.append(resolve_builtin_type(BuiltinType.unit))
+            bound.append(false)
+        if len(type_arguments) > 0:
+            if len(type_arguments) != len(generic.type_parameters):
+                try self.fail(span, "generic function `" + generic.name + "` needs " + str(len(generic.type_parameters)) + " type argument(s), got " + str(len(type_arguments)))
+            for index in range(0, len(type_arguments)):
+                match type_arguments[index]:
+                    TypeArgument(value): inferred[index] = try self.declarations.resolve_type(self.state.current_module, value)
+                    IntegerArgument(token): try self.fail(token.span, "generic function type arguments must be types")
+                bound[index] = true
+
+        let assigned = list[bool]()
+        for parameter in generic.signature.parameters: assigned.append(false)
+        let placed_parameters = list[i64]()
+        let placed_nodes = list[NodeId]()
+        var positional_index = 0
+        var saw_named = false
+        for argument in arguments:
+            var parameter_index = -1
+            let label = argument.label
+            if label == none:
+                if saw_named: try self.fail(argument.span, "positional arguments must precede named arguments")
+                parameter_index = positional_index
+                positional_index += 1
+            else:
+                saw_named = true
+                parameter_index = self.find_parameter(generic.signature, label)
+                if parameter_index < 0:
+                    try self.fail(argument.span, "function `" + generic.name + "` has no parameter `" + label + "`")
+            if parameter_index >= len(generic.signature.parameters):
+                try self.fail(argument.span, "function `" + generic.name + "` accepts " + str(len(generic.signature.parameters)) + " argument(s)")
+            if assigned[parameter_index]:
+                try self.fail(argument.span, "parameter `" + generic.signature.parameters[parameter_index].name + "` is supplied more than once")
+            assigned[parameter_index] = true
+            let pattern = generic.signature.parameters[parameter_index].value_type
+            let context = self.inferred_type(pattern, generic_index, inferred, bound)
+            let checked = try semantics.check_expression_for_generic(argument.value, context)
+            try self.infer_type_arguments(pattern, self.state.type_of(checked), generic_index, inferred, bound, argument.span)
+            placed_parameters.append(parameter_index)
+            placed_nodes.append(checked)
+
+        for index in range(0, len(bound)):
+            if not bound[index]:
+                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + generic.name + "`; supply explicit type arguments")
+
+        let function_index = try self.instantiate(semantics, generic_index, inferred, span)
+        let function = self.state.functions[function_index]
+        let placed = list[u32]()
+        for index in range(0, len(placed_nodes)):
+            let parameter_index = placed_parameters[index]
+            let converted = try semantics.require_type_for_generic(placed_nodes[index], function.parameters[parameter_index].value_type)
+            placed.append(u32(parameter_index))
+            placed.append(converted.value)
+        for parameter_index in range(0, len(function.parameters)):
+            if assigned[parameter_index]: continue
+            let default_value = function.parameters[parameter_index].default_value
+            if default_value.value == no_node:
+                try self.fail(span, "call to `" + generic.name + "` is missing argument `" + function.parameters[parameter_index].name + "`")
+            placed.append(u32(parameter_index))
+            placed.append(default_value.value)
+        let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.state.push_run(placed)), function.result, span)
+        return try semantics.require_type_for_generic(typed, expected)
+
+    ## Infer a concrete specialization from an expected function type.
+    pub func check_function_address(semantics: HirSemanticChecker, generic_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let generic = self.state.generic_functions[generic_index]
+        let needed = expected else error(self.state.diagnostic_at(self.state.current_module, span, "generic function `" + generic.name + "` needs a function type from context"))
+        var callable = needed
+        let optional = self.state.optional_inner(needed)
+        if optional != none: callable = optional
+        let expected_parameters = list[TypeId]()
+        var expected_result = resolve_builtin_type(BuiltinType.unit)
+        match self.state.types.definitions[callable.value].form:
+            Function(parameters, result):
+                for parameter in parameters: expected_parameters.append(parameter)
+                expected_result = result
+            CFunction(parameters, result):
+                for parameter in parameters: expected_parameters.append(parameter)
+                expected_result = result
+            else: try self.fail(span, "generic function `" + generic.name + "` needs a function type from context")
+        if len(expected_parameters) != len(generic.signature.parameters):
+            try self.fail(span, "generic function `" + generic.name + "` has " + str(len(generic.signature.parameters)) + " parameter(s), expected " + str(len(expected_parameters)))
+        let inferred = list[TypeId]()
+        let bound = list[bool]()
+        for parameter in generic.type_parameters:
+            inferred.append(resolve_builtin_type(BuiltinType.unit))
+            bound.append(false)
+        for index in range(0, len(expected_parameters)):
+            try self.infer_type_arguments(generic.signature.parameters[index].value_type, expected_parameters[index], generic_index, inferred, bound, span)
+        try self.infer_type_arguments(generic.signature.result, expected_result, generic_index, inferred, bound, span)
+        for index in range(0, len(bound)):
+            if not bound[index]:
+                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + generic.name + "` from the expected function type")
+        return try semantics.check_function_address_for_generic(try self.instantiate(semantics, generic_index, inferred, span), span, expected)
+
+    # mark: Structural type inference ===========================================================
+
+    func inferred_type(pattern: TypeId, generic_index: i64, arguments: list[TypeId], bound: list[bool]) -> TypeId?:
+        match self.state.types.definitions[pattern.value].form:
+            TypeParameter(owner, position):
+                if i64(owner) != generic_index: return pattern
+                if not bound[position]: return none
+                return arguments[position]
+            Slice(element):
+                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_slice(inner)
+            List(element):
+                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_list(inner)
+            Weak(value):
+                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_weak(inner)
+            Range(element):
+                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_range(inner)
+            Array(element, count):
+                let inner = self.inferred_type(element, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_array(inner, count)
+            Optional(value):
+                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_optional(inner)
+            Fallible(value):
+                let inner = self.inferred_type(value, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_fallible(inner)
+            Tuple(elements):
+                let values = list[TypeId]()
+                for element in elements:
+                    let item = self.inferred_type(element, generic_index, arguments, bound)
+                    if item == none: return none
+                    values.append(item)
+                return self.state.intern_tuple(values)
+            Function(parameters, result):
+                let values = list[TypeId]()
+                for parameter in parameters:
+                    let item = self.inferred_type(parameter, generic_index, arguments, bound)
+                    if item == none: return none
+                    values.append(item)
+                let result_type = self.inferred_type(result, generic_index, arguments, bound)
+                if result_type == none: return none
+                return self.state.intern_function_type(values, result_type)
+            CFunction(parameters, result):
+                let values = list[TypeId]()
+                for parameter in parameters:
+                    let item = self.inferred_type(parameter, generic_index, arguments, bound)
+                    if item == none: return none
+                    values.append(item)
+                let result_type = self.inferred_type(result, generic_index, arguments, bound)
+                if result_type == none: return none
+                return self.state.intern_c_function_type(values, result_type)
+            NativePointer(pointee, is_mutable):
+                let inner = self.inferred_type(pointee, generic_index, arguments, bound)
+                if inner == none: return none
+                return self.state.intern_native_pointer(inner, is_mutable)
+            else: return pattern
+
+    func infer_type_arguments(pattern: TypeId, actual: TypeId, generic_index: i64, arguments: list[TypeId], bound: list[bool], span: SourceSpan) -> !:
+        match self.state.types.definitions[pattern.value].form:
+            TypeParameter(owner, position):
+                if i64(owner) != generic_index:
+                    if not types_match(pattern, actual): try self.inference_mismatch(span, pattern, actual)
+                    return
+                if bound[position]:
+                    if not types_match(arguments[position], actual): try self.inference_mismatch(span, arguments[position], actual)
+                else:
+                    arguments[position] = actual
+                    bound[position] = true
+                return
+            Optional(inner):
+                match self.state.types.definitions[actual.value].form:
+                    Optional(actual_inner): try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
+                    else: try self.infer_type_arguments(inner, actual, generic_index, arguments, bound, span)
+                return
+            Fallible(inner):
+                match self.state.types.definitions[actual.value].form:
+                    Fallible(actual_inner):
+                        try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
+                        return
+                    else: pass
+            Slice(element):
+                match self.state.types.definitions[actual.value].form:
+                    Slice(actual_element):
+                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        return
+                    else: pass
+            List(element):
+                match self.state.types.definitions[actual.value].form:
+                    List(actual_element):
+                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        return
+                    else: pass
+            Weak(inner):
+                match self.state.types.definitions[actual.value].form:
+                    Weak(actual_inner):
+                        try self.infer_type_arguments(inner, actual_inner, generic_index, arguments, bound, span)
+                        return
+                    else: pass
+            Range(element):
+                match self.state.types.definitions[actual.value].form:
+                    Range(actual_element):
+                        try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                        return
+                    else: pass
+            Array(element, count):
+                match self.state.types.definitions[actual.value].form:
+                    Array(actual_element, actual_count):
+                        if count == actual_count:
+                            try self.infer_type_arguments(element, actual_element, generic_index, arguments, bound, span)
+                            return
+                    else: pass
+            Tuple(elements):
+                match self.state.types.definitions[actual.value].form:
+                    Tuple(actual_elements):
+                        if len(elements) == len(actual_elements):
+                            for index in range(0, len(elements)):
+                                try self.infer_type_arguments(elements[index], actual_elements[index], generic_index, arguments, bound, span)
+                            return
+                    else: pass
+            Function(parameters, result):
+                match self.state.types.definitions[actual.value].form:
+                    Function(actual_parameters, actual_result):
+                        if len(parameters) == len(actual_parameters):
+                            for index in range(0, len(parameters)):
+                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_index, arguments, bound, span)
+                            try self.infer_type_arguments(result, actual_result, generic_index, arguments, bound, span)
+                            return
+                    else: pass
+            CFunction(parameters, result):
+                match self.state.types.definitions[actual.value].form:
+                    CFunction(actual_parameters, actual_result):
+                        if len(parameters) == len(actual_parameters):
+                            for index in range(0, len(parameters)):
+                                try self.infer_type_arguments(parameters[index], actual_parameters[index], generic_index, arguments, bound, span)
+                            try self.infer_type_arguments(result, actual_result, generic_index, arguments, bound, span)
+                            return
+                    else: pass
+            NativePointer(pointee, is_mutable):
+                match self.state.types.definitions[actual.value].form:
+                    NativePointer(actual_pointee, actual_mutable):
+                        if is_mutable == actual_mutable:
+                            try self.infer_type_arguments(pointee, actual_pointee, generic_index, arguments, bound, span)
+                            return
+                    else: pass
+            else:
+                if types_match(pattern, actual): return
+        try self.inference_mismatch(span, pattern, actual)
+
+    # mark: Concrete instances =================================================================
+
+    func instantiate(semantics: HirSemanticChecker, generic_index: i64, arguments: list[TypeId], span: SourceSpan) -> i64!:
+        let existing = self.state.find_generic_instance(generic_index, arguments)
+        if existing >= 0: return existing
+        if not self.probing and len(self.state.generic_instances) >= self.state.monomorphization_budget:
+            try self.fail(span, "generic specialization budget of " + str(self.state.monomorphization_budget) + " was exceeded")
+        let generic = self.state.generic_functions[generic_index]
+        let bindings = list[TypeBinding]()
+        var specialized_name = generic.name + "["
+        for index in range(0, len(arguments)):
+            if index > 0: specialized_name = specialized_name + ", "
+            specialized_name = specialized_name + self.state.describe_type(arguments[index])
+            bindings.append(TypeBinding(name = generic.type_parameters[index].name, value_type = arguments[index]))
+        specialized_name = specialized_name + "]"
+
+        let saved_bindings = self.state.current_type_bindings
+        self.state.current_type_bindings = bindings
+        let parameters = list[HirParameter]()
+        for index in range(0, len(generic.signature.parameters)):
+            let template_parameter = generic.signature.parameters[index]
+            let value_type = self.state.substitute_type(template_parameter.value_type, generic_index, arguments)
+            var default_value = NodeId(value = no_node)
+            let default_syntax = generic.syntax.parameters[index].default_value
+            if default_syntax != none:
+                default_value = try semantics.check_constant_expression(generic.module_index, default_syntax, value_type, "default of parameter `" + template_parameter.name + "`")
+            parameters.append(HirParameter(
+                symbol = self.state.make_symbol(template_parameter.name, SymbolKind.parameter, value_type),
+                name = template_parameter.name,
+                value_type = value_type,
+                default_value = default_value,
+            ))
+        let result = self.state.substitute_type(generic.signature.result, generic_index, arguments)
+        let symbol = self.state.make_symbol(specialized_name, SymbolKind.function, result)
+        let function_index = len(self.state.functions)
+        self.state.functions.append(FunctionSymbol(
+            symbol = symbol,
+            module_index = generic.module_index,
+            name = specialized_name,
+            is_public = false,
+            documentation = generic.documentation,
+            receiver = none,
+            parameters = parameters,
+            result = result,
+            source = CollectedFunctionSource.Defined(syntax = generic.syntax),
+            span = generic.span,
+            type_bindings = bindings,
+        ))
+        let key_arguments = list[TypeId]()
+        for argument in arguments: key_arguments.append(argument)
+        self.state.generic_instances.append(GenericFunctionInstance(generic_index = generic_index, arguments = key_arguments, function_index = function_index))
+        self.state.current_type_bindings = saved_bindings
+        return function_index
+
+    func find_parameter(function: FunctionSymbol, name: str) -> i64:
+        for index in range(0, len(function.parameters)):
+            if function.parameters[index].name == name: return index
+        return -1
+
+    func inference_mismatch(span: SourceSpan, expected: TypeId, actual: TypeId) -> !:
+        try self.fail(span, "generic argument requires `" + self.state.describe_type(expected) + "`, found `" + self.state.describe_type(actual) + "`")
+
+    func fail(span: SourceSpan, message: str) -> !:
+        try self.state.fail_at(self.state.current_module, span, message)

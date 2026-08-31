@@ -14,9 +14,9 @@ from compiler.core_types import is_reserved_core_name
 from compiler.frontend.source import SourceSpan, format_diagnostic
 from compiler.frontend.syntax import EnumSyntax, ExpressionSyntax, FunctionSyntax, ModuleSyntax, NominalTypeSyntax, TypeAliasSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token
-from compiler.hir.ir import BinaryOperation, BuiltinType, HirCFunction, HirClosure, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirNode, HirNodeForm, HirParameter, HirReceiver
+from compiler.hir.ir import BinaryOperation, BuiltinType, HirCFunction, HirClosure, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirNode, HirNodeForm, HirParameter, HirReceiver, HirTypeParameter
 from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable, Value
-from compiler.hir.ir import create_builtin_type_table, describe_type, resolve_builtin_type, type_forms_match
+from compiler.hir.ir import create_builtin_type_table, describe_type, resolve_builtin_type, type_forms_match, types_match
 from compiler.runtime_contract import RuntimeService
 
 # mark: Shared generation model ===============================================================
@@ -49,6 +49,33 @@ pub struct FunctionSymbol:
     pub let result: TypeId
     pub let source: CollectedFunctionSource
     pub let span: SourceSpan
+    ## Empty for ordinary declarations. Generic probes and concrete instances
+    ## resolve every source `T` through this lexical type environment.
+    pub let type_bindings: list[TypeBinding]
+
+## One lexical generic name mapped to its abstract or concrete type identity.
+pub struct TypeBinding:
+    pub let name: str
+    pub let value_type: TypeId
+
+## A generic source declaration after its abstract signature has resolved.
+## Its body is checked once using `signature`, while executable instances are
+## ordinary entries in `HirGenerationState.functions`.
+pub struct GenericFunctionTemplate:
+    pub let module_index: i64
+    pub let name: str
+    pub let is_public: bool
+    pub let documentation: list[str]
+    pub let type_parameters: list[HirTypeParameter]
+    pub let signature: FunctionSymbol
+    pub let syntax: FunctionSyntax
+    pub let span: SourceSpan
+
+## Memoized monomorphization key and its concrete function-table entry.
+pub struct GenericFunctionInstance:
+    pub let generic_index: i64
+    pub let arguments: list[TypeId]
+    pub let function_index: i64
 
 # A callable is collected once regardless of where its implementation lives.
 # This prevents external declarations from growing parallel symbol, import,
@@ -174,6 +201,7 @@ pub struct ImportedModule:
 
 pub union ImportedValue:
     Function(function_index: i64)
+    GenericFunction(generic_index: i64)
     ExternalVariable(variable_index: i64)
 
 pub struct ImportedValueBinding:
@@ -252,10 +280,16 @@ pub struct NativePointerType:
     pub let pointee: TypeId
     pub let is_mutable: bool
 
-## The sole body-semantics operation declaration collection needs: defaults
-## become ordinary typed HIR nodes in the same arena as function bodies.
-pub interface DeclarationValueChecker:
+## The narrow semantic services that declaration collection and generic
+## specialization borrow from the mutually recursive body checker.
+pub interface HirSemanticChecker:
     func check_constant_expression(module_index: i64, value: ExpressionSyntax, expected: TypeId, what: str) -> NodeId!
+    func check_expression_for_generic(value: ExpressionSyntax, expected: TypeId?) -> NodeId!
+    func require_type_for_generic(value: NodeId, expected: TypeId?) -> NodeId!
+    func check_function(function: FunctionSymbol) -> HirFunction!
+    func check_function_address_for_generic(function_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!
+    func checkpoint_generic_closures() -> i64
+    func restore_generic_closures(checkpoint: i64)
 
 # mark: Generation transaction ================================================================
 
@@ -277,6 +311,9 @@ pub class HirGenerationState:
     # Every function signature in the program, across all modules; methods
     # are here too, distinguished by `receiver`.
     pub let functions: list[FunctionSymbol]
+    pub let generic_functions: list[GenericFunctionTemplate]
+    pub let generic_instances: list[GenericFunctionInstance]
+    pub let monomorphization_budget: i64
     pub let structs: list[CollectedStruct]
     pub let classes: list[CollectedClass]
     pub let enums: list[CollectedEnum]
@@ -297,6 +334,7 @@ pub class HirGenerationState:
     pub var loop_depth: i64
     pub var recovery_types: list[TypeId]
     pub var current_constant: i64
+    pub var current_type_bindings: list[TypeBinding]
     pub let error_codes: list[DeclaredErrorCode]
     # Children precede parents in this shared flat HIR arena.
     pub let nodes: list[HirNode]
@@ -306,7 +344,7 @@ pub class HirGenerationState:
     pub let extra: list[u32]
     pub let values: list[Value]
 
-    pub init(package_identity: str, sources: list[SourceModule], package_role: PackageRole):
+    pub init(package_identity: str, sources: list[SourceModule], package_role: PackageRole, monomorphization_budget: i64):
         self.package_identity = package_identity
         self.package_role = package_role
         self.sources = sources
@@ -319,6 +357,9 @@ pub class HirGenerationState:
         self.constant_stack = list[str]()
         self.module_bindings = list[ModuleBindings]()
         self.functions = list[FunctionSymbol]()
+        self.generic_functions = list[GenericFunctionTemplate]()
+        self.generic_instances = list[GenericFunctionInstance]()
+        self.monomorphization_budget = monomorphization_budget
         self.structs = list[CollectedStruct]()
         self.classes = list[CollectedClass]()
         self.enums = list[CollectedEnum]()
@@ -337,6 +378,7 @@ pub class HirGenerationState:
         self.loop_depth = 0
         self.recovery_types = list[TypeId]()
         self.current_constant = -1
+        self.current_type_bindings = list[TypeBinding]()
         self.error_codes = list[DeclaredErrorCode]()
         self.nodes = list[HirNode]()
         self.node_types = list[TypeId]()
@@ -424,11 +466,26 @@ pub class HirGenerationState:
         if imported >= 0: return imported
         return self.find_function_in_module(self.current_module, name)
 
+    pub func find_visible_generic_function(name: str) -> i64:
+        let imported = self.find_imported_generic_function(name)
+        if imported >= 0: return imported
+        return self.find_generic_function_in_module(self.current_module, name)
+
     func find_imported_function(name: str) -> i64:
         for imported in self.bindings.values:
             if imported.name != name: continue
             match imported.value:
                 Function(function_index): return function_index
+                GenericFunction(generic_index): return -1
+                ExternalVariable(variable_index): return -1
+        return -1
+
+    func find_imported_generic_function(name: str) -> i64:
+        for imported in self.bindings.values:
+            if imported.name != name: continue
+            match imported.value:
+                GenericFunction(generic_index): return generic_index
+                Function(function_index): return -1
                 ExternalVariable(variable_index): return -1
         return -1
 
@@ -438,6 +495,7 @@ pub class HirGenerationState:
             match imported.value:
                 ExternalVariable(variable_index): return variable_index
                 Function(function_index): return -1
+                GenericFunction(generic_index): return -1
         return -1
 
     pub func find_visible_extern_variable(name: str) -> i64:
@@ -470,6 +528,58 @@ pub class HirGenerationState:
         for index in range(0, len(self.functions)):
             if self.functions[index].receiver != none: continue
             if self.functions[index].module_index == module_index and self.functions[index].name == name: return index
+        return -1
+
+    pub func find_generic_function_in_module(module_index: i64, name: str) -> i64:
+        for index in range(0, len(self.generic_functions)):
+            let generic = self.generic_functions[index]
+            if generic.module_index == module_index and generic.name == name: return index
+        return -1
+
+    pub func find_type_binding(name: str) -> TypeId?:
+        for binding in self.current_type_bindings:
+            if binding.name == name: return binding.value_type
+        return none
+
+    ## Replace one template's abstract parameters throughout a structural
+    ## type. Nominal generic types will extend this same operation; callers
+    ## never reconstruct types independently.
+    pub func substitute_type(value: TypeId, generic_index: i64, arguments: list[TypeId]) -> TypeId:
+        match self.types.definitions[value.value].form:
+            TypeParameter(owner, position):
+                if i64(owner) != generic_index: return value
+                if i64(position) >= len(arguments): trap("generic substitution argument is missing")
+                return arguments[position]
+            Slice(element): return self.intern_slice(self.substitute_type(element, generic_index, arguments))
+            List(element): return self.intern_list(self.substitute_type(element, generic_index, arguments))
+            Weak(inner): return self.intern_weak(self.substitute_type(inner, generic_index, arguments))
+            Range(element): return self.intern_range(self.substitute_type(element, generic_index, arguments))
+            Array(element, count): return self.intern_array(self.substitute_type(element, generic_index, arguments), count)
+            Optional(inner): return self.intern_optional(self.substitute_type(inner, generic_index, arguments))
+            Fallible(inner): return self.intern_fallible(self.substitute_type(inner, generic_index, arguments))
+            Tuple(elements):
+                let substituted = list[TypeId]()
+                for element in elements: substituted.append(self.substitute_type(element, generic_index, arguments))
+                return self.intern_tuple(substituted)
+            Function(parameters, result):
+                let substituted = list[TypeId]()
+                for parameter in parameters: substituted.append(self.substitute_type(parameter, generic_index, arguments))
+                return self.intern_function_type(substituted, self.substitute_type(result, generic_index, arguments))
+            CFunction(parameters, result):
+                let substituted = list[TypeId]()
+                for parameter in parameters: substituted.append(self.substitute_type(parameter, generic_index, arguments))
+                return self.intern_c_function_type(substituted, self.substitute_type(result, generic_index, arguments))
+            NativePointer(pointee, is_mutable):
+                return self.intern_native_pointer(self.substitute_type(pointee, generic_index, arguments), is_mutable)
+            else: return value
+
+    pub func find_generic_instance(generic_index: i64, arguments: list[TypeId]) -> i64:
+        for instance in self.generic_instances:
+            if instance.generic_index != generic_index or len(instance.arguments) != len(arguments): continue
+            var matches = true
+            for index in range(0, len(arguments)):
+                if not types_match(instance.arguments[index], arguments[index]): matches = false
+            if matches: return instance.function_index
         return -1
 
     pub func find_alias_in_module(module_index: i64, name: str) -> i64:

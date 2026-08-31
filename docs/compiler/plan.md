@@ -569,7 +569,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   structured, non-fatal analysis result through check, run, compilation, build,
   and CLI presentation; it neither changes valid capture semantics nor prints
   from HIR generation. Sendability closes with workers.
-- [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
+- [ ] **Interfaces** (data pointer + witness table) and the remaining generic
+  surface. Unconstrained generic functions now have abstract HIR checking,
+  structural inference, memoized concrete instances, and an explicit
+  generator budget through QBE (`done.md` §2). Next: interface constraints,
+  generic nominal types, serialized typed bodies, package/CLI budget
+  configuration, and expansion accounting.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
@@ -598,17 +603,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   body semantics over one typed transaction. MIR lowering separates the
   whole-program coordinator and shared identity/type transaction from one
   cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. The remaining 2,631-line HIR body checker
-  and 3,514-line MIR function lowerer stay intact until a language family
-  establishes a narrower ownership boundary. The 2,219-line HIR interpreter
+  forwarding-only collaborators. Generic functions established a further
+  honest boundary: abstract probing, structural inference, and concrete
+  specialization live in `hir/generics/functions.luc` and borrow a narrow
+  semantic interface without duplicating the generation transaction. The
+  remaining 2,901-line HIR body checker and 3,514-line MIR function lowerer
+  stay intact until another language family establishes a similarly cohesive
+  owner. The 2,219-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.
   The class audit found no such seam: lifecycle semantics are inseparable from
   the same expression/place/call transaction, and a class-only helper would
-  be forwarding rather than ownership. Closures trigger the next review;
-  capture/environment construction may have an independent contract. Line
-  count alone does not. Parser grammar is already frozen; separate its
+  be forwarding rather than ownership. Line count alone does not. Parser
+  grammar is already frozen; separate its
   byte/token plumbing only where one owner can retain the cursor and
   diagnostic state.
 - [ ] **Bound recursion the way shipping compilers do** — [`recursion.md`](recursion.md) §4. Phase 1 (a 256-deep cap on expression nesting) landed 2026-08-29; phases 2–5 remain: `frame_limit` derived at startup from the host rather than declared, thinner interpreter frames, and a stack reservation on the ELF path. Statement and type nesting have their own recursions and are **unmeasured** — no evidence they crash, so they wait for evidence rather than a speculative counter.
@@ -631,7 +639,7 @@ Gates — settle in `1.0.md` before the feature lands in `hir_gen`:
 | Owned (non-copyable, consuming) values — state transitions, destruction on every exit | classes / ARC | keys wiped in destructors, guest handles, journal lock fd |
 | Scoped values generalised from `mutable_slice`/`task` | closures | borrowed `const Element*`, `thread_local const char*` |
 | Closure capture: explicit vs §14.1 implicit shared cell, by the both-ways corpus test | closures | the compiler and all three C++ repos are closure-light corpora |
-| Const-generic grammar `[T, const n: u64]` reserved in the parser | generics | `Spectrum` = 32 inline floats, fixed guest buffers |
+| ~~Whether 1.0 has general const generics~~ | generics | **met**: §15.4 excludes them; `array[T, N]` is the sole compiler-built fixed value parameter |
 | ~~`hir_gen` keeps doc comments, parameter names, defaults~~ | structs | **met** (`done.md` §2) |
 
 Standing rules:

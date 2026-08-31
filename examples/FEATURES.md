@@ -42,7 +42,7 @@ column because it does not determine stage-1 completion.
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
-| §15 | Generic declarations, constraints, monomorphization, limits | complete | syntax | — | — | syntax | HIR generic identities and bounded monomorphization. |
+| §15 | Generic declarations, constraints, monomorphization, limits | complete | partial | partial | partial | partial | Unconstrained generic functions, abstract body checking, structural inference, contextual function values, defaults, recursion, memoized instances, and an explicit generator specialization budget reach QBE; constraints, nominal generics, package/CLI budget configuration, origin/size/time accounting, and expansion-path diagnostics remain. |
 | §16 | Interfaces, conformance, static use, interface values | complete | syntax | — | — | syntax | HIR requirements/conformance and witness representation. |
 | §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Closed protocol model beyond built-in range/list iteration and value equality. |
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
@@ -189,6 +189,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `stage0_sort.luc` | Fixed arrays, copies, mutation, sorting | Native QBE execution/status. |
 | `stage0_brainfuck.luc` | Bytes, nested flow/match, bounded interpreter | HIR, MIR, Wasm, and native QBE execution. |
 | `function_values.luc` | Exact named function values and indirect calls | HIR, MIR, Wasm, and native QBE execution. |
+| `generic_functions.luc` | Unconstrained generic functions, inference, defaults, recursion, contextual values, and memoized concrete instances | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `closures.luc` | Managed copied/shared/weak captures, fallibility lifting, nested escape, collection/field ownership, and weak-self cycle breaking | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |

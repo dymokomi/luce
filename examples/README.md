@@ -38,6 +38,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   function addresses, selection, aliases, fields, parameters/results and
   fallible calls execute through the semantic oracle and native QBE, and the
   same canonical MIR builds as WebAssembly.
+- `generic_functions.luc` proves abstract body checking, argument inference,
+  explicit structural specialization, contextual generic function values,
+  defaults, recursion, and memoized monomorphization through both semantic
+  oracles, Wasm, and native QBE. Constraints and generic nominal types remain
+  open and are not implied by this example.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership
