@@ -34,7 +34,7 @@ column because it does not determine stage-1 completion.
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | List literals execute; map literals and formatted/prefixed/triple strings remain. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16`, list iteration/ownership, maps/sets, classes, interfaces, generics, hashing, and recursive managed forms. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Definite initialization for class/custom-construction and future managed places. |
-| §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Dynamic sequence operations, identity, and capability-dependent conversions. |
+| §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Dynamic sequence operations, identity for future shared-reference kinds, and capability-dependent conversions. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Generic functions and managed function environments; audit all default-argument rules. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Conditional binding, protocol iteration/`try for`, and the remaining pattern families. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Close the remaining synthesized/custom initialization, enum, and structural-operation rules as one audited set. |
@@ -72,7 +72,7 @@ working list path from being mistaken for the complete §12.4 contract.
 
 | §12.4 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
-| Reference identity; `let` prevents rebinding, not mutation | yes | yes | yes | `lists.luc` | complete for current operations |
+| Reference identity via `is`/`is not`; `let` prevents rebinding, not mutation | yes | yes | yes | `lists.luc` | complete for current operations |
 | Contextual/inferred literals, empty construction, left-to-right elements | yes | yes | yes | `lists.luc` | complete |
 | `length`, checked get/set, `append` | yes | yes | yes, including bounds trap | `lists.luc` | complete |
 | Value, aggregate, and collection-recursive elements across growth/reallocation | yes | yes | yes | `lists.luc` | complete |

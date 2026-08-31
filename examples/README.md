@@ -45,7 +45,8 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   same example. Dynamic and nullable pointers arriving from C remain later
   boundary work.
 - `lists.luc` is the first runtime-backed collection example. It proves
-  shared identity through aliases and `let` fields, checked indexed mutation,
+  shared identity through aliases, `let` fields, and `is`/`is not`, checked
+  indexed mutation,
   typed list parameters/results, mutating aggregate elements, insertion,
   removal, clearing, reservation, shallow independent copying, O(1) immutable
   snapshot slicing, evaluation order, and geometric growth through the HIR
