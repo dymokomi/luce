@@ -203,20 +203,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
   166-line orchestration facade, a 1,111-line program-wide
-  declaration collector, a 750-line shared typed transaction/model, and one
-  2,453-line body checker. Declaration defaults cross that boundary through
+  declaration collector, a 776-line shared typed transaction/model, and one
+  2,522-line body checker. Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
   MIR lowerer is likewise a 110-line whole-program coordinator, a 619-line
-  shared identity/type/state transaction, and one 3,085-line function walk.
+  shared identity/type/state transaction, and one 3,239-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
   transaction; classes, closures, and interfaces may later expose a real
   internal boundary. The size is now an active design warning: review the
   ownership boundary when the first of those families lands, before adding a
-  second. Keep the 2,121-line parser and 1,977-line Wasm encoder sectioned
+  second. Keep the 2,121-line parser and 2,019-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -315,6 +315,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   count-independent MIR loop. HIR, MIR, Wasm, and real QBE agree on nested
   arrays, zero length, aggregate calls/results, and bounds traps. The adapted
   Stage-0 sort program uses allocation-free fixed storage and is a native QBE gate.
+- [x] **Fixed arrays convert to ownership-safe immutable slices**
+  (2026-08-31). `array[T, N][lower..<upper]` evaluates its source and bounds
+  once in source order, validates them before allocation, and snapshots only
+  the selected value range. Shared lowering reserves one runtime buffer,
+  copies through a count-independent loop with structural retain helpers,
+  captures the existing canonical `slice[T]`, and releases the temporary list
+  identity. Inline frame storage never escapes, reference elements stay
+  shallow, and no array layout or slice representation enters HIR/MIR.
+  Scalar and managed-element escapes, post-snapshot mutation, zero/partial
+  ranges, invalid bounds, both oracles, native QBE, and Wasm all agree.
 - [x] **The adopted Brainfuck example is a whole-program integration gate**
   (2026-08-30): Stage-0's interpreter algorithm now runs with explicit fixed
   tape/output capacities, retaining its bytecode loop, forward/backward
@@ -538,17 +548,21 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   File length is reviewed at each vertical-slice audit; roughly 2,000 lines
   triggers an ownership review, not an arbitrary mechanical split. Wasm
   module planning now has its own 263-line owner, leaving the related
-  instruction/section encoder cohesive at 1,977 lines; its byte plumbing is
+  instruction/section encoder cohesive at 2,019 lines; its byte plumbing is
   too small to justify another module today.
   HIR generation now separates program declarations from mutually recursive
   body semantics over one typed transaction. MIR lowering separates the
   whole-program coordinator and shared identity/type transaction from one
   cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. The remaining 2,432-line HIR body checker
-  and 3,064-line MIR function lowerer stay intact until a language family
-  establishes a narrower ownership boundary. Parser grammar is already
-  frozen; separate its byte/token plumbing only where one owner can retain
-  the cursor and diagnostic state.
+  forwarding-only collaborators. The remaining 2,522-line HIR body checker
+  and 3,239-line MIR function lowerer stay intact until a language family
+  establishes a narrower ownership boundary. The 2,081-line HIR interpreter
+  likewise remains one semantic state machine: expression evaluation,
+  mutable-place access, calls, and control transfer recurse through each
+  other, while their stack-heavy arms already live in focused helpers.
+  Classes or closures may expose a real ownership seam; line count alone does
+  not. Parser grammar is already frozen; separate its byte/token plumbing only
+  where one owner can retain the cursor and diagnostic state.
 - [ ] **Bound recursion the way shipping compilers do** — [`recursion.md`](recursion.md) §4. Phase 1 (a 256-deep cap on expression nesting) landed 2026-08-29; phases 2–5 remain: `frame_limit` derived at startup from the host rather than declared, thinner interpreter frames, and a stack reservation on the ELF path. Statement and type nesting have their own recursions and are **unmeasured** — no evidence they crash, so they wait for evidence rather than a speculative counter.
 - [ ] Generated programs and fuzzing as release gates (not yet built; do not claim them).
 - [ ] Language freeze after the compiler and one host slice depend on every feature.

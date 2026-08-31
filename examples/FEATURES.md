@@ -37,7 +37,7 @@ column because it does not determine stage-1 completion.
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and releases owned temporaries; dynamic sequence operations, future reference identity, and floating/capability-dependent conversions remain. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Generic functions and managed function environments; audit all default-argument rules. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Protocol iteration/`try for` and the remaining pattern families. |
-| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Close the remaining synthesized/custom initialization, enum, and structural-operation rules as one audited set. |
+| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals and ownership-safe fixed-array slicing execute; generics, interface conformance, hashing, and the remaining rule-by-rule audit keep the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | syntax | — | — | syntax | HIR ownership model and semantic oracle. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
@@ -79,6 +79,20 @@ to QBE or Wasm.
 | Float-to-integer truncates toward zero and traps NaN/infinity/out-of-range | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and trapping corpus | complete for f32/f64 |
 | f32/f64 widening and checked narrowing; contextual f32 literals and per-operation f32 rounding | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete |
 | f16 construction and arithmetic | rejected at first missing stage | n/a | n/a | focused negative fixture | open with f16 |
+
+## Current fixed-array slice evidence
+
+An array is inline value storage, while an unrestricted `slice[T]` may escape.
+The conversion therefore snapshots values into the existing immutable owned
+slice protocol; it never leaks a frame address or introduces target layout.
+
+| §10.4/§12.6 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Explicit partial/full slicing with checked `u64` bounds | yes | yes | yes, plus Wasm | `array_slices.luc` | complete |
+| Source, lower, and upper evaluate once from left to right | yes | yes | yes | differential output fixture | complete |
+| Mutation after capture cannot alter the value snapshot | yes | yes | yes, plus Wasm | `array_slices.luc` | complete |
+| A slice returned after inline array destruction retains scalar and managed elements | yes | yes | yes, plus Wasm | `array_slices.luc` | complete |
+| Copy loop and MIR size are independent of `N`; selected capacity reserves once | n/a | yes | yes | lowerer inspection | complete |
 
 ## Current `list[T]` evidence
 
@@ -161,6 +175,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |
 | `numeric_conversions.luc` | Checked integer/float construction, binary32 contextual rounding, width conversion, and truncation | HIR and MIR oracles plus native QBE and Wasm execution. |
+| `array_slices.luc` | Immutable owned snapshots from inline fixed arrays, including escaping managed elements | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `lists.luc` | Shared list identity, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `strings.luc` | Raw/escaped text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |

@@ -1271,6 +1271,8 @@ pub class FunctionLowerer:
         self.store_value(builtin_mir_type(BuiltinMirType.unsigned_u64), self.field_address(value_type, result, self.state.buffer_length_field(), span, body), length, span, body)
         return result
 
+    # mark: Immutable sequence snapshots =======================================================
+
     func lower_sequence_slice(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, start: NodeId, end: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.state.program, expression)
         let source = try self.lower_expression(module, function, value, body)
@@ -1282,6 +1284,7 @@ pub class FunctionLowerer:
         if end.value != no_node: upper = try self.lower_expression(module, function, end, body)
         else:
             match self.state.program.types.definitions[hir_source_type.value].form:
+                Array(element, count): upper = self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), count, span, body)
                 List(element):
                     upper = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                     body.append(MirInstruction(form = InstructionForm.ListLength(result = upper, value = source), span = span))
@@ -1290,6 +1293,9 @@ pub class FunctionLowerer:
         let result_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
         let result = self.state.new_register(result_type)
         match self.state.program.types.definitions[hir_source_type.value].form:
+            Array(element, count):
+                let element_type = try self.state.mir_type_of(module, function, span, element)
+                self.lower_array_slice(result, source, element_type, count, lower, upper, span, body)
             List(element): body.append(MirInstruction(form = InstructionForm.ListSlice(result = result, value = source, start = lower, end = upper), span = span))
             Bytes:
                 let owner = try self.load_field(source_type, source, self.state.buffer_owner_field(), span, body)
@@ -1298,6 +1304,62 @@ pub class FunctionLowerer:
                 body.append(MirInstruction(form = InstructionForm.BytesSlice(result = result, owner = owner, data = data, length = length, start = lower, end = upper), span = span))
             else: trap("HIR admitted an unsupported sequence slice")
         return result
+
+    # A fixed array lives inline and therefore cannot lend its frame storage
+    # to an escaping safe slice. Copy only the selected elements into the
+    # shared immutable list-buffer protocol, then release the temporary list
+    # identity after the slice has retained its backing buffer.
+    func lower_array_slice(result: RegisterId, source: RegisterId, element_type: TypeId, count: i64, lower: RegisterId, upper: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let source_length = self.integer_constant(index_type, count, span, body)
+        self.guard_slice_bounds(lower, upper, source_length, span, body)
+        let snapshot_length = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = snapshot_length, operation = BinaryOp.sub, left = upper, right = lower), span = span))
+
+        let snapshot_list_type = self.state.intern_lowered_type(MirType.List(element = element_type))
+        let snapshot_source = self.state.new_register(snapshot_list_type)
+        let ownership = self.ownership_helper_for(element_type)
+        body.append(MirInstruction(form = InstructionForm.ListCreate(result = snapshot_source), span = span))
+        body.append(MirInstruction(form = InstructionForm.ListReserve(value = snapshot_source, minimum_capacity = snapshot_length, element_retain = ownership.retain), span = span))
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, lower, span, body)
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = upper), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+        let source_address = self.element_address(element_type, source, index, span, body)
+        let item = self.load_value(element_type, source_address, span, body)
+        let destination = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = destination, value = snapshot_source, element_retain = ownership.retain), span = span))
+        self.initialize_owned_value(element_type, destination, item, span, body)
+        let next = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+        let zero = self.integer_constant(index_type, 0, span, body)
+        body.append(MirInstruction(form = InstructionForm.ListSlice(result = result, value = snapshot_source, start = zero, end = snapshot_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.ListRelease(value = snapshot_source, element_release = ownership.release), span = span))
+
+    func guard_slice_bounds(lower: RegisterId, upper: RegisterId, length: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        let reversed = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = reversed, operation = BinaryOp.gt, left = lower, right = upper), span = span))
+        self.open_if(reversed, list[RegisterId](), span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "slice bounds out of range"), span = span))
+        self.emit_else(span, body)
+        self.emit_end(span, body)
+        let beyond_end = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = beyond_end, operation = BinaryOp.gt, left = upper, right = length), span = span))
+        self.open_if(beyond_end, list[RegisterId](), span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "slice bounds out of range"), span = span))
+        self.emit_else(span, body)
+        self.emit_end(span, body)
+
+    # mark: Mutable lists ======================================================================
 
     func lower_list_append(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, element: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.state.program, expression)
