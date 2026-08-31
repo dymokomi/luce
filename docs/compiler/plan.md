@@ -202,21 +202,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
-  166-line orchestration facade, a 1,098-line program-wide
-  declaration collector, a 747-line shared typed transaction/model, and one
-  2,396-line body checker. Declaration defaults cross that boundary through
+  166-line orchestration facade, a 1,111-line program-wide
+  declaration collector, a 750-line shared typed transaction/model, and one
+  2,453-line body checker. Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
   callback graph rather than a responsibility boundary. The former 3,659-line
-  MIR lowerer is likewise a 110-line whole-program coordinator, a 624-line
-  shared identity/type/state transaction, and one 2,937-line function walk.
+  MIR lowerer is likewise a 110-line whole-program coordinator, a 619-line
+  shared identity/type/state transaction, and one 3,085-line function walk.
   Statements, expressions, patterns, calls, aggregates, and cleanup remain
   together because they are mutually recursive and share one lexical
   transaction; classes, closures, and interfaces may later expose a real
-  internal boundary. Keep the 2,121-line parser sectioned until new grammar
-  work establishes a real component boundary; do not split any pass into
-  arbitrary helper files just to lower a line count.
+  internal boundary. The size is now an active design warning: review the
+  ownership boundary when the first of those families lands, before adding a
+  second. Keep the 2,121-line parser and 1,977-line Wasm encoder sectioned
+  until new work establishes real component boundaries; do not split any pass
+  into arbitrary helper files just to lower a line count.
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for` and integer ranges** (2026-08-29, `done.md` §2). The fallible-iteration gate is settled: ordinary `for` uses `Iterable[T]`; `try for` uses `FallibleIterable[T]`, whose `next()` answers `T?!`. Built-in `range[T]` values and infallible range iteration run through all three executions now. User-defined protocol dispatch waits for interfaces/generics; executable `try for` waits for the next failure-as-data slice.
@@ -239,6 +241,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `luce_rt_trap(Ptr, u64)` contract followed by canonical `Unreachable`; QBE
   and Wasm alone choose stderr and their terminating instruction. Complete
   source-location/stack diagnostics remain part of the §13 audit.
+- [x] **Source `assert(condition, message?)` execution** (2026-08-31,
+  `done.md` §2). One unit-valued HIR form preserves ordinary eager argument
+  order and supplies the exact default `"assertion failed"` message. Shared
+  lowering emits a structured failed arm around the existing trap contract;
+  there is no assertion MIR instruction or backend-specific lowering. The
+  remaining effect-free-condition proof waits for real operational summaries,
+  and source-location/stack reporting remains in the §13 diagnostic audit.
 - [ ] **Complete explicit numeric construction.** Checked integer-to-integer
   construction is complete. Integer/float and float/integer MIR operations
   already exist, but source completion also needs float-width conversion. The

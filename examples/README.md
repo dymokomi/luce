@@ -62,6 +62,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `traps.luc` proves that a nonrecoverable source trap accepts dynamically
   owned text, reports it through each execution path, and does not run
   deferred cleanup.
+- `assertions.luc` proves the optional default and eager dynamic assertion
+  messages, unit-valued successful continuation, captured QBE/Wasm failure
+  diagnostics, and skipped deferred cleanup.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the

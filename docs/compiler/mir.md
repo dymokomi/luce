@@ -854,6 +854,12 @@ A source trap calls the target-neutral `luce_rt_trap` contract and then ends
 its canonical region with `Unreachable`. Only the backend chooses the
 diagnostic channel and concrete terminating instruction.
 
+A source assertion evaluates its Boolean and ordinary string message before
+opening a structured `If` for the failed path. That path uses the same trap
+contract and `Unreachable`; success reaches `End` and continues with `unit`.
+There is no assertion MIR form because its complete semantics are already
+expressed by canonical control flow and the trap contract.
+
 ### What the verifier proves
 
 - every register is defined once, before use, with its declared type;
