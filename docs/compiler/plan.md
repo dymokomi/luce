@@ -29,9 +29,10 @@ removed once the QBE product path replaced them; their history remains in
 
 `stage1-qbe` is the sole development line through complete planned 1.0
 coverage. Do not merge partial slices back into the current `main`. Once every
-planned source feature passes the frontend/HIR/MIR/QBE/Wasm gates, audit the
-finished branch as a whole, make that history the new local `main`, and pause
-before beginning Luce-owned native backends.
+planned source feature passes the frontend/HIR/MIR/QBE gates, with Wasm
+regressions wherever that supporting backend applies, audit the finished
+branch as a whole, make that history the new local `main`, and pause before
+beginning Luce-owned native backends.
 
 Every unpublished change has this disposition:
 
@@ -57,14 +58,21 @@ must agree:
 1. the HIR interpreter — the definition of behaviour, never sees MIR;
 2. the MIR interpreter — the lowerer's first consumer, using explicit
    backend layout rules rather than the host platform;
-3. a compiled artifact — wasm under `wasmtime`, and native through pinned
-   QBE 1.3 for the complete current lowerer corpus.
+3. a compiled artifact through pinned QBE 1.3 — the required stage-1
+   portability oracle and product path across QBE's supported targets.
+
+Wasm is an additional independent regression backend wherever it naturally
+supports a slice. It must never dictate HIR/MIR shape, delay complete QBE
+coverage, or become a second platform abstraction. Stage 1 is complete when
+the full language supplies one sufficient canonical MIR to QBE; Luce-owned
+platform backends then replace QBE behind that same boundary.
 
 When two agree and one differs, the stage between them is wrong. Every
-lowerer slice adds fixtures to `differential_test.luc` *and* the same
-programs to `tests/wasm_test.sh`, plus programs that must trap on all
-three. The triangle has found six real bugs so far (`done.md` §3), four of
-them in "reference" implementations. Keep it.
+lowerer slice adds fixtures to `differential_test.luc` and executes them
+through QBE, plus programs that must trap on all three required executions.
+Add the same case to the Wasm gate when that backend supports the feature
+without changing canonical shape. The triangle has found real bugs in every
+stage, including its "reference" implementations. Keep it.
 
 Rules: a spec semantics question (overflow, `//`, shifts, `~` on unsigned)
 is settled by reading `1.0.md` §7, implemented in the HIR interpreter first,
@@ -78,6 +86,27 @@ lives in `examples/README.md`: adopt only cohesive sources that become an
 automated parser/HIR/MIR/artifact gate, modernize them to the current 1.0
 surface, and pin the first unsupported stage until it advances. Do not bulk
 copy generated caches or duplicate programs merely to increase the count.
+
+### Stage-1 completion contract
+
+`examples/FEATURES.md` is the single conformance ledger for
+`docs/language/1.0.md`, not merely a parser showcase. It must account for every
+specified declaration, statement, expression, operator, reserved word,
+semantic rule, diagnostic rule, and deliberate rejection. Each row names its
+positive and negative tokenizer/parser tests, HIR resolution tests, canonical
+MIR/verifier tests, and real QBE artifact test where the rule is executable.
+An absent layer is marked unsupported with the first missing stage; it is never
+silently omitted or counted as complete.
+
+The example corpus is the human-readable half of the same proof. Together its
+small focused programs must express every executable language capability,
+build through the product QBE path, run, and compare their observable output
+with checked expectations. Parser-only tours remain useful fixtures but do not
+prove implementation. Stage 1 is complete only when the ledger has no
+unsupported 1.0 rows, all applicable examples execute through QBE, the full
+diagnostic corpus is green, and the architecture audit still finds no target
+fact before the backend boundary. Wasm results are additional evidence, never
+a substitute for or prerequisite to this QBE-complete claim.
 
 ## 2. Canonical MIR — the decisions (details in `mir.md`)
 
@@ -326,6 +355,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `ElementAddress` instructions, so all backends consume one representation
   and choose layout only at their existing boundary. Typed bulk copy, checked
   pointer conversion and the sealed arena provider remain pending.
+- [x] **Give sealed runtime state an explicit source-to-QBE path**
+  (2026-08-30). `PackageRole` is a compiler input rather than a package-name
+  convention. Only that role may declare private, structurally zeroable
+  `var name: Type` module cells; applications cannot declare or import them.
+  HIR keeps observable `GlobalLoad`/`GlobalStore` nodes and its oracle owns one
+  isolated state instance. Shared lowering emits ordinary canonical
+  `MirGlobal`/`GlobalAddress`/`Load`/`Store`; reachability retains live cells,
+  and the existing verifier and composer remain their sole MIR authorities.
+  QBE lays out and mutates the same program successfully. Wasm also places
+  cells after immutable data in linear memory as a supporting regression,
+  without leaking an offset or pointer width before its backend plan.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only

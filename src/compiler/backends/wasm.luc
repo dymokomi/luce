@@ -25,10 +25,12 @@
 #       `wasi_snapshot_preview1.fd_write` on stdout through an iovec kept in
 #       the first sixteen bytes of linear memory (scratch); data items pack
 #       after that scratch area; the memory is exported as `memory` as WASI
-#       requires. A program with an entry gains a `_start` function that
-#       calls the entry and hands its exit status to `proc_exit`. Modules
-#       with no writes, no slots, and no entry stay import-free and
-#       memory-free.
+#       requires. Canonical internal globals occupy aligned, zero-filled
+#       linear-memory cells after immutable data; `GlobalAddress` is their
+#       backend-computed offset. A program with an entry gains a `_start`
+#       function that calls the entry and hands its exit status to
+#       `proc_exit`. Modules with no writes, no slots, and no entry stay
+#       import-free and memory-free.
 #
 #       A module with slots gets a shadow stack: the memory grows to sixteen
 #       pages (1 MiB) and the stack pointer starts at its top, growing down
@@ -287,8 +289,8 @@ pub class WasmBackend:
         if plan.has_function_table:
             append_section(output, element_section, encode_element_entries(program, plan))
         append_section(output, code_section, try encode_code_entries(program, plan))
-        if len(program.data) > 0:
-            append_section(output, data_section, encode_data_entries(program, plan))
+        if data_segment_count(program) > 0:
+            append_section(output, data_section, try encode_data_entries(program, plan))
         return output
 
 # mark: Module layout =========================================================================
@@ -325,8 +327,9 @@ struct ModulePlan:
     # Wasm function indices of only the C imports whose addresses are used.
     let table_imports: list[i64]
     let data_offsets: list[i64]
-    # First byte past the data items, rounded to a frame boundary: the
-    # lowest address the shadow stack may reach.
+    let global_offsets: list[i64]
+    # First byte past data and internal globals, rounded to a frame boundary:
+    # the lowest address the shadow stack may reach.
     let data_end: i64
     let has_memory: bool
     let has_stack: bool
@@ -396,18 +399,26 @@ func plan_module(program: MirProgram) -> ModulePlan!:
                     discard(intern_signature(signatures, try wasm_signature(program.types, indirect_signature)))
                 else: pass
 
-    # Data items pack after the scratch area, each at its own alignment.
+    # Immutable data and mutable Luce globals share linear memory but receive
+    # disjoint aligned cells. Their concrete offsets exist only in this plan.
     let data_offsets = list[i64]()
     var offset = scratch_size
     for item in program.data:
         offset = align_up(offset, item.align)
         data_offsets.append(offset)
         offset += len(item.bytes)
+    let global_offsets = list[i64]()
+    for global in program.globals:
+        offset = align_up(offset, layout.align_of(global.value_type))
+        global_offsets.append(offset)
+        offset += layout.size_of(global.value_type)
     let data_end = align_up(offset, frame_alignment)
 
     # `fd_write` reads its iovec from memory, so importing it needs a memory
     # even when the program has no data of its own; so does a shadow stack.
-    let has_memory = len(program.data) > 0 or len(imports) > 0 or has_stack or allocates_storage
+    let has_memory = len(program.data) > 0 or len(program.globals) > 0 or len(imports) > 0 or has_stack or allocates_storage
+    if has_stack and data_end > stack_top:
+        error("wasm backend: static data and globals overlap the shadow stack")
     return ModulePlan(
         layout = layout,
         signatures = signatures,
@@ -416,6 +427,7 @@ func plan_module(program: MirProgram) -> ModulePlan!:
         function_types = function_types,
         table_imports = table_imports,
         data_offsets = data_offsets,
+        global_offsets = global_offsets,
         data_end = data_end,
         has_memory = has_memory,
         has_stack = has_stack,
@@ -548,7 +560,10 @@ func encode_memory_entry(plan: ModulePlan) -> list[u8]:
     append_unsigned(entries, 1)
     entries.append(0x00)
     if plan.has_stack: append_unsigned(entries, stack_pages)
-    else: append_unsigned(entries, 1)
+    else:
+        var pages = (plan.data_end + page_size - 1) // page_size
+        if pages < 1: pages = 1
+        append_unsigned(entries, pages)
     return entries
 
 # One mutable i32 global — the shadow stack pointer — initialised to the top
@@ -641,9 +656,9 @@ func encode_start_body(program: MirProgram, plan: ModulePlan) -> list[u8]:
 
 # One active data segment per item, placed into memory 0 at its packed offset
 # when the module is instantiated.
-func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
+func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
     let entries = list[u8]()
-    append_unsigned(entries, len(program.data))
+    append_unsigned(entries, data_segment_count(program))
     for index in range(0, len(program.data)):
         let item = program.data[index]
         entries.append(0x00)                # active segment in memory 0
@@ -652,7 +667,27 @@ func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]:
         entries.append(opcode_end)
         append_unsigned(entries, len(item.bytes))
         append_all(entries, item.bytes)
+    for index in range(0, len(program.globals)):
+        let global = program.globals[index]
+        let initial = global.initial
+        if initial == none: continue
+        let size = plan.layout.size_of(global.value_type)
+        let payload = program.data[initial.value].bytes
+        if len(payload) < size:
+            error("wasm backend: initializer for global `" + global.name + "` is shorter than its type")
+        entries.append(0x00)
+        entries.append(opcode_i32_const)
+        append_signed(entries, plan.global_offsets[index])
+        entries.append(opcode_end)
+        append_unsigned(entries, size)
+        for offset in range(0, size): entries.append(payload[offset])
     return entries
+
+func data_segment_count(program: MirProgram) -> i64:
+    var count = len(program.data)
+    for global in program.globals:
+        if global.initial != none: count += 1
+    return count
 
 # Initialise defined-function slots first, then only addressed C imports. The
 # runtime imports and synthetic `_start` wrapper are not source callable values.
@@ -976,6 +1011,9 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
             body.append(0)
         DataAddress(result, data):
             append_constant(body, plan.data_offsets[data.value], false)
+            local_set(body, result)
+        GlobalAddress(result, global):
+            append_constant(body, plan.global_offsets[global.value], false)
             local_set(body, result)
         LoadExternalGlobal(result, global):
             body.append(opcode_global_get)

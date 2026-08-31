@@ -80,7 +80,7 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, ExternalGlobalId, FunctionId
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, ExternId, ExternalGlobalId, FunctionId, GlobalId
 from compiler.mir.canonical import InstructionForm, MirConstant, MirData, MirExtern, MirExternalGlobal, MirFunction, MirGlobal, MirInstruction
 from compiler.mir.canonical import MirProgram, MirRuntimeBinding, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, create_builtin_mir_types
@@ -189,6 +189,7 @@ pub class Lowerer:
     let external_globals: list[MirExternalGlobal]
     let lowered_external_globals: list[ExternalGlobalId]
     let external_global_contracts: list[ExternalGlobalContract]
+    let globals: list[MirGlobal]
     let data: list[MirData]
     let lowered_functions: list[LoweredFunction]
     let c_wrappers: list[CWrapper]
@@ -221,6 +222,7 @@ pub class Lowerer:
         self.external_globals = list[MirExternalGlobal]()
         self.lowered_external_globals = list[ExternalGlobalId]()
         self.external_global_contracts = list[ExternalGlobalContract]()
+        self.globals = list[MirGlobal]()
         self.data = list[MirData]()
         self.lowered_functions = list[LoweredFunction]()
         self.c_wrappers = list[CWrapper]()
@@ -271,6 +273,13 @@ pub class Lowerer:
         # declarations in several raw modules share one canonical identity.
         for variable in self.program.extern_variables:
             self.lowered_external_globals.append(try self.declare_external_global(variable))
+        for global in self.program.globals:
+            self.globals.append(MirGlobal(
+                name = self.program.modules[global.module.value].name + "." + global.name,
+                value_type = try self.global_mir_type(global),
+                initial = none,
+                is_mutable = true,
+            ))
         let functions = list[MirFunction]()
         for function in self.program.functions:
             match function.implementation:
@@ -291,7 +300,7 @@ pub class Lowerer:
             runtime_bindings = list[MirRuntimeBinding](),
             externs = self.externs,
             external_globals = self.external_globals,
-            globals = list[MirGlobal](),
+            globals = self.globals,
             data = self.data,
             functions = functions,
             entry = entry,
@@ -619,6 +628,7 @@ pub class Lowerer:
             Binding(symbol, is_mutable, value): try self.lower_prologue_node(module, function, value, body)
             Assignment(symbol, operation, value): try self.lower_prologue_node(module, function, value, body)
             ExternStore(variable, operation, value): try self.lower_prologue_node(module, function, value, body)
+            GlobalStore(global, operation, value): try self.lower_prologue_node(module, function, value, body)
             NativeLoad(pointer): try self.lower_prologue_node(module, function, pointer, body)
             NativeStore(pointer, value):
                 try self.lower_prologue_node(module, function, pointer, body)
@@ -771,6 +781,10 @@ pub class Lowerer:
                         body.append(MirInstruction(form = InstructionForm.LoadExternalGlobal(result = current, global = global), span = span))
                         stored = try self.lower_binary_operation(module, function, span, binary, value_type, current, right, body)
                 body.append(MirInstruction(form = InstructionForm.StoreExternalGlobal(global = global, value = stored), span = span))
+            GlobalStore(global_index, operation, value):
+                let address = self.global_address(global_index, span, body)
+                let value_type = self.globals[global_index].value_type
+                try self.lower_store(module, function, span, value_type, address, operation, value, body)
             PlaceAssignment(symbol, steps, operation, value):
                 # Walk the resolved HIR field/array path to its final address.
                 var address = try self.address_of(module, function, span, symbol)
@@ -1234,6 +1248,9 @@ pub class Lowerer:
                 let result = self.new_register(value_type)
                 body.append(MirInstruction(form = InstructionForm.LoadExternalGlobal(result = result, global = global), span = span))
                 return result
+            GlobalLoad(global_index):
+                let address = self.global_address(global_index, span, body)
+                return self.load_value(value_type, address, span, body)
             NativeLoad(pointer):
                 let address = try self.lower_expression(module, function, pointer, body)
                 return self.load_value(value_type, address, span, body)
@@ -2165,6 +2182,11 @@ pub class Lowerer:
         body.append(MirInstruction(form = InstructionForm.ElementAddress(result = address, element_type = element_type, base = base, index = index), span = span))
         return address
 
+    func global_address(index: u32, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.GlobalAddress(result = address, global = GlobalId(value = index)), span = span))
+        return address
+
     # The scalar field `field` of the struct at `base`, loaded.
     func load_field(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
         match mir_type(self.types, struct_type):
@@ -2532,6 +2554,13 @@ pub class Lowerer:
     # have a `TypeId`; the HIR one is spelled `ir.TypeId` here. `char` is its
     # code point in a `u32`.
     func mir_type_of(module: HirModule, function: HirFunction, span: SourceSpan, value: ir.TypeId) -> TypeId!:
+        let lowered = self.lower_mir_type(value) catch feature:
+            error(self.unsupported(module, function, span, feature))
+        return lowered
+
+    # Structural HIR-to-MIR type lowering is context-free. The function and
+    # global wrappers add source context only if this shared conversion fails.
+    func lower_mir_type(value: ir.TypeId) -> TypeId!:
         let scalar = self.scalar_mir_type(value)
         if scalar != none: return scalar
         # Composites are interned structurally, so two `(i64, bool)` tuples
@@ -2543,40 +2572,40 @@ pub class Lowerer:
                 let fields = [self.byte_string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
                 return intern_mir_type(self.types, make_struct_type(fields))
             Error:
-                let code = try self.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_code))
+                let code = try self.lower_mir_type(resolve_builtin_type(BuiltinType.error_code))
                 let fields = [code, self.byte_string_type()]
                 return intern_mir_type(self.types, make_struct_type(fields))
             Tuple(elements):
                 let field_types = list[TypeId]()
                 for element in elements:
-                    field_types.append(try self.mir_type_of(module, function, span, element))
+                    field_types.append(try self.lower_mir_type(element))
                 return intern_mir_type(self.types, make_struct_type(field_types))
             Array(element, count):
-                let element_type = try self.mir_type_of(module, function, span, element)
+                let element_type = try self.lower_mir_type(element)
                 return intern_mir_type(self.types, MirType.Array(element = element_type, count = count))
             Range(element):
-                let element_type = try self.mir_type_of(module, function, span, element)
+                let element_type = try self.lower_mir_type(element)
                 let field_types = [element_type, element_type, builtin_mir_type(BuiltinMirType.boolean)]
                 return intern_mir_type(self.types, make_struct_type(field_types))
             Struct(index):
                 let field_types = list[TypeId]()
                 for field in self.program.structs[index].fields:
-                    field_types.append(try self.mir_type_of(module, function, span, field.value_type))
+                    field_types.append(try self.lower_mir_type(field.value_type))
                 return intern_mir_type(self.types, make_struct_type(field_types))
             Enum(index):
                 # One payload struct per case, in case order; the tag is a `u8`.
                 if len(self.program.enums[index].cases) > 256:
-                    try self.fail_unsupported(module, function, span, "enums with more than 256 cases")
+                    error("enums with more than 256 cases")
                 let case_types = list[TypeId]()
                 for case_value in self.program.enums[index].cases:
                     let field_types = list[TypeId]()
                     for field in case_value.payload:
-                        field_types.append(try self.mir_type_of(module, function, span, field.value_type))
+                        field_types.append(try self.lower_mir_type(field.value_type))
                     case_types.append(intern_mir_type(self.types, make_struct_type(field_types)))
                 return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), case_types))
             Optional(inner):
                 let absent = intern_mir_type(self.types, make_struct_type(list[TypeId]()))
-                let present = try self.mir_type_of(module, function, span, inner)
+                let present = try self.lower_mir_type(inner)
                 return intern_mir_type(self.types, make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
             Function(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             CFunction(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
@@ -2587,8 +2616,18 @@ pub class Lowerer:
                 # remains a backend concern.
                 match self.program.extern_types[index].representation:
                     Pointer: return builtin_mir_type(BuiltinMirType.pointer)
-                    Integer(representation): return try self.mir_type_of(module, function, span, representation)
-            else: error(self.unsupported(module, function, span, "type `" + describe_type(self.program.types, value) + "`"))
+                    Integer(representation): return try self.lower_mir_type(representation)
+            else: error("type `" + describe_type(self.program.types, value) + "`")
+
+    func global_mir_type(global: ir.HirGlobal) -> TypeId!:
+        let module = self.program.modules[global.module.value]
+        let lowered = self.lower_mir_type(global.value_type) catch feature:
+            error(format_diagnostic(
+                module.path,
+                global.span,
+                "lowerer does not support " + feature + " yet in runtime global `" + module.name + "." + global.name + "`",
+            ))
+        return lowered
 
     # The one scalar mapping shared by ordinary values and external-global
     # declarations. This is semantic width, not target ABI placement.

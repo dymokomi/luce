@@ -294,10 +294,11 @@ The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
 join — and says it should be "small and explicit enough to replace per
 host". The sealed `libluce_rt` source package is composed with application MIR
-before optimization and verification, so both artifact backends consume one
-program. Only the tiny stable-arena provider remains backend-owned: Wasm may
-grow its memory, while native may reserve/commit virtual storage. Neither fact
-appears in HIR or canonical MIR. The full service list is in the appendix.
+before optimization and verification, so QBE receives one complete program;
+supporting backends may consume that same program where applicable. Only the
+tiny stable-arena provider remains backend-owned: Wasm may grow its memory,
+while native may reserve/commit virtual storage. Neither fact appears in HIR
+or canonical MIR. The full service list is in the appendix.
 
 Composition is an identity remap, not a source import or a link step. The
 application's tables remain the prefix unchanged. The runtime's canonical
@@ -309,6 +310,15 @@ verification. The composer rejects application-owned service bindings and a
 runtime entry, public function or artifact export, preserving the sealed
 boundary structurally. The combined program alone then enters verification,
 reachability and backend encoding.
+
+The source side of runtime state is equally closed. An explicit
+`PackageRole.sealed_runtime` compilation may declare private
+`var next_offset: u64` cells with structural zero initialization. HIR keeps
+their reads and writes observable; lowering maps them to canonical
+`MirGlobal` storage and `GlobalAddress` without choosing an address. QBE
+places each cell in target data, while supporting backends such as Wasm may
+place it in their own linear-memory plan. Applications cannot declare or
+import runtime cells.
 
 Native source authority is already resolved metadata before HIR generation.
 HIR keeps `native_ptr[T]` and `native_mut_ptr[T]` distinct, including the
