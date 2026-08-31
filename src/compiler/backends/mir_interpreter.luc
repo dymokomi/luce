@@ -31,20 +31,22 @@
 #==============================================================================================
 
 from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, FunctionId, InstructionForm
-from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirFunction, MirInstruction, MirProgram, MirSignature, MirType
+from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirFunction, MirInstruction, MirProgram, MirSignature, MirType, MirTypeTable
 from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, find_mir_function, int_maximum
 from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_identity_type, is_int_type, is_ptr_type, is_reference_type
-from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match
+from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match, uint_maximum
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
 import std.strings
 
 # mark: Values and flow ========================================================================
 
-## One register's contents. Integers of every width travel as `i64`; `Ptr`
-## is a byte offset into the interpreter's memory.
+## One register's contents. Integer variants preserve the MIR type's signed
+## domain; width remains a property of that type. `Ptr` is a byte offset into
+## the interpreter's memory.
 pub union MirValue:
-    Int(value: i64)
+    SignedInt(value: i64)
+    UnsignedInt(value: u64)
     Float(value: f64)
     Bool(value: bool)
     Ptr(value: i64)
@@ -324,7 +326,8 @@ pub class MirInterpreter: MirExternMemory:
         if is_float_type(types, id): return MirValue.Float(value = 0.0)
         if is_bool_type(types, id): return MirValue.Bool(value = false)
         if is_reference_type(types, id): return MirValue.Ptr(value = 0)
-        return MirValue.Int(value = 0)
+        if is_signed_int_type(types, id): return MirValue.SignedInt(value = 0)
+        return MirValue.UnsignedInt(value = u64(0))
 
     # mark: Bodies and regions ==================================================================
 
@@ -358,7 +361,7 @@ pub class MirInterpreter: MirExternMemory:
                     pc = plan.end_of[pc] + 1
                 Switch(tag):
                     regions.append(RunRegion(is_loop = false, start = pc, end = plan.end_of[pc], results = no_registers()))
-                    pc = select_arm(body, plan, pc, int_of(frame.registers[tag.value]))
+                    pc = select_arm(body, plan, pc, frame.registers[tag.value])
                 Case(value):
                     regions.remove(len(regions) - 1)
                     pc = plan.end_of[pc] + 1
@@ -411,7 +414,8 @@ pub class MirInterpreter: MirExternMemory:
         match instruction.form:
             Const(result, value):
                 match value:
-                    Int(item): frame.registers[result.value] = MirValue.Int(value = item)
+                    SignedInt(item): frame.registers[result.value] = MirValue.SignedInt(value = item)
+                    UnsignedInt(item): frame.registers[result.value] = MirValue.UnsignedInt(value = item)
                     Float(item): frame.registers[result.value] = MirValue.Float(value = item)
                     Bool(item): frame.registers[result.value] = MirValue.Bool(value = item)
                     Null: frame.registers[result.value] = MirValue.Ptr(value = 0)
@@ -426,7 +430,7 @@ pub class MirInterpreter: MirExternMemory:
             Alloca(result, slot):
                 frame.registers[result.value] = MirValue.Ptr(value = frame.slots[slot])
             AllocateStorage(result, element_type, count):
-                let item_count = int_of(frame.registers[count.value])
+                let item_count = try host_count_of(frame.registers[count.value], "storage element count")
                 if item_count == 0:
                     frame.registers[result.value] = MirValue.Ptr(value = 0)
                 else:
@@ -439,7 +443,7 @@ pub class MirInterpreter: MirExternMemory:
                     let size = storage_class_size(byte_count, alignment)
                     frame.registers[result.value] = MirValue.Ptr(value = self.allocate_recyclable(size))
             DeallocateStorage(address, element_type, count):
-                let item_count = int_of(frame.registers[count.value])
+                let item_count = try host_count_of(frame.registers[count.value], "storage element count")
                 if item_count > 0:
                     let element_size = self.layout.size_of(element_type)
                     var byte_count = 1
@@ -463,14 +467,16 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + self.layout.enum_payload_offset(enum_type))
             ElementAddress(result, element_type, base, index):
                 let stride = self.layout.size_of(element_type)
-                frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + int_of(frame.registers[index.value]) * stride)
+                let position = try host_integer_of(frame.registers[index.value], "element index")
+                let offset = try checked_multiply(position, stride)
+                frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + offset)
             Memcpy(destination, source, value_type):
                 let size = self.layout.size_of(value_type)
                 let to = ptr_of(frame.registers[destination.value])
                 let from = ptr_of(frame.registers[source.value])
                 self.copy_bytes(from, to, size)
             MoveElements(destination, source, element_type, count):
-                let element_count = int_of(frame.registers[count.value])
+                let element_count = try host_count_of(frame.registers[count.value], "move element count")
                 let byte_count = try checked_multiply(self.layout.size_of(element_type), element_count)
                 let to = ptr_of(frame.registers[destination.value])
                 let from = ptr_of(frame.registers[source.value])
@@ -525,11 +531,11 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
             ListLength(result, value):
                 let storage = try self.list_at(frame.registers[value.value])
-                frame.registers[result.value] = MirValue.Int(value = len(storage.buffer.elements))
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.buffer.elements)))
             ListIterationBegin(result, value):
                 let storage = try self.list_at(frame.registers[value.value])
                 storage.active_iterations += 1
-                frame.registers[result.value] = MirValue.Int(value = len(storage.buffer.elements))
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.buffer.elements)))
             ListIterationEnd(value):
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.active_iterations <= 0: error("mir interpreter: trap: list iteration depth underflow")
@@ -547,8 +553,7 @@ pub class MirInterpreter: MirExternMemory:
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified list insert changed element type")
-                let position = int_of(frame.registers[index.value])
-                if position < 0 or position > len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), true, "index out of bounds")
                 try self.require_list_shape_mutable(storage)
                 try self.detach_list(storage, element_retain)
                 let address = self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
@@ -561,8 +566,7 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = address)
             ListRemoveAt(value, index, element_retain):
                 let storage = try self.list_at(frame.registers[value.value])
-                let position = int_of(frame.registers[index.value])
-                if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
                 try self.require_list_shape_mutable(storage)
                 try self.detach_list(storage, element_retain)
                 for current in range(position, len(storage.buffer.elements) - 1):
@@ -583,29 +587,29 @@ pub class MirInterpreter: MirExternMemory:
             ListReserve(value, minimum_capacity, element_retain):
                 # Capacity is deliberately unobservable in canonical MIR.
                 let storage = try self.list_at(frame.registers[value.value])
-                discard(int_of(frame.registers[minimum_capacity.value]))
+                discard(unsigned_int_of(frame.registers[minimum_capacity.value]))
                 try self.detach_list(storage, element_retain)
             ListElementAddress(result, value, index):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified list index changed element type")
-                let position = int_of(frame.registers[index.value])
-                if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
                 frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
             ListMutableElementAddress(result, value, index, element_retain):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified mutable list index changed element type")
-                let position = int_of(frame.registers[index.value])
-                if position < 0 or position >= len(storage.buffer.elements): error("mir interpreter: trap: index out of bounds")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
                 try self.detach_list(storage, element_retain)
                 frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
             ListSlice(result, value, start, end):
                 let element_type = self.list_element_type(frame.function, value)
                 let storage = try self.list_at(frame.registers[value.value])
-                let lower = int_of(frame.registers[start.value])
-                let upper = int_of(frame.registers[end.value])
-                if lower < 0 or lower > upper or upper > len(storage.buffer.elements): error("mir interpreter: trap: slice bounds out of range")
+                let lower_value = unsigned_int_of(frame.registers[start.value])
+                let upper_value = unsigned_int_of(frame.registers[end.value])
+                if lower_value > upper_value or upper_value > u64(len(storage.buffer.elements)): error("mir interpreter: trap: slice bounds out of range")
+                let lower = i64(lower_value)
+                let upper = i64(upper_value)
                 storage.buffer.references += 1
                 self.slices.append(MirSlice(element_type, MirSliceBacking.List(buffer = storage.buffer, start = lower), upper - lower))
                 frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
@@ -617,9 +621,9 @@ pub class MirInterpreter: MirExternMemory:
             BufferRelease(value):
                 try self.release_immutable_buffer(ptr_of(frame.registers[value.value]))
             BufferConcat(result, left_data, left_length, right_data, right_length):
-                let left_count = int_of(frame.registers[left_length.value])
-                let right_count = int_of(frame.registers[right_length.value])
-                if left_count < 0 or right_count < 0 or left_count > i64_maximum - right_count:
+                let left_count = try host_count_of(frame.registers[left_length.value], "left buffer length")
+                let right_count = try host_count_of(frame.registers[right_length.value], "right buffer length")
+                if left_count > i64_maximum - right_count:
                     error("mir interpreter: trap: integer overflow")
                 let total = left_count + right_count
                 let data = self.allocate(total, 1)
@@ -634,27 +638,29 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = storage.data)
             StringScalarCount(result, data, length):
                 let address = ptr_of(frame.registers[data.value])
-                let byte_length = int_of(frame.registers[length.value])
+                let byte_length = try host_count_of(frame.registers[length.value], "string byte length")
                 var offset = 0
                 var count = 0
                 while offset < byte_length:
                     offset += (try self.decode_string(address, byte_length, offset)) >> 32
                     count += 1
-                frame.registers[result.value] = MirValue.Int(value = count)
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(count))
             StringDecode(character, width, data, length, offset):
                 let decoded = try self.decode_string(
                     ptr_of(frame.registers[data.value]),
-                    int_of(frame.registers[length.value]),
-                    int_of(frame.registers[offset.value]),
+                    try host_count_of(frame.registers[length.value], "string byte length"),
+                    try host_count_of(frame.registers[offset.value], "string byte offset"),
                 )
-                frame.registers[character.value] = MirValue.Int(value = decoded & 4294967295)
-                frame.registers[width.value] = MirValue.Int(value = decoded >> 32)
+                frame.registers[character.value] = MirValue.UnsignedInt(value = u64(decoded & 4294967295))
+                frame.registers[width.value] = MirValue.UnsignedInt(value = u64(decoded >> 32))
             BytesSlice(result, owner, data, length, start, end):
                 let owner_value = ptr_of(frame.registers[owner.value])
-                let source_length = int_of(frame.registers[length.value])
-                let lower = int_of(frame.registers[start.value])
-                let upper = int_of(frame.registers[end.value])
-                if lower < 0 or lower > upper or upper > source_length: error("mir interpreter: trap: slice bounds out of range")
+                let source_length = try host_count_of(frame.registers[length.value], "byte length")
+                let lower_value = unsigned_int_of(frame.registers[start.value])
+                let upper_value = unsigned_int_of(frame.registers[end.value])
+                if lower_value > upper_value or upper_value > u64(source_length): error("mir interpreter: trap: slice bounds out of range")
+                let lower = i64(lower_value)
+                let upper = i64(upper_value)
                 if owner_value != 0:
                     let storage = try self.immutable_buffer_at(owner_value)
                     storage.references += 1
@@ -663,7 +669,7 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
             SliceLength(result, value):
                 let storage = try self.slice_at(frame.registers[value.value])
-                frame.registers[result.value] = MirValue.Int(value = storage.length)
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(storage.length))
             SliceRetain(value):
                 if ptr_of(frame.registers[value.value]) != 0:
                     let storage = try self.slice_at(frame.registers[value.value])
@@ -682,8 +688,7 @@ pub class MirInterpreter: MirExternMemory:
                 let element_type = self.slice_element_type(frame.function, value)
                 let storage = try self.slice_at(frame.registers[value.value])
                 if storage.element_type.value != element_type.value: trap("verified slice index changed element type")
-                let position = int_of(frame.registers[index.value])
-                if position < 0 or position >= storage.length: error("mir interpreter: trap: index out of bounds")
+                let position = try bounded_position_of(frame.registers[index.value], storage.length, false, "index out of bounds")
                 match storage.backing:
                     List(buffer, start): frame.registers[result.value] = MirValue.Ptr(value = buffer.elements[start + position])
                     Bytes(owner, data): frame.registers[result.value] = MirValue.Ptr(value = data + position)
@@ -842,9 +847,11 @@ pub class MirInterpreter: MirExternMemory:
             if operation == BinaryOp.eq: return MirValue.Bool(value = ptr_of(left) == ptr_of(right))
             if operation == BinaryOp.ne: return MirValue.Bool(value = ptr_of(left) != ptr_of(right))
             trap("verified identity operands reached a non-equality operation")
-        return try self.evaluate_int_binary(operation, operand_type, int_of(left), int_of(right))
+        if is_signed_int_type(types, operand_type):
+            return try self.evaluate_signed_int_binary(operation, operand_type, signed_int_of(left), signed_int_of(right))
+        return try self.evaluate_unsigned_int_binary(operation, operand_type, unsigned_int_of(left), unsigned_int_of(right))
 
-    func evaluate_int_binary(operation: BinaryOp, operand_type: TypeId, left: i64, right: i64) -> MirValue!:
+    func evaluate_signed_int_binary(operation: BinaryOp, operand_type: TypeId, left: i64, right: i64) -> MirValue!:
         let types = self.program.types
         let minimum = int_minimum(types, operand_type)
         let maximum = int_maximum(types, operand_type)
@@ -858,50 +865,83 @@ pub class MirInterpreter: MirExternMemory:
         if operation == BinaryOp.add:
             if (right > 0 and left > maximum - right) or (right < 0 and left < minimum - right):
                 try trap_overflow()
-            return MirValue.Int(value = left + right)
+            return MirValue.SignedInt(value = left + right)
         if operation == BinaryOp.sub:
             if (right < 0 and left > maximum + right) or (right > 0 and left < minimum + right):
                 try trap_overflow()
-            return MirValue.Int(value = left - right)
+            return MirValue.SignedInt(value = left - right)
         if operation == BinaryOp.mul:
             let product = try checked_multiply(left, right)
             if product < minimum or product > maximum: try trap_overflow()
-            return MirValue.Int(value = product)
+            return MirValue.SignedInt(value = product)
         if operation == BinaryOp.floor_div or operation == BinaryOp.rem:
             if right == 0: error("mir interpreter: trap: division by zero")
             # `minimum // -1` overflows; `minimum % -1` is simply 0.
-            if operation == BinaryOp.rem and right == -1: return MirValue.Int(value = 0)
+            if operation == BinaryOp.rem and right == -1: return MirValue.SignedInt(value = 0)
             if left == minimum and right == -1: try trap_overflow()
-            if operation == BinaryOp.floor_div: return MirValue.Int(value = left // right)
-            return MirValue.Int(value = left % right)
-        if operation == BinaryOp.bit_and: return MirValue.Int(value = left & right)
-        if operation == BinaryOp.bit_or: return MirValue.Int(value = left | right)
-        if operation == BinaryOp.bit_xor: return MirValue.Int(value = left ^ right)
+            if operation == BinaryOp.floor_div: return MirValue.SignedInt(value = left // right)
+            return MirValue.SignedInt(value = left % right)
+        if operation == BinaryOp.bit_and: return MirValue.SignedInt(value = left & right)
+        if operation == BinaryOp.bit_or: return MirValue.SignedInt(value = left | right)
+        if operation == BinaryOp.bit_xor: return MirValue.SignedInt(value = left ^ right)
         if operation == BinaryOp.shift_left:
             if right < 0 or right >= bits: error("mir interpreter: trap: shift count is outside integer width")
             # Only the count is checked (language section 7); bits shifted
             # past the width are dropped and the result is re-canonicalised.
-            return MirValue.Int(value = shift_left_within(left, right, bits, is_signed_int_type(types, operand_type)))
+            return MirValue.SignedInt(value = shift_left_within(left, right, bits, true))
         if operation == BinaryOp.shift_right:
             if right < 0 or right >= bits: error("mir interpreter: trap: shift count is outside integer width")
             # Unsigned values are non-negative here, so `>>` is logical for
             # them and arithmetic for signed values, as the language requires.
-            return MirValue.Int(value = left >> right)
+            return MirValue.SignedInt(value = left >> right)
         if operation == BinaryOp.div: trap("verified integer operands reached `div`")
         trap("unhandled integer operation")
+
+    func evaluate_unsigned_int_binary(operation: BinaryOp, operand_type: TypeId, left: u64, right: u64) -> MirValue!:
+        let maximum = uint_maximum(self.program.types, operand_type)
+        let bits = bits_of(self.program.types, operand_type)
+        if operation == BinaryOp.eq: return MirValue.Bool(value = left == right)
+        if operation == BinaryOp.ne: return MirValue.Bool(value = left != right)
+        if operation == BinaryOp.lt: return MirValue.Bool(value = left < right)
+        if operation == BinaryOp.le: return MirValue.Bool(value = left <= right)
+        if operation == BinaryOp.gt: return MirValue.Bool(value = left > right)
+        if operation == BinaryOp.ge: return MirValue.Bool(value = left >= right)
+        if operation == BinaryOp.add:
+            if left > maximum - right: try trap_overflow()
+            return MirValue.UnsignedInt(value = left + right)
+        if operation == BinaryOp.sub:
+            if left < right: try trap_overflow()
+            return MirValue.UnsignedInt(value = left - right)
+        if operation == BinaryOp.mul:
+            if right != u64(0) and left > maximum // right: try trap_overflow()
+            return MirValue.UnsignedInt(value = left * right)
+        if operation == BinaryOp.floor_div or operation == BinaryOp.rem:
+            if right == u64(0): error("mir interpreter: trap: division by zero")
+            if operation == BinaryOp.floor_div: return MirValue.UnsignedInt(value = left // right)
+            return MirValue.UnsignedInt(value = left % right)
+        if operation == BinaryOp.bit_and: return MirValue.UnsignedInt(value = left & right)
+        if operation == BinaryOp.bit_or: return MirValue.UnsignedInt(value = left | right)
+        if operation == BinaryOp.bit_xor: return MirValue.UnsignedInt(value = left ^ right)
+        if operation == BinaryOp.shift_left:
+            if right >= u64(bits): error("mir interpreter: trap: shift count is outside integer width")
+            return MirValue.UnsignedInt(value = shift_left_unsigned(left, i64(right), bits))
+        if operation == BinaryOp.shift_right:
+            if right >= u64(bits): error("mir interpreter: trap: shift count is outside integer width")
+            return MirValue.UnsignedInt(value = left >> right)
+        if operation == BinaryOp.div: trap("verified integer operands reached `div`")
+        trap("unhandled unsigned integer operation")
 
     func evaluate_unary(operation: UnaryOp, operand_type: TypeId, operand: MirValue) -> MirValue!:
         let types = self.program.types
         match operation:
             neg:
                 if is_float_type(types, operand_type): return MirValue.Float(value = 0.0 - float_of(operand))
-                let value = int_of(operand)
+                let value = signed_int_of(operand)
                 if value == int_minimum(types, operand_type): try trap_overflow()
-                return MirValue.Int(value = 0 - value)
+                return MirValue.SignedInt(value = 0 - value)
             bit_not:
-                let value = int_of(operand)
-                if is_signed_int_type(types, operand_type): return MirValue.Int(value = ~value)
-                return MirValue.Int(value = int_maximum(types, operand_type) - value)
+                if is_signed_int_type(types, operand_type): return MirValue.SignedInt(value = ~signed_int_of(operand))
+                return MirValue.UnsignedInt(value = uint_maximum(types, operand_type) - unsigned_int_of(operand))
             bool_not:
                 return MirValue.Bool(value = not bool_of(operand))
 
@@ -909,25 +949,25 @@ pub class MirInterpreter: MirExternMemory:
         let types = self.program.types
         match operation:
             extend:
-                return MirValue.Int(value = int_of(operand))
+                return integer_from_low_bits(operand, result_type, types)
             wrap:
-                # Keep the low `bits` and reinterpret them in the target's sign.
-                let bits = bits_of(types, result_type)
-                let mask = (1 << bits) - 1
-                var value = int_of(operand) & mask
-                if is_signed_int_type(types, result_type) and value >= (1 << (bits - 1)):
-                    value = value - (1 << bits)
-                return MirValue.Int(value = value)
+                return integer_from_low_bits(operand, result_type, types)
             int_reinterpret:
-                return MirValue.Int(value = int_of(operand))
+                return integer_from_low_bits(operand, result_type, types)
             int_to_float:
-                return MirValue.Float(value = f64(int_of(operand)))
+                if is_signed_int_type(types, operand_type): return MirValue.Float(value = f64(signed_int_of(operand)))
+                return MirValue.Float(value = f64(unsigned_int_of(operand)))
             float_to_int:
                 let value = float_of(operand)
                 if value != value: error("mir interpreter: trap: float to integer conversion of NaN")
-                if value < f64(int_minimum(types, result_type)) or value >= f64(int_maximum(types, result_type)) + 1.0:
+                if is_signed_int_type(types, result_type):
+                    if value < f64(int_minimum(types, result_type)) or value >= f64(int_maximum(types, result_type)) + 1.0:
+                        error("mir interpreter: trap: float to integer conversion is outside the integer range")
+                    return MirValue.SignedInt(value = i64(value))
+                let upper = f64(uint_maximum(types, result_type)) + 1.0
+                if value < 0.0 or value >= upper:
                     error("mir interpreter: trap: float to integer conversion is outside the integer range")
-                return MirValue.Int(value = i64(value))
+                return MirValue.UnsignedInt(value = u64(value))
 
     # mark: Memory ==============================================================================
 
@@ -954,7 +994,9 @@ pub class MirInterpreter: MirExternMemory:
             return MirValue.Float(value = 0.0)
         if is_bool_type(types, value_type): return MirValue.Bool(value = self.memory[address] != 0)
         if is_reference_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.layout.pointer_size(), false))
-        return MirValue.Int(value = self.read_int(address, bits_of(types, value_type) // 8, is_signed_int_type(types, value_type)))
+        if is_signed_int_type(types, value_type):
+            return MirValue.SignedInt(value = self.read_int(address, bits_of(types, value_type) // 8, true))
+        return MirValue.UnsignedInt(value = self.read_unsigned_int(address, bits_of(types, value_type) // 8))
 
     func store(value_type: TypeId, address: i64, value: MirValue):
         let types = self.program.types
@@ -968,7 +1010,10 @@ pub class MirInterpreter: MirExternMemory:
         if is_reference_type(types, value_type):
             self.write_int(address, self.layout.pointer_size(), ptr_of(value))
             return
-        self.write_int(address, bits_of(types, value_type) // 8, int_of(value))
+        if is_signed_int_type(types, value_type):
+            self.write_int(address, bits_of(types, value_type) // 8, signed_int_of(value))
+        else:
+            self.write_unsigned_int(address, bits_of(types, value_type) // 8, unsigned_int_of(value))
 
     # Little-endian, sign-extending on request. A negative value's two's
     # complement bytes are produced by adding 2^64 conceptually, one byte at a
@@ -980,6 +1025,12 @@ pub class MirInterpreter: MirExternMemory:
             self.memory[address + offset] = u8(low)
             remaining = (remaining - low) // 256
 
+    func write_unsigned_int(address: i64, size: i64, value: u64):
+        var remaining = value
+        for offset in range(0, size):
+            self.memory[address + offset] = u8(remaining % u64(256))
+            remaining = remaining // u64(256)
+
     func read_int(address: i64, size: i64, is_signed: bool) -> i64:
         # The top byte is folded in as a signed digit so eight bytes never
         # form a value Stage-0 cannot hold; narrower reads sign-extend after.
@@ -989,6 +1040,14 @@ pub class MirInterpreter: MirExternMemory:
         var position = size - 2
         while position >= 0:
             value = value * 256 + i64(self.memory[address + position])
+            position -= 1
+        return value
+
+    func read_unsigned_int(address: i64, size: i64) -> u64:
+        var value = u64(0)
+        var position = size - 1
+        while position >= 0:
+            value = value * u64(256) + u64(self.memory[address + position])
             position -= 1
         return value
 
@@ -1031,16 +1090,16 @@ pub class MirInterpreter: MirExternMemory:
             return results
         let name = external.name
         if name == "luce_rt_arena":
-            let requested_end = int_of(arguments[0])
-            if requested_end < 0 or requested_end > mir_arena_capacity:
+            let requested_end = try host_count_of(arguments[0], "arena end")
+            if requested_end > mir_arena_capacity:
                 error("mir interpreter: trap: arena capacity exceeded")
             if requested_end > self.arena_committed: self.arena_committed = requested_end
             return [MirValue.Ptr(value = self.arena_address)]
         if name == "luce_rt_write":
-            self.output = self.output + self.text_at(ptr_of(arguments[0]), int_of(arguments[1]))
+            self.output = self.output + self.text_at(ptr_of(arguments[0]), try host_count_of(arguments[1], "write length"))
             return none_results
         if name == "luce_rt_trap":
-            error("mir interpreter: trap: " + self.text_at(ptr_of(arguments[0]), int_of(arguments[1])))
+            error("mir interpreter: trap: " + self.text_at(ptr_of(arguments[0]), try host_count_of(arguments[1], "trap reason length")))
         if name == "luce_rt_retain" or name == "luce_rt_release":
             return none_results
         if name == "luce_rt_weak_make" or name == "luce_rt_weak_get":
@@ -1061,8 +1120,12 @@ pub class MirInterpreter: MirExternMemory:
                 Ptr(item): return true
                 else: return false
         if is_int_type(self.program.types, value_type):
+            if is_signed_int_type(self.program.types, value_type):
+                match value:
+                    SignedInt(item): return item >= int_minimum(self.program.types, value_type) and item <= int_maximum(self.program.types, value_type)
+                    else: return false
             match value:
-                Int(item): return item >= int_minimum(self.program.types, value_type) and item <= int_maximum(self.program.types, value_type)
+                UnsignedInt(item): return item <= uint_maximum(self.program.types, value_type)
                 else: return false
         return false
 
@@ -1140,25 +1203,38 @@ func extend_group(open_groups: list[list[i64]], next_arm: list[i64], index: i64)
 
 # The first instruction of the `Switch` arm for `selected`: the matching
 # `Case`, else the `Default` (the verifier requires one).
-func select_arm(body: list[MirInstruction], plan: RegionPlan, opener: i64, selected: i64) -> i64:
+func select_arm(body: list[MirInstruction], plan: RegionPlan, opener: i64, selected: MirValue) -> i64:
     var arm = plan.next_arm[opener]
     var fallback = -1
     while arm >= 0:
         match body[arm].form:
             Case(value):
-                if value == selected: return arm + 1
+                if case_matches(value, selected): return arm + 1
             Default: fallback = arm
             else: trap("switch arm plan names a non-arm instruction")
         arm = plan.next_arm[arm]
     if fallback < 0: trap("verified Switch without a Default")
     return fallback + 1
 
+func case_matches(candidate: i64, selected: MirValue) -> bool:
+    match selected:
+        SignedInt(value): return candidate == value
+        UnsignedInt(value):
+            if candidate < 0: return false
+            return u64(candidate) == value
+        else: trap("verified MIR switch received a non-integer tag")
+
 # mark: Value helpers ==========================================================================
 
-pub func int_of(value: MirValue) -> i64:
+pub func signed_int_of(value: MirValue) -> i64:
     match value:
-        Int(item): return item
-        else: trap("verified MIR register holds a non-integer where an integer was expected")
+        SignedInt(item): return item
+        else: trap("verified MIR register holds a non-signed-integer where a signed integer was expected")
+
+pub func unsigned_int_of(value: MirValue) -> u64:
+    match value:
+        UnsignedInt(item): return item
+        else: trap("verified MIR register holds a non-unsigned-integer where an unsigned integer was expected")
 
 pub func float_of(value: MirValue) -> f64:
     match value:
@@ -1177,6 +1253,70 @@ pub func ptr_of(value: MirValue) -> i64:
 
 func trap_overflow() -> !:
     error("mir interpreter: trap: integer overflow")
+
+# Convert one target-independent unsigned semantic quantity into the oracle's
+# host indexing domain only after proving it fits. This capacity is an oracle
+# implementation limit, never a canonical-MIR or target limit.
+func host_count_of(value: MirValue, what: str) -> i64!:
+    let item = unsigned_int_of(value)
+    if item > u64(9223372036854775807):
+        error("mir interpreter: trap: " + what + " exceeds semantic-oracle capacity")
+    return i64(item)
+
+# Check a source-visible position in the unsigned semantic domain before
+# narrowing it to the oracle's host-list index. An enormous index is out of
+# bounds; it is not evidence that canonical MIR inherited an i64 limit.
+func bounded_position_of(value: MirValue, length: i64, allows_end: bool, reason: str) -> i64!:
+    let item = unsigned_int_of(value)
+    var outside = item >= u64(length)
+    if allows_end: outside = item > u64(length)
+    if outside: error("mir interpreter: trap: " + reason)
+    return i64(item)
+
+func host_integer_of(value: MirValue, what: str) -> i64!:
+    match value:
+        SignedInt(item): return item
+        UnsignedInt(item):
+            if item > u64(9223372036854775807):
+                error("mir interpreter: trap: " + what + " exceeds semantic-oracle capacity")
+            return i64(item)
+        else: trap("verified MIR register holds a non-integer where an integer was expected")
+
+# Reinterpret the low destination-width bits, choosing the semantic variant
+# from the destination type. `extend`, `wrap`, and equal-width reinterpret
+# differ in verifier constraints; their bit materialization is shared.
+func integer_from_low_bits(value: MirValue, result_type: TypeId, types: MirTypeTable) -> MirValue:
+    let bits = bits_of(types, result_type)
+    let low = low_integer_bits(value, bits)
+    if not is_signed_int_type(types, result_type): return MirValue.UnsignedInt(value = low)
+    if bits == 64:
+        if low <= u64(9223372036854775807): return MirValue.SignedInt(value = i64(low))
+        return MirValue.SignedInt(value = (-9223372036854775807 - 1) + i64(low - u64(9223372036854775808)))
+    let sign = u64(1) << u64(bits - 1)
+    if low < sign: return MirValue.SignedInt(value = i64(low))
+    return MirValue.SignedInt(value = i64(low) - i64(u64(1) << u64(bits)))
+
+func low_integer_bits(value: MirValue, bits: i64) -> u64:
+    var mask = u64(18446744073709551615)
+    if bits < 64: mask = (u64(1) << u64(bits)) - u64(1)
+    match value:
+        UnsignedInt(item): return item & mask
+        SignedInt(item):
+            if item >= 0: return u64(item) & mask
+            if bits == 64: return u64(9223372036854775808) + u64(item - (-9223372036854775807 - 1))
+            return u64(item & i64(mask))
+        else: trap("verified MIR conversion received a non-integer")
+
+# Shift one bit at a time after dropping the outgoing high bit. The remaining
+# value can always be doubled in host `u64`, including for a 64-bit operand,
+# so Stage-0 never decides Luce's fixed-width shift behavior through overflow.
+func shift_left_unsigned(value: u64, count: i64, bits: i64) -> u64:
+    let high_bit = u64(1) << u64(bits - 1)
+    var result = value
+    for step in range(0, count):
+        if result >= high_bit: result -= high_bit
+        result += result
+    return result
 
 # Multiply two `i64` values, reporting overflow instead of letting Stage-0
 # trap. Magnitudes are compared against `maximum // |b|`; the one product
