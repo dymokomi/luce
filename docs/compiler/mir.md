@@ -310,6 +310,19 @@ perform only the unchecked storage operation after the backend guard.
 Capacity, header layout, concatenation allocation/copy policy, and geometric
 growth remain ordinary freestanding Luce runtime policy.
 
+Existential storage follows the same boundary. `InterfaceCreate` names one
+canonical conformance and the address of its concrete source storage. The
+conformance supplies the concrete type; backend legalization supplies that
+type's size/alignment and its generated structural retain/release helpers to
+the sealed runtime. The private header retains the
+conformance/witness identity and enough policy to detach a shared value before
+mutation. `InterfaceDetach` consumes the caller's one reference and returns
+either the same unique handle or a retained copy. `InterfacePayload` exposes
+only an opaque address to a normalized witness thunk. A class payload remains
+the same shared class identity after wrapper detachment, while a value payload
+is independently mutated. Header fields, inline capacity, box placement, and
+witness-table encoding never enter canonical MIR.
+
 `ListIterationBegin` registers one active traversal on the semantic list
 identity and returns the element count captured at entry. The lowerer emits a
 matching `ListIterationEnd` through its lexical cleanup stack on return/error
@@ -422,10 +435,14 @@ things MIR already has.
   signature, typed capture schema, and destroyer. A captured `var` is a typed
   ARC-managed `Cell(T)` shared by the enclosing scope and every closure
   (§14.1). Backends alone choose descriptor and environment layout.
-- **Interface values** are a pair of pointers — the data and a *witness
-  table*, a constant block of function pointers in requirement order
-  (§16.3). Calling through an interface is loading a pointer from the table
-  and calling it.
+- **Interface syntax and source conformance lookup** are gone, but the
+  existential contract is not flattened prematurely. `Interface(id)` is an
+  opaque managed handle; `MirInterface` fixes normalized requirement
+  signatures and `MirConformance` fixes witness functions in declaration
+  order. Create/payload/detach/retain/release and `CallInterface` remain
+  semantic MIR operations. A backend may represent the handle as data plus a
+  witness-table pointer, inline a small value, or box it; HIR/MIR never choose
+  pointer count, inline capacity, offsets, or table layout (§16.3).
 - **Names** are gone: functions, globals, and data are numbers. The strings
   survive only for artifacts and diagnostics.
 
@@ -591,7 +608,8 @@ as a target-neutral type fact and element placement deferred to the backend;
 class references → `Class(id)` and both weak field storage and source
 `Weak[T]` values → `WeakClass(id)`, with their field schema and generated
 `(class, initialized)` destroyer in
-`MirProgram.classes`; interface values → a two-`Ptr` `Struct`.
+`MirProgram.classes`; interface values → `Interface(id)`, an opaque typed
+managed handle whose requirement and conformance tables are program metadata.
 
 Aggregates never sit in a register. The lowerer's protocol: a register of
 aggregate type holds the value's *address* (a slot, a field, a parameter's
@@ -774,6 +792,7 @@ Call(FunctionId, args)                       -> results
 CallExtern(ExternId, args)                   -> results
 CallIndirect(signature, convention, target, args) -> results
 CallClosure(signature, descriptor, args)          -> results
+CallInterface(InterfaceId, requirement, handle, args) -> results
 ```
 
 An exact source `func(P...) -> R` is a canonical aggregate descriptor with a
@@ -871,6 +890,11 @@ ClosureCreate(Ptr destination, Func(T), ClosureId) -> Ptr environment
 ClosureMarkInitialized(Ptr environment)
 ClosureCaptureAddress(Ptr environment, ClosureId, capture) -> Ptr
 FunctionRetain(Ptr descriptor) / FunctionRelease(Ptr descriptor)
+InterfaceCreate(ConformanceId, Ptr source storage) -> Interface(I)
+InterfaceRetain(Interface(I)) / InterfaceRelease(Interface(I))
+InterfaceDetach(Interface(I)) -> Interface(I)   consumes one reference; COW before mutation
+InterfacePayload(Interface(I)) -> Ptr           erased receiver storage
+CallInterface(InterfaceId, requirement, Interface(I), args) -> results
 list_iteration_active(List(T)) -> bool        backend guards every shape mutation
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)

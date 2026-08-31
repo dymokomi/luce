@@ -120,18 +120,20 @@ a substitute for or prerequisite to this QBE-complete claim.
   Wasm, QBE, and later native backends.
 - **Aggregates never sit in a register**: a register of aggregate type holds an address; copies are explicit `Memcpy`; aggregate results go through a hidden leading pointer parameter; aggregate parameters are passed by pointer, written through only by a `mutating` receiver.
 - **Runtime services as explicit calls and bindings.** Ownership, weak
-  references, I/O and traps are ordinary verified calls. Typed storage
-  allocation is the sole canonical instruction because its structural
-  `TypeId` must survive to the backend. A program-level runtime binding names
-  the exact private Luce allocator function by `FunctionId`; backend
-  legalization computes its byte count/alignment and calls that identity.
-  There is no allocator symbol lookup and no target fact in MIR.
+  references, I/O and traps use verified semantic operations. Operations whose
+  structural type must survive legalization—typed storage, collections,
+  classes, closures, and interface values—remain canonical instructions. A
+  program-level runtime binding names each exact private Luce implementation by
+  `FunctionId`; backend legalization alone supplies physical layout and calls
+  that identity. There is no runtime symbol lookup and no target fact in MIR.
 - **Failure as data with explicit ownership**: a fallible function receives a caller-owned `Error` slot as hidden parameter 0 and returns `(value, null)` on success or `(absent, error_out)` on failure. `try` is a call plus one conditional branch; propagation copies into the current function's slot after active `defer`s; no allocation or unwinding.
 - **Semantics fixed in MIR**: `Add` means checked add; `floor_div`/`rem` are floor semantics; shifts trap on count, drop bits shifted out. Checks are removed only by proof, never by build mode.
-- **Not in MIR**: generics (monomorphized), interfaces (data pointer + witness
-  table), names. Closures do reach MIR as typed semantic descriptors and
-  environment metadata; only their physical code/environment layout belongs
-  to a backend.
+- **Not in MIR**: generic declarations/parameters (monomorphized), source
+  interface lookup/conformance syntax, and semantic names. Interface values do
+  reach MIR as nominal handles, normalized requirement/conformance metadata,
+  and dynamic calls; their box and witness-table layout belong only to a
+  backend. Closures likewise retain typed descriptors and environment metadata
+  without choosing a physical layout.
 - **`Yield`** is the structured phi: a region that produces values names them on every exit.
 - **Narrow integers stay MIR types** (Prism `DType` and the C ABI need exact widths).
 - **Settled**: optionals, including `Class?`, remain uniform `u8`-tagged enums
@@ -221,8 +223,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   destruction, weak sinks, places, calls, and structured control all mutate
   that same register/region/defer transaction, so extracting them would add a
   forwarding graph or duplicate ownership state rather than establish a new
-  owner. Closures are the next mandatory review because capture environments
-  may provide an actual independently testable boundary. Keep the parser and
+  owner. The later closure review kept the recursive evaluator cohesive, while
+  existential interface resolution established an independently testable HIR
+  boundary. The now 3,923-line function walk must be reviewed again with its
+  next major language family. Keep the parser and
   2,085-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
@@ -569,15 +573,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   structured, non-fatal analysis result through check, run, compilation, build,
   and CLI presentation; it neither changes valid capture semantics nor prints
   from HIR generation. Sendability closes with workers.
-- [ ] **Interface values** (data pointer + witness table) and the remaining
-  generic surface. Nominal interface declarations, generic interface
-  arguments and constraints, explicit struct/class/enum conformances,
-  constraint intersections, static requirement dispatch, and safe
-  infallible-to-fallible adapters now reach QBE (`done.md` §2). HIR retains
-  target-neutral requirement/conformance identity and canonical MIR remains
-  generic-free. Next: existential interface values with boxing/COW and dynamic
-  witnesses; then generic nominal types, serialized typed bodies, package/CLI
-  budget configuration, and expansion accounting.
+- [x] **Interface values** (2026-08-31). Existential conversion and dynamic
+  requirement calls retain nominal interface/conformance identities through
+  HIR and target-neutral MIR. The sealed runtime owns erased payload lifetime
+  and value COW; class payloads preserve shared identity. QBE and Wasm choose
+  their own descriptor/witness encodings, and both semantic oracles plus the
+  executable interface example agree on generic interfaces, struct/class/enum
+  conformers, nested ownership, returned existentials, mutation, fallibility
+  adaptation, and propagation (`done.md` §2).
+- [ ] **Finish the remaining generic surface.** Generic nominal types,
+  serialized typed bodies, package/CLI budget configuration, origin/size/time
+  expansion accounting, and path-rich budget diagnostics remain. Keep
+  monomorphization out of canonical MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
@@ -613,12 +620,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   1,680-line declaration collector now owns one cohesive, marked interface
   declaration/conformance section because it directly shares name, type, and
   method resolution; splitting it today would create a forwarding cycle.
-  Existential representation and dynamic calls are a distinct concern and
-  must get their own owner rather than extending that section past the review
-  threshold. The
-  remaining 2,907-line HIR body checker and 3,514-line MIR function lowerer
-  stay intact until another language family establishes a similarly cohesive
-  owner. The 2,219-line HIR interpreter
+  Existential representation and dynamic calls established the focused
+  105-line `hir/interfaces/values.luc` owner rather than extending the
+  declaration collector. The remaining 2,918-line HIR body checker and
+  3,923-line MIR function lowerer stay intact only until another language
+  family establishes a similarly cohesive owner; the lowerer's next major
+  slice must include a fresh transaction-boundary review. The 2,219-line HIR interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.

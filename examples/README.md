@@ -48,6 +48,14 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   from an infallible implementation to a fallible requirement through both
   semantic oracles, Wasm, and native QBE. It deliberately does not claim
   existential interface values or witness-table dynamic dispatch.
+- `interfaces.luc` proves existential conversion and dynamic dispatch for
+  value and class conformers. Value payload mutation detaches with copy-on-
+  write, class payload mutation preserves shared identity, and infallible
+  implementations adapt to fallible requirements while a genuinely failing
+  witness preserves caller-owned error propagation. Generic interface
+  applications, enum conformers, returned existentials, and existentials in
+  managed collections travel through both semantic oracles, Wasm, and native
+  QBE using the same HIR and MIR shapes.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership

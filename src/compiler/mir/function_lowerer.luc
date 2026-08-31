@@ -15,7 +15,7 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ClassId, ClosureId, DataId, FunctionId, GlobalId
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ClassId, ClosureId, ConformanceId, DataId, FunctionId, GlobalId, InterfaceId
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
@@ -38,6 +38,13 @@ from compiler.mir.lowering_model import CellStorage, OwnershipHelper, RecoverTar
 struct WeakClassSource:
     let is_present: RegisterId
     let value: RegisterId
+
+# One fully evaluated dynamic-call site. `target` selects the witness table;
+# `payload` is its erased receiver and `values` are source arguments in order.
+struct InterfaceOperands:
+    let target: RegisterId
+    let payload: RegisterId
+    let values: list[RegisterId]
 
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
@@ -154,7 +161,7 @@ pub class FunctionLowerer:
     # Reserve both identities before generating either body. Recursive value
     # shapes can then refer back through list/slice element callbacks without
     # late patching or backend discovery.
-    func ownership_helper_for(value_type: TypeId) -> OwnershipHelper:
+    pub func ownership_helper_for(value_type: TypeId) -> OwnershipHelper:
         for helper in self.state.ownership_helpers:
             if helper.value_type.value == value_type.value: return helper
         let retain = FunctionId(value = self.state.next_generated_function)
@@ -178,6 +185,77 @@ pub class FunctionLowerer:
             name = ".luce_" + operation + "_t" + str(value_type.value),
             convention = CallingConvention.luce,
             signature = MirSignature(parameters = [pointer], results = list[TypeId](), is_fallible = false),
+            registers = self.state.registers,
+            slots = self.state.slots,
+            body = body,
+            operands = self.state.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = span,
+        )
+
+    ## Adapt one concrete method to its interface's erased receiver protocol.
+    ## The thunk changes only the receiver representation; hidden result/error
+    ## slots and every explicit argument remain in their canonical positions.
+    pub func lower_interface_witness(conformance_index: i64, requirement_index: i64) -> MirFunction!:
+        self.begin_function()
+        let source = self.state.program.conformances[conformance_index]
+        let metadata = self.state.conformances[conformance_index]
+        let requirement = self.state.interfaces[metadata.interface_id.value].requirements[requirement_index]
+        var applied: ir.HirInterfaceApplication? = none
+        for candidate in self.state.program.interface_applications:
+            if candidate.value_type.value == source.interface_type.value: applied = candidate
+        let contract = applied else trap("HIR conformance has no applied interface contract")
+        let source_requirement = contract.requirements[requirement_index]
+        let span = source_requirement.span
+
+        let parameters = list[RegisterId]()
+        for value_type in requirement.signature.parameters: parameters.append(self.state.new_register(value_type))
+        let results = list[RegisterId]()
+        for value_type in requirement.signature.results: results.append(self.state.new_register(value_type))
+
+        var receiver_index: i64 = 0
+        if requirement.signature.is_fallible: receiver_index += 1
+        let successful = self.state.fallible_inner(source_requirement.result)
+        var result_type = source_requirement.result
+        if successful != none: result_type = successful
+        if not types_match(result_type, resolve_builtin_type(BuiltinType.unit)):
+            let lowered_result = try self.state.lower_mir_type(result_type)
+            if self.is_aggregate(lowered_result): receiver_index += 1
+
+        let call_arguments = list[RegisterId]()
+        for parameter in parameters: call_arguments.append(parameter)
+        let body = list[MirInstruction]()
+        match self.state.program.types.definitions[source.value_type.value].form:
+            Class(class_index):
+                let receiver = self.state.new_register(metadata.value_type)
+                call_arguments[receiver_index] = receiver
+                body.append(MirInstruction(form = InstructionForm.Load(result = receiver, value_type = metadata.value_type, address = parameters[receiver_index]), span = span))
+            else: pass
+        let target = self.state.function_index_of(source.implementations[requirement_index])
+        if target < 0: trap("HIR conformance implementation has no function")
+        self.emit_call(target, results, call_arguments, span, body)
+        self.emit_interface_witness_return(requirement.signature, parameters, results, span, body)
+        return self.interface_witness_function(conformance_index, requirement_index, requirement.signature, body, span)
+
+    ## A fallible call reports failure by returning its caller-owned error
+    ## slot. A witness must preserve that convention while also making the
+    ## successful null result explicit enough for canonical verification.
+    func emit_interface_witness_return(signature: MirSignature, parameters: list[RegisterId], results: list[RegisterId], span: SourceSpan, body: list[MirInstruction]):
+        if signature.is_fallible:
+            let reported = results[len(results) - 1]
+            let failed = self.error_is_present(reported, span, body)
+            self.open_if(failed, list[RegisterId](), span, body)
+            body.append(MirInstruction(form = InstructionForm.Raise(failure = parameters[0]), span = span))
+            self.emit_end(span, body)
+            results[len(results) - 1] = self.null_constant(span, body)
+        body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run(results)), span = span))
+
+    func interface_witness_function(conformance_index: i64, requirement_index: i64, signature: MirSignature, body: list[MirInstruction], span: SourceSpan) -> MirFunction:
+        return MirFunction(
+            name = ".luce_witness_c" + str(conformance_index) + "_r" + str(requirement_index),
+            convention = CallingConvention.luce,
+            signature = signature,
             registers = self.state.registers,
             slots = self.state.slots,
             body = body,
@@ -296,6 +374,7 @@ pub class FunctionLowerer:
             Slice(element): return true
             Class(identity): return true
             WeakClass(identity): return true
+            Interface(identity): return true
             Cell(element): return true
             Func(signature): return true
             Struct(fields):
@@ -340,6 +419,9 @@ pub class FunctionLowerer:
             WeakClass(identity):
                 if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
+            Interface(identity):
+                if retaining: body.append(MirInstruction(form = InstructionForm.InterfaceRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.InterfaceRelease(value = value), span = span))
             Cell(element):
                 if retaining: body.append(MirInstruction(form = InstructionForm.CellRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.CellRelease(value = value), span = span))
@@ -414,6 +496,10 @@ pub class FunctionLowerer:
                 let value = self.load_value(value_type, address, span, body)
                 if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
+            Interface(identity):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining: body.append(MirInstruction(form = InstructionForm.InterfaceRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.InterfaceRelease(value = value), span = span))
             Cell(element):
                 let value = self.load_value(value_type, address, span, body)
                 if retaining: body.append(MirInstruction(form = InstructionForm.CellRetain(value = value), span = span))
@@ -818,15 +904,18 @@ pub class FunctionLowerer:
                     return
                 let register = try self.lower_expression(module, function, value, body)
                 let returned = list[RegisterId]()
-                if self.state.result_slot >= 0:
-                    # The caller owns the result's memory; fill it and return nothing.
-                    let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
-                    self.initialize_owned_value(value_type, RegisterId(value = u32(self.state.result_slot)), register, span, body)
-                else:
-                    let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
-                    if self.type_needs_ownership(value_type) and not self.take_owned_value(register):
-                        self.emit_value_ownership(value_type, register, true, span, body)
-                    returned.append(register)
+                # `return effectful_unit_call()` carries no machine value.
+                # Every non-unit result still follows the ordinary direct or
+                # caller-owned aggregate result path below.
+                if register.value != no_register:
+                    if self.state.result_slot >= 0:
+                        let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                        self.initialize_owned_value(value_type, RegisterId(value = u32(self.state.result_slot)), register, span, body)
+                    else:
+                        let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                        if self.type_needs_ownership(value_type) and not self.take_owned_value(register):
+                            self.emit_value_ownership(value_type, register, true, span, body)
+                        returned.append(register)
                 try self.emit_deferred_from(module, function, 0, body)
                 if self.state.error_slot >= 0: returned.append(self.null_constant(span, body))
                 body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run(returned)), span = span))
@@ -1539,6 +1628,11 @@ pub class FunctionLowerer:
         # A call may produce `unit`, which has no machine type; every other
         # expression form has a scalar type or is refused below.
         match node_form(self.state.program, expression):
+            InterfaceValue(value, conformance): return try self.lower_interface_value(module, function, expression, value, conformance, body)
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                if self.state.fallible_inner(node_type(self.state.program, expression)) != none:
+                    try self.state.fail_unsupported(module, function, node_span(self.state.program, expression), "an unhandled fallible interface call")
+                return try self.lower_interface_call(module, function, expression, receiver, interface_type, requirement, arguments, body)
             Call(callee, arguments):
                 if self.state.fallible_inner(node_type(self.state.program, expression)) != none:
                     try self.state.fail_unsupported(module, function, node_span(self.state.program, expression), "an unhandled fallible call")
@@ -1602,6 +1696,109 @@ pub class FunctionLowerer:
             Try(value): return try self.lower_try(module, function, expression, value, body)
             Catch(value, failure, catch_body): return try self.lower_catch(module, function, expression, value, failure, catch_body, body)
             else: return try self.lower_typed_expression(module, function, expression, body)
+
+    # mark: Interface values ==================================================================
+
+    func lower_interface_value(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, conformance: u32, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let concrete = try self.lower_expression(module, function, value, body)
+        let concrete_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+        if self.type_needs_ownership(concrete_type):
+            # InterfaceCreate consumes the expression's concrete +1. Reads
+            # acquired that +1 in lower_expression; constructors already had it.
+            if not self.take_owned_value(concrete): trap("managed interface payload has no owned expression result")
+        var source = concrete
+        if not self.is_aggregate(concrete_type):
+            source = self.new_temp(concrete_type, span, body)
+            self.store_value(concrete_type, source, concrete, span, body)
+        let interface_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let result = self.state.new_register(interface_type)
+        body.append(MirInstruction(form = InstructionForm.InterfaceCreate(result = result, source = source, conformance = ConformanceId(value = conformance)), span = span))
+        return result
+
+    func lower_interface_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: u32, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let lowered_interface = try self.state.mir_type_of(module, function, span, interface_type)
+        let interface_id = self.interface_identity(lowered_interface)
+        let contract = self.state.interfaces[interface_id.value].requirements[requirement]
+        let operands = try self.lower_interface_operands(module, function, receiver, lowered_interface, contract.is_mutating, arguments, span, body)
+        let call_arguments = list[RegisterId]()
+        let results = list[RegisterId]()
+        let result_hir_type = node_type(self.state.program, expression)
+        var value = RegisterId(value = no_register)
+        if not types_match(result_hir_type, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.state.mir_type_of(module, function, span, result_hir_type)
+            if self.is_aggregate(result_type):
+                value = self.new_temp(result_type, span, body)
+                call_arguments.append(value)
+            else:
+                value = self.state.new_register(result_type)
+                results.append(value)
+        call_arguments.append(operands.payload)
+        for argument in operands.values: call_arguments.append(argument)
+        body.append(MirInstruction(form = InstructionForm.CallInterface(
+            results = self.state.operands.run(results),
+            interface_id = interface_id,
+            requirement = requirement,
+            target = operands.target,
+            arguments = self.state.operands.run(call_arguments),
+        ), span = span))
+        return value
+
+    func lower_fallible_interface_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: u32, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.state.program, expression)
+        let lowered_interface = try self.state.mir_type_of(module, function, span, interface_type)
+        let interface_id = self.interface_identity(lowered_interface)
+        let contract = self.state.interfaces[interface_id.value].requirements[requirement]
+        let operands = try self.lower_interface_operands(module, function, receiver, lowered_interface, contract.is_mutating, arguments, span, body)
+        let successful = self.state.fallible_inner(node_type(self.state.program, expression)) else trap("fallible interface call has an infallible result")
+        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let call_arguments = [self.new_temp(error_type, span, body)]
+        let results = list[RegisterId]()
+        var value = RegisterId(value = no_register)
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.state.mir_type_of(module, function, span, successful)
+            if self.is_aggregate(result_type):
+                value = self.new_temp(result_type, span, body)
+                call_arguments.append(value)
+            else:
+                value = self.state.new_register(result_type)
+                results.append(value)
+        call_arguments.append(operands.payload)
+        for argument in operands.values: call_arguments.append(argument)
+        let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        results.append(reported_error)
+        body.append(MirInstruction(form = InstructionForm.CallInterface(
+            results = self.state.operands.run(results),
+            interface_id = interface_id,
+            requirement = requirement,
+            target = operands.target,
+            arguments = self.state.operands.run(call_arguments),
+        ), span = span))
+        return FallibleResult(value = value, error_value = reported_error)
+
+    func lower_interface_operands(module: HirModule, function: HirFunction, receiver: NodeId, interface_type: TypeId, is_mutating: bool, arguments: Operands, span: SourceSpan, body: list[MirInstruction]) -> InterfaceOperands!:
+        var target = RegisterId(value = no_register)
+        var place = RegisterId(value = no_register)
+        if is_mutating: place = try self.lower_mutable_place_address(module, function, receiver, body)
+        else: target = try self.lower_expression(module, function, receiver, body)
+        let values = list[RegisterId]()
+        for position in range(0, i64(arguments.count)):
+            values.append(try self.lower_expression(module, function, node_at(self.state.program, arguments, position), body))
+        if is_mutating:
+            target = self.load_value(interface_type, place, span, body)
+            let detached = self.state.new_register(interface_type)
+            body.append(MirInstruction(form = InstructionForm.InterfaceDetach(result = detached, value = target), span = span))
+            self.store_value(interface_type, place, detached, span, body)
+            target = detached
+        let payload = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.InterfacePayload(result = payload, value = target), span = span))
+        return InterfaceOperands(target = target, payload = payload, values = values)
+
+    func interface_identity(value_type: TypeId) -> InterfaceId:
+        match mir_type(self.state.types, value_type):
+            Interface(identity): return identity
+            else: trap("dynamic HIR call has no MIR interface type")
 
     # mark: Runtime-backed collections =========================================================
 
@@ -2258,6 +2455,7 @@ pub class FunctionLowerer:
     func lower_fallible_expression(module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> FallibleResult!:
         let span = node_span(self.state.program, expression)
         match node_form(self.state.program, expression):
+            InterfaceCall(receiver, interface_type, requirement, arguments): return try self.lower_fallible_interface_call(module, function, expression, receiver, interface_type, requirement, arguments, body)
             Call(callee, arguments): return try self.lower_fallible_call(module, function, expression, callee, arguments, body)
             IndirectCall(callee, arguments): return try self.lower_fallible_indirect_call(module, function, expression, callee, arguments, body)
             Initialize(callee, arguments): return try self.lower_fallible_initializer(module, function, expression, callee, arguments, body)
