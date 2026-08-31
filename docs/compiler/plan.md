@@ -415,10 +415,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `remove_at`, clear, reserve, aggregate elements, growth, and immutable list
   snapshot slicing now execute
   through HIR, canonical MIR, and QBE (`done.md` §2). Shallow `copy` with
-  independent collection storage is complete too. Finish list
+  independent collection storage and shallow `+` concatenation are complete
+  too. Finish list
   iteration-invalidation traps and ARC/reclamation, then maps, sets,
   strings/bytes builders, ownership-retaining bytes slices, and formatted
-  strings. Do not implement bytes slicing only for static literals: §12.6
+  strings. Structural list equality also waits for a cycle-aware comparison
+  context: recursive value/list graphs are already constructible, so an
+  acyclic inline element loop would be an incorrect partial implementation.
+  Do not implement bytes slicing only for static literals: §12.6
   requires every escaping safe slice to retain hidden ownership. Do not
   promote the broad §12 row until every operation has its own conformance
   evidence.

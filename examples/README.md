@@ -48,8 +48,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   shared identity through aliases, `let` fields, and `is`/`is not`, checked
   indexed mutation,
   typed list parameters/results, mutating aggregate elements, insertion,
-  removal, clearing, reservation, shallow independent copying, O(1) immutable
-  snapshot slicing, evaluation order, and geometric growth through the HIR
+  removal, clearing, reservation, shallow independent copying and `+`
+  concatenation, O(1) immutable snapshot slicing, evaluation order, and
+  geometric growth through the HIR
   and MIR oracles and a real native QBE artifact. Iteration invalidation, ARC,
   and reclamation remain explicit later list slices.
 - `native_interop.native.luc` is the focused parser-conformance example for
