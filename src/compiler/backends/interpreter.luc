@@ -687,53 +687,85 @@ class HirInterpreterRun:
                         Raised(error_value): return Execution.Raised(error_value = error_value)
                         Recovered(value): return Execution.Recovered(value = value)
             ForStatement(symbol, iterable, body):
-                let evaluated = try self.evaluate(iterable, bindings)
-                var ranged = Value.Unit
-                match evaluated:
-                    Evaluated(item): ranged = item
-                    Transferred(execution): return execution
-                var lower = 0
-                var upper = 0
-                var inclusive = false
-                match ranged:
-                    Record(fields):
-                        if len(fields) != 3: trap("typed range has the wrong field count")
-                        match fields[0].value:
-                            Integer(value): lower = value
-                            else: trap("typed range lower bound is not an integer")
-                        match fields[1].value:
-                            Integer(value): upper = value
-                            else: trap("typed range upper bound is not an integer")
-                        match fields[2].value:
-                            Boolean(value): inclusive = value
-                            else: trap("typed range boundary flag is not boolean")
-                    else: trap("typed `for` received a non-range value")
-                let range_type = node_type(self.program, iterable)
-                var element_type = range_type
-                match self.program.types.definitions[range_type.value].form:
-                    Range(element): element_type = element
-                    else: trap("typed `for` range has a non-range type")
-                let outer_count = len(bindings)
-                var current = lower
-                while current < upper or (inclusive and current == upper):
-                    bindings.append(Binding(symbol = symbol, value = Value.Integer(value = current)))
-                    let outcome = try self.execute_scope(body, bindings)
-                    trim_bindings(bindings, outer_count)
-                    match outcome:
-                        Broke: return Execution.Next
-                        Returned(value): return Execution.Returned(value = value)
-                        Raised(error_value): return Execution.Raised(error_value = error_value)
-                        Recovered(value): return Execution.Recovered(value = value)
-                        else: pass
-                    # Do not overflow when a closed range ends at the type's
-                    # maximum; the endpoint has already been delivered.
-                    if inclusive and current == upper: return Execution.Next
-                    match try checked_integer_result(try checked_add(current, 1), element_type, self.program.types):
-                        Integer(value): current = value
-                        else: trap("range increment produced a non-integer")
-                return Execution.Next
+                return try self.execute_for(symbol, iterable, body, bindings)
             Match(subject, arms, has_result): return try self.execute_match(subject, arms, bindings)
             else: trap("expression node executed as a statement")
+
+    # Execute one built-in iterable through the common resolved HIR loop.
+    # User-defined protocol dispatch will select the same element binding.
+    func execute_for(symbol: SymbolId, iterable: NodeId, body: Operands, bindings: list[Binding]) -> Execution!:
+        let evaluated = try self.evaluate(iterable, bindings)
+        var value = Value.Unit
+        match evaluated:
+            Evaluated(item): value = item
+            Transferred(execution): return execution
+        match self.program.types.definitions[node_type(self.program, iterable).value].form:
+            Range(element): return try self.execute_range_for(symbol, value, element, body, bindings)
+            List(element): return try self.execute_list_for(symbol, value, body, bindings)
+            else: trap("typed `for` received a non-iterable value")
+
+    func execute_range_for(symbol: SymbolId, ranged: Value, element_type: TypeId, body: Operands, bindings: list[Binding]) -> Execution!:
+        var lower = 0
+        var upper = 0
+        var inclusive = false
+        match ranged:
+            Record(fields):
+                if len(fields) != 3: trap("typed range has the wrong field count")
+                match fields[0].value:
+                    Integer(value): lower = value
+                    else: trap("typed range lower bound is not an integer")
+                match fields[1].value:
+                    Integer(value): upper = value
+                    else: trap("typed range upper bound is not an integer")
+                match fields[2].value:
+                    Boolean(value): inclusive = value
+                    else: trap("typed range boundary flag is not boolean")
+            else: trap("typed range iteration received a non-range value")
+        let outer_count = len(bindings)
+        var current = lower
+        while current < upper or (inclusive and current == upper):
+            bindings.append(Binding(symbol = symbol, value = Value.Integer(value = current)))
+            let outcome = try self.execute_scope(body, bindings)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return Execution.Next
+                Returned(value): return Execution.Returned(value = value)
+                Raised(error_value): return Execution.Raised(error_value = error_value)
+                Recovered(value): return Execution.Recovered(value = value)
+                else: pass
+            # Do not overflow when a closed range ends at the type's maximum;
+            # the endpoint has already been delivered.
+            if inclusive and current == upper: return Execution.Next
+            match try checked_integer_result(try checked_add(current, 1), element_type, self.program.types):
+                Integer(value): current = value
+                else: trap("range increment produced a non-integer")
+        return Execution.Next
+
+    func execute_list_for(symbol: SymbolId, iterated: Value, body: Operands, bindings: list[Binding]) -> Execution!:
+        let storage = require_list_storage(iterated)
+        storage.active_iterations += 1
+        let outer_count = len(bindings)
+        let length = len(storage.buffer.elements)
+        var index = 0
+        while index < length:
+            bindings.append(Binding(symbol = symbol, value = storage.buffer.elements[index].value))
+            let outcome = self.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                storage.active_iterations -= 1
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return self.finish_list_iteration(storage, Execution.Next)
+                Returned(value): return self.finish_list_iteration(storage, Execution.Returned(value = value))
+                Raised(error_value): return self.finish_list_iteration(storage, Execution.Raised(error_value = error_value))
+                Recovered(value): return self.finish_list_iteration(storage, Execution.Recovered(value = value))
+                else: pass
+            index += 1
+        return self.finish_list_iteration(storage, Execution.Next)
+
+    func finish_list_iteration(storage: ListStorage, outcome: Execution) -> Execution:
+        storage.active_iterations -= 1
+        return outcome
 
     func execute_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Execution!:
         let evaluated = try self.evaluate(subject, bindings)
@@ -931,6 +963,7 @@ class HirInterpreterRun:
                     EvaluatedList(storage):
                         match try self.evaluate(element, bindings):
                             Evaluated(item):
+                                try require_list_shape_mutable(storage)
                                 detach_list(storage)
                                 storage.buffer.elements.append(BoxedValue(value = item))
                                 return Evaluation.Evaluated(value = Value.Unit)
@@ -946,6 +979,7 @@ class HirInterpreterRun:
                                         match try self.evaluate(element, bindings):
                                             Evaluated(item):
                                                 if position < 0 or position > len(storage.buffer.elements): error("interpreter: index out of bounds")
+                                                try require_list_shape_mutable(storage)
                                                 detach_list(storage)
                                                 let rebuilt = list[BoxedValue]()
                                                 for current in range(0, len(storage.buffer.elements) + 1):
@@ -968,6 +1002,7 @@ class HirInterpreterRun:
                                 match index_value:
                                     Integer(position):
                                         if position < 0 or position >= len(storage.buffer.elements): error("interpreter: index out of bounds")
+                                        try require_list_shape_mutable(storage)
                                         let removed = storage.buffer.elements[position].value
                                         detach_list(storage)
                                         let rebuilt = list[BoxedValue]()
@@ -981,6 +1016,7 @@ class HirInterpreterRun:
             ListClear(value):
                 match try self.evaluate_list(value, bindings):
                     EvaluatedList(storage):
+                        try require_list_shape_mutable(storage)
                         storage.buffer = ListBuffer(list[BoxedValue]())
                         storage.has_snapshot = false
                         return Evaluation.Evaluated(value = Value.Unit)
@@ -1697,6 +1733,15 @@ func evaluate_list_binary(left: ListStorage, operation: BinaryOperation, right: 
             for element in right.buffer.elements: elements.append(element)
             return Value.List(storage = ListStorage(elements))
         else: trap("lists have no other binary operations in the current slice")
+
+func require_list_shape_mutable(storage: ListStorage) -> !:
+    if storage.active_iterations > 0:
+        error("interpreter: list structurally modified during active iteration")
+
+func require_list_storage(value: Value) -> ListStorage:
+    match value:
+        List(storage): return storage
+        else: trap("typed list iteration received a non-list value")
 
 # Tuples compare elementwise through `evaluate_binary`, so each element uses
 # its own family's equality; HirGenerator already made both sides one type.

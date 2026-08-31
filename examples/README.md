@@ -49,10 +49,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   indexed mutation,
   typed list parameters/results, mutating aggregate elements, insertion,
   removal, clearing, reservation, shallow independent copying and `+`
-  concatenation, O(1) immutable snapshot slicing, evaluation order, and
+  concatenation, O(1) immutable snapshot slicing, ordered iteration with
+  nested reads, alias-wide shape invalidation and cleanup across structured
+  exits, evaluation order, and
   geometric growth through the HIR
-  and MIR oracles and a real native QBE artifact. Iteration invalidation, ARC,
-  and reclamation remain explicit later list slices.
+  and MIR oracles and a real native QBE artifact. ARC and reclamation remain
+  explicit later list slices.
 - `native_interop.native.luc` is the focused parser-conformance example for
   raw `extern` types, blocking functions, output parameters, variables, and
   structs. Implemented boundary pieces have separate executable tests; the
@@ -71,7 +73,7 @@ artifacts are never imported.
 |---|---|---|
 | `hello` | entry arguments, strings, output | Intent represented by `hello.luc`; compiled on both artifact paths. |
 | `calc` | byte scanning, checked indexing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; native QBE execution green. |
-| `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` remains adopted as the fixed-array `stage0_sort.luc`; growable list storage now works, while list iteration/removal and the numeric library still block the original shape and `stats`. |
+| `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` remains adopted as the fixed-array `stage0_sort.luc`; growable lists, iteration, and removal now work, while the numeric library and remaining source/API differences still block the original shape and `stats`. |
 | `bf` | arrays, byte indexing, nested loops/match, wrapping cells, output construction | Adopted as allocation-free `stage0_brainfuck.luc`; the interpreter executes through every current product path, while general builders still wait for the runtime. |
 | `dice` | RNG, arrays/lists, formatted strings, files | Catalogued; waits for collections, formatting, and the standard runtime. |
 | `life` | two-dimensional arrays, terminal input/output, timing | Fixed-array storage is now covered; the full program still waits for terminal and timing host services. |

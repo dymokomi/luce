@@ -302,13 +302,24 @@ for Wasm and QBE.
 Lists follow the same separation without duplicating the element type on each
 instruction. A `List(T)` register is the semantic handle; `ListCreate`,
 `ListCopy`, `ListConcat`, `ListLength`, slot insertion/removal, reservation,
-clearing, and `ListElementAddress` derive `T` from that register. Operations
+clearing, iteration begin/end, and `ListElementAddress` derive `T` from that register. Operations
 that move or address elements ask the backend to pass its computed
 size/alignment to the exact composed runtime service. Bounds checking is part
 of canonical list indexing, insertion, and removal; private runtime functions
 perform only the unchecked storage operation after the backend guard.
 Capacity, header layout, concatenation allocation/copy policy, and geometric
 growth remain ordinary freestanding Luce runtime policy.
+
+`ListIterationBegin` registers one active traversal on the semantic list
+identity and returns the element count captured at entry. The lowerer emits a
+matching `ListIterationEnd` through its lexical cleanup stack on return/error
+transfer, while exhaustion and `break` converge on one common end; `continue`
+does not end traversal. Append, insert, removal, and clear consult the exact
+`list_iteration_active` runtime service at each backend boundary and trap
+before calling the unchecked shape mutator. Element replacement and reserve
+remain valid, so the loop requests the current element address on every pass
+instead of retaining a relocated storage pointer. The active depth is
+semantic shared-identity state; its concrete header field is runtime-private.
 
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
@@ -703,6 +714,8 @@ ListCreate()                            -> r: List(T)    T is the result-registe
 ListCopy(value: List(T))                -> r: List(T)    shallow, independent storage
 ListConcat(left: List(T), right: List(T)) -> r: List(T)  fresh shallow ordered result
 ListLength(value: List(T))              -> r: u64
+ListIterationBegin(value: List(T))      -> r: u64       enter traversal and capture length
+ListIterationEnd(value: List(T))                       leave one traversal depth
 ListAppendSlot(value: List(T))          -> r: Ptr       uninitialized typed slot
 ListInsertSlot(value: List(T), index: u64) -> r: Ptr    checked uninitialized slot
 ListRemoveAt(value: List(T), index: u64)                 checked shape mutation
@@ -786,6 +799,8 @@ ListCreate() -> List(T)                      typed semantic handle
 ListCopy(List(T)) -> List(T)                 backend supplies size/alignment
 ListConcat(List(T), List(T)) -> List(T)       backend supplies size/alignment
 ListLength(List(T)) -> u64
+ListIterationBegin(List(T)) -> u64             enter and capture length
+ListIterationEnd(List(T))                    leave one traversal depth
 ListAppendSlot(List(T)) -> Ptr               backend supplies size/alignment
 ListInsertSlot(List(T), u64) -> Ptr           backend checks index <= length
 ListRemoveAt(List(T), u64)                    backend checks index < length
@@ -796,6 +811,7 @@ ListMutableElementAddress(List(T), u64) -> Ptr backend checks bounds, supplies s
 ListSlice(List(T), u64, u64) -> Slice(T)      backend checks start <= end <= length and supplies size
 SliceLength(Slice(T)) -> u64
 SliceElementAddress(Slice(T), u64) -> Ptr     backend checks bounds and supplies size
+list_iteration_active(List(T)) -> bool        backend guards every shape mutation
 luce_rt_retain(Ptr)                         luce_rt_release(Ptr)
 luce_rt_weak_make(Ptr) -> Ptr            luce_rt_weak_get(Ptr) -> Ptr
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)

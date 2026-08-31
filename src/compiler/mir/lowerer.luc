@@ -180,6 +180,13 @@ struct ExternalGlobalContract:
     let name: str
     let value_type: ir.TypeId
 
+# Source `defer` statements and semantic compiler cleanups share one lexical
+# LIFO. The latter are explicit canonical MIR actions rather than synthetic
+# HIR nodes, so HIR remains an exact representation of the source program.
+union DeferredAction:
+    Source(statement: NodeId)
+    ListIteration(value: RegisterId, span: SourceSpan)
+
 let unlowered_nominal_type: u32 = 4294967295
 
 ## Turns one semantically analyzed typed-HIR program into canonical MIR.
@@ -211,7 +218,7 @@ pub class Lowerer:
     var regions: list[Region]
     # Deferred actions currently registered in enclosing lexical scopes, and
     # the first action belonging to each active source loop.
-    var defers: list[NodeId]
+    var defers: list[DeferredAction]
     var loop_defer_starts: list[i64]
     var recover_targets: list[RecoverTarget]
     # The operand table of the function being lowered.
@@ -245,7 +252,7 @@ pub class Lowerer:
         self.locals = list[Local]()
         self.parameters = list[Local]()
         self.regions = list[Region]()
-        self.defers = list[NodeId]()
+        self.defers = list[DeferredAction]()
         self.loop_defer_starts = list[i64]()
         self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
@@ -537,7 +544,7 @@ pub class Lowerer:
         self.locals = list[Local]()
         self.parameters = list[Local]()
         self.regions = list[Region]()
-        self.defers = list[NodeId]()
+        self.defers = list[DeferredAction]()
         self.loop_defer_starts = list[i64]()
         self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
@@ -814,7 +821,7 @@ pub class Lowerer:
                 let depth = len(self.regions) - 1 - target.region_index
                 body.append(MirInstruction(form = InstructionForm.Br(depth = depth, values = self.operands.run(values)), span = span))
             DeferStatement(action):
-                self.defers.append(action)
+                self.defers.append(DeferredAction.Source(statement = action))
             Binding(symbol, is_mutable, value):
                 let local = try self.local_of(module, function, span, symbol)
                 let register = try self.lower_expression(module, function, value, body)
@@ -983,12 +990,21 @@ pub class Lowerer:
         self.emit_end(span, body)
         self.emit_end(span, body)
 
+    # Built-in iterables retain one resolved HIR shape and select only their
+    # semantic canonical MIR operation here. No backend or target fact enters
+    # this dispatch.
+    func lower_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+        match self.program.types.definitions[node_type(self.program, iterable).value].form:
+            Range(element): try self.lower_range_for(module, function, span, symbol, iterable, statements, body)
+            List(element): try self.lower_list_for(module, function, span, symbol, iterable, element, statements, body)
+            else: try self.fail_unsupported(module, function, span, "a non-iterable `for` value")
+
     # A range loop uses its immutable iteration binding as the private
     # counter slot. The extra inner block is the `continue` target: leaving
     # it reaches the increment, while `break` crosses it, the loop, and lands
     # at the outer block. The endpoint test before increment keeps a closed
     # range ending at the integer maximum from overflowing.
-    func lower_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+    func lower_range_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
         let ranged = try self.lower_expression(module, function, iterable, body)
         let range_type = try self.mir_type_of(module, function, span, node_type(self.program, iterable))
         var element_hir_type = node_type(self.program, iterable)
@@ -1048,6 +1064,60 @@ pub class Lowerer:
         self.emit_end(span, body)
         self.emit_end(span, body)
 
+    # Enter traversal once, retain its captured length, and address the
+    # current slot through the list identity on every pass. `reserve` may
+    # relocate storage during iteration, so caching a backend address here
+    # would be both incorrect and a violation of canonical MIR's boundary.
+    # The generated cleanup stays below body defers: `continue` skips it,
+    # `break` reaches the common post-block copy, and function exits emit it
+    # through the ordinary lexical cleanup stack.
+    func lower_list_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, element_hir_type: ir.TypeId, statements: Operands, body: list[MirInstruction]) -> !:
+        let list_value = try self.lower_expression(module, function, iterable, body)
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let element_type = try self.mir_type_of(module, function, span, element_hir_type)
+        let length = self.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.ListIterationBegin(result = length, value = list_value), span = span))
+
+        let cleanup_start = len(self.defers)
+        self.defers.append(DeferredAction.ListIteration(value = list_value, span = span))
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        self.regions.append(Region.block)
+        self.regions.append(Region.loop_body)
+
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+
+        let element_address = self.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = element_address, value = list_value, index = index), span = span))
+        let element = self.load_value(element_type, element_address, span, body)
+        let binding = (try self.local_of(module, function, span, symbol)).address
+        self.store_value(element_type, binding, element, span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        self.regions.append(Region.for_continue)
+        try self.lower_loop_scope(module, function, statements, body)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_end(span, body)
+
+        let next = self.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+
+        self.regions.remove(len(self.regions) - 1)
+        self.regions.remove(len(self.regions) - 1)
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+        try self.emit_deferred_from(module, function, cleanup_start, body)
+        while len(self.defers) > cleanup_start: self.defers.remove(len(self.defers) - 1)
+
     # Lower statements inside one new region.
     func lower_region(module: HirModule, function: HirFunction, region: Region, statements: Operands, body: list[MirInstruction]) -> !:
         self.regions.append(region)
@@ -1076,7 +1146,9 @@ pub class Lowerer:
     func emit_deferred_from(module: HirModule, function: HirFunction, start: i64, body: list[MirInstruction]) -> !:
         var index = len(self.defers) - 1
         while index >= start:
-            try self.lower_statement(module, function, self.defers[index], body)
+            match self.defers[index]:
+                Source(statement): try self.lower_statement(module, function, statement, body)
+                ListIteration(value, span): body.append(MirInstruction(form = InstructionForm.ListIterationEnd(value = value), span = span))
             index -= 1
 
     func emit_loop_deferred(module: HirModule, function: HirFunction, span: SourceSpan, body: list[MirInstruction]) -> !:

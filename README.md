@@ -103,7 +103,8 @@ examples and tests link back here rather than restating it.
   value arrays with contextual literals, structural equality, copies,
   checked indexing and nested mutable places, plus runtime-backed list
   literals, identity, checked access and shape mutation, aggregate elements,
-  growth, shallow copies, immutable snapshot slices, and collection-recursive
+  growth, shallow copies, immutable snapshot slices, ordered list iteration
+  with alias-wide shape-mutation invalidation, and collection-recursive
   value shapes on the QBE path, direct
   scalar C imports/exports and variables with nominal integer and pointer
   handles (including boundary-only null translation), ordered `out` results,
