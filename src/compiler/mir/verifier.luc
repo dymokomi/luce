@@ -92,6 +92,7 @@ pub class MirVerifier:
     pub func verify() -> !:
         try self.verify_types()
         try self.verify_classes()
+        try self.verify_closures()
         try self.verify_runtime_bindings()
         for external in self.program.externs:
             try self.verify_extern(external)
@@ -233,6 +234,7 @@ pub class MirVerifier:
                 WeakClass(identity):
                     if i64(identity.value) >= len(self.program.classes):
                         try self.fail_program("type " + str(index) + " names class " + str(identity.value) + ", which does not exist")
+                Cell(element): try self.require_type_id(element, "cell type " + str(index) + " element")
                 Func(signature):
                     try self.verify_signature_types(signature, "function type " + str(index))
                 else: pass
@@ -273,6 +275,39 @@ pub class MirVerifier:
                 else: pass
         if found < 0: try self.fail_program("class " + str(class_index) + " has no strong MIR type")
         return TypeId(value = u32(found))
+
+    ## Closure metadata is the complete target-neutral calling and payload
+    ## contract. A hidden body differs from its public function signature only
+    ## by the opaque environment parameter; its destroyer owns that payload.
+    func verify_closures() -> !:
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        for closure_index in range(0, len(self.program.closures)):
+            let closure = self.program.closures[closure_index]
+            try self.verify_signature_types(closure.signature, "closure " + str(closure_index) + " signature")
+            for capture_index in range(0, len(closure.captures)):
+                try self.require_type_id(closure.captures[capture_index].value_type, "closure " + str(closure_index) + " capture " + str(capture_index))
+            if i64(closure.function.value) >= len(self.program.functions):
+                try self.fail_program("closure " + str(closure_index) + " names function " + str(closure.function.value) + ", which does not exist")
+            let target = self.program.functions[closure.function.value]
+            if target.convention != CallingConvention.luce or target.is_public or target.is_exported:
+                try self.fail_program("closure " + str(closure_index) + " must name a private Luce function")
+            let parameters = list[TypeId]()
+            for parameter in closure.signature.parameters: parameters.append(parameter)
+            var environment_index: i64 = 0
+            if closure.signature.is_fallible: environment_index = 1
+            parameters.insert(environment_index, pointer)
+            let expected_target = MirSignature(parameters = parameters, results = closure.signature.results, is_fallible = closure.signature.is_fallible)
+            if not signatures_match(target.signature, expected_target):
+                try self.fail_program("closure " + str(closure_index) + " body has signature " + describe_signature(self.program.types, target.signature) + ", expected " + describe_signature(self.program.types, expected_target))
+            if i64(closure.destroyer.value) >= len(self.program.functions):
+                try self.fail_program("closure " + str(closure_index) + " destroyer names function " + str(closure.destroyer.value) + ", which does not exist")
+            let destroyer = self.program.functions[closure.destroyer.value]
+            if destroyer.convention != CallingConvention.luce or destroyer.is_public or destroyer.is_exported:
+                try self.fail_program("closure " + str(closure_index) + " destroyer must name a private Luce function")
+            let expected_destroyer = MirSignature(parameters = [pointer, boolean], results = list[TypeId](), is_fallible = false)
+            if not signatures_match(destroyer.signature, expected_destroyer):
+                try self.fail_program("closure " + str(closure_index) + " destroyer has signature " + describe_signature(self.program.types, destroyer.signature) + ", expected " + describe_signature(self.program.types, expected_destroyer))
 
     func verify_type_is_well_founded(id: TypeId, states: list[i64]) -> !:
         if states[id.value] == 2: return
@@ -339,12 +374,19 @@ pub class MirVerifier:
         if (item.align & (item.align - 1)) != 0:
             try self.fail_program("data `" + item.name + "` has non-power-of-two alignment " + str(item.align))
 
-    # A canonical name identifies one function in the whole program.
+    # Only functions whose spelling survives into an artifact inhabit a name
+    # namespace. Private Luce definitions are addressed exclusively by their
+    # FunctionId; independently lowered packages may legitimately synthesize
+    # the same diagnostic name for structurally identical ownership helpers.
     func verify_unique_function_names() -> !:
         for index in range(0, len(self.program.functions)):
             let function = self.program.functions[index]
+            let has_artifact_name = function.is_public or function.is_exported or function.convention == CallingConvention.c
+            if not has_artifact_name: continue
             for previous in range(0, index):
-                if self.program.functions[previous].name == function.name:
+                let other = self.program.functions[previous]
+                let other_has_artifact_name = other.is_public or other.is_exported or other.convention == CallingConvention.c
+                if other_has_artifact_name and other.name == function.name:
                     try self.fail_program("duplicate function `" + function.name + "`")
 
     # C functions and objects inhabit one external symbol namespace.
@@ -781,6 +823,50 @@ pub class MirVerifier:
                     else: try self.fail_at(instruction, "`WeakClassPromote` needs an optional enum type")
                 if find_runtime_binding(self.program, RuntimeService.weak_class_promote) == none:
                     try self.fail_at(instruction, "`WeakClassPromote` requires the `weak_class_promote` runtime binding")
+            CellCreate(result, element_type, destroyer):
+                try self.require_type_id(element_type, "`CellCreate` element type")
+                let result_type = try self.result_type(result, defined)
+                match mir_type(types, result_type):
+                    Cell(element): try self.require_same(instruction, element, element_type, "`CellCreate` element")
+                    else: try self.fail_at(instruction, "`CellCreate` result must be a cell")
+                if i64(destroyer.value) >= len(self.program.functions): try self.fail_at(instruction, "`CellCreate` names a missing destroyer")
+                let destroyer_function = self.program.functions[destroyer.value]
+                let expected_destroyer = MirSignature(parameters = [result_type, builtin_mir_type(BuiltinMirType.boolean)], results = list[TypeId](), is_fallible = false)
+                if destroyer_function.convention != CallingConvention.luce or destroyer_function.is_public or destroyer_function.is_exported or not signatures_match(destroyer_function.signature, expected_destroyer):
+                    try self.fail_at(instruction, "`CellCreate` destroyer does not match its cell type")
+                if find_runtime_binding(self.program, RuntimeService.class_create) == none:
+                    try self.fail_at(instruction, "`CellCreate` requires the `class_create` runtime binding")
+                self.define(result, defined)
+            CellMarkInitialized(value):
+                let value_type = try self.operand_type(instruction, value, defined)
+                match mir_type(types, value_type):
+                    Cell(element): pass
+                    else: try self.fail_at(instruction, "cell ownership operation needs a cell value")
+                if find_runtime_binding(self.program, RuntimeService.class_mark_initialized) == none:
+                    try self.fail_at(instruction, "`CellMarkInitialized` requires the `class_mark_initialized` runtime binding")
+            CellRetain(value):
+                let value_type = try self.operand_type(instruction, value, defined)
+                match mir_type(types, value_type):
+                    Cell(element): pass
+                    else: try self.fail_at(instruction, "cell ownership operation needs a cell value")
+                if find_runtime_binding(self.program, RuntimeService.class_retain) == none:
+                    try self.fail_at(instruction, "`CellRetain` requires the `class_retain` runtime binding")
+            CellRelease(value):
+                let value_type = try self.operand_type(instruction, value, defined)
+                match mir_type(types, value_type):
+                    Cell(element): pass
+                    else: try self.fail_at(instruction, "cell ownership operation needs a cell value")
+                if find_runtime_binding(self.program, RuntimeService.class_release) == none:
+                    try self.fail_at(instruction, "`CellRelease` requires the `class_release` runtime binding")
+            CellValueAddress(result, value, element_type):
+                let value_type = try self.operand_type(instruction, value, defined)
+                match mir_type(types, value_type):
+                    Cell(element): try self.require_same(instruction, element, element_type, "`CellValueAddress` element")
+                    else: try self.fail_at(instruction, "`CellValueAddress` needs a cell value")
+                try self.require_ptr_result(instruction, result, defined, "`CellValueAddress`")
+                if find_runtime_binding(self.program, RuntimeService.class_payload) == none:
+                    try self.fail_at(instruction, "`CellValueAddress` requires the `class_payload` runtime binding")
+                self.define(result, defined)
             Load(result, value_type, address):
                 try self.require_type_id(value_type, "`Load`")
                 try self.require_ptr_operand(instruction, address, defined, "`Load` address")
@@ -854,6 +940,46 @@ pub class MirVerifier:
                 if self.program.externs[target.value].convention != CallingConvention.c: try self.fail_at(instruction, "`ExternAddress` requires a C-convention extern")
                 try self.require_ptr_result(instruction, result, defined, "`ExternAddress`")
                 self.define(result, defined)
+            FunctionNull(destination, function_type):
+                try self.require_ptr_operand(instruction, destination, defined, "`FunctionNull` destination")
+                discard(try self.require_function_type(instruction, function_type, "`FunctionNull` type"))
+            FunctionValue(destination, function_type, target):
+                try self.require_ptr_operand(instruction, destination, defined, "`FunctionValue` destination")
+                let signature = try self.require_function_type(instruction, function_type, "`FunctionValue` type")
+                if i64(target.value) >= len(self.program.functions): try self.fail_at(instruction, "`FunctionValue` names a missing function")
+                let target_function = self.program.functions[target.value]
+                if target_function.convention != CallingConvention.luce or not signatures_match(target_function.signature, signature):
+                    try self.fail_at(instruction, "`FunctionValue` target has signature " + describe_signature(types, target_function.signature) + ", expected " + describe_signature(types, signature))
+            ClosureCreate(environment, destination, function_type, closure):
+                try self.require_ptr_operand(instruction, destination, defined, "`ClosureCreate` destination")
+                let signature = try self.require_function_type(instruction, function_type, "`ClosureCreate` type")
+                if i64(closure.value) >= len(self.program.closures): try self.fail_at(instruction, "`ClosureCreate` names a missing closure")
+                elif not signatures_match(self.program.closures[closure.value].signature, signature):
+                    try self.fail_at(instruction, "`ClosureCreate` metadata has signature " + describe_signature(types, self.program.closures[closure.value].signature) + ", expected " + describe_signature(types, signature))
+                try self.require_ptr_result(instruction, environment, defined, "`ClosureCreate` environment")
+                if find_runtime_binding(self.program, RuntimeService.class_create) == none:
+                    try self.fail_at(instruction, "`ClosureCreate` requires the `class_create` runtime binding")
+                self.define(environment, defined)
+            ClosureMarkInitialized(environment):
+                try self.require_ptr_operand(instruction, environment, defined, "`ClosureMarkInitialized` environment")
+                if find_runtime_binding(self.program, RuntimeService.class_mark_initialized) == none:
+                    try self.fail_at(instruction, "`ClosureMarkInitialized` requires the `class_mark_initialized` runtime binding")
+            ClosureCaptureAddress(result, environment, closure, capture):
+                try self.require_ptr_operand(instruction, environment, defined, "`ClosureCaptureAddress` environment")
+                if i64(closure.value) >= len(self.program.closures): try self.fail_at(instruction, "`ClosureCaptureAddress` names a missing closure")
+                elif capture < 0 or capture >= len(self.program.closures[closure.value].captures): try self.fail_at(instruction, "`ClosureCaptureAddress` names a missing capture")
+                try self.require_ptr_result(instruction, result, defined, "`ClosureCaptureAddress`")
+                if find_runtime_binding(self.program, RuntimeService.class_payload) == none:
+                    try self.fail_at(instruction, "`ClosureCaptureAddress` requires the `class_payload` runtime binding")
+                self.define(result, defined)
+            FunctionRetain(value):
+                try self.require_ptr_operand(instruction, value, defined, "function ownership value")
+                if find_runtime_binding(self.program, RuntimeService.class_retain) == none:
+                    try self.fail_at(instruction, "`FunctionRetain` requires the `class_retain` runtime binding")
+            FunctionRelease(value):
+                try self.require_ptr_operand(instruction, value, defined, "function ownership value")
+                if find_runtime_binding(self.program, RuntimeService.class_release) == none:
+                    try self.fail_at(instruction, "`FunctionRelease` requires the `class_release` runtime binding")
             Call(results, target, arguments):
                 if i64(target.value) >= len(self.program.functions): try self.fail_at(instruction, "`Call` names function " + str(target.value) + ", which does not exist")
                 try self.verify_call(instruction, self.program.functions[target.value].signature, registers_of(function, results), registers_of(function, arguments), defined)
@@ -870,6 +996,10 @@ pub class MirVerifier:
                     for result in signature.results:
                         if not self.is_c_representable(result): try self.fail_at(instruction, "C-convention `CallIndirect` returns `" + describe_mir_type(self.program.types, result) + "` across the C boundary")
                 try self.require_ptr_operand(instruction, target, defined, "`CallIndirect` target")
+                try self.verify_call(instruction, signature, registers_of(function, results), registers_of(function, arguments), defined)
+            CallClosure(results, signature, target, arguments):
+                try self.verify_signature_types(signature, "`CallClosure` signature")
+                try self.require_ptr_operand(instruction, target, defined, "`CallClosure` target")
                 try self.verify_call(instruction, signature, registers_of(function, results), registers_of(function, arguments), defined)
             Block(results):
                 let result_types = try self.region_result_types(instruction, registers_of(function, results), defined)
@@ -1061,6 +1191,12 @@ pub class MirVerifier:
         if not is_ptr_type(self.program.types, found):
             try self.fail_at(instruction, what + " result must be `ptr`, found `" + describe_mir_type(self.program.types, found) + "`")
 
+    func require_function_type(instruction: MirInstruction, id: TypeId, what: str) -> MirSignature!:
+        try self.require_type_id(id, what)
+        match mir_type(self.program.types, id):
+            Func(signature): return signature
+            else: error("MIR verifier: `" + self.function_name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + what + " must be `func`, found `" + describe_mir_type(self.program.types, id) + "`")
+
     func require_buffer_owner_operand(instruction: MirInstruction, register: RegisterId, defined: list[bool], what: str) -> !:
         let found = try self.operand_type(instruction, register, defined)
         match mir_type(self.program.types, found):
@@ -1146,6 +1282,7 @@ pub class MirVerifier:
             Struct(fields): try self.fail_at(instruction, what + " of a struct; aggregates move with `Memcpy`")
             Array(element, count): try self.fail_at(instruction, what + " of an array; aggregates move with `Memcpy`")
             Enum(tag, cases): try self.fail_at(instruction, what + " of an enum; aggregates move with `Memcpy`")
+            Func(signature): try self.fail_at(instruction, what + " of a function descriptor; aggregates move with `Memcpy`")
             else: return
 
     func require_type_id(id: TypeId, what: str) -> !:

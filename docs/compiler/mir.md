@@ -417,9 +417,11 @@ things MIR already has.
 
 - **Generics** are monomorphized (§15): each use with concrete types becomes
   its own plain function.
-- **Closures** become a struct holding the captures plus an ordinary
-  function whose first parameter is that struct. A captured `var` is a
-  runtime cell shared by reference (§14.1).
+- **Closure syntax and capture resolution** are gone, but their semantic
+  contract remains explicit. `MirClosure` names a hidden body, source-visible
+  signature, typed capture schema, and destroyer. A captured `var` is a typed
+  ARC-managed `Cell(T)` shared by the enclosing scope and every closure
+  (§14.1). Backends alone choose descriptor and environment layout.
 - **Interface values** are a pair of pointers — the data and a *witness
   table*, a constant block of function pointers in requirement order
   (§16.3). Calling through an interface is loading a pointer from the table
@@ -771,20 +773,25 @@ separate hidden result-slot argument described above.
 Call(FunctionId, args)                       -> results
 CallExtern(ExternId, args)                   -> results
 CallIndirect(signature, convention, target, args) -> results
+CallClosure(signature, descriptor, args)          -> results
 ```
 
-An exact source `func(P...) -> R` is an opaque pointer-shaped value in
-canonical MIR; its type is carried by the `CallIndirect` operation, not
-recovered from its representation. `FunctionAddress` creates the token for a
-defined Luce function. QBE currently represents it as a code address, while
-Wasm represents it as a slot in an on-demand funcref table. A source `cfunc`
-uses the same opaque token and indirect operation, but the operation retains
-the C convention; `ExternAddress` names an exact imported C symbol, while a
-converted Luce definition's `FunctionAddress` names its generated C adapter.
-Table indices, code addresses and ABI placement are not HIR/MIR facts. A later
-closure slice may make an ordinary-function backend token refer to a
-managed code-and-environment descriptor without changing source type checking
-or introducing target layout before the backend boundary.
+An exact source `func(P...) -> R` is a canonical aggregate descriptor with a
+code identity and nullable managed environment. `FunctionNull`,
+`FunctionValue`, and `ClosureCreate` initialize caller-owned descriptor
+storage; all carry or reference the exact source-visible signature so the
+verifier can reject mismatched code before a backend. Capture-free values use
+a null environment and allocate nothing. `CallClosure` invokes the descriptor;
+the hidden environment parameter is inserted immediately after a fallible
+error slot, or first for an infallible call. Function retain/release operations
+own only the environment.
+
+A source `cfunc` remains an opaque raw callable token used by
+convention-bearing `CallIndirect`. `FunctionAddress` names a generated C
+adapter and `ExternAddress` names an imported C symbol. QBE chooses native
+addresses and two-word ordinary descriptors; Wasm chooses table indices and
+linear-memory descriptors. Those representations, table placement, code
+addresses, and ABI details never enter HIR or MIR.
 
 **Control flow** — a body is one flat instruction list; these open,
 separate, and close regions in that list:
@@ -854,6 +861,16 @@ ClassFieldAddress(Class(T), field) -> Ptr     backend supplies payload offset
 WeakClassCreate(Class(T)) -> WeakClass(T)
 WeakClassRetain(WeakClass(T)) / WeakClassRelease(WeakClass(T))
 WeakClassPromote(WeakClass(T), Class(T)?)     atomic owned optional result
+CellCreate(T, destroyer) -> Cell(T)           shared mutable capture storage
+CellMarkInitialized(Cell(T))
+CellRetain(Cell(T)) / CellRelease(Cell(T))
+CellValueAddress(Cell(T), T) -> Ptr
+FunctionNull(Ptr destination, Func(T))
+FunctionValue(Ptr destination, Func(T), FunctionId)
+ClosureCreate(Ptr destination, Func(T), ClosureId) -> Ptr environment
+ClosureMarkInitialized(Ptr environment)
+ClosureCaptureAddress(Ptr environment, ClosureId, capture) -> Ptr
+FunctionRetain(Ptr descriptor) / FunctionRelease(Ptr descriptor)
 list_iteration_active(List(T)) -> bool        backend guards every shape mutation
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
 luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
@@ -879,6 +896,10 @@ expressed by canonical control flow and the trap contract.
   defined on every path to the join;
 - every type identity exists and the layout-dependency graph has no by-value
   cycle; forward references through pointer-shaped handles are valid;
+- every closure body is private Luce code with exactly one hidden environment
+  parameter in the canonical position; every closure/cell destroyer has its
+  exact private lifecycle signature; descriptor initializers match their
+  canonical `Func` signature and capture accesses stay within their schema;
 - a fallible signature takes a `Ptr` as parameter 0 and returns a `Ptr` last;
   fallible calls pass the caller-owned error slot and define the reported
   error pointer; a fallible `Return` reports null and `Raise` returns r0;

@@ -128,7 +128,10 @@ a substitute for or prerequisite to this QBE-complete claim.
   There is no allocator symbol lookup and no target fact in MIR.
 - **Failure as data with explicit ownership**: a fallible function receives a caller-owned `Error` slot as hidden parameter 0 and returns `(value, null)` on success or `(absent, error_out)` on failure. `try` is a call plus one conditional branch; propagation copies into the current function's slot after active `defer`s; no allocation or unwinding.
 - **Semantics fixed in MIR**: `Add` means checked add; `floor_div`/`rem` are floor semantics; shifts trap on count, drop bits shifted out. Checks are removed only by proof, never by build mode.
-- **Not in MIR**: generics (monomorphized), closures (env struct + function), interfaces (data pointer + witness table), names.
+- **Not in MIR**: generics (monomorphized), interfaces (data pointer + witness
+  table), names. Closures do reach MIR as typed semantic descriptors and
+  environment metadata; only their physical code/environment layout belongs
+  to a backend.
 - **`Yield`** is the structured phi: a region that produces values names them on every exit.
 - **Narrow integers stay MIR types** (Prism `DType` and the C ABI need exact widths).
 - **Settled**: optionals, including `Class?`, remain uniform `u8`-tagged enums
@@ -341,14 +344,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   become statically typed HIR `FunctionAddress` values and calls through
   locals, constants, fields, parameters, results, conditionals and imported
   module members become `IndirectCall`. Labels/defaults remain declaration-call
-  facts; function-value calls are positional and exact. Canonical MIR uses its
-  existing opaque pointer-shaped call token plus the exact signature on
-  `CallIndirect`; QBE calls code addresses and Wasm adds a function table only
-  when either function-value instruction occurs. Both semantic oracles,
-  optimized MIR, Wasmtime, real QBE and `examples/function_values.luc` agree,
-  including aggregate/fallible protocols, defer capture and evaluation order.
-  This does **not** claim closures or the spec's infallible-to-fallible lift:
-  both need the managed environment/allocation contract below.
+  facts; function-value calls are positional and exact. The closure slice
+  generalized canonical MIR ordinary functions to typed code/environment
+  descriptors and `CallClosure`; capture-free names retain a null environment
+  and allocate nothing. QBE and Wasm alone choose descriptor/table layout.
+  Both semantic oracles, optimized MIR, Wasmtime, real QBE and
+  `examples/function_values.luc` agree, including aggregate/fallible named
+  protocols, defer capture and evaluation order. Infallible-to-fallible lift
+  remains separate work.
 - [x] **Exact named `cfunc` values and C-convention indirect calls**
   (2026-08-30): the contextual type is now a canonical HIR form, while calls
   reuse the same positional `IndirectCall` node as ordinary function values.
@@ -543,7 +546,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 - [ ] **Finish the remaining §11 class contract.** Add directly provable
   strong-cycle diagnostics, resource/reentrancy lints, and the remaining
   rule-by-rule negative matrix before promoting §11 from partial to complete.
-- [ ] **Closures.** *Gate: capture rule.*
+- [x] **Core managed closures** (2026-08-31). Expression and block closures,
+  capture-free elision, explicit value snapshots, default immutable captures,
+  shared mutable cells, nested escaping environments, and weak class captures
+  agree through HIR, canonical MIR, both semantic oracles, QBE, Wasm, and
+  `examples/closures.luc`. MIR retains only typed descriptor/environment
+  contracts; physical layout begins in each backend. *Gate passed: capture
+  rule.*
+- [ ] **Finish the remaining §14 closure contract.** Prove fallible closure
+  invocation, infallible-to-fallible function lifting, `weak self`, managed
+  closure values in fields and collections, direct strong-cycle diagnostics,
+  and the accidental shared-cell diagnostic. Sendability closes with workers.
 - [ ] **Interfaces** (data pointer + witness table) and **generics** (monomorphization, memoized per instantiation, with a budget). *Gate: const-generic grammar.*
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;

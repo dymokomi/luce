@@ -37,8 +37,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `function_values.luc` is an end-to-end exact-function-value example. Named
   function addresses, selection, aliases, fields, parameters/results and
   fallible calls execute through the semantic oracle and native QBE, and the
-  same canonical MIR builds as WebAssembly. Closure environments and the
-  infallible-to-fallible adapter remain a later managed-runtime slice.
+  same canonical MIR builds as WebAssembly.
+- `closures.luc` proves capture-free and managed anonymous functions,
+  explicit value snapshots, shared mutable capture cells, nested escaping
+  environments, and weak class captures through both semantic oracles, Wasm,
+  and native QBE. The remaining §14 diagnostic/lifting matrix stays explicit
+  in the compiler plan.
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the

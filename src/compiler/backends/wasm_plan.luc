@@ -12,8 +12,8 @@
 #==============================================================================================
 
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
-from compiler.mir.canonical import CallingConvention, InstructionForm, MirProgram, MirSignature, MirTypeTable, TypeId
-from compiler.mir.canonical import describe_mir_type, mir_type
+from compiler.mir.canonical import BuiltinMirType, CallingConvention, InstructionForm, MirProgram, MirSignature, MirTypeTable, TypeId
+from compiler.mir.canonical import builtin_mir_type, describe_mir_type, mir_type
 
 # mark: WebAssembly policy ===================================================================
 
@@ -68,6 +68,9 @@ pub struct ModulePlan:
     pub let function_types: list[i64]
     ## Wasm function indices of only the C imports whose addresses are used.
     pub let table_imports: list[i64]
+    ## Static `{table slot, null environment}` values passed to source-runtime
+    ## callbacks. `-1` means the function is never used in that role.
+    pub let function_descriptor_offsets: list[i64]
     pub let data_offsets: list[i64]
     pub let global_offsets: list[i64]
     ## First aligned byte past static data: the shadow stack's lower bound.
@@ -135,6 +138,8 @@ pub func plan_module(program: MirProgram) -> ModulePlan!:
     var has_stack = false
     var has_function_table = false
     var allocates_storage = false
+    let descriptor_marks = list[bool]()
+    for function in program.functions: descriptor_marks.append(false)
     for function in program.functions:
         function_types.append(intern_signature(signatures, try wasm_signature(program.types, function.signature)))
         if len(function.slots) > 0: has_stack = true
@@ -143,6 +148,7 @@ pub func plan_module(program: MirProgram) -> ModulePlan!:
                 AllocateStorage(result, element_type, count): allocates_storage = true
                 DeallocateStorage(address, element_type, count): allocates_storage = true
                 FunctionAddress(result, target): has_function_table = true
+                FunctionValue(destination, function_type, target): has_function_table = true
                 ExternAddress(result, target):
                     has_function_table = true
                     let import_index = external_imports[target.value]
@@ -151,21 +157,67 @@ pub func plan_module(program: MirProgram) -> ModulePlan!:
                 CallIndirect(results, signature, convention, target, arguments):
                     has_function_table = true
                     discard(intern_signature(signatures, try wasm_signature(program.types, signature)))
-                ListRelease(value, element_release): has_function_table = true
-                ListCopy(result, value, element_retain): has_function_table = true
-                ListConcat(result, left, right, element_retain): has_function_table = true
-                ListAppendSlot(result, value, element_retain): has_function_table = true
-                ListInsertSlot(result, value, index, element_retain): has_function_table = true
-                ListRemoveAt(value, index, element_retain): has_function_table = true
-                ListClear(value, element_release): has_function_table = true
-                ListReserve(value, minimum_capacity, element_retain): has_function_table = true
-                ListMutableElementAddress(result, value, index, element_retain): has_function_table = true
-                SliceRelease(value, element_release): has_function_table = true
-                ClassCreate(result, identity): has_function_table = true
+                CallClosure(results, signature, target, arguments):
+                    has_function_table = true
+                    discard(intern_signature(signatures, try wasm_signature(program.types, signature)))
+                    let hidden_parameters = list[TypeId]()
+                    for parameter in signature.parameters: hidden_parameters.append(parameter)
+                    var environment_index: i64 = 0
+                    if signature.is_fallible: environment_index = 1
+                    hidden_parameters.insert(environment_index, builtin_mir_type(BuiltinMirType.pointer))
+                    let hidden = MirSignature(parameters = hidden_parameters, results = signature.results, is_fallible = signature.is_fallible)
+                    discard(intern_signature(signatures, try wasm_signature(program.types, hidden)))
+                ListRelease(value, element_release):
+                    has_function_table = true
+                    descriptor_marks[element_release.value] = true
+                ListCopy(result, value, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListConcat(result, left, right, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListAppendSlot(result, value, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListInsertSlot(result, value, index, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListRemoveAt(value, index, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListClear(value, element_release):
+                    has_function_table = true
+                    descriptor_marks[element_release.value] = true
+                ListReserve(value, minimum_capacity, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                ListMutableElementAddress(result, value, index, element_retain):
+                    has_function_table = true
+                    descriptor_marks[element_retain.value] = true
+                SliceRelease(value, element_release):
+                    has_function_table = true
+                    descriptor_marks[element_release.value] = true
+                ClassCreate(result, identity):
+                    has_function_table = true
+                    descriptor_marks[program.classes[identity.value].destroyer.value] = true
+                CellCreate(result, element_type, destroyer):
+                    has_function_table = true
+                    descriptor_marks[destroyer.value] = true
+                ClosureCreate(environment, destination, function_type, closure):
+                    has_function_table = true
+                    descriptor_marks[program.closures[closure.value].destroyer.value] = true
                 else: pass
 
     let data_offsets = list[i64]()
     var offset = scratch_size
+    let function_descriptor_offsets = list[i64]()
+    for index in range(0, len(descriptor_marks)):
+        if descriptor_marks[index]:
+            offset = align_up(offset, layout.pointer_align())
+            function_descriptor_offsets.append(offset)
+            offset += layout.pointer_size() * 2
+        else:
+            function_descriptor_offsets.append(-1)
     for item in program.data:
         offset = align_up(offset, item.align)
         data_offsets.append(offset)
@@ -177,7 +229,10 @@ pub func plan_module(program: MirProgram) -> ModulePlan!:
         offset += layout.size_of(global.value_type)
     let data_end = align_up(offset, frame_alignment)
 
-    let has_memory = len(program.data) > 0 or len(program.globals) > 0 or len(imports) > 0 or has_stack or has_runtime_arena or allocates_storage
+    var has_descriptors = false
+    for descriptor in function_descriptor_offsets:
+        if descriptor >= 0: has_descriptors = true
+    let has_memory = len(program.data) > 0 or len(program.globals) > 0 or len(imports) > 0 or has_stack or has_runtime_arena or allocates_storage or has_descriptors
     if (has_stack or has_runtime_arena) and data_end > stack_top:
         error("wasm backend: static data and globals overlap the shadow stack")
     return ModulePlan(
@@ -188,6 +243,7 @@ pub func plan_module(program: MirProgram) -> ModulePlan!:
         global_imports = global_imports,
         function_types = function_types,
         table_imports = table_imports,
+        function_descriptor_offsets = function_descriptor_offsets,
         data_offsets = data_offsets,
         global_offsets = global_offsets,
         data_end = data_end,
@@ -254,6 +310,7 @@ pub func wasm_value_type(types: MirTypeTable, id: TypeId) -> u8!:
         Slice(element): return i32_value_type
         Class(identity): return i32_value_type
         WeakClass(identity): return i32_value_type
+        Cell(element): return i32_value_type
         else: error("wasm backend cannot place `" + describe_mir_type(types, id) + "` in a register")
 
 pub func defined_function_index(plan: ModulePlan, function: i64) -> i64:

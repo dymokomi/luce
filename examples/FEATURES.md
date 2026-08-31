@@ -33,15 +33,15 @@ column because it does not determine stage-1 completion.
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Closure, generic, interface, and test scopes remain with those features. |
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw text, character, byte escapes, and list literals execute; map, formatted, and formatter-trimmed triple literals remain. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16`, maps/sets, interfaces, generics, hashing, structural list equality, and managed forms beyond the completed class/list/slice/bytes ownership graphs. |
-| §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class and custom-construction definite initialization execute; future closure/interface/generic managed places remain. |
+| §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization and shared mutable closure cells execute; interface/generic managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` and class/list identity execute; dynamic sequence operations and floating/capability-dependent conversions remain. |
-| §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Generic functions and managed function environments; audit all default-argument rules. |
+| §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values and core managed function environments execute; infallible-to-fallible lifting, generics, and the complete default-argument audit remain. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Protocol iteration/`try for` and the remaining pattern families. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals and ownership-safe fixed-array slicing execute; generics, interface conformance, hashing, and the remaining rule-by-rule audit keep the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core classes, strong ARC, weak fields and `Weak[T]` collections, failed initialization, and `deinit` reach both oracles, QBE, and Wasm. Proven-cycle diagnostics/leak tooling and the remaining resource/reentrancy rules remain. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
-| §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | syntax | — | — | syntax | Managed function environments and capture/ownership analysis. |
+| §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | Core capture-free/copied/default/shared-cell/weak/nested escaping closures execute; lifting, storage/cycle diagnostics, and worker sendability remain. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | syntax | — | — | syntax | HIR generic identities and bounded monomorphization. |
 | §16 | Interfaces, conformance, static use, interface values | complete | syntax | — | — | syntax | HIR requirements/conformance and witness representation. |
 | §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Closed protocol model beyond built-in range/list iteration and value equality. |
@@ -93,6 +93,23 @@ slice protocol; it never leaks a frame address or introduces target layout.
 | Mutation after capture cannot alter the value snapshot | yes | yes | yes, plus Wasm | `array_slices.luc` | complete |
 | A slice returned after inline array destruction retains scalar and managed elements | yes | yes | yes, plus Wasm | `array_slices.luc` | complete |
 | Copy loop and MIR size are independent of `N`; selected capacity reserves once | n/a | yes | yes | lowerer inspection | complete |
+
+## Current closure evidence
+
+Core §14 now has one target-neutral managed representation, but the row stays
+partial until its lifting, storage, diagnostic, and worker interactions are
+proved individually.
+
+| §14 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Capture-free expression/block closures become allocation-free function values | yes | yes | yes, plus Wasm | `closures.luc` and differential corpus | complete |
+| Default immutable and explicit `copy` captures snapshot at formation in source order | yes | yes | yes, plus Wasm | `closures.luc` | complete |
+| Captured `var` is one shared ARC cell visible to the scope and every closure | yes | yes | yes, plus Wasm | `closures.luc` | complete core behavior; accidental-cell diagnostic open |
+| Nested environments escape without backend facts in HIR/MIR | yes | yes | yes, plus Wasm | `closures.luc` | complete |
+| Weak class capture does not retain and promotes to an owned optional | yes | yes | yes, plus Wasm | `closures.luc` | complete for named locals; `weak self` evidence open |
+| Fallible closures and infallible-to-fallible function lift | partial | partial | partial | focused corpus pending | open |
+| Closure ownership in fields/collections and direct stored strong-cycle diagnosis | partial | partial | partial | focused example pending | open |
+| Closures cannot cross worker boundaries | syntax | n/a | n/a | worker corpus pending | opens with workers |
 
 ## Current `list[T]` evidence
 
@@ -172,6 +189,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `stage0_sort.luc` | Fixed arrays, copies, mutation, sorting | Native QBE execution/status. |
 | `stage0_brainfuck.luc` | Bytes, nested flow/match, bounded interpreter | HIR, MIR, Wasm, and native QBE execution. |
 | `function_values.luc` | Exact named function values and indirect calls | HIR, MIR, Wasm, and native QBE execution. |
+| `closures.luc` | Managed copied/shared/weak captures and nested escaping environments | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |
 | `numeric_conversions.luc` | Checked integer/float construction, binary32 contextual rounding, width conversion, and truncation | HIR and MIR oracles plus native QBE and Wasm execution. |

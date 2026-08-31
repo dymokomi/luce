@@ -13,13 +13,13 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BuiltinMirType, CallingConvention, ClassId, ExternId, ExternalGlobalId, FunctionId
-from compiler.mir.canonical import MirClass, MirClassField, MirData, MirExtern, MirExternalGlobal, MirFunction, MirGlobal
+from compiler.mir.canonical import BuiltinMirType, CallingConvention, ClassId, ClosureId, ExternId, ExternalGlobalId, FunctionId
+from compiler.mir.canonical import MirClass, MirClassField, MirClosure, MirData, MirExtern, MirExternalGlobal, MirField, MirFunction, MirGlobal
 from compiler.mir.canonical import MirRuntimeBinding, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirType, TypeId, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, make_enum_type
-from compiler.mir.canonical import OperandBuilder, is_ptr_type, make_struct_type, mir_type, mir_types_match, signatures_match
-from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
+from compiler.mir.canonical import OperandBuilder, is_aggregate_type, is_ptr_type, make_struct_type, mir_type, mir_types_match, signatures_match
+from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, HirProgram, NodeId, SymbolId, TypeForm, describe_type
 from compiler.hir.ir import resolve_builtin_type, types_match
 import compiler.hir.ir
@@ -120,6 +120,15 @@ pub struct OwnershipHelper:
     pub let retain: FunctionId
     pub let release: FunctionId
 
+## One canonical cell representation shared by every captured mutable binding
+## of the same source type. Its generated destroyer releases the payload only
+## after successful initialization.
+pub struct CellStorage:
+    pub let hir_type: ir.TypeId
+    pub let element_type: TypeId
+    pub let cell_type: TypeId
+    pub let destroyer: FunctionId
+
 # Source `defer` statements and semantic compiler cleanups share one lexical
 # LIFO. The latter are explicit canonical MIR actions rather than synthetic
 # HIR nodes, so HIR remains an exact representation of the source program.
@@ -150,6 +159,13 @@ pub class MirLoweringState:
     pub let lowered_functions: list[LoweredFunction]
     pub let classes: list[MirClass]
     pub let class_destroyers: list[FunctionId]
+    pub let closures: list[MirClosure]
+    # HIR contains entries for capture-free lambdas as an observable semantic
+    # fact. Only allocating closures enter canonical MIR; this parallel table
+    # maps the former identities to the latter or the unlowered sentinel.
+    pub let lowered_closures: list[u32]
+    pub let closure_destroyers: list[FunctionId]
+    pub let cells: list[CellStorage]
     # Nominal aggregates reserve their MIR identity before lowering fields.
     # A collection reference may point back to that identity without making
     # the aggregate's byte layout recursive.
@@ -195,6 +211,11 @@ pub class MirLoweringState:
         self.lowered_functions = list[LoweredFunction]()
         self.classes = list[MirClass]()
         self.class_destroyers = list[FunctionId]()
+        self.closures = list[MirClosure]()
+        self.lowered_closures = list[u32]()
+        for closure in self.program.closures: self.lowered_closures.append(unlowered_nominal_type)
+        self.closure_destroyers = list[FunctionId]()
+        self.cells = list[CellStorage]()
         self.lowered_struct_types = list[u32]()
         for index in range(0, len(self.program.structs)): self.lowered_struct_types.append(unlowered_nominal_type)
         self.lowered_class_types = list[u32]()
@@ -378,6 +399,32 @@ pub class MirLoweringState:
             if self.program.functions[index].symbol.value == symbol.value: return index
         return -1
 
+    pub func is_shared_symbol(symbol: SymbolId) -> bool:
+        return contains_symbol(self.program.shared_cells, symbol)
+
+    pub func cell_for_hir_type(value_type: ir.TypeId) -> CellStorage?:
+        for cell in self.cells:
+            if types_match(cell.hir_type, value_type): return cell
+        return none
+
+    pub func cell_for_symbol(symbol: SymbolId) -> CellStorage:
+        let cell = self.cell_for_hir_type(self.program.symbols[symbol.value].value_type) else trap("shared HIR symbol has no reserved MIR cell representation")
+        return cell
+
+    ## Reserve one typed cell and its lifecycle callback before any body can
+    ## refer to either identity.
+    pub func reserve_cell(value_type: ir.TypeId, destroyer: FunctionId) -> !:
+        if self.cell_for_hir_type(value_type) != none: return
+        let element_type = try self.lower_mir_type(value_type)
+        let cell_type = self.intern_lowered_type(MirType.Cell(element = element_type))
+        self.cells.append(CellStorage(hir_type = value_type, element_type = element_type, cell_type = cell_type, destroyer = destroyer))
+
+    pub func closure_id_of(hir_closure: i64) -> ClosureId:
+        if hir_closure < 0 or hir_closure >= len(self.lowered_closures): trap("HIR closure identity is out of range")
+        let lowered = self.lowered_closures[hir_closure]
+        if lowered == unlowered_nominal_type: trap("capture-free HIR closure has no MIR environment")
+        return ClosureId(value = lowered)
+
     # The module constant a reference names, if any.
     pub func constant_of(symbol: SymbolId) -> HirConstant?:
         for constant in self.program.constants:
@@ -497,7 +544,8 @@ pub class MirLoweringState:
                 let absent = self.intern_lowered_type(make_struct_type(list[TypeId]()))
                 let present = try self.lower_mir_type(inner)
                 return self.intern_lowered_type(make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
-            Function(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
+            Function(parameters, result):
+                return self.intern_lowered_type(MirType.Func(signature = try self.lower_luce_function_signature(parameters, result)))
             CFunction(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
             NativePointer(pointee, is_mutable): return builtin_mir_type(BuiltinMirType.pointer)
             List(element):
@@ -514,6 +562,28 @@ pub class MirLoweringState:
                     Pointer: return builtin_mir_type(BuiltinMirType.pointer)
                     Integer(representation): return try self.lower_mir_type(representation)
             else: error("type `" + describe_type(self.program.types, value) + "`")
+
+    # Function values retain the same hidden result/error protocol as direct
+    # Luce calls. Their aggregate handle is separate from this invocation
+    # signature, so backends can keep capture layout private.
+    pub func lower_luce_function_signature(parameters: list[ir.TypeId], result: ir.TypeId) -> MirSignature!:
+        let lowered_parameters = list[TypeId]()
+        let lowered_results = list[TypeId]()
+        let fallible = self.fallible_inner(result)
+        var successful = result
+        if fallible != none:
+            successful = fallible
+            lowered_parameters.append(builtin_mir_type(BuiltinMirType.pointer))
+        if not types_match(successful, resolve_builtin_type(BuiltinType.unit)):
+            let result_type = try self.lower_mir_type(successful)
+            if is_aggregate_type(self.types, result_type): lowered_parameters.append(builtin_mir_type(BuiltinMirType.pointer))
+            else: lowered_results.append(result_type)
+        if fallible != none: lowered_results.append(builtin_mir_type(BuiltinMirType.pointer))
+        for parameter in parameters:
+            let value_type = try self.lower_mir_type(parameter)
+            if is_aggregate_type(self.types, value_type): lowered_parameters.append(builtin_mir_type(BuiltinMirType.pointer))
+            else: lowered_parameters.append(value_type)
+        return MirSignature(parameters = lowered_parameters, results = lowered_results, is_fallible = fallible != none)
 
     ## Publish each nominal payload schema after all class types and destroyer
     ## identities have been reserved. Weak fields deliberately lower to a
@@ -538,6 +608,54 @@ pub class MirLoweringState:
                     storage_type = self.intern_lowered_type(MirType.WeakClass(identity = ClassId(value = u32(referent))))
                 fields.append(MirClassField(storage_type = storage_type))
             self.classes.append(MirClass(fields = fields, destroyer = self.class_destroyers[class_index]))
+
+    ## Publish only allocating closure environments. Capture-free anonymous
+    ## functions remain ordinary function values and therefore need neither
+    ## metadata nor a generated destroyer in canonical MIR.
+    pub func lower_closures() -> !:
+        var allocating_index: i64 = 0
+        for hir_index in range(0, len(self.program.closures)):
+            let source = self.program.closures[hir_index]
+            if len(source.captures) == 0: continue
+            if allocating_index >= len(self.closure_destroyers): trap("closure destroyer identities were not reserved")
+            let fields = list[MirField]()
+            for capture in source.captures:
+                var storage_type = try self.lower_mir_type(capture.value_type)
+                if capture.kind == HirCaptureKind.shared_cell:
+                    let cell = self.cell_for_hir_type(capture.value_type) else trap("shared HIR capture has no reserved MIR cell")
+                    storage_type = cell.cell_type
+                elif capture.kind == HirCaptureKind.weak_capture:
+                    var class_index: i64 = -1
+                    match self.program.types.definitions[capture.value_type.value].form:
+                        Optional(inner):
+                            match self.program.types.definitions[inner.value].form:
+                                Class(index): class_index = index
+                                else: pass
+                        else: pass
+                    if class_index < 0: trap("weak HIR closure capture is not an optional class")
+                    discard(try self.lower_mir_type(self.class_hir_type(class_index)))
+                    storage_type = self.intern_lowered_type(MirType.WeakClass(identity = ClassId(value = u32(class_index))))
+                fields.append(MirField(value_type = storage_type))
+            let function_index = self.function_index_of(source.function)
+            if function_index < 0: trap("HIR closure body has no function identity")
+            var target = FunctionId(value = 0)
+            match self.lowered_functions[function_index]:
+                Defined(function): target = function
+                External(external): trap("HIR closure body names an external function")
+            let hidden = self.program.functions[function_index]
+            let parameters = list[ir.TypeId]()
+            for parameter in hidden.parameters: parameters.append(parameter.value_type)
+            let signature = try self.lower_luce_function_signature(parameters, hidden.result)
+            let closure = ClosureId(value = u32(len(self.closures)))
+            self.lowered_closures[hir_index] = closure.value
+            self.closures.append(MirClosure(
+                function = target,
+                signature = signature,
+                captures = fields,
+                destroyer = self.closure_destroyers[allocating_index],
+            ))
+            allocating_index += 1
+        if allocating_index != len(self.closure_destroyers): trap("closure destroyer reservation count does not match allocating closures")
 
     ## Recover the canonical HIR type identity naming one class table entry.
     func class_hir_type(class_index: i64) -> ir.TypeId:

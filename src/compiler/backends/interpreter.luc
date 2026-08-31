@@ -16,7 +16,7 @@
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, ClassFinalizer, ClassStorage, HirNodeForm, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HirCaptureKind, HirNodeForm, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
@@ -286,6 +286,9 @@ class HirInterpreterRun: ClassFinalizer:
     # The parameters outlive the body's scope, so after the body runs the
     # frame still holds `self` as the method left it.
     func call(function: HirFunction, arguments: list[Value]) -> Invocation!:
+        return try self.call_with_captures(function, arguments, list[Value]())
+
+    func call_with_captures(function: HirFunction, arguments: list[Value], captures: list[Value]) -> Invocation!:
         match function.implementation:
             ExternalC(contract):
                 let host = self.external_host else error("interpreter: extern `" + self.program.modules[function.module.value].name + "." + function.name + "` has no host binding")
@@ -296,9 +299,17 @@ class HirInterpreterRun: ClassFinalizer:
             else: pass
         if self.depth >= frame_limit: error("interpreter: call depth exceeded " + str(frame_limit) + " frames in `" + function.name + "`")
         let bindings = list[Binding]()
+        let closure_index = function.closure
+        if closure_index != none:
+            let capture_table = self.program.closures[closure_index].captures
+            if len(captures) != len(capture_table): trap("closure environment does not match its HIR capture table")
+            for capture_index in range(0, len(capture_table)):
+                bindings.append(Binding(symbol = capture_table[capture_index].symbol, value = captures[capture_index]))
+        elif len(captures) > 0:
+            trap("capture-free function received a closure environment")
         var index = 0
         while index < len(function.parameters):
-            bindings.append(Binding(symbol = function.parameters[index].symbol, value = arguments[index]))
+            bindings.append(Binding(symbol = function.parameters[index].symbol, value = self.initial_binding(function.parameters[index].symbol, arguments[index])))
             index += 1
 
         self.depth += 1
@@ -327,6 +338,34 @@ class HirInterpreterRun: ClassFinalizer:
                 trap("checked function `" + function.name + "` finished without returning a value")
             Recovered(value): trap("recover escaped its catch handler")
             else: trap("loop control escaped a function")
+
+    # mark: Captured local storage ==============================================================
+
+    # Promotion is a property of the semantic symbol, not of the point where
+    # its declaration executes. Parameters and local bindings therefore pass
+    # through the same initializer and converge on one cell identity.
+    func initial_binding(symbol: SymbolId, value: Value) -> Value:
+        if not self.is_shared_cell(symbol): return value
+        match value:
+            CapturedCell(storage): return value
+            else: return Value.CapturedCell(storage = CapturedCellStorage(value = value))
+
+    func is_shared_cell(symbol: SymbolId) -> bool:
+        for shared in self.program.shared_cells:
+            if shared.value == symbol.value: return true
+        return false
+
+    # Source reads see the cell payload; closure construction alone reads the
+    # raw binding so it can share the cell rather than snapshot its value.
+    func binding_value(value: Value) -> Value:
+        match value:
+            CapturedCell(storage): return storage.value.value
+            else: return value
+
+    func assign_binding(bindings: list[Binding], index: i64, value: Value):
+        match bindings[index].value:
+            CapturedCell(storage): storage.value = BoxedValue(value = value)
+            else: bindings[index] = Binding(symbol = bindings[index].symbol, value = value)
 
     # Encode ordinary semantic values into the C-shaped values an explicit
     # host receives. This is a boundary operation: tagged optionals become a
@@ -581,7 +620,7 @@ class HirInterpreterRun: ClassFinalizer:
             ContinueStatement: return Execution.Continued
             Binding(symbol, is_mutable, value):
                 match try self.evaluate(value, bindings):
-                    Evaluated(item): bindings.append(Binding(symbol = symbol, value = item))
+                    Evaluated(item): bindings.append(Binding(symbol = symbol, value = self.initial_binding(symbol, item)))
                     Transferred(execution): return execution
                 return Execution.Next
             Assignment(symbol, operation, value):
@@ -595,8 +634,8 @@ class HirInterpreterRun: ClassFinalizer:
                 var assigned = right
                 match operation:
                     Replace: assigned = right
-                    Combine(binary): assigned = try evaluate_binary(bindings[index].value, binary, right, self.program.types)
-                bindings[index] = Binding(symbol = symbol, value = assigned)
+                    Combine(binary): assigned = try evaluate_binary(self.binding_value(bindings[index].value), binary, right, self.program.types)
+                self.assign_binding(bindings, index, assigned)
                 return Execution.Next
             ExternStore(variable_index, operation, value):
                 let variable = self.program.extern_variables[variable_index]
@@ -631,9 +670,9 @@ class HirInterpreterRun: ClassFinalizer:
             PlaceAssignment(symbol, step_run, operation, value):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed place assignment refers to an unknown binding")
-                match try self.execute_place_update(bindings[index].value, symbol, -1, step_run, operation, value, bindings):
+                match try self.execute_place_update(self.binding_value(bindings[index].value), symbol, -1, step_run, operation, value, bindings):
                     Updated(updated):
-                        bindings[index] = Binding(symbol = symbol, value = updated)
+                        self.assign_binding(bindings, index, updated)
                         return Execution.Next
                     Transferred(execution): return execution
             GlobalPlaceAssignment(global_index, step_run, operation, value):
@@ -932,7 +971,7 @@ class HirInterpreterRun: ClassFinalizer:
             Constant(value): return Evaluation.Evaluated(value = self.program.values[value])
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
-                if index >= 0: return Evaluation.Evaluated(value = bindings[index].value)
+                if index >= 0: return Evaluation.Evaluated(value = self.binding_value(bindings[index].value))
                 for constant in self.program.constants:
                     if constant.symbol.value == symbol.value:
                         # Initializers are literal trees; re-evaluating is lookup.
@@ -1051,6 +1090,37 @@ class HirInterpreterRun: ClassFinalizer:
                 match self.program.types.definitions[node_type(self.program, expression).value].form:
                     CFunction(parameters, result): return Evaluation.Evaluated(value = Value.CFunction(symbol = function))
                     else: return Evaluation.Evaluated(value = Value.Function(symbol = function))
+            ClosureValue(closure, initializers):
+                let capture_table = self.program.closures[closure].captures
+                if initializers.count != u32(len(capture_table)): trap("closure initializer run does not match its capture table")
+                let captures = list[BoxedValue]()
+                for position in range(0, len(capture_table)):
+                    let capture = capture_table[position]
+                    if capture.kind == HirCaptureKind.shared_cell:
+                        let source = capture.source else trap("shared-cell capture has no source binding")
+                        let binding_index = find_binding(bindings, source)
+                        if binding_index < 0: trap("shared-cell capture refers outside its call frame")
+                        match bindings[binding_index].value:
+                            CapturedCell(storage): captures.append(BoxedValue(value = Value.CapturedCell(storage = storage)))
+                            else: trap("shared-cell capture source was not promoted")
+                        continue
+                    let initializer = node_at(self.program, initializers, position)
+                    match try self.evaluate(initializer, bindings):
+                        Evaluated(item):
+                            if capture.kind == HirCaptureKind.weak_capture:
+                                match item:
+                                    Class(storage): captures.append(BoxedValue(value = Value.WeakClass(storage = WeakClassStorage(target = storage))))
+                                    else: trap("weak closure capture initializer is not a class value")
+                            else:
+                                captures.append(BoxedValue(value = item))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Closure(storage = ClosureStorage(closure = closure, captures = captures)))
+            WeakCaptureReference(symbol):
+                let index = find_binding(bindings, symbol)
+                if index < 0: trap("weak capture reference points outside its call frame")
+                match bindings[index].value:
+                    WeakClass(storage): return Evaluation.Evaluated(value = weak_class_value(storage))
+                    else: trap("weak capture reference names owning storage")
             IndirectCall(callee, arguments): return try self.evaluate_indirect_call(callee, arguments, bindings)
             Initialize(function, arguments): return try self.evaluate_initializer(function, arguments, bindings)
             ErrorCodeLiteral(value):
@@ -1358,7 +1428,7 @@ class HirInterpreterRun: ClassFinalizer:
             let place = mutable_receiver_place else trap("mutating call on a value that is not a place")
             let index = find_binding(bindings, place.symbol)
             if index < 0: trap("mutating call refers to an unknown binding")
-            values[0] = try value_at_assignment_place(bindings[index].value, place.steps, 0)
+            values[0] = try value_at_assignment_place(self.binding_value(bindings[index].value), place.steps, 0)
         let invocation = try self.call(target, values)
         # A mutating method changed its copy of `self`; the caller's place
         # receives that copy (HirGenerator proved it is a place).
@@ -1366,7 +1436,8 @@ class HirInterpreterRun: ClassFinalizer:
             let place = mutable_receiver_place else trap("mutating call on a value that is not a place")
             let index = find_binding(bindings, place.symbol)
             if index < 0: trap("mutating call refers to an unknown binding")
-            bindings[index] = Binding(symbol = place.symbol, value = try value_with_assignment_place(bindings[index].value, place.steps, 0, invocation.receiver))
+            let updated = try value_with_assignment_place(self.binding_value(bindings[index].value), place.steps, 0, invocation.receiver)
+            self.assign_binding(bindings, index, updated)
         return Evaluation.Evaluated(value = invocation.value)
 
     # A function-value call evaluates its pointer first and positional
@@ -1374,11 +1445,15 @@ class HirInterpreterRun: ClassFinalizer:
     func evaluate_indirect_call(callee: NodeId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
         let selected = try self.evaluate(callee, bindings)
         var function = SymbolId(value = 0)
+        let captures = list[Value]()
         match selected:
             Evaluated(value):
                 match value:
                     Function(symbol): function = symbol
                     CFunction(symbol): function = symbol
+                    Closure(storage):
+                        function = self.program.closures[storage.closure].function
+                        for capture in storage.captures: captures.append(capture.value)
                     else: trap("typed indirect call has a non-function value")
             Transferred(execution): return Evaluation.Transferred(execution = execution)
         let values = list[Value]()
@@ -1386,7 +1461,7 @@ class HirInterpreterRun: ClassFinalizer:
             match try self.evaluate(node_at(self.program, arguments, position), bindings):
                 Evaluated(value): values.append(value)
                 Transferred(execution): return Evaluation.Transferred(execution = execution)
-        return Evaluation.Evaluated(value = (try self.call(self.find_function(function), values)).value)
+        return Evaluation.Evaluated(value = (try self.call_with_captures(self.find_function(function), values, captures)).value)
 
     # Evaluate one mutable receiver exactly once while retaining where its
     # final value must be copied back after the method returns.
@@ -1395,7 +1470,7 @@ class HirInterpreterRun: ClassFinalizer:
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("mutating call refers to an unknown binding")
-                return PlaceEvaluation.EvaluatedPlace(place = Place(symbol = symbol, steps = list[AssignmentPlaceStep]()), value = bindings[index].value)
+                return PlaceEvaluation.EvaluatedPlace(place = Place(symbol = symbol, steps = list[AssignmentPlaceStep]()), value = self.binding_value(bindings[index].value))
             FieldAccess(inner, field):
                 match try self.evaluate_mutable_place(inner, bindings):
                     EvaluatedPlace(place, base):
@@ -1786,6 +1861,7 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
                 Array(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
                 else: trap("typed binary expression has unequal value types")
         Function(symbol): trap("function values have no binary operations")
+        Closure(storage): trap("closure values have no binary operations")
         CFunction(symbol): trap("cfunc values have no binary operations")
         Record(left_fields):
             match right:
@@ -1800,6 +1876,7 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
                         else: trap("classes support identity operations only")
                 else: trap("typed binary expression has unequal value types")
         WeakClass(storage): trap("hidden weak storage escaped field access")
+        CapturedCell(storage): trap("hidden captured-cell storage escaped source reads")
         Variant(left_case, left_payload):
             match right:
                 Variant(right_case, right_payload):

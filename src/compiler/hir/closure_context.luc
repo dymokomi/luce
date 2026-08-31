@@ -1,0 +1,132 @@
+#==============================================================================================
+#
+#   closure_context - Lexical capture ownership during HIR generation
+#
+#   DESCRIPTION:
+#       Turns references to outer locals into explicit closure-environment
+#       fields. It owns capture identity and storage policy; expression and
+#       statement typing remain in HirBodyChecker.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.hir.generation_model import HirGenerationState, LocalBinding, LocalStorage
+from compiler.hir.ir import HirCapture, HirCaptureKind, HirClosure, HirNodeForm, NodeId, SymbolId, SymbolKind, TypeId, no_node
+
+# mark: Capture frames ========================================================================
+
+## One anonymous-function body currently being checked. `outer_count` is the
+## precise boundary between inherited lexical names and bindings introduced
+## by this body; aliases are appended above it as captures are discovered.
+class CaptureFrame:
+    let closure: u32
+    let outer_count: i64
+    let captures: list[HirCapture]
+    let initializers: list[NodeId]
+
+    init(closure: u32, outer_count: i64):
+        self.closure = closure
+        self.outer_count = outer_count
+        self.captures = list[HirCapture]()
+        self.initializers = list[NodeId]()
+
+## Maintains the capture stack independently of ordinary body typing. A body
+## checker asks it to normalize a resolved local index before reading or
+## writing that local; the returned index always belongs to the current body.
+pub class ClosureContext:
+    let state: HirGenerationState
+    let frames: list[CaptureFrame]
+
+    pub init(state: HirGenerationState):
+        self.state = state
+        self.frames = list[CaptureFrame]()
+
+    pub func is_active() -> bool:
+        return len(self.frames) > 0
+
+    pub func require_free_name(name: str, span: SourceSpan) -> !:
+        if len(self.frames) == 0:
+            try self.state.require_free_local_name(name, span)
+            return
+        try self.state.require_free_local_name_after(name, span, self.current().outer_count)
+
+    ## Reserve the closure identity before checking its body so nested
+    ## closures receive distinct stable identities even though they finish
+    ## first.
+    pub func begin(function: SymbolId, span: SourceSpan) -> u32:
+        let closure = u32(len(self.state.closures))
+        self.state.closures.append(HirClosure(function = function, captures = list[HirCapture](), span = span))
+        self.frames.append(CaptureFrame(closure = closure, outer_count = len(self.state.locals)))
+        return closure
+
+    ## Make an explicit capture alias visible before parameters and body
+    ## bindings are introduced. The caller has already checked its initializer
+    ## in the enclosing lexical context, preserving source evaluation order.
+    pub func add_explicit(name: str, value_type: TypeId, kind: HirCaptureKind, initializer: NodeId, source: SymbolId?, span: SourceSpan) -> !:
+        let frame = self.current()
+        for existing in frame.captures:
+            if self.state.symbols[existing.symbol.value].name == name:
+                error(self.state.diagnostic_at(self.state.current_module, span, "duplicate capture `" + name + "`"))
+        let symbol = self.state.make_symbol(name, SymbolKind.local, value_type)
+        var storage = LocalStorage.value
+        if kind == HirCaptureKind.shared_cell: storage = LocalStorage.shared_cell
+        elif kind == HirCaptureKind.weak_capture: storage = LocalStorage.weak_capture
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = kind == HirCaptureKind.shared_cell, storage = storage))
+        frame.captures.append(HirCapture(symbol = symbol, source = source, value_type = value_type, kind = kind))
+        frame.initializers.append(initializer)
+
+    ## Convert an inherited local into a capture on first use. Repeated reads
+    ## find the alias appended above `outer_count`, so every source binding has
+    ## exactly one field in this environment.
+    pub func capture(local_index: i64, span: SourceSpan) -> i64:
+        if len(self.frames) == 0: return local_index
+        return self.capture_in_frame(len(self.frames) - 1, local_index, span)
+
+    # A nested closure cannot point directly into a grandparent frame. First
+    # make the value available in its parent environment, then capture that
+    # immediate representation. The parent alias may be appended after the
+    # child recorded its boundary, so this routine deliberately continues
+    # instead of reapplying the boundary test after recursion.
+    func capture_in_frame(frame_index: i64, local_index: i64, span: SourceSpan) -> i64:
+        let frame = self.frames[frame_index]
+        if local_index >= frame.outer_count: return local_index
+        var source_index = local_index
+        if frame_index > 0:
+            source_index = self.capture_in_frame(frame_index - 1, local_index, span)
+        let source = self.state.locals[source_index]
+
+        var kind = HirCaptureKind.value
+        var storage = LocalStorage.value
+        var initializer = self.state.push_node(HirNodeForm.Reference(symbol = source.symbol), source.value_type, span)
+        var is_mutable = false
+        if source.is_mutable or source.storage == LocalStorage.shared_cell:
+            kind = HirCaptureKind.shared_cell
+            storage = LocalStorage.shared_cell
+            initializer = NodeId(value = no_node)
+            is_mutable = true
+            self.state.mark_shared_cell(source.symbol)
+        elif source.storage == LocalStorage.weak_capture:
+            # An implicit capture of a weak view is an ordinary snapshot of
+            # its optional promoted value, not a second weak policy request.
+            initializer = self.state.push_node(HirNodeForm.WeakCaptureReference(symbol = source.symbol), source.value_type, span)
+
+        let symbol = self.state.make_symbol(source.name, SymbolKind.local, source.value_type)
+        self.state.locals.append(LocalBinding(symbol = symbol, name = source.name, value_type = source.value_type, is_mutable = is_mutable, storage = storage))
+        frame.captures.append(HirCapture(symbol = symbol, source = source.symbol, value_type = source.value_type, kind = kind))
+        frame.initializers.append(initializer)
+        return len(self.state.locals) - 1
+
+    ## Publish the completed environment table and return the initializer run
+    ## used by the closure-forming expression.
+    pub func finish(function: SymbolId, span: SourceSpan) -> list[NodeId]:
+        let frame = self.current()
+        self.state.closures[frame.closure] = HirClosure(function = function, captures = frame.captures, span = span)
+        self.frames.remove(len(self.frames) - 1)
+        return frame.initializers
+
+    pub func abandon():
+        if len(self.frames) > 0: self.frames.remove(len(self.frames) - 1)
+
+    func current() -> CaptureFrame:
+        if len(self.frames) == 0: trap("closure capture operation has no active frame")
+        return self.frames[len(self.frames) - 1]

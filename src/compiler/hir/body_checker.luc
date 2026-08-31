@@ -11,10 +11,11 @@
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan, format_diagnostic
-from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax, FunctionSyntax, IfBranchSyntax, StatementSyntax
+from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, CaptureSyntax, ExpressionSyntax, FunctionSyntax, IfBranchSyntax, ParameterSyntax, StatementSyntax
 from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiverKind
+from compiler.hir.closure_context import ClosureContext
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind
 from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
@@ -23,7 +24,7 @@ from compiler.hir.ir import place_class_field_step, place_element_step, place_fi
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, CollectedFunctionSource
 from compiler.hir.generation_model import DeclarationValueChecker, DeclaredErrorCode, FunctionSymbol, HirGenerationState, ImportedModule, ImportedValue, ImportedValueBinding
-from compiler.hir.generation_model import LocalBinding, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
+from compiler.hir.generation_model import LocalBinding, LocalStorage, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
 from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_text_literal
 
 # Largest finite IEEE binary32 value, represented exactly in binary64.
@@ -33,10 +34,12 @@ let maximum_f32_value: f64 = 3.4028234663852886e38
 pub class HirBodyChecker: DeclarationValueChecker:
     let state: HirGenerationState
     let declarations: DeclarationCollector
+    let closures: ClosureContext
 
     pub init(state: HirGenerationState, declarations: DeclarationCollector):
         self.state = state
         self.declarations = declarations
+        self.closures = ClosureContext(state)
 
     # mark: Constants and bodies ================================================================
 
@@ -134,6 +137,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
                     is_public = function.is_public,
                     documentation = function.documentation,
                     receiver = none,
+                    closure = none,
                     parameters = function.parameters,
                     result = function.result,
                     implementation = HirFunctionImplementation.ExternalC(contract = contract),
@@ -152,9 +156,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
         let receiver = function.receiver
         if receiver != none: self_is_mutable = receiver.kind == HirReceiverKind.mutating_method
         for parameter in function.parameters:
-            try self.state.require_free_local_name(parameter.name, function.span)
+            try self.require_free_local_name(parameter.name, function.span)
             let is_mutable = parameter.name == "self" and self_is_mutable
-            self.state.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = is_mutable))
+            self.state.locals.append(LocalBinding(symbol = parameter.symbol, name = parameter.name, value_type = parameter.value_type, is_mutable = is_mutable, storage = LocalStorage.value))
 
         let definition = source else trap("defined function lost its syntax")
         let body_syntax = definition.body else trap("function definition has no body")
@@ -174,11 +178,24 @@ pub class HirBodyChecker: DeclarationValueChecker:
             is_public = function.is_public,
             documentation = function.documentation,
             receiver = function.receiver,
+            closure = none,
             parameters = function.parameters,
             result = function.result,
             implementation = implementation,
             span = function.span,
         )
+
+    # Anonymous functions introduce a fresh local namespace while retaining
+    # inherited names as capture candidates. Every other lexical suite keeps
+    # the language's ordinary no-shadowing rule.
+    func require_free_local_name(name: str, span: SourceSpan) -> !:
+        try self.closures.require_free_name(name, span)
+
+    # Normalize an inherited local into the current closure's hidden alias.
+    # Callers must use the returned index; the source binding remains in the
+    # table only so nested capture discovery retains exact provenance.
+    func capture_local(local_index: i64, span: SourceSpan) -> i64:
+        return self.closures.capture(local_index, span)
 
     # A suite is one lexical scope: bindings made inside it end with it.
     func check_suite(statements: list[StatementSyntax]) -> list[NodeId]!:
@@ -319,7 +336,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
         # never make an otherwise-valid user binding look like a duplicate.
         let name = "$defer_capture_" + str(self.state.next_symbol)
         let symbol = self.state.make_symbol(name, SymbolKind.local, value_type)
-        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = true))
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = true, storage = LocalStorage.value))
         statements.append(self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = true, value = value), self.state.span_of(value)))
         return self.state.push_node(HirNodeForm.Reference(symbol = symbol), value_type, self.state.span_of(value))
 
@@ -328,7 +345,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
     func check_binding(is_mutable: bool, pattern: BindingPatternSyntax, annotation: TypeSyntax?, value: ExpressionSyntax, span: SourceSpan) -> list[NodeId]!:
         match pattern:
             Name(name, name_span):
-                try self.state.require_free_local_name(name, name_span)
+                try self.require_free_local_name(name, name_span)
                 var expected: TypeId? = none
                 if annotation != none:
                     expected = try self.declarations.resolve_type(self.state.current_module, annotation)
@@ -337,7 +354,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 if self.state.contains_fallible(checked_type):
                     try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
                 let symbol = self.state.make_symbol(name, SymbolKind.local, checked_type)
-                self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked_type, is_mutable = is_mutable))
+                self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = checked_type, is_mutable = is_mutable, storage = LocalStorage.value))
                 return [self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = checked), span)]
             TupleNames(names, pattern_span):
                 # Duplicate names report at the binding statement; the pattern
@@ -358,10 +375,10 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 var index = 0
                 while index < len(names):
                     let name = names[index].text
-                    try self.state.require_free_local_name(name, names[index].span)
+                    try self.require_free_local_name(name, names[index].span)
                     let element_type = elements[index]
                     let symbol = self.state.make_symbol(name, SymbolKind.local, element_type)
-                    self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = is_mutable))
+                    self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = is_mutable, storage = LocalStorage.value))
                     let tuple_ref = self.state.push_node(HirNodeForm.Reference(symbol = tuple_symbol), checked_type, span)
                     let element = self.state.push_node(HirNodeForm.Element(value = tuple_ref, index = index), element_type, span)
                     statements.append(self.state.push_statement(HirNodeForm.Binding(symbol = symbol, is_mutable = is_mutable, value = element), names[index].span))
@@ -397,8 +414,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
             Index(indexed, subscript): return try self.check_place_assignment(target, operator, value, span)
             Group(grouped): return try self.check_assignment(grouped, operator, value, span)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
-        let local_index = self.state.find_local(name)
+        var local_index = self.state.find_local(name)
         if local_index < 0: try self.fail(span, "unknown local binding `" + name + "`")
+        local_index = self.capture_local(local_index, span)
         let local = self.state.locals[local_index]
         if not local.is_mutable:
             if name == "self": try self.fail(span, "cannot assign to `self` in a non-mutating method; declare the method `mutating`")
@@ -472,7 +490,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
         match target.form:
             Group(grouped): return try self.resolve_assignment_place(grouped, span, mutate_value)
             Name(root_name):
-                let local_index = self.state.find_local(root_name)
+                var local_index = self.state.find_local(root_name)
                 if local_index < 0:
                     let global_index = self.state.find_global_in_module(self.state.current_module, root_name)
                     if global_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
@@ -484,6 +502,7 @@ pub class HirBodyChecker: DeclarationValueChecker:
                         steps = list[u32](),
                         initializer_field = false,
                     )
+                local_index = self.capture_local(local_index, span)
                 let local = self.state.locals[local_index]
                 var initializer_field = false
                 let active_receiver = self.state.current_receiver
@@ -600,9 +619,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
         let subject_type = self.state.type_of(subject)
         let inner = self.state.optional_inner(subject_type) else error(self.diagnostic(condition_span, "`if let` requires an optional value, found `" + self.describe_type(subject_type) + "`"))
 
-        try self.state.require_free_local_name(name, condition_span)
+        try self.require_free_local_name(name, condition_span)
         let symbol = self.state.make_symbol(name, SymbolKind.local, inner)
-        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = inner, is_mutable = false))
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = inner, is_mutable = false, storage = LocalStorage.value))
         let present_body = self.state.push_nodes(try self.check_suite(body.statements))
         self.state.locals.remove(len(self.state.locals) - 1)
 
@@ -661,9 +680,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
             String: element = resolve_builtin_type(BuiltinType.character)
             else: pass
         let element_type = element else error(self.diagnostic(iterable.span, "`for` needs an iterable value, found `" + self.describe_type(self.state.type_of(checked_iterable)) + "`"))
-        try self.state.require_free_local_name(name, span)
+        try self.require_free_local_name(name, span)
         let symbol = self.state.make_symbol(name, SymbolKind.local, element_type)
-        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = false))
+        self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = element_type, is_mutable = false, storage = LocalStorage.value))
         self.state.loop_depth += 1
         let checked_body = self.check_suite(body.statements) catch reason:
             self.state.loop_depth -= 1
@@ -682,10 +701,13 @@ pub class HirBodyChecker: DeclarationValueChecker:
         match value.form:
             Literal(token): return try self.check_literal(token, expected)
             Name(name):
-                let local_index = self.state.find_local(name)
+                var local_index = self.state.find_local(name)
                 if local_index >= 0:
+                    local_index = self.capture_local(local_index, value.span)
                     let local = self.state.locals[local_index]
-                    let reference = self.state.push_node(HirNodeForm.Reference(symbol = local.symbol), local.value_type, value.span)
+                    var reference = self.state.push_node(HirNodeForm.Reference(symbol = local.symbol), local.value_type, value.span)
+                    if local.storage == LocalStorage.weak_capture:
+                        reference = self.state.push_node(HirNodeForm.WeakCaptureReference(symbol = local.symbol), local.value_type, value.span)
                     return try self.require_type(reference, expected)
                 let constant_index = self.state.find_constant_in_module(self.state.current_module, name)
                 if constant_index >= 0:
@@ -758,9 +780,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
             Slice(sliced, start, operator, end):
                 return try self.check_slice(sliced, start, end, value.span, expected)
             Lambda(parameters, body):
-                error(self.diagnostic(value.span, "lambdas are not implemented yet"))
+                return try self.check_lambda(parameters, body, value.span, expected)
             Closure(captures, parameters, result, body):
-                error(self.diagnostic(value.span, "closures are not implemented yet"))
+                return try self.check_block_closure(captures, parameters, result, body, value.span, expected)
             MatchValue(subject, arms):
                 return try self.check_match_value(subject, arms, value.span, expected)
             NewValue(value_type, arguments):
@@ -769,6 +791,215 @@ pub class HirBodyChecker: DeclarationValueChecker:
                 error(self.diagnostic(value.span, "`spawn` is not implemented yet"))
             CatchValue(caught, failure_name, body):
                 return try self.check_catch(caught, failure_name, body, value.span, expected)
+
+    # mark: Closures ============================================================================
+
+    # An expression lambda receives its complete signature from context. Its
+    # body is represented as an ordinary hidden HIR function whose sole
+    # statement yields the checked expression.
+    func check_lambda(parameters: list[ParameterSyntax], body: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let context = try self.callable_context(expected, span, "an expression lambda requires an expected function type")
+        let parameter_types = list[TypeId]()
+        var result = resolve_builtin_type(BuiltinType.unit)
+        var c_callable = false
+        match self.state.types.definitions[context.value].form:
+            Function(items, function_result):
+                for item in items: parameter_types.append(item)
+                result = function_result
+            CFunction(items, function_result):
+                for item in items: parameter_types.append(item)
+                result = function_result
+                c_callable = true
+            else: trap("callable context did not contain a callable")
+        if len(parameters) != len(parameter_types):
+            try self.fail(span, "lambda declares " + str(len(parameters)) + " parameter(s), expected " + str(len(parameter_types)))
+        return try self.check_anonymous_function(list[CaptureSyntax](), parameters, parameter_types, result, body, none, span, context, c_callable)
+
+    # A block closure can stand alone when every parameter is annotated; an
+    # omitted result is `unit`. Context supplies only missing parameter types
+    # and otherwise acts as the exact final signature check.
+    func check_block_closure(captures: list[CaptureSyntax], parameters: list[ParameterSyntax], result_syntax: TypeSyntax?, body: SuiteSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let parameter_types = list[TypeId]()
+        var contextual_result: TypeId? = none
+        var context: TypeId? = none
+        var c_callable = false
+        if expected != none:
+            let resolved_context = try self.callable_context(expected, span, "closure context must be a function type")
+            context = resolved_context
+            match self.state.types.definitions[resolved_context.value].form:
+                Function(items, function_result):
+                    for item in items: parameter_types.append(item)
+                    contextual_result = function_result
+                CFunction(items, function_result):
+                    for item in items: parameter_types.append(item)
+                    contextual_result = function_result
+                    c_callable = true
+                else: trap("callable context did not contain a callable")
+            if len(parameters) != len(parameter_types):
+                try self.fail(span, "closure declares " + str(len(parameters)) + " parameter(s), expected " + str(len(parameter_types)))
+        else:
+            for parameter in parameters:
+                let annotation = parameter.annotation else error(self.diagnostic(parameter.span, "parameter `" + parameter.name + "` requires a type when the closure has no expected function type"))
+                parameter_types.append(try self.declarations.resolve_type(self.state.current_module, annotation))
+
+        var result = resolve_builtin_type(BuiltinType.unit)
+        if result_syntax != none:
+            result = try self.declarations.resolve_type(self.state.current_module, result_syntax)
+        elif contextual_result != none:
+            result = contextual_result
+        return try self.check_anonymous_function(captures, parameters, parameter_types, result, none, body, span, context, c_callable)
+
+    # Shared implementation for both surface forms. Capture initializers are
+    # checked before the frame exists, then aliases and parameters establish
+    # the hidden function's independent local namespace.
+    func check_anonymous_function(captures: list[CaptureSyntax], parameters: list[ParameterSyntax], parameter_types: list[TypeId], result: TypeId, expression_body: ExpressionSyntax?, suite_body: SuiteSyntax?, span: SourceSpan, expected: TypeId?, c_callable: bool) -> NodeId!:
+        try self.state.validate_function_result(self.state.current_module, result, span)
+        let capture_names = list[str]()
+        let capture_types = list[TypeId]()
+        let capture_kinds = list[HirCaptureKind]()
+        let capture_initializers = list[NodeId]()
+        let capture_sources = list[SymbolId?]()
+        for capture in captures:
+            for previous in capture_names:
+                if previous == capture.name: try self.fail(capture.span, "duplicate capture `" + capture.name + "`")
+            capture_names.append(capture.name)
+            if capture.is_weak:
+                let source_index = self.state.find_local(capture.name)
+                if source_index < 0: try self.fail(capture.span, "weak capture `" + capture.name + "` requires an outer class binding")
+                let source = self.state.locals[source_index]
+                if self.declarations.class_of(source.value_type) < 0:
+                    try self.fail(capture.span, "weak capture `" + capture.name + "` requires a class value, found `" + self.describe_type(source.value_type) + "`")
+                capture_types.append(self.state.intern_optional(source.value_type))
+                capture_kinds.append(HirCaptureKind.weak_capture)
+                capture_initializers.append(self.state.push_node(HirNodeForm.Reference(symbol = source.symbol), source.value_type, capture.span))
+                capture_sources.append(source.symbol)
+            else:
+                let initializer_syntax = capture.value else trap("copy capture lost its initializer")
+                let initializer = try self.check_expression(initializer_syntax, none)
+                let initializer_type = self.state.type_of(initializer)
+                if self.state.contains_fallible(initializer_type):
+                    try self.fail(capture.span, "a fallible value cannot be copied into a closure capture")
+                capture_types.append(initializer_type)
+                capture_kinds.append(HirCaptureKind.value)
+                capture_initializers.append(initializer)
+                capture_sources.append(none)
+
+        let function_type = self.state.intern_function_type(parameter_types, result)
+        let hidden_name = "$closure_" + str(self.state.next_symbol)
+        let function_symbol = self.state.make_symbol(hidden_name, SymbolKind.function, result)
+        let closure = self.closures.begin(function_symbol, span)
+        let outer_count = len(self.state.locals)
+        for index in range(0, len(capture_names)):
+            self.closures.add_explicit(capture_names[index], capture_types[index], capture_kinds[index], capture_initializers[index], capture_sources[index], span) catch reason:
+                self.closures.abandon()
+                error(reason)
+
+        let checked_parameters = list[HirParameter]()
+        for index in range(0, len(parameters)):
+            let parameter = parameters[index]
+            if parameter.default_value != none:
+                self.restore_closure_scope(outer_count)
+                self.closures.abandon()
+                try self.fail(parameter.span, "anonymous-function parameters cannot have defaults because function values have no argument labels")
+            let annotation = parameter.annotation
+            if annotation != none:
+                let declared = try self.declarations.resolve_type(self.state.current_module, annotation)
+                if not types_match(declared, parameter_types[index]):
+                    self.restore_closure_scope(outer_count)
+                    self.closures.abandon()
+                    try self.fail(parameter.span, "parameter `" + parameter.name + "` has type `" + self.describe_type(declared) + "`, expected `" + self.describe_type(parameter_types[index]) + "`")
+            if self.state.contains_fallible(parameter_types[index]):
+                self.restore_closure_scope(outer_count)
+                self.closures.abandon()
+                try self.fail(parameter.span, "parameter `" + parameter.name + "` cannot store a fallible type")
+            self.require_free_local_name(parameter.name, parameter.span) catch reason:
+                self.restore_closure_scope(outer_count)
+                self.closures.abandon()
+                error(reason)
+            let symbol = self.state.make_symbol(parameter.name, SymbolKind.parameter, parameter_types[index])
+            checked_parameters.append(HirParameter(symbol = symbol, name = parameter.name, value_type = parameter_types[index], default_value = NodeId(value = no_node)))
+            self.state.locals.append(LocalBinding(symbol = symbol, name = parameter.name, value_type = parameter_types[index], is_mutable = false, storage = LocalStorage.value))
+
+        let saved_result = self.state.current_result
+        let saved_receiver = self.state.current_receiver
+        let saved_loop_depth = self.state.loop_depth
+        let saved_recovery_types = self.state.recovery_types
+        self.state.current_result = result
+        self.state.current_receiver = none
+        self.state.loop_depth = 0
+        self.state.recovery_types = list[TypeId]()
+
+        let statements = list[NodeId]()
+        if expression_body != none:
+            var successful_result = result
+            let inner_result = self.state.fallible_inner(result)
+            if inner_result != none: successful_result = inner_result
+            let yielded = self.check_expression(expression_body, successful_result) catch reason:
+                self.restore_anonymous_context(outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                error(reason)
+            statements.append(self.state.push_statement(HirNodeForm.ReturnStatement(value = yielded), span))
+        else:
+            let syntax = suite_body else trap("anonymous function has no body")
+            let checked_body = self.check_suite(syntax.statements) catch reason:
+                self.restore_anonymous_context(outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                error(reason)
+            for statement in checked_body: statements.append(statement)
+            var successful_result = result
+            let inner_result = self.state.fallible_inner(result)
+            if inner_result != none: successful_result = inner_result
+            if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)) and not self.statements_return(statements):
+                self.restore_anonymous_context(outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                try self.fail(span, "closure may finish without returning `" + self.describe_type(result) + "`")
+
+        let initializers = self.closures.finish(function_symbol, span)
+        self.restore_anonymous_context(outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+        var environment: u32? = none
+        if len(initializers) > 0: environment = closure
+        self.state.generated_functions.append(HirFunction(
+            symbol = function_symbol,
+            module = ModuleId(value = u32(self.state.current_module)),
+            name = hidden_name,
+            is_public = false,
+            documentation = list[str](),
+            receiver = none,
+            closure = environment,
+            parameters = checked_parameters,
+            result = result,
+            implementation = HirFunctionImplementation.Defined(body = self.state.push_nodes(statements)),
+            span = span,
+        ))
+
+        var value_type = function_type
+        if c_callable:
+            if len(initializers) > 0: try self.fail(span, "a capturing closure cannot become a `cfunc` value")
+            value_type = self.state.intern_c_function_type(parameter_types, result)
+        var value = self.state.push_node(HirNodeForm.FunctionAddress(function = function_symbol), value_type, span)
+        if len(initializers) > 0:
+            value = self.state.push_node(HirNodeForm.ClosureValue(closure = closure, initializers = self.state.push_nodes(initializers)), function_type, span)
+        return try self.require_type(value, expected)
+
+    func callable_context(expected: TypeId?, span: SourceSpan, message: str) -> TypeId!:
+        let supplied = expected else error(self.diagnostic(span, message))
+        var context = supplied
+        let optional = self.state.optional_inner(supplied)
+        if optional != none: context = optional
+        match self.state.types.definitions[context.value].form:
+            Function(parameters, result): return context
+            CFunction(parameters, result): return context
+            else: error(self.diagnostic(span, message + ", found `" + self.describe_type(supplied) + "`"))
+
+    func restore_closure_scope(outer_count: i64):
+        while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+
+    func restore_anonymous_context(outer_count: i64, result: TypeId, receiver: HirReceiver?, loop_depth: i64, recovery_types: list[TypeId]):
+        self.restore_closure_scope(outer_count)
+        self.state.current_result = result
+        self.state.current_receiver = receiver
+        self.state.loop_depth = loop_depth
+        self.state.recovery_types = recovery_types
 
     # A bare literal becomes a constant. An unsuffixed integer is i64 unless
     # the context asks for another integer width, e.g. `let count: i32 = 7`.
@@ -1633,10 +1864,10 @@ pub class HirBodyChecker: DeclarationValueChecker:
     func check_catch(caught: ExpressionSyntax, failure_name: str, body: SuiteSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let checked = try self.check_expression(caught, none)
         let successful = self.state.fallible_inner(self.state.type_of(checked)) else error(self.diagnostic(caught.span, "`catch` needs a fallible expression"))
-        try self.state.require_free_local_name(failure_name, span)
+        try self.require_free_local_name(failure_name, span)
         let failure = self.state.make_symbol(failure_name, SymbolKind.local, resolve_builtin_type(BuiltinType.error_value))
         let outer_count = len(self.state.locals)
-        self.state.locals.append(LocalBinding(symbol = failure, name = failure_name, value_type = resolve_builtin_type(BuiltinType.error_value), is_mutable = false))
+        self.state.locals.append(LocalBinding(symbol = failure, name = failure_name, value_type = resolve_builtin_type(BuiltinType.error_value), is_mutable = false, storage = LocalStorage.value))
         self.state.recovery_types.append(successful)
         let statements = try self.check_suite(body.statements)
         self.state.recovery_types.remove(len(self.state.recovery_types) - 1)
@@ -2300,9 +2531,9 @@ pub class HirBodyChecker: DeclarationValueChecker:
             if previous == name: try self.fail(span, "`" + name + "` is bound twice in one pattern")
         bound.append(name)
         if is_first:
-            try self.state.require_free_local_name(name, span)
+            try self.require_free_local_name(name, span)
             let symbol = self.state.make_symbol(name, SymbolKind.local, value_type)
-            self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = false))
+            self.state.locals.append(LocalBinding(symbol = symbol, name = name, value_type = value_type, is_mutable = false, storage = LocalStorage.value))
             bindings.append(ArmBinding(name = name, symbol = symbol, value_type = value_type))
             return symbol
         for binding in bindings:

@@ -15,12 +15,12 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ClassId, DataId, FunctionId, GlobalId
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ClassId, ClosureId, DataId, FunctionId, GlobalId
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
 from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_int_type, is_ptr_type, is_signed_int_type, mir_type, no_register, no_registers, uint_maximum
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
@@ -30,7 +30,7 @@ from compiler.frontend.source import SourceSpan
 import std.strings
 from compiler.mir.lowering_model import CExternContract, CExternSlot, COutputSlot, CWrapper, DeferredAction, ExternalGlobalContract
 from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, LoweredFunction, MatchExit, MirLoweringState, contains_symbol
-from compiler.mir.lowering_model import OwnershipHelper, RecoverTarget, Region
+from compiler.mir.lowering_model import CellStorage, OwnershipHelper, RecoverTarget, Region
 
 ## The non-owning result of adapting a source `Class?` for a weak sink. Presence
 ## is kept separately from the weak handle because a dying `self` is already
@@ -61,6 +61,7 @@ pub class FunctionLowerer:
         let results = list[TypeId]()
         let fallible_result = self.state.fallible_inner(function.result)
         let is_fallible = fallible_result != none
+        var environment: RegisterId? = none
         var successful_result = function.result
         if fallible_result != none: successful_result = fallible_result
         let returns_unit = types_match(successful_result, resolve_builtin_type(BuiltinType.unit))
@@ -68,6 +69,10 @@ pub class FunctionLowerer:
             let pointer = builtin_mir_type(BuiltinMirType.pointer)
             parameter_types.append(pointer)
             self.state.error_slot = i64(self.state.new_register(pointer).value)
+        if function.closure != none:
+            let pointer = builtin_mir_type(BuiltinMirType.pointer)
+            parameter_types.append(pointer)
+            environment = self.state.new_register(pointer)
         if not returns_unit:
             let result_type = try self.state.mir_type_of(module, function, function.span, successful_result)
             if self.is_aggregate(result_type):
@@ -84,6 +89,20 @@ pub class FunctionLowerer:
                 self.state.parameters.append(Local(symbol = parameter.symbol.value, address = self.state.new_register(parameter_type)))
 
         let body = list[MirInstruction]()
+        if function.closure != none:
+            let hir_closure = function.closure else trap("capturing function lost its HIR closure identity")
+            let closure_environment = environment else trap("capturing function lost its environment parameter")
+            let closure = self.state.closure_id_of(i64(hir_closure))
+            let source = self.state.program.closures[hir_closure]
+            for capture_index in range(0, len(source.captures)):
+                let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.ClosureCaptureAddress(
+                    result = address,
+                    environment = closure_environment,
+                    closure = closure,
+                    capture = capture_index,
+                ), span = source.span))
+                self.state.locals.append(Local(symbol = source.captures[capture_index].symbol.value, address = address))
         let source_body = function_body(function)
         try self.lower_prologue(module, function, source_body, body)
         try self.lower_scope(module, function, source_body, body)
@@ -206,6 +225,70 @@ pub class FunctionLowerer:
             span = class_value.span,
         )
 
+    ## Final release for one closure environment. Capture initialization is
+    ## atomic from the language's perspective; the initialized flag still
+    ## makes the managed-object lifecycle explicit and robust to backend traps.
+    pub func lower_closure_destroyer(closure_index: i64, identity: FunctionId) -> MirFunction:
+        self.begin_function()
+        let closure = self.state.closures[closure_index]
+        let source = self.state.program.closures[self.hir_closure_index(closure_index)]
+        let span = source.span
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let environment = self.state.new_register(pointer)
+        let initialized = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        let body = list[MirInstruction]()
+        self.open_if(initialized, list[RegisterId](), span, body)
+        var capture_index = len(closure.captures) - 1
+        while capture_index >= 0:
+            let address = self.closure_capture_address(environment, ClosureId(value = u32(closure_index)), capture_index, span, body)
+            self.emit_ownership_at(closure.captures[capture_index].value_type, address, false, span, body)
+            capture_index -= 1
+        self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
+        return MirFunction(
+            name = ".luce_destroy_closure" + str(closure_index) + "_f" + str(identity.value),
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = [pointer, builtin_mir_type(BuiltinMirType.boolean)], results = list[TypeId](), is_fallible = false),
+            registers = self.state.registers,
+            slots = self.state.slots,
+            body = body,
+            operands = self.state.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = span,
+        )
+
+    ## Final release for one mutable capture cell. A cell owns exactly one
+    ## source value once its defining binding has finished initialization.
+    pub func lower_cell_destroyer(cell: CellStorage) -> MirFunction:
+        self.begin_function()
+        let instance = self.state.new_register(cell.cell_type)
+        let initialized = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        let body = list[MirInstruction]()
+        let span = SourceSpan(start = 0, end = 0, line = 1, column = 1)
+        self.open_if(initialized, list[RegisterId](), span, body)
+        let address = self.cell_value_address(instance, cell.element_type, span, body)
+        self.emit_ownership_at(cell.element_type, address, false, span, body)
+        self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = span))
+        return MirFunction(
+            name = ".luce_destroy_cell_t" + str(cell.element_type.value) + "_f" + str(cell.destroyer.value),
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = [cell.cell_type, builtin_mir_type(BuiltinMirType.boolean)], results = list[TypeId](), is_fallible = false),
+            registers = self.state.registers,
+            slots = self.state.slots,
+            body = body,
+            operands = self.state.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = span,
+        )
+
+    func hir_closure_index(lowered: i64) -> i64:
+        for hir_index in range(0, len(self.state.lowered_closures)):
+            if self.state.lowered_closures[hir_index] == u32(lowered): return hir_index
+        trap("canonical closure has no HIR source")
+
     func type_needs_ownership(value_type: TypeId) -> bool:
         match mir_type(self.state.types, value_type):
             BufferOwner: return true
@@ -213,6 +296,8 @@ pub class FunctionLowerer:
             Slice(element): return true
             Class(identity): return true
             WeakClass(identity): return true
+            Cell(element): return true
+            Func(signature): return true
             Struct(fields):
                 for field in fields:
                     if self.type_needs_ownership(field.value_type): return true
@@ -255,6 +340,12 @@ pub class FunctionLowerer:
             WeakClass(identity):
                 if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
+            Cell(element):
+                if retaining: body.append(MirInstruction(form = InstructionForm.CellRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.CellRelease(value = value), span = span))
+            Func(signature):
+                if retaining: body.append(MirInstruction(form = InstructionForm.FunctionRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.FunctionRelease(value = value), span = span))
             else: trap("managed scalar has no ownership operation")
 
     # Every managed expression result owns one structural reference. A value
@@ -323,6 +414,13 @@ pub class FunctionLowerer:
                 let value = self.load_value(value_type, address, span, body)
                 if retaining: body.append(MirInstruction(form = InstructionForm.WeakClassRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.WeakClassRelease(value = value), span = span))
+            Cell(element):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining: body.append(MirInstruction(form = InstructionForm.CellRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.CellRelease(value = value), span = span))
+            Func(signature):
+                if retaining: body.append(MirInstruction(form = InstructionForm.FunctionRetain(value = address), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.FunctionRelease(value = address), span = span))
             Struct(fields):
                 if retaining:
                     for index in range(0, len(fields)):
@@ -361,6 +459,8 @@ pub class FunctionLowerer:
             Slice(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Class(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             WeakClass(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Cell(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Func(signature): self.function_null(value_type, address, span, body)
             Struct(fields):
                 for index in range(0, len(fields)):
                     let field = fields[index]
@@ -384,6 +484,30 @@ pub class FunctionLowerer:
         let index = self.load_value(index_type, counter, span, body)
         let done = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
         body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = self.integer_constant(index_type, count, span, body)), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+        self.initialize_ownership_at(element_type, self.element_address(element_type, address, index, span, body), span, body)
+        let next = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+    # Runtime allocation yields raw storage, while `native.store` has ordinary
+    # replacement semantics so audited runtime code can update managed header
+    # values without leaking their former contents. Establish an inert state
+    # for every owning field before that first replacement. The element count
+    # and type remain canonical MIR facts; backends still choose only layout.
+    func initialize_allocated_ownership(element_type: TypeId, count: RegisterId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        if not self.type_needs_ownership(element_type): return
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = count), span = span))
         body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
         self.initialize_ownership_at(element_type, self.element_address(element_type, address, index, span, body), span, body)
         let next = self.state.new_register(index_type)
@@ -494,7 +618,8 @@ pub class FunctionLowerer:
             try self.lower_prologue_node(module, function, statement, body)
             match node_form(self.state.program, statement):
                 Binding(symbol, is_mutable, value):
-                    let slot_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                    var slot_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                    if self.state.is_shared_symbol(symbol): slot_type = self.state.cell_for_symbol(symbol).cell_type
                     let slot = len(self.state.slots)
                     self.state.slots.append(MirSlot(value_type = slot_type))
                     let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
@@ -657,7 +782,8 @@ pub class FunctionLowerer:
 
     # One slot for a binding introduced by a pattern; its type is the symbol's.
     func reserve_slot(module: HirModule, function: HirFunction, symbol: SymbolId, span: SourceSpan, body: list[MirInstruction]) -> !:
-        let slot_type = try self.state.mir_type_of(module, function, span, self.state.program.symbols[symbol.value].value_type)
+        var slot_type = try self.state.mir_type_of(module, function, span, self.state.program.symbols[symbol.value].value_type)
+        if self.state.is_shared_symbol(symbol): slot_type = self.state.cell_for_symbol(symbol).cell_type
         let slot = len(self.state.slots)
         self.state.slots.append(MirSlot(value_type = slot_type))
         let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
@@ -720,11 +846,20 @@ pub class FunctionLowerer:
                 let local = try self.state.local_of(module, function, span, symbol)
                 let register = try self.lower_expression(module, function, value, body)
                 let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
-                self.initialize_owned_value(value_type, local.address, register, span, body)
-                if self.type_needs_ownership(value_type):
-                    self.state.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = value_type, span = span))
+                if self.state.is_shared_symbol(symbol):
+                    let cell = self.state.cell_for_symbol(symbol)
+                    let storage = self.state.new_register(cell.cell_type)
+                    body.append(MirInstruction(form = InstructionForm.CellCreate(result = storage, element_type = cell.element_type, destroyer = cell.destroyer), span = span))
+                    self.initialize_owned_value(value_type, self.cell_value_address(storage, cell.element_type, span, body), register, span, body)
+                    body.append(MirInstruction(form = InstructionForm.CellMarkInitialized(value = storage), span = span))
+                    self.store_value(cell.cell_type, local.address, storage, span, body)
+                    self.state.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = cell.cell_type, span = span))
+                else:
+                    self.initialize_owned_value(value_type, local.address, register, span, body)
+                    if self.type_needs_ownership(value_type):
+                        self.state.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = value_type, span = span))
             Assignment(symbol, operation, value):
-                let address = try self.address_of(module, function, span, symbol)
+                let address = try self.address_of(module, function, span, symbol, body)
                 let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
                 try self.lower_store(module, function, span, value_type, address, operation, value, body)
             ExternStore(variable_index, operation, value):
@@ -753,7 +888,7 @@ pub class FunctionLowerer:
                 if root_is_class and parameter != none:
                     try self.lower_place_store(module, function, span, parameter, true, root_type, steps, operation, value, body)
                 else:
-                    try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol), false, root_type, steps, operation, value, body)
+                    try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol, body), false, root_type, steps, operation, value, body)
             GlobalPlaceAssignment(global, steps, operation, value):
                 try self.lower_place_store(module, function, span, self.global_address(global, span, body), false, self.state.program.globals[global].value_type, steps, operation, value, body)
             ExpressionStatement(value):
@@ -952,13 +1087,32 @@ pub class FunctionLowerer:
 
     # The address a mutable binding lives at: a local's slot, or — for `self`
     # in a mutating method — the pointer the caller passed.
-    func address_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId) -> RegisterId!:
+    func address_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, body: list[MirInstruction]) -> RegisterId!:
         for parameter in self.state.parameters:
             if parameter.symbol == symbol.value:
                 if is_ptr_type(self.state.types, self.state.registers[parameter.address.value]): return parameter.address
                 try self.state.fail_unsupported(module, function, span, "assignment to a scalar parameter")
         let local = try self.state.local_of(module, function, span, symbol)
+        if self.symbol_uses_cell(function, symbol):
+            let cell = self.state.cell_for_symbol(symbol)
+            let storage = self.load_value(cell.cell_type, local.address, span, body)
+            return self.cell_value_address(storage, cell.element_type, span, body)
         return local.address
+
+    func symbol_uses_cell(function: HirFunction, symbol: SymbolId) -> bool:
+        if self.state.is_shared_symbol(symbol): return true
+        let index = self.capture_index(function, symbol)
+        if index < 0: return false
+        let hir_closure = function.closure else trap("captured symbol belongs to a function without a closure")
+        return self.state.program.closures[hir_closure].captures[index].kind == HirCaptureKind.shared_cell
+
+    func capture_index(function: HirFunction, symbol: SymbolId) -> i64:
+        let hir_closure = function.closure
+        if hir_closure == none: return -1
+        let captures = self.state.program.closures[hir_closure].captures
+        for index in range(0, len(captures)):
+            if captures[index].symbol.value == symbol.value: return index
+        return -1
 
     func parameter_value(symbol: SymbolId) -> RegisterId?:
         for parameter in self.state.parameters:
@@ -1772,8 +1926,7 @@ pub class FunctionLowerer:
                 let constant = self.state.constant_of(symbol)
                 if constant != none:
                     return try self.lower_expression(module, function, constant.value, body)
-                let local = try self.state.local_of(module, function, span, symbol)
-                return self.load_value(value_type, local.address, span, body)
+                return self.load_value(value_type, try self.address_of(module, function, span, symbol, body), span, body)
             FunctionAddress(target):
                 let source_index = self.state.function_index_of(target)
                 if source_index < 0: trap("function address names an unknown HIR symbol")
@@ -1782,22 +1935,65 @@ pub class FunctionLowerer:
                 # an indirect signature that disagrees with the definition.
                 if self.state.is_process_entry(self.state.program.functions[source_index]):
                     try self.state.fail_unsupported(module, function, span, "process-entry function values")
-                let result = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 match self.state.program.types.definitions[node_type(self.state.program, expression).value].form:
                     CFunction(parameters, function_result):
+                        let result = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
                         match self.state.lowered_functions[source_index]:
                             External(external): body.append(MirInstruction(form = InstructionForm.ExternAddress(result = result, external = external), span = span))
                             Defined(function_id):
                                 match self.state.c_wrappers[source_index]:
                                     Present(wrapper): body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = wrapper), span = span))
                                     Absent: trap("cfunc conversion has no predeclared C wrapper")
+                        return result
                     else:
                         var lowered = FunctionId(value = 0)
                         match self.state.lowered_functions[source_index]:
                             Defined(function_id): lowered = function_id
                             External(external): trap("Luce function address names a C extern")
-                        body.append(MirInstruction(form = InstructionForm.FunctionAddress(result = result, function = lowered), span = span))
+                        let result = self.new_temp(value_type, span, body)
+                        body.append(MirInstruction(form = InstructionForm.FunctionValue(destination = result, function_type = value_type, function = lowered), span = span))
+                        return result
+            ClosureValue(hir_closure, initializers):
+                let closure = self.state.closure_id_of(i64(hir_closure))
+                let source = self.state.program.closures[hir_closure]
+                let metadata = self.state.closures[closure.value]
+                if len(source.captures) != i64(initializers.count): trap("HIR closure initializers do not match capture metadata")
+                let result = self.new_temp(value_type, span, body)
+                let environment = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.ClosureCreate(environment = environment, destination = result, function_type = value_type, closure = closure), span = span))
+                for capture_index in range(0, len(source.captures)):
+                    let capture = source.captures[capture_index]
+                    let storage_type = metadata.captures[capture_index].value_type
+                    let address = self.closure_capture_address(environment, closure, capture_index, span, body)
+                    if capture.kind == HirCaptureKind.shared_cell:
+                        let source_symbol = capture.source else trap("shared closure capture has no source symbol")
+                        let source_local = try self.state.local_of(module, function, span, source_symbol)
+                        let cell = self.state.cell_for_symbol(source_symbol)
+                        let storage = self.load_value(cell.cell_type, source_local.address, span, body)
+                        self.initialize_owned_value(storage_type, address, storage, span, body)
+                    elif capture.kind == HirCaptureKind.weak_capture:
+                        let initializer = node_at(self.state.program, initializers, capture_index)
+                        let strong = try self.lower_expression(module, function, initializer, body)
+                        let weak_value = self.state.new_register(storage_type)
+                        body.append(MirInstruction(form = InstructionForm.WeakClassCreate(result = weak_value, value = strong), span = span))
+                        self.store_value(storage_type, address, weak_value, span, body)
+                    else:
+                        let initializer = node_at(self.state.program, initializers, capture_index)
+                        let captured = try self.lower_expression(module, function, initializer, body)
+                        self.initialize_owned_value(storage_type, address, captured, span, body)
+                body.append(MirInstruction(form = InstructionForm.ClosureMarkInitialized(environment = environment), span = span))
                 return result
+            WeakCaptureReference(symbol):
+                let hir_closure = function.closure else trap("weak capture reference appears outside a closure body")
+                let capture_index = self.capture_index(function, symbol)
+                if capture_index < 0: trap("weak capture reference has no capture field")
+                let closure = self.state.closure_id_of(i64(hir_closure))
+                let weak_type = self.state.closures[closure.value].captures[capture_index].value_type
+                let local = try self.state.local_of(module, function, span, symbol)
+                let weak_value = self.load_value(weak_type, local.address, span, body)
+                let promoted = self.new_temp(value_type, span, body)
+                body.append(MirInstruction(form = InstructionForm.WeakClassPromote(destination = promoted, value = weak_value, optional_type = value_type), span = span))
+                return promoted
             ExternLoad(variable_index):
                 let global = self.state.lowered_external_globals[variable_index]
                 let result = self.state.new_register(value_type)
@@ -1824,6 +2020,7 @@ pub class FunctionLowerer:
                 let stored_type = try self.state.mir_type_of(module, function, span, element_type)
                 let result = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 body.append(MirInstruction(form = InstructionForm.AllocateStorage(result = result, element_type = stored_type, count = element_count), span = span))
+                self.initialize_allocated_ownership(stored_type, element_count, result, span, body)
                 return result
             NativeArena(end):
                 let requested_end = try self.lower_expression(module, function, end, body)
@@ -2163,7 +2360,7 @@ pub class FunctionLowerer:
     func lower_mutable_place_address(module: HirModule, function: HirFunction, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.state.program, value)
         match node_form(self.state.program, value):
-            Reference(symbol): return try self.address_of(module, function, span, symbol)
+            Reference(symbol): return try self.address_of(module, function, span, symbol, body)
             FieldAccess(inner, field):
                 let base = try self.lower_mutable_place_address(module, function, inner, body)
                 let owner_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, inner))
@@ -2257,7 +2454,7 @@ pub class FunctionLowerer:
                 value = self.state.new_register(result_type)
                 results.append(value)
         for argument in operands.values: call_arguments.append(argument)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = operands.target, arguments = self.state.operands.run(call_arguments)), span = span))
+        body.append(MirInstruction(form = InstructionForm.CallClosure(results = self.state.operands.run(results), signature = signature, target = operands.target, arguments = self.state.operands.run(call_arguments)), span = span))
         return value
 
     # A cfunc call uses the same evaluated callee/argument list as an ordinary
@@ -2306,7 +2503,7 @@ pub class FunctionLowerer:
         for argument in operands.values: call_arguments.append(argument)
         let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         results.append(reported_error)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = self.function_value_convention(node_type(self.state.program, callee)), target = operands.target, arguments = self.state.operands.run(call_arguments)), span = span))
+        body.append(MirInstruction(form = InstructionForm.CallClosure(results = self.state.operands.run(results), signature = signature, target = operands.target, arguments = self.state.operands.run(call_arguments)), span = span))
         return FallibleResult(value = value, error_value = reported_error)
 
     func lower_fallible_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
@@ -3015,6 +3212,7 @@ pub class FunctionLowerer:
             Struct(fields): return true
             Enum(tag, cases): return true
             Array(element, count): return true
+            Func(signature): return true
             else: return false
 
     func list_element_mir_type(value_type: TypeId) -> TypeId:
@@ -3036,6 +3234,9 @@ pub class FunctionLowerer:
         let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.Alloca(result = address, slot = slot), span = span))
         return address
+
+    func function_null(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        body.append(MirInstruction(form = InstructionForm.FunctionNull(destination = address, function_type = value_type), span = span))
 
     # Put a value at an address: `Memcpy` for an aggregate, `Store` otherwise.
     func store_value(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
@@ -3060,6 +3261,16 @@ pub class FunctionLowerer:
     func class_field_address(value: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
         let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.ClassFieldAddress(result = address, value = value, field = field), span = span))
+        return address
+
+    func closure_capture_address(environment: RegisterId, closure: ClosureId, capture: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ClosureCaptureAddress(result = address, environment = environment, closure = closure, capture = capture), span = span))
+        return address
+
+    func cell_value_address(value: RegisterId, element_type: TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.CellValueAddress(result = address, value = value, element_type = element_type), span = span))
         return address
 
     func element_address(element_type: TypeId, base: RegisterId, index: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:

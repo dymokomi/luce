@@ -227,6 +227,42 @@ pub func test_typed_runtime_storage_lowers_without_concrete_layout():
                 else: assert(false)
         else: assert(false)
 
+pub func test_typed_allocation_initializes_managed_slots_before_native_store_replaces_them():
+    let modules = [native_source_module(
+        "allocator",
+        "struct Header:\n    let callback: func(native_mut_ptr[u8]) -> unit\nfunc noop(value: native_mut_ptr[u8]): return\nfunc allocate(byte_count: u64, byte_alignment: u64) -> native_mut_ptr[u8]: return native.arena(byte_count)\nfunc retain(value: native_mut_ptr[u8]): return\nfunc release(value: native_mut_ptr[u8]): return\nfunc acquire(count: u64) -> native_mut_ptr[Header]:\n    let pointer = native.allocate[Header](count)\n    native.store(pointer, Header(callback = noop))\n    return pointer\n",
+    )]
+    let generator = HirGenerator("org.luce.runtime", modules, PackageRole.sealed_runtime)
+    generator.bind_runtime_service(RuntimeService.storage_allocator, "allocator", "allocate")
+    generator.bind_runtime_service(RuntimeService.class_retain, "allocator", "retain")
+    generator.bind_runtime_service(RuntimeService.class_release, "allocator", "release")
+    let hir = generator.generate() catch reason:
+        trap(reason)
+    let analyzed = SemanticAnalyzer(hir).analyze() catch reason:
+        trap(reason)
+    let program = Lowerer(analyzed).lower() catch reason:
+        trap(reason)
+    MirVerifier(program).verify() catch reason:
+        trap(reason)
+
+    let acquire = program.functions[4]
+    assert(acquire.name == "allocator.acquire")
+    var allocation = -1
+    var initialization = -1
+    var replacement_release = -1
+    for index in range(0, len(acquire.body)):
+        match acquire.body[index].form:
+            AllocateStorage(result, element_type, count): allocation = index
+            FunctionNull(destination, function_type):
+                if allocation >= 0 and initialization < 0: initialization = index
+            Call(results, target, arguments):
+                if initialization >= 0 and strings.contains(program.functions[target.value].name, ".luce_release_t"):
+                    replacement_release = index
+            else: pass
+    assert(allocation >= 0)
+    assert(initialization > allocation)
+    assert(replacement_release > initialization)
+
 pub func test_runtime_globals_are_zero_initialized_and_persistent_in_both_oracles():
     let analyzed = checked_runtime_modules([source_module(
         "state",
@@ -298,6 +334,16 @@ func verify_application(program: MirProgram):
                 WeakClassRetain(value): needs_runtime = true
                 WeakClassRelease(value): needs_runtime = true
                 WeakClassPromote(destination, value, optional_type): needs_runtime = true
+                CellCreate(result, element_type, destroyer): needs_runtime = true
+                CellMarkInitialized(value): needs_runtime = true
+                CellRetain(value): needs_runtime = true
+                CellRelease(value): needs_runtime = true
+                CellValueAddress(result, value, element_type): needs_runtime = true
+                ClosureCreate(environment, destination, function_type, closure): needs_runtime = true
+                ClosureMarkInitialized(environment): needs_runtime = true
+                ClosureCaptureAddress(result, environment, closure, capture): needs_runtime = true
+                FunctionRetain(value): needs_runtime = true
+                FunctionRelease(value): needs_runtime = true
                 else: pass
     if not needs_runtime:
         MirVerifier(program).verify() catch reason:
@@ -998,9 +1044,9 @@ pub func test_slice_function_values_keep_the_exact_reference_signature():
     let source = "func keep(items: slice[i64]) -> slice[i64]: return items\nfunc invoke(operation: func(slice[i64]) -> slice[i64], items: slice[i64]) -> slice[i64]: return operation(items)\n"
     let program = Lowerer(checked(source)).lower() catch reason:
         trap(reason)
-    # The two source functions stay first. Releasing the borrowed slice
-    # argument also demand-generates the exact element ownership callbacks.
-    assert(len(program.functions) == 4)
+    # The two source functions stay first. Function and slice ownership may
+    # demand-generate structural callbacks after them.
+    assert(len(program.functions) >= 4)
     let invoke = program.functions[1]
     assert(is_type(invoke.signature.parameters[0], BuiltinMirType.pointer))
     assert(describe_mir_type(program.types, invoke.signature.parameters[1]) == "slice[i64]")
@@ -1008,9 +1054,8 @@ pub func test_slice_function_values_keep_the_exact_reference_signature():
     var indirect_calls = 0
     for instruction in invoke.body:
         match instruction.form:
-            CallIndirect(results, signature, convention, target, arguments):
+            CallClosure(results, signature, target, arguments):
                 indirect_calls += 1
-                assert(convention == CallingConvention.luce)
                 assert(describe_mir_type(program.types, signature.parameters[0]) == "slice[i64]")
                 assert(describe_mir_type(program.types, signature.results[0]) == "slice[i64]")
                 assert(register_at(invoke, arguments, 0).value == 1)
@@ -1072,7 +1117,7 @@ pub func test_calls_place_arguments_by_parameter_index_in_source_order():
         else: assert(false)
     assert(agree(source) == "12")
 
-pub func test_exact_function_values_lower_to_one_canonical_indirect_call_protocol():
+pub func test_exact_function_values_lower_to_one_canonical_closure_call_protocol():
     let source = "func add(left: i64, right: i64) -> i64: return left + right\npub func answer() -> i64:\n    let operation: func(i64, i64) -> i64 = add\n    return operation(20, 22)\n"
     let program = lowered(source)
     let caller = program.functions[1]
@@ -1080,13 +1125,12 @@ pub func test_exact_function_values_lower_to_one_canonical_indirect_call_protoco
     var saw_indirect = false
     for instruction in caller.body:
         match instruction.form:
-            FunctionAddress(result, function):
+            FunctionValue(destination, function_type, function):
                 saw_address = true
                 assert(function.value == 0)
-                assert(is_type(caller.registers[result.value], BuiltinMirType.pointer))
-            CallIndirect(results, signature, convention, target, arguments):
+                assert(is_type(caller.registers[destination.value], BuiltinMirType.pointer))
+            CallClosure(results, signature, target, arguments):
                 saw_indirect = true
-                assert(convention == CallingConvention.luce)
                 assert(is_type(caller.registers[target.value], BuiltinMirType.pointer))
                 assert(not signature.is_fallible)
                 assert(len(signature.parameters) == 2 and len(signature.results) == 1)
@@ -1102,9 +1146,8 @@ pub func test_exact_function_values_lower_to_one_canonical_indirect_call_protoco
     var saw_fallible = false
     for instruction in fallible.functions[1].body:
         match instruction.form:
-            CallIndirect(results, signature, convention, target, arguments):
+            CallClosure(results, signature, target, arguments):
                 saw_fallible = true
-                assert(convention == CallingConvention.luce)
                 assert(signature.is_fallible)
                 # hidden error storage precedes the one source argument;
                 # scalar success and error pointer are both results.
@@ -1113,6 +1156,24 @@ pub func test_exact_function_values_lower_to_one_canonical_indirect_call_protoco
                 assert(arguments.count == 2 and results.count == 2)
             else: pass
     assert(saw_fallible)
+
+pub func test_closures_lower_to_typed_environments_cells_and_calls():
+    let source = "pub func answer() -> i64:\n    var current = 40\n    let next = func () -> i64:\n        current += 1\n        return current\n    let first = next()\n    return first + next()\n"
+    let program = lowered(source)
+    assert(len(program.closures) == 1)
+    assert(len(program.closures[0].captures) == 1)
+    assert(describe_mir_type(program.types, program.closures[0].captures[0].value_type) == "cell[i64]")
+    assert(agree(source) == "83")
+
+pub func test_escaping_nested_and_weak_closures_agree_with_the_hir_oracle():
+    let escaping = "func make(start: i64) -> func() -> i64:\n    var value = start\n    return func () -> i64:\n        value += 1\n        return value\npub func answer() -> i64:\n    let next = make(40)\n    return next() + next()\n"
+    assert(agree(escaping) == "83")
+
+    let nested = "func make(value: i64) -> func() -> func() -> i64:\n    return () => () => value\npub func answer() -> i64:\n    let outer = make(42)\n    let inner = outer()\n    return inner()\n"
+    assert(agree(nested) == "42")
+
+    let weak_capture = "class Owner:\n    var value: i64\n    func init(self, value: i64): self.value = value\nfunc read(owner: Owner) -> func() -> i64?:\n    return func [weak owner] () -> i64?:\n        if let live = owner: return live.value\n        return none\nfunc expired() -> func() -> i64?:\n    let owner = new Owner(42)\n    return read(owner)\npub func answer() -> i64:\n    let callback = expired()\n    return callback() else 0\n"
+    assert(agree(weak_capture) == "0")
 
 pub func test_cfunc_values_lower_to_shared_c_adapters_and_extern_addresses():
     let callback = lowered("func negate(value: i32) -> i32: return -value\npub func answer() -> i32:\n    let operation: cfunc(i32) -> i32 = negate\n    return operation(-42i32)\n")
