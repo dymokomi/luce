@@ -299,6 +299,17 @@ program. Only the tiny stable-arena provider remains backend-owned: Wasm may
 grow its memory, while native may reserve/commit virtual storage. Neither fact
 appears in HIR or canonical MIR. The full service list is in the appendix.
 
+Composition is an identity remap, not a source import or a link step. The
+application's tables remain the prefix unchanged. The runtime's canonical
+builtin prefix maps back to those same builtin identities; its remaining
+types, functions, globals and data are appended, its equal external
+declarations are interned, and every reference in its instructions and
+service bindings is rewritten once. A conflict is reported before
+verification. The composer rejects application-owned service bindings and a
+runtime entry, public function or artifact export, preserving the sealed
+boundary structurally. The combined program alone then enters verification,
+reachability and backend encoding.
+
 Retain and release calls are placed by the lowerer using the ownership facts
 that `SemanticAnalyzer` will attach to HIR (§11.3). Until that analysis
 exists, the lowerer uses the simplest rule that is never wrong — retain on

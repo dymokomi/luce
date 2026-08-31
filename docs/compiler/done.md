@@ -181,6 +181,18 @@ Last updated: 2026-08-30 (Stage-0 0.28).
   all three cases. The former `luce_rt_alloc` extern route is gone, so MIR
   cannot smuggle target byte layout around the typed instruction. The
   production sealed runtime and source collection lowering remain pending.
+- [x] **Sealed runtime composition is an explicit MIR stage** (2026-08-30).
+  The application keeps all of its canonical identities while the separately
+  compiled runtime has every structural type and table reference remapped
+  once. Identical external declarations are interned; conflicting C
+  function/object shapes fail during composition. Only the runtime may supply
+  service bindings, and it may expose neither a process entry nor public or
+  artifact functions. Verification and reachability run on the one combined
+  program, retaining the private allocator through a live typed-allocation
+  edge and pruning unrelated runtime code. Tests cover every remapped table,
+  input immutability, service identity, external interning and sealed-boundary
+  diagnostics. Production runtime source and its freestanding analysis are
+  still pending.
 - [x] **Exact ordinary function values reuse the canonical callable model**
   (2026-08-30). A named, capture-free Luce declaration has an exact `func`
   type and explicit `FunctionAddress` HIR form; calls through values are

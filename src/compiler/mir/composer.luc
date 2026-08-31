@@ -1,0 +1,333 @@
+#==============================================================================================
+#
+#   composer - Join a sealed runtime package to one application program
+#
+#   DESCRIPTION:
+#       Runtime source is compiled independently, then composed with the
+#       application's canonical MIR before verification and optimization.
+#       Composition is table work, not linking: application identities stay
+#       unchanged; runtime types, functions, globals, data and external
+#       bindings are appended or explicitly interned, and every runtime
+#       reference is remapped once. Semantic runtime bindings then point at
+#       the remapped private definitions.
+#
+#       The runtime is sealed. It has no process entry or package/artifact
+#       exports, and an application cannot provide a runtime binding of its
+#       own. Equal external declarations share one identity; conflicting
+#       declarations fail here before either backend sees them. No symbol
+#       spelling resolves a semantic service and no target fact participates.
+#
+#==============================================================================================
+
+from compiler.mir.canonical import DataId, ExternId, ExternalGlobalId, FunctionId, GlobalId, InstructionForm
+from compiler.mir.canonical import MirData, MirExtern, MirExternalGlobal, MirField, MirFunction, MirGlobal, MirInstruction, MirProgram
+from compiler.mir.canonical import MirRuntimeBinding, MirSignature, MirSlot, MirType, MirTypeTable, TypeId
+from compiler.mir.canonical import create_builtin_mir_types, mir_types_match, signatures_match
+
+let builtin_type_count: i64 = 12
+
+struct ComposedTypes:
+    let table: MirTypeTable
+    let runtime_remap: list[TypeId]
+
+struct ComposedExterns:
+    let values: list[MirExtern]
+    let runtime_remap: list[ExternId]
+
+struct ComposedExternalGlobals:
+    let values: list[MirExternalGlobal]
+    let runtime_remap: list[ExternalGlobalId]
+
+## Compose a separately compiled sealed runtime after one application. The
+## result still needs the ordinary `MirVerifier` -> `Optimizer` -> verifier
+## pipeline; keeping those stages separate makes every invariant observable.
+pub func compose_runtime(application: MirProgram, runtime: MirProgram) -> MirProgram!:
+    try require_sealed_boundary(application, runtime)
+    let composed_types = try compose_types(application.types, runtime.types)
+    let data = compose_data(application.data, runtime.data)
+    let external_globals_seed = copy_external_globals(application.external_globals)
+    let composed_externs = try compose_externs(application.externs, external_globals_seed, runtime.externs, composed_types.runtime_remap)
+    let composed_external_globals = try compose_external_globals(
+        external_globals_seed,
+        composed_externs.values,
+        runtime.external_globals,
+        composed_types.runtime_remap,
+    )
+    let globals = try compose_globals(application.globals, runtime.globals, composed_types.runtime_remap, len(application.data))
+    let functions = try compose_functions(
+        application.functions,
+        runtime.functions,
+        composed_types.runtime_remap,
+        composed_externs.runtime_remap,
+        composed_external_globals.runtime_remap,
+        len(application.globals),
+        len(application.data),
+    )
+    let runtime_bindings = try compose_runtime_bindings(application.functions, runtime.functions, runtime.runtime_bindings)
+    return MirProgram(
+        types = composed_types.table,
+        runtime_bindings = runtime_bindings,
+        externs = composed_externs.values,
+        external_globals = composed_external_globals.values,
+        globals = globals,
+        data = data,
+        functions = functions,
+        entry = application.entry,
+    )
+
+# The runtime is not a source import and applications cannot shadow its
+# services. Artifact exposure would also puncture the sealed package boundary.
+func require_sealed_boundary(application: MirProgram, runtime: MirProgram) -> !:
+    if len(application.runtime_bindings) > 0:
+        error("MIR composition: application programs cannot bind runtime services")
+    if runtime.entry != none:
+        error("MIR composition: the sealed runtime cannot define a process entry")
+    for function in runtime.functions:
+        if function.is_public or function.is_exported:
+            error("MIR composition: sealed runtime function `" + function.name + "` cannot be public or exported")
+
+# mark: Types ==================================================================================
+
+# Builtin identities stay canonical. Runtime-defined types are appended and
+# may refer forward through function signatures, so their complete remap is
+# assigned before any definition is rewritten.
+func compose_types(application: MirTypeTable, runtime: MirTypeTable) -> ComposedTypes!:
+    let expected = create_builtin_mir_types()
+    if len(application.definitions) < builtin_type_count or len(runtime.definitions) < builtin_type_count:
+        error("MIR composition: both programs must contain the canonical builtin type prefix")
+    for index in range(0, builtin_type_count):
+        if not mir_types_match(application.definitions[index], expected.definitions[index]):
+            error("MIR composition: application builtin type " + str(index) + " is not canonical")
+        if not mir_types_match(runtime.definitions[index], expected.definitions[index]):
+            error("MIR composition: runtime builtin type " + str(index) + " is not canonical")
+
+    let definitions = list[MirType]()
+    for value in application.definitions: definitions.append(value)
+    let remap = list[TypeId]()
+    for index in range(0, len(runtime.definitions)):
+        if index < builtin_type_count: remap.append(TypeId(value = u32(index)))
+        else: remap.append(TypeId(value = u32(len(application.definitions) + index - builtin_type_count)))
+    for index in range(builtin_type_count, len(runtime.definitions)):
+        definitions.append(try remap_type(runtime.definitions[index], remap))
+    return ComposedTypes(table = MirTypeTable(definitions = definitions), runtime_remap = remap)
+
+func remap_type(value: MirType, remap: list[TypeId]) -> MirType!:
+    match value:
+        Int(bits, is_signed): return MirType.Int(bits = bits, is_signed = is_signed)
+        Float(bits): return MirType.Float(bits = bits)
+        Bool: return MirType.Bool
+        Ptr: return MirType.Ptr
+        Struct(fields):
+            let mapped = list[MirField]()
+            for field in fields: mapped.append(MirField(value_type = try remap_type_id(field.value_type, remap)))
+            return MirType.Struct(fields = mapped)
+        Array(element, count): return MirType.Array(element = try remap_type_id(element, remap), count = count)
+        Enum(tag, cases):
+            let mapped = list[TypeId]()
+            for case_type in cases: mapped.append(try remap_type_id(case_type, remap))
+            return MirType.Enum(tag = try remap_type_id(tag, remap), cases = mapped)
+        Func(signature): return MirType.Func(signature = try remap_signature(signature, remap))
+
+func remap_type_id(id: TypeId, remap: list[TypeId]) -> TypeId!:
+    if i64(id.value) >= len(remap): error("MIR composition: runtime refers outside its type table")
+    return remap[id.value]
+
+func remap_signature(signature: MirSignature, type_remap: list[TypeId]) -> MirSignature!:
+    let parameters = list[TypeId]()
+    for parameter in signature.parameters: parameters.append(try remap_type_id(parameter, type_remap))
+    let results = list[TypeId]()
+    for result in signature.results: results.append(try remap_type_id(result, type_remap))
+    return MirSignature(parameters = parameters, results = results, is_fallible = signature.is_fallible)
+
+# mark: External declarations =================================================================
+
+# C and host-runtime symbols form one program-wide namespace. Equal function
+# declarations share an identity; a different shape or a function/object
+# collision is a composition error rather than backend-dependent behavior.
+func compose_externs(application: list[MirExtern], application_globals: list[MirExternalGlobal], runtime: list[MirExtern], type_remap: list[TypeId]) -> ComposedExterns!:
+    let values = list[MirExtern]()
+    for external in application: values.append(external)
+    let remap = list[ExternId]()
+    for external in runtime:
+        let signature = try remap_signature(external.signature, type_remap)
+        for global in application_globals:
+            if global.name == external.name:
+                error("MIR composition: external symbol `" + external.name + "` is both a function and a global")
+        var found = -1
+        for index in range(0, len(values)):
+            if values[index].name == external.name: found = index
+        if found >= 0:
+            if values[found].convention != external.convention or not signatures_match(values[found].signature, signature):
+                error("MIR composition: conflicting extern function `" + external.name + "`")
+            remap.append(ExternId(value = u32(found)))
+        else:
+            remap.append(ExternId(value = u32(len(values))))
+            values.append(MirExtern(name = external.name, convention = external.convention, signature = signature))
+    return ComposedExterns(values = values, runtime_remap = remap)
+
+func compose_external_globals(application: list[MirExternalGlobal], externs: list[MirExtern], runtime: list[MirExternalGlobal], type_remap: list[TypeId]) -> ComposedExternalGlobals!:
+    let values = copy_external_globals(application)
+    let remap = list[ExternalGlobalId]()
+    for global in runtime:
+        let value_type = try remap_type_id(global.value_type, type_remap)
+        for external in externs:
+            if external.name == global.name:
+                error("MIR composition: external symbol `" + global.name + "` is both a function and a global")
+        var found = -1
+        for index in range(0, len(values)):
+            if values[index].name == global.name: found = index
+        if found >= 0:
+            if values[found].value_type.value != value_type.value:
+                error("MIR composition: conflicting external global `" + global.name + "`")
+            remap.append(ExternalGlobalId(value = u32(found)))
+        else:
+            remap.append(ExternalGlobalId(value = u32(len(values))))
+            values.append(MirExternalGlobal(name = global.name, value_type = value_type))
+    return ComposedExternalGlobals(values = values, runtime_remap = remap)
+
+func copy_external_globals(source: list[MirExternalGlobal]) -> list[MirExternalGlobal]:
+    let copied = list[MirExternalGlobal]()
+    for value in source: copied.append(value)
+    return copied
+
+# mark: Owned tables ===========================================================================
+
+func compose_data(application: list[MirData], runtime: list[MirData]) -> list[MirData]:
+    let values = list[MirData]()
+    for item in application: values.append(item)
+    for item in runtime: values.append(item)
+    return values
+
+func compose_globals(application: list[MirGlobal], runtime: list[MirGlobal], type_remap: list[TypeId], data_offset: i64) -> list[MirGlobal]!:
+    let values = list[MirGlobal]()
+    for global in application: values.append(global)
+    for global in runtime:
+        var initial: DataId? = none
+        let runtime_initial = global.initial
+        if runtime_initial != none: initial = offset_data(runtime_initial, data_offset)
+        values.append(MirGlobal(
+            name = global.name,
+            value_type = try remap_type_id(global.value_type, type_remap),
+            initial = initial,
+            is_mutable = global.is_mutable,
+        ))
+    return values
+
+func compose_functions(
+    application: list[MirFunction],
+    runtime: list[MirFunction],
+    type_remap: list[TypeId],
+    extern_remap: list[ExternId],
+    external_global_remap: list[ExternalGlobalId],
+    global_offset: i64,
+    data_offset: i64,
+) -> list[MirFunction]!:
+    let values = list[MirFunction]()
+    for function in application: values.append(function)
+    let function_offset = len(application)
+    for function in runtime:
+        values.append(try remap_function(
+            function,
+            type_remap,
+            extern_remap,
+            external_global_remap,
+            function_offset,
+            global_offset,
+            data_offset,
+        ))
+    return values
+
+func remap_function(
+    function: MirFunction,
+    type_remap: list[TypeId],
+    extern_remap: list[ExternId],
+    external_global_remap: list[ExternalGlobalId],
+    function_offset: i64,
+    global_offset: i64,
+    data_offset: i64,
+) -> MirFunction!:
+    let registers = list[TypeId]()
+    for value_type in function.registers: registers.append(try remap_type_id(value_type, type_remap))
+    let slots = list[MirSlot]()
+    for slot in function.slots: slots.append(MirSlot(value_type = try remap_type_id(slot.value_type, type_remap)))
+    let body = list[MirInstruction]()
+    for instruction in function.body:
+        body.append(try remap_instruction(
+            instruction,
+            type_remap,
+            extern_remap,
+            external_global_remap,
+            function_offset,
+            global_offset,
+            data_offset,
+        ))
+    let operands = list[u32]()
+    for operand in function.operands: operands.append(operand)
+    return MirFunction(
+        name = function.name,
+        convention = function.convention,
+        signature = try remap_signature(function.signature, type_remap),
+        registers = registers,
+        slots = slots,
+        body = body,
+        operands = operands,
+        is_public = function.is_public,
+        is_exported = function.is_exported,
+        span = function.span,
+    )
+
+func remap_instruction(
+    instruction: MirInstruction,
+    type_remap: list[TypeId],
+    extern_remap: list[ExternId],
+    external_global_remap: list[ExternalGlobalId],
+    function_offset: i64,
+    global_offset: i64,
+    data_offset: i64,
+) -> MirInstruction!:
+    var form = instruction.form
+    match instruction.form:
+        AllocateStorage(result, element_type, count): form = InstructionForm.AllocateStorage(result = result, element_type = try remap_type_id(element_type, type_remap), count = count)
+        Load(result, value_type, address): form = InstructionForm.Load(result = result, value_type = try remap_type_id(value_type, type_remap), address = address)
+        Store(value_type, address, value): form = InstructionForm.Store(value_type = try remap_type_id(value_type, type_remap), address = address, value = value)
+        FieldAddress(result, struct_type, base, field): form = InstructionForm.FieldAddress(result = result, struct_type = try remap_type_id(struct_type, type_remap), base = base, field = field)
+        EnumPayloadAddress(result, enum_type, base): form = InstructionForm.EnumPayloadAddress(result = result, enum_type = try remap_type_id(enum_type, type_remap), base = base)
+        ElementAddress(result, element_type, base, index): form = InstructionForm.ElementAddress(result = result, element_type = try remap_type_id(element_type, type_remap), base = base, index = index)
+        Memcpy(destination, source, value_type): form = InstructionForm.Memcpy(destination = destination, source = source, value_type = try remap_type_id(value_type, type_remap))
+        DataAddress(result, data): form = InstructionForm.DataAddress(result = result, data = offset_data(data, data_offset))
+        GlobalAddress(result, global): form = InstructionForm.GlobalAddress(result = result, global = offset_global(global, global_offset))
+        LoadExternalGlobal(result, global): form = InstructionForm.LoadExternalGlobal(result = result, global = try remap_external_global(global, external_global_remap))
+        StoreExternalGlobal(global, value): form = InstructionForm.StoreExternalGlobal(global = try remap_external_global(global, external_global_remap), value = value)
+        FunctionAddress(result, target): form = InstructionForm.FunctionAddress(result = result, function = offset_function(target, function_offset))
+        ExternAddress(result, target): form = InstructionForm.ExternAddress(result = result, external = try remap_extern(target, extern_remap))
+        Call(results, target, arguments): form = InstructionForm.Call(results = results, function = offset_function(target, function_offset), arguments = arguments)
+        CallExtern(results, external, arguments): form = InstructionForm.CallExtern(results = results, external = try remap_extern(external, extern_remap), arguments = arguments)
+        CallIndirect(results, signature, convention, target, arguments): form = InstructionForm.CallIndirect(results = results, signature = try remap_signature(signature, type_remap), convention = convention, target = target, arguments = arguments)
+        else: pass
+    return MirInstruction(form = form, span = instruction.span)
+
+# mark: Identity helpers =======================================================================
+
+func compose_runtime_bindings(application_functions: list[MirFunction], runtime_functions: list[MirFunction], bindings: list[MirRuntimeBinding]) -> list[MirRuntimeBinding]!:
+    let values = list[MirRuntimeBinding]()
+    for binding in bindings:
+        if i64(binding.function.value) >= len(runtime_functions): error("MIR composition: runtime binding refers outside its function table")
+        values.append(MirRuntimeBinding(service = binding.service, function = offset_function(binding.function, len(application_functions))))
+    return values
+
+func remap_extern(id: ExternId, remap: list[ExternId]) -> ExternId!:
+    if i64(id.value) >= len(remap): error("MIR composition: runtime refers outside its extern table")
+    return remap[id.value]
+
+func remap_external_global(id: ExternalGlobalId, remap: list[ExternalGlobalId]) -> ExternalGlobalId!:
+    if i64(id.value) >= len(remap): error("MIR composition: runtime refers outside its external-global table")
+    return remap[id.value]
+
+func offset_function(id: FunctionId, offset: i64) -> FunctionId:
+    return FunctionId(value = u32(i64(id.value) + offset))
+
+func offset_global(id: GlobalId, offset: i64) -> GlobalId:
+    return GlobalId(value = u32(i64(id.value) + offset))
+
+func offset_data(id: DataId, offset: i64) -> DataId:
+    return DataId(value = u32(i64(id.value) + offset))

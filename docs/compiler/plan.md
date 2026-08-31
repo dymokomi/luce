@@ -297,6 +297,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `luce_rt_alloc` MIR extern is removed, leaving no route around the typed
   operation. This is substrate, not yet source collection lowering or the
   production allocator.
+- [x] **Compose a sealed runtime as canonical MIR before optimization**
+  (2026-08-30). `compose_runtime` preserves every application identity and
+  remaps the runtime's type, function, extern, external-global, global and
+  data tables exactly once. Canonical builtins are validated, equal external
+  declarations share one identity, conflicts fail before a backend, and
+  runtime service bindings follow the remapped private function. Applications
+  cannot supply bindings; the runtime cannot define an entry, package API or
+  artifact export. The combined program is then verified and optimized as one
+  closed world, where live allocation is the edge that retains its allocator.
+  This proves the composition mechanism with hand-built MIR; loading and
+  compiling the production sealed source package remains the next rung.
 - [ ] **`libluce_rt` in Luce, freestanding**: bump/free-list allocator over
   backend-provided storage, `write`, `trap`, string/bytes primitives; through
   the MIR interpreter's stub runtime first, then compiled. This starts only
