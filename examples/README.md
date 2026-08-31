@@ -41,8 +41,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `generic_functions.luc` proves abstract body checking, argument inference,
   explicit structural specialization, contextual generic function values,
   defaults, recursion, and memoized monomorphization through both semantic
-  oracles, Wasm, and native QBE. Generic nominal types remain open and are not
-  implied by this example.
+  oracles, Wasm, and native QBE.
+- `generic_methods.luc` proves that an applied receiver fixes its generic-owner
+  arguments while independently declared method parameters are inferred or
+  supplied explicitly. Owner-dependent constraints, defaults, recursion,
+  mutation, and concrete/generic struct, class, and enum receivers specialize
+  to ordinary functions through both semantic oracles, Wasm, and native QBE.
 - `constrained_generics.luc` proves nominal interface requirements, explicit
   conformance, statically dispatched generic constraints, a constrained
   generic-struct method specialized from its applied receiver, concrete

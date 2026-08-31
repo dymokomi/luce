@@ -209,9 +209,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
 
 - [x] **Decompose the stateful compiler passes before the next major
   managed-language family.** The former 4,299-line HIR class is now a
-  166-line orchestration facade, a 1,111-line program-wide
-  declaration collector, a shared typed transaction/model, and one
-  2,631-line body checker. Declaration defaults cross that boundary through
+  339-line orchestration facade, a 2,253-line program-wide declaration
+  collector, a 1,150-line shared typed transaction/model, a 2,967-line body
+  checker, and focused 599- and 291-line generic function/nominal owners.
+  Declaration defaults cross that boundary through
   one constant-expression contract; type, symbol, and node tables remain
   singular. Statements, expressions, and patterns remain together because
   their traversal is mutually recursive; splitting them today would add a
@@ -226,9 +227,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   forwarding graph or duplicate ownership state rather than establish a new
   owner. The later closure review kept the recursive evaluator cohesive, while
   existential interface resolution established an independently testable HIR
-  boundary. The now 3,923-line function walk must be reviewed again with its
-  next major language family. Keep the parser and
-  2,085-line Wasm encoder sectioned
+  boundary. Independently generic methods reused the generic-function owner
+  and the existing declaration transaction rather than adding another pass.
+  The declaration collector and now 3,955-line function walk must be reviewed
+  again before the next major language family; their current growth remains
+  cohesive but is at the threshold where a real ownership boundary should be
+  extracted when that family makes one visible. Keep the parser and
+  2,281-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -584,9 +589,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   adaptation, and propagation (`done.md` §2).
 - [ ] **Finish the remaining generic surface.** Memberwise generic structs,
   enums, and classes, including their owner-parameterized
-  value/mutating/lifecycle methods and concrete conformances, are complete
-  through both oracles and artifact backends (`done.md` §2). Independently
-  generic methods, custom generic-nominal initializers/type functions,
+  value/mutating/lifecycle methods, independently generic instance methods,
+  and concrete conformances are complete through both oracles and artifact
+  backends (`done.md` §2). Custom generic-nominal initializers/type functions,
   serialized typed bodies,
   package/CLI budget configuration,
   origin/size/time expansion accounting, and path-rich budget diagnostics also

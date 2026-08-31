@@ -16,7 +16,7 @@ from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgum
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generics.inference import GenericInference
 from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, GenericRequirementUse, HirGenerationState, HirSemanticChecker, TypeBinding
-from compiler.hir.ir import BuiltinType, HirInterfaceRequirement, HirNodeForm, HirParameter, HirReceiver, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import BuiltinType, HirInterfaceRequirement, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import resolve_builtin_type, types_match
 
 struct ResolvedRequirement:
@@ -28,6 +28,21 @@ struct PreparedGenericCall:
     let function_index: i64
     let type_arguments: list[TypeId]
     let arguments: Operands
+
+## Declaration/call-site facts that vary across free calls, nominal
+## construction, and instance methods. Keeping them together makes argument
+## inference one transaction without turning `prepare_call` into a list of
+## loosely related positional controls.
+struct GenericCallShape:
+    let first_source_parameter: i64
+    let explicit_parameter_start: i64
+    let context_pattern: TypeId?
+    let context_value: TypeId?
+    let receiver: NodeId?
+    let type_subject: str
+    let call_subject: str
+    let missing_subject: str
+    let inference_subject: str
 
 ## Coordinates generic semantics with the ordinary body checker through the
 ## narrow operations that require expression or closure knowledge.
@@ -119,8 +134,8 @@ pub class GenericFunctionChecker:
 
     # mark: Call resolution and inference =======================================================
 
-    ## Resolve only free generic functions. Methods use declaration identity
-    ## and the applied receiver through `instantiate_method` below.
+    ## Resolve only free generic functions. Instance methods use declaration
+    ## identity plus their applied receiver through `check_method_call` below.
     pub func resolve_callee(callee: ExpressionSyntax) -> i64!:
         match callee.form:
             Name(name):
@@ -147,13 +162,57 @@ pub class GenericFunctionChecker:
             generic_index,
             type_arguments,
             arguments,
-            0,
-            none,
-            none,
-            "generic function `" + generic.name + "`",
-            "function `" + generic.name + "`",
-            "call to `" + generic.name + "`",
-            generic.name,
+            GenericCallShape(
+                first_source_parameter = 0,
+                explicit_parameter_start = 0,
+                context_pattern = none,
+                context_value = none,
+                receiver = none,
+                type_subject = "generic function `" + generic.name + "`",
+                call_subject = "function `" + generic.name + "`",
+                missing_subject = "call to `" + generic.name + "`",
+                inference_subject = generic.name,
+            ),
+            span,
+        )
+        let function = self.state.functions[prepared.function_index]
+        let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = prepared.arguments), function.result, span)
+        return try semantics.require_type_for_feature(typed, expected)
+
+    ## Infer an independently generic method's declared suffix after binding
+    ## its owner prefix from the already-checked receiver. Owner-only generic
+    ## methods use the same path with an empty explicit suffix.
+    pub func check_method_call(semantics: HirSemanticChecker, generic_index: i64, owner_type: TypeId, receiver: NodeId, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let generic = self.state.generic_functions[generic_index]
+        let method_receiver = generic.signature.receiver else trap("generic method template has no receiver")
+        if method_receiver.kind == HirReceiverKind.type_function:
+            try self.fail(callee_span, "`" + name + "` is a type function; call it as `" + self.state.describe_type(owner_type) + "." + name + "(...)`")
+        if method_receiver.kind == HirReceiverKind.initializer:
+            try self.fail(callee_span, "initializer `init` is called by constructing a `" + self.state.describe_type(owner_type) + "` value")
+        if method_receiver.kind == HirReceiverKind.deinitializer:
+            try self.fail(callee_span, "deinitializer `deinit` runs automatically at the final strong release and cannot be called directly")
+        let owner_module = self.declarations.owner_module(owner_type)
+        if owner_module != self.state.current_module and not generic.is_public:
+            try self.fail(callee_span, "`" + name + "` is private to module `" + self.state.sources[owner_module].name + "`")
+        if method_receiver.kind == HirReceiverKind.mutating_method:
+            try semantics.require_mutable_receiver_for_feature(receiver, callee_span)
+
+        let prepared = try self.prepare_call(
+            semantics,
+            generic_index,
+            type_arguments,
+            arguments,
+            GenericCallShape(
+                first_source_parameter = 1,
+                explicit_parameter_start = generic.owner_parameter_count,
+                context_pattern = method_receiver.owner,
+                context_value = owner_type,
+                receiver = receiver,
+                type_subject = "generic method `" + name + "`",
+                call_subject = "method `" + name + "`",
+                missing_subject = "call to `" + name + "`",
+                inference_subject = name,
+            ),
             span,
         )
         let function = self.state.functions[prepared.function_index]
@@ -178,13 +237,17 @@ pub class GenericFunctionChecker:
             generic_index,
             type_arguments,
             arguments,
-            1,
-            owner_template,
-            contextual,
-            "type `" + owner_name + "`",
-            "initializer for `" + owner_name + "`",
-            "construction of `" + owner_name + "`",
-            owner_name,
+            GenericCallShape(
+                first_source_parameter = 1,
+                explicit_parameter_start = 0,
+                context_pattern = owner_template,
+                context_value = contextual,
+                receiver = none,
+                type_subject = "type `" + owner_name + "`",
+                call_subject = "initializer for `" + owner_name + "`",
+                missing_subject = "construction of `" + owner_name + "`",
+                inference_subject = owner_name,
+            ),
             span,
         )
         let function = self.state.functions[prepared.function_index]
@@ -196,10 +259,10 @@ pub class GenericFunctionChecker:
         return try semantics.require_type_for_feature(typed, expected)
 
     ## Infer, specialize, and place one generic callable's source arguments.
-    ## Class construction skips hidden `self` but otherwise shares exactly the
-    ## same labels, defaults, evaluation order, and conversion transaction as
-    ## a free generic call.
-    func prepare_call(semantics: HirSemanticChecker, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], first_source_parameter: i64, context_pattern: TypeId?, context_value: TypeId?, type_subject: str, call_subject: str, missing_subject: str, inference_subject: str, span: SourceSpan) -> PreparedGenericCall!:
+    ## Construction skips its allocated `self`; a method supplies its already
+    ## checked receiver. Both otherwise share the same labels, defaults,
+    ## evaluation order, and conversion transaction as a free generic call.
+    func prepare_call(semantics: HirSemanticChecker, generic_index: i64, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], shape: GenericCallShape, span: SourceSpan) -> PreparedGenericCall!:
         let generic = self.state.generic_functions[generic_index]
         let inferred = list[TypeId]()
         let bound = list[bool]()
@@ -207,23 +270,27 @@ pub class GenericFunctionChecker:
             inferred.append(resolve_builtin_type(BuiltinType.unit))
             bound.append(false)
         if len(type_arguments) > 0:
-            if len(type_arguments) != len(generic.type_parameters):
-                try self.fail(span, type_subject + " needs " + str(len(generic.type_parameters)) + " type argument(s), got " + str(len(type_arguments)))
+            let explicit_count = len(generic.type_parameters) - shape.explicit_parameter_start
+            if len(type_arguments) != explicit_count:
+                try self.fail(span, shape.type_subject + " needs " + str(explicit_count) + " type argument(s), got " + str(len(type_arguments)))
             for index in range(0, len(type_arguments)):
+                let parameter_index = shape.explicit_parameter_start + index
                 match type_arguments[index]:
-                    TypeArgument(value): inferred[index] = try self.declarations.resolve_type(self.state.current_module, value)
+                    TypeArgument(value): inferred[parameter_index] = try self.declarations.resolve_type(self.state.current_module, value)
                     IntegerArgument(token): try self.fail(token.span, "generic callable type arguments must be types")
-                bound[index] = true
+                bound[parameter_index] = true
 
+        let context_pattern = shape.context_pattern
+        let context_value = shape.context_value
         if context_pattern != none and context_value != none:
             try self.inference.infer(context_pattern, context_value, generic.generic_id, inferred, bound, span)
 
         let assigned = list[bool]()
         for parameter_index in range(0, len(generic.signature.parameters)):
-            assigned.append(parameter_index < first_source_parameter)
+            assigned.append(parameter_index < shape.first_source_parameter)
         let placed_parameters = list[i64]()
         let placed_nodes = list[NodeId]()
-        var positional_index = first_source_parameter
+        var positional_index = shape.first_source_parameter
         var saw_named = false
         for argument in arguments:
             var parameter_index = -1
@@ -235,10 +302,10 @@ pub class GenericFunctionChecker:
             else:
                 saw_named = true
                 parameter_index = self.find_parameter(generic.signature, label)
-                if parameter_index < first_source_parameter:
-                    try self.fail(argument.span, call_subject + " has no parameter `" + label + "`")
+                if parameter_index < shape.first_source_parameter:
+                    try self.fail(argument.span, shape.call_subject + " has no parameter `" + label + "`")
             if parameter_index >= len(generic.signature.parameters):
-                try self.fail(argument.span, call_subject + " accepts " + str(len(generic.signature.parameters) - first_source_parameter) + " argument(s)")
+                try self.fail(argument.span, shape.call_subject + " accepts " + str(len(generic.signature.parameters) - shape.first_source_parameter) + " argument(s)")
             if assigned[parameter_index]:
                 try self.fail(argument.span, "parameter `" + generic.signature.parameters[parameter_index].name + "` is supplied more than once")
             assigned[parameter_index] = true
@@ -251,21 +318,26 @@ pub class GenericFunctionChecker:
 
         for index in range(0, len(bound)):
             if not bound[index]:
-                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + inference_subject + "`; supply explicit type arguments")
+                try self.fail(span, "cannot infer generic parameter `" + generic.type_parameters[index].name + "` of `" + shape.inference_subject + "`; supply explicit type arguments")
 
         let function_index = try self.instantiate(semantics, generic_index, inferred, span)
         let function = self.state.functions[function_index]
         let placed = list[u32]()
+        let call_receiver = shape.receiver
+        if call_receiver != none:
+            let receiver = try semantics.require_type_for_feature(call_receiver, function.parameters[0].value_type)
+            placed.append(0)
+            placed.append(receiver.value)
         for index in range(0, len(placed_nodes)):
             let parameter_index = placed_parameters[index]
             let converted = try semantics.require_type_for_feature(placed_nodes[index], function.parameters[parameter_index].value_type)
             placed.append(u32(parameter_index))
             placed.append(converted.value)
-        for parameter_index in range(first_source_parameter, len(function.parameters)):
+        for parameter_index in range(shape.first_source_parameter, len(function.parameters)):
             if assigned[parameter_index]: continue
             let default_value = function.parameters[parameter_index].default_value
             if default_value.value == no_node:
-                try self.fail(span, missing_subject + " is missing argument `" + function.parameters[parameter_index].name + "`")
+                try self.fail(span, shape.missing_subject + " is missing argument `" + function.parameters[parameter_index].name + "`")
             placed.append(u32(parameter_index))
             placed.append(default_value.value)
         let copied_arguments = list[TypeId]()
@@ -442,6 +514,9 @@ pub class GenericFunctionChecker:
         let generic_index = self.declarations.find_generic_method(owner_type, name)
         if generic_index < 0: return -1
         let generic = self.state.generic_functions[generic_index]
+        # Lifecycle and interface-conformance callers have no method-call
+        # syntax from which to infer an independently declared suffix.
+        if generic.owner_parameter_count != len(generic.type_parameters): return -1
         let template_receiver = generic.signature.receiver else trap("generic method template has no receiver")
         let arguments = self.state.nominal_application_arguments(template_receiver.owner, owner_type)
         let checked_arguments = arguments else trap("generic method owner does not match its application")
