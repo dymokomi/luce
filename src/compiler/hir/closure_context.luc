@@ -4,14 +4,16 @@
 #
 #   DESCRIPTION:
 #       Turns references to outer locals into explicit closure-environment
-#       fields. It owns capture identity and storage policy; expression and
-#       statement typing remain in HirBodyChecker.
+#       fields and constructs the one environment-bearing function conversion.
+#       It owns capture identity and storage policy; expression and statement
+#       typing remain in HirBodyChecker.
 #
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan
 from compiler.hir.generation_model import HirGenerationState, LocalBinding, LocalStorage
-from compiler.hir.ir import HirCapture, HirCaptureKind, HirClosure, HirNodeForm, NodeId, SymbolId, SymbolKind, TypeId, no_node
+from compiler.hir.ir import HirCapture, HirCaptureKind, HirClosure, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, ModuleId, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, no_node
+from compiler.hir.ir import place_class_field_step
 
 # mark: Capture frames ========================================================================
 
@@ -30,16 +32,29 @@ class CaptureFrame:
         self.captures = list[HirCapture]()
         self.initializers = list[NodeId]()
 
+# An immutable local preserves the exact closure-formation provenance of its
+# initializer. Keeping this here lets the cycle rule follow ordinary aliases
+# without turning general body typing into ownership analysis.
+class ImmutableValue:
+    let symbol: SymbolId
+    let value: NodeId
+
+    init(symbol: SymbolId, value: NodeId):
+        self.symbol = symbol
+        self.value = value
+
 ## Maintains the capture stack independently of ordinary body typing. A body
 ## checker asks it to normalize a resolved local index before reading or
 ## writing that local; the returned index always belongs to the current body.
 pub class ClosureContext:
     let state: HirGenerationState
     let frames: list[CaptureFrame]
+    let immutable_values: list[ImmutableValue]
 
     pub init(state: HirGenerationState):
         self.state = state
         self.frames = list[CaptureFrame]()
+        self.immutable_values = list[ImmutableValue]()
 
     pub func is_active() -> bool:
         return len(self.frames) > 0
@@ -126,6 +141,148 @@ pub class ClosureContext:
 
     pub func abandon():
         if len(self.frames) > 0: self.frames.remove(len(self.frames) - 1)
+
+    ## Preserve exact immutable-alias provenance for the direct cycle rule.
+    ## Mutable bindings are intentionally excluded because their current value
+    ## is a control-flow fact, not a closure-formation fact.
+    pub func record_binding(symbol: SymbolId, value: NodeId, is_mutable: bool):
+        if not is_mutable: self.immutable_values.append(ImmutableValue(symbol = symbol, value = value))
+
+    # mark: Function conversion ================================================================
+
+    ## Adapt an arbitrary infallible function value to the corresponding
+    ## fallible type. The original value is evaluated once into an owned
+    ## environment field; a private wrapper forwards the exact arguments and
+    ## returns normally, which is the fallible protocol's success path.
+    pub func lift_fallibility(value: NodeId, source_type: TypeId, target_type: TypeId, span: SourceSpan) -> NodeId:
+        let parameter_types = list[TypeId]()
+        var source_result = source_type
+        match self.state.types.definitions[source_type.value].form:
+            Function(parameters, result):
+                for parameter in parameters: parameter_types.append(parameter)
+                source_result = result
+            else: trap("function fallibility lift received a non-function source")
+        var target_result = target_type
+        match self.state.types.definitions[target_type.value].form:
+            Function(parameters, result): target_result = result
+            else: trap("function fallibility lift received a non-function target")
+
+        let hidden_name = "$fallibility_lift_" + str(self.state.next_symbol)
+        let function = self.state.make_symbol(hidden_name, SymbolKind.function, target_result)
+        let captured = self.state.make_symbol("$lifted_function_" + str(function.value), SymbolKind.local, source_type)
+        let parameters = list[HirParameter]()
+        let arguments = list[NodeId]()
+        for index in range(0, len(parameter_types)):
+            let name = "$argument_" + str(index)
+            let symbol = self.state.make_symbol(name, SymbolKind.parameter, parameter_types[index])
+            parameters.append(HirParameter(symbol = symbol, name = name, value_type = parameter_types[index], default_value = NodeId(value = no_node)))
+            arguments.append(self.state.push_node(HirNodeForm.Reference(symbol = symbol), parameter_types[index], span))
+        let callee = self.state.push_node(HirNodeForm.Reference(symbol = captured), source_type, span)
+        let call = self.state.push_node(HirNodeForm.IndirectCall(callee = callee, arguments = self.state.push_nodes(arguments)), source_result, span)
+        let returned = self.state.push_statement(HirNodeForm.ReturnStatement(value = call), span)
+
+        let closure = u32(len(self.state.closures))
+        self.state.closures.append(HirClosure(
+            function = function,
+            captures = [HirCapture(symbol = captured, source = none, value_type = source_type, kind = HirCaptureKind.value)],
+            span = span,
+        ))
+        self.state.generated_functions.append(HirFunction(
+            symbol = function,
+            module = ModuleId(value = u32(self.state.current_module)),
+            name = hidden_name,
+            is_public = false,
+            documentation = list[str](),
+            receiver = none,
+            closure = closure,
+            parameters = parameters,
+            result = target_result,
+            implementation = HirFunctionImplementation.Defined(body = self.state.push_nodes([returned])),
+            span = span,
+        ))
+        return self.state.push_node(HirNodeForm.ClosureValue(closure = closure, initializers = self.state.push_nodes([value])), target_type, span)
+
+    # mark: Stored cycle diagnostics ===========================================================
+
+    ## Reject the direct ARC cycle the source rule can prove locally: a class
+    ## stores a closure in its own payload while that closure strongly retains
+    ## the same class binding. More dynamic graph cycles remain leak-tool work.
+    pub func reject_direct_class_cycle(root: SymbolId, steps: list[u32], value: NodeId, span: SourceSpan) -> !:
+        if len(steps) < 2 or steps[0] != place_class_field_step: return
+        match self.state.types.definitions[self.state.symbols[root.value].value_type.value].form:
+            Class(index): pass
+            else: return
+        if not self.strongly_retains(value, root): return
+        let name = self.state.symbols[root.value].name
+        error(self.state.diagnostic_at(
+            self.state.current_module,
+            span,
+            "storing this closure on `" + name + "` creates a strong reference cycle; capture it with `weak " + name + "`",
+        ))
+
+    # Follow value-forming wrappers and immutable aliases. A mutable alias has
+    # control-flow-dependent provenance and is deliberately left to runtime
+    # leak tooling rather than diagnosed from stale information.
+    func strongly_retains(value: NodeId, root: SymbolId) -> bool:
+        return self.value_retains_root(value, root, false, list[SymbolId]())
+
+    # `direct_reference_retains` is false at the stored value's root: assigning
+    # `self` to an ordinary field is a class-cycle concern, not a closure-cycle
+    # diagnostic. It becomes true inside an environment initializer, where a
+    # reference is precisely a retained capture value.
+    func value_retains_root(value: NodeId, root: SymbolId, direct_reference_retains: bool, visiting: list[SymbolId]) -> bool:
+        match self.state.node_form(value):
+            ClosureValue(closure, initializers):
+                let captures = self.state.closures[closure].captures
+                for position in range(0, len(captures)):
+                    let capture = captures[position]
+                    if capture.kind == HirCaptureKind.weak_capture: continue
+                    let source = capture.source
+                    if source != none and source.value == root.value: return true
+                    let initializer = self.entry_in(initializers, position)
+                    if initializer != i64(no_node) and self.value_retains_root(NodeId(value = u32(initializer)), root, true, visiting): return true
+                return false
+            Reference(symbol):
+                if direct_reference_retains and symbol.value == root.value: return true
+                for visited in visiting:
+                    if visited.value == symbol.value: return false
+                for binding in self.immutable_values:
+                    if binding.symbol.value != symbol.value: continue
+                    visiting.append(symbol)
+                    let retained = self.value_retains_root(binding.value, root, direct_reference_retains, visiting)
+                    visiting.remove(len(visiting) - 1)
+                    return retained
+                return false
+            Some(inner): return self.value_retains_root(inner, root, direct_reference_retains, visiting)
+            Conditional(selected, condition, alternative):
+                return self.value_retains_root(selected, root, direct_reference_retains, visiting) or self.value_retains_root(alternative, root, direct_reference_retains, visiting)
+            ElseFallback(inner, arm): return self.value_retains_root(inner, root, direct_reference_retains, visiting) or self.value_retains_root(arm, root, direct_reference_retains, visiting)
+            Tuple(values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
+            Array(values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
+            List(values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
+            StructValue(index, values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
+            EnumValue(enum_index, case_index, values): return self.run_retains_root(values, root, direct_reference_retains, visiting)
+            Element(inner, index): return self.value_retains_root(inner, root, direct_reference_retains, visiting)
+            FieldAccess(inner, field): return self.value_retains_root(inner, root, direct_reference_retains, visiting)
+            Match(subject, arms, has_result):
+                for position in range(0, i64(arms.count)):
+                    match self.state.node_form(self.node_in(arms, position)):
+                        MatchArm(patterns, statements, arm_value):
+                            if arm_value.value != no_node and self.value_retains_root(arm_value, root, direct_reference_retains, visiting): return true
+                        else: pass
+                return false
+            else: return false
+
+    func run_retains_root(values: Operands, root: SymbolId, direct_reference_retains: bool, visiting: list[SymbolId]) -> bool:
+        for position in range(0, i64(values.count)):
+            if self.value_retains_root(self.node_in(values, position), root, direct_reference_retains, visiting): return true
+        return false
+
+    func node_in(values: Operands, position: i64) -> NodeId:
+        return NodeId(value = u32(self.entry_in(values, position)))
+
+    func entry_in(values: Operands, position: i64) -> i64:
+        return i64(self.state.extra[i64(values.start) + position])
 
     func current() -> CaptureFrame:
         if len(self.frames) == 0: trap("closure capture operation has no active frame")
