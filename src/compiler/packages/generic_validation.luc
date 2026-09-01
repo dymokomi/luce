@@ -1,0 +1,516 @@
+#==============================================================================================
+#
+#   package_generic_validation - Closed validation for retained generic HIR
+#
+#   DESCRIPTION:
+#       Validates decoded generic signatures and every arena-local reference
+#       before import may remap or specialize them. Child nodes must preserve
+#       the generator's postorder form, operand runs are shape-checked at each
+#       use, template-only identities must resolve inside the decoded package,
+#       and closure metadata must be wholly owned by its retained body.
+#
+#==============================================================================================
+
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, HirFunctionImplementation
+from compiler.hir.ir import HirGenericBody, HirGenericCallKind, HirGenericFunction, HirInterface, HirIteration, HirNodeForm
+from compiler.hir.ir import NodeId, Operands, SymbolId, TypeForm, TypeId, TypeTable, UnaryOperation, no_node, types_match
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step
+from compiler.hir.ir import place_list_element_step, place_map_element_step
+from compiler.hir.ir import place_mutable_slice_element_step, place_weak_field_step
+from compiler.packages.hir_fields import validate_module_id, validate_operands, validate_optional_node_id
+from compiler.packages.hir_fields import validate_optional_symbol_id, validate_package_id, validate_symbol_id, validate_type_id
+from compiler.packages.signature_codec import validate_optional_receiver, validate_parameters, validate_type_parameters
+
+## Package tables needed to prove every identity a retained body may name.
+## Counts are semantic table sizes, not target dimensions.
+pub struct HirGenericValidationContext:
+    pub let types: TypeTable
+    pub let package_count: i64
+    pub let module_count: i64
+    pub let symbol_count: i64
+    pub let extern_variable_count: i64
+    pub let global_count: i64
+    pub let struct_count: i64
+    pub let enum_count: i64
+    pub let interfaces: list[HirInterface]
+
+# mark: Declaration graph ======================================================================
+
+pub func validate_generic_functions(values: list[HirGenericFunction], context: HirGenericValidationContext) -> !:
+    for value in values:
+        try validate_symbol_id(value.symbol, context.symbol_count)
+        try validate_module_id(value.module, context.module_count)
+        if len(value.name) == 0:
+            error("typed package artifact: generic function name must not be empty")
+        try validate_type_parameters(value.type_parameters, value.generic_id, context.types)
+        if len(value.type_parameters) == 0:
+            error("typed package artifact: generic function has no type parameters")
+        if value.owner_parameter_count < 0 or value.owner_parameter_count > len(value.type_parameters):
+            error("typed package artifact: generic owner parameter count is outside its signature")
+        try validate_optional_receiver(value.receiver, context.types)
+        try validate_parameters(value.parameters, context.types, context.symbol_count, len(value.body.arena.nodes))
+        try validate_type_id(value.result, len(context.types.definitions))
+        if len(value.parameters) != len(value.body.defaults):
+            error("typed package artifact: generic default table does not match its parameters")
+        for index in range(0, len(value.parameters)):
+            if value.parameters[index].default_value.value != value.body.defaults[index].value:
+                error("typed package artifact: generic signature default does not match its retained body")
+            let default_value = value.body.defaults[index]
+            if default_value.value != no_node and not types_match(value.body.arena.node_types[default_value.value], value.parameters[index].value_type):
+                error("typed package artifact: generic default type does not match its parameter")
+
+    for value in values:
+        try BodyValidator(value.body, values, context).validate()
+
+# mark: Body ownership =========================================================================
+
+class BodyValidator:
+    let body: HirGenericBody
+    let generics: list[HirGenericFunction]
+    let context: HirGenericValidationContext
+
+    init(body: HirGenericBody, generics: list[HirGenericFunction], context: HirGenericValidationContext):
+        self.body = body
+        self.generics = generics
+        self.context = context
+
+    func validate() -> !:
+        let arena = self.body.arena
+        if len(arena.nodes) != len(arena.node_types) or len(arena.nodes) != len(arena.node_modules) or len(arena.nodes) != len(arena.node_spans):
+            error("typed package artifact: retained HIR arena parallel tables have different lengths")
+        for index in range(0, len(arena.nodes)):
+            try validate_type_id(arena.node_types[index], len(self.context.types.definitions))
+            try validate_module_id(arena.node_modules[index], self.context.module_count)
+            try self.validate_node(arena.nodes[index].form, index)
+        try self.validate_node_run(self.body.body, len(arena.nodes), false)
+        for value in self.body.defaults:
+            try validate_optional_node_id(value, len(arena.nodes))
+
+        for index in range(0, len(self.body.local_symbols)):
+            let symbol = self.body.local_symbols[index]
+            try validate_symbol_id(symbol, self.context.symbol_count)
+            for previous in range(0, index):
+                if self.body.local_symbols[previous].value == symbol.value:
+                    error("typed package artifact: retained HIR local symbol is duplicated")
+        for symbol in self.body.shared_cells:
+            try self.require_local_symbol(symbol, "shared cell")
+
+        for index in range(0, len(self.body.closures)):
+            let closure = self.body.closures[index]
+            try self.require_local_symbol(closure.function, "closure function")
+            for capture in closure.captures:
+                try self.require_local_symbol(capture.symbol, "closure capture")
+                try validate_optional_symbol_id(capture.source, self.context.symbol_count)
+                try validate_type_id(capture.value_type, len(self.context.types.definitions))
+
+        for function in self.body.generated_functions:
+            try self.require_local_symbol(function.symbol, "generated function")
+            try validate_module_id(function.module, self.context.module_count)
+            if len(function.name) == 0 or function.is_public:
+                error("typed package artifact: retained generated function has an invalid declaration header")
+            try validate_optional_receiver(function.receiver, self.context.types)
+            let closure = function.closure
+            if closure != none:
+                if i64(closure) >= len(self.body.closures):
+                    error("typed package artifact: retained generated function references a missing closure")
+                if self.body.closures[closure].function.value != function.symbol.value:
+                    error("typed package artifact: retained generated function does not match its closure")
+            try validate_parameters(function.parameters, self.context.types, self.context.symbol_count, len(arena.nodes))
+            for parameter in function.parameters:
+                try self.require_local_symbol(parameter.symbol, "generated parameter")
+                if parameter.default_value.value != no_node:
+                    error("typed package artifact: retained generated function parameter has a default")
+            try validate_type_id(function.result, len(self.context.types.definitions))
+            match function.implementation:
+                Defined(body): try self.validate_node_run(body, len(arena.nodes), false)
+                else: error("typed package artifact: retained generated function is not an ordinary HIR body")
+        for closure in self.body.closures:
+            var found = false
+            for function in self.body.generated_functions:
+                if function.symbol.value == closure.function.value: found = true
+            if not found:
+                error("typed package artifact: retained closure has no generated function")
+
+    func require_local_symbol(symbol: SymbolId, what: str) -> !:
+        try validate_symbol_id(symbol, self.context.symbol_count)
+        for local in self.body.local_symbols:
+            if local.value == symbol.value: return
+        error("typed package artifact: retained " + what + " is not owned by its body")
+
+# mark: Node graph =============================================================================
+
+    func validate_node(form: HirNodeForm, owner: i64) -> !:
+        match form:
+            BreakStatement: pass
+            ContinueStatement: pass
+            PrintText(value): pass
+            NoneLiteral: pass
+            PatternWildcard: pass
+            Binding(symbol, is_mutable, value):
+                try validate_symbol_id(symbol, self.context.symbol_count)
+                try self.validate_child(value, owner, false)
+            Assignment(symbol, operation, value):
+                try validate_symbol_id(symbol, self.context.symbol_count)
+                try self.validate_assignment(operation)
+                try self.validate_child(value, owner, false)
+            ExternStore(variable, operation, value):
+                try self.validate_index(variable, self.context.extern_variable_count, "external variable")
+                try self.validate_assignment(operation)
+                try self.validate_child(value, owner, false)
+            GlobalStore(global, operation, value):
+                try self.validate_index(global, self.context.global_count, "global")
+                try self.validate_assignment(operation)
+                try self.validate_child(value, owner, false)
+            PlaceAssignment(symbol, steps, operation, value):
+                try validate_symbol_id(symbol, self.context.symbol_count)
+                try self.validate_place_steps(steps, owner)
+                try self.validate_assignment(operation)
+                try self.validate_child(value, owner, false)
+            GlobalPlaceAssignment(global, steps, operation, value):
+                try self.validate_index(global, self.context.global_count, "global")
+                try self.validate_place_steps(steps, owner)
+                try self.validate_assignment(operation)
+                try self.validate_child(value, owner, false)
+            PrintValue(value): try self.validate_single(value, owner)
+            DeferStatement(value): try self.validate_single(value, owner)
+            ExpressionStatement(value): try self.validate_single(value, owner)
+            NativeLoad(value): try self.validate_single(value, owner)
+            NativeRebind(value): try self.validate_single(value, owner)
+            NativeIsNull(value): try self.validate_single(value, owner)
+            NativeAddressHash(value): try self.validate_single(value, owner)
+            NativeFloatBits(value): try self.validate_single(value, owner)
+            NativeArena(value): try self.validate_single(value, owner)
+            NumericConvert(value): try self.validate_single(value, owner)
+            Discard(value): try self.validate_single(value, owner)
+            NeverCoercion(value): try self.validate_single(value, owner)
+            StringScalarCount(value): try self.validate_single(value, owner)
+            BuiltinDisplay(value): try self.validate_single(value, owner)
+            Hash(value): try self.validate_single(value, owner)
+            SequenceLength(value): try self.validate_single(value, owner)
+            ListCopy(value): try self.validate_single(value, owner)
+            ListClear(value): try self.validate_single(value, owner)
+            MapClear(value): try self.validate_single(value, owner)
+            MapCopy(value): try self.validate_single(value, owner)
+            SetClear(value): try self.validate_single(value, owner)
+            SetCopy(value): try self.validate_single(value, owner)
+            WeakCreate(value): try self.validate_single(value, owner)
+            WeakGet(value): try self.validate_single(value, owner)
+            Some(value): try self.validate_single(value, owner)
+            GenericInterfaceValue(value):
+                try self.validate_single(value, owner)
+                discard(try self.require_interface_type(self.body.arena.node_types[owner]))
+            Trap(value): try self.validate_single(value, owner)
+            Try(value): try self.validate_single(value, owner)
+            ReturnStatement(value): try self.validate_child(value, owner, true)
+            RecoverStatement(value): try self.validate_child(value, owner, true)
+            IfStatement(branches, has_fallback, fallback):
+                try self.validate_if_branches(branches, owner)
+                try self.validate_node_run(fallback, owner, false)
+                if not has_fallback and fallback.count != 0:
+                    error("typed package artifact: HIR if fallback flag does not match its operand run")
+            WhileStatement(condition, body):
+                try self.validate_child(condition, owner, false)
+                try self.validate_node_run(body, owner, false)
+            ForStatement(symbol, iteration, body):
+                try validate_symbol_id(symbol, self.context.symbol_count)
+                try self.validate_iteration(iteration, owner)
+                try self.validate_node_run(body, owner, false)
+            Constant(value): try self.validate_index(value, len(self.body.arena.values), "literal")
+            PatternLiteral(value): try self.validate_index(value, len(self.body.arena.values), "literal")
+            PatternRange(lower, upper, inclusive):
+                try self.validate_index(lower, len(self.body.arena.values), "literal")
+                try self.validate_index(upper, len(self.body.arena.values), "literal")
+            Reference(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
+            WeakCaptureReference(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
+            FunctionAddress(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
+            ExternLoad(variable): try self.validate_index(variable, self.context.extern_variable_count, "external variable")
+            GlobalLoad(global): try self.validate_index(global, self.context.global_count, "global")
+            NativeStore(left, right): try self.validate_pair(left, right, owner)
+            NativeAdvance(left, right): try self.validate_pair(left, right, owner)
+            NativeIsSame(left, right): try self.validate_pair(left, right, owner)
+            SequenceIndex(left, right): try self.validate_pair(left, right, owner)
+            ListWithMutableSlice(left, right): try self.validate_pair(left, right, owner)
+            ListAppend(left, right): try self.validate_pair(left, right, owner)
+            ListRemoveAt(left, right): try self.validate_pair(left, right, owner)
+            ListReserve(left, right): try self.validate_pair(left, right, owner)
+            MapLookup(left, right): try self.validate_pair(left, right, owner)
+            MapRemove(left, right): try self.validate_pair(left, right, owner)
+            MapReserve(left, right): try self.validate_pair(left, right, owner)
+            SetContains(left, right): try self.validate_pair(left, right, owner)
+            SetInsert(left, right): try self.validate_pair(left, right, owner)
+            SetRemove(left, right): try self.validate_pair(left, right, owner)
+            SetReserve(left, right): try self.validate_pair(left, right, owner)
+            ElseFallback(left, right): try self.validate_pair(left, right, owner)
+            Raise(left, right): try self.validate_pair(left, right, owner)
+            Assert(left, right): try self.validate_pair(left, right, owner)
+            NativeMove(first, second, third): try self.validate_triple(first, second, third, owner)
+            ListInsert(first, second, third): try self.validate_triple(first, second, third, owner)
+            Conditional(first, second, third): try self.validate_triple(first, second, third, owner)
+            NativeAllocate(element_type, count):
+                try validate_type_id(element_type, len(self.context.types.definitions))
+                try self.validate_child(count, owner, false)
+            NativeDeallocate(pointer, element_type, count):
+                try self.validate_child(pointer, owner, false)
+                try validate_type_id(element_type, len(self.context.types.definitions))
+                try self.validate_child(count, owner, false)
+            DivergingSequence(values): try self.validate_node_run(values, owner, false)
+            FormattedString(values): try self.validate_node_run(values, owner, false)
+            Tuple(values): try self.validate_node_run(values, owner, false)
+            Array(values): try self.validate_node_run(values, owner, false)
+            List(values): try self.validate_node_run(values, owner, false)
+            Set(values): try self.validate_node_run(values, owner, false)
+            Match(subject, arms, has_result):
+                try self.validate_child(subject, owner, false)
+                try self.validate_node_run(arms, owner, false)
+            Map(entries): try self.validate_node_run(entries, owner, false, 2)
+            Unary(operation, operand):
+                try self.validate_unary(operation)
+                try self.validate_child(operand, owner, false)
+            Binary(left, operation, right):
+                try self.validate_child(left, owner, false)
+                try self.validate_binary(operation)
+                try self.validate_child(right, owner, false)
+            Range(lower, upper, inclusive):
+                try self.validate_child(lower, owner, false)
+                try self.validate_child(upper, owner, false)
+            Call(function, arguments):
+                try validate_symbol_id(function, self.context.symbol_count)
+                try self.validate_placed_run(arguments, owner)
+            Initialize(function, arguments):
+                try validate_symbol_id(function, self.context.symbol_count)
+                try self.validate_placed_run(arguments, owner)
+            GenericCall(generic, type_arguments, arguments, kind):
+                try self.validate_generic_reference(generic, type_arguments)
+                try self.validate_generic_call_arguments(generic, arguments, kind, owner)
+            GenericFunctionAddress(generic, type_arguments): try self.validate_generic_reference(generic, type_arguments)
+            GenericDefaultArgument(generic, parameter, type_arguments):
+                try self.validate_generic_reference(generic, type_arguments)
+                if i64(parameter) >= len(self.generics[generic].parameters):
+                    error("typed package artifact: generic default references a missing parameter")
+                if self.generics[generic].body.defaults[parameter].value == no_node:
+                    error("typed package artifact: generic default references a parameter without a default")
+            GenericRequirementCall(interface_type, requirement, arguments):
+                let parameter_count = try self.validate_requirement(interface_type, requirement)
+                try self.validate_requirement_arguments(arguments, parameter_count, owner)
+            InterfaceValue(value, conformance):
+                error("typed package artifact: executable interface conversion appears in a retained generic body")
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                try self.validate_child(receiver, owner, false)
+                let parameter_count = try self.validate_requirement(interface_type, requirement)
+                try self.validate_node_run(arguments, owner, false)
+                if i64(arguments.count) != parameter_count:
+                    error("typed package artifact: interface call has the wrong argument count")
+            ClosureValue(closure, initializers):
+                try self.validate_index(closure, len(self.body.closures), "closure")
+                try self.validate_node_run(initializers, owner, true)
+                if i64(initializers.count) != len(self.body.closures[closure].captures):
+                    error("typed package artifact: closure initializer count does not match its captures")
+            IndirectCall(callee, arguments):
+                try self.validate_child(callee, owner, false)
+                try self.validate_node_run(arguments, owner, false)
+            ErrorCodeLiteral(package, value): try validate_package_id(package, self.context.package_count)
+            Catch(value, failure, body):
+                try self.validate_child(value, owner, false)
+                try validate_symbol_id(failure, self.context.symbol_count)
+                try self.validate_node_run(body, owner, false)
+            SequenceSlice(value, start, end):
+                try self.validate_child(value, owner, false)
+                try self.validate_child(start, owner, true)
+                try self.validate_child(end, owner, true)
+            Element(value, index):
+                try self.validate_child(value, owner, false)
+                if index < 0: error("typed package artifact: HIR element index is negative")
+            StructValue(struct_index, fields):
+                if struct_index < 0 or struct_index >= self.context.struct_count:
+                    error("typed package artifact: HIR struct value references a missing declaration")
+                try self.validate_placed_run(fields, owner)
+            FieldAccess(value, field):
+                try self.validate_child(value, owner, false)
+                if field < 0: error("typed package artifact: HIR field index is negative")
+            EnumValue(enum_index, case_index, payload):
+                if enum_index < 0 or enum_index >= self.context.enum_count:
+                    error("typed package artifact: HIR enum value references a missing declaration")
+                if case_index < 0: error("typed package artifact: HIR enum case index is negative")
+                try self.validate_placed_run(payload, owner)
+            MatchArm(patterns, statements, value):
+                try self.validate_node_run(patterns, owner, false)
+                try self.validate_node_run(statements, owner, false)
+                try self.validate_child(value, owner, true)
+            PatternCase(case_index, bindings):
+                if case_index < 0: error("typed package artifact: HIR pattern case index is negative")
+                try self.validate_symbol_run(bindings)
+
+# mark: Operand runs ===========================================================================
+
+    func validate_child(value: NodeId, owner: i64, optional: bool) -> !:
+        if value.value == no_node:
+            if optional: return
+            error("typed package artifact: required HIR child node is missing")
+        if i64(value.value) >= owner:
+            error("typed package artifact: retained HIR child does not precede its owner")
+
+    func validate_single(value: NodeId, owner: i64) -> !:
+        try self.validate_child(value, owner, false)
+
+    func validate_pair(left: NodeId, right: NodeId, owner: i64) -> !:
+        try self.validate_child(left, owner, false)
+        try self.validate_child(right, owner, false)
+
+    func validate_triple(first: NodeId, second: NodeId, third: NodeId, owner: i64) -> !:
+        try self.validate_child(first, owner, false)
+        try self.validate_child(second, owner, false)
+        try self.validate_child(third, owner, false)
+
+    func validate_node_run(value: Operands, owner: i64, optional: bool, stride: i64 = 1) -> !:
+        try validate_operands(value, len(self.body.arena.extra), stride)
+        for index in range(0, i64(value.count)):
+            try self.validate_child(NodeId(value = self.body.arena.extra[i64(value.start) + index]), owner, optional)
+
+    func validate_placed_run(value: Operands, owner: i64) -> !:
+        try validate_operands(value, len(self.body.arena.extra), 2)
+        for pair in range(0, i64(value.count) // 2):
+            let node = NodeId(value = self.body.arena.extra[i64(value.start) + pair * 2 + 1])
+            try self.validate_child(node, owner, false)
+
+    func validate_generic_call_arguments(generic: u32, value: Operands, kind: HirGenericCallKind, owner: i64) -> !:
+        try self.validate_placed_run(value, owner)
+        let parameter_count = len(self.generics[generic].parameters)
+        var expected = parameter_count
+        match kind:
+            function: pass
+            initializer: expected -= 1
+        if i64(value.count) // 2 != expected:
+            error("typed package artifact: generic call has the wrong argument count")
+        let seen = list[bool]()
+        for index in range(0, parameter_count): seen.append(false)
+        for pair in range(0, i64(value.count) // 2):
+            let position = self.body.arena.extra[i64(value.start) + pair * 2]
+            if i64(position) >= parameter_count:
+                error("typed package artifact: generic call references a missing parameter")
+            match kind:
+                initializer:
+                    if position == 0:
+                        error("typed package artifact: generic initializer call supplies its implicit receiver")
+                function: pass
+            if seen[position]: error("typed package artifact: generic call supplies a parameter more than once")
+            seen[position] = true
+
+    func validate_requirement_arguments(value: Operands, parameter_count: i64, owner: i64) -> !:
+        try self.validate_placed_run(value, owner)
+        if i64(value.count) // 2 != parameter_count + 1:
+            error("typed package artifact: generic requirement call has the wrong argument count")
+        let seen = list[bool]()
+        for index in range(0, parameter_count + 1): seen.append(false)
+        for pair in range(0, i64(value.count) // 2):
+            let position = self.body.arena.extra[i64(value.start) + pair * 2]
+            if i64(position) > parameter_count:
+                error("typed package artifact: generic requirement call references a missing parameter")
+            if seen[position]: error("typed package artifact: generic requirement call supplies a parameter more than once")
+            seen[position] = true
+        if not seen[0]: error("typed package artifact: generic requirement call has no receiver")
+
+    func validate_symbol_run(value: Operands) -> !:
+        try validate_operands(value, len(self.body.arena.extra))
+        for index in range(0, i64(value.count)):
+            try validate_symbol_id(SymbolId(value = self.body.arena.extra[i64(value.start) + index]), self.context.symbol_count)
+
+    func validate_type_run(value: Operands) -> !:
+        try validate_operands(value, len(self.body.arena.extra))
+        for index in range(0, i64(value.count)):
+            try validate_type_id(TypeId(value = self.body.arena.extra[i64(value.start) + index]), len(self.context.types.definitions))
+
+    func validate_if_branches(value: Operands, owner: i64) -> !:
+        try validate_operands(value, len(self.body.arena.extra), 3)
+        for branch in range(0, i64(value.count) // 3):
+            let offset = i64(value.start) + branch * 3
+            try self.validate_child(NodeId(value = self.body.arena.extra[offset]), owner, false)
+            try self.validate_node_run(Operands(
+                start = self.body.arena.extra[offset + 1],
+                count = self.body.arena.extra[offset + 2],
+            ), owner, false)
+
+    func validate_place_steps(value: Operands, owner: i64) -> !:
+        try validate_operands(value, len(self.body.arena.extra), 2)
+        for step in range(0, i64(value.count) // 2):
+            let offset = i64(value.start) + step * 2
+            let kind = self.body.arena.extra[offset]
+            let payload = self.body.arena.extra[offset + 1]
+            if kind == place_element_step or kind == place_list_element_step or kind == place_map_element_step or kind == place_mutable_slice_element_step:
+                try self.validate_child(NodeId(value = payload), owner, false)
+            elif kind != place_field_step and kind != place_class_field_step and kind != place_weak_field_step:
+                error("typed package artifact: unknown retained HIR place-step tag " + str(u64(kind)))
+
+# mark: Referenced semantic identities =========================================================
+
+    func validate_iteration(value: HirIteration, owner: i64) -> !:
+        match value:
+            Builtin(item): try self.validate_child(item, owner, false)
+            Protocol(symbol, iterator, next):
+                try validate_symbol_id(symbol, self.context.symbol_count)
+                try self.validate_child(iterator, owner, false)
+                try self.validate_child(next, owner, false)
+
+    func validate_assignment(value: AssignmentOperation) -> !:
+        match value:
+            Replace: pass
+            Combine(operation): try self.validate_binary(operation)
+
+    func validate_unary(value: UnaryOperation) -> !:
+        match value:
+            LogicalNot: pass
+            NumericIdentity(value_type): try self.validate_operation_type(value_type)
+            NumericNegate(value_type): try self.validate_operation_type(value_type)
+            IntegerBitwiseNot(value_type): try self.validate_operation_type(value_type)
+
+    func validate_binary(value: BinaryOperation) -> !:
+        match value:
+            LogicalAnd: pass
+            LogicalOr: pass
+            Equal(value_type): try self.validate_operation_type(value_type)
+            NotEqual(value_type): try self.validate_operation_type(value_type)
+            Identity(value_type): try self.validate_operation_type(value_type)
+            NotIdentity(value_type): try self.validate_operation_type(value_type)
+            Less(value_type): try self.validate_operation_type(value_type)
+            LessEqual(value_type): try self.validate_operation_type(value_type)
+            Greater(value_type): try self.validate_operation_type(value_type)
+            GreaterEqual(value_type): try self.validate_operation_type(value_type)
+            Add(value_type): try self.validate_operation_type(value_type)
+            Subtract(value_type): try self.validate_operation_type(value_type)
+            Multiply(value_type): try self.validate_operation_type(value_type)
+            Divide(value_type): try self.validate_operation_type(value_type)
+            FloorDivide(value_type): try self.validate_operation_type(value_type)
+            Remainder(value_type): try self.validate_operation_type(value_type)
+            BitwiseAnd(value_type): try self.validate_operation_type(value_type)
+            BitwiseOr(value_type): try self.validate_operation_type(value_type)
+            BitwiseXor(value_type): try self.validate_operation_type(value_type)
+            ShiftLeft(value_type): try self.validate_operation_type(value_type)
+            ShiftRight(value_type): try self.validate_operation_type(value_type)
+
+    func validate_operation_type(value: TypeId) -> !:
+        try validate_type_id(value, len(self.context.types.definitions))
+
+    func validate_generic_reference(generic: u32, type_arguments: Operands) -> !:
+        try self.validate_index(generic, len(self.generics), "generic function")
+        try self.validate_type_run(type_arguments)
+        if i64(type_arguments.count) != len(self.generics[generic].type_parameters):
+            error("typed package artifact: generic reference has the wrong type-argument count")
+
+    func require_interface_type(interface_type: TypeId) -> i64!:
+        try validate_type_id(interface_type, len(self.context.types.definitions))
+        var interface_index = -1
+        match self.context.types.definitions[interface_type.value].form:
+            Interface(index, arguments): interface_index = index
+            else: error("typed package artifact: HIR interface reference is not an interface type")
+        if interface_index < 0 or interface_index >= len(self.context.interfaces):
+            error("typed package artifact: HIR interface reference is missing its declaration")
+        return interface_index
+
+    func validate_requirement(interface_type: TypeId, requirement: u32) -> i64!:
+        let interface_index = try self.require_interface_type(interface_type)
+        if i64(requirement) >= len(self.context.interfaces[interface_index].requirements):
+            error("typed package artifact: HIR requirement index is outside its interface")
+        return len(self.context.interfaces[interface_index].requirements[requirement].parameters)
+
+    func validate_index(value: u32, count: i64, family: str) -> !:
+        if i64(value) >= count:
+            error("typed package artifact: HIR " + family + " references a missing table entry")

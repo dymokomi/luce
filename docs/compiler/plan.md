@@ -785,10 +785,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   closures, resolves deferred calls/conformances, and emits only ordinary
   concrete `HirFunction`s before MIR. Concrete `FunctionSymbol`s carry a
   closed source-less variant, and the former span-indexed source replay path is
-  gone. The next step is to serialize/decode retained bodies, remap
-  package-local semantic identities once during import, and prove
-  dependency-origin specialization through a real multi-package QBE build.
-  No generic form may reach MIR.
+  gone. The retained body section now has one canonical codec for every HIR
+  node/operation/literal, flat arena, default, local symbol, closure, shared
+  cell, and generated function, plus a strict postorder/reference validator.
+  Abstract existential conversion has its own template-only form, so no
+  rolled-back probe conformance identity enters an artifact. The next step is
+  to compose the existing identity/type/nominal/interface/generic sections
+  into one typed payload, remap package-local semantic identities once during
+  import, and prove dependency-origin specialization through a real
+  multi-package QBE build. No generic form may reach MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
