@@ -31,7 +31,7 @@ column because it does not determine stage-1 completion.
 | Spec | Capability | Frontend | HIR/oracle | MIR/oracle | QBE | Example | First open work |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
-| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw text, character, byte escapes, list/map literals, and set construction execute; formatted and formatter-trimmed triple literals remain. |
+| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw/triple text and bytes, character and byte escapes, list/map literals, and set construction execute; formatted strings remain. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16` and managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
@@ -176,6 +176,7 @@ HIR keeps the language types and their legal operations distinct.
 | --- | --- | --- | --- | --- | --- |
 | Valid UTF-8 literal, O(1) `byte_count`, O(n) scalar `length()` | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Ordinary and raw spellings with complete simple/Unicode escapes | yes | constants unchanged | yes, plus Wasm | `strings.luc` | complete |
+| Triple spellings use closing-delimiter indentation, canonical LF, then ordinary/raw escape semantics | normalized before HIR | constants unchanged | yes, plus Wasm | `strings.luc` | complete |
 | Immutable concatenation with escaping owned storage | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Unicode scalar iteration with ordinary loop exits | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Exact equality and deterministic scalar-value/prefix ordering | yes | yes | yes, plus Wasm | `strings.luc` | complete |
@@ -257,7 +258,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `lists.luc` | Shared list identity, cycle-aware structural equality, shallow independent copies and concatenation, immutable snapshots, ordered invalidating iteration, checked access/shape mutation, aggregate elements, recursive ARC/reclamation, and growth | HIR and MIR oracles plus native QBE and Wasm execution, bounds and iteration traps. |
 | `maps_and_sets.luc` | Insertion-ordered map/set identity, lookup, mutation, copy, recursive equality, managed ownership, and alias-wide iteration invalidation | HIR and MIR oracles plus native QBE and Wasm execution and mutation traps. |
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
-| `strings.luc` | Raw/escaped text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
+| `strings.luc` | Ordinary/raw/triple text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `traps.luc` | Dynamic nonrecoverable diagnostics and skipped deferred cleanup | HIR and MIR oracles plus captured native QBE and Wasm failure diagnostics. |
 | `assertions.luc` | Default/dynamic assertion messages, successful continuation, and failed no-cleanup termination | HIR and MIR oracles plus captured native QBE and Wasm failure diagnostics. |
 | `language_tour.luc` | Broad 1.0 declaration/control/managed surface | Parser only; each section migrates into focused executable examples as it lands. |
