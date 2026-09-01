@@ -357,6 +357,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   QBE, and Wasm carry the values; no compiler-known name or special backend
   operation exists. Source paths remain explicit package input until the
   deliberately post-1.0 manifest/dependency work.
+- [x] **Complete the §§5–6 core type-and-binding rule audit** (2026-09-01,
+  `done.md` §2). Aliases are transparent, non-generic, non-recursive,
+  order-independent identities usable in every signature and through
+  qualified public modules. Public constants spell their type while private
+  inference remains local. Tuple binding, value copies, shared reference
+  identity, recursive indirection, definite initialization, and nested generic
+  mutable places now have named positive and negative fixtures. Reference
+  parameters traverse shared list/map/class storage without becoming
+  assignable roots; the same target-neutral place reaches both backends.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

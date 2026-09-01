@@ -32,8 +32,8 @@ column because it does not determine stage-1 completion.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | complete | complete | complete | complete | Every normative literal rule and the width-explicit `math` special-value surface execute through both oracles and QBE/Wasm. |
-| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | Every scalar width executes; managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs remain. |
-| §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
+| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit is complete; `mutable_slice`, `task`, and explicit total ordering remain in S11/S18/S19. |
+| §6 | Immutable/mutable bindings, assignment, initialization | complete | complete | complete | complete | complete | Every binding, tuple, copy/reference, checked-place, and definite-initialization rule has positive, negative, oracle, and artifact evidence. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values, core managed function environments, generic functions and independently generic methods, interface-requirement fallibility lifts, and dynamic interface calls execute; the complete default-argument audit remains. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | The complete §9.6 pattern/exhaustiveness contract and both standard iteration spellings execute; the remaining control-flow/return/defer rule audit is S08. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S05 | §§5–6 | Rule audit for aliases, inference, recursive indirection, value/reference copying, and generic-nominal mutable places | Common and managed cases execute; promote only after every rule has a named fixture. |
 | S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
 | S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
 | S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
@@ -109,6 +108,22 @@ service, documentation, and release-policy work from silently expanding the
 language baseline. Separately requested engineering gates, including generated
 programs and fuzzing, remain in `docs/compiler/plan.md` and still precede the
 final architecture audit.
+
+## Current type-and-binding evidence
+
+The closed S05 surface is resolved before MIR: aliases disappear into their
+underlying type identity, and every assignment destination is one checked HIR
+place. MIR therefore receives neither alias spelling nor source lvalue syntax.
+
+| §§5–6 rule | Frontend/HIR | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Aliases are non-generic, transparent, order-independent, and non-recursive; qualified access enforces visibility | one lazily resolved identity and recursion guard | alias spelling erased | unchanged, plus Wasm | `types_and_bindings.luc` and cross-module fixtures | complete |
+| Inference is local to private bindings, arguments, returns, collections, `none`, and enum shorthand; public constants spell their type | exact expected/inferred `TypeId`; stable missing-context/API diagnostics | concrete types only | yes, plus Wasm | `types_and_bindings.luc`, generic examples | complete |
+| Recursive value layouts are rejected; class and collection edges provide explicit indirection | nominal cycle proof and focused negatives | finite concrete shapes | yes, plus Wasm | `types_and_bindings.luc`, class/collection examples | complete |
+| `let`, `var`, immutable parameters, and tuple binding preserve one RHS evaluation and left-to-right initialization | one hidden tuple value and resolved local symbols | typed slots and ordered stores | yes, plus Wasm | `types_and_bindings.luc` | complete |
+| Struct/tuple/array/enum values copy; class/closure/collection references share identity and ownership | typed value/reference operations | structural copies versus retain/release | yes, plus Wasm | `types_and_bindings.luc` and ownership examples | complete |
+| A field/index destination is checked and evaluated once; value roots/fields require mutation authority while shared storage remains mutable through `let` and parameters | one target-neutral `PlaceAssignment` path with exact diagnostics | one address walk; reference parameters remain values | yes, plus Wasm | `types_and_bindings.luc` and focused list/map/aggregate fixtures | complete |
+| Struct/class initialization assigns every field once before reads, calls, escape, loops, or successful exit | whole-program three-state flow proof | initialized ownership-bearing storage | yes, plus Wasm | class/generic construction examples and analyzer negatives | complete |
 
 ## Current `match` evidence
 
@@ -360,6 +375,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `constrained_generics.luc` | Generic interfaces, explicit and generic-struct conformance, static requirement dispatch, concrete existential witnesses, and infallible-to-fallible requirement adaptation | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `generic_enums.luc` | Inferred/explicit/contextual generic enum applications, concrete methods and conformances, matching, existential dispatch, distinct payload shapes, and named-payload evaluation order | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `generic_classes.luc` | Inferred/explicit/contextual generic class applications, distinct managed payload/lifecycle identities, weak recursive edges, fallible construction, conformances, and existential dispatch | HIR and MIR oracles plus Wasm and native QBE execution. |
+| `types_and_bindings.luc` | Transparent aliases, local/contextual inference, tuple binding, value copies, shared reference identity, recursive indirection, and nested generic mutable places | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `interfaces.luc` | Generic existential conversion, struct/class/enum witness dispatch, nested ownership, value COW, class identity, and fallibility adaptation/propagation | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `iteration.luc` | Compiler-known infallible/fallible iteration through concrete, constrained-generic, and existential values, including lexical iterator cleanup | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `hashing.luc` | Compiler-derived structural constraints and execution-local hashing across immutable value families | HIR and MIR oracles plus Wasm and native QBE execution. |

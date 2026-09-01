@@ -71,6 +71,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   concrete identity, weak recursive references, fallible construction,
   conformance witnesses and existential dispatch through both semantic
   oracles, Wasm, and native QBE.
+- `types_and_bindings.luc` closes the core type-and-binding audit with
+  transparent aliases, explicit public API types, local/contextual inference,
+  single-evaluation tuple binding, value-copy independence, shared list/class
+  identity, recursive class indirection, and nested generic mutable places
+  through both semantic oracles, Wasm, and native QBE.
 - `interfaces.luc` proves existential conversion and dynamic dispatch for
   value and class conformers. Value payload mutation detaches with copy-on-
   write, class payload mutation preserves shared identity, and infallible
