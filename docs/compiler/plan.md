@@ -773,15 +773,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   canonical MIR. HIR now has the required composable package table, module
   ownership, and package-owned `ErrorCodeLiteral`; the remaining work is the
   canonical typed artifact, strict decoder, import/seeding transaction, and
-  dependency-origin generic specialization. A retained template uses
-  `HirBodyArena`: exactly the ordinary flat HIR node/extra/value shape, but
-  with template-local node and operand identities. HIR-only deferred calls
+  dependency-origin generic specialization. HIR generation now checks every
+  abstract definition in an independent `HirBodyArena` and clones typed
+  declaration defaults across the arena boundary without source replay; the
+  checked arena is still discarded. The next step is to publish that arena as
+  the retained template: exactly the ordinary flat HIR node/extra/value shape,
+  but with template-local node and operand identities. HIR-only deferred calls
   retain resolved generic declarations, type arguments, and conformance
   requirements; neither source syntax nor spelling is serialized. One HIR
   specializer substitutes canonical `TypeId`s, remaps template-local symbols
   and closures, resolves those calls, and emits ordinary concrete
   `HirFunction`s before MIR. Artifact import remaps package-local semantic
-  identities once; no generic form reaches MIR.
+  identities once; no generic form reaches MIR. Then prove dependency-origin
+  specialization through a real multi-package QBE build before closing this
+  item.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it

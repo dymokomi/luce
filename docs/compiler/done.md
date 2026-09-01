@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 776 unit tests across 17 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 808 unit tests across 24 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1003,6 +1003,20 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   silently retag dependency errors as application errors. The representation
   remains target-neutral and adds no package, ABI, or layout policy to MIR.
   Serialized public APIs and typed generic bodies are still the open S16 work.
+
+- [x] **Abstract generic checks own isolated flat HIR arenas** (2026-09-01).
+  The generation transaction now distinguishes its published program arena
+  from each temporary template arena while retaining exactly one `HirNodeForm`
+  and one flat node/extra/value representation. Abandoning a checked template
+  restores one arena instead of truncating six coupled tables. Package
+  constants derive reference types from their canonical symbols, and the
+  focused arena owner clones already-typed declaration defaults—including
+  nested ordinary and placed operand runs—into the consuming arena without
+  replaying source. Regression tests cover unused bodies, package error codes,
+  function defaults, struct defaults, identity remapping, and detached table
+  ownership. The 808-test, CLI, Wasm, and native-QBE gate is green. These
+  arenas are not yet published or serialized as generic bodies; that remains
+  the next package-artifact milestone.
 
 - [x] **The executable §15 generic rule audit is closed** (2026-09-01).
   Named type parameters, local inference, explicit arguments, nominal owner
