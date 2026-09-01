@@ -349,6 +349,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `examples/numeric_conversions.luc` agree through native QBE and Wasm. Direct
   f16 C ABI crossings remain part of the generated rich-boundary adapter work;
   the compiler rejects them instead of silently widening the signature.
+- [x] **Named IEEE values live in the ordinary `math` module** (2026-09-01,
+  `done.md` §2). Nine width-explicit constants cover NaN and both infinities
+  for f16/f32/f64. Public constants now participate in the existing unified
+  qualified/selective import value namespace and resolve to ordinary HIR
+  constant symbols. Existing constant expressions, conversions, oracles, MIR,
+  QBE, and Wasm carry the values; no compiler-known name or special backend
+  operation exists. Source paths remain explicit package input until the
+  deliberately post-1.0 manifest/dependency work.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

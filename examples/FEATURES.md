@@ -31,7 +31,7 @@ column because it does not determine stage-1 completion.
 | Spec | Capability | Frontend | HIR/oracle | MIR/oracle | QBE | Example | First open work |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
-| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Every literal form, including the complete §4.5 collection matrix, executes; named NaN/infinity library values are the first open work. |
+| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | complete | complete | complete | complete | Every normative literal rule and the width-explicit `math` special-value surface execute through both oracles and QBE/Wasm. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | Every scalar width executes; managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs remain. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S03 | §4.3, §22.2 | Named NaN/infinity constructors/constants | IEEE values execute when produced arithmetically; named library surface is absent. |
 | S05 | §§5–6 | Rule audit for aliases, inference, recursive indirection, value/reference copying, and generic-nominal mutable places | Common and managed cases execute; promote only after every rule has a named fixture. |
 | S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
 | S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
@@ -272,10 +271,23 @@ families. The complete §9.4/§17.1 iteration contract has this narrower proof:
 | One canonical element type per nominal and no implicit infallible/fallible conversion | stable declaration/use diagnostics | n/a | n/a | focused negative fixtures | complete |
 | Iterator cleanup on exhaustion, `break`, `return`, and propagated error | observable class `deinit` | lexical ownership helper | yes, plus Wasm | `iteration.luc` | complete |
 
+## Current IEEE special-value evidence
+
+The §4.3 named surface is ordinary `math` module source. Imports resolve once
+to existing constant symbols, after which the same typed initializer tree feeds
+both oracles and the unchanged MIR/backend paths.
+
+| §4.3/§20.2/§22.2 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| `nan`, positive infinity, and negative infinity have explicit f16/f32/f64 constants | exact public constant types | existing typed constants/conversions | yes, plus Wasm | `numeric_conversions.luc` | complete |
+| Qualified and selective imports resolve to one program-wide constant symbol | one imported-value namespace; exact visibility diagnostics | import spelling erased | unchanged | focused multi-module fixtures | complete |
+| NaN remains unordered and both infinity signs survive width conversion | yes | yes | yes, plus Wasm execution | `numeric_conversions.luc` | complete |
+| No token, prelude name, HIR form, MIR form, runtime service, or backend special case is added | ordinary module source and `Reference` | unchanged | unchanged | architecture gate | complete |
+| The shipped module path is an explicit package input until post-1.0 manifest/dependency discovery | pipeline source identity | n/a | n/a | product example gate | complete |
+
 ## Current collection-literal evidence
 
-The broad §4 row remains partial only because named NaN/infinity values belong
-to the standard library. The §4.5 source contract itself has this closed proof:
+The §4.5 source contract has this closed proof:
 
 | §4.5 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
@@ -302,9 +314,8 @@ family has this narrower proof:
 
 ## Current formatted-string evidence
 
-The broad §4/§12/§17 rows remain partial for unrelated numeric, public-builder,
-ordering, and encoding work. The complete interpolation contract has this
-narrower proof:
+The broad §12/§17 rows remain partial for unrelated public-builder, ordering,
+and encoding work. The complete interpolation contract has this narrower proof:
 
 | §4.4/§17.3 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |

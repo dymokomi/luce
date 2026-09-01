@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 743 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 745 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -426,6 +426,25 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   native QBE, Wasmtime, and executable-example evidence agree. Direct f16 C
   ABI crossings remain rejected until the rich-boundary adapter can preserve
   `_Float16` without pretending it is f32.
+- [x] **Named IEEE special values establish the first ordinary `math` surface**
+  (2026-09-01). `src/standard/math.luc` declares width-explicit NaN, positive
+  infinity, and negative infinity constants for f16/f32/f64 using only the
+  language's existing constant expressions and checked conversions. The HIR
+  import value union now includes constants: qualified and selective access
+  enforce public visibility, reject missing values and local shadowing, and
+  converge on the same program-wide symbol and typed initializer. No import
+  spelling or library identity reaches MIR. Both semantic oracles, verified
+  MIR, Wasm execution, real native QBE, exact import diagnostics, and the
+  updated `examples/numeric_conversions.luc` prove every width and sign. The
+  standard module remains an explicit source input because manifest and
+  dependency discovery are deliberately post-1.0; no implicit prelude or
+  checkout path is embedded in the compiler. The 2,710-line declaration
+  collector's touched import section already owns the one value-namespace
+  transaction; extracting this small variant extension would split that
+  exhaustive resolution without creating independent state. The 3,467-line
+  body checker adds one constant-reference convergence helper inside its
+  marked recursive expression/call transaction, so its prior ownership
+  decision remains unchanged.
 - [x] **Fixed-array slices own a selected value snapshot** (2026-08-31).
   HIR admits array slicing as the explicit `array[T, N]` to `slice[T]`
   conversion and its oracle copies the selected values into immutable backing.
