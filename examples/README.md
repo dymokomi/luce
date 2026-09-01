@@ -86,6 +86,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   through both semantic oracles, Wasm, and native QBE. Protocol loops lower to
   existing calls, optionals, failure transfer, and structured control rather
   than adding a backend-specific iteration representation.
+- `hashing.luc` proves compiler-derived `Equatable`/`Hashable` constraints and
+  execution-local structural hashing across scalars, strings/bytes, arrays,
+  ranges, tuples, optionals, structs, and payload enums. Equal-value behavior
+  runs through both semantic oracles, Wasm, and native QBE without pinning a
+  backend's numeric hash code.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership

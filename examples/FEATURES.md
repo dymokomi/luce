@@ -32,19 +32,19 @@ column because it does not determine stage-1 completion.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw text, character, byte escapes, and list literals execute; map, formatted, and formatter-trimmed triple literals remain. |
-| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16`, maps/sets, hashing, structural list equality, and managed forms beyond the completed generic-class/list/slice/bytes/interface ownership graphs. |
+| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16`, maps/sets, structural list equality, and managed forms beyond the completed generic-class/list/slice/bytes/interface ownership graphs. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values, core managed function environments, generic functions and independently generic methods, interface-requirement fallibility lifts, and dynamic interface calls execute; the complete default-argument audit remains. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Both standard iteration spellings execute; the remaining pattern families keep the broad row open. |
-| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, and ownership-safe fixed-array slicing execute; hashing and the remaining rule-by-rule audit keep the broad row open. |
+| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, ownership-safe fixed-array slicing, and immutable structural hashing execute; the remaining rule-by-rule audit keeps the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core class lifetime reaches both oracles, QBE, and Wasm; direct strong-cycle rejection and `deinit` reentrancy advisories are complete. Resource-shape diagnostics and leak census remain. |
-| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, and Unicode string fundamentals reach QBE and Wasm. Maps/sets, structural list equality, builders/codecs, and content hashing remain. |
+| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, immutable list snapshots, recursive list/slice ownership and reclamation, owned bytes with escaping slices, Unicode string fundamentals, and immutable content hashing reach QBE and Wasm. Maps/sets, structural list equality, and builders/codecs remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | partial | partial | partial | partial | Generic functions, generic structs/enums/classes with memberwise or custom construction where defined, owner-parameterized type functions, owner-parameterized and independently generic instance methods, concrete conformances, interface constraints/intersections, abstract body checking, structural inference, contextual values, defaults, recursion, memoized instances, configurable package budgets, infinite-expansion detection, source paths, and HIR/MIR/backend size/time accounting reach QBE; serialized typed bodies in package artifacts remain. |
 | §16 | Interfaces, conformance, static use, interface values | complete | partial | partial | partial | partial | Nominal requirements, generic interfaces, explicit struct/class/enum conformance, static constrained calls, fallibility adapters, and existential value/class dispatch with value COW reach both oracles, QBE, and Wasm. The remaining rule-by-rule interface audit and dynamic-call cost reporting remain. |
-| §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | The complete iteration protocol is executable; equality/hashing/formatting/encoding protocols remain. |
+| §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Iteration plus closed derived equality/hashability and immutable structural hashing execute; cycle-aware mutable equality, ordering, formatting, and encoding remain. |
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
 | §20 | Modules, imports, visibility, entry points, manifests, dependency identity | complete | partial | partial | partial | partial | Manifest/dependency graph and the complete package/entry diagnostic matrix. |
@@ -143,6 +143,7 @@ policy.
 | ASCII source, exact `\xNN`, and Unicode-scalar-to-UTF-8 escapes | yes | constants unchanged | yes, plus Wasm | `strings.luc` | complete |
 | Immutable concatenation with fresh owned storage and left-to-right operands | yes | yes | yes, plus Wasm | `bytes.luc` | complete |
 | Equality and unsigned lexicographic ordering | yes | yes | yes, plus Wasm | `bytes.luc` | complete |
+| Content hashing | yes | yes | yes, plus Wasm | `hashing.luc` | complete for immutable bytes |
 | Half-open O(1) slicing with checked bounds | yes | yes | yes, including traps | `bytes.luc` | complete for bytes |
 | Slice returned across a temporary dynamic source's destruction retains that source owner | yes | yes, including forged-owner rejection | yes, plus Wasm execution | `bytes.luc` | complete |
 
@@ -159,7 +160,7 @@ HIR keeps the language types and their legal operations distinct.
 | Unicode scalar iteration with ordinary loop exits | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Exact equality and deterministic scalar-value/prefix ordering | yes | yes | yes, plus Wasm | `strings.luc` | complete |
 | Integer indexing and slicing remain unavailable | stable rejection | n/a | n/a | focused negative fixtures | complete |
-| Content hashing | — | — | — | — | waits for the structural hashing protocol |
+| Content hashing | yes | yes | yes, plus Wasm | `hashing.luc` | complete for immutable strings |
 
 ## Current standard-iteration evidence
 
@@ -174,6 +175,21 @@ families. The complete §9.4/§17.1 iteration contract has this narrower proof:
 | Source is evaluated once; one private mutable iterator drives repeated `next()` calls | yes | one owned slot and structured loop | yes | focused HIR/MIR tests | complete |
 | One canonical element type per nominal and no implicit infallible/fallible conversion | stable declaration/use diagnostics | n/a | n/a | focused negative fixtures | complete |
 | Iterator cleanup on exhaustion, `break`, `return`, and propagated error | observable class `deinit` | lexical ownership helper | yes, plus Wasm | `iteration.luc` | complete |
+
+## Current structural hashing evidence
+
+The broad §5/§12/§17 rows remain partial for mutable cyclic equality,
+maps/sets, ordering, formatting, and encoding. The closed immutable hashing
+family has this narrower proof:
+
+| §10.6/§17.2 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| `Equatable`/`Hashable` are compiler-derived constraint-only markers | yes, including stable rejection | erased before MIR | n/a | `hashing.luc` | complete |
+| Scalars, strings/bytes, ranges, arrays, optionals, tuples, structs, and enums derive recursively | yes | one canonical expansion | yes, plus Wasm | `hashing.luc` | complete |
+| `hash(value)` evaluates its operand exactly once | yes, observable effect | yes | yes | differential fixture | complete |
+| Equal values hash equally, including IEEE signed zero | yes | yes | yes, plus Wasm | `hashing.luc` | complete |
+| Numeric codes and mixing remain execution/backend-local | specified and unobserved by conformance tests | `FloatHash` only | independent legalizations | focused source tests | complete |
+| Mutable reference collections/classes are not hashable keys | stable rejection | n/a | n/a | focused negative fixtures | complete |
 
 ## Reserved and contextual words
 
@@ -211,6 +227,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `generic_classes.luc` | Inferred/explicit/contextual generic class applications, distinct managed payload/lifecycle identities, weak recursive edges, fallible construction, conformances, and existential dispatch | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `interfaces.luc` | Generic existential conversion, struct/class/enum witness dispatch, nested ownership, value COW, class identity, and fallibility adaptation/propagation | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `iteration.luc` | Compiler-known infallible/fallible iteration through concrete, constrained-generic, and existential values, including lexical iterator cleanup | HIR and MIR oracles plus Wasm and native QBE execution. |
+| `hashing.luc` | Compiler-derived structural constraints and execution-local hashing across immutable value families | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `closures.luc` | Managed copied/shared/weak captures, fallibility lifting, nested escape, collection/field ownership, and weak-self cycle breaking | HIR and MIR oracles plus Wasm and native QBE execution. |
 | `cfunc_values.luc` | Exact C-callable values and adapters | HIR, MIR, Wasm, and native QBE execution. |
 | `conditional_binding.luc` | Optional conditional binding, branch-only payload scope, and absent fallback | HIR, MIR, Wasm, and native QBE execution. |

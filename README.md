@@ -102,6 +102,11 @@ examples and tests link back here rather than restating it.
   `defer`, recoverable `Error` values with `try`/`catch`, nominal pointer- and
   integer-represented C handles, C `out` parameters as ordinary results,
   loops, and returns.
+- Compiler-derived `Equatable` and `Hashable` markers constrain generic code
+  without runtime witnesses. Immutable structural values hash through one
+  resolved HIR operation and one canonical MIR expansion; equal values agree
+  through both semantic oracles, QBE, and Wasm while numeric hash codes remain
+  deliberately execution-local.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,

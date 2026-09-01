@@ -748,9 +748,16 @@ BoolNot                        Bool
 Extend(r, to)  Wrap(r, to)     integer width changes; checked construction guards before Wrap
 IntReinterpret(r, to)          equal-width signedness change after representability guards
 IntToFloat  FloatToInt         explicit; FloatToInt traps out of range
+FloatHash(r) -> u64            execution-local code for one IEEE scalar
 ```
 
 Short-circuit `and`/`or` are control flow (`If`), not instructions.
+Source `hash(value)` is otherwise fully expanded once by the shared lowerer:
+ordinary integer, control, field, element, and memory instructions traverse
+the resolved structural value. `FloatHash` is the sole primitive because the
+numeric hash is deliberately private to an execution/backend; lowering
+normalizes equal signed zeros before it. Backends never choose aggregate
+hashing semantics or re-walk HIR types.
 
 **Memory**
 

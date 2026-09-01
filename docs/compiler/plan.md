@@ -236,17 +236,30 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   owner and a 28-line backend emission record instead of coupling presentation
   to HIR, MIR, QBE, or Wasm. Its out-of-band function provenance follows
   package composition and optimizer remapping without adding source or generic
-  facts to canonical MIR. The declaration collector and now 4,025-line
-  function walk must be reviewed
-  again before the next major language family; their current growth remains
-  cohesive but is at the threshold where a real ownership boundary should be
-  extracted when that family makes one visible. Keep the parser and
+  facts to canonical MIR. The declaration collector and now 4,255-line
+  function walk were reviewed again for structural hashing. The 57-line HIR
+  protocol owner is independent, but MIR hashing recursively shares the same
+  register, slot, aggregate-address, and structured-region transaction as
+  equality. Extracting its 230-line marked section today would duplicate that
+  machinery or add a forwarding interface, so it remains cohesive until a
+  reusable function-emission owner can replace—not wrap—the shared helpers.
+  Keep the parser and
   2,305-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
 - [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
 - [x] **`for`, integer ranges, and standard iteration protocols** (2026-08-31, `done.md` §2). Built-in ranges/lists/strings retain their canonical semantic paths. User values use compiler-known `Iterable[T]`/`FallibleIterable[T]` contracts through concrete, constrained-generic, or existential dispatch; `try for` applies the ordinary failure model to each `next()`. HIR resolves one target-independent loop driver, MIR reuses calls/optionals/structured control, and both oracles, QBE, and Wasm prove execution and lexical iterator cleanup.
+- [x] **Compiler-derived structural markers and immutable hashing**
+  (2026-08-31, `done.md` §2). `Equatable` and `Hashable` are closed,
+  constraint-only proofs with no source conformance or runtime witness.
+  `hash(value)` evaluates once and resolves to one HIR operation; shared MIR
+  lowering expands every structural aggregate into ordinary typed control and
+  memory operations. Only execution-local IEEE scalar coding remains a
+  verified canonical primitive. Both semantic oracles, QBE, Wasm, and
+  `examples/hashing.luc` prove equal-value consistency without freezing a
+  numeric hash algorithm. Mutable collection equality remains the separate
+  cycle-aware work required before maps/sets can close.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
@@ -650,11 +663,11 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Existential representation and dynamic calls established the focused
   108-line `hir/interfaces/values.luc` owner rather than extending the
   declaration collector. Standard protocol identity and iteration selection
-  established sibling 137- and 210-line owners. The remaining 3,008-line HIR
-  body checker and
-  4,025-line MIR function lowerer stay intact only until another language
-  family establishes a similarly cohesive owner; the lowerer's next major
-  slice must include a fresh transaction-boundary review. The 2,426-line HIR
+  established sibling 137- and 210-line owners. Structural marker use adds a
+  focused 57-line sibling. The remaining 3,013-line HIR body checker and
+  4,255-line MIR function lowerer stay intact after the hashing review above;
+  the lowerer's next major slice must include another transaction-boundary
+  review. The 2,495-line HIR
   interpreter
   likewise remains one semantic state machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
