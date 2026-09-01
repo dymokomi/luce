@@ -357,7 +357,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   sole HIR-to-MIR lowering maps it to canonical target-neutral `pointer`.
   Direct, optional, out, cfunc-signature, and extern-struct-field crossings
   share the existing null adapter; real QBE/libc `malloc`/`writev`/`free`
-  proves the end-to-end layout and call path. External
+  proves the end-to-end layout and call path. Direct C `str` inputs, results,
+  and `out` slots are complete without widening the closed `cfunc`, C-export,
+  extern-struct, or extern-variable vocabularies. Inputs receive exact
+  call-scoped NUL-terminated copies; results trap on null, scan immediately,
+  validate UTF-8, and become ordinary owned string buffers before any input
+  temporary is released. HIR and MIR hosts cover valid, null, malformed, and
+  unterminated values; the differential harness reaches both artifact
+  encoders; real QBE/libc `strchr` proves a result borrowed from its input.
+  External
   variables are also complete: HIR retains explicit observable loads/stores,
   canonical MIR owns a distinct external-global table and instructions, both
   semantic oracles use explicit variable hosts, QBE binds the C object symbol,
@@ -375,7 +383,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   the grammar and parser deliberately admit only plain fields; that
   specification inconsistency must be resolved before calling §21.17 closed.
   Incoming bare/nullable C function pointers and cfunc fields are now complete
-  in the separate rung below. Strings, lists, exported
+  in the separate rung below. Lists, exported
   structs/enums, generated adapters, and callback runtime enforcement remain
   on this item.
 - [x] **Checked byte access and the first adopted native example**

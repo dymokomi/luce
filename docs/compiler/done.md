@@ -1123,6 +1123,31 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   semantic-oracle addition remains inside its marked C-boundary transaction,
   and the canonical lowerer changed only the shared pointer predicate.
 
+- [x] **Borrowed C strings copy through one owned text boundary**
+  (2026-09-01). `extern func` alone now admits direct `str` inputs, results,
+  and `out` slots; `cfunc`, C exports, extern structs, and extern variables
+  retain their deliberately closed surfaces. The HIR oracle exposes exact
+  NUL-terminated UTF-8 bytes to its explicit host and scans host bytes only to
+  the first terminator. Canonical MIR keeps the ordinary
+  `{owner, data, byte_length}` string shape: its adapter builds input storage
+  with existing typed allocation/move instructions, decodes every result
+  before releasing those call-scoped allocations, and uses the single
+  target-neutral `CStringCopy` operation to scan, validate, and publish a
+  fresh immutable owner. The sealed Luce runtime owns the scan and complete
+  UTF-8 validation; null traps `null_foreign` and malformed text traps
+  `invalid_utf8`. Focused HIR/MIR hosts cover input encoding, result and `out`
+  copying, null, malformed UTF-8, and missing termination; the MIR verifier,
+  differential Wasm/QBE encoders, real QBE/libc `strchr`, and the expanded
+  `native_interop.native.luc` example prove the vertical slice. The real C
+  result deliberately aliases its input, pinning decode-before-cleanup rather
+  than merely checking the final text. No source file or parallel lowering
+  path was added. The size review records the shared function lowerer at 5,250
+  lines and the stateful MIR oracle at 2,038: this slice is respectively a
+  46-line addition inside the existing marked C-boundary transaction and one
+  instruction plus the oracle's narrow foreign-memory view. Splitting either
+  now would divide a single register/memory ownership transaction; their
+  planned holistic ownership refactor remains preferable to forwarding files.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.

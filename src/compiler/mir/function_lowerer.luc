@@ -52,6 +52,13 @@ struct HashLookup:
     let found: RegisterId
     let index: RegisterId
 
+## Storage owned solely by one in-flight C call. String results are decoded
+## before these allocations are released because a C result may alias an
+## input string (for example, `strchr`).
+struct CInputTemporary:
+    let address: RegisterId
+    let count: RegisterId
+
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
 ## function state while program identities remain stable.
@@ -3548,12 +3555,13 @@ pub class FunctionLowerer:
     # exact boundary in both directions.
     func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, contract: HirCFunction, placed: list[RegisterId], body: list[MirInstruction]) -> RegisterId!:
         let encoded = list[RegisterId]()
+        let temporaries = list[CInputTemporary]()
         let output_slots = list[COutputSlot]()
         for slot in contract.slots:
             match slot:
                 Input(parameter):
                     let value_type = called.parameters[parameter].value_type
-                    encoded.append(try self.encode_c_boundary_value(module, function, span, value_type, placed[parameter], body))
+                    encoded.append(try self.encode_c_import_value(module, function, span, value_type, placed[parameter], temporaries, body))
                 Output(name, value_type):
                     var raw_type = try self.state.c_boundary_type_of(module, function, span, value_type)
                     # The call operand is still one pointer, but C writes the
@@ -3579,6 +3587,10 @@ pub class FunctionLowerer:
             values.append(try self.decode_c_boundary_value(module, function, span, output.value_type, raw_value, body))
             value_types.append(output.value_type)
 
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        for temporary in temporaries:
+            body.append(MirInstruction(form = InstructionForm.DeallocateStorage(address = temporary.address, element_type = byte_type, count = temporary.count), span = span))
+
         if len(values) == 0: return RegisterId(value = no_register)
         if len(values) == 1: return values[0]
         let tuple_type = try self.state.mir_type_of(module, function, span, called.result)
@@ -3588,6 +3600,28 @@ pub class FunctionLowerer:
             let field_type = try self.state.mir_type_of(module, function, span, value_types[index])
             self.store_value(field_type, field, values[index], span, body)
         return result
+
+    # A Luce string is not assumed to carry spare storage after its byte
+    # length. Copy it into exact call-scoped storage and append the required
+    # C terminator; cleanup remains delayed until every result has been copied.
+    func encode_c_import_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, temporaries: list[CInputTemporary], body: list[MirInstruction]) -> RegisterId!:
+        if not types_match(value_type, resolve_builtin_type(BuiltinType.string)):
+            return try self.encode_c_boundary_value(module, function, span, value_type, value, body)
+        let text_type = try self.state.mir_type_of(module, function, span, value_type)
+        let data = try self.load_field(text_type, value, self.state.buffer_data_field(), span, body)
+        let length = try self.load_field(text_type, value, self.state.buffer_length_field(), span, body)
+        let u64_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let one = self.integer_constant(u64_type, 1, span, body)
+        let count = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = count, operation = BinaryOp.add, left = length, right = one), span = span))
+        let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+        let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.AllocateStorage(result = address, element_type = byte_type, count = count), span = span))
+        body.append(MirInstruction(form = InstructionForm.MoveElements(destination = address, source = data, element_type = byte_type, count = length), span = span))
+        let terminator = self.element_address(byte_type, address, length, span, body)
+        self.store_value(byte_type, terminator, self.integer_constant(byte_type, 0, span, body), span, body)
+        temporaries.append(CInputTemporary(address = address, count = count))
+        return address
 
     # Internal value -> C slot. Only nullable pointer-shaped values need
     # structural conversion; a bare pointer is validated, and every other
@@ -3620,6 +3654,16 @@ pub class FunctionLowerer:
     func decode_c_boundary_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
         if self.state.is_extern_struct(value_type):
             return try self.copy_extern_struct_boundary(module, function, span, value_type, value, false, body)
+        if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
+            self.emit_nonnull_c_guard(value, span, body)
+            let owner = self.state.new_register(builtin_mir_type(BuiltinMirType.buffer_owner))
+            body.append(MirInstruction(form = InstructionForm.CStringCopy(result = owner, source = value), span = span))
+            let data = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            body.append(MirInstruction(form = InstructionForm.BufferData(result = data, owner = owner), span = span))
+            let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+            body.append(MirInstruction(form = InstructionForm.BufferLength(result = length, owner = owner), span = span))
+            let text_type = try self.state.mir_type_of(module, function, span, value_type)
+            return self.materialize_buffer_value(text_type, owner, data, length, span, body)
         let optional_inner = self.state.optional_c_pointer(value_type)
         if optional_inner != none:
             let optional_type = try self.state.mir_type_of(module, function, span, value_type)
