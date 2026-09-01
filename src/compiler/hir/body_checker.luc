@@ -2633,6 +2633,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         if owner_module != self.state.current_module and not is_public:
             try self.fail(span, "`" + name + "` is private to module `" + self.state.sources[owner_module].name + "`")
 
+    # mark: Aggregate literals ==================================================================
+
     func check_tuple(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         var expected_parts: list[TypeId]? = none
         if expected != none:
@@ -2655,9 +2657,10 @@ pub class HirBodyChecker: HirSemanticChecker:
         let tuple_type = self.state.intern_tuple(parts)
         return try self.require_type(self.state.push_node(HirNodeForm.Tuple(elements = self.state.push_nodes(checked)), tuple_type, span), expected)
 
-    # Brackets construct a fresh reference list by default. An expected fixed
-    # array type selects the allocation-free value form and supplies both its
-    # element type and exact count.
+    # Brackets construct a fresh reference list by default. A fixed-array
+    # context selects the allocation-free value form; an immutable-slice
+    # context snapshots the same checked list literal through the ordinary
+    # list-to-slice operation, preserving one ownership implementation.
     func check_array_literal(elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         if expected != none:
             match self.state.types.definitions[expected.value].form:
@@ -2668,6 +2671,14 @@ pub class HirBodyChecker: HirSemanticChecker:
                     for element in elements: checked.append(try self.check_expression(element, element_type))
                     return self.state.push_node(HirNodeForm.Array(elements = self.state.push_nodes(checked)), expected, span)
                 List(element_type): return try self.check_list_literal(elements, element_type, expected, span)
+                Slice(element_type):
+                    let list_type = self.state.intern_list(element_type)
+                    let list_value = try self.check_list_literal(elements, element_type, list_type, span)
+                    return self.state.push_node(
+                        HirNodeForm.SequenceSlice(value = list_value, start = NodeId(value = no_node), end = NodeId(value = no_node)),
+                        expected,
+                        span,
+                    )
                 else: pass
         if len(elements) == 0:
             error(self.diagnostic(span, "an empty list literal needs a `list[T]` context"))
@@ -2967,19 +2978,34 @@ pub class HirBodyChecker: HirSemanticChecker:
         if case_index == 1: return [inner]
         return list[TypeId]()
 
-    # A literal pattern: the subject's type is the context, a leading `-`
-    # folds into an integer literal exactly as in an expression.
+    # A literal pattern: the subject's type is the context, and a leading `-`
+    # folds into a numeric literal exactly as in an expression.
     func check_pattern_literal(literal: PatternLiteralSyntax, subject_type: TypeId) -> u32!:
-        if self.state.optional_inner(subject_type) != none or self.declarations.enum_of(subject_type) >= 0:
+        let scalar_or_string = (
+            types_match(subject_type, resolve_builtin_type(BuiltinType.boolean))
+            or is_numeric_type(self.state.types, subject_type)
+            or types_match(subject_type, resolve_builtin_type(BuiltinType.character))
+            or types_match(subject_type, resolve_builtin_type(BuiltinType.string))
+        )
+        if not scalar_or_string:
             try self.fail(literal.span, "literal patterns need a scalar or string subject, found `" + self.describe_type(subject_type) + "`")
         var node = NodeId(value = no_node)
         if literal.is_negative:
-            if literal.token.kind != TokenKind.int_lit: try self.fail(literal.span, "`-` in a pattern needs an integer literal")
-            let integer_type = try self.integer_literal_type(literal.token, subject_type)
-            if is_unsigned_integer_type(self.state.types, integer_type): try self.fail(literal.span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
-            let integer = try self.decode_negative_integer(literal.token)
-            try self.require_integer_range(literal.span, integer, integer_type)
-            node = try self.require_type(self.push_constant(Value.SignedInteger(value = integer), integer_type, literal.span), subject_type)
+            if literal.token.kind == TokenKind.int_lit:
+                let integer_type = try self.integer_literal_type(literal.token, subject_type)
+                if is_unsigned_integer_type(self.state.types, integer_type): try self.fail(literal.span, "`-` is invalid for `" + self.describe_type(integer_type) + "`")
+                let integer = try self.decode_negative_integer(literal.token)
+                try self.require_integer_range(literal.span, integer, integer_type)
+                node = try self.require_type(self.push_constant(Value.SignedInteger(value = integer), integer_type, literal.span), subject_type)
+            elif literal.token.kind == TokenKind.float_lit:
+                let positive = try self.check_literal(literal.token, subject_type)
+                match self.state.node_form(positive):
+                    Constant(value):
+                        match self.state.values[value]:
+                            Floating(item): node = self.push_constant(Value.Floating(value = item * -1.0), subject_type, literal.span)
+                            else: trap("floating pattern literal did not produce a floating constant")
+                    else: trap("floating pattern literal did not produce a constant")
+            else: try self.fail(literal.span, "`-` in a pattern needs a numeric literal")
         else:
             node = try self.check_literal(literal.token, subject_type)
         match self.state.node_form(node):
@@ -3248,21 +3274,74 @@ func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
             return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
         else: return false
 
-# A map literal rejects keys only when the checked HIR proves their equality
-# without execution. Literal constants are the current closed constant-value
-# family; computed duplicates intentionally follow ordinary replacement at
-# run time.
+# A map literal rejects keys only when checked HIR proves their equality
+# without execution. Decoded constants, one source-level numeric sign, and
+# recursively literal optional/tuple/array values form the closed proof; calls
+# and other computed keys intentionally follow ordinary replacement at run
+# time.
 func statically_equal_nodes(state: HirGenerationState, left: NodeId, right: NodeId) -> bool:
+    let left_literal = statically_literal_value(state, left)
+    let right_literal = statically_literal_value(state, right)
+    if left_literal != none:
+        if right_literal == none: return false
+        return values_equal(left_literal, right_literal)
+    if right_literal != none: return false
     match state.node_form(left):
-        Constant(left_value):
+        NoneLiteral:
             match state.node_form(right):
-                Constant(right_value): return values_equal(state.values[left_value], state.values[right_value])
+                NoneLiteral: return true
+                else: return false
+        Some(left_value):
+            match state.node_form(right):
+                Some(right_value): return statically_equal_nodes(state, left_value, right_value)
+                else: return false
+        Tuple(left_values):
+            match state.node_form(right):
+                Tuple(right_values): return statically_equal_runs(state, left_values, right_values)
+                else: return false
+        Array(left_values):
+            match state.node_form(right):
+                Array(right_values): return statically_equal_runs(state, left_values, right_values)
                 else: return false
         else: return false
 
-# Structural comparison of pattern literals; only scalars and strings appear.
+# Return the semantic value of a source literal without evaluating arbitrary
+# HIR. The grammar represents a negative number as one unary node over its
+# positive literal (§4.2), so that single resolved layer belongs to the proof.
+func statically_literal_value(state: HirGenerationState, node: NodeId) -> Value?:
+    match state.node_form(node):
+        Constant(value): return state.values[value]
+        Unary(operation, operand):
+            match state.node_form(operand):
+                Constant(value):
+                    let literal = state.values[value]
+                    match operation:
+                        NumericIdentity(operand_type): return literal
+                        NumericNegate(operand_type):
+                            match literal:
+                                Floating(item): return Value.Floating(value = item * -1.0)
+                                else: return none
+                        else: return none
+                else: return none
+        else: return none
+
+func statically_equal_runs(state: HirGenerationState, left: Operands, right: Operands) -> bool:
+    if left.count != right.count: return false
+    for index in range(0, i64(left.count)):
+        let left_value = NodeId(value = state.extra[i64(left.start) + index])
+        let right_value = NodeId(value = state.extra[i64(right.start) + index])
+        if not statically_equal_nodes(state, left_value, right_value): return false
+    return true
+
+# Structural comparison of source literals used by match coverage and static
+# map-key equality. Floating signed zero follows language equality; named NaN
+# is not a literal and therefore never reaches this proof.
 func values_equal(left: Value, right: Value) -> bool:
     match left:
+        Unit:
+            match right:
+                Unit: return true
+                else: return false
         SignedInteger(a):
             match right:
                 SignedInteger(b): return a == b
@@ -3282,6 +3361,18 @@ func values_equal(left: Value, right: Value) -> bool:
         Text(a):
             match right:
                 Text(b): return a == b
+                else: return false
+        Floating(a):
+            match right:
+                Floating(b): return a == b
+                else: return false
+        Bytes(a):
+            match right:
+                Bytes(b):
+                    if len(a) != len(b): return false
+                    for index in range(0, len(a)):
+                        if a[index] != b[index]: return false
+                    return true
                 else: return false
         else: return false
 

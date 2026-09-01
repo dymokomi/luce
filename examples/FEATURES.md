@@ -31,7 +31,7 @@ column because it does not determine stage-1 completion.
 | Spec | Capability | Frontend | HIR/oracle | MIR/oracle | QBE | Example | First open work |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
-| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw/formatted/triple text and bytes, every IEEE width, character and byte escapes, list/map literals, and set construction execute; remaining contextual collection cases keep the broad row open. |
+| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Every literal form, including the complete §4.5 collection matrix, executes; named NaN/infinity library values are the first open work. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | Every scalar width executes; managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs remain. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
@@ -78,7 +78,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
 | S03 | §4.3, §22.2 | Named NaN/infinity constructors/constants | IEEE values execute when produced arithmetically; named library surface is absent. |
-| S04 | §4.5 | Every list/array/slice/map/set literal context, heterogeneous rejection, evaluation order, and static duplicate-key case | Common list/array/map/set paths execute; finish the closed contextual matrix. |
 | S05 | §§5–6 | Rule audit for aliases, inference, recursive indirection, value/reference copying, and generic-nominal mutable places | Common and managed cases execute; promote only after every rule has a named fixture. |
 | S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
 | S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
@@ -272,6 +271,20 @@ families. The complete §9.4/§17.1 iteration contract has this narrower proof:
 | Source is evaluated once; one private mutable iterator drives repeated `next()` calls | yes | one owned slot and structured loop | yes | focused HIR/MIR tests | complete |
 | One canonical element type per nominal and no implicit infallible/fallible conversion | stable declaration/use diagnostics | n/a | n/a | focused negative fixtures | complete |
 | Iterator cleanup on exhaustion, `break`, `return`, and propagated error | observable class `deinit` | lexical ownership helper | yes, plus Wasm | `iteration.luc` | complete |
+
+## Current collection-literal evidence
+
+The broad §4 row remains partial only because named NaN/infinity values belong
+to the standard library. The §4.5 source contract itself has this closed proof:
+
+| §4.5 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| `[...]` selects inferred/contextual `list[T]`, fixed `array[T, N]`, or immutable `slice[T]`, including contextual empties | one typed aggregate path | slices reuse list snapshot operations | yes, plus Wasm | `lists.luc`, `array_slices.luc` | complete |
+| Map literals and explicit empty map/set construction retain one homogeneous key/value/element type | stable positive and negative resolution | existing hash protocol | yes, plus Wasm | `maps_and_sets.luc` | complete |
+| Hidden heterogeneous and numeric-union collections, count/range errors, and `{}` are rejected | exact source diagnostics | n/a | n/a | focused frontend/HIR fixtures | complete |
+| Every element, key, and value evaluates exactly once, left-to-right | observable effects | source order retained | captured native output | differential fixture | complete |
+| Statically equal scalar, bytes, optional, tuple, and fixed-array map keys fail; computed duplicates replace in insertion order and sets deduplicate | recursive literal proof only | ordinary hash insertion | yes, plus Wasm | `maps_and_sets.luc` | complete |
+| No literal-specific target fact or backend path exists | canonical typed HIR | unchanged target-neutral MIR | unchanged encoder | architecture gate | complete |
 
 ## Current structural hashing evidence
 

@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 732 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 743 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1027,6 +1027,28 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   would be a forwarding shell or duplicate state, so extraction remains
   deferred until the planned common function-emission owner can replace those
   dependencies cohesively.
+
+- [x] **Collection literals close §4.5 without another representation**
+  (2026-09-01). `[...]` now selects inferred or contextual lists, exact fixed
+  arrays, and contextual immutable slices, including every legal empty form.
+  A slice literal is the existing typed list literal followed by the existing
+  immutable snapshot operation, so its construction order and escaping buffer
+  ownership share one HIR/MIR/runtime implementation. Map and set literals
+  keep their existing insertion protocol; static duplicate-map-key rejection
+  now proves equality for scalar/bytes constants and recursively literal
+  optional, tuple, and fixed-array keys, while computed duplicates still
+  replace at execution. Focused diagnostics reject heterogeneous/numeric-union
+  elements, invalid contextual values, `{}`, and duplicate literal keys.
+  Observable differential output proves exact left-to-right evaluation for
+  list, array, slice, map keys/values, and set arguments through both semantic
+  oracles and the real QBE product; Wasm consumes the same unchanged MIR. The
+  adjacent §9.6 audit also corrected its shared literal comparison boundary:
+  negative floats are valid numeric patterns, signed zero duplicates, and
+  `bytes` is not a scalar/string pattern. No MIR form, runtime service, backend
+  path, target fact, or new file was added. The 3,456-line body checker remains
+  one recursive typed-expression transaction; aggregate construction and the
+  closed static literal proof are marked cohesive sections, and extraction
+  would currently introduce a forwarding owner rather than separate state.
 
 - [x] **Triple-quoted literals normalize once at the source boundary**
   (2026-08-31). `str`, raw `str`, and `bytes` triples share one linear

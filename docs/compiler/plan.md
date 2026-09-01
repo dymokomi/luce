@@ -288,6 +288,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   remain target-neutral through MIR; generated code owns hashing/equality and
   structural ownership callbacks, while runtime/backend code owns only table
   storage, process-private bucket seeding, layout, and descriptors.
+- [x] **Collection literals satisfy the complete §4.5 matrix** (2026-09-01,
+  `done.md` §2). Brackets select one inferred/contextual list, fixed array, or
+  immutable slice; map/set construction keeps homogeneous types and source
+  order. Static duplicate-map-key proof covers the closed recursively literal
+  hashable family, while computed duplicates retain ordinary replacement.
+  Contextual slices reuse the existing list-snapshot HIR/MIR ownership path;
+  this slice adds no MIR form, runtime operation, backend branch, or target
+  fact.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
