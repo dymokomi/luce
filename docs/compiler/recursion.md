@@ -63,16 +63,18 @@ Measured on 0.25/arm64-macOS; method and full table in `plan.md` §8.1.
 
 | | value | verdict |
 | --- | --- | --- |
-| Stack under the compiler today | 512 MiB, from Stage-0's link-time reservation | fine, and not ours to keep |
+| Stack under the compiler today | 512 MiB, with Stage-0 0.30 count and host-provided floor guards | safe seed, and not ours to keep |
 | Stack in what we emit | host-toolchain default through QBE; 1 MiB shadow stack on wasm | native policy waits for our own backend/runtime |
 | Cost of one interpreted call | ~32 KiB across six host frames | 8–30× the norm |
 | ↳ and it depends on the build mode | 42.7 KiB release, 52.9 KiB debug (0.26) | see below |
 | `frame_limit` | 2000, declared | right for one host, wrong elsewhere |
 | Front-end nesting cap | 256 on expressions | done; other productions unmeasured |
 | Front-end throughput | linear, ~450 KB/s | was quadratic — see §5 |
-| Stack probe | wasm only | the QBE/host native path has none |
+| Stack probe | Stage-0 seed and Wasm output | the QBE/host native path has none |
 
-Two of these are already good and worth saying plainly. The wasm backend
+Three of these are already good and worth saying plainly. Stage-0 0.30 passes
+a stack floor in its host context and checks it at every generated function,
+including C callback entry and ARC destruction. The wasm backend
 emits a real stack-pointer probe: every frame checks that the new frame base
 has not fallen below the data segment and traps if it has (`wasm.luc`, the
 overflow guard around the shadow-stack prologue). That is exactly mechanism
@@ -126,7 +128,7 @@ Once self-hosted on the 64 MiB we emit, the fat-callee ceiling is about 1,600
 — under the limit, so the guard would stop guarding.
 
 **On macOS the query lies, and we would have believed it.** The Stage-0 team
-built this guard, and reports that neither `pthread_get_stacksize_np` nor
+found that neither `pthread_get_stacksize_np` nor
 `getrlimit(RLIMIT_STACK)` reflects a linker `-stack_size`: both answer the
 8 MiB default on a main thread that actually has 512 MiB. A guard measuring
 from the platform bound therefore under-estimates by 64× and starts refusing
@@ -134,16 +136,16 @@ calls on a stack with room to spare. Our own §8.1 measurements saw the same
 thing from the other side — raising `ulimit -s` moved nothing, because the
 reservation was never the rlimit's to describe.
 
-So the plan is not "query the bound":
+Stage-0 0.30 resolves this for the seed exactly once: the host places the
+floor beside the call-depth budget, and every Luce entry carries it. The plan
+for our self-hosted runtime is therefore not "query the bound":
 
-- **Take the floor from the host, not from the platform.** The right design is
-  a host ABI slot carrying the stack floor, exactly as the call-depth budget is
-  carried today; the host is the only party that reliably knows the stack it
-  reserved. This is the direction the Stage-0 team intends and it is an ABI
-  change, so we adopt it rather than invent a second answer.
-- **Until that exists, resolve every uncertainty toward not firing.** Take the
-  *lower* of the platform bound and an entry-frame estimate. A quiet guard
-  costs nothing; one that fires early is a wrong answer to a correct program.
+- **Take the floor from the host, not from the platform.** The host ABI slot
+  proven by Stage-0 0.30 is the design to carry into our runtime; the host is
+  the only party that reliably knows the stack it reserved.
+- **Until our runtime carries that slot, resolve every uncertainty toward not
+  firing.** A quiet guard costs nothing; one that fires early is a wrong answer
+  to a correct program.
 - Compute `N = (S − R) / (F × H) / k` with `R` = 1 MiB (our diagnostic path
   builds a source trace, so more than Clang's 256 KiB), `F × H` = the measured
   per-call cost, `k` = 10.
@@ -162,9 +164,9 @@ already has it.
 - Record the stack base once at entry; at each interpreter call and each
   recursive front-end production, compare the current stack pointer against
   `base + (S − R)`. Stage-0's implementation of exactly this traps our
-  fat-frame recursion with a full call trace instead of taking SIGBUS, and
-  reaches 597,695 frames on the 512 MiB it could not previously spend — so the
-  mechanism is proven, and only its interaction with the C boundary is open.
+  fat-frame recursion with a full call trace instead of taking SIGBUS. Stage-0
+  0.30 also proves the C-callback and ARC-deinitializer entries; our remaining
+  work is to carry the same contract into Luce-owned runtime/backend paths.
 - On breach: the same reported trap as the count limit, so the two mechanisms
   are indistinguishable to a user and only one message needs documenting.
 - This is what makes the promise in §1 true rather than approximately true.

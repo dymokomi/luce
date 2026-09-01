@@ -7,21 +7,21 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-31 (Stage-0 0.28).
+Last updated: 2026-08-31 (Stage-0 0.30).
 
 ## 1. Where things stand
 
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generic functions with abstract checking, bounded generic structs, enums, and classes with memberwise or custom construction where defined, generic nominal type functions, independently generic instance methods, concrete value/mutating/lifecycle method specializations and conformances, interface constraints and memoized concrete callable instances, nominal and compiler-known standard interfaces, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, infallible-to-fallible adapters, resolved infallible/fallible protocol iteration, and closed derived `Equatable`/`Hashable` constraint proofs with resolved equality/hash operations; direct calls, exact named `func`/`cfunc` values and shared indirect calls; managed closures, classes, lists, maps, sets, slices, failure, control flow, native authority, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: `f16`, assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, formatted/triple strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generic functions with abstract checking, bounded generic structs, enums, and classes with memberwise or custom construction where defined, generic nominal type functions, independently generic instance methods, concrete value/mutating/lifecycle method specializations and conformances, interface constraints and memoized concrete callable instances, nominal and compiler-known standard interfaces, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, infallible-to-fallible adapters, resolved infallible/fallible protocol iteration, and closed derived `Equatable`/`Hashable` constraint proofs with resolved equality/hash operations; direct calls, exact named `func`/`cfunc` values and shared indirect calls; managed closures, classes, lists, maps, sets, slices, failure, control flow, native authority, triple-literal normalization, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: `f16`, assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, formatted strings, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including compiler-known protocol iteration, structural hashing, and cycle-aware mutable collection equality, existential interface storage, dynamic calls and value/class mutation semantics; escaping/nested closures, shared mutable capture cells and weak captures; shared class identity, atomic weak promotion/zeroing, fallible construction cleanup, deterministic deinitialization, and isolated sealed-runtime state. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed list/map/set/slice handles, nominal interface handles and normalized requirement/conformance metadata, typed function descriptors, closure schemas, mutable cells, nominal strong/weak class handles, payload schemas, and generated ownership helpers with no physical layout; the verifier proves every rule, reachability removes unreachable closed-world functions/resources, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, and managed-class examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 687 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
-| Toolchain | Stage-0 0.28 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
+| Tests | 690 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
 
@@ -711,6 +711,12 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   `files.make_temporary_directory` operation needed by QBE product
   materialization. The complete 405-test, QBE differential, CLI, Wasm, and
   native gate passes under the new module-format 73 and host-ABI 32 toolchain.
+- [x] **Stage-0 0.30 adopted** (2026-08-31). Both host archives and source
+  identity are pinned from the official release. Its host-provided stack-floor
+  guard closes the last open Stage-0 request without changing the language,
+  module format 73, or host ABI 32. The complete 690-test, differential, CLI,
+  Wasm, and native QBE gate passes; exact adoption evidence is in
+  `stage0-0.30.md`.
 - [x] **The front end is linear** (2026-08-29, `recursion.md` §5). It was quadratic in file size: 8,000 statements took 179 s, 8,000 comment lines took 25 s. Three causes — bracket matching scanned per nesting level, `len(self.source)` sat inside the scanning loops, and `str` indexing walks the string in Stage-0 (`text[i]` is O(i), `for c in text` is O(n²), `text[a:b]` is O(a)). The tokenizer now decodes `bytes(source)` once into a `list[char]`, scans that, and builds token text with `text_between`; the parser precomputes bracket matches in `match_brackets`. Same inputs: 0.42 s and 0.07 s, and 1.4 MB in 3.1 s. Reported upstream for 0.27 with a reproduction (`build/stage0-0.27-repro/`), since the `str` cost is Stage-0's and it bounded self-hosting.
 - [x] **Expression nesting is bounded** (2026-08-29). 26,250 nested parentheses took SIGBUS; 25,000 did not. `parse_expression` counts its depth and refuses past 256 — Swift's and Clang's number, from the C++ standard's recommended minimums — with `expression nests deeper than 256`. Pinned by `test_expression_nesting_is_bounded`. The crash had been invisible because the old tokenizer took minutes to reach that depth: fixing throughput is what exposed it.
 - [x] **Integer ranges and `for`** (2026-08-29). `range[T]` is an immutable `{lower, upper, inclusive}` value for every implemented integer width; it can be bound, compared, passed, and returned under the aggregate protocol. `for` binds each element immutably, handles empty and closed ranges, and gives `continue` an inner block so it reaches the increment rather than restarting the same value. A closed range ending at the type maximum stops before incrementing. The HIR oracle, MIR interpreter, and wasm agree on half-open/closed/empty/max ranges, nesting, break/continue, early return, and range aggregate calls. The protocol and executable `try for` continuation is recorded in the later compiler-known iteration milestone below.
@@ -997,6 +1003,18 @@ Last updated: 2026-08-31 (Stage-0 0.28).
   deferred until the planned common function-emission owner can replace those
   dependencies cohesively.
 
+- [x] **Triple-quoted literals normalize once at the source boundary**
+  (2026-08-31). `str`, raw `str`, and `bytes` triples share one linear
+  formatter-owned pass in `compiler/formatting/triple_strings.luc`. A closing
+  delimiter on its own line defines the space baseline; opening/closing
+  structural line breaks disappear, CRLF/CR become LF, blank lines may be
+  shorter, and a nonblank outdented line is rejected. Escape decoding runs
+  afterward, so raw triples preserve backslashes and byte triples retain exact
+  byte/scalar rules. The decoder then emits the existing canonical text/bytes
+  constant: no triple fact enters HIR, MIR, runtime, or a backend. Focused
+  decoder/HIR rejection tests, both semantic oracles, QBE, Wasm, and
+  `examples/strings.luc` prove the contract.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.
@@ -1074,4 +1092,8 @@ The proving programs (`plan.md` §4): first the seed guest commands rewritten in
 - 0.28 added atomic temporary-directory creation and made string encoding
   metadata and callback context explicit. It also advanced the module format
   to 73 and host ABI to 32; the full compiler gate passes on the new formats.
+- 0.30 added a host-provided stack floor beside the frame counter and checks
+  both at every generated function entry, including C callbacks and ARC
+  deinitializers. It closes the fat-frame SIGBUS report; adoption identity and
+  the 690-test project gate are recorded in `stage0-0.30.md`.
 - Withdrawn after checking: "`return` in a statement-form `catch` does not return" — it does.

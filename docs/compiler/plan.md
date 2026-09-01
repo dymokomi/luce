@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-31 (Stage-0 0.28).
+Last updated: 2026-08-31 (Stage-0 0.30).
 
 ## Recovery audit of the unpublished native branch
 
@@ -569,13 +569,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   deterministic scalar ordering are complete through the same gates. Ordinary
   and raw text, character, and byte spellings now pass through one linear,
   target-independent semantic decoder with the complete escape vocabulary.
-  Triple-quoted values remain paired with the canonical formatter because §4.4
-  makes their indentation trimming formatter-owned; preserving source
-  indentation in HIR would establish the wrong semantics. Cycle-aware
+  Triple-quoted text and bytes now use one formatter-owned normalization pass:
+  the closing delimiter establishes the space baseline, physical line endings
+  become LF, and escape decoding happens only after trimming. HIR therefore
+  receives the same canonical immutable value as an ordinary spelling and no
+  triple-specific node survives the source boundary. Cycle-aware
   structural list/map equality and insertion-ordered maps/sets are complete
   without making runtime or backend callbacks responsible for value
-  semantics. Continue with text/bytes builders, formatted/triple strings, and
-  the formatter.
+  semantics. Continue with text/bytes builders, formatted strings, and the
+  rest of the formatter.
   The bytes implementation follows §12.6 for both static and dynamic sources:
   `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners
   retainable without exposing runtime layout. Do not promote the broad §12
@@ -747,9 +749,9 @@ Standing rules:
 ## 8. Stage-0 constraints
 
 The compiler must stay buildable by Stage-0 (the frozen seed) until it builds
-itself. Stage-0 0.28 is pinned by the published checksums for both supported
+itself. Stage-0 0.30 is pinned by the published checksums for both supported
 hosts; the release was built from source commit
-`d5b458355179c059ce9c506c37990612c2c8f68f`. Remaining constraints:
+`a5c3a099de3631024e739093066a4df388706b6f`. Remaining constraints:
 
 - Reserved identifiers (`error`, `bytes`, `i8`…, `pass`, `never`), and no top-level function sharing a name with a pattern binding.
 - A dropped result is an error (`luce.sema.unused`): write `discard(...)` around a value nothing receives, with any `catch` outside it — `discard(risky()) catch reason:`.
@@ -758,11 +760,19 @@ hosts; the release was built from source commit
 - Stack, not frame count, is the real recursion limit — see §8.1 — and since 0.26 the ceiling also depends on the build mode; `recursion.md` §3 has the numbers.
 - Lifted in 0.26, do not re-introduce the workarounds: `i64`-only indexing, bare `pub name: T` fields, file-scope `const`, single-member match arms, and the absence of `pass`/`never`/`list[T?]`.
 - Rule: reproduce a suspected Stage-0 defect as a standalone program and confirm it fails on the installed `luce-0` before reporting or working around it. History in `done.md` §5.
-- Open requests to the Stage-0 team: [`stage0-0.26.md`](stage0-0.26.md), with reproductions in `build/stage0-0.25-repro/` and `build/stage0-0.26-repro/`.
+- There are no open Stage-0 requests. Stage-0 0.30 closed the remaining stack
+  exhaustion report; the historical request and reproductions remain in
+  [`stage0-0.26.md`](stage0-0.26.md) and `build/stage0-0.25-repro/`.
 
 ### 8.1 The depth budget is a stack budget
 
-Stage-0 advertises 1,000,000 frames on a 512 MiB stack. That pairing assumes about 512 bytes per frame, which compiler-shaped code does not obey, so the advertised number is not the number to plan against. It still stands in 0.26: the stack-pointer guard that would fix it was built, worked, and was reverted for aborting a `cfunc` callback, so this remains the one open request.
+Stage-0 advertises 1,000,000 frames on a 512 MiB stack. That pairing assumes
+about 512 bytes per frame, which compiler-shaped code does not obey, so the
+advertised count alone is not the number to plan against. Stage-0 0.30 closes
+the safety gap: every generated function also checks a host-provided stack
+floor with a 256 KiB diagnostic reserve, including functions entered through
+`cfunc` callbacks and ARC deinitializers. The count keeps thin recursion
+deterministic; the floor catches fat frames first.
 
 Measured on 0.25/arm64-macOS (method: bisect the depth at which a built program takes SIGBUS, then divide the 512 MiB reservation by it):
 
@@ -773,9 +783,18 @@ Measured on 0.25/arm64-macOS (method: bisect the depth at which a built program 
 | 30-arm | 8,343 | ~64,000 |
 | one HIR-interpreter call (six host frames) | ~32,000 | ~16,600 |
 
-The cost is linear in the number of match arms that build a value struct — about 270 bytes per arm, never reused across arms that cannot both run. Past the ceiling the process takes SIGBUS; Stage-0's frame counter never fires, so the promised trap does not appear.
+The cost is linear in the number of match arms that build a value struct —
+about 270 bytes per arm, never reused across arms that cannot both run. Before
+0.30, passing the measured ceiling took SIGBUS because the frame counter never
+fired. The 0.30 release's published reproduction now reports
+`call_depth_exceeded` before the guard page.
 
-Consequences we hold to: both interpreters cap at `frame_limit = 2000`, a sixfold margin under the measured fat-callee ceiling of 12,875 and above the deepest fixture (`down(1500)`), so exhaustion is *reported* rather than fatal. The number is recorded with its measurement in `backends/interpreter.luc`. Re-measure when the reservation or the interpreter's shape changes. Reproduction for the Stage-0 team: `build/stage0-0.25-repro/`.
+Consequences we hold to: both interpreters still cap at `frame_limit = 2000`,
+a sixfold margin under the measured fat-callee ceiling of 12,875 and above the
+deepest fixture (`down(1500)`). That language-level limit remains deterministic
+while Stage-0's independent floor makes a wrong estimate safe. Re-measure when
+the reservation or interpreter shape changes. Historical reproduction:
+`build/stage0-0.25-repro/`.
 
 ### 8.2 What everyone else does, and where we are short
 
@@ -788,7 +807,8 @@ Checked against the implementations rather than argued from first principles.
 | rustc | 16 MiB on a *spawned* thread, for control over the size | `recursion_limit` 128 | no longer — it now lets the OS handle growth |
 | Zig | 46 MiB for the compiler, 60 MiB per worker | none in the parser | no — and deep nesting segfaults, filed as urgent |
 | CPython | 16 MiB linked on macOS, 64 MiB under sanitizers | 1000 Python frames | yes, since 3.14, against queried stack bounds |
-| Luce (us) | 512 MiB from Stage-0; 64 MiB in what we emit | `frame_limit` 2000 | no |
+| Luce seed (Stage-0 0.30) | 512 MiB | 1,000,000 host frames plus our `frame_limit` 2000 | yes — host-provided floor |
+| Luce QBE/Wasm output | host policy through QBE; 1 MiB Wasm shadow stack | source recursion limits remain open | Wasm yes; QBE native no |
 
 Three patterns hold across all of them. A declared count limit exists so the error is deterministic across machines. The safety factor on that count is ten to a hundred, not the six we run, because per-frame cost depends on the input's shape. And the ones that degrade gracefully rather than crashing all probe the stack pointer; the one that does not, Zig, has an open urgent bug for exactly the crash we reproduced.
 
@@ -796,8 +816,9 @@ Where we are short, in the order it will bite. The design record that turns this
 
 - ~~The front end has no nesting guard.~~ **Closed 2026-08-29.** Expression nesting is capped at 256; 26,250 nested parentheses used to take SIGBUS. Statement and type nesting are still unguarded and still unmeasured.
 - **`frame_limit` is declared, not derived.** It is right for Stage-0's 512 MiB
-  host and unproven for executables linked by the QBE host toolchain. The fix
-  is to compute it at startup from real stack bounds, as CPython does.
+  host and unproven for executables linked by the QBE host toolchain. Stage-0
+  0.30 proves the portable input is a host-provided floor, not a platform query;
+  our runtime must carry the equivalent fact when Luce owns the native path.
 - **32 KiB per interpreted call is eight to thirty times the norm** (a lean tree-walker spends 1–4 KiB). It is Stage-0's per-arm slot inflation in our wide `match` walkers. Thinner frames are a linear multiplier on depth that costs no address space, which is why this is the fix rather than a bigger constant.
 - **The QBE baseline inherits the host stack policy.** Stage 1 deliberately
   does not rebuild linker/loader policy around the oracle. An explicit stack

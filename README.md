@@ -17,7 +17,7 @@ end-to-end slices. Unsupported features fail with a clear diagnostic.
 ## Getting started
 
 The bootstrap script supports Apple silicon macOS and x86-64 Linux. It downloads
-Stage-0 0.28 and the official QBE 1.3 source, verifies both checksums, and builds
+Stage-0 0.30 and the official QBE 1.3 source, verifies both checksums, and builds
 the QBE oracle. `./stage0` is the resulting pinned toolchain, not this
 repository's source.
 
@@ -119,7 +119,8 @@ examples and tests link back here rather than restating it.
   every operator, `if`/`while`, functions and calls across modules, module
   constants, tuples, optionals, integer ranges and `for`, structs (including
   custom initialization), enums and `match`, methods, lexical `defer`,
-  caller-owned failure propagation and recovery, `str`/`bytes` values with
+  caller-owned failure propagation and recovery, ordinary/raw/triple
+  `str`/`bytes` values with
   equality, `bytes.length`, checked `bytes[index]`, `str.byte_count`, fixed
   value arrays with contextual literals, structural equality, copies,
   checked indexing and nested mutable places, plus runtime-backed list
