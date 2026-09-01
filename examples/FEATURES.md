@@ -47,11 +47,11 @@ column because it does not determine stage-1 completion.
 | §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Iteration, closed derived equality/hashability, cycle-aware collection equality, immutable structural hashing, and closed `Display` formatting execute; ordering and encoding remain. |
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
-| §20 | Modules, imports, visibility, entry points, manifests, dependency identity | complete | partial | partial | partial | partial | Manifest/dependency graph and the complete package/entry diagnostic matrix. |
+| §20 | Modules, imports, visibility, entry points, and compile-time constants | complete | partial | partial | partial | partial | Module-cycle and import-use diagnostics, the public-signature/API-surface matrix, the complete constant subset, and the package/entry diagnostic matrix remain. Manifest, dependency identity, and platform variation are explicitly post-1.0. |
 | §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | Scalar/handle/nested extern structs now remain ordinary HIR/MIR values and pack/unpack fieldwise through pointer slots on both compiled backends, with a real QBE/libc proof. FIIR generation, string/list adapters, the f16 C adapter, exported aggregates, `foreign`, incoming cfunc fields, and remaining callback/lifetime rules remain. |
 | §22 | Compiler/runtime versus standard-library boundary | complete | partial | partial | partial | partial | Implement and execute the standard modules required by the language examples. |
-| §23 | Semantic pipeline, runtime services, ABI, artifacts, backends | complete | partial | partial | partial | partial | Arena/runtime completion and full-language QBE artifact proof. Deferred subsections stay deferred by the spec. |
-| §24 | Command/diagnostic contract, formatter, source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, and the remaining stable diagnostic contracts remain. |
+| §23 | Semantic pipeline and runtime services | complete | partial | partial | partial | partial | Worker services, source traces/fatal outcomes, optional resource instrumentation, self-hosting, and the final full-language QBE artifact proof remain. Backend portfolio, artifact, ABI, profile, and cache policy are explicitly post-1.0. |
+| §24 | First-party command, diagnostics, formatter, and source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, the required command modes, and the remaining stable diagnostic contract remain. Persistent service, docs, observability, budgets, and release gates are explicitly post-1.0. |
 | §25 | Deliberate exclusions | partial | partial | n/a | n/a | partial | Map every exclusion to a stable negative fixture; do not infer coverage from lack of implementation. |
 | §28 | Compact declarations/statements/expressions/operators/grammar reference | complete | partial | partial | partial | partial | This surface closes only when the semantic rows above close. |
 
@@ -64,6 +64,55 @@ The evidence for frontend completeness is concentrated in
 As implementation advances, broad `partial` rows are split until every
 normative rule has a named positive and negative fixture. No broad row may be
 promoted merely because its common case works.
+
+## Exact open stage-1 checklist
+
+This is the resumption list for the source-to-QBE baseline. Each row is one
+bounded closure unit: it either names the exact missing behavior or names the
+specific subsection whose already-broad implementation still needs a complete
+positive/negative audit. A row closes only under the six gates above. The
+identifiers are stable planning labels, not diagnostic codes.
+
+| ID | Spec | Closure unit | Current state / dependency |
+| --- | --- | --- | --- |
+| S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
+| S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
+| S03 | §4.3, §22.2 | Named NaN/infinity constructors/constants | IEEE values execute when produced arithmetically; named library surface is absent. |
+| S04 | §4.5 | Every list/array/slice/map/set literal context, heterogeneous rejection, evaluation order, and static duplicate-key case | Common list/array/map/set paths execute; finish the closed contextual matrix. |
+| S05 | §§5–6 | Rule audit for aliases, inference, recursive indirection, value/reference copying, and generic-nominal mutable places | Common and managed cases execute; promote only after every rule has a named fixture. |
+| S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
+| S07 | §9.6 | Complete match exhaustiveness/redundancy matrix, including finite literal/range coverage and redundant catch-all advisory | Enum/optional/bool/literal/range alternatives execute; audit the remaining finite-domain cases. |
+| S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
+| S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
+| S10 | §11.4–§11.5 | Resource-shape diagnostics and runtime leak/live-resource census | ARC, weak references, cycle diagnostics, destruction, and reentrancy advisories execute. |
+| S11 | §12.6 | Restricted non-storable `mutable_slice[T]` plus closure-scoped mutable access | Syntax only; requires a scoped runtime operation and escape/send/native checks. |
+| S12 | §§12.7–12.8, §22.2 | Public text/bytes builders, UTF codecs, parsing/formatting, arenas/pools/generational handles | Internal affine builder and owned text/bytes substrate are complete. |
+| S13 | §§13.3–13.7 | Error context/source traces, complete trap provenance, structured fatal outcomes, and stack-budget reporting | Error data/control and dynamic traps execute; trace/fatal runtime path is incomplete. |
+| S14 | §13.8 | Prove assertion conditions effect-free from operational summaries | Runtime assertion semantics execute; static proof is absent. |
+| S15 | §14.4 | Closure/value sendability and all worker-boundary capture rejections | Core closure contract is complete; closes with workers. |
+| S16 | §15 | Final generic rule audit and serialized typed bodies in package artifacts | Executable generic surface and specialization accounting are complete. |
+| S17 | §16 | Final interface rule audit, including no-downcast exclusions and every static/existential adaptation | Concrete/generic/existential dispatch executes; audit remains. |
+| S18 | §17.2 | Explicit `Comparable` conformance and total-order `compare` contract | Derived equality/hashability are complete; ordering protocol is absent. |
+| S19 | §§19.1–19.5 | Workers, `task[T]`, graph-copy transfer, sendability, `wait_all`, cancellation, and supervised lifetime | Syntax only. |
+| S20 | §§20.1–20.5 | Module-cycle, import-use, public-signature, constant-expression, and complete entry-point diagnostics | Imports/modules/constants/entry work in common paths; exact matrix remains. |
+| S21 | §§21.1–21.15 | FIIR, C/C++ import and wrapper/thunk generation, recipes, provenance, and support diagnostics | Architecture is specified; generator is absent. |
+| S22 | §21.16 | `str` input/result adapters, UTF-8 validation, raw memory copy/take verbs, and f16 generated shim | Scalar/handle/out/global paths execute. |
+| S23 | §21.17 | Resolve the field-only grammar conflict; then add `foreign`/incoming-cfunc fields and close the extern-struct matrix | Scalar/handle/nested fields and pointer crossings execute. |
+| S24 | §21.19 | Raw incoming and nullable `cfunc` pointers, capture-free lambdas, null invocation, and callback thread/runtime contract | Exact named functions/externs and generated C adapters execute. Depends on the `foreign` decision in S23. |
+| S25 | §21.20 | Borrowed `list[H]` pointer-plus-count parameters, empty-list null, and every rejected direction/element shape | Runtime dense lists exist; boundary adapter is absent. |
+| S26 | §§24.2, 24.5 | Source `test` HIR/MIR/registry, isolated execution, test-only scope/import pruning, CLI selection/reporting, and `testing.expect_trap` | Parser surface only. |
+| S27 | §§24.2–24.4 | Required first-party command modes, complete structured diagnostic shape/fixes, and canonical formatter | `check`, `run`, and `build` have a working core; remaining modes/contracts are absent. |
+| S28 | §25 | Stable negative fixtures for every deliberate exclusion | Representative tokenizer/parser exclusions exist; exhaustive mapping remains. |
+| S29 | §23.1 | Compile the compiler with stage-1, compare observable behavior, and preserve the frozen bootstrap chain | Stage-0 0.30 builds and tests the tree; self-hosting proof remains. |
+| S30 | §§22–23 | Finish the standard modules and runtime services required by the proving examples, then run the full corpus through QBE | Core runtime storage/collections/text/classes are executable; workers, codecs, host libraries, and resource tooling remain. |
+
+The following spec sections do **not** block language-spec completion because the 1.0
+document explicitly defers them: §§20.6–20.8, 23.2–23.3, 23.5–23.8, 24.1,
+and 24.6–24.9. This prevents post-1.0 package, backend-portfolio, artifact,
+service, documentation, and release-policy work from silently expanding the
+language baseline. Separately requested engineering gates, including generated
+programs and fuzzing, remain in `docs/compiler/plan.md` and still precede the
+final architecture audit.
 
 ## Current `never` evidence
 
