@@ -48,7 +48,7 @@ column because it does not determine stage-1 completion.
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
 | §20 | Modules, imports, visibility, entry points, and compile-time constants | complete | partial | partial | partial | partial | Module-cycle and import-use diagnostics, the public-signature/API-surface matrix, the complete constant subset, and the package/entry diagnostic matrix remain. Manifest, dependency identity, and platform variation are explicitly post-1.0. |
-| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | Scalar/handle/nested extern structs and incoming bare/nullable cfunc pointers retain target-neutral HIR/MIR shape, with real QBE/libc proofs. FIIR generation, string/list adapters, the f16 C adapter, exported aggregates, `foreign`, and callback runtime/lifetime rules remain. |
+| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | Scalar/handle/nested extern structs, anonymous `foreign` data pointers, and incoming bare/nullable cfunc pointers retain target-neutral HIR/MIR shape, with real QBE/libc proofs. FIIR generation, string/list adapters, the f16 C adapter, exported aggregates, and callback runtime/lifetime rules remain. |
 | §22 | Compiler/runtime versus standard-library boundary | complete | partial | partial | partial | partial | Implement and execute the standard modules required by the language examples. |
 | §23 | Semantic pipeline and runtime services | complete | partial | partial | partial | partial | Worker services, source traces/fatal outcomes, optional resource instrumentation, self-hosting, and the final full-language QBE artifact proof remain. Backend portfolio, artifact, ABI, profile, and cache policy are explicitly post-1.0. |
 | §24 | First-party command, diagnostics, formatter, and source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, the required command modes, and the remaining stable diagnostic contract remain. Persistent service, docs, observability, budgets, and release gates are explicitly post-1.0. |
@@ -97,7 +97,7 @@ identifiers are stable planning labels, not diagnostic codes.
 | S20 | §§20.1–20.5 | Module-cycle, import-use, public-signature, constant-expression, and complete entry-point diagnostics | Imports/modules/constants/entry work in common paths; exact matrix remains. |
 | S21 | §§21.1–21.15 | FIIR, C/C++ import and wrapper/thunk generation, recipes, provenance, and support diagnostics | Architecture is specified; generator is absent. |
 | S22 | §21.16 | `str` input/result adapters, UTF-8 validation, raw memory copy/take verbs, and f16 generated shim | Scalar/handle/out/global paths execute. |
-| S23 | §21.17 | Resolve the field-only grammar conflict; then add `foreign` fields and close the extern-struct matrix | Scalar/handle/nested/cfunc fields and pointer crossings execute. |
+| S23 | §21.17 | Resolve the field-only grammar/prose conflict, then close the remaining extern-struct matrix | Scalar/handle/`foreign`/nested/cfunc fields and pointer crossings execute; the syntax-versus-prose decision remains. |
 | S24 | §21.19 | Enforce the callback thread/runtime contract and close the remaining C-export callback matrix | Raw incoming and nullable `cfunc` pointers, capture-free names/lambdas, null invocation, and generated C adapters execute. |
 | S25 | §21.20 | Borrowed `list[H]` pointer-plus-count parameters, empty-list null, and every rejected direction/element shape | Runtime dense lists exist; boundary adapter is absent. |
 | S26 | §§24.2, 24.5 | Source `test` HIR/MIR/registry, isolated execution, test-only scope/import pruning, CLI selection/reporting, and `testing.expect_trap` | Parser surface only. |
@@ -344,7 +344,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `checkout/` | Multi-module application shape | Parser only until collections/strings are complete. |
 | `c_api.luc` | C export surface | Parser only as a whole; focused C function export tests execute elsewhere. |
 | `c_import/` | Manifest-generated C import architecture | Parser/C-source checks; FIIR generation and end-to-end linking pending. |
-| `native_interop.native.luc` | `extern` declarations, fieldwise extern-struct crossing, incoming C function pointers, and audited pointer rebind/move | Checks and executes `clock_gettime` plus a returned `signal` handler through native QBE/libc; pointer primitives execute in focused compiler tests. |
+| `native_interop.native.luc` | `extern` declarations, anonymous `foreign` pointers, fieldwise extern-struct crossing, incoming C function pointers, and audited pointer rebind/move | Checks and executes `clock_gettime`, a zero-length `writev` over `foreign` memory, and a returned `signal` handler through native QBE/libc; pointer primitives execute in focused compiler tests. |
 
 ## Stage-0 corpus
 

@@ -351,7 +351,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   pointers and shapes declared-result-then-output values, the semantic hosts
   cover both sides of that memory boundary, and real QBE/libc
   `posix_memalign` proves a nullable pointer output. Real QBE/libc `getpid` and
-  `malloc`/`free` execution prove both handle representations. External
+  `malloc`/`free` execution prove both handle representations. The anonymous
+  raw data-pointer type `foreign` is complete on the same protocol: HIR retains
+  one atomic opaque/equatable token, ordinary optionals stay tagged, and the
+  sole HIR-to-MIR lowering maps it to canonical target-neutral `pointer`.
+  Direct, optional, out, cfunc-signature, and extern-struct-field crossings
+  share the existing null adapter; real QBE/libc `malloc`/`writev`/`free`
+  proves the end-to-end layout and call path. External
   variables are also complete: HIR retains explicit observable loads/stores,
   canonical MIR owns a distinct external-global table and instructions, both
   semantic oracles use explicit variable hosts, QBE binds the C object symbol,
@@ -369,7 +375,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   the grammar and parser deliberately admit only plain fields; that
   specification inconsistency must be resolved before calling §21.17 closed.
   Incoming bare/nullable C function pointers and cfunc fields are now complete
-  in the separate rung below. Strings, lists, `foreign`, exported
+  in the separate rung below. Strings, lists, exported
   structs/enums, generated adapters, and callback runtime enforcement remain
   on this item.
 - [x] **Checked byte access and the first adopted native example**
