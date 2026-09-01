@@ -75,7 +75,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   transparent aliases, explicit public API types, local/contextual inference,
   single-evaluation tuple binding, value-copy independence, shared list/class
   identity, recursive class indirection, and nested generic mutable places
-  through both semantic oracles, Wasm, and native QBE.
+  through both semantic oracles, Wasm, and native QBE. Together with
+  `array_slices.luc`, `generic_enums.luc`, and `hashing.luc`, it is the
+  readable product proof for the complete ordinary §10 value-data model.
 - `expressions_and_calls.luc` closes the core expression/function audit with
   observable receiver, argument, literal, interpolation, binary, assignment,
   and constructor order; pure defaults, named placement, tuples, exact

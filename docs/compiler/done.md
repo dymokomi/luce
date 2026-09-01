@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 752 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 756 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1300,6 +1300,34 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   mutually recursive expression/scope transaction remains a deliberate
   post-coverage holistic refactor candidate rather than being split into a
   small forwarding file during this audit.
+
+- [x] **The complete §10 value-data model is closed before the backend
+  boundary** (2026-09-01). The rule audit pins struct field mutability,
+  declaration order, synthesized and custom initialization, recursive-value
+  rejection, source visibility, tuple positionality, fixed-array length and
+  copy semantics, owned array-to-slice snapshots, enum construction and
+  exhaustive payload matching, derived equality/hashability, and every
+  deliberate omission: inheritance, object spread, ordinary unions, tuple or
+  enum projections, implicit array views, user value parameters, source
+  ordinals, operator overloads, and ordinary layout attributes. Existing
+  examples already form the readable proof, so the audit adds no duplicate
+  showcase program.
+
+  The audit found one real canonical-MIR defect: ordinary enums were rejected
+  above 256 cases because their internal selector was hard-coded to `u8`.
+  HIR now documents case position as semantic identity rather than an ABI tag;
+  MIR selects the smallest sufficient Luce unsigned scalar, the verifier
+  requires that scalar to represent every case, and construction, ownership,
+  pattern matching, equality, and hashing all read the type's selected tag.
+  A generated 257-case fixture selects, compares, hashes, matches, Wasm-encodes,
+  and executes through real QBE without adding a 257-line source fixture.
+  Optional tags remain their independent specified two-case `u8` form.
+
+  No target, layout, ABI, runtime service, backend branch, source example file,
+  or Stage-0 workaround was added. The 5,331-line function lowerer grew only
+  inside its existing aggregate/ownership transaction and now names optional
+  versus ordinary enum tag operations explicitly. Its holistic split remains
+  preferable to extracting a forwarding helper during the coverage audit.
 
 ## 3. Bugs the multi-backend harness found
 

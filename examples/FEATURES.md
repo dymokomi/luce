@@ -37,7 +37,7 @@ column because it does not determine stage-1 completion.
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | The S06 eager-order/operator audit is complete; named arithmetic-policy APIs remain in S30. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | complete | complete | complete | complete | Exact direct/generic/function/closure callables, defaults, tuples, methods, mutation, and recursion execute through both oracles, QBE, and Wasm. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | complete | complete | complete | complete | Every branch, loop, match, return, and lexical-cleanup rule has stable negative and executable product evidence. |
-| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, ownership-safe fixed-array slicing, and immutable structural hashing execute; the remaining rule-by-rule audit keeps the broad row open. |
+| §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | complete | complete | complete | complete | Every ordinary value-data rule has positive, negative, oracle, and artifact evidence; explicit native representation remains the §21 boundary concern. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core class lifetime reaches both oracles, QBE, and Wasm; direct strong-cycle rejection and `deinit` reentrancy advisories are complete. Resource-shape diagnostics and leak census remain. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
 | S10 | §11.4–§11.5 | Resource-shape diagnostics and runtime leak/live-resource census | ARC, weak references, cycle diagnostics, destruction, and reentrancy advisories execute. |
 | S11 | §12.6 | Restricted non-storable `mutable_slice[T]` plus closure-scoped mutable access | Syntax only; requires a scoped runtime operation and escape/send/native checks. |
 | S12 | §§12.7–12.8, §22.2 | Public text/bytes builders, UTF codecs, parsing/formatting, arenas/pools/generational handles | Internal affine builder and owned text/bytes substrate are complete. |
@@ -122,6 +121,24 @@ place. MIR therefore receives neither alias spelling nor source lvalue syntax.
 | Struct/tuple/array/enum values copy; class/closure/collection references share identity and ownership | typed value/reference operations | structural copies versus retain/release | yes, plus Wasm | `types_and_bindings.luc` and ownership examples | complete |
 | A field/index destination is checked and evaluated once; value roots/fields require mutation authority while shared storage remains mutable through `let` and parameters | one target-neutral `PlaceAssignment` path with exact diagnostics | one address walk; reference parameters remain values | yes, plus Wasm | `types_and_bindings.luc` and focused list/map/aggregate fixtures | complete |
 | Struct/class initialization assigns every field once before reads, calls, escape, loops, or successful exit | whole-program three-state flow proof | initialized ownership-bearing storage | yes, plus Wasm | class/generic construction examples and analyzer negatives | complete |
+
+## Current value-data-modeling evidence
+
+The closed §10 surface ends before physical representation. HIR retains
+nominal meaning and semantic declaration order; canonical MIR retains typed
+products and sums; only a backend or explicit native boundary chooses offsets,
+alignment, and ABI representation.
+
+| §10 rule | Frontend/HIR | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Struct fields use `let`/`var`, private-by-default visibility, declaration order, defaults, and a synthesized memberwise initializer only when no custom `init` exists | exact fields, receiver kinds, argument placement, visibility, and whole-program definite initialization | structural fields, caller-owned value storage, and ownership initialization | yes, plus Wasm | `types_and_bindings.luc`, generic construction examples | complete |
+| Value mutation requires a mutable place; immutable transformations are named methods; inheritance and object spread are absent | stable mutation diagnostics and parser exclusions | one checked address walk | yes, plus Wasm | `types_and_bindings.luc`, `generic_methods.luc` | complete |
+| Tuples are anonymous positional values with destructuring, no named projections, and no one-element form | exact arity/type diagnostics and parser exclusions | structural aggregate copy | yes, plus Wasm | `types_and_bindings.luc`, `expressions_and_calls.luc` | complete |
+| `array[T, N]` has one nonnegative literal length in its type, copies elementwise, and converts to `slice[T]` only by an owned snapshot | no user value parameter or implicit-view path; checked indexing/slicing | canonical arrays and scalable typed snapshot loop | yes, plus Wasm | `stage0_sort.luc`, `array_slices.luc` | complete |
+| Enums are closed sums with contextual/named construction and exhaustive payload matching; no union, ordinal, discriminator, or unchecked payload projection is exposed | exact construction/match/recursion/visibility diagnostics | ordinary tags scale to the smallest sufficient target-neutral unsigned scalar and are verified; optionals retain their specified `u8` shape | generated 257-case fixture executes, plus Wasm encoding | `generic_enums.luc`, `language_tour.luc` | complete |
+| Struct, tuple, array, and enum assignment is value copy; embedded references retain their ordinary shallow shared identity | independent HIR value/reference operations | structural copy versus explicit retain/release | yes, plus Wasm | `types_and_bindings.luc` | complete |
+| Equality and hashing derive only when every stored component supports them; ordinary source exposes neither operator overloads nor layout attributes | closed `Equatable`/`Hashable` proof and exclusions | one structural equality/hash expansion | yes, plus Wasm | `hashing.luc` | complete |
+| `pub` controls source access, including synthesized/custom initialization and enum payloads, without promising memory layout | cross-module positive and stable private-access diagnostics | no source visibility or platform layout survives | unchanged | cross-module fixtures | complete; explicit C representation is tracked in §21 |
 
 ## Current expression-and-call evidence
 
