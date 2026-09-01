@@ -775,18 +775,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   canonical typed artifact, strict decoder, import/seeding transaction, and
   dependency-origin generic specialization. HIR generation now checks every
   abstract definition in an independent `HirBodyArena` and clones typed
-  declaration defaults across the arena boundary without source replay; the
-  checked arena is still discarded. The next step is to publish that arena as
-  the retained template: exactly the ordinary flat HIR node/extra/value shape,
-  but with template-local node and operand identities. HIR-only deferred calls
-  retain resolved generic declarations, type arguments, and conformance
-  requirements; neither source syntax nor spelling is serialized. One HIR
-  specializer substitutes canonical `TypeId`s, remaps template-local symbols
-  and closures, resolves those calls, and emits ordinary concrete
-  `HirFunction`s before MIR. Artifact import remaps package-local semantic
-  identities once; no generic form reaches MIR. Then prove dependency-origin
-  specialization through a real multi-package QBE build before closing this
-  item.
+  declaration defaults across the arena boundary without source replay. That
+  arena is now retained with its body/default runs and template-local closure
+  metadata; canonical package types and symbols remain shared identities.
+  HIR-only deferred calls retain resolved generic declarations, inferred type
+  arguments, placed operands, and conformance requirement positions; neither
+  source syntax nor spelling enters the contract. The next step is one HIR
+  specializer that substitutes canonical `TypeId`s, remaps template-local
+  symbols and closures, resolves those calls, and emits ordinary concrete
+  `HirFunction`s before MIR, replacing the current concrete source recheck.
+  Then serialize/decode retained bodies, remap package-local semantic
+  identities once during import, and prove dependency-origin specialization
+  through a real multi-package QBE build. No generic form may reach MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
