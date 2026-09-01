@@ -1273,6 +1273,34 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   section would replace direct expression/statement checking with a forwarding
   interface rather than establish an independent owner.
 
+- [x] **The rest of §9 is closed as one target-neutral control-flow contract**
+  (2026-09-01). The audit found one semantic asymmetry: an uncontextualized
+  conditional previously chose its first arm's type and forced the second arm
+  into it, so swapping `never`, `T`/`T?`, or infallible/fallible function arms
+  could change acceptance. HIR now computes one symmetric join, while an outer
+  expected type still checks both arms directly. Equal types, bottom removal,
+  optional injection, conversion to an interface type established by one arm,
+  and the sole function-fallibility lift are the closed implicit cases;
+  unrelated or doubly context-dependent arms receive stable diagnostics.
+  Focused HIR structure tests and the differential corpus execute every join
+  through both semantic oracles, verified MIR, Wasm, and real QBE.
+
+  The rule-by-rule pass also pins Boolean conditions, lexical branch and
+  conditional-binding scope, immutable range/protocol elements, illegal loop
+  exits, descending and maximum-closed ranges, nested `break`/`continue`, and
+  bare/value/every-path returns. Existing defer execution already covered
+  registration-time receiver/argument capture, LIFO fallthrough, return,
+  both loop exits, propagation/recovery, and trap suppression; new negatives
+  make the failure-capable-cleanup rule explicit and prove that handling it in
+  a non-failing wrapper is accepted. `conditional_binding.luc` now exercises
+  order-independent optional joins without adding another example file, while
+  `iteration.luc` and the defer corpus retain the broader product proof. No
+  MIR instruction, backend path, runtime service, source file, target fact, or
+  Stage-0 workaround was added. The body checker is now 3,577 lines; its
+  mutually recursive expression/scope transaction remains a deliberate
+  post-coverage holistic refactor candidate rather than being split into a
+  small forwarding file during this audit.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.

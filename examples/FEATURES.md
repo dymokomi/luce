@@ -36,7 +36,7 @@ column because it does not determine stage-1 completion.
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | complete | complete | complete | complete | Every binding, tuple, copy/reference, checked-place, and definite-initialization rule has positive, negative, oracle, and artifact evidence. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | The S06 eager-order/operator audit is complete; named arithmetic-policy APIs remain in S30. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | complete | complete | complete | complete | Exact direct/generic/function/closure callables, defaults, tuples, methods, mutation, and recursion execute through both oracles, QBE, and Wasm. |
-| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | The complete §9.6 pattern/exhaustiveness contract and both standard iteration spellings execute; the remaining control-flow/return/defer rule audit is S08. |
+| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | complete | complete | complete | complete | Every branch, loop, match, return, and lexical-cleanup rule has stable negative and executable product evidence. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, ownership-safe fixed-array slicing, and immutable structural hashing execute; the remaining rule-by-rule audit keeps the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core class lifetime reaches both oracles, QBE, and Wasm; direct strong-cycle rejection and `deinit` reentrancy advisories are complete. Resource-shape diagnostics and leak census remain. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
 | S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
 | S10 | §11.4–§11.5 | Resource-shape diagnostics and runtime leak/live-resource census | ARC, weak references, cycle diagnostics, destruction, and reentrancy advisories execute. |
 | S11 | §12.6 | Restricted non-storable `mutable_slice[T]` plus closure-scoped mutable access | Syntax only; requires a scoped runtime operation and escape/send/native checks. |
@@ -139,6 +138,21 @@ nor permission to choose an order.
 | Same-module, qualified-import, and selective-import constants in ordinary defaults | post-import default-resolution pass; body locals absent | constants embedded before lowering | yes, plus Wasm | cross-module differential fixture | complete |
 | Tuples/results, exact callable values, infallible lift, methods/type functions, value mutation/self replacement, and recursion | resolved callable identity and receiver kind | canonical direct/closure calls and caller-owned value mutation | yes, plus Wasm | `expressions_and_calls.luc`, function/closure/generic examples | complete |
 | Non-unit public results are explicit; every reachable path returns; nested named functions and overloads are absent | declaration/flow diagnostics | only complete concrete functions lower | n/a | focused parser/HIR negatives | complete |
+
+## Current control-flow evidence
+
+The closed S08 surface retains structured control and lexical cleanup in HIR.
+MIR lowers those facts once into regions and explicit exit edges; neither
+backend reconstructs source scope, range semantics, or deferred actions.
+
+| §§9.1–9.5, §§9.7–9.8 rule | Frontend/HIR | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Boolean `if`/`elif` and `while`, lexical branch scope, and optional-only `if let` payload scope | exact typed branches and stable rejections | structured regions | yes, plus Wasm | `conditional_binding.luc` and control-flow fixtures | complete |
+| Conditional expressions choose one symmetric type through equality, bottom, optional injection, an established interface, or function-fallibility lift | one explicit common `TypeId`; ambiguous/missing context rejected | typed region result | yes, plus Wasm | `conditional_binding.luc` and differential joins | complete |
+| Built-in integer ranges ascend by one, descending bounds are empty, and a closed maximum stops after yielding it | exact `range[T]` and immutable loop symbol | typed range loop with overflow-free closed termination | yes, plus Wasm | `iteration.luc` and range corpus | complete |
+| Ordinary and fallible protocol iteration keep item/end/error distinct; `break` and `continue` target the innermost loop | resolved interface operation and lexical loop depth | structured branch depths and explicit failure edge | yes, plus Wasm | `iteration.luc` | complete |
+| Bare/unit and value returns, including every closed branch and terminating `error`/`trap`/`never` path | structural completion proof and exact diagnostics | signature-checked returns | yes, plus Wasm | control-flow and trapping corpus | complete |
+| Deferred unit calls capture receiver/arguments at registration, execute LIFO on fallthrough/return/loop exit/error, and do not run after traps | hidden typed captures; failing cleanup rejected unless wrapped | cleanup duplicated on every ordinary lexical exit | yes, plus Wasm | `iteration.luc`, list/class examples, and defer corpus | complete |
 
 ## Current `match` evidence
 

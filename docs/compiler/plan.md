@@ -374,6 +374,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   constants, so pure qualified/selective imported constants work without
   leaking body locals or declaration order into signatures. Named arithmetic
   policy APIs remain standard-library work in S30.
+- [x] **Complete the §§9.1–9.5 and §§9.7–9.8 control-flow audit**
+  (2026-09-01, `done.md` §2). Conditional joins are symmetric across bottom,
+  optional, established-interface, and function-fallibility conversions.
+  Branch/loop scope, immutable iteration, innermost exits, range endpoints,
+  return coverage, and every deferred-cleanup exit/failure rule now have exact
+  semantic and executable evidence. The already closed §9.6 match matrix makes
+  all of §9 complete through QBE, with Wasm as an additional product check.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

@@ -823,15 +823,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             Unary(operator, operand): return try self.check_unary(operator, operand, value.span, expected)
             Binary(left, operator, right): return try self.check_binary(left, operator, right, value.span, expected)
             Conditional(selected, condition, alternative):
-                let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
-                let checked_value = try self.check_expression(selected, expected)
-                let checked_alternative = try self.check_expression(alternative, self.state.type_of(checked_value))
-                let typed = self.state.push_node(
-                    HirNodeForm.Conditional(value = checked_value, condition = checked_condition, alternative = checked_alternative),
-                    self.state.type_of(checked_value),
-                    value.span,
-                )
-                return try self.require_type(typed, expected)
+                return try self.check_conditional_expression(selected, condition, alternative, value.span, expected)
             Call(callee, type_arguments, arguments):
                 return try self.check_call(callee, type_arguments, arguments, value.span, expected)
             ElseValue(optional_value, arm):
@@ -3131,6 +3123,102 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return self.state.push_node(HirNodeForm.Some(value = optional_existential), expected, self.state.span_of(value))
         error(self.diagnostic(self.state.span_of(value), "expected `" + self.describe_type(expected) + "`, found `" + self.describe_type(found) + "`"))
 
+    # mark: Conditional joins =================================================================
+
+    # A conditional's source arms are peers. With an outer context both are
+    # checked against that exact type. Without one, independently typed arms
+    # contribute symmetrically to the narrow set of implicit joins Luce owns:
+    # bottom elimination, optional injection, function-fallibility lifting,
+    # or conversion to an interface type already named by the other arm.
+    func check_conditional_expression(selected: ExpressionSyntax, condition: ExpressionSyntax, alternative: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked_condition = try self.check_expression(condition, resolve_builtin_type(BuiltinType.boolean))
+        if expected != none:
+            let checked_value = try self.check_expression(selected, expected)
+            let checked_alternative = try self.check_expression(alternative, expected)
+            return self.state.push_node(
+                HirNodeForm.Conditional(value = checked_value, condition = checked_condition, alternative = checked_alternative),
+                expected,
+                span,
+            )
+
+        let selected_needs_context = conditional_arm_needs_context(selected)
+        let alternative_needs_context = conditional_arm_needs_context(alternative)
+        if selected_needs_context and alternative_needs_context:
+            try self.fail(span, "conditional expression arms need a type from context")
+
+        var checked_value = NodeId(value = no_node)
+        var checked_alternative = NodeId(value = no_node)
+        var common: TypeId? = none
+        if selected_needs_context:
+            checked_alternative = try self.check_expression(alternative, none)
+            common = self.contextual_conditional_type(selected, self.state.type_of(checked_alternative))
+            let joined = common else error(self.diagnostic(span, "conditional expression arms have no common type"))
+            checked_value = try self.check_expression(selected, joined)
+            checked_alternative = try self.require_type(checked_alternative, joined)
+        elif alternative_needs_context:
+            checked_value = try self.check_expression(selected, none)
+            common = self.contextual_conditional_type(alternative, self.state.type_of(checked_value))
+            let joined = common else error(self.diagnostic(span, "conditional expression arms have no common type"))
+            checked_value = try self.require_type(checked_value, joined)
+            checked_alternative = try self.check_expression(alternative, joined)
+        else:
+            checked_value = try self.check_expression(selected, none)
+            checked_alternative = try self.check_expression(alternative, none)
+            common = self.conditional_common_type(self.state.type_of(checked_value), self.state.type_of(checked_alternative))
+            let joined = common else error(self.no_conditional_common_type(span, self.state.type_of(checked_value), self.state.type_of(checked_alternative)))
+            checked_value = try self.require_type(checked_value, joined)
+            checked_alternative = try self.require_type(checked_alternative, joined)
+
+        let result_type = common else trap("conditional join did not choose a result type")
+        return self.state.push_node(
+            HirNodeForm.Conditional(value = checked_value, condition = checked_condition, alternative = checked_alternative),
+            result_type,
+            span,
+        )
+
+    # A context-dependent spelling borrows the peer's exact type. `none` is
+    # the sole spelling that instead establishes the peer's optional wrapper.
+    func contextual_conditional_type(value: ExpressionSyntax, peer: TypeId) -> TypeId?:
+        if conditional_arm_is_none(value):
+            if self.state.optional_inner(peer) != none: return peer
+            match self.state.types.definitions[peer.value].form:
+                Never: return none
+                else: return self.state.intern_optional(peer)
+        return peer
+
+    func conditional_common_type(left: TypeId, right: TypeId) -> TypeId?:
+        if types_match(left, right): return left
+        match self.state.types.definitions[left.value].form:
+            Never: return right
+            Optional(inner):
+                if types_match(inner, right): return left
+                match self.state.types.definitions[inner.value].form:
+                    Interface(index, arguments): return left
+                    else: pass
+            Interface(index, arguments):
+                match self.state.types.definitions[right.value].form:
+                    Interface(other_index, other_arguments): pass
+                    else: return left
+            else: pass
+        match self.state.types.definitions[right.value].form:
+            Never: return left
+            Optional(inner):
+                if types_match(inner, left): return right
+                match self.state.types.definitions[inner.value].form:
+                    Interface(index, arguments): return right
+                    else: pass
+            Interface(index, arguments):
+                match self.state.types.definitions[left.value].form:
+                    Interface(other_index, other_arguments): pass
+                    else: return right
+            else: pass
+        if self.is_function_fallibility_lift(left, right): return right
+        if self.is_function_fallibility_lift(right, left): return left
+        return none
+
+    func no_conditional_common_type(span: SourceSpan, left: TypeId, right: TypeId) -> str:
+        return self.diagnostic(span, "conditional expression arms have no common type (`" + self.describe_type(left) + "` and `" + self.describe_type(right) + "`)")
+
     # Operators and other intrinsically non-optional expressions receive the
     # value inside an expected `T?` as their contextual type. `require_type`
     # then inserts the one explicit `Some` node around the completed result.
@@ -3260,6 +3348,28 @@ pub class HirBodyChecker: HirSemanticChecker:
 
 
 # mark: Type and operator tables ==============================================================
+
+# A few expression spellings deliberately cannot invent their own type. This
+# syntactic predicate lets a conditional borrow the independently established
+# peer type without catching and rolling back a partially checked HIR tree.
+func conditional_arm_needs_context(value: ExpressionSyntax) -> bool:
+    match value.form:
+        Group(grouped): return conditional_arm_needs_context(grouped)
+        Literal(token): return token.text == "none"
+        CaseValue(name, arguments): return true
+        ListValue(elements): return len(elements) == 0
+        Lambda(parameters, body): return true
+        Closure(captures, parameters, result, body):
+            for parameter in parameters:
+                if parameter.annotation == none: return true
+            return false
+        else: return false
+
+func conditional_arm_is_none(value: ExpressionSyntax) -> bool:
+    match value.form:
+        Group(grouped): return conditional_arm_is_none(grouped)
+        Literal(token): return token.text == "none"
+        else: return false
 
 func find_literal_token(value: ExpressionSyntax) -> Token?:
     match value.form:

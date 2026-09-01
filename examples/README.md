@@ -96,6 +96,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   through both semantic oracles, Wasm, and native QBE. Protocol loops lower to
   existing calls, optionals, failure transfer, and structured control rather
   than adding a backend-specific iteration representation.
+- `conditional_binding.luc` proves optional binding scope and both outcomes,
+  plus source-order-independent conditional joins through optional promotion.
+  The same HIR executes through both semantic oracles, Wasm, and native QBE.
 - `hashing.luc` proves compiler-derived `Equatable`/`Hashable` constraints and
   execution-local structural hashing across scalars, strings/bytes, arrays,
   ranges, tuples, optionals, structs, and payload enums. Equal-value behavior
