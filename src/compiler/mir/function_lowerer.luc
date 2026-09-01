@@ -19,11 +19,11 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
-from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_float_type, is_int_type, is_ptr_type, is_signed_int_type, mir_type, no_register, no_registers, uint_maximum
+from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_float_type, is_int_type, is_ptr_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
-from compiler.hir.ir import executable_function_name, place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
+from compiler.hir.ir import executable_function_name, place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_weak_field_step
 import compiler.hir.ir
 from compiler.mir.verifier import terminates
 from compiler.frontend.source import SourceSpan
@@ -45,6 +45,12 @@ struct InterfaceOperands:
     let target: RegisterId
     let payload: RegisterId
     let values: list[RegisterId]
+
+## Result of one generated structural-key probe. `index` is the dense
+## insertion-order entry index and is meaningful only when `found` is true.
+struct HashLookup:
+    let found: RegisterId
+    let index: RegisterId
 
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
@@ -399,6 +405,8 @@ pub class FunctionLowerer:
         match mir_type(self.state.types, value_type):
             BufferOwner: return true
             List(element): return true
+            Map(key, value): return true
+            Set(element): return true
             Slice(element): return true
             Class(identity): return true
             WeakClass(identity): return true
@@ -438,6 +446,13 @@ pub class FunctionLowerer:
             List(element):
                 if retaining: body.append(MirInstruction(form = InstructionForm.ListRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.ListRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
+            Map(key, element):
+                if retaining: body.append(MirInstruction(form = InstructionForm.HashRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.HashRelease(value = value, key_release = self.ownership_helper_for(key).release, value_release = self.ownership_helper_for(element).release), span = span))
+            Set(element):
+                let unit = self.state.intern_lowered_type(make_struct_type(list[TypeId]()))
+                if retaining: body.append(MirInstruction(form = InstructionForm.HashRetain(value = value), span = span))
+                else: body.append(MirInstruction(form = InstructionForm.HashRelease(value = value, key_release = self.ownership_helper_for(element).release, value_release = self.ownership_helper_for(unit).release), span = span))
             Slice(element):
                 if retaining: body.append(MirInstruction(form = InstructionForm.SliceRetain(value = value), span = span))
                 else: body.append(MirInstruction(form = InstructionForm.SliceRelease(value = value, element_release = self.ownership_helper_for(element).release), span = span))
@@ -494,6 +509,21 @@ pub class FunctionLowerer:
         self.emit_ownership_call(value_type, address, false, span, body)
         self.store_value(value_type, address, value, span, body)
 
+    # A conditional store cannot consume the lowerer's one compile-time
+    # ownership record: only one runtime arm executes. Copy the +1 into the
+    # selected storage and leave full-expression cleanup branch-independent.
+    func initialize_owned_copy(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        self.emit_value_ownership(value_type, value, true, span, body)
+        self.store_value(value_type, address, value, span, body)
+
+    func replace_owned_copy(value_type: TypeId, address: RegisterId, value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
+        if not self.type_needs_ownership(value_type):
+            self.store_value(value_type, address, value, span, body)
+            return
+        self.emit_value_ownership(value_type, value, true, span, body)
+        self.emit_ownership_call(value_type, address, false, span, body)
+        self.store_value(value_type, address, value, span, body)
+
     # Recursion follows only by-value structure. List and slice handles stop
     # the walk and delegate their identity/buffer counts to the sealed runtime.
     func emit_ownership_at(value_type: TypeId, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
@@ -509,6 +539,19 @@ pub class FunctionLowerer:
                 else:
                     let element_release = self.ownership_helper_for(element).release
                     body.append(MirInstruction(form = InstructionForm.ListRelease(value = value, element_release = element_release), span = span))
+            Map(key, element):
+                let value = self.load_value(value_type, address, span, body)
+                if retaining:
+                    body.append(MirInstruction(form = InstructionForm.HashRetain(value = value), span = span))
+                else:
+                    body.append(MirInstruction(form = InstructionForm.HashRelease(value = value, key_release = self.ownership_helper_for(key).release, value_release = self.ownership_helper_for(element).release), span = span))
+            Set(element):
+                let value = self.load_value(value_type, address, span, body)
+                let unit = self.state.intern_lowered_type(make_struct_type(list[TypeId]()))
+                if retaining:
+                    body.append(MirInstruction(form = InstructionForm.HashRetain(value = value), span = span))
+                else:
+                    body.append(MirInstruction(form = InstructionForm.HashRelease(value = value, key_release = self.ownership_helper_for(element).release, value_release = self.ownership_helper_for(unit).release), span = span))
             Slice(element):
                 let value = self.load_value(value_type, address, span, body)
                 if retaining:
@@ -570,6 +613,8 @@ pub class FunctionLowerer:
         match mir_type(self.state.types, value_type):
             BufferOwner: self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             List(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Map(key, value): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
+            Set(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Slice(element): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             Class(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
             WeakClass(identity): self.store_value(value_type, address, self.typed_null_constant(value_type, span, body), span, body)
@@ -798,6 +843,7 @@ pub class FunctionLowerer:
             NativeIsSame(left, right):
                 try self.lower_prologue_node(module, function, left, body)
                 try self.lower_prologue_node(module, function, right, body)
+            NativeAddressHash(pointer): try self.lower_prologue_node(module, function, pointer, body)
             NativeArena(end): try self.lower_prologue_node(module, function, end, body)
             NumericConvert(value): try self.lower_prologue_node(module, function, value, body)
             Discard(value): try self.lower_prologue_node(module, function, value, body)
@@ -808,13 +854,13 @@ pub class FunctionLowerer:
             PlaceAssignment(symbol, steps, operation, value):
                 for position in range(0, i64(steps.count) // 2):
                     let step = u32(entry_at(self.state.program, steps, position * 2))
-                    if step == place_element_step or step == place_list_element_step:
+                    if step == place_element_step or step == place_list_element_step or step == place_map_element_step:
                         try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.state.program, steps, position * 2 + 1))), body)
                 try self.lower_prologue_node(module, function, value, body)
             GlobalPlaceAssignment(global, steps, operation, value):
                 for position in range(0, i64(steps.count) // 2):
                     let step = u32(entry_at(self.state.program, steps, position * 2))
-                    if step == place_element_step or step == place_list_element_step:
+                    if step == place_element_step or step == place_list_element_step or step == place_map_element_step:
                         try self.lower_prologue_node(module, function, NodeId(value = u32(entry_at(self.state.program, steps, position * 2 + 1))), body)
                 try self.lower_prologue_node(module, function, value, body)
             PrintValue(value): try self.lower_prologue_node(module, function, value, body)
@@ -844,6 +890,33 @@ pub class FunctionLowerer:
                     try self.lower_prologue_node(module, function, node_at(self.state.program, elements, position), body)
             List(elements): try self.lower_prologue_run(module, function, elements, body)
             ListCopy(value): try self.lower_prologue_node(module, function, value, body)
+            Map(entries): try self.lower_prologue_run(module, function, entries, body)
+            Set(elements): try self.lower_prologue_run(module, function, elements, body)
+            MapLookup(value, key):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, key, body)
+            MapRemove(value, key):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, key, body)
+            SetContains(value, element):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, element, body)
+            SetInsert(value, element):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, element, body)
+            SetRemove(value, element):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, element, body)
+            MapClear(value): try self.lower_prologue_node(module, function, value, body)
+            MapCopy(value): try self.lower_prologue_node(module, function, value, body)
+            SetClear(value): try self.lower_prologue_node(module, function, value, body)
+            SetCopy(value): try self.lower_prologue_node(module, function, value, body)
+            MapReserve(value, minimum_capacity):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, minimum_capacity, body)
+            SetReserve(value, minimum_capacity):
+                try self.lower_prologue_node(module, function, value, body)
+                try self.lower_prologue_node(module, function, minimum_capacity, body)
             SequenceSlice(value, start, end):
                 try self.lower_prologue_node(module, function, value, body)
                 if start.value != no_node: try self.lower_prologue_node(module, function, start, body)
@@ -1080,6 +1153,44 @@ pub class FunctionLowerer:
                 address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
                 body.append(MirInstruction(form = InstructionForm.ListMutableElementAddress(result = address, value = list_value, index = index, element_retain = self.ownership_helper_for(mir_element).retain), span = span))
                 place_type = element_type
+            elif kind == place_map_element_step:
+                if position != i64(steps.count) // 2 - 1: trap("map assignment step is not final")
+                match operation:
+                    Replace: pass
+                    Combine(binary): trap("map element has a compound assignment")
+                var hir_key_type = resolve_builtin_type(BuiltinType.unit)
+                var hir_value_type = resolve_builtin_type(BuiltinType.unit)
+                match self.state.program.types.definitions[place_type.value].form:
+                    Map(key, item):
+                        hir_key_type = key
+                        hir_value_type = item
+                    else: trap("map assignment step has a non-map HIR type")
+                let map_type = try self.state.mir_type_of(module, function, span, place_type)
+                let key = try self.lower_expression(module, function, NodeId(value = u32(payload)), body)
+                # The selected key is fixed before the RHS, but candidate
+                # discovery follows RHS effects against the authoritative
+                # map identity. Existing-value replacement is not a shape
+                # mutation; missing-key insertion is checked by the runtime.
+                let assigned = try self.lower_expression(module, function, value, body)
+                let collection = self.load_value(map_type, address, span, body)
+                let key_hash = try self.lower_structural_hash(module, function, span, hir_key_type, key, body)
+                let lookup = try self.lower_hash_lookup(module, function, span, hir_key_type, collection, key, key_hash, body)
+                let value_type = try self.state.mir_type_of(module, function, span, hir_value_type)
+                self.open_if(lookup.found, list[RegisterId](), span, body)
+                let value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = value_address, value = collection, index = lookup.index), span = span))
+                self.replace_owned_copy(value_type, value_address, assigned, span, body)
+                self.emit_else(span, body)
+                let inserted = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                body.append(MirInstruction(form = InstructionForm.HashInsertEntry(result = inserted, value = collection, hash = key_hash), span = span))
+                let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                let inserted_value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+                body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = collection, index = inserted), span = span))
+                body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = inserted_value_address, value = collection, index = inserted), span = span))
+                self.initialize_owned_copy(try self.state.mir_type_of(module, function, span, hir_key_type), key_address, key, span, body)
+                self.initialize_owned_copy(value_type, inserted_value_address, assigned, span, body)
+                self.emit_end(span, body)
+                return
             elif kind == place_class_field_step or kind == place_weak_field_step:
                 let class_type = try self.state.mir_type_of(module, function, span, place_type)
                 var class_index = -1
@@ -1332,6 +1443,8 @@ pub class FunctionLowerer:
                 match self.state.program.types.definitions[node_type(self.state.program, iterable).value].form:
                     Range(element): try self.lower_range_for(module, function, span, symbol, iterable, statements, body)
                     List(element): try self.lower_list_for(module, function, span, symbol, iterable, element, statements, body)
+                    Map(key, value): try self.lower_hash_for(module, function, span, symbol, iterable, key, statements, body)
+                    Set(element): try self.lower_hash_for(module, function, span, symbol, iterable, element, statements, body)
                     String: try self.lower_string_for(module, function, span, symbol, iterable, statements, body)
                     else: try self.state.fail_unsupported(module, function, span, "a non-iterable built-in `for` value")
             Protocol(iterator_symbol, iterator, next):
@@ -1524,6 +1637,61 @@ pub class FunctionLowerer:
         try self.emit_deferred_from(module, function, cleanup_start, body)
         while len(self.state.defers) > cleanup_start: self.state.defers.remove(len(self.state.defers) - 1)
 
+    ## Maps iterate keys and sets iterate elements; both are the key column of
+    ## the shared insertion-ordered table. The active traversal is paired on
+    ## every lexical exit, while each element binding has its own lifetime.
+    func lower_hash_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, element_hir_type: ir.TypeId, statements: Operands, body: list[MirInstruction]) -> !:
+        let hash_value = try self.lower_expression(module, function, iterable, body)
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let element_type = try self.state.mir_type_of(module, function, span, element_hir_type)
+        let length = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.HashIterationBegin(result = length, value = hash_value), span = span))
+
+        let cleanup_start = len(self.state.defers)
+        self.state.defers.append(DeferredAction.HashIteration(value = hash_value, span = span))
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        self.state.regions.append(Region.block)
+        self.state.regions.append(Region.loop_body)
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+
+        let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = hash_value, index = index), span = span))
+        let element = self.load_value(element_type, key_address, span, body)
+        let binding = (try self.state.local_of(module, function, span, symbol)).address
+        self.initialize_owned_value(element_type, binding, element, span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        self.state.regions.append(Region.for_continue)
+        let iteration_start = len(self.state.defers)
+        if self.type_needs_ownership(element_type):
+            self.state.defers.append(DeferredAction.DestroyAddress(address = binding, value_type = element_type, span = span))
+        self.state.loop_defer_starts.append(iteration_start)
+        try self.lower_scope(module, function, statements, body)
+        self.state.loop_defer_starts.remove(len(self.state.loop_defer_starts) - 1)
+        try self.emit_deferred_from(module, function, iteration_start, body)
+        while len(self.state.defers) > iteration_start: self.state.defers.remove(len(self.state.defers) - 1)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+
+        let next = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+        try self.emit_deferred_from(module, function, cleanup_start, body)
+        while len(self.state.defers) > cleanup_start: self.state.defers.remove(len(self.state.defers) - 1)
+
     # Walk one UTF-8 string by scalar boundary. The source expression is
     # evaluated once, and the canonical decode operation produces both the
     # language `char` and the byte width used only by traversal.
@@ -1604,6 +1772,7 @@ pub class FunctionLowerer:
             match self.state.defers[index]:
                 Source(statement): try self.lower_statement(module, function, statement, body)
                 ListIteration(value, span): body.append(MirInstruction(form = InstructionForm.ListIterationEnd(value = value), span = span))
+                HashIteration(value, span): body.append(MirInstruction(form = InstructionForm.HashIterationEnd(value = value), span = span))
                 DestroyAddress(address, value_type, span): self.emit_ownership_call(value_type, address, false, span, body)
                 OwnedValue(value, value_type, span): self.emit_value_ownership(value_type, value, false, span, body)
             index -= 1
@@ -1705,6 +1874,16 @@ pub class FunctionLowerer:
         # over-release it. Values read from its fields keep ordinary ownership.
         if self.is_borrowed_self(function, expression): return value
         if self.expression_borrows_ownership(expression):
+            # Aggregate reads are addresses into mutable storage. Snapshot the
+            # bytes before retaining so a later write to the source cannot
+            # redirect this temporary's eventual release to the replacement
+            # value (for example `text = text + suffix`).
+            if self.is_aggregate(value_type):
+                let snapshot = self.new_temp(value_type, span, body)
+                self.store_value(value_type, snapshot, value, span, body)
+                self.emit_value_ownership(value_type, snapshot, true, span, body)
+                self.remember_owned_value(snapshot, value_type, span)
+                return snapshot
             self.emit_value_ownership(value_type, value, true, span, body)
         self.remember_owned_value(value, value_type, span)
         return value
@@ -1795,10 +1974,27 @@ pub class FunctionLowerer:
                 let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
                 body.append(MirInstruction(form = InstructionForm.Binary(result = result, operation = BinaryOp.eq, left = left_address, right = right_address), span = span))
                 return result
+            NativeAddressHash(pointer):
+                let span = node_span(self.state.program, expression)
+                let address = try self.lower_expression(module, function, pointer, body)
+                let result = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                body.append(MirInstruction(form = InstructionForm.PointerHash(result = result, operand = address), span = span))
+                return result
             Discard(value):
                 let discarded = try self.lower_expression(module, function, value, body)
                 return RegisterId(value = no_register)
             ListCopy(value): return try self.lower_list_copy(module, function, expression, value, body)
+            MapLookup(value, key): return try self.lower_map_lookup(module, function, expression, value, key, body)
+            MapRemove(value, key): return try self.lower_map_remove(module, function, expression, value, key, body)
+            MapClear(value): return try self.lower_hash_clear(module, function, expression, value, body)
+            MapReserve(value, minimum_capacity): return try self.lower_hash_reserve(module, function, expression, value, minimum_capacity, body)
+            MapCopy(value): return try self.lower_hash_copy(module, function, expression, value, body)
+            SetContains(value, element): return try self.lower_set_membership(module, function, expression, value, element, 0, body)
+            SetInsert(value, element): return try self.lower_set_membership(module, function, expression, value, element, 1, body)
+            SetRemove(value, element): return try self.lower_set_membership(module, function, expression, value, element, 2, body)
+            SetClear(value): return try self.lower_hash_clear(module, function, expression, value, body)
+            SetReserve(value, minimum_capacity): return try self.lower_hash_reserve(module, function, expression, value, minimum_capacity, body)
+            SetCopy(value): return try self.lower_hash_copy(module, function, expression, value, body)
             SequenceSlice(value, start, end): return try self.lower_sequence_slice(module, function, expression, value, start, end, body)
             ListAppend(value, element): return try self.lower_list_append(module, function, expression, value, element, body)
             ListInsert(value, index, element): return try self.lower_list_insert(module, function, expression, value, index, element, body)
@@ -1925,6 +2121,237 @@ pub class FunctionLowerer:
         let result = self.state.new_register(result_type)
         let element_type = self.list_element_mir_type(result_type)
         body.append(MirInstruction(form = InstructionForm.ListCopy(result = result, value = source, element_retain = self.ownership_helper_for(element_type).retain), span = node_span(self.state.program, expression)))
+        return result
+
+    # mark: Hash collections -------------------------------------------------------------------
+
+    ## Probe one table using a source key's structural hash and equality.
+    ## The runtime returns only same-hash candidates; generated MIR remains
+    ## authoritative for language equality and therefore for membership.
+    func lower_hash_lookup(module: HirModule, function: HirFunction, span: SourceSpan, hir_key_type: ir.TypeId, collection: RegisterId, key: RegisterId, key_hash: RegisterId, body: list[MirInstruction]) -> HashLookup!:
+        let u64_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let bool_type = builtin_mir_type(BuiltinMirType.boolean)
+        let found = self.state.new_register(bool_type)
+        let index = self.state.new_register(u64_type)
+        let candidate_slot = self.new_temp(u64_type, span, body)
+        let first = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.HashFindFirst(result = first, value = collection, hash = key_hash), span = span))
+        self.store_value(u64_type, candidate_slot, first, span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([found, index])), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let candidate = self.load_value(u64_type, candidate_slot, span, body)
+        let zero = self.integer_constant(u64_type, 0, span, body)
+        let exhausted = self.state.new_register(bool_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = exhausted, operation = BinaryOp.eq, left = candidate, right = zero), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = exhausted, depth = 1, values = self.state.operands.run([self.bool_constant(false, span, body), zero])), span = span))
+
+        let raw_index = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = raw_index, operation = BinaryOp.sub, left = candidate, right = self.integer_constant(u64_type, 1, span, body)), span = span))
+        let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = collection, index = raw_index), span = span))
+        let mir_key_type = try self.state.mir_type_of(module, function, span, hir_key_type)
+        let stored_key = self.load_value(mir_key_type, key_address, span, body)
+        let equal = try self.lower_equality_definition(module, function, span, hir_key_type, stored_key, key, none, body)
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = equal, depth = 1, values = self.state.operands.run([self.bool_constant(true, span, body), raw_index])), span = span))
+
+        let next = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.HashFindNext(result = next, value = collection, current = candidate), span = span))
+        self.store_value(u64_type, candidate_slot, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+        return HashLookup(found = found, index = index)
+
+    func lower_map_literal(module: HirModule, function: HirFunction, expression: NodeId, entries: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let hir_map_type = node_type(self.state.program, expression)
+        var hir_key_type = resolve_builtin_type(BuiltinType.unit)
+        var hir_value_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[hir_map_type.value].form:
+            Map(key, value):
+                hir_key_type = key
+                hir_value_type = value
+            else: trap("map HIR node has a non-map type")
+        let map_type = try self.state.mir_type_of(module, function, span, hir_map_type)
+        let key_type = try self.state.mir_type_of(module, function, span, hir_key_type)
+        let value_type = try self.state.mir_type_of(module, function, span, hir_value_type)
+        let result = self.state.new_register(map_type)
+        body.append(MirInstruction(form = InstructionForm.HashCreate(result = result), span = span))
+        for position in range(0, i64(entries.count) // 2):
+            let key_node = node_at(self.state.program, entries, position * 2)
+            let value_node = node_at(self.state.program, entries, position * 2 + 1)
+            let key = try self.lower_expression(module, function, key_node, body)
+            let item = try self.lower_expression(module, function, value_node, body)
+            let key_hash = try self.lower_structural_hash(module, function, node_span(self.state.program, key_node), hir_key_type, key, body)
+            let lookup = try self.lower_hash_lookup(module, function, span, hir_key_type, result, key, key_hash, body)
+            self.open_if(lookup.found, list[RegisterId](), span, body)
+            let existing = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = existing, value = result, index = lookup.index), span = span))
+            self.replace_owned_copy(value_type, existing, item, span, body)
+            self.emit_else(span, body)
+            let inserted = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+            body.append(MirInstruction(form = InstructionForm.HashInsertEntry(result = inserted, value = result, hash = key_hash), span = span))
+            let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            let value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = result, index = inserted), span = span))
+            body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = value_address, value = result, index = inserted), span = span))
+            self.initialize_owned_copy(key_type, key_address, key, span, body)
+            self.initialize_owned_copy(value_type, value_address, item, span, body)
+            self.emit_end(span, body)
+        return result
+
+    func lower_set_literal(module: HirModule, function: HirFunction, expression: NodeId, elements: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let hir_set_type = node_type(self.state.program, expression)
+        var hir_element_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[hir_set_type.value].form:
+            Set(element): hir_element_type = element
+            else: trap("set HIR node has a non-set type")
+        let set_type = try self.state.mir_type_of(module, function, span, hir_set_type)
+        let element_type = try self.state.mir_type_of(module, function, span, hir_element_type)
+        let result = self.state.new_register(set_type)
+        body.append(MirInstruction(form = InstructionForm.HashCreate(result = result), span = span))
+        for position in range(0, i64(elements.count)):
+            let element_node = node_at(self.state.program, elements, position)
+            let element = try self.lower_expression(module, function, element_node, body)
+            let key_hash = try self.lower_structural_hash(module, function, node_span(self.state.program, element_node), hir_element_type, element, body)
+            let lookup = try self.lower_hash_lookup(module, function, span, hir_element_type, result, element, key_hash, body)
+            let missing = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Unary(result = missing, operation = UnaryOp.bool_not, operand = lookup.found), span = span))
+            self.open_if(missing, list[RegisterId](), span, body)
+            let inserted = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+            body.append(MirInstruction(form = InstructionForm.HashInsertEntry(result = inserted, value = result, hash = key_hash), span = span))
+            let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = result, index = inserted), span = span))
+            self.initialize_owned_copy(element_type, key_address, element, span, body)
+            self.emit_end(span, body)
+        return result
+
+    func lower_map_lookup(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, key_node: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let collection = try self.lower_expression(module, function, value, body)
+        let key = try self.lower_expression(module, function, key_node, body)
+        var hir_key_type = resolve_builtin_type(BuiltinType.unit)
+        var hir_value_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[node_type(self.state.program, value).value].form:
+            Map(found_key, found_value):
+                hir_key_type = found_key
+                hir_value_type = found_value
+            else: trap("map lookup has a non-map receiver")
+        let key_hash = try self.lower_structural_hash(module, function, span, hir_key_type, key, body)
+        let lookup = try self.lower_hash_lookup(module, function, span, hir_key_type, collection, key, key_hash, body)
+        let optional_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let value_type = try self.state.mir_type_of(module, function, span, hir_value_type)
+        let result = self.new_temp(optional_type, span, body)
+        self.open_if(lookup.found, list[RegisterId](), span, body)
+        self.store_tag(result, 1, span, body)
+        let source = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = source, value = collection, index = lookup.index), span = span))
+        self.initialize_owned_value(value_type, self.payload_address(optional_type, result, span, body), self.load_value(value_type, source, span, body), span, body)
+        self.emit_else(span, body)
+        self.store_tag(result, 0, span, body)
+        self.emit_end(span, body)
+        return result
+
+    func lower_map_remove(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, key_node: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let collection = try self.lower_expression(module, function, value, body)
+        let key = try self.lower_expression(module, function, key_node, body)
+        var hir_key_type = resolve_builtin_type(BuiltinType.unit)
+        var hir_value_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[node_type(self.state.program, value).value].form:
+            Map(found_key, found_value):
+                hir_key_type = found_key
+                hir_value_type = found_value
+            else: trap("map removal has a non-map receiver")
+        let key_hash = try self.lower_structural_hash(module, function, span, hir_key_type, key, body)
+        let lookup = try self.lower_hash_lookup(module, function, span, hir_key_type, collection, key, key_hash, body)
+        let optional_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let key_type = try self.state.mir_type_of(module, function, span, hir_key_type)
+        let value_type = try self.state.mir_type_of(module, function, span, hir_value_type)
+        let result = self.new_temp(optional_type, span, body)
+        self.open_if(lookup.found, list[RegisterId](), span, body)
+        self.store_tag(result, 1, span, body)
+        let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        let value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = collection, index = lookup.index), span = span))
+        body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = value_address, value = collection, index = lookup.index), span = span))
+        self.store_value(value_type, self.payload_address(optional_type, result, span, body), self.load_value(value_type, value_address, span, body), span, body)
+        self.emit_ownership_call(key_type, key_address, false, span, body)
+        body.append(MirInstruction(form = InstructionForm.HashRemoveEntry(value = collection, index = lookup.index), span = span))
+        self.emit_else(span, body)
+        self.store_tag(result, 0, span, body)
+        self.emit_end(span, body)
+        return result
+
+    # `mode`: 0 contains, 1 insert, 2 remove. This keeps the single semantic
+    # probe and mutation protocol visibly shared without erasing source APIs.
+    func lower_set_membership(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, element_node: NodeId, mode: i64, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let collection = try self.lower_expression(module, function, value, body)
+        let element = try self.lower_expression(module, function, element_node, body)
+        var hir_element_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[node_type(self.state.program, value).value].form:
+            Set(found): hir_element_type = found
+            else: trap("set operation has a non-set receiver")
+        let element_type = try self.state.mir_type_of(module, function, span, hir_element_type)
+        let key_hash = try self.lower_structural_hash(module, function, span, hir_element_type, element, body)
+        let lookup = try self.lower_hash_lookup(module, function, span, hir_element_type, collection, element, key_hash, body)
+        if mode == 0: return lookup.found
+        let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        if mode == 1:
+            self.open_if(lookup.found, [result], span, body)
+            self.emit_yield(self.bool_constant(false, span, body), span, body)
+            self.emit_else(span, body)
+            let inserted = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+            body.append(MirInstruction(form = InstructionForm.HashInsertEntry(result = inserted, value = collection, hash = key_hash), span = span))
+            let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+            body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = collection, index = inserted), span = span))
+            self.initialize_owned_copy(element_type, key_address, element, span, body)
+            self.emit_yield(self.bool_constant(true, span, body), span, body)
+            self.emit_end(span, body)
+            return result
+        self.open_if(lookup.found, [result], span, body)
+        let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = collection, index = lookup.index), span = span))
+        self.emit_ownership_call(element_type, key_address, false, span, body)
+        body.append(MirInstruction(form = InstructionForm.HashRemoveEntry(value = collection, index = lookup.index), span = span))
+        self.emit_yield(self.bool_constant(true, span, body), span, body)
+        self.emit_else(span, body)
+        self.emit_yield(self.bool_constant(false, span, body), span, body)
+        self.emit_end(span, body)
+        return result
+
+    func lower_hash_clear(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let collection = try self.lower_expression(module, function, value, body)
+        let collection_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+        match mir_type(self.state.types, collection_type):
+            Map(key, item): body.append(MirInstruction(form = InstructionForm.HashClear(value = collection, key_release = self.ownership_helper_for(key).release, value_release = self.ownership_helper_for(item).release), span = span))
+            Set(element):
+                let unit = self.state.intern_lowered_type(make_struct_type(list[TypeId]()))
+                body.append(MirInstruction(form = InstructionForm.HashClear(value = collection, key_release = self.ownership_helper_for(element).release, value_release = self.ownership_helper_for(unit).release), span = span))
+            else: trap("hash clear has a non-collection receiver")
+        return RegisterId(value = no_register)
+
+    func lower_hash_reserve(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, minimum_capacity: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let collection = try self.lower_expression(module, function, value, body)
+        let minimum = try self.lower_expression(module, function, minimum_capacity, body)
+        body.append(MirInstruction(form = InstructionForm.HashReserve(value = collection, minimum_capacity = minimum), span = node_span(self.state.program, expression)))
+        return RegisterId(value = no_register)
+
+    func lower_hash_copy(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let source = try self.lower_expression(module, function, value, body)
+        let result_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let result = self.state.new_register(result_type)
+        match mir_type(self.state.types, result_type):
+            Map(key, item): body.append(MirInstruction(form = InstructionForm.HashCopy(result = result, value = source, key_retain = self.ownership_helper_for(key).retain, value_retain = self.ownership_helper_for(item).retain), span = span))
+            Set(element):
+                let unit = self.state.intern_lowered_type(make_struct_type(list[TypeId]()))
+                body.append(MirInstruction(form = InstructionForm.HashCopy(result = result, value = source, key_retain = self.ownership_helper_for(element).retain, value_retain = self.ownership_helper_for(unit).retain), span = span))
+            else: trap("hash copy has a non-collection result")
         return result
 
     # Preserve concatenation as one typed semantic operation. Backends alone
@@ -2359,6 +2786,14 @@ pub class FunctionLowerer:
                         let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                         body.append(MirInstruction(form = InstructionForm.ListLength(result = length, value = sequence), span = span))
                         return length
+                    Map(key, item):
+                        let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                        body.append(MirInstruction(form = InstructionForm.HashLength(result = length, value = sequence), span = span))
+                        return length
+                    Set(element):
+                        let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                        body.append(MirInstruction(form = InstructionForm.HashLength(result = length, value = sequence), span = span))
+                        return length
                     Slice(element):
                         let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                         body.append(MirInstruction(form = InstructionForm.SliceLength(result = length, value = sequence), span = span))
@@ -2417,6 +2852,8 @@ pub class FunctionLowerer:
                     body.append(MirInstruction(form = InstructionForm.ListAppendSlot(result = slot, value = result, element_retain = self.ownership_helper_for(element_type).retain), span = node_span(self.state.program, element_node)))
                     self.initialize_owned_value(element_type, slot, element, node_span(self.state.program, element_node), body)
                 return result
+            Map(entries): return try self.lower_map_literal(module, function, expression, entries, body)
+            Set(elements): return try self.lower_set_literal(module, function, expression, elements, body)
             Range(lower, upper, inclusive):
                 let temp = self.new_temp(value_type, span, body)
                 let lower_value = try self.lower_expression(module, function, lower, body)
@@ -2544,6 +2981,16 @@ pub class FunctionLowerer:
                                     Add(item): return try self.lower_list_concatenation(module, function, span, left_type, left_register, right_register, body)
                                     Equal(item): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
                                     NotEqual(item): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                                    else: pass
+                            Map(key, item):
+                                match operation:
+                                    Equal(value): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                                    NotEqual(value): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                                    else: pass
+                            Set(element):
+                                match operation:
+                                    Equal(value): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                                    NotEqual(value): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
                                     else: pass
                             Bytes:
                                 match operation:
@@ -4057,6 +4504,7 @@ pub class FunctionLowerer:
             Range(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
             Array(inner, count): recursive = self.equality_type_is_recursive_once(inner, visiting)
             List(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
+            Map(key, item): recursive = self.equality_type_is_recursive_once(item, visiting)
             Optional(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
             Tuple(elements):
                 for element in elements:
@@ -4100,6 +4548,8 @@ pub class FunctionLowerer:
         let mir_value_type = try self.state.mir_type_of(module, function, span, value_type)
         match self.state.program.types.definitions[value_type.value].form:
             List(element): return try self.lower_list_equality(module, function, span, element, left, right, context, body)
+            Map(key, item): return try self.lower_map_equality(module, function, span, key, item, left, right, context, body)
+            Set(element): return try self.lower_set_equality(module, function, span, element, left, right, body)
             else: pass
         if not self.is_aggregate(mir_value_type):
             return try self.lower_binary_operation(module, function, span, BinaryOperation.Equal(operand_type = value_type), mir_value_type, left, right, body)
@@ -4228,6 +4678,113 @@ pub class FunctionLowerer:
         let next = self.state.new_register(index_type)
         body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
         self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+        return result
+
+    # Maps compare unordered key/value contents. Dense left-table traversal
+    # preserves no ordering requirement: every key probes the right table by
+    # structural hash and generated equality, then compares its mapped value.
+    func lower_map_equality(module: HirModule, function: HirFunction, span: SourceSpan, hir_key_type: ir.TypeId, hir_value_type: ir.TypeId, left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let u64_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let yes = self.bool_constant(true, span, body)
+        let no = self.bool_constant(false, span, body)
+        let result = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
+        let same_identity = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = same_identity, operation = BinaryOp.eq, left = left, right = right), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = same_identity, depth = 0, values = self.state.operands.run([yes])), span = span))
+        let left_length = self.state.new_register(u64_type)
+        let right_length = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.HashLength(result = left_length, value = left), span = span))
+        body.append(MirInstruction(form = InstructionForm.HashLength(result = right_length, value = right), span = span))
+        let lengths_differ = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = lengths_differ, operation = BinaryOp.ne, left = left_length, right = right_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = lengths_differ, depth = 0, values = self.state.operands.run([no])), span = span))
+        if context != none:
+            let active = context
+            let visited = self.state.new_register(boolean)
+            body.append(MirInstruction(form = InstructionForm.EqualityContextVisit(result = visited, context = active, left = left, right = right), span = span))
+            body.append(MirInstruction(form = InstructionForm.BrIf(condition = visited, depth = 0, values = self.state.operands.run([yes])), span = span))
+
+        let counter = self.new_temp(u64_type, span, body)
+        self.store_value(u64_type, counter, self.integer_constant(u64_type, 0, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(u64_type, counter, span, body)
+        let done = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = left_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = self.state.operands.run([yes])), span = span))
+        let key_type = try self.state.mir_type_of(module, function, span, hir_key_type)
+        let left_key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = left_key_address, value = left, index = index), span = span))
+        let key = self.load_value(key_type, left_key_address, span, body)
+        let key_hash = try self.lower_structural_hash(module, function, span, hir_key_type, key, body)
+        let lookup = try self.lower_hash_lookup(module, function, span, hir_key_type, right, key, key_hash, body)
+        let missing = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Unary(result = missing, operation = UnaryOp.bool_not, operand = lookup.found), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = missing, depth = 1, values = self.state.operands.run([no])), span = span))
+        let left_value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        let right_value_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = left_value_address, value = left, index = index), span = span))
+        body.append(MirInstruction(form = InstructionForm.HashValueAddress(result = right_value_address, value = right, index = lookup.index), span = span))
+        let value_type = try self.state.mir_type_of(module, function, span, hir_value_type)
+        let left_value = self.load_value(value_type, left_value_address, span, body)
+        let right_value = self.load_value(value_type, right_value_address, span, body)
+        var values_equal = self.bool_constant(true, span, body)
+        if context != none:
+            let active = context
+            values_equal = try self.lower_nested_equality(module, function, span, hir_value_type, left_value, right_value, active, body)
+        else:
+            values_equal = try self.lower_equality_definition(module, function, span, hir_value_type, left_value, right_value, none, body)
+        let values_differ = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Unary(result = values_differ, operation = UnaryOp.bool_not, operand = values_equal), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = values_differ, depth = 1, values = self.state.operands.run([no])), span = span))
+        let next = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(u64_type, 1, span, body)), span = span))
+        self.store_value(u64_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+        return result
+
+    func lower_set_equality(module: HirModule, function: HirFunction, span: SourceSpan, hir_element_type: ir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let u64_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let yes = self.bool_constant(true, span, body)
+        let no = self.bool_constant(false, span, body)
+        let result = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
+        let same_identity = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = same_identity, operation = BinaryOp.eq, left = left, right = right), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = same_identity, depth = 0, values = self.state.operands.run([yes])), span = span))
+        let left_length = self.state.new_register(u64_type)
+        let right_length = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.HashLength(result = left_length, value = left), span = span))
+        body.append(MirInstruction(form = InstructionForm.HashLength(result = right_length, value = right), span = span))
+        let lengths_differ = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = lengths_differ, operation = BinaryOp.ne, left = left_length, right = right_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = lengths_differ, depth = 0, values = self.state.operands.run([no])), span = span))
+        let counter = self.new_temp(u64_type, span, body)
+        self.store_value(u64_type, counter, self.integer_constant(u64_type, 0, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(u64_type, counter, span, body)
+        let done = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = left_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = self.state.operands.run([yes])), span = span))
+        let element_type = try self.state.mir_type_of(module, function, span, hir_element_type)
+        let key_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.HashKeyAddress(result = key_address, value = left, index = index), span = span))
+        let element = self.load_value(element_type, key_address, span, body)
+        let key_hash = try self.lower_structural_hash(module, function, span, hir_element_type, element, body)
+        let lookup = try self.lower_hash_lookup(module, function, span, hir_element_type, right, element, key_hash, body)
+        let missing = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Unary(result = missing, operation = UnaryOp.bool_not, operand = lookup.found), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = missing, depth = 1, values = self.state.operands.run([no])), span = span))
+        let next = self.state.new_register(u64_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(u64_type, 1, span, body)), span = span))
+        self.store_value(u64_type, counter, next, span, body)
         body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
         self.emit_end(span, body)
         self.emit_end(span, body)

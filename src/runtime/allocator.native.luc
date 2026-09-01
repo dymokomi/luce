@@ -121,6 +121,234 @@ func equality_context_visit(value: native_mut_ptr[u8], left: native_mut_ptr[u8],
     native.store(context, state)
     return false
 
+# mark: Insertion-ordered hash collections ====================================================
+
+# Maps and sets share this dense entry table. Dense key/value arrays preserve
+# insertion order; separate bucket heads and collision links keep lookup
+# proportional to the matching hash chain rather than collection length.
+# Entries move only as raw owned representations. Generated MIR remains the
+# sole owner of key equality, hashing, and nested retain/release semantics.
+struct HashHeader:
+    var references: u64
+    var hashes: native_mut_ptr[u64]
+    var next: native_mut_ptr[u64]
+    var keys: native_mut_ptr[u8]
+    var values: native_mut_ptr[u8]
+    var length: u64
+    var capacity: u64
+    var buckets: native_mut_ptr[u64]
+    var bucket_capacity: u64
+    var active_iterations: u64
+    let seed: u64
+
+func hash_create() -> native_mut_ptr[u8]:
+    let pointer = native.allocate[HashHeader](1u64)
+    let seed_address: native_mut_ptr[u8] = native.rebind(pointer)
+    native.store(pointer, HashHeader(
+        references = 1u64,
+        hashes = native.allocate[u64](0u64),
+        next = native.allocate[u64](0u64),
+        keys = native.allocate[u8](0u64),
+        values = native.allocate[u8](0u64),
+        length = 0u64,
+        capacity = 0u64,
+        buckets = native.allocate[u64](0u64),
+        bucket_capacity = 0u64,
+        active_iterations = 0u64,
+        seed = native.address_hash(seed_address),
+    ))
+    return native.rebind(pointer)
+
+func hash_retain(value: native_mut_ptr[u8]):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references += 1u64
+    native.store(pointer, header)
+
+func hash_bucket(key_hash: u64, seed: u64, capacity: u64) -> u64:
+    return (key_hash ^ seed) % capacity
+
+func rebuild_hash_buckets(pointer: native_mut_ptr[HashHeader]):
+    var header = native.load(pointer)
+    var bucket = 0u64
+    while bucket < header.bucket_capacity:
+        native.store(native.advance(header.buckets, bucket), 0u64)
+        bucket += 1u64
+    var index = 0u64
+    while index < header.length:
+        let selected = hash_bucket(native.load(native.advance(header.hashes, index)), header.seed, header.bucket_capacity)
+        native.store(native.advance(header.next, index), native.load(native.advance(header.buckets, selected)))
+        native.store(native.advance(header.buckets, selected), index + 1u64)
+        index += 1u64
+
+func grow_hash(pointer: native_mut_ptr[HashHeader], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, minimum_capacity: u64):
+    var header = native.load(pointer)
+    if header.capacity >= minimum_capacity: return
+
+    var capacity = header.capacity
+    if capacity == 0u64: capacity = 4u64
+    while capacity < minimum_capacity:
+        if capacity > 4611686018427387903u64: capacity = minimum_capacity
+        else: capacity *= 2u64
+    var bucket_capacity = 8u64
+    while bucket_capacity < capacity * 2u64: bucket_capacity *= 2u64
+
+    let hashes = native.allocate[u64](capacity)
+    let next = native.allocate[u64](capacity)
+    var keys = native.allocate[u8](0u64)
+    var values = native.allocate[u8](0u64)
+    if key_size > 0u64: keys = allocate_storage(capacity * key_size, key_alignment)
+    if value_size > 0u64: values = allocate_storage(capacity * value_size, value_alignment)
+    let buckets = native.allocate[u64](bucket_capacity)
+
+    if header.length > 0u64:
+        native.move(hashes, header.hashes, header.length)
+        if key_size > 0u64: native.move(keys, header.keys, header.length * key_size)
+        if value_size > 0u64: native.move(values, header.values, header.length * value_size)
+    if header.capacity > 0u64:
+        native.deallocate(header.hashes, header.capacity)
+        native.deallocate(header.next, header.capacity)
+        if key_size > 0u64: deallocate_storage(header.keys, header.capacity * key_size, key_alignment)
+        if value_size > 0u64: deallocate_storage(header.values, header.capacity * value_size, value_alignment)
+        native.deallocate(header.buckets, header.bucket_capacity)
+
+    header.hashes = hashes
+    header.next = next
+    header.keys = keys
+    header.values = values
+    header.capacity = capacity
+    header.buckets = buckets
+    header.bucket_capacity = bucket_capacity
+    native.store(pointer, header)
+    rebuild_hash_buckets(pointer)
+
+func hash_release(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, release_key: func(native_mut_ptr[u8]) -> unit, release_value: func(native_mut_ptr[u8]) -> unit):
+    if native.is_null(value): return
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.references -= 1u64
+    if header.references > 0u64:
+        native.store(pointer, header)
+        return
+    var remaining = header.length
+    while remaining > 0u64:
+        remaining -= 1u64
+        release_key(native.advance(header.keys, remaining * key_size))
+        release_value(native.advance(header.values, remaining * value_size))
+    if header.capacity > 0u64:
+        native.deallocate(header.hashes, header.capacity)
+        native.deallocate(header.next, header.capacity)
+        if key_size > 0u64: deallocate_storage(header.keys, header.capacity * key_size, key_alignment)
+        if value_size > 0u64: deallocate_storage(header.values, header.capacity * value_size, value_alignment)
+        native.deallocate(header.buckets, header.bucket_capacity)
+    native.deallocate(pointer, 1u64)
+
+func hash_copy(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, retain_key: func(native_mut_ptr[u8]) -> unit, retain_value: func(native_mut_ptr[u8]) -> unit) -> native_mut_ptr[u8]:
+    let source_pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    let source = native.load(source_pointer)
+    let result = hash_create()
+    let result_pointer: native_mut_ptr[HashHeader] = native.rebind(result)
+    grow_hash(result_pointer, key_size, key_alignment, value_size, value_alignment, source.length)
+    var copied = native.load(result_pointer)
+    if source.length > 0u64:
+        native.move(copied.hashes, source.hashes, source.length)
+        if key_size > 0u64: native.move(copied.keys, source.keys, source.length * key_size)
+        if value_size > 0u64: native.move(copied.values, source.values, source.length * value_size)
+    copied.length = source.length
+    native.store(result_pointer, copied)
+    rebuild_hash_buckets(result_pointer)
+    var index = 0u64
+    while index < source.length:
+        retain_key(native.advance(copied.keys, index * key_size))
+        retain_value(native.advance(copied.values, index * value_size))
+        index += 1u64
+    return result
+
+func hash_length(value: native_mut_ptr[u8]) -> u64:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    return native.load(pointer).length
+
+func hash_iteration_begin(value: native_mut_ptr[u8]) -> u64:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.active_iterations += 1u64
+    native.store(pointer, header)
+    return header.length
+
+func hash_iteration_end(value: native_mut_ptr[u8]):
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    var header = native.load(pointer)
+    header.active_iterations -= 1u64
+    native.store(pointer, header)
+
+func require_hash_shape_mutable(pointer: native_mut_ptr[HashHeader]):
+    if native.load(pointer).active_iterations > 0u64:
+        trap("hash collection structurally modified during active iteration")
+
+func hash_find_first(value: native_mut_ptr[u8], key_hash: u64) -> u64:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    let header = native.load(pointer)
+    if header.bucket_capacity == 0u64: return 0u64
+    return native.load(native.advance(header.buckets, hash_bucket(key_hash, header.seed, header.bucket_capacity)))
+
+func hash_find_next(value: native_mut_ptr[u8], current: u64) -> u64:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    return native.load(native.advance(native.load(pointer).next, current - 1u64))
+
+func hash_key_address(value: native_mut_ptr[u8], key_size: u64, index: u64) -> native_mut_ptr[u8]:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    return native.advance(native.load(pointer).keys, index * key_size)
+
+func hash_value_address(value: native_mut_ptr[u8], value_size: u64, index: u64) -> native_mut_ptr[u8]:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    return native.advance(native.load(pointer).values, index * value_size)
+
+func hash_insert_entry(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, key_hash: u64) -> u64:
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    require_hash_shape_mutable(pointer)
+    var header = native.load(pointer)
+    grow_hash(pointer, key_size, key_alignment, value_size, value_alignment, header.length + 1u64)
+    header = native.load(pointer)
+    let index = header.length
+    native.store(native.advance(header.hashes, index), key_hash)
+    let bucket = hash_bucket(key_hash, header.seed, header.bucket_capacity)
+    native.store(native.advance(header.next, index), native.load(native.advance(header.buckets, bucket)))
+    native.store(native.advance(header.buckets, bucket), index + 1u64)
+    header.length += 1u64
+    native.store(pointer, header)
+    return index
+
+func hash_remove_entry(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, index: u64):
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    require_hash_shape_mutable(pointer)
+    var header = native.load(pointer)
+    let tail = header.length - index - 1u64
+    if tail > 0u64:
+        native.move(native.advance(header.hashes, index), native.advance(header.hashes, index + 1u64), tail)
+        if key_size > 0u64: native.move(native.advance(header.keys, index * key_size), native.advance(header.keys, (index + 1u64) * key_size), tail * key_size)
+        if value_size > 0u64: native.move(native.advance(header.values, index * value_size), native.advance(header.values, (index + 1u64) * value_size), tail * value_size)
+    header.length -= 1u64
+    native.store(pointer, header)
+    rebuild_hash_buckets(pointer)
+
+func hash_clear(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, release_key: func(native_mut_ptr[u8]) -> unit, release_value: func(native_mut_ptr[u8]) -> unit):
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    require_hash_shape_mutable(pointer)
+    var header = native.load(pointer)
+    var remaining = header.length
+    while remaining > 0u64:
+        remaining -= 1u64
+        release_key(native.advance(header.keys, remaining * key_size))
+        release_value(native.advance(header.values, remaining * value_size))
+    header.length = 0u64
+    native.store(pointer, header)
+    rebuild_hash_buckets(pointer)
+
+func hash_reserve(value: native_mut_ptr[u8], key_size: u64, key_alignment: u64, value_size: u64, value_alignment: u64, minimum_capacity: u64):
+    let pointer: native_mut_ptr[HashHeader] = native.rebind(value)
+    grow_hash(pointer, key_size, key_alignment, value_size, value_alignment, minimum_capacity)
+
 # mark: Class identities and weak references ==================================================
 
 # Strong and weak handles share one control block. The implicit weak count

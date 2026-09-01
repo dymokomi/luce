@@ -244,8 +244,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   expression walk. Extracting either marked section today would duplicate that
   machinery or add a forwarding interface, so they remain cohesive until a
   reusable function-emission owner can replace—not wrap—the shared helpers.
-  Keep the parser and
-  2,333-line Wasm encoder sectioned
+  The completed map/set slice raised that shared function walk to 4,991 lines
+  and the Wasm encoder to 2,475 lines; both were reviewed again at the slice
+  boundary. Keep the parser and Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -270,8 +271,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   and Wasm only pass their list handles. Both semantic oracles, verifier and
   optimizer gates, the differential native corpus, and `examples/lists.luc`
   prove identity, finite contents, self/deep cycles, mismatches, alias-topology
-  independence, and context growth. Maps and sets can now build on one settled
-  equality/hash baseline.
+  independence, and context growth, providing the settled equality/hash
+  baseline used by maps and sets.
+- [x] **Insertion-ordered maps and sets** (2026-08-31, `done.md` §2).
+  Inferred/explicit construction, typed lookup and mutation, insertion order,
+  copy, identity, recursive order-independent equality, iteration guards, and
+  complete key/value ownership run through both semantic oracles, canonical
+  MIR, the sealed hash-table runtime, QBE, and Wasm. `Map(K,V)` and `Set(T)`
+  remain target-neutral through MIR; generated code owns hashing/equality and
+  structural ownership callbacks, while runtime/backend code owns only table
+  storage, process-private bucket seeding, layout, and descriptors.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
@@ -563,9 +572,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Triple-quoted values remain paired with the canonical formatter because §4.4
   makes their indentation trimming formatter-owned; preserving source
   indentation in HIR would establish the wrong semantics. Cycle-aware
-  structural list equality is complete without making runtime or backend
-  callbacks responsible for element semantics. Continue with maps, sets,
-  text/bytes builders, formatted/triple strings, and the formatter.
+  structural list/map equality and insertion-ordered maps/sets are complete
+  without making runtime or backend callbacks responsible for value
+  semantics. Continue with text/bytes builders, formatted/triple strings, and
+  the formatter.
   The bytes implementation follows §12.6 for both static and dynamic sources:
   `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners
   retainable without exposing runtime layout. Do not promote the broad §12

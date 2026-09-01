@@ -12,7 +12,7 @@
 
 from compiler.frontend.source import SourceSpan, format_diagnostic
 from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, CaptureSyntax, ExpressionSyntax, FunctionSyntax, IfBranchSyntax, ParameterSyntax, StatementSyntax
-from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
+from compiler.frontend.syntax import MapEntrySyntax, MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.closure_context import ClosureContext
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind
@@ -20,7 +20,7 @@ from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operan
 from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_weak_field_step
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, CollectedFunctionSource
 from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, HirGenerationState, HirSemanticChecker, ImportedModule, ImportedValue, ImportedValueBinding
@@ -532,6 +532,12 @@ pub class HirBodyChecker: HirSemanticChecker:
     # syntax or repeat type checks.
     func check_place_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         let place = try self.resolve_assignment_place(target, span, true)
+        for position in range(0, len(place.steps) // 2):
+            if place.steps[position * 2] == place_map_element_step:
+                if position != len(place.steps) // 2 - 1:
+                    try self.fail(span, "map lookup returns an optional value; assign the complete indexed value")
+                if operator != "=":
+                    try self.fail(span, "map indexed assignment supports only `=`; lookup returns an optional value")
         if len(place.steps) == 0: trap("place assignment has no path steps")
         let checked = try self.check_expression(value, place.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
@@ -620,11 +626,18 @@ pub class HirBodyChecker: HirSemanticChecker:
                     List(element):
                         element_type = element
                         step = place_list_element_step
+                    Map(key, element):
+                        element_type = element
+                        step = place_map_element_step
                     else: try self.fail(span, "`" + self.describe_type(inspected.value_type) + "` does not support mutable indexing")
                 var place = inspected
                 if step == place_element_step:
                     place = try self.resolve_assignment_place(base, span, true)
-                let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
+                var index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+                match self.state.types.definitions[inspected.value_type.value].form:
+                    Map(key, element): index_type = key
+                    else: pass
+                let index = try self.check_expression(subscript, index_type)
                 place.steps.append(step)
                 place.steps.append(index.value)
                 return CheckedPlace(symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
@@ -836,7 +849,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             ListValue(elements):
                 return try self.check_array_literal(elements, value.span, expected)
             MapValue(entries):
-                error(self.diagnostic(value.span, "map literals are not implemented yet"))
+                return try self.check_map_literal(entries, value.span, expected)
             Member(member_value, name):
                 return try self.check_field_access(member_value, name, value.span, expected)
             Index(indexed, subscript):
@@ -1251,6 +1264,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         if operator == "is" or operator == "is not":
             match self.state.types.definitions[left.value].form:
                 List(element): pass
+                Map(key, value): pass
+                Set(element): pass
                 Class(index, arguments): pass
                 else: try self.fail(span, "`" + operator + "` requires shared reference operands, found `" + self.describe_type(left) + "`")
             if operator == "is": return ResolvedBinary(operation = BinaryOperation.Identity(operand_type = left), result = boolean_type)
@@ -1306,6 +1321,10 @@ pub class HirBodyChecker: HirSemanticChecker:
                     return try self.structural.check_hash_call(self, type_arguments, arguments, span, expected)
                 if name == "list" and self.state.find_local(name) < 0:
                     return try self.check_list_constructor(type_arguments, arguments, span, expected)
+                if name == "map" and self.state.find_local(name) < 0:
+                    return try self.check_map_constructor(type_arguments, arguments, span, expected)
+                if name == "set" and self.state.find_local(name) < 0:
+                    return try self.check_set_constructor(type_arguments, arguments, span, expected)
                 if name == "Weak" and self.state.find_local(name) < 0:
                     return try self.check_weak_constructor(type_arguments, arguments, span, expected)
                 let conversion_type = builtin_type_id(name)
@@ -1524,6 +1543,14 @@ pub class HirBodyChecker: HirSemanticChecker:
             discard(try self.require_native_pointer(self.state.type_of(right), arguments[1].span, "`native.is_same`"))
             let typed = self.state.push_node(HirNodeForm.NativeIsSame(left = left, right = right), resolve_builtin_type(BuiltinType.boolean), span)
             return try self.require_type(typed, expected)
+        if name == "address_hash":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.address_hash` is reserved for the sealed runtime package")
+            if len(arguments) != 1: try self.fail(span, "`native.address_hash` takes one typed pointer")
+            let pointer = try self.check_expression(arguments[0].value, none)
+            discard(try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.address_hash`"))
+            let typed = self.state.push_node(HirNodeForm.NativeAddressHash(pointer = pointer), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+            return try self.require_type(typed, expected)
         if name == "arena":
             if self.state.package_role != PackageRole.sealed_runtime:
                 try self.fail(span, "`native.arena` is reserved for the sealed runtime package")
@@ -1565,6 +1592,10 @@ pub class HirBodyChecker: HirSemanticChecker:
         match self.state.types.definitions[owner_type.value].form:
             List(element_type):
                 return try self.check_list_call(receiver, owner_type, element_type, name, arguments, callee_span, span, expected)
+            Map(key_type, value_type):
+                return try self.check_map_call(receiver, owner_type, key_type, value_type, name, arguments, callee_span, span, expected)
+            Set(element_type):
+                return try self.check_set_call(receiver, owner_type, element_type, name, arguments, callee_span, span, expected)
             Weak(referent):
                 return try self.check_weak_call(receiver, owner_type, referent, name, arguments, callee_span, span, expected)
             String:
@@ -1634,6 +1665,54 @@ pub class HirBodyChecker: HirSemanticChecker:
             let minimum = try self.check_expression(arguments[0].value, index_type)
             return try self.require_type(self.state.push_node(HirNodeForm.ListReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
         trap("recognized list method did not return a checked HIR node")
+
+    # mark: Hash collection calls =============================================================
+
+    func check_map_call(receiver: NodeId, owner_type: TypeId, key_type: TypeId, value_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "remove" and name != "clear" and name != "reserve":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`map." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`map.copy` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.MapCopy(value = receiver), owner_type, span), expected)
+        if name == "remove":
+            if len(arguments) != 1: try self.fail(span, "`map.remove` takes one key")
+            let key = try self.check_expression(arguments[0].value, key_type)
+            let result_type = self.state.intern_optional(value_type)
+            return try self.require_type(self.state.push_node(HirNodeForm.MapRemove(value = receiver, key = key), result_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`map.clear` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.MapClear(value = receiver), unit_type, span), expected)
+        if len(arguments) != 1: try self.fail(span, "`map.reserve` takes one minimum capacity")
+        let minimum = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+        return try self.require_type(self.state.push_node(HirNodeForm.MapReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+
+    func check_set_call(receiver: NodeId, owner_type: TypeId, element_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "contains" and name != "insert" and name != "remove" and name != "clear" and name != "reserve":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`set." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        let boolean_type = resolve_builtin_type(BuiltinType.boolean)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`set.copy` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.SetCopy(value = receiver), owner_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`set.clear` takes no arguments")
+            return try self.require_type(self.state.push_node(HirNodeForm.SetClear(value = receiver), unit_type, span), expected)
+        if name == "reserve":
+            if len(arguments) != 1: try self.fail(span, "`set.reserve` takes one minimum capacity")
+            let minimum = try self.check_expression(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            return try self.require_type(self.state.push_node(HirNodeForm.SetReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+        if len(arguments) != 1: try self.fail(span, "`set." + name + "` takes one element")
+        let element = try self.check_expression(arguments[0].value, element_type)
+        if name == "contains":
+            return try self.require_type(self.state.push_node(HirNodeForm.SetContains(value = receiver, element = element), boolean_type, span), expected)
+        if name == "insert":
+            return try self.require_type(self.state.push_node(HirNodeForm.SetInsert(value = receiver, element = element), boolean_type, span), expected)
+        return try self.require_type(self.state.push_node(HirNodeForm.SetRemove(value = receiver, element = element), boolean_type, span), expected)
 
     # `Weak(value)` infers its nominal referent. It is a closed core
     # constructor rather than generic call syntax, and never creates a strong
@@ -2179,6 +2258,14 @@ pub class HirBodyChecker: HirSemanticChecker:
                 if name == "length":
                     let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
                     return try self.require_type(length, expected)
+            Map(key, value):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
+            Set(element):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                    return try self.require_type(length, expected)
             Slice(element):
                 if name == "length":
                     let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
@@ -2242,6 +2329,11 @@ pub class HirBodyChecker: HirSemanticChecker:
                 Array(element, count): element_type = element
                 List(element): element_type = element
                 Slice(element): element_type = element
+                Map(key, element):
+                    let checked_key = try self.check_expression(subscript, key)
+                    let result_type = self.state.intern_optional(element)
+                    let result = self.state.push_node(HirNodeForm.MapLookup(value = value, key = checked_key), result_type, span)
+                    return try self.require_type(result, expected)
                 else:
                     if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
                         try self.fail(span, "`str` does not support integer indexing; iterate characters or encode UTF-8 bytes")
@@ -2523,6 +2615,75 @@ pub class HirBodyChecker: HirSemanticChecker:
         if len(arguments) != 0: try self.fail(span, "`list[T]()` takes no arguments")
         let list_type = self.state.intern_list(element_type)
         let value = self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(list[NodeId]())), list_type, span)
+        return try self.require_type(value, expected)
+
+    # mark: Hash collection construction ======================================================
+
+    func check_map_literal(entries: list[MapEntrySyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var key_type = resolve_builtin_type(BuiltinType.unit)
+        var value_type = resolve_builtin_type(BuiltinType.unit)
+        if expected != none:
+            match self.state.types.definitions[expected.value].form:
+                Map(expected_key, expected_value):
+                    key_type = expected_key
+                    value_type = expected_value
+                else: pass
+
+        let checked = list[NodeId]()
+        for entry in entries:
+            var expected_key: TypeId? = key_type
+            if key_type.value == resolve_builtin_type(BuiltinType.unit).value: expected_key = none
+            let key = try self.check_expression(entry.key, expected_key)
+            if len(checked) == 0 and key_type.value == resolve_builtin_type(BuiltinType.unit).value: key_type = self.state.type_of(key)
+            if not self.declarations.is_hash_key_type(key_type):
+                try self.fail(entry.key.span, "map key type `" + self.describe_type(key_type) + "` must satisfy `Equatable & Hashable`")
+            var expected_value: TypeId? = value_type
+            if value_type.value == resolve_builtin_type(BuiltinType.unit).value: expected_value = none
+            let element = try self.check_expression(entry.value, expected_value)
+            if len(checked) == 0 and value_type.value == resolve_builtin_type(BuiltinType.unit).value: value_type = self.state.type_of(element)
+            for index in range(0, len(checked) // 2):
+                if statically_equal_nodes(self.state, checked[index * 2], key):
+                    try self.fail(entry.key.span, "duplicate statically equal map key")
+            checked.append(key)
+            checked.append(element)
+        let map_type = self.state.intern_map(key_type, value_type)
+        return try self.require_type(self.state.push_node(HirNodeForm.Map(entries = self.state.push_nodes(checked)), map_type, span), expected)
+
+    func check_map_constructor(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 2: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        if len(arguments) != 0: try self.fail(span, "`map[K, V]()` takes no arguments")
+        var key_type = resolve_builtin_type(BuiltinType.unit)
+        var value_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(key): key_type = try self.declarations.resolve_type(self.state.current_module, key)
+            else: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        match type_arguments[1]:
+            TypeArgument(element): value_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        if self.state.contains_fallible(key_type) or self.state.contains_fallible(value_type):
+            try self.fail(span, "a map cannot store a fallible type; `T!` is a function-result effect")
+        if not self.declarations.is_hash_key_type(key_type):
+            try self.fail(span, "map key type `" + self.describe_type(key_type) + "` must satisfy `Equatable & Hashable`")
+        let map_type = self.state.intern_map(key_type, value_type)
+        let value = self.state.push_node(HirNodeForm.Map(entries = self.state.push_nodes(list[NodeId]())), map_type, span)
+        return try self.require_type(value, expected)
+
+    func check_set_constructor(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 1: try self.fail(span, "`set[T](...)` needs exactly one element type")
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(element): element_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`set[T](...)` needs exactly one element type")
+        if self.state.contains_fallible(element_type):
+            try self.fail(span, "a set cannot store a fallible type; `T!` is a function-result effect")
+        if not self.declarations.is_hash_key_type(element_type):
+            try self.fail(span, "set element type `" + self.describe_type(element_type) + "` must satisfy `Equatable & Hashable`")
+        let checked = list[NodeId]()
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`set[T](...)` uses positional elements")
+            checked.append(try self.check_expression(argument.value, element_type))
+        let set_type = self.state.intern_set(element_type)
+        let value = self.state.push_node(HirNodeForm.Set(elements = self.state.push_nodes(checked)), set_type, span)
         return try self.require_type(value, expected)
 
     func check_else(optional_value: ExpressionSyntax, arm: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
@@ -2947,6 +3108,18 @@ func is_contextual_integer_expression(value: ExpressionSyntax) -> bool:
         Group(grouped): return is_contextual_integer_expression(grouped)
         Unary(operator, operand):
             return (operator == "+" or operator == "-") and is_contextual_integer_expression(operand)
+        else: return false
+
+# A map literal rejects keys only when the checked HIR proves their equality
+# without execution. Literal constants are the current closed constant-value
+# family; computed duplicates intentionally follow ordinary replacement at
+# run time.
+func statically_equal_nodes(state: HirGenerationState, left: NodeId, right: NodeId) -> bool:
+    match state.node_form(left):
+        Constant(left_value):
+            match state.node_form(right):
+                Constant(right_value): return values_equal(state.values[left_value], state.values[right_value])
+                else: return false
         else: return false
 
 # Structural comparison of pattern literals; only scalars and strings appear.

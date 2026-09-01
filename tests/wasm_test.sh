@@ -945,6 +945,18 @@ for name in missing missing_store; do
     fi
 done
 
+# Maps and sets retain one semantic shape through the maintained example; the
+# composed runtime owns storage while Wasm supplies only layout and calls.
+"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/hash_collections.wasm" examples/maps_and_sets.luc >/dev/null
+expect 0 "42" wasmtime run --invoke maps_and_sets.answer "$test_dir/hash_collections.wasm"
+set +e
+wasmtime run --invoke maps_and_sets.mutation_trap "$test_dir/hash_collections.wasm" >/dev/null 2>&1; status=$?
+set -e
+if [ "$status" = 0 ]; then
+    echo "wasm: maps_and_sets.mutation_trap exited 0, expected an iteration mutation trap" >&2
+    exit 1
+fi
+
 # Every trapping program must trap under wasmtime too.
 cat > "$test_dir/traps.luc" <<'LUCE'
 pub func i8_overflow() -> i8:

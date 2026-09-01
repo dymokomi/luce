@@ -310,6 +310,14 @@ perform only the unchecked storage operation after the backend guard.
 Capacity, header layout, concatenation allocation/copy policy, and geometric
 growth remain ordinary freestanding Luce runtime policy.
 
+Maps and sets preserve the same boundary with distinct `Map(K,V)` and
+`Set(T)` handles and one `Hash*` instruction family. Candidate discovery uses
+compiler-produced `u64` hashes, but generated MIR performs every key equality
+and typed retain/release callback. The sealed runtime owns dense
+insertion-order entries, private seeded buckets, collision chains, growth,
+iteration depth, and the mutation guard itself. QBE and Wasm contribute only
+layout numbers, callback descriptors, and the ordinary call encoding.
+
 Structural list equality is expanded by the shared lowerer, not delegated to
 a backend. Finite list element shapes use one ordinary canonical loop and
 allocate no comparison state. A type graph recursive through a list reserves
@@ -608,6 +616,8 @@ symbol).
 | `Ptr` | abstract address, untyped; its width is a backend fact |
 | `BufferOwner` | opaque immutable string/byte storage owner; pointer-shaped only after backend legalization |
 | `List(element)` | typed mutable reference collection handle |
+| `Map(key, value)` | typed insertion-ordered mutable hash-map handle |
+| `Set(element)` | typed insertion-ordered mutable hash-set handle |
 | `Slice(element)` | typed immutable snapshot handle |
 | `Class(identity)` | owning nominal identity handle; payload layout remains a backend fact |
 | `WeakClass(identity)` | non-owning handle for the same nominal identity |
@@ -622,10 +632,9 @@ unsigned)`; both `str` and `bytes` → an owning
 item with an inert null owner, while a dynamic value names sealed-runtime
 storage. HIR retains the language distinction; semantic string and byte MIR
 operations do not reinterpret one as the other.
-`list[T]` → `List(T)` and
-`slice[T]` → `Slice(T)`, both opaque reference-sized handles whose concrete
-headers are runtime/backend facts; future `map` and `set` handles follow the
-same typed-reference rule; `T?` → a two-case `Enum` with a `u8` tag, including
+`list[T]` → `List(T)`, `map[K, V]` → `Map(K, V)`, `set[T]` → `Set(T)`, and
+`slice[T]` → `Slice(T)`, all opaque reference-sized handles whose concrete
+headers are runtime/backend facts; `T?` → a two-case `Enum` with a `u8` tag, including
 class optionals (foreign handles also stay tagged internally); a scalar `T!`
 result → a scalar and error pointer, never a
 type;
@@ -786,7 +795,21 @@ MoveElements(destination, source, element_type, count)  overlap-safe typed range
 AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
 EqualityContextCreate() -> r: Ptr                        one recursive comparison transaction
 EqualityContextRelease(Ptr)
-EqualityContextVisit(Ptr, List(T), List(T)) -> r: bool   true when the ordered pair was visited
+EqualityContextVisit(Ptr, Collection(T), Collection(T)) -> r: bool
+                                            true when the ordered identity pair was visited
+HashCreate()                             -> r: Map(K,V) or Set(T)
+HashCopy(value, key_retain, value_retain) -> r: same type
+HashLength(value)                        -> r: u64
+HashIterationBegin(value)                -> r: u64       enter traversal and capture length
+HashIterationEnd(value)                                  leave one traversal depth
+HashFindFirst(value, hash: u64)          -> r: u64       candidate index + 1, or zero
+HashFindNext(value, current: u64)        -> r: u64       next candidate index + 1, or zero
+HashKeyAddress(value, index: u64)        -> r: Ptr
+HashValueAddress(Map(K,V), index: u64)   -> r: Ptr
+HashInsertEntry(value, hash: u64)        -> r: u64       uninitialized entry index
+HashRemoveEntry(value, index: u64)                       raw removal after typed cleanup
+HashClear(value, key_release, value_release)
+HashReserve(value, minimum_capacity: u64)
 ListCreate()                            -> r: List(T)    T is the result-register type
 ListCopy(value: List(T))                -> r: List(T)    shallow, independent storage
 ListConcat(left: List(T), right: List(T)) -> r: List(T)  fresh shallow ordered result
@@ -939,7 +962,7 @@ InterfacePayload(Interface(I)) -> Ptr           erased receiver storage
 CallInterface(InterfaceId, requirement, Interface(I), args) -> results
 list_iteration_active(List(T)) -> bool        backend guards every shape mutation
 luce_rt_trap(message, u64 length)        luce_rt_write(bytes, u64 length)
-luce_rt_str_*  luce_rt_list_*  luce_rt_map_*  luce_rt_set_*         dynamic storage (§12)
+luce_rt_str_*  private list/hash runtime services                    dynamic storage (§12)
 luce_rt_spawn(function, input) -> Ptr    luce_rt_wait(Ptr) -> Ptr    luce_rt_cancel(Ptr)
 luce_rt_transfer(value, type_info) -> Ptr                             value-graph copy (§19.2)
 ```

@@ -16,12 +16,12 @@
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_weak_field_step
 from compiler.hir.analyzer import AnalyzedProgram
 import std.strings
 
@@ -42,6 +42,7 @@ union AssignmentPlaceStep:
     WeakField(index: i64)
     Element(index: i64)
     ListElement(index: i64)
+    MapElement(key: BoxedValue)
 
 # A mutable place: a binding and resolved field/element steps to its value.
 struct Place:
@@ -82,6 +83,10 @@ union RunEvaluation:
 union ListEvaluation:
     EvaluatedList(storage: ListStorage)
     TransferredList(execution: Execution)
+
+union HashEvaluation:
+    EvaluatedHash(storage: HashStorage)
+    TransferredHash(execution: Execution)
 
 union PlaceEvaluation:
     EvaluatedPlace(place: Place, value: Value)
@@ -789,6 +794,17 @@ class HirInterpreterRun: ClassFinalizer:
                                     else: trap("list element step applied to a non-list HIR value")
                             else: trap("typed place index is not an integer")
                     Transferred(execution): return PlaceUpdate.Transferred(execution = execution)
+            elif kind == place_map_element_step:
+                match try self.evaluate(NodeId(value = u32(payload)), bindings):
+                    Evaluated(key):
+                        steps.append(AssignmentPlaceStep.MapElement(key = BoxedValue(value = key)))
+                        match current:
+                            Map(storage):
+                                let entry = try find_hash_entry(storage, key)
+                                if entry >= 0: current = storage.entries[entry].value.value
+                                else: current = Value.Unit
+                            else: trap("map element step applied to a non-map HIR value")
+                    Transferred(execution): return PlaceUpdate.Transferred(execution = execution)
             else: trap("typed place assignment has an unknown step")
 
         var right = Value.Unit
@@ -804,7 +820,7 @@ class HirInterpreterRun: ClassFinalizer:
         else:
             let binding_index = find_binding(bindings, root_symbol)
             if binding_index < 0: trap("typed place assignment lost its root binding")
-            latest_root = bindings[binding_index].value
+            latest_root = self.binding_value(bindings[binding_index].value)
         var assigned = right
         match operation:
             Replace: pass
@@ -831,6 +847,8 @@ class HirInterpreterRun: ClassFinalizer:
         match self.program.types.definitions[node_type(self.program, iterable).value].form:
             Range(element): return try self.execute_range_for(symbol, value, element, body, bindings)
             List(element): return try self.execute_list_for(symbol, value, body, bindings)
+            Map(key, element): return try self.execute_hash_for(symbol, value, true, body, bindings)
+            Set(element): return try self.execute_hash_for(symbol, value, false, body, bindings)
             String: return try self.execute_string_for(symbol, value, body, bindings)
             else: trap("typed `for` received a non-iterable value")
 
@@ -994,6 +1012,37 @@ class HirInterpreterRun: ClassFinalizer:
         storage.active_iterations -= 1
         return outcome
 
+    func execute_hash_for(symbol: SymbolId, iterated: Value, is_map: bool, body: Operands, bindings: list[Binding]) -> Execution!:
+        var storage: HashStorage? = none
+        match iterated:
+            Map(value):
+                if is_map: storage = value
+            Set(value):
+                if not is_map: storage = value
+            else: pass
+        let collection = storage else trap("typed hash-collection iteration received the wrong value")
+        collection.active_iterations += 1
+        let outer_count = len(bindings)
+        let length = len(collection.entries)
+        for index in range(0, length):
+            bindings.append(Binding(symbol = symbol, value = collection.entries[index].key.value))
+            let outcome = self.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                collection.active_iterations -= 1
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return self.finish_hash_iteration(collection, Execution.Next)
+                Returned(value): return self.finish_hash_iteration(collection, Execution.Returned(value = value))
+                Raised(error_value): return self.finish_hash_iteration(collection, Execution.Raised(error_value = error_value))
+                Recovered(value): return self.finish_hash_iteration(collection, Execution.Recovered(value = value))
+                else: pass
+        return self.finish_hash_iteration(collection, Execution.Next)
+
+    func finish_hash_iteration(storage: HashStorage, outcome: Execution) -> Execution:
+        storage.active_iterations -= 1
+        return outcome
+
     func execute_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Execution!:
         let evaluated = try self.evaluate(subject, bindings)
         var selected = Value.Unit
@@ -1062,6 +1111,8 @@ class HirInterpreterRun: ClassFinalizer:
                             Text(text): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(strings.to_bytes(text)))))
                             Array(elements): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(elements))))
                             List(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.buffer.elements))))
+                            Map(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
+                            Set(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
                             Slice(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(storage.length)))
                             else: trap("typed sequence length has a non-sequence value")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
@@ -1266,6 +1317,31 @@ class HirInterpreterRun: ClassFinalizer:
                         Evaluated(item): storage.buffer.elements.append(BoxedValue(value = item))
                         Transferred(execution): return Evaluation.Transferred(execution = execution)
                 return Evaluation.Evaluated(value = Value.List(storage = storage))
+            Map(entries):
+                let storage = HashStorage(list[HashEntry]())
+                for position in range(0, i64(entries.count) // 2):
+                    var key = Value.Unit
+                    match try self.evaluate(node_at(self.program, entries, position * 2), bindings):
+                        Evaluated(item): key = item
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    match try self.evaluate(node_at(self.program, entries, position * 2 + 1), bindings):
+                        Evaluated(item):
+                            let selected = try find_hash_entry(storage, key)
+                            if selected >= 0:
+                                storage.entries[selected].value = BoxedValue(value = item)
+                            else:
+                                storage.entries.append(HashEntry(key = BoxedValue(value = key), value = BoxedValue(value = item)))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Map(storage = storage))
+            Set(elements):
+                let storage = HashStorage(list[HashEntry]())
+                for position in range(0, i64(elements.count)):
+                    match try self.evaluate(node_at(self.program, elements, position), bindings):
+                        Evaluated(item):
+                            if try find_hash_entry(storage, item) < 0:
+                                storage.entries.append(HashEntry(key = BoxedValue(value = item), value = BoxedValue(value = Value.Unit)))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Set(storage = storage))
             ListCopy(value):
                 match try self.evaluate_list(value, bindings):
                     EvaluatedList(storage):
@@ -1363,6 +1439,50 @@ class HirInterpreterRun: ClassFinalizer:
                             UnsignedInteger(minimum): return Evaluation.Evaluated(value = Value.Unit)
                             else: trap("typed list reserve capacity is not an integer")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapLookup(value, key):
+                let receiver = try self.evaluate(value, bindings)
+                var storage: HashStorage? = none
+                match receiver:
+                    Evaluated(item):
+                        match item:
+                            Map(found): storage = found
+                            else: trap("typed map lookup has a non-map receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                match try self.evaluate(key, bindings):
+                    Evaluated(item):
+                        let found = storage else trap("map lookup lost its storage")
+                        let selected = try find_hash_entry(found, item)
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                        return Evaluation.Evaluated(value = Value.Present(value = found.entries[selected].value))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapCopy(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Map(storage):
+                                let entries = list[HashEntry]()
+                                for entry in storage.entries: entries.append(HashEntry(key = entry.key, value = entry.value))
+                                return Evaluation.Evaluated(value = Value.Map(storage = HashStorage(entries)))
+                            else: trap("typed map copy has a non-map receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapRemove(value, key): return try self.evaluate_map_remove(value, key, bindings)
+            MapClear(value): return try self.evaluate_hash_clear(value, true, bindings)
+            MapReserve(value, minimum_capacity): return try self.evaluate_hash_reserve(value, true, minimum_capacity, bindings)
+            SetContains(value, element): return try self.evaluate_set_membership(value, element, 0, bindings)
+            SetInsert(value, element): return try self.evaluate_set_membership(value, element, 1, bindings)
+            SetRemove(value, element): return try self.evaluate_set_membership(value, element, 2, bindings)
+            SetClear(value): return try self.evaluate_hash_clear(value, false, bindings)
+            SetReserve(value, minimum_capacity): return try self.evaluate_hash_reserve(value, false, minimum_capacity, bindings)
+            SetCopy(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Set(storage):
+                                let entries = list[HashEntry]()
+                                for entry in storage.entries: entries.append(HashEntry(key = entry.key, value = entry.value))
+                                return Evaluation.Evaluated(value = Value.Set(storage = HashStorage(entries)))
+                            else: trap("typed set copy has a non-set receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             Element(value, index):
                 match try self.evaluate(value, bindings):
                     Evaluated(item):
@@ -1426,6 +1546,83 @@ class HirInterpreterRun: ClassFinalizer:
                     List(storage): return ListEvaluation.EvaluatedList(storage = storage)
                     else: trap("typed list operation has a non-list receiver")
             Transferred(execution): return ListEvaluation.TransferredList(execution = execution)
+
+    func evaluate_hash(value: NodeId, is_map: bool, bindings: list[Binding]) -> HashEvaluation!:
+        match try self.evaluate(value, bindings):
+            Evaluated(item):
+                match item:
+                    Map(storage):
+                        if is_map: return HashEvaluation.EvaluatedHash(storage = storage)
+                    Set(storage):
+                        if not is_map: return HashEvaluation.EvaluatedHash(storage = storage)
+                    else: pass
+                trap("typed hash-collection operation has the wrong receiver")
+            Transferred(execution): return HashEvaluation.TransferredHash(execution = execution)
+
+    func evaluate_map_remove(value: NodeId, key: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(value, true, bindings):
+            EvaluatedHash(storage):
+                match try self.evaluate(key, bindings):
+                    Evaluated(item):
+                        let selected = try find_hash_entry(storage, item)
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                        try require_hash_shape_mutable(storage, "map")
+                        let removed = storage.entries[selected].value
+                        let rebuilt = list[HashEntry]()
+                        for index in range(0, len(storage.entries)):
+                            if index != selected: rebuilt.append(storage.entries[index])
+                        while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                        for entry in rebuilt: storage.entries.append(entry)
+                        return Evaluation.Evaluated(value = Value.Present(value = removed))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+
+    func evaluate_hash_clear(value: NodeId, is_map: bool, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(value, is_map, bindings):
+            EvaluatedHash(storage):
+                var kind = "set"
+                if is_map: kind = "map"
+                try require_hash_shape_mutable(storage, kind)
+                while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                return Evaluation.Evaluated(value = Value.Unit)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+
+    func evaluate_hash_reserve(value: NodeId, is_map: bool, minimum_capacity: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(value, is_map, bindings):
+            EvaluatedHash(storage): pass
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+        match try self.evaluate(minimum_capacity, bindings):
+            Evaluated(item):
+                match item:
+                    UnsignedInteger(minimum): return Evaluation.Evaluated(value = Value.Unit)
+                    else: trap("typed hash-collection reserve capacity is not an integer")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    # Operation 0 is contains, 1 insert, and 2 remove. The compact internal
+    # tag keeps the shared semantic transaction in one place without leaking
+    # a source-level enum or duplicating receiver/operand evaluation.
+    func evaluate_set_membership(value: NodeId, element: NodeId, operation: i64, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(value, false, bindings):
+            EvaluatedHash(storage):
+                match try self.evaluate(element, bindings):
+                    Evaluated(item):
+                        let selected = try find_hash_entry(storage, item)
+                        if operation == 0: return Evaluation.Evaluated(value = Value.Boolean(value = selected >= 0))
+                        if operation == 1:
+                            if selected >= 0: return Evaluation.Evaluated(value = Value.Boolean(value = false))
+                            try require_hash_shape_mutable(storage, "set")
+                            storage.entries.append(HashEntry(key = BoxedValue(value = item), value = BoxedValue(value = Value.Unit)))
+                            return Evaluation.Evaluated(value = Value.Boolean(value = true))
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Boolean(value = false))
+                        try require_hash_shape_mutable(storage, "set")
+                        let rebuilt = list[HashEntry]()
+                        for index in range(0, len(storage.entries)):
+                            if index != selected: rebuilt.append(storage.entries[index])
+                        while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                        for entry in rebuilt: storage.entries.append(entry)
+                        return Evaluation.Evaluated(value = Value.Boolean(value = true))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
 
     func evaluate_sequence_slice(value: NodeId, start: NodeId, end: NodeId, bindings: list[Binding]) -> Evaluation!:
         match try self.evaluate(value, bindings):
@@ -1838,6 +2035,13 @@ func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], s
                     if index < 0 or index >= len(storage.buffer.elements): error("interpreter: index out of bounds")
                     return try value_at_assignment_place(storage.buffer.elements[index].value, steps, start + 1)
                 else: trap("list element step applied to a non-list HIR value")
+        MapElement(key):
+            match value:
+                Map(storage):
+                    let selected = try find_hash_entry(storage, key.value)
+                    if selected < 0: trap("absent map value was read as an assignment place")
+                    return try value_at_assignment_place(storage.entries[selected].value.value, steps, start + 1)
+                else: trap("map element step applied to a non-map HIR value")
 
 # Preserve every immutable snapshot by moving a list identity to a new buffer
 # immediately before its first subsequent write. Aliases share ListStorage and
@@ -1895,6 +2099,18 @@ func value_with_assignment_place(value: Value, steps: list[AssignmentPlaceStep],
                     storage.buffer.elements[selected] = BoxedValue(value = try value_with_assignment_place(storage.buffer.elements[selected].value, steps, start + 1, replacement))
                     return value
                 else: trap("list element step applied to a non-list HIR value")
+        MapElement(key):
+            if start + 1 != len(steps): trap("map element step cannot contain a nested assignment")
+            match value:
+                Map(storage):
+                    let selected = try find_hash_entry(storage, key.value)
+                    if selected >= 0:
+                        storage.entries[selected].value = BoxedValue(value = replacement)
+                    else:
+                        try require_hash_shape_mutable(storage, "map")
+                        storage.entries.append(HashEntry(key = key, value = BoxedValue(value = replacement)))
+                    return value
+                else: trap("map element step applied to a non-map HIR value")
 
 # Remove locals introduced after a lexical scope began.
 func trim_bindings(bindings: list[Binding], count: i64):
@@ -1949,8 +2165,8 @@ func evaluate_unary(operation: UnaryOperation, value: Value, types: TypeTable) -
 # share it, so a mismatch here is a compiler bug, not a user error.
 func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, types: TypeTable) -> Value!:
     match operation:
-        Equal(operand_type): return Value.Boolean(value = try values_equal(left, right, EqualityContext(), types))
-        NotEqual(operand_type): return Value.Boolean(value = not (try values_equal(left, right, EqualityContext(), types)))
+        Equal(operand_type): return Value.Boolean(value = try values_equal(left, right, EqualityContext()))
+        NotEqual(operand_type): return Value.Boolean(value = not (try values_equal(left, right, EqualityContext())))
         else: pass
     match left:
         Unit:
@@ -2038,6 +2254,14 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         List(left_storage):
             match right:
                 List(right_storage): return evaluate_list_binary(left_storage, operation, right_storage)
+                else: trap("typed binary expression has unequal value types")
+        Map(left_storage):
+            match right:
+                Map(right_storage): return evaluate_hash_identity(left_storage, operation, right_storage, "maps")
+                else: trap("typed binary expression has unequal value types")
+        Set(left_storage):
+            match right:
+                Set(right_storage): return evaluate_hash_identity(left_storage, operation, right_storage, "sets")
                 else: trap("typed binary expression has unequal value types")
 
 # Render the source-visible Error shape only at the host execution boundary.
@@ -2327,6 +2551,12 @@ func evaluate_list_binary(left: ListStorage, operation: BinaryOperation, right: 
             return Value.List(storage = ListStorage(elements))
         else: trap("lists have no other binary operations in the current slice")
 
+func evaluate_hash_identity(left: HashStorage, operation: BinaryOperation, right: HashStorage, kind: str) -> Value:
+    match operation:
+        Identity(operand_type): return Value.Boolean(value = left is right)
+        NotIdentity(operand_type): return Value.Boolean(value = not (left is right))
+        else: trap(kind + " have no non-structural binary operation")
+
 # mark: Cycle-aware equality ==================================================================
 
 # A comparison is one coinductive transaction. Revisiting the same ordered
@@ -2337,10 +2567,14 @@ func evaluate_list_binary(left: ListStorage, operation: BinaryOperation, right: 
 class EqualityContext:
     let left_lists: list[ListStorage]
     let right_lists: list[ListStorage]
+    let left_maps: list[HashStorage]
+    let right_maps: list[HashStorage]
 
     pub init():
         self.left_lists = list[ListStorage]()
         self.right_lists = list[ListStorage]()
+        self.left_maps = list[HashStorage]()
+        self.right_maps = list[HashStorage]()
 
     func seen_or_add(left: ListStorage, right: ListStorage) -> bool:
         for index in range(0, len(self.left_lists)):
@@ -2349,10 +2583,17 @@ class EqualityContext:
         self.right_lists.append(right)
         return false
 
-func boxed_values_equal(left: list[BoxedValue], right: list[BoxedValue], context: EqualityContext, types: TypeTable) -> bool!:
+    func seen_map_or_add(left: HashStorage, right: HashStorage) -> bool:
+        for index in range(0, len(self.left_maps)):
+            if self.left_maps[index] is left and self.right_maps[index] is right: return true
+        self.left_maps.append(left)
+        self.right_maps.append(right)
+        return false
+
+func boxed_values_equal(left: list[BoxedValue], right: list[BoxedValue], context: EqualityContext) -> bool!:
     if len(left) != len(right): return false
     for index in range(0, len(left)):
-        if not (try values_equal(left[index].value, right[index].value, context, types)): return false
+        if not (try values_equal(left[index].value, right[index].value, context)): return false
     return true
 
 func byte_values_equal(left: list[u8], right: list[u8]) -> bool:
@@ -2361,7 +2602,12 @@ func byte_values_equal(left: list[u8], right: list[u8]) -> bool:
         if left[index] != right[index]: return false
     return true
 
-func values_equal(left: Value, right: Value, context: EqualityContext, types: TypeTable) -> bool!:
+func find_hash_entry(storage: HashStorage, key: Value) -> i64!:
+    for index in range(0, len(storage.entries)):
+        if try values_equal(storage.entries[index].key.value, key, EqualityContext()): return index
+    return -1
+
+func values_equal(left: Value, right: Value, context: EqualityContext) -> bool!:
     match left:
         Unit:
             match right:
@@ -2401,20 +2647,20 @@ func values_equal(left: Value, right: Value, context: EqualityContext, types: Ty
                 else: return false
         Tuple(values):
             match right:
-                Tuple(other): return try boxed_values_equal(values, other, context, types)
+                Tuple(other): return try boxed_values_equal(values, other, context)
                 else: return false
         Array(values):
             match right:
-                Array(other): return try boxed_values_equal(values, other, context, types)
+                Array(other): return try boxed_values_equal(values, other, context)
                 else: return false
         Record(values):
             match right:
-                Record(other): return try boxed_values_equal(values, other, context, types)
+                Record(other): return try boxed_values_equal(values, other, context)
                 else: return false
         Variant(case_index, payload):
             match right:
                 Variant(other_case, other_payload):
-                    return case_index == other_case and try boxed_values_equal(payload, other_payload, context, types)
+                    return case_index == other_case and try boxed_values_equal(payload, other_payload, context)
                 else: return false
         Absent:
             match right:
@@ -2422,7 +2668,7 @@ func values_equal(left: Value, right: Value, context: EqualityContext, types: Ty
                 else: return false
         Present(value):
             match right:
-                Present(other): return try values_equal(value.value, other.value, context, types)
+                Present(other): return try values_equal(value.value, other.value, context)
                 else: return false
         List(storage):
             match right:
@@ -2430,13 +2676,38 @@ func values_equal(left: Value, right: Value, context: EqualityContext, types: Ty
                     if storage is other: return true
                     if len(storage.buffer.elements) != len(other.buffer.elements): return false
                     if context.seen_or_add(storage, other): return true
-                    return try boxed_values_equal(storage.buffer.elements, other.buffer.elements, context, types)
+                    return try boxed_values_equal(storage.buffer.elements, other.buffer.elements, context)
+                else: return false
+        Map(storage):
+            match right:
+                Map(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    if context.seen_map_or_add(storage, other): return true
+                    for entry in storage.entries:
+                        let found = try find_hash_entry(other, entry.key.value)
+                        if found < 0: return false
+                        if not (try values_equal(entry.value.value, other.entries[found].value.value, context)): return false
+                    return true
+                else: return false
+        Set(storage):
+            match right:
+                Set(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        if try find_hash_entry(other, entry.key.value) < 0: return false
+                    return true
                 else: return false
         else: trap("non-equatable HIR value reached structural equality")
 
 func require_list_shape_mutable(storage: ListStorage) -> !:
     if storage.active_iterations > 0:
         error("interpreter: list structurally modified during active iteration")
+
+func require_hash_shape_mutable(storage: HashStorage, kind: str) -> !:
+    if storage.active_iterations > 0:
+        error("interpreter: " + kind + " structurally modified during active iteration")
 
 func require_list_storage(value: Value) -> ListStorage:
     match value:
@@ -2499,6 +2770,8 @@ func structural_hash(value: Value) -> u64:
         Foreign(token): trap("foreign handles are not structurally hashable")
         TextSlice(items): trap("slices are not structurally hashable")
         List(storage): trap("mutable lists are not structurally hashable")
+        Map(storage): trap("mutable maps are not structurally hashable")
+        Set(storage): trap("mutable sets are not structurally hashable")
         Slice(storage): trap("slices are not structurally hashable")
         Function(symbol): trap("functions are not structurally hashable")
         Closure(storage): trap("closures are not structurally hashable")

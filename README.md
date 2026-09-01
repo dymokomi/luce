@@ -87,7 +87,9 @@ examples and tests link back here rather than restating it.
   defaults, bindings, assignment, scalars, strings, checked byte indexing and
   byte-sequence lengths, fixed arrays, reference lists (literals, shared
   identity, length, checked get/set, append, insert, removal, clear, and
-  reserve, plus shallow independent copies and immutable snapshots), tuples,
+  reserve, plus shallow independent copies and immutable snapshots),
+  insertion-ordered maps and sets (typed lookup/mutation, copy, recursive
+  equality, iteration guards, and managed ownership), tuples,
   optionals, nominal classes with explicit construction, shared identity,
   strong ARC, optional weak fields, first-class `Weak[T]` handles,
   deterministic destruction, and initialization/resurrection analysis,

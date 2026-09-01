@@ -85,6 +85,8 @@ pub let weak_class_address_base: i64 = 0x7000000
 pub let interface_address_base: i64 = 0x8000000
 ## Recursive equality contexts occupy an oracle-only opaque range.
 pub let equality_context_address_base: i64 = 0x9000000
+## Hash-collection identities are disjoint from every other oracle handle.
+pub let hash_address_base: i64 = 0xA000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -138,6 +140,29 @@ class MirList:
     pub init(element_type: TypeId):
         self.element_type = element_type
         self.buffer = MirListBuffer()
+        self.references = 1
+        self.active_iterations = 0
+        self.is_alive = true
+
+## Insertion-ordered semantic table storage. Keys and map values occupy
+## independent typed oracle cells; hashes only select candidates and never
+## decide language equality.
+class MirHash:
+    let key_type: TypeId
+    let value_type: TypeId?
+    let hashes: list[u64]
+    let keys: list[i64]
+    let values: list[i64]
+    var references: i64
+    var active_iterations: i64
+    var is_alive: bool
+
+    pub init(key_type: TypeId, value_type: TypeId?):
+        self.key_type = key_type
+        self.value_type = value_type
+        self.hashes = list[u64]()
+        self.keys = list[i64]()
+        self.values = list[i64]()
         self.references = 1
         self.active_iterations = 0
         self.is_alive = true
@@ -276,6 +301,7 @@ pub class MirInterpreter: MirExternMemory:
     let data_addresses: list[i64]
     let global_addresses: list[i64]
     let lists: list[MirList]
+    let hashes: list[MirHash]
     let equality_contexts: list[MirEqualityContext]
     let immutable_buffers: list[MirImmutableBuffer]
     let slices: list[MirSlice]
@@ -301,6 +327,7 @@ pub class MirInterpreter: MirExternMemory:
         self.data_addresses = list[i64]()
         self.global_addresses = list[i64]()
         self.lists = list[MirList]()
+        self.hashes = list[MirHash]()
         self.equality_contexts = list[MirEqualityContext]()
         self.immutable_buffers = list[MirImmutableBuffer]()
         self.slices = list[MirSlice]()
@@ -505,6 +532,8 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = try self.evaluate_convert(operation, frame.function.registers[operand.value], frame.function.registers[result.value], frame.registers[operand.value])
             FloatHash(result, operand):
                 frame.registers[result.value] = MirValue.UnsignedInt(value = semantic_float_hash(float_of(frame.registers[operand.value])))
+            PointerHash(result, operand):
+                frame.registers[result.value] = MirValue.UnsignedInt(value = semantic_pointer_hash(ptr_of(frame.registers[operand.value])))
             Alloca(result, slot):
                 frame.registers[result.value] = MirValue.Ptr(value = frame.slots[slot])
             AllocateStorage(result, element_type, count):
@@ -551,6 +580,123 @@ pub class MirInterpreter: MirExternMemory:
                     state.left.append(left_identity)
                     state.right.append(right_identity)
                 frame.registers[result.value] = MirValue.Bool(value = visited)
+            HashCreate(result):
+                let shape = self.hash_types(frame.function, result)
+                var value_type: TypeId? = none
+                if len(shape) == 2: value_type = shape[1]
+                self.hashes.append(MirHash(shape[0], value_type))
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.hash_at(frame.registers[value.value])
+                    storage.references += 1
+            HashRelease(value, key_release, value_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.hash_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("hash reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        if storage.active_iterations != 0: trap("released a hash collection during active iteration")
+                        var position = len(storage.keys) - 1
+                        while position >= 0:
+                            discard(try self.call(i64(key_release.value), [MirValue.Ptr(value = storage.keys[position])]))
+                            var value_address = 0
+                            if storage.value_type != none: value_address = storage.values[position]
+                            discard(try self.call(i64(value_release.value), [MirValue.Ptr(value = value_address)]))
+                            position -= 1
+                        storage.is_alive = false
+            HashCopy(result, value, key_retain, value_retain):
+                let source = try self.hash_at(frame.registers[value.value])
+                let copied = MirHash(source.key_type, source.value_type)
+                for position in range(0, len(source.keys)):
+                    copied.hashes.append(source.hashes[position])
+                    let key_address = self.allocate(self.layout.size_of(source.key_type), self.layout.align_of(source.key_type))
+                    self.copy_bytes(source.keys[position], key_address, self.layout.size_of(source.key_type))
+                    discard(try self.call(i64(key_retain.value), [MirValue.Ptr(value = key_address)]))
+                    copied.keys.append(key_address)
+                    var value_address = 0
+                    if source.value_type != none:
+                        let item_type = source.value_type else trap("map hash storage lost its value type")
+                        value_address = self.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                        self.copy_bytes(source.values[position], value_address, self.layout.size_of(item_type))
+                    discard(try self.call(i64(value_retain.value), [MirValue.Ptr(value = value_address)]))
+                    copied.values.append(value_address)
+                self.hashes.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashLength(result, value):
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len((try self.hash_at(frame.registers[value.value])).keys)))
+            HashIterationBegin(result, value):
+                let storage = try self.hash_at(frame.registers[value.value])
+                storage.active_iterations += 1
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.keys)))
+            HashIterationEnd(value):
+                let storage = try self.hash_at(frame.registers[value.value])
+                if storage.active_iterations <= 0: error("mir interpreter: trap: hash iteration depth underflow")
+                storage.active_iterations -= 1
+            HashFindFirst(result, value, key_hash):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let wanted = unsigned_int_of(frame.registers[key_hash.value])
+                var candidate: u64 = u64(0)
+                for position in range(0, len(storage.hashes)):
+                    if storage.hashes[position] == wanted:
+                        candidate = u64(position + 1)
+                        break
+                frame.registers[result.value] = MirValue.UnsignedInt(value = candidate)
+            HashFindNext(result, value, current):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let encoded = try host_count_of(frame.registers[current.value], "hash candidate")
+                if encoded <= 0 or encoded > len(storage.hashes): error("mir interpreter: trap: invalid hash candidate")
+                let wanted = storage.hashes[encoded - 1]
+                var candidate: u64 = u64(0)
+                for position in range(encoded, len(storage.hashes)):
+                    if storage.hashes[position] == wanted:
+                        candidate = u64(position + 1)
+                        break
+                frame.registers[result.value] = MirValue.UnsignedInt(value = candidate)
+            HashKeyAddress(result, value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.keys), false, "hash index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.keys[position])
+            HashValueAddress(result, value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                if storage.value_type == none: trap("verified hash value address on a set")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.values), false, "hash index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.values[position])
+            HashInsertEntry(result, value, key_hash):
+                let storage = try self.hash_at(frame.registers[value.value])
+                try self.require_hash_shape_mutable(storage)
+                let key_address = self.allocate(self.layout.size_of(storage.key_type), self.layout.align_of(storage.key_type))
+                var value_address = 0
+                if storage.value_type != none:
+                    let item_type = storage.value_type else trap("map hash storage lost its value type")
+                    value_address = self.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                storage.hashes.append(unsigned_int_of(frame.registers[key_hash.value]))
+                storage.keys.append(key_address)
+                storage.values.append(value_address)
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.keys) - 1))
+            HashRemoveEntry(value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.keys), false, "hash index out of bounds")
+                try self.require_hash_shape_mutable(storage)
+                storage.hashes.remove(position)
+                storage.keys.remove(position)
+                storage.values.remove(position)
+            HashClear(value, key_release, value_release):
+                let storage = try self.hash_at(frame.registers[value.value])
+                try self.require_hash_shape_mutable(storage)
+                var position = len(storage.keys) - 1
+                while position >= 0:
+                    discard(try self.call(i64(key_release.value), [MirValue.Ptr(value = storage.keys[position])]))
+                    var value_address = 0
+                    if storage.value_type != none: value_address = storage.values[position]
+                    discard(try self.call(i64(value_release.value), [MirValue.Ptr(value = value_address)]))
+                    position -= 1
+                storage.hashes.clear()
+                storage.keys.clear()
+                storage.values.clear()
+            HashReserve(value, minimum_capacity):
+                discard(try self.hash_at(frame.registers[value.value]))
+                discard(try host_count_of(frame.registers[minimum_capacity.value], "hash minimum capacity"))
             Load(result, value_type, address):
                 frame.registers[result.value] = self.load(value_type, ptr_of(frame.registers[address.value]))
             Store(value_type, address, value):
@@ -1046,6 +1192,17 @@ pub class MirInterpreter: MirExternMemory:
         if not storage.is_alive: error("mir interpreter: trap: released list handle")
         return storage
 
+    func hash_at(value: MirValue) -> MirHash!:
+        let index = ptr_of(value) - hash_address_base
+        if index < 0 or index >= len(self.hashes): error("mir interpreter: trap: invalid hash collection handle")
+        let storage = self.hashes[index]
+        if not storage.is_alive: error("mir interpreter: trap: released hash collection handle")
+        return storage
+
+    func require_hash_shape_mutable(storage: MirHash) -> !:
+        if storage.active_iterations > 0:
+            error("mir interpreter: trap: hash collection structurally modified during active iteration")
+
     func equality_context_at(value: MirValue) -> MirEqualityContext!:
         let index = ptr_of(value) - equality_context_address_base
         if index < 0 or index >= len(self.equality_contexts): error("mir interpreter: trap: invalid equality context")
@@ -1118,6 +1275,12 @@ pub class MirInterpreter: MirExternMemory:
         match mir_type(self.program.types, function.registers[value.value]):
             List(element): return element
             else: trap("verified list instruction has a non-list handle")
+
+    func hash_types(function: MirFunction, value: RegisterId) -> list[TypeId]:
+        match mir_type(self.program.types, function.registers[value.value]):
+            Map(key, item): return [key, item]
+            Set(element): return [element]
+            else: trap("verified hash instruction has a non-map/set handle")
 
     func slice_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, function.registers[value.value]):
@@ -1748,4 +1911,13 @@ func semantic_float_hash(value: f64) -> u64:
         result = result ^ shift_left_unsigned(result, 13, 64)
         result = result ^ (result >> u64(7))
         result = result ^ shift_left_unsigned(result, 17, 64)
+    return result
+
+# Oracle-only address tokens are non-negative. Mix them into a process-local
+# code without exposing an integer conversion operation to canonical MIR.
+func semantic_pointer_hash(value: i64) -> u64:
+    var result = u64(value) ^ u64(0x9E3779B97F4A7C15)
+    result = result ^ shift_left_unsigned(result, 13, 64)
+    result = result ^ (result >> u64(7))
+    result = result ^ shift_left_unsigned(result, 17, 64)
     return result

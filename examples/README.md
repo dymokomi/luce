@@ -122,6 +122,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   exits, evaluation order, and
   geometric growth, recursive ARC, and storage reclamation through the HIR
   and MIR oracles, Wasm, and a real native QBE artifact.
+- `maps_and_sets.luc` proves insertion-ordered map/set identity, lookup,
+  replacement, insertion, removal, reservation, clearing, shallow copying,
+  order-independent and recursive equality, alias-wide iteration guards, and
+  exact managed-value release through both semantic oracles, Wasm, and native
+  QBE.
 - `strings.luc` proves exact raw and escaped text/byte spellings, escaping
   owned concatenation and explicit disposal of an owned temporary, distinct
   byte/scalar lengths, Unicode scalar iteration, and lexicographic ordering
