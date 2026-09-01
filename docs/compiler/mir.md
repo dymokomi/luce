@@ -334,6 +334,18 @@ remain valid, so the loop requests the current element address on every pass
 instead of retaining a relocated storage pointer. The active depth is
 semantic shared-identity state; its concrete header field is runtime-private.
 
+User-defined iteration does not add a second MIR protocol. HIR has already
+selected the exact compiler-known interface application and resolved
+`iterator()`/`next()` as static, constrained, or dynamic interface calls. The
+function lowerer evaluates `iterator()` once into one private owned slot, then
+expresses repeated `next()` using the existing call, optional-tag/payload,
+`Block`, `Loop`, and branch operations. Fallible iteration is the same shape
+with the existing HIR `Try` around each fallible `next()`, so ordinary MIR
+failure transfer runs the active cleanup suffix. The private slot uses the
+same generated ownership helper as any lexical interface local and is released
+on exhaustion, `break`, return, or propagation. No iterator layout, ABI, or
+target choice enters canonical MIR.
+
 The spec (§23.4) lists what the runtime provides — allocation, ARC,
 weak references, dynamic strings and collections, traps, worker spawn and
 join — and says it should be "small and explicit enough to replace per

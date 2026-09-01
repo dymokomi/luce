@@ -14,7 +14,7 @@ from luce.compiler.hir.generation_model import SourceModule
 from luce.compiler.frontend.parser import Parser
 from luce.compiler.frontend.tokenizer import Tokenizer
 from luce.compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirProgram, HirReceiverKind, ModuleAuthority, PackageRole
-from luce.compiler.hir.ir import NodeId, Operands, SymbolKind, TypeForm, describe_type, entry_at, function_body, no_node, node_at, node_form, node_type
+from luce.compiler.hir.ir import NodeId, Operands, StandardInterface, SymbolKind, TypeForm, describe_type, entry_at, function_body, no_node, node_at, node_form, node_type
 from luce.compiler.hir.ir import is_integer_type, is_numeric_type, nominal_fields, resolve_builtin_type, type_contains_parameter, types_match
 from luce.compiler.hir.ir import place_element_step, place_field_step, place_list_element_step
 from luce.compiler.runtime_contract import RuntimeService
@@ -612,10 +612,12 @@ pub func test_integer_ranges_and_for_bindings_are_typed():
     let program = checked([source_module("main", source)])
     assert(describe_type(program.types, program.functions[0].parameters[0].value_type) == "range[u8]")
     match statement(program, program.functions[0], 1):
-        ForStatement(symbol, iterable, body):
+        ForStatement(symbol, iteration, body):
             assert(program.symbols[symbol.value].name == "value")
             assert(describe_type(program.types, program.symbols[symbol.value].value_type) == "u8")
-            assert(describe_type(program.types, node_type(program, iterable)) == "range[u8]")
+            match iteration:
+                Builtin(iterable): assert(describe_type(program.types, node_type(program, iterable)) == "range[u8]")
+                Protocol(iterator_symbol, iterator, next): assert(false)
             assert(i64(body.count) == 2)
         else: assert(false)
     match statement(program, program.functions[1], 0):
@@ -635,10 +637,12 @@ pub func test_list_iteration_uses_the_common_typed_for_shape():
     let source = "func total(values: list[i64]) -> i64:\n    var result = 0\n    for value in values:\n        result += value\n    return result\n"
     let program = checked([source_module("main", source)])
     match statement(program, program.functions[0], 1):
-        ForStatement(symbol, iterable, body):
+        ForStatement(symbol, iteration, body):
             assert(program.symbols[symbol.value].name == "value")
             assert(describe_type(program.types, program.symbols[symbol.value].value_type) == "i64")
-            assert(describe_type(program.types, node_type(program, iterable)) == "list[i64]")
+            match iteration:
+                Builtin(iterable): assert(describe_type(program.types, node_type(program, iterable)) == "list[i64]")
+                Protocol(iterator_symbol, iterator, next): assert(false)
             assert(i64(body.count) == 1)
         else: assert(false)
 
@@ -1751,6 +1755,109 @@ pub func test_generic_interfaces_substitute_arguments_in_requirements_and_constr
     assert(describe_type(program.types, program.conformances[0].interface_type) == "Combiner[i64]")
     assert(program.functions[2].name == "apply[Sum]")
 
+pub func test_standard_iteration_interfaces_are_compiler_owned_resolved_hir():
+    let source = "struct CountIterator implements Iterator[i64]:\n    var current: i64\n    let end: i64\n    pub mutating func next(self) -> i64?:\n        if self.current >= self.end: return none\n        let value = self.current\n        self.current += 1\n        return value\nstruct Count implements Iterable[i64]:\n    let end: i64\n    pub func iterator(self) -> Iterator[i64]: return CountIterator(current = 0, end = self.end)\nfunc sum(values: Count) -> i64:\n    var total = 0\n    for value in values: total += value\n    return total\n"
+    let program = checked([source_module("main", source)])
+    assert(len(program.interfaces) == 2)
+    match program.interfaces[0].origin:
+        Standard(identity): assert(identity == StandardInterface.iterator)
+        Source(module): assert(false)
+    match program.interfaces[1].origin:
+        Standard(identity): assert(identity == StandardInterface.iterable)
+        Source(module): assert(false)
+    assert(program.interfaces[0].name == "Iterator")
+    assert(program.interfaces[0].requirements[0].name == "next")
+    assert(program.interfaces[0].requirements[0].is_mutating)
+    assert(program.interfaces[1].name == "Iterable")
+    assert(program.interfaces[1].requirements[0].name == "iterator")
+    assert(not program.interfaces[1].requirements[0].is_mutating)
+    assert(len(program.conformances) == 2)
+    match statement(program, program.functions[2], 1):
+        ForStatement(symbol, iteration, body):
+            assert(describe_type(program.types, program.symbols[symbol.value].value_type) == "i64")
+            match iteration:
+                Protocol(iterator_symbol, iterator, next):
+                    assert(program.symbols[iterator_symbol.value].name == ".luce_iterator")
+                    assert(describe_type(program.types, program.symbols[iterator_symbol.value].value_type) == "Iterator[i64]")
+                    match form(program, iterator):
+                        Call(function, arguments): assert(i64(arguments.count) == 2)
+                        else: assert(false)
+                    match form(program, next):
+                        InterfaceCall(receiver, interface_type, requirement, arguments):
+                            assert(describe_type(program.types, node_type(program, next)) == "i64?")
+                            assert(requirement == 0)
+                        else: assert(false)
+                Builtin(iterable): assert(false)
+        else: assert(false)
+    expect_failure(
+        [source_module("main", "interface Iterator[T]:\n    mutating func next(self) -> T?\n")],
+        "main.luc:1:1: `Iterator` belongs to the compiler-known core namespace",
+    )
+
+    let fallible_source = "let stopped: ErrorCode = ErrorCode.package(1)\nstruct CheckedIterator implements FallibleIterator[i64]:\n    pub mutating func next(self) -> i64?!: error(stopped, \"stopped\")\nstruct Checked implements FallibleIterable[i64]:\n    pub func iterator(self) -> FallibleIterator[i64]: return CheckedIterator()\nfunc sum[T: FallibleIterable[i64]](values: T) -> i64!:\n    try for value in values: return value\n    return 0\nfunc use() -> i64!: return try sum(Checked())\n"
+    let fallible_program = checked([source_module("main", fallible_source)])
+    var sum_index = -1
+    for index in range(0, len(fallible_program.functions)):
+        if fallible_program.functions[index].name == "sum[Checked]": sum_index = index
+    assert(sum_index >= 0)
+    match statement(fallible_program, fallible_program.functions[sum_index], 0):
+        ForStatement(symbol, iteration, body):
+            match iteration:
+                Protocol(iterator_symbol, iterator, next):
+                    match form(fallible_program, next):
+                        Try(call):
+                            assert(describe_type(fallible_program.types, node_type(fallible_program, call)) == "i64?!")
+                            assert(describe_type(fallible_program.types, node_type(fallible_program, next)) == "i64?")
+                        else: assert(false)
+                Builtin(iterable): assert(false)
+        else: assert(false)
+
+pub func test_standard_iteration_protocols_reject_ambiguous_and_mismatched_use():
+    let fallible = "let stopped: ErrorCode = ErrorCode.package(1)\nstruct CheckedIterator implements FallibleIterator[i64]:\n    pub mutating func next(self) -> i64?!: error(stopped, \"stopped\")\nstruct Checked implements FallibleIterable[i64]:\n    pub func iterator(self) -> FallibleIterator[i64]: return CheckedIterator()\nfunc ordinary(value: Checked):\n    for item in value: discard(item)\n"
+    expect_failure(
+        [source_module("main", fallible)],
+        "main.luc:7:5: `for` requires `Iterable[T]`; use `try for` for `Checked`",
+    )
+
+    let infallible = "struct ValuesIterator implements Iterator[i64]:\n    pub mutating func next(self) -> i64?: return none\nstruct Values implements Iterable[i64]:\n    pub func iterator(self) -> Iterator[i64]: return ValuesIterator()\nfunc fallible(value: Values) -> unit!:\n    try for item in value: discard(item)\n"
+    expect_failure(
+        [source_module("main", infallible)],
+        "main.luc:6:5: `try for` requires `FallibleIterable[T]`; `Values` provides only infallible iteration",
+    )
+
+    let propagation = "let stopped: ErrorCode = ErrorCode.package(1)\nstruct CheckedIterator implements FallibleIterator[i64]:\n    pub mutating func next(self) -> i64?!: error(stopped, \"stopped\")\nstruct Checked implements FallibleIterable[i64]:\n    pub func iterator(self) -> FallibleIterator[i64]: return CheckedIterator()\nfunc consume(value: Checked):\n    try for item in value: discard(item)\n"
+    expect_failure(
+        [source_module("main", propagation)],
+        "main.luc:7:5: `try for` can propagate failure only from a fallible function",
+    )
+
+    let ambiguous = "struct NumberIterator implements Iterator[i64]:\n    pub mutating func next(self) -> i64?: return none\nstruct Ambiguous implements Iterable[i64], Iterable[str]:\n    pub func iterator(self) -> Iterator[i64]: return NumberIterator()\n"
+    expect_failure(
+        [source_module("main", ambiguous)],
+        "main.luc:3:44: type `Ambiguous` cannot use more than one element type across standard iteration protocols",
+    )
+
+    let generic_ambiguous = "struct EmptyIterator[T] implements Iterator[T]:\n    pub mutating func next(self) -> T?: return none\nstruct Ambiguous[T] implements Iterable[T], Iterable[i64]:\n    pub func iterator(self) -> Iterator[T]: return EmptyIterator[T]()\n"
+    expect_failure(
+        [source_module("main", generic_ambiguous)],
+        "main.luc:3:45: type `Ambiguous` cannot use more than one element type across standard iteration protocols",
+    )
+
+    let cross_protocol = "struct NumberIterator implements Iterator[i64]:\n    pub mutating func next(self) -> i64?: return none\nstruct CrossProtocol implements Iterable[i64], FallibleIterable[str]:\n    pub func iterator(self) -> Iterator[i64]: return NumberIterator()\n"
+    expect_failure(
+        [source_module("main", cross_protocol)],
+        "main.luc:3:48: type `CrossProtocol` cannot use more than one element type across standard iteration protocols",
+    )
+
+    expect_failure(
+        [source_module("main", "func consume[T: Iterable[i64] & FallibleIterable[str]](value: T): return\n")],
+        "main.luc:1:33: generic parameter `T` cannot use more than one element type across standard iteration constraints",
+    )
+
+    # Iterator and Iterable are distinct roles: one value may itself produce
+    # numbers while creating a separate string iterator for source `for`.
+    discard(checked([source_module("main", "func valid[T: Iterator[i64] & Iterable[str]](value: T): return\n")]))
+
 pub func test_constraint_resolution_preserves_fallible_lifts_and_parameter_identity():
     let source = "interface Writer:\n    func write(self) -> unit!\ninterface Left:\n    func left(self) -> i64\ninterface Right:\n    func right(self) -> i64\nstruct Both implements Writer, Left, Right:\n    pub func write(self): return\n    pub func left(self) -> i64: return 20\n    pub func right(self) -> i64: return 22\nfunc emit[T: Writer](value: T) -> unit!:\n    try value.write()\nfunc combine[A: Left, B: Right](left: A, right: B) -> i64:\n    return left.left() + right.right()\nfunc use() -> i64!:\n    try emit(Both())\n    return combine(Both(), Both())\n"
     let program = checked([source_module("main", source)])
@@ -2344,9 +2451,11 @@ pub func test_strings_resolve_scalar_length_iteration_concatenation_and_ordering
                 else: assert(false)
         else: assert(false)
     match statement(program, program.functions[3], 0):
-        ForStatement(symbol, iterable, body):
+        ForStatement(symbol, iteration, body):
             assert(describe_type(program.types, program.symbols[symbol.value].value_type) == "char")
-            assert(describe_type(program.types, node_type(program, iterable)) == "str")
+            match iteration:
+                Builtin(iterable): assert(describe_type(program.types, node_type(program, iterable)) == "str")
+                Protocol(iterator_symbol, iterator, next): assert(false)
         else: assert(false)
     assert(semantic_failure([source_module("main", "func bad(value: str) -> u64: return value.length(1)\n")]) != "")
     assert(semantic_failure([source_module("main", "func bad(value: str) -> u64: return value.unknown()\n")]) != "")
@@ -2644,8 +2753,8 @@ pub func test_unimplemented_declarations_fail_by_name():
     expect_failure([source_module("main", "test \"ok\":\n    return\n")], "main.luc:1:1: test declarations are not implemented yet")
 
 pub func test_unimplemented_statements_and_expressions_fail_by_name():
-    expect_failure([source_module("main", "func walk():\n    for item in 1: return\n")], "main.luc:2:17: `for` needs an iterable value, found `i64`")
-    expect_failure([source_module("main", "func walk():\n    try for item in 0..<1: return\n")], "main.luc:2:5: `try for` needs fallible iteration, which is not implemented yet")
+    expect_failure([source_module("main", "func walk():\n    for item in 1: return\n")], "main.luc:2:5: `for` needs a value conforming to `Iterable[T]`, found `i64`")
+    expect_failure([source_module("main", "func walk():\n    try for item in 0..<1: return\n")], "main.luc:2:5: `try for` needs a value conforming to `FallibleIterable[T]`, found `range[i64]`")
     expect_failure([source_module("main", "func work():\n    recover none\n")], "main.luc:2:5: `recover` is only valid inside a `catch` handler")
     expect_failure([source_module("main", "func value() -> i64: return [1, 2]\n")], "main.luc:1:29: expected `i64`, found `list[i64]`")
     expect_failure([source_module("main", "func value() -> i64: return item.field\n")], "main.luc:1:29: unknown name `item`")

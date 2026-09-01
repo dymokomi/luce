@@ -79,6 +79,13 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   applications, enum conformers, returned existentials, and existentials in
   managed collections travel through both semantic oracles, Wasm, and native
   QBE using the same HIR and MIR shapes.
+- `iteration.luc` proves the four compiler-known iteration interfaces through
+  concrete, constrained-generic, and existential dispatch. Ordinary `for`,
+  propagating `try for`, item/end/error separation, break/continue, and the
+  private iterator's cleanup on exhaustion, break, return, and error all run
+  through both semantic oracles, Wasm, and native QBE. Protocol loops lower to
+  existing calls, optionals, failure transfer, and structured control rather
+  than adding a backend-specific iteration representation.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership

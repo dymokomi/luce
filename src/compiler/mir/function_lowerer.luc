@@ -21,7 +21,7 @@ from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
 from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_int_type, is_ptr_type, is_signed_int_type, mir_type, no_register, no_registers, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
-from compiler.hir.ir import HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
+from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
 from compiler.hir.ir import executable_function_name, place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_weak_field_step
 import compiler.hir.ir
@@ -725,7 +725,10 @@ pub class FunctionLowerer:
                     if has_fallback: try self.lower_prologue(module, function, fallback, body)
                 WhileStatement(condition, loop_body):
                     try self.lower_prologue(module, function, loop_body, body)
-                ForStatement(symbol, iterable, loop_body):
+                ForStatement(symbol, iteration, loop_body):
+                    match iteration:
+                        Protocol(iterator_symbol, iterator, next): try self.reserve_slot(module, function, iterator_symbol, span, body)
+                        Builtin(iterable): pass
                     try self.reserve_slot(module, function, symbol, span, body)
                     try self.lower_prologue(module, function, loop_body, body)
                 else: pass
@@ -801,7 +804,12 @@ pub class FunctionLowerer:
                 for branch in range(0, i64(branches.count) // 3):
                     try self.lower_prologue_node(module, function, self.branch_condition(branches, branch), body)
             WhileStatement(condition, loop_body): try self.lower_prologue_node(module, function, condition, body)
-            ForStatement(symbol, iterable, loop_body): try self.lower_prologue_node(module, function, iterable, body)
+            ForStatement(symbol, iteration, loop_body):
+                match iteration:
+                    Builtin(iterable): try self.lower_prologue_node(module, function, iterable, body)
+                    Protocol(iterator_symbol, iterator, next):
+                        try self.lower_prologue_node(module, function, iterator, body)
+                        try self.lower_prologue_node(module, function, next, body)
             SequenceLength(value): try self.lower_prologue_node(module, function, value, body)
             StringScalarCount(value): try self.lower_prologue_node(module, function, value, body)
             SequenceIndex(value, index):
@@ -998,8 +1006,8 @@ pub class FunctionLowerer:
                 try self.lower_if(module, function, span, branches, 0, has_fallback, fallback, body)
             WhileStatement(condition, loop_body):
                 try self.lower_while(module, function, span, condition, loop_body, body)
-            ForStatement(symbol, iterable, loop_body):
-                try self.lower_for(module, function, span, symbol, iterable, loop_body, body)
+            ForStatement(symbol, iteration, loop_body):
+                try self.lower_for(module, function, span, symbol, iteration, loop_body, body)
             Match(subject, arms, has_result):
                 let discarded = try self.lower_match(module, function, statement, subject, arms, false, body)
             BreakStatement:
@@ -1291,15 +1299,80 @@ pub class FunctionLowerer:
         self.emit_end(span, body)
         self.emit_end(span, body)
 
-    # Built-in iterables retain one resolved HIR shape and select only their
-    # semantic canonical MIR operation here. No backend or target fact enters
-    # this dispatch.
-    func lower_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
-        match self.state.program.types.definitions[node_type(self.state.program, iterable).value].form:
-            Range(element): try self.lower_range_for(module, function, span, symbol, iterable, statements, body)
-            List(element): try self.lower_list_for(module, function, span, symbol, iterable, element, statements, body)
-            String: try self.lower_string_for(module, function, span, symbol, iterable, statements, body)
-            else: try self.state.fail_unsupported(module, function, span, "a non-iterable `for` value")
+    # Source iteration retains its semantic driver in HIR. Built-in sequences
+    # use their canonical operations; standard protocols are already ordinary
+    # resolved calls and therefore add no protocol instruction to MIR.
+    func lower_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iteration: HirIteration, statements: Operands, body: list[MirInstruction]) -> !:
+        match iteration:
+            Builtin(iterable):
+                match self.state.program.types.definitions[node_type(self.state.program, iterable).value].form:
+                    Range(element): try self.lower_range_for(module, function, span, symbol, iterable, statements, body)
+                    List(element): try self.lower_list_for(module, function, span, symbol, iterable, element, statements, body)
+                    String: try self.lower_string_for(module, function, span, symbol, iterable, statements, body)
+                    else: try self.state.fail_unsupported(module, function, span, "a non-iterable built-in `for` value")
+            Protocol(iterator_symbol, iterator, next):
+                try self.lower_protocol_for(module, function, span, symbol, iterator_symbol, iterator, next, statements, body)
+
+    ## Lower resolved protocol iteration entirely in terms of existing calls,
+    ## optionals, ownership, and structured control. The iterator slot is one
+    ## lexical owner; each successful element is a separate per-pass owner.
+    func lower_protocol_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterator_symbol: SymbolId, iterator: NodeId, next: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+        let cleanup_start = len(self.state.defers)
+        let iterator_value = try self.lower_expression(module, function, iterator, body)
+        let iterator_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, iterator))
+        let iterator_address = (try self.state.local_of(module, function, span, iterator_symbol)).address
+        self.initialize_owned_value(iterator_type, iterator_address, iterator_value, span, body)
+        try self.emit_temporaries_from(cleanup_start, body)
+        if self.type_needs_ownership(iterator_type):
+            self.state.defers.append(DeferredAction.DestroyAddress(address = iterator_address, value_type = iterator_type, span = span))
+
+        let optional_hir_type = node_type(self.state.program, next)
+        var element_hir_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[optional_hir_type.value].form:
+            Optional(element): element_hir_type = element
+            else: trap("protocol iterator next expression is not optional")
+        let optional_type = try self.state.mir_type_of(module, function, span, optional_hir_type)
+        let element_type = try self.state.mir_type_of(module, function, span, element_hir_type)
+        let element_address = (try self.state.local_of(module, function, span, symbol)).address
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        self.state.regions.append(Region.block)
+        self.state.regions.append(Region.loop_body)
+
+        let next_start = len(self.state.defers)
+        let optional_value = try self.lower_expression(module, function, next, body)
+        let present = self.load_present(optional_value, span, body)
+        self.open_if(present, list[RegisterId](), span, body)
+        let payload = self.payload_address(optional_type, optional_value, span, body)
+        self.initialize_owned_value(element_type, element_address, self.load_value(element_type, payload, span, body), span, body)
+        self.emit_end(span, body)
+        try self.emit_temporaries_from(next_start, body)
+        let absent = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Unary(result = absent, operation = UnaryOp.bool_not, operand = present), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = absent, depth = 1, values = no_registers()), span = span))
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        self.state.regions.append(Region.for_continue)
+        let iteration_start = len(self.state.defers)
+        if self.type_needs_ownership(element_type):
+            self.state.defers.append(DeferredAction.DestroyAddress(address = element_address, value_type = element_type, span = span))
+        self.state.loop_defer_starts.append(iteration_start)
+        try self.lower_scope(module, function, statements, body)
+        self.state.loop_defer_starts.remove(len(self.state.loop_defer_starts) - 1)
+        try self.emit_deferred_from(module, function, iteration_start, body)
+        while len(self.state.defers) > iteration_start: self.state.defers.remove(len(self.state.defers) - 1)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+
+        try self.emit_deferred_from(module, function, cleanup_start, body)
+        while len(self.state.defers) > cleanup_start: self.state.defers.remove(len(self.state.defers) - 1)
 
     # A range loop uses its immutable iteration binding as the private
     # counter slot. The extra inner block is the `continue` target: leaving

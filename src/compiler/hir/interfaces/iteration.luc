@@ -1,0 +1,210 @@
+#==============================================================================================
+#
+#   iteration - Resolution of standard iteration protocols
+#
+#   DESCRIPTION:
+#       Selects the one closed Iterable protocol demanded by `for` or
+#       `try for`, then constructs ordinary resolved HIR calls. Concrete
+#       conformers dispatch statically, constrained generic parameters retain
+#       their exact requirement choice for specialization, and existential
+#       values dispatch dynamically. Later stages see only those calls and one
+#       target-independent loop shape.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.frontend.syntax import ArgumentSyntax
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generation_model import HirGenerationState, HirSemanticChecker, LocalBinding, LocalStorage
+from compiler.hir.generics.functions import GenericFunctionChecker
+from compiler.hir.interfaces.standard import ensure_standard_interface, is_standard_interface, standard_interface_name
+from compiler.hir.interfaces.values import InterfaceValueChecker
+from compiler.hir.ir import BuiltinType, HirIteration, HirNodeForm, NodeId, StandardInterface, SymbolId, SymbolKind, TypeForm, TypeId
+from compiler.hir.ir import resolve_builtin_type, types_match
+
+union ProtocolDispatch:
+    Abstract
+    Dynamic
+    Static(conformance: u32)
+
+struct ResolvedProtocol:
+    let interface_type: TypeId
+    let element_type: TypeId
+    let dispatch: ProtocolDispatch
+
+pub struct CheckedIteration:
+    pub let element_type: TypeId
+    pub let iteration: HirIteration
+
+## Owns only iteration-protocol selection and call construction. Lexical body
+## checking remains with HirBodyChecker, which restores the private iterator
+## binding together with the source element binding after the loop suite.
+pub class IterationChecker:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+    let generics: GenericFunctionChecker
+    let interfaces: InterfaceValueChecker
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector, generics: GenericFunctionChecker, interfaces: InterfaceValueChecker):
+        self.state = state
+        self.declarations = declarations
+        self.generics = generics
+        self.interfaces = interfaces
+
+    # mark: Source loop ========================================================================
+
+    ## Resolve a checked source operand. Protocol iteration appends one
+    ## private mutable iterator binding to `state.locals`; the caller owns the
+    ## lexical checkpoint and restores it after checking the loop body.
+    pub func check(semantics: HirSemanticChecker, is_fallible: bool, iterable: NodeId, span: SourceSpan) -> CheckedIteration!:
+        let iterable_type = self.state.type_of(iterable)
+        if not is_fallible:
+            match self.state.types.definitions[iterable_type.value].form:
+                Range(element): return CheckedIteration(element_type = element, iteration = HirIteration.Builtin(value = iterable))
+                List(element): return CheckedIteration(element_type = element, iteration = HirIteration.Builtin(value = iterable))
+                String:
+                    return CheckedIteration(
+                        element_type = resolve_builtin_type(BuiltinType.character),
+                        iteration = HirIteration.Builtin(value = iterable),
+                    )
+                else: pass
+
+        var protocol_identity = StandardInterface.iterable
+        if is_fallible: protocol_identity = StandardInterface.fallible_iterable
+        let resolved = try self.resolve_protocol(semantics, iterable_type, protocol_identity, span)
+        if resolved == none:
+            var other_identity = StandardInterface.fallible_iterable
+            if is_fallible: other_identity = StandardInterface.iterable
+            let other = try self.resolve_protocol(semantics, iterable_type, other_identity, span)
+            if other != none:
+                if is_fallible:
+                    try self.fail(span, "`try for` requires `FallibleIterable[T]`; `" + self.state.describe_type(iterable_type) + "` provides only infallible iteration")
+                try self.fail(span, "`for` requires `Iterable[T]`; use `try for` for `" + self.state.describe_type(iterable_type) + "`")
+            var spelling = "`for`"
+            if is_fallible: spelling = "`try for`"
+            try self.fail(span, spelling + " needs a value conforming to `" + standard_interface_name(protocol_identity) + "[T]`, found `" + self.state.describe_type(iterable_type) + "`")
+        let protocol = resolved else trap("resolved iteration protocol disappeared")
+
+        let iterator = try self.make_iterator_call(semantics, iterable, protocol, span)
+        let iterator_type = self.state.type_of(iterator)
+        var expected_iterator = StandardInterface.iterator
+        if is_fallible: expected_iterator = StandardInterface.fallible_iterator
+        if not self.is_application(iterator_type, expected_iterator):
+            trap("standard iterable requirement returned the wrong iterator interface")
+        let iterator_symbol = self.state.make_symbol(".luce_iterator", SymbolKind.local, iterator_type)
+        self.state.locals.append(LocalBinding(
+            symbol = iterator_symbol,
+            name = ".luce_iterator",
+            value_type = iterator_type,
+            is_mutable = true,
+            storage = LocalStorage.value,
+        ))
+        let reference = self.state.push_node(HirNodeForm.Reference(symbol = iterator_symbol), iterator_type, span)
+        let called = try self.interfaces.check_call(
+            semantics,
+            reference,
+            iterator_type,
+            "next",
+            list[ArgumentSyntax](),
+            span,
+            span,
+            none,
+        )
+        var next = called else trap("standard iterator did not resolve `next`")
+        if is_fallible:
+            let successful = self.state.fallible_inner(self.state.type_of(next)) else trap("fallible iterator returned a non-fallible value")
+            if self.state.fallible_inner(self.state.current_result) == none:
+                try self.fail(span, "`try for` can propagate failure only from a fallible function")
+            next = self.state.push_node(HirNodeForm.Try(value = next), successful, span)
+        let optional_element = self.state.optional_inner(self.state.type_of(next)) else trap("standard iterator `next` returned a non-optional value")
+        if not types_match(optional_element, protocol.element_type):
+            trap("standard iteration element changed between Iterable and Iterator")
+        return CheckedIteration(
+            element_type = protocol.element_type,
+            iteration = HirIteration.Protocol(iterator_symbol = iterator_symbol, iterator = iterator, next = next),
+        )
+
+    # mark: Protocol selection =================================================================
+
+    func resolve_protocol(semantics: HirSemanticChecker, value_type: TypeId, identity: StandardInterface, span: SourceSpan) -> ResolvedProtocol?!:
+        let interface_index = ensure_standard_interface(self.state, identity)
+        match self.state.types.definitions[value_type.value].form:
+            TypeParameter(generic, position):
+                let found_constraints = self.state.type_parameter_constraints(generic, position)
+                if found_constraints == none: return none
+                for constraint in found_constraints:
+                    if self.application_declaration(constraint) == interface_index:
+                        return self.resolved(constraint, ProtocolDispatch.Abstract)
+                return none
+            Interface(index, arguments):
+                if index == interface_index: return self.resolved(value_type, ProtocolDispatch.Dynamic)
+                return none
+            else: pass
+
+        try self.declarations.materialize_generic_conformances_for_type(semantics, value_type)
+        var found: ResolvedProtocol? = none
+        for index in range(0, len(self.state.conformances)):
+            let conformance = self.state.conformances[index]
+            if not types_match(conformance.value_type, value_type): continue
+            if self.application_declaration(conformance.interface_type) != interface_index: continue
+            if found != none:
+                try self.fail(span, "type `" + self.state.describe_type(value_type) + "` has more than one `" + standard_interface_name(identity) + "` element type")
+            found = self.resolved(conformance.interface_type, ProtocolDispatch.Static(conformance = u32(index)))
+        return found
+
+    func resolved(interface_type: TypeId, dispatch: ProtocolDispatch) -> ResolvedProtocol:
+        var element = resolve_builtin_type(BuiltinType.unit)
+        match self.state.types.definitions[interface_type.value].form:
+            Interface(index, arguments):
+                if len(arguments) != 1: trap("standard interface application has the wrong arity")
+                element = arguments[0]
+            else: trap("standard protocol resolution produced a non-interface")
+        return ResolvedProtocol(interface_type = interface_type, element_type = element, dispatch = dispatch)
+
+    func application_declaration(value_type: TypeId) -> i64:
+        match self.state.types.definitions[value_type.value].form:
+            Interface(index, arguments): return index
+            else: return -1
+
+    func is_application(value_type: TypeId, identity: StandardInterface) -> bool:
+        let index = self.application_declaration(value_type)
+        return index >= 0 and is_standard_interface(self.state, index, identity)
+
+    # mark: Resolved calls =====================================================================
+
+    func make_iterator_call(semantics: HirSemanticChecker, receiver: NodeId, protocol: ResolvedProtocol, span: SourceSpan) -> NodeId!:
+        match protocol.dispatch:
+            Abstract:
+                return try self.generics.check_selected_requirement_call(
+                    semantics,
+                    receiver,
+                    protocol.interface_type,
+                    0,
+                    span,
+                    span,
+                )
+            Dynamic:
+                let called = try self.interfaces.check_call(
+                    semantics,
+                    receiver,
+                    protocol.interface_type,
+                    "iterator",
+                    list[ArgumentSyntax](),
+                    span,
+                    span,
+                    none,
+                )
+                let result = called else trap("standard iterable did not resolve `iterator`")
+                return result
+            Static(conformance_index):
+                let conformance = self.state.conformances[conformance_index]
+                let implementation = conformance.implementations[0]
+                let arguments = self.state.push_run([u32(0), receiver.value])
+                return self.state.push_node(
+                    HirNodeForm.Call(function = implementation, arguments = arguments),
+                    self.state.symbols[implementation.value].value_type,
+                    span,
+                )
+
+    func fail(span: SourceSpan, message: str) -> !:
+        try self.state.fail_at(self.state.current_module, span, message)
