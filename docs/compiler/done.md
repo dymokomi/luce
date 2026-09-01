@@ -1148,6 +1148,29 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   now would divide a single register/memory ownership transaction; their
   planned holistic ownership refactor remains preferable to forwarding files.
 
+- [x] **Borrowed C lists expose their one existing dense representation**
+  (2026-09-01). `extern func` input parameters now admit `list[H]` exactly
+  where `H` is a boundary scalar, named handle, or `foreign`; results, `out`
+  slots, nested/text/optional elements, extern-struct fields, cfunc signatures,
+  and C exports remain closed with focused diagnostics. HIR keeps the ordinary
+  shared list identity and gives its explicit semantic host a read-only
+  C-shaped sequence. Canonical MIR keeps the same typed list handle and lowers
+  the boundary using only existing `ListLength`, `ListElementAddress`,
+  structured control, and the raw C call: nonempty values lend the first dense
+  element, empty values lend null, and the source-declared count crosses as its
+  own untouched argument. No packing, element copy, new MIR operation, or
+  backend-specific lowering was added. A target-neutral loop rejects zero in
+  every bare pointer-shaped element before C observes it. Focused admission,
+  HIR, lowering, null-element, and logical-memory tests cover the contract;
+  the differential harness reaches Wasm and QBE; real QBE/libc `memcmp` and
+  `native_interop.native.luc` prove ordered bytes are read directly from the
+  runtime list buffer. The ownership/size review added no files: the 49-line
+  lowerer transaction remains inside its marked C-boundary section (now 5,299
+  lines), while the MIR oracle's 20-line read-only host view remains inside
+  its existing external-memory boundary (now 2,058 lines). Splitting either
+  would separate the adapter from the ownership and register transaction it
+  documents; both remain candidates for the planned holistic refactor.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.

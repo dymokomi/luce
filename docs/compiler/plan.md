@@ -365,8 +365,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   temporary is released. HIR and MIR hosts cover valid, null, malformed, and
   unterminated values; the differential harness reaches both artifact
   encoders; real QBE/libc `strchr` proves a result borrowed from its input.
-  External
-  variables are also complete: HIR retains explicit observable loads/stores,
+  Borrowed `list[H]` inputs are complete for the closed scalar, named-handle,
+  and `foreign` element row. The existing list identity remains intact through
+  HIR and MIR; the call adapter exposes its dense first-element address, uses
+  null for an empty value, and leaves the separately declared count untouched.
+  It emits no copy, packing path, new MIR instruction, or backend-specific
+  representation. Bare pointer elements receive a target-neutral validation
+  loop before the call. Both semantic hosts prove ordered and empty values,
+  Wasm and QBE encode the same canonical MIR, and real QBE/libc `memcmp` reads
+  the storage directly. List results, output slots, nested/text/optional
+  elements, extern-struct fields, cfunc signatures, and C exports remain
+  deliberately refused. External variables are also complete: HIR retains
+  explicit observable loads/stores,
   canonical MIR owns a distinct external-global table and instructions, both
   semantic oracles use explicit variable hosts, QBE binds the C object symbol,
   and Wasm imports one mutable `env` global. Bare pointer-handle zero is
@@ -383,9 +393,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   the grammar and parser deliberately admit only plain fields; that
   specification inconsistency must be resolved before calling §21.17 closed.
   Incoming bare/nullable C function pointers and cfunc fields are now complete
-  in the separate rung below. Lists, exported
-  structs/enums, generated adapters, and callback runtime enforcement remain
-  on this item.
+  in the separate rung below. Exported structs/enums, generated adapters, the
+  explicit inbound-memory verbs, and callback runtime enforcement remain on
+  this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
