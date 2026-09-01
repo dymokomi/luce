@@ -146,10 +146,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `assertions.luc` proves the optional default and eager dynamic assertion
   messages, unit-valued successful continuation, captured QBE/Wasm failure
   diagnostics, and skipped deferred cleanup.
-- `native_interop.native.luc` is the focused parser-conformance example for
-  raw `extern` types, blocking functions, output parameters, variables, and
-  structs. Implemented boundary pieces have separate executable tests; the
-  whole example advances only with FIIR and richer C layout support.
+- `native_interop.native.luc` checks and executes raw `extern` types,
+  functions, output parameters, variables, and ordinary value-shaped extern
+  structs. Its `clock_gettime` call crosses a real QBE/libc pointer boundary;
+  the same file keeps the audited native rebind/move surface visible.
 
 ## Stage-0 example corpus as a progress gate
 

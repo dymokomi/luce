@@ -13,15 +13,15 @@
 
 from compiler.core_types import is_core_type_name, is_reserved_core_name
 from compiler.frontend.source import SourceSpan
-from compiler.frontend.syntax import ConstantSyntax, EnumSyntax, ExternFunctionSyntax, ExternTypeSyntax, ExternVariableSyntax, FunctionSyntax, GenericParameterSyntax, InterfaceSyntax, NominalTypeKind, NominalTypeSyntax
+from compiler.frontend.syntax import ConstantSyntax, EnumSyntax, ExternFunctionSyntax, ExternStructSyntax, ExternTypeSyntax, ExternVariableSyntax, FunctionSyntax, GenericParameterSyntax, InterfaceSyntax, NominalTypeKind, NominalTypeSyntax
 from compiler.frontend.syntax import PathSyntax, RuntimeGlobalSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirConformance, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirFunctionImplementation, HirInterfaceOrigin, HirInterfaceRequirement, HirNodeForm, HirParameter, HirPayloadField, HirReceiver, HirReceiverKind, HirTypeParameter
 from compiler.hir.ir import HirRuntimeBinding, ModuleAuthority, ModuleId, NodeId, PackageRole, StandardInterface, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import is_floating_type, is_integer_type, resolve_builtin_type, types_match
 from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource, CollectedInterface, CollectedNominalCallable
-from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, ConformanceMethodAdaptation, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
+from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, CollectedStructSource, ConformanceMethodAdaptation, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
 from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, PendingGenericApplication, RuntimeBindingRequest, builtin_type_id
-from compiler.hir.generation_model import TypeBinding
+from compiler.hir.generation_model import TypeBinding, collected_struct_is_extern
 from compiler.hir.interfaces.standard import ensure_standard_interface, standard_interface_element, standard_interface_named, standard_interface_of, standard_interfaces_share_role
 from compiler.runtime_contract import RuntimeService
 
@@ -549,6 +549,8 @@ pub class DeclarationCollector:
                         try self.collect_enum_name(module_index, declaration.is_public, declaration.documentation, enumeration, declaration.span)
                     ExternType(extern_type):
                         try self.collect_extern_type_name(module_index, declaration.is_public, declaration.documentation, extern_type, declaration.span)
+                    ExternStruct(extern_struct):
+                        try self.collect_extern_struct_name(module_index, declaration.is_public, declaration.documentation, extern_struct, declaration.span)
                     else: pass
         # Interface signatures precede functions and nominal members so
         # constraints and `implements` clauses may refer forward across the
@@ -594,7 +596,7 @@ pub class DeclarationCollector:
                     ExternVariable(extern_variable):
                         try self.collect_extern_variable(module_index, declaration.is_public, declaration.documentation, extern_variable, declaration.span)
                     ExternStruct(extern_struct):
-                        try self.state.fail_at(module_index, declaration.span, "extern struct declarations are not implemented yet")
+                        try self.collect_extern_struct_members(module_index, extern_struct)
         try self.collect_conformances()
 
     func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
@@ -958,7 +960,7 @@ pub class DeclarationCollector:
             names.append(parameter.name)
             let value_type = try self.resolve_type(module_index, parameter.value_type)
             var supported = self.is_c_function_value(value_type)
-            if parameter.is_out: supported = self.is_c_function_component(value_type)
+            if parameter.is_out: supported = self.is_c_function_output(value_type)
             if not supported:
                 var kind = "parameter"
                 if parameter.is_out: kind = "out parameter"
@@ -974,6 +976,8 @@ pub class DeclarationCollector:
         if result_syntax != none: declared_result = try self.resolve_type(module_index, result_syntax)
         if self.state.contains_fallible(declared_result):
             try self.state.fail_at(module_index, span, "an extern function cannot be fallible")
+        if self.is_extern_struct(declared_result):
+            try self.state.fail_at(module_index, span, "extern function `" + function.name + "` cannot return extern struct `" + self.state.describe_type(declared_result) + "` by value; declare it as an `out` parameter or use a generated C shim")
         if not types_match(declared_result, resolve_builtin_type(BuiltinType.unit)) and not self.is_c_function_component(declared_result):
             try self.state.fail_at(module_index, span, "extern function `" + function.name + "` has unsupported result type `" + self.state.describe_type(declared_result) + "`")
         let contract = HirCFunction(is_blocking = function.is_blocking, slots = slots, declared_result = declared_result)
@@ -1048,10 +1052,17 @@ pub class DeclarationCollector:
     # the value must already name a Luce adapter or exact extern symbol.
     func is_c_function_value(value: TypeId) -> bool:
         if self.is_c_scalar_or_handle(value): return true
+        if self.is_extern_struct(value): return true
         match self.state.types.definitions[value.value].form:
             CFunction(parameters, result): return true
             Optional(inner): return self.is_pointer_extern_type(inner)
             else: return false
+
+    # C writes an extern struct through its declared pointer slot. Scalars and
+    # handles use the existing one-word output path; callbacks remain excluded
+    # until the foreign-pointer oracle can represent an arriving code address.
+    func is_c_function_output(value: TypeId) -> bool:
+        return self.is_c_function_component(value) or self.is_extern_struct(value)
 
     # A component inside a `cfunc` signature cannot itself be a function
     # pointer. This enforces the deliberately closed, non-recursive callback
@@ -1077,6 +1088,13 @@ pub class DeclarationCollector:
             # treating it as f32 here would silently change the C signature.
             Floating(bits): return bits == 32 or bits == 64
             Extern(index): return true
+            else: return false
+
+    ## Extern-struct identity is a HIR declaration fact. It never changes the
+    ## ordinary nominal value representation and carries no target layout.
+    pub func is_extern_struct(value: TypeId) -> bool:
+        match self.state.types.definitions[value.value].form:
+            Struct(index, arguments): return collected_struct_is_extern(self.state.structs[index])
             else: return false
 
     func is_pointer_extern_type(value: TypeId) -> bool:
@@ -1316,11 +1334,14 @@ pub class DeclarationCollector:
     func collect_conformances() -> !:
         let saved_type_bindings = self.state.current_type_bindings
         for item in self.state.structs:
-            if len(item.type_parameters) == 0:
-                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
-            else:
-                self.state.current_type_bindings = item.type_bindings
-                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, false)
+            match item.source:
+                Defined(nominal):
+                    if len(item.type_parameters) == 0:
+                        try self.collect_nominal_conformances(item.module_index, item.type_id, nominal.interfaces, item.name, false)
+                    else:
+                        self.state.current_type_bindings = item.type_bindings
+                        try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, nominal.interfaces, item.name, false)
+                External: pass
         for item in self.state.classes:
             if len(item.type_parameters) == 0:
                 try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, true)
@@ -1779,6 +1800,81 @@ pub class DeclarationCollector:
 
     # mark: Structs =============================================================================
 
+    # Register an extern struct in the ordinary nominal struct table. The
+    # additional capability controls only which values may cross a C pointer
+    # slot; all construction, field, equality, display, and copy semantics use
+    # the same paths as any other value struct.
+    func collect_extern_struct_name(module_index: i64, is_public: bool, documentation: list[str], syntax: ExternStructSyntax, span: SourceSpan) -> !:
+        try self.require_free_module_name(module_index, syntax.name, span)
+        let index = len(self.state.structs)
+        let type_id = self.state.intern_named(syntax.name, TypeForm.Struct(index = index, arguments = list[TypeId]()))
+        self.state.structs.append(CollectedStruct(
+            module_index = module_index,
+            name = syntax.name,
+            is_public = is_public,
+            documentation = documentation,
+            generic_id = self.state.allocate_generic_identity(),
+            type_parameters = list[HirTypeParameter](),
+            type_bindings = list[TypeBinding](),
+            type_id = type_id,
+            fields = list[HirField](),
+            initializer = none,
+            source = CollectedStructSource.External,
+            span = span,
+        ))
+
+    # Resolve the field-only raw declaration after every nominal name exists.
+    # Its vocabulary is deliberately recursive only through other extern
+    # structs; this is a portable semantic check, not a layout computation.
+    func collect_extern_struct_members(module_index: i64, syntax: ExternStructSyntax) -> !:
+        let struct_index = self.find_struct_in_module(module_index, syntax.name)
+        if struct_index < 0: trap("extern struct name was not registered")
+        let item = self.state.structs[struct_index]
+        if not collected_struct_is_extern(item): trap("extern struct syntax resolved to an ordinary struct")
+        let fields = list[HirField]()
+        for field in syntax.fields:
+            for previous in fields:
+                if previous.name == field.name:
+                    try self.state.fail_at(module_index, field.span, "duplicate field `" + field.name + "`")
+            let field_type = try self.resolve_type(module_index, field.value_type)
+            match self.state.types.definitions[field_type.value].form:
+                CFunction(parameters, result):
+                    try self.state.fail_at(module_index, field.span, "extern struct `" + syntax.name + "` cfunc field `" + field.name + "` requires the dynamic foreign-function-pointer oracle")
+                else: pass
+            if not self.is_extern_struct_field(field_type):
+                try self.state.fail_at(module_index, field.span, "extern struct `" + syntax.name + "` field `" + field.name + "` has unsupported C layout type `" + self.state.describe_type(field_type) + "`")
+            fields.append(HirField(
+                name = field.name,
+                value_type = field_type,
+                is_mutable = false,
+                is_weak = false,
+                is_public = true,
+                documentation = list[str](),
+                default_value = NodeId(value = no_node),
+            ))
+        self.state.structs[struct_index] = CollectedStruct(
+            module_index = item.module_index,
+            name = item.name,
+            is_public = item.is_public,
+            documentation = item.documentation,
+            generic_id = item.generic_id,
+            type_parameters = item.type_parameters,
+            type_bindings = item.type_bindings,
+            type_id = item.type_id,
+            fields = fields,
+            initializer = none,
+            source = CollectedStructSource.External,
+            span = item.span,
+        )
+        for field in fields:
+            if self.contains_struct(field.value_type, struct_index):
+                try self.state.fail_at(module_index, item.span, "extern struct `" + item.name + "` contains itself through field `" + field.name + "`")
+
+    func is_extern_struct_field(value: TypeId) -> bool:
+        if self.is_c_scalar_or_handle(value): return true
+        if self.is_extern_struct(value): return true
+        return false
+
     func collect_struct_name(module_index: i64, is_public: bool, documentation: list[str], nominal: NominalTypeSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, nominal.name, span)
         let declared = try self.declare_type_parameters(module_index, nominal.generic_parameters)
@@ -1797,7 +1893,7 @@ pub class DeclarationCollector:
             type_id = type_id,
             fields = list[HirField](),
             initializer = none,
-            syntax = nominal,
+            source = CollectedStructSource.Defined(syntax = nominal),
             span = span,
         ))
 
@@ -1822,7 +1918,7 @@ pub class DeclarationCollector:
             type_id = item.type_id,
             fields = item.fields,
             initializer = item.initializer,
-            syntax = item.syntax,
+            source = item.source,
             span = item.span,
         )
         let saved_type_bindings = self.state.current_type_bindings
@@ -1889,7 +1985,7 @@ pub class DeclarationCollector:
             type_id = item.type_id,
             fields = fields,
             initializer = initializer,
-            syntax = item.syntax,
+            source = item.source,
             span = item.span,
         )
         self.state.current_type_bindings = saved_type_bindings
@@ -2541,6 +2637,8 @@ pub class DeclarationCollector:
                 return self.state.intern_c_function_type(parts, result_type)
             OptionalType(optional_value):
                 let inner = try self.resolve_type(module_index, optional_value)
+                if self.is_extern_struct(inner):
+                    try self.state.fail_at(module_index, value.span, "extern struct `" + self.state.describe_type(inner) + "` is a value, not a nullable C pointer")
                 try self.state.validate_stored_type(module_index, inner, optional_value.span, "an optional payload")
                 return self.state.intern_optional(inner)
             FallibleType(successful_value):

@@ -48,7 +48,7 @@ column because it does not determine stage-1 completion.
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
 | §20 | Modules, imports, visibility, entry points, manifests, dependency identity | complete | partial | partial | partial | partial | Manifest/dependency graph and the complete package/entry diagnostic matrix. |
-| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | FIIR generation, the f16 C adapter, extern structs/richer boundary adapters, and remaining callback/lifetime rules. |
+| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | Scalar/handle/nested extern structs now remain ordinary HIR/MIR values and pack/unpack fieldwise through pointer slots on both compiled backends, with a real QBE/libc proof. FIIR generation, string/list adapters, the f16 C adapter, exported aggregates, `foreign`, incoming cfunc fields, and remaining callback/lifetime rules remain. |
 | §22 | Compiler/runtime versus standard-library boundary | complete | partial | partial | partial | partial | Implement and execute the standard modules required by the language examples. |
 | §23 | Semantic pipeline, runtime services, ABI, artifacts, backends | complete | partial | partial | partial | partial | Arena/runtime completion and full-language QBE artifact proof. Deferred subsections stay deferred by the spec. |
 | §24 | Command/diagnostic contract, formatter, source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, and the remaining stable diagnostic contracts remain. |
@@ -295,7 +295,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `checkout/` | Multi-module application shape | Parser only until collections/strings are complete. |
 | `c_api.luc` | C export surface | Parser only as a whole; focused C function export tests execute elsewhere. |
 | `c_import/` | Manifest-generated C import architecture | Parser/C-source checks; FIIR generation and end-to-end linking pending. |
-| `native_interop.native.luc` | `extern` declarations plus audited pointer rebind/move | Parser conformance as a whole; supported pointer operations execute in focused compiler tests. |
+| `native_interop.native.luc` | `extern` declarations, fieldwise extern-struct crossing, and audited pointer rebind/move | Checks and executes `clock_gettime` through native QBE/libc; pointer primitives execute in focused compiler tests. |
 
 ## Stage-0 corpus
 

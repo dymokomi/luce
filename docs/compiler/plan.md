@@ -358,8 +358,19 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   and Wasm imports one mutable `env` global. Bare pointer-handle zero is
   ordinary global state; null translation remains confined to callable C
   boundaries. Exact named `cfunc` values are complete in the separate rung
-  below. Strings, extern structs, exported structs/enums, dynamically
-  supplied C function pointers, and nullable cfunc slots remain on this item.
+  below. The field-only `extern struct` declaration is now executable too:
+  HIR keeps one nominal value-struct capability, MIR stays structurally
+  target-neutral, and the call adapter recursively packs inputs and unpacks
+  outputs field by field into call-owned pointer slots. Both semantic oracles,
+  focused MIR verification, backend-generic aggregate legalization, and real
+  QBE/libc `clock_gettime` execution prove the path. By-value results and
+  nullable extern structs are refused. The prose in language §21.17 also says
+  methods, field defaults, and interface conformance remain available while
+  the grammar and parser deliberately admit only plain fields; that
+  specification inconsistency must be resolved before calling §21.17 closed.
+  Strings, lists, `foreign`, exported structs/enums, dynamically supplied C
+  function pointers—including cfunc fields in extern structs—and nullable
+  cfunc slots remain on this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
