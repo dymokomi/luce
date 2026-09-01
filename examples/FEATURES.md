@@ -36,7 +36,7 @@ column because it does not determine stage-1 completion.
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values, core managed function environments, generic functions and independently generic methods, interface-requirement fallibility lifts, and dynamic interface calls execute; the complete default-argument audit remains. |
-| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | Both standard iteration spellings execute; the remaining pattern families keep the broad row open. |
+| §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | The complete §9.6 pattern/exhaustiveness contract and both standard iteration spellings execute; the remaining control-flow/return/defer rule audit is S08. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, ownership-safe fixed-array slicing, and immutable structural hashing execute; the remaining rule-by-rule audit keeps the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core class lifetime reaches both oracles, QBE, and Wasm; direct strong-cycle rejection and `deinit` reentrancy advisories are complete. Resource-shape diagnostics and leak census remain. |
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
@@ -81,7 +81,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | S04 | §4.5 | Every list/array/slice/map/set literal context, heterogeneous rejection, evaluation order, and static duplicate-key case | Common list/array/map/set paths execute; finish the closed contextual matrix. |
 | S05 | §§5–6 | Rule audit for aliases, inference, recursive indirection, value/reference copying, and generic-nominal mutable places | Common and managed cases execute; promote only after every rule has a named fixture. |
 | S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
-| S07 | §9.6 | Complete match exhaustiveness/redundancy matrix, including finite literal/range coverage and redundant catch-all advisory | Enum/optional/bool/literal/range alternatives execute; audit the remaining finite-domain cases. |
 | S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
 | S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
 | S10 | §11.4–§11.5 | Resource-shape diagnostics and runtime leak/live-resource census | ARC, weak references, cycle diagnostics, destruction, and reentrancy advisories execute. |
@@ -112,6 +111,21 @@ service, documentation, and release-policy work from silently expanding the
 language baseline. Separately requested engineering gates, including generated
 programs and fuzzing, remain in `docs/compiler/plan.md` and still precede the
 final architecture audit.
+
+## Current `match` evidence
+
+`match` remains structured HIR and lowers once to ordinary canonical MIR
+control. Exhaustiveness is a source semantic fact; neither MIR nor a backend
+receives a pattern-coverage representation.
+
+| §9.6 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Enum, optional, Boolean, numeric, character, and string patterns; alternatives and payload scope | yes | existing structured control | yes, plus Wasm | `language_tour.luc` and differential corpus | complete |
+| Statement suites and contextual expression results evaluate one subject once | yes | one lowered subject value | yes, plus Wasm | `language_tour.luc` and differential corpus | complete |
+| Missing enum/optional/Boolean cases and scalar `_` requirements | stable diagnostics | n/a | n/a | focused HIR fixtures | complete |
+| Duplicate literals/cases, overlapping ranges, and arms after complete coverage | stable diagnostics | n/a | n/a | focused HIR fixtures | complete |
+| Complete signed/unsigned integer and Unicode-scalar domains proven from adjacent literals/ranges | yes, without enumeration | unchanged | yes, plus Wasm | differential finite-domain fixtures | complete |
+| Enum `_` remains legal but emits structured `L0901`; Boolean/optional `_` stays quiet | structured advisory | n/a | n/a | focused analysis fixtures | complete |
 
 ## Current `never` evidence
 

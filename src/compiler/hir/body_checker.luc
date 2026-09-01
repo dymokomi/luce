@@ -16,7 +16,7 @@ from compiler.frontend.syntax import MapEntrySyntax, MatchStatementArmSyntax, Ma
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.closure_context import ClosureContext
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind
-from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageRole, SymbolId, SymbolKind, TypeForm, TypeId, TypeTable, UnaryOperation, Value, no_node
 from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import is_unsigned_integer_type, resolve_builtin_type, types_match
@@ -2866,6 +2866,8 @@ pub class HirBodyChecker: HirSemanticChecker:
     # symbols.
     func check_patterns(patterns: list[PatternSyntax], subject_type: TypeId, coverage: MatchCoverage, bindings: list[ArmBinding], span: SourceSpan) -> Operands!:
         if coverage.saw_wildcard: try self.fail(span, "this arm is unreachable; an earlier `_` matches everything")
+        if self.coverage_is_complete(subject_type, coverage):
+            try self.fail(span, "this arm is unreachable; earlier patterns cover every value")
         let nodes = list[NodeId]()
         var alternative = 0
         for pattern in patterns:
@@ -2984,10 +2986,12 @@ pub class HirBodyChecker: HirSemanticChecker:
             Constant(value): return value
             else: error(self.diagnostic(literal.span, "pattern must be a literal of `" + self.describe_type(subject_type) + "`"))
 
-    # Every `match` is exhaustive: enums, optionals, and bools by their cases,
-    # anything else by a `_` arm.
+    # Every `match` is exhaustive. Closed tagged domains are checked by case;
+    # integer and character domains may also close through adjacent literals
+    # and ranges. Strings and IEEE values still require `_`: their source
+    # literal vocabularies cannot enumerate every semantic value.
     func require_exhaustive(subject_type: TypeId, coverage: MatchCoverage, span: SourceSpan) -> !:
-        if coverage.saw_wildcard: return
+        if self.coverage_is_complete(subject_type, coverage): return
         let enum_index = self.declarations.enum_of(subject_type)
         if enum_index >= 0:
             let missing = list[str]()
@@ -3020,6 +3024,51 @@ pub class HirBodyChecker: HirSemanticChecker:
             if not has_false: try self.fail(span, "`match` does not cover `false`")
             return
         try self.fail(span, "`match` on `" + self.describe_type(subject_type) + "` needs a `_` arm")
+
+    # Prove complete finite-domain coverage without enumerating it. Pattern
+    # overlap is already rejected, so a complete set is exactly one chain of
+    # adjacent singleton/range intervals from the type's minimum to maximum.
+    func coverage_is_complete(subject_type: TypeId, coverage: MatchCoverage) -> bool:
+        if coverage.saw_wildcard: return true
+        let enum_index = self.declarations.enum_of(subject_type)
+        if enum_index >= 0: return len(coverage.cases) == len(self.state.enums[enum_index].cases)
+        if self.state.optional_inner(subject_type) != none:
+            var has_none = false
+            var has_some = false
+            for case_index in coverage.cases:
+                if case_index == 0: has_none = true
+                if case_index == 1: has_some = true
+            return has_none and has_some
+        if types_match(subject_type, resolve_builtin_type(BuiltinType.boolean)):
+            var has_true = false
+            var has_false = false
+            for literal in coverage.literals:
+                match literal:
+                    Boolean(item):
+                        if item: has_true = true
+                        else: has_false = true
+                    else: pass
+            return has_true and has_false
+        if not is_integer_type(self.state.types, subject_type) and not types_match(subject_type, resolve_builtin_type(BuiltinType.character)):
+            return false
+
+        var cursor = finite_domain_minimum(self.state.types, subject_type)
+        let maximum = finite_domain_maximum(self.state.types, subject_type)
+        while true:
+            var found = false
+            var interval_end = cursor
+            for literal in coverage.literals:
+                if values_equal(literal, cursor):
+                    found = true
+                    interval_end = literal
+            for index in range(0, len(coverage.ranges) // 2):
+                let low = coverage.ranges[index * 2]
+                if values_equal(low, cursor):
+                    found = true
+                    interval_end = coverage.ranges[index * 2 + 1]
+            if not found: return false
+            if values_equal(interval_end, maximum): return true
+            cursor = successor(interval_end)
 
     # The one gate every checked expression passes: its type must satisfy the
     # context that asked for it.
@@ -3257,7 +3306,38 @@ func predecessor(value: Value) -> Value:
     match value:
         SignedInteger(a): return Value.SignedInteger(value = a - 1)
         UnsignedInteger(a): return Value.UnsignedInteger(value = a - u64(1))
-        Character(a): return Value.Character(value = char(u32(a) - 1))
+        Character(a):
+            let code = u32(a)
+            if code == u32(57344): return Value.Character(value = char(u32(55295)))
+            return Value.Character(value = char(code - u32(1)))
+        else: return value
+
+# Endpoints stay semantic values. Width belongs to the subject TypeId, so this
+# proof never introduces storage size, target integer width, or backend layout.
+func finite_domain_minimum(types: TypeTable, value_type: TypeId) -> Value:
+    if types_match(value_type, resolve_builtin_type(BuiltinType.character)):
+        return Value.Character(value = char(u32(0)))
+    if is_unsigned_integer_type(types, value_type):
+        return Value.UnsignedInteger(value = u64(0))
+    return Value.SignedInteger(value = integer_minimum(types, value_type))
+
+func finite_domain_maximum(types: TypeTable, value_type: TypeId) -> Value:
+    if types_match(value_type, resolve_builtin_type(BuiltinType.character)):
+        return Value.Character(value = char(u32(1114111)))
+    if is_unsigned_integer_type(types, value_type):
+        return Value.UnsignedInteger(value = unsigned_integer_maximum(types, value_type))
+    return Value.SignedInteger(value = integer_maximum(types, value_type))
+
+# `char` contains Unicode scalar values, not surrogate code points. Advancing
+# an interval ending at U+D7FF therefore resumes at U+E000.
+func successor(value: Value) -> Value:
+    match value:
+        SignedInteger(a): return Value.SignedInteger(value = a + 1)
+        UnsignedInteger(a): return Value.UnsignedInteger(value = a + u64(1))
+        Character(a):
+            let code = u32(a)
+            if code == u32(55295): return Value.Character(value = char(u32(57344)))
+            return Value.Character(value = char(code + u32(1)))
         else: return value
 
 func value_in_range(value: Value, low: Value, high: Value) -> bool:

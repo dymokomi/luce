@@ -250,7 +250,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
-- [x] **Enums and `match`** (2026-08-28, `done.md` §2). `Switch` is still unused by the lowerer: `match` is an `If` chain, because a wasm `Switch` needs `br_table` plumbing that breaks the one-region-one-label invariant; jump tables come with the native pass.
+- [x] **Enums and `match`** (2026-08-28; §9.6 audit closed
+  2026-09-01, `done.md` §2). Enum/optional/Boolean/literal/range patterns,
+  both arm forms, complete finite integer/Unicode-scalar coverage, overlap and
+  unreachable detection, and the enum catch-all advisory are closed through
+  both oracles and QBE/Wasm. `Switch` is still unused by the lowerer: `match`
+  is an `If` chain, because a Wasm `Switch` needs `br_table` plumbing that
+  breaks the one-region-one-label invariant; jump tables come with the native
+  pass.
 - [x] **`for`, integer ranges, and standard iteration protocols** (2026-08-31, `done.md` §2). Built-in ranges/lists/strings retain their canonical semantic paths. User values use compiler-known `Iterable[T]`/`FallibleIterable[T]` contracts through concrete, constrained-generic, or existential dispatch; `try for` applies the ordinary failure model to each `next()`. HIR resolves one target-independent loop driver, MIR reuses calls/optionals/structured control, and both oracles, QBE, and Wasm prove execution and lexical iterator cleanup.
 - [x] **Compiler-derived structural markers and immutable hashing**
   (2026-08-31, `done.md` §2). `Equatable` and `Hashable` are closed,

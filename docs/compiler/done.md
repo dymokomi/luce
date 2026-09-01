@@ -1165,11 +1165,29 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   the differential harness reaches Wasm and QBE; real QBE/libc `memcmp` and
   `native_interop.native.luc` prove ordered bytes are read directly from the
   runtime list buffer. The ownership/size review added no files: the 49-line
-  lowerer transaction remains inside its marked C-boundary section (now 5,299
+  lowerer transaction remains inside its marked C-boundary section (now 5,300
   lines), while the MIR oracle's 20-line read-only host view remains inside
   its existing external-memory boundary (now 2,058 lines). Splitting either
   would separate the adapter from the ownership and register transaction it
   documents; both remain candidates for the planned holistic refactor.
+
+- [x] **The complete §9.6 match matrix is closed** (2026-09-01). Existing
+  enum, optional, Boolean, literal, range, alternative, statement, expression,
+  and payload-binding paths now have the missing finite-domain proof: adjacent
+  non-overlapping singleton/range intervals close every signed or unsigned
+  integer width and the Unicode-scalar domain without enumerating values.
+  Character predecessor/successor explicitly cross the surrogate gap rather
+  than constructing an invalid `char`. Once earlier patterns cover a complete
+  domain, a later arm is rejected as unreachable. A legal enum `_` now emits
+  structured `L0901`, because it would hide the exhaustiveness error for a
+  future case; fixed Boolean and optional domains remain quiet. Both semantic
+  oracles, verified canonical MIR, Wasm encoding, and real QBE execution agree
+  on the new full-domain fixtures. No MIR instruction, backend path, target
+  fact, source file, or runtime service was added. The body checker remains one
+  mutually recursive lexical/type transaction; its 3,365-line ownership was
+  reviewed at this boundary, and extracting only the 247-line marked match
+  section would replace direct expression/statement checking with a forwarding
+  interface rather than establish an independent owner.
 
 ## 3. Bugs the multi-backend harness found
 
