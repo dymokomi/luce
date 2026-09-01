@@ -169,9 +169,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   preserves the eager owned prefix of a nested call while omitting its
   unreachable outer operation, reports through each execution path, and does
   not run deferred cleanup.
-- `assertions.luc` proves the optional default and eager dynamic assertion
-  messages, unit-valued successful continuation, captured QBE/Wasm failure
-  diagnostics, and skipped deferred cleanup.
+- `assertions.luc` proves effect-free conditions, the optional default and
+  eager dynamic assertion messages, unit-valued successful continuation,
+  captured QBE/Wasm failure diagnostics, and skipped deferred cleanup.
 - `native_interop.native.luc` checks and executes raw `extern` types,
   anonymous `foreign` data pointers, borrowed dense lists, functions, output
   parameters, variables, and ordinary value-shaped extern structs. Its

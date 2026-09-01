@@ -331,9 +331,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `done.md` §2). One unit-valued HIR form preserves ordinary eager argument
   order and supplies the exact default `"assertion failed"` message. Shared
   lowering emits a structured failed arm around the existing trap contract;
-  there is no assertion MIR instruction or backend-specific lowering. The
-  remaining effect-free-condition proof waits for real operational summaries,
-  and source-location/stack reporting remains in the §13 diagnostic audit.
+  there is no assertion MIR instruction or backend-specific lowering.
+  Target-independent HIR operational summaries now close allocation,
+  observable mutation, I/O, external access, dynamic calls, and termination
+  over resolved recursive call graphs. Assertion conditions reject the first
+  reachable effect with an exact cross-module call path; source-location/stack
+  reporting for runtime traps remains in the §13 diagnostic audit.
 - [x] **Complete explicit numeric construction for every scalar width**
   (2026-09-01). One `NumericConvert` HIR node covers every integer/integer,
   integer/float, float/integer, and f16/f32/f64 pair without

@@ -1,0 +1,578 @@
+#==============================================================================================
+#
+#   effects - Closed operational summaries over typed HIR
+#
+#   DESCRIPTION:
+#       Classifies the observable operations reachable from every callable.
+#       Direct source operations seed facts; a fixed point closes those facts
+#       over resolved calls. The resulting summaries are semantic HIR data:
+#       they contain no ABI, layout, target, or backend policy.
+#
+#       Assertion checking is the first consumer. It follows the same graph
+#       back to one concrete source operation so a rejected condition reports
+#       the complete call path rather than only saying that a helper is impure.
+#
+#==============================================================================================
+
+from compiler.frontend.source import format_diagnostic
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, HirCaptureKind, HirFunction, HirProgram, HirReceiverKind
+from compiler.hir.ir import NodeId, Operands, SymbolId, TypeForm, entry_at, function_body, no_node, node_at, node_form, node_module, node_span, node_type
+from compiler.hir.ir import place_class_field_step, place_element_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step, place_weak_field_step
+
+## A closed fact about evaluating a callable. The cases deliberately describe
+## language operations rather than implementation mechanisms. More selective
+## execution profiles can consume the same summaries without changing HIR.
+pub enum OperationalEffectKind:
+    allocation
+    state_mutation
+    input_output
+    external_access
+    dynamic_call
+    termination
+
+## The transitive effects of one HIR function. Summaries align with callable
+## identities, not source names, so overloads and generic instances remain
+## unambiguous.
+pub struct FunctionOperationalSummary:
+    pub let function: SymbolId
+    pub let effects: list[OperationalEffectKind]
+
+    pub func is_effect_free() -> bool:
+        return len(self.effects) == 0
+
+union OperationalEvent:
+    Direct(node: NodeId, kind: OperationalEffectKind)
+    Call(node: NodeId, function: u32)
+
+class FunctionOperationalFacts:
+    let events: list[OperationalEvent]
+    let assertions: list[NodeId]
+
+    init():
+        self.events = list[OperationalEvent]()
+        self.assertions = list[NodeId]()
+
+struct OperationalEffectPath:
+    let kind: OperationalEffectKind
+    let nodes: list[NodeId]
+
+## Compute all summaries and enforce the assertion rule from §13.8.
+pub func analyze_operational_effects(program: HirProgram) -> list[FunctionOperationalSummary]!:
+    return try OperationalAnalyzer(program).analyze()
+
+class OperationalAnalyzer:
+    let program: HirProgram
+    let function_by_symbol: list[i64]
+    let facts: list[FunctionOperationalFacts]
+    let summaries: list[FunctionOperationalSummary]
+
+    init(program: HirProgram):
+        self.program = program
+        self.function_by_symbol = list[i64]()
+        for symbol in program.symbols: self.function_by_symbol.append(-1)
+        for index in range(0, len(program.functions)):
+            self.function_by_symbol[program.functions[index].symbol.value] = index
+        self.facts = list[FunctionOperationalFacts]()
+        self.summaries = list[FunctionOperationalSummary]()
+
+    # mark: Analysis ===========================================================================
+
+    func analyze() -> list[FunctionOperationalSummary]!:
+        for function in self.program.functions:
+            let function_facts = FunctionOperationalFacts()
+            self.facts.append(function_facts)
+            self.summaries.append(FunctionOperationalSummary(
+                function = function.symbol,
+                effects = list[OperationalEffectKind](),
+            ))
+            match function.implementation:
+                ExternalC(contract):
+                    function_facts.events.append(OperationalEvent.Direct(
+                        node = NodeId(value = no_node),
+                        kind = OperationalEffectKind.external_access,
+                    ))
+                else: try self.scan_suite(function_body(function), function, function_facts)
+
+        self.close_call_graph()
+        try self.validate_assertions()
+        return self.summaries
+
+    # Propagation is monotone: each pass can only add one of the finite effect
+    # cases. Mutually recursive pure components therefore remain empty, while
+    # any concrete effect reached through a recursive component flows to every
+    # caller without recursion in the analysis itself.
+    func close_call_graph():
+        # Close one canonical category at a time. Summary ordering therefore
+        # remains stable when source traversal happens to discover the same
+        # set of facts in a different order.
+        for sought in operational_effect_kinds():
+            var changed = true
+            while changed:
+                changed = false
+                for index in range(0, len(self.facts)):
+                    for event in self.facts[index].events:
+                        match event:
+                            Direct(node, kind):
+                                if kind == sought and self.add_effect(index, kind): changed = true
+                            Call(node, target):
+                                if contains_effect(self.summaries[target].effects, sought) and self.add_effect(index, sought): changed = true
+
+    func add_effect(function: i64, effect: OperationalEffectKind) -> bool:
+        if contains_effect(self.summaries[function].effects, effect): return false
+        self.summaries[function].effects.append(effect)
+        return true
+
+    # mark: Assertion proof ====================================================================
+
+    func validate_assertions() -> !:
+        for function_index in range(0, len(self.facts)):
+            let function = self.program.functions[function_index]
+            for assertion in self.facts[function_index].assertions:
+                match node_form(self.program, assertion):
+                    Assert(condition, message):
+                        let condition_facts = FunctionOperationalFacts()
+                        try self.scan_node(condition, function, condition_facts)
+                        let path = self.first_effect(condition_facts.events)
+                        if path != none: error(self.assertion_diagnostic(condition, path))
+                    else: trap("operational assertion table names a non-assert node")
+
+    func first_effect(events: list[OperationalEvent]) -> OperationalEffectPath?:
+        for event in events:
+            match event:
+                Direct(node, kind): return OperationalEffectPath(kind = kind, nodes = [node])
+                Call(node, target):
+                    if len(self.summaries[target].effects) == 0: continue
+                    let active = list[bool]()
+                    for function in self.program.functions: active.append(false)
+                    let suffix = self.find_first_effect_path(i64(target), active)
+                    if suffix == none: continue
+                    let nodes = [node]
+                    for child in suffix.nodes: nodes.append(child)
+                    return OperationalEffectPath(kind = suffix.kind, nodes = nodes)
+        return none
+
+    func find_first_effect_path(function: i64, active: list[bool]) -> OperationalEffectPath?:
+        if active[function]: return none
+        active[function] = true
+        for event in self.facts[function].events:
+            match event:
+                Direct(node, kind):
+                    active[function] = false
+                    return OperationalEffectPath(kind = kind, nodes = [node])
+                Call(node, target):
+                    if len(self.summaries[target].effects) == 0: continue
+                    let suffix = self.find_first_effect_path(i64(target), active)
+                    if suffix == none: continue
+                    let nodes = [node]
+                    for child in suffix.nodes: nodes.append(child)
+                    active[function] = false
+                    return OperationalEffectPath(kind = suffix.kind, nodes = nodes)
+        active[function] = false
+        return none
+
+    func assertion_diagnostic(condition: NodeId, path: OperationalEffectPath) -> str:
+        let module = node_module(self.program, condition)
+        var rendered = format_diagnostic(
+            self.program.modules[module.value].path,
+            node_span(self.program, condition),
+            "assertion condition is not effect-free; " + effect_description(path.kind),
+        )
+        if len(path.nodes) == 1: return rendered
+        rendered = rendered + "\n  operational call path:"
+        for position in range(0, len(path.nodes)):
+            let node = path.nodes[position]
+            let node_module_id = node_module(self.program, node)
+            var label = effect_description(path.kind)
+            if position + 1 < len(path.nodes): label = self.call_description(node)
+            rendered = rendered + "\n    " + format_diagnostic(
+                self.program.modules[node_module_id.value].path,
+                node_span(self.program, node),
+                label,
+            )
+        return rendered
+
+    func call_description(node: NodeId) -> str:
+        match node_form(self.program, node):
+            Call(symbol, arguments): return "call to `" + self.program.symbols[symbol.value].name + "`"
+            Initialize(symbol, arguments): return "construction through `" + self.program.symbols[symbol.value].name + "`"
+            else: return "call"
+
+    # mark: HIR traversal ======================================================================
+
+    func scan_suite(suite: Operands, function: HirFunction, result: FunctionOperationalFacts) -> !:
+        for position in range(0, i64(suite.count)):
+            try self.scan_node(node_at(self.program, suite, position), function, result)
+
+    func scan_run(values: Operands, function: HirFunction, result: FunctionOperationalFacts) -> !:
+        for position in range(0, i64(values.count)):
+            let value = node_at(self.program, values, position)
+            if value.value != no_node: try self.scan_node(value, function, result)
+
+    func scan_placed(values: Operands, function: HirFunction, result: FunctionOperationalFacts) -> !:
+        for pair in range(0, i64(values.count) // 2):
+            try self.scan_node(NodeId(value = u32(entry_at(self.program, values, pair * 2 + 1))), function, result)
+
+    func scan_place_indices(steps: Operands, function: HirFunction, result: FunctionOperationalFacts) -> !:
+        for pair in range(0, i64(steps.count) // 2):
+            let kind = u32(entry_at(self.program, steps, pair * 2))
+            if kind == place_element_step or kind == place_list_element_step or kind == place_map_element_step or kind == place_mutable_slice_element_step:
+                try self.scan_node(NodeId(value = u32(entry_at(self.program, steps, pair * 2 + 1))), function, result)
+
+    func scan_node(node: NodeId, function: HirFunction, result: FunctionOperationalFacts) -> !:
+        match node_form(self.program, node):
+            BreakStatement, ContinueStatement, NoneLiteral, PatternWildcard: return
+            Constant(index): return
+            Reference(symbol): return
+            FunctionAddress(symbol): return
+            WeakCaptureReference(symbol): return
+            ErrorCodeLiteral(value): return
+            PatternLiteral(value): return
+            PatternRange(lower, upper, inclusive): return
+            PatternCase(case_index, bindings): return
+            Binding(symbol, is_mutable, value): try self.scan_node(value, function, result)
+            Assignment(symbol, operation, value):
+                try self.scan_node(value, function, result)
+                if self.is_shared_cell(symbol): self.direct(result, node, OperationalEffectKind.state_mutation)
+                if self.assignment_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            ExternStore(variable, operation, value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+                if self.assignment_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            GlobalStore(global, operation, value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                if self.assignment_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            PlaceAssignment(symbol, steps, operation, value):
+                try self.scan_place_indices(steps, function, result)
+                try self.scan_node(value, function, result)
+                if self.place_mutates_visible_state(symbol, steps, function): self.direct(result, node, OperationalEffectKind.state_mutation)
+                if self.assignment_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            GlobalPlaceAssignment(global, steps, operation, value):
+                try self.scan_place_indices(steps, function, result)
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                if self.assignment_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            PrintText(value): self.direct(result, node, OperationalEffectKind.input_output)
+            PrintValue(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.input_output)
+            ReturnStatement(value):
+                if value.value != no_node: try self.scan_node(value, function, result)
+            RecoverStatement(value):
+                if value.value != no_node: try self.scan_node(value, function, result)
+            DeferStatement(action): try self.scan_node(action, function, result)
+            ExpressionStatement(action): try self.scan_node(action, function, result)
+            IfStatement(branches, has_fallback, fallback):
+                for branch in range(0, i64(branches.count) // 3):
+                    let offset = i64(branches.start) + branch * 3
+                    try self.scan_node(NodeId(value = self.program.extra[offset]), function, result)
+                    try self.scan_suite(Operands(start = self.program.extra[offset + 1], count = self.program.extra[offset + 2]), function, result)
+                if has_fallback: try self.scan_suite(fallback, function, result)
+            WhileStatement(condition, body):
+                try self.scan_node(condition, function, result)
+                try self.scan_suite(body, function, result)
+            ForStatement(symbol, iteration, body):
+                match iteration:
+                    Builtin(value): try self.scan_node(value, function, result)
+                    Protocol(iterator_symbol, iterator, next):
+                        try self.scan_node(iterator, function, result)
+                        try self.scan_node(next, function, result)
+                try self.scan_suite(body, function, result)
+            ExternLoad(variable): self.direct(result, node, OperationalEffectKind.external_access)
+            GlobalLoad(variable): self.direct(result, node, OperationalEffectKind.external_access)
+            NativeLoad(pointer):
+                try self.scan_node(pointer, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeRebind(pointer):
+                try self.scan_node(pointer, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeIsNull(pointer):
+                try self.scan_node(pointer, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeAddressHash(pointer):
+                try self.scan_node(pointer, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeFloatBits(pointer):
+                try self.scan_node(pointer, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeStore(pointer, value):
+                try self.scan_node(pointer, function, result)
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeAdvance(pointer, value):
+                try self.scan_node(pointer, function, result)
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeMove(destination, source, count):
+                try self.scan_node(destination, function, result)
+                try self.scan_node(source, function, result)
+                try self.scan_node(count, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeAllocate(element_type, count):
+                try self.scan_node(count, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            NativeDeallocate(pointer, element_type, count):
+                try self.scan_node(pointer, function, result)
+                try self.scan_node(count, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeIsSame(left, right):
+                try self.scan_node(left, function, result)
+                try self.scan_node(right, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+            NativeArena(end):
+                try self.scan_node(end, function, result)
+                self.direct(result, node, OperationalEffectKind.external_access)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            NumericConvert(value): try self.scan_node(value, function, result)
+            Discard(value): try self.scan_node(value, function, result)
+            NeverCoercion(value): try self.scan_node(value, function, result)
+            StringScalarCount(value): try self.scan_node(value, function, result)
+            Hash(value): try self.scan_node(value, function, result)
+            SequenceLength(value): try self.scan_node(value, function, result)
+            WeakGet(value): try self.scan_node(value, function, result)
+            Element(value, index): try self.scan_node(value, function, result)
+            FieldAccess(value, index): try self.scan_node(value, function, result)
+            Some(value): try self.scan_node(value, function, result)
+            Try(value): try self.scan_node(value, function, result)
+            DivergingSequence(values): try self.scan_run(values, function, result)
+            BuiltinDisplay(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            FormattedString(parts):
+                try self.scan_run(parts, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            SequenceIndex(value, index):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+            Unary(operation, operand): try self.scan_node(operand, function, result)
+            Binary(left, operation, right):
+                try self.scan_node(left, function, result)
+                try self.scan_node(right, function, result)
+                if self.binary_allocates(operation): self.direct(result, node, OperationalEffectKind.allocation)
+            Conditional(value, condition, alternative):
+                try self.scan_node(condition, function, result)
+                try self.scan_node(value, function, result)
+                try self.scan_node(alternative, function, result)
+            Range(lower, upper, inclusive):
+                try self.scan_node(lower, function, result)
+                try self.scan_node(upper, function, result)
+            Call(symbol, arguments):
+                try self.scan_placed(arguments, function, result)
+                self.record_call(result, node, symbol)
+            InterfaceValue(value, conformance):
+                try self.scan_node(value, function, result)
+                # The existential owns an independently retained/COW payload;
+                # current runtime implementations materialize that box.
+                self.direct(result, node, OperationalEffectKind.allocation)
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                try self.scan_node(receiver, function, result)
+                try self.scan_run(arguments, function, result)
+                self.direct(result, node, OperationalEffectKind.dynamic_call)
+            ClosureValue(closure, initializers):
+                try self.scan_run(initializers, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            IndirectCall(callee, arguments):
+                try self.scan_node(callee, function, result)
+                try self.scan_run(arguments, function, result)
+                self.direct(result, node, OperationalEffectKind.dynamic_call)
+            Initialize(symbol, arguments):
+                try self.scan_placed(arguments, function, result)
+                self.record_call(result, node, symbol)
+                match self.program.types.definitions[node_type(self.program, node).value].form:
+                    Class(index, values): self.direct(result, node, OperationalEffectKind.allocation)
+                    else: pass
+            Raise(code, message):
+                try self.scan_node(code, function, result)
+                try self.scan_node(message, function, result)
+                # Recoverable failure is typed control, not process/task
+                # termination. A Boolean condition cannot expose `T!`, and a
+                # locally caught failure has no effect outside its expression.
+            Trap(message):
+                try self.scan_node(message, function, result)
+                self.direct(result, node, OperationalEffectKind.termination)
+            Assert(condition, message):
+                result.assertions.append(node)
+                try self.scan_node(condition, function, result)
+                try self.scan_node(message, function, result)
+                self.direct(result, node, OperationalEffectKind.termination)
+            Catch(value, failure, body):
+                try self.scan_node(value, function, result)
+                try self.scan_suite(body, function, result)
+            Tuple(elements): try self.scan_run(elements, function, result)
+            Array(elements): try self.scan_run(elements, function, result)
+            List(elements):
+                try self.scan_run(elements, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            Map(elements):
+                try self.scan_run(elements, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            Set(elements):
+                try self.scan_run(elements, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            ListCopy(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            MapCopy(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            SetCopy(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            WeakCreate(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            ListWithMutableSlice(value, callback):
+                try self.scan_node(value, function, result)
+                try self.scan_node(callback, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+                self.direct(result, node, OperationalEffectKind.dynamic_call)
+            SequenceSlice(value, start, end):
+                try self.scan_node(value, function, result)
+                if start.value != no_node: try self.scan_node(start, function, result)
+                if end.value != no_node: try self.scan_node(end, function, result)
+            ListAppend(value, element):
+                try self.scan_node(value, function, result)
+                try self.scan_node(element, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            MapRemove(value, element):
+                try self.scan_node(value, function, result)
+                try self.scan_node(element, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            SetInsert(value, element):
+                try self.scan_node(value, function, result)
+                try self.scan_node(element, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            SetRemove(value, element):
+                try self.scan_node(value, function, result)
+                try self.scan_node(element, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            ListInsert(value, index, element):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+                try self.scan_node(element, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            ListRemoveAt(value, index):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            ListReserve(value, index):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            MapReserve(value, index):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            SetReserve(value, index):
+                try self.scan_node(value, function, result)
+                try self.scan_node(index, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+                self.direct(result, node, OperationalEffectKind.allocation)
+            ListClear(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            MapClear(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            SetClear(value):
+                try self.scan_node(value, function, result)
+                self.direct(result, node, OperationalEffectKind.state_mutation)
+            MapLookup(value, key):
+                try self.scan_node(value, function, result)
+                try self.scan_node(key, function, result)
+            SetContains(value, key):
+                try self.scan_node(value, function, result)
+                try self.scan_node(key, function, result)
+            StructValue(struct_index, fields): try self.scan_placed(fields, function, result)
+            EnumValue(struct_index, case_index, fields): try self.scan_placed(fields, function, result)
+            ElseFallback(value, arm):
+                try self.scan_node(value, function, result)
+                try self.scan_node(arm, function, result)
+            Match(subject, arms, has_result):
+                try self.scan_node(subject, function, result)
+                try self.scan_run(arms, function, result)
+            MatchArm(patterns, statements, value):
+                try self.scan_suite(statements, function, result)
+                if value.value != no_node: try self.scan_node(value, function, result)
+
+    # mark: Classification helpers =============================================================
+
+    func direct(result: FunctionOperationalFacts, node: NodeId, kind: OperationalEffectKind):
+        result.events.append(OperationalEvent.Direct(node = node, kind = kind))
+
+    func record_call(result: FunctionOperationalFacts, node: NodeId, symbol: SymbolId):
+        let target = self.function_by_symbol[symbol.value]
+        if target < 0: trap("resolved HIR call names an unknown function")
+        match self.program.functions[target].implementation:
+            ExternalC(contract): self.direct(result, node, OperationalEffectKind.external_access)
+            else: result.events.append(OperationalEvent.Call(node = node, function = u32(target)))
+
+    func is_shared_cell(symbol: SymbolId) -> bool:
+        for shared in self.program.shared_cells:
+            if shared.value == symbol.value: return true
+        # Nested bodies name their own capture alias rather than the outer
+        # source binding recorded in `shared_cells`. The closure table is the
+        # canonical storage-kind map for those hidden parameters.
+        for closure in self.program.closures:
+            for capture in closure.captures:
+                if capture.symbol.value == symbol.value and capture.kind == HirCaptureKind.shared_cell: return true
+        return false
+
+    func place_mutates_visible_state(symbol: SymbolId, steps: Operands, function: HirFunction) -> bool:
+        if self.is_shared_cell(symbol): return true
+        let receiver = function.receiver
+        if receiver != none and receiver.kind == HirReceiverKind.mutating_method and len(function.parameters) > 0:
+            if function.parameters[0].symbol.value == symbol.value: return true
+        for pair in range(0, i64(steps.count) // 2):
+            let kind = u32(entry_at(self.program, steps, pair * 2))
+            if kind == place_class_field_step or kind == place_weak_field_step:
+                return true
+            if kind == place_list_element_step or kind == place_map_element_step:
+                return true
+            if kind == place_mutable_slice_element_step: return true
+        return false
+
+    func binary_allocates(operation: BinaryOperation) -> bool:
+        match operation:
+            Add(operand_type):
+                match self.program.types.definitions[operand_type.value].form:
+                    String, Bytes: return true
+                    List(element): return true
+                    else: return false
+            else: return false
+
+    func assignment_allocates(operation: AssignmentOperation) -> bool:
+        match operation:
+            Replace: return false
+            Combine(binary): return self.binary_allocates(binary)
+
+func contains_effect(effects: list[OperationalEffectKind], sought: OperationalEffectKind) -> bool:
+    for effect in effects:
+        if effect == sought: return true
+    return false
+
+func operational_effect_kinds() -> list[OperationalEffectKind]:
+    return [
+        OperationalEffectKind.allocation,
+        OperationalEffectKind.state_mutation,
+        OperationalEffectKind.input_output,
+        OperationalEffectKind.external_access,
+        OperationalEffectKind.dynamic_call,
+        OperationalEffectKind.termination,
+    ]
+
+func effect_description(kind: OperationalEffectKind) -> str:
+    match kind:
+        allocation: return "evaluation may allocate"
+        state_mutation: return "evaluation may mutate observable state"
+        input_output: return "evaluation may perform input or output"
+        external_access: return "evaluation may access native or external state"
+        dynamic_call: return "a dynamic call has no statically proven effect-free target"
+        termination: return "evaluation may terminate instead of returning a Boolean"

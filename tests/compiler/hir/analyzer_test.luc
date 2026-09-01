@@ -12,6 +12,7 @@ from luce.compiler.hir.generator import HirGenerator
 from luce.compiler.hir.generation_model import SourceModule
 from luce.compiler.frontend.parser import Parser
 from luce.compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
+from luce.compiler.hir.effects import FunctionOperationalSummary, OperationalEffectKind
 from luce.compiler.frontend.source import DiagnosticSeverity
 from luce.compiler.frontend.tokenizer import Tokenizer
 from luce.compiler.hir.ir import ModuleAuthority
@@ -29,7 +30,10 @@ func named_source_module(name: str, path: str, source: str) -> SourceModule:
     return SourceModule(name = name, path = path, authority = ModuleAuthority.safe, syntax = syntax)
 
 func analysis_failure(source: str) -> str:
-    let hir = HirGenerator("test.luce", [source_module(source)]).generate() catch reason:
+    return analysis_failure_in([source_module(source)])
+
+func analysis_failure_in(modules: list[SourceModule]) -> str:
+    let hir = HirGenerator("test.luce", modules).generate() catch reason:
         return reason
     let analyzed = SemanticAnalyzer(hir).analyze() catch reason:
         return reason
@@ -45,6 +49,16 @@ func analyze_source(source: str) -> AnalyzedProgram:
 func expect_failure(source: str, expected: str):
     let actual = analysis_failure(source)
     if actual != expected: trap("expected `" + expected + "`, got `" + actual + "`")
+
+func summary_named(program: AnalyzedProgram, name: str) -> FunctionOperationalSummary:
+    for summary in program.operational_summaries:
+        if program.hir.symbols[summary.function.value].name == name: return summary
+    trap("missing operational summary for `" + name + "`")
+
+func summary_has_effect(summary: FunctionOperationalSummary, sought: OperationalEffectKind) -> bool:
+    for effect in summary.effects:
+        if effect == sought: return true
+    return false
 
 # mark: Advisories =============================================================================
 
@@ -231,3 +245,59 @@ pub func test_discarded_results_require_explicit_intent():
         trap(reason)
     assert(len(cross_module.diagnostics) == 1)
     assert(cross_module.diagnostics[0].primary.path == "src/worker.luc")
+
+# mark: Operational effects ===================================================================
+
+pub func test_operational_summaries_prove_direct_transitive_and_recursive_purity():
+    let source = "func even(value: i64) -> bool:\n    if value == 0: return true\n    return odd(value - 1)\nfunc odd(value: i64) -> bool:\n    if value == 0: return false\n    return even(value - 1)\nclass Cache:\n    let valid: bool\n    func init(self, valid: bool): self.valid = valid\n    func is_valid(self) -> bool: return self.valid\nfunc verify(cache: Cache):\n    assert(cache.is_valid())\n    assert(even(4))\n"
+    let program = analyze_source(source)
+    assert(len(program.operational_summaries) == len(program.hir.functions))
+    assert(summary_named(program, "even").is_effect_free())
+    assert(summary_named(program, "odd").is_effect_free())
+    assert(summary_named(program, "is_valid").is_effect_free())
+    let verification = summary_named(program, "verify")
+    assert(len(verification.effects) == 1)
+    assert(verification.effects[0] == OperationalEffectKind.termination)
+
+    let recovered = analyze_source("let invalid: ErrorCode = ErrorCode.package(1)\nfunc checked() -> bool!: error(invalid, \"invalid\")\nfunc handled() -> bool:\n    return checked() catch failure: recover true\nfunc verify(): assert(handled())\n")
+    assert(summary_named(recovered, "checked").is_effect_free())
+    assert(summary_named(recovered, "handled").is_effect_free())
+
+pub func test_assertion_effect_proof_reports_the_complete_direct_call_path():
+    let source = "func mutate(values: list[i64]) -> bool:\n    values.append(1)\n    return true\nfunc check(values: list[i64]) -> bool:\n    return mutate(values)\nfunc run():\n    let values = list[i64]()\n    assert(check(values))\n"
+    expect_failure(source, "main.luc:8:12: assertion condition is not effect-free; evaluation may mutate observable state\n  operational call path:\n    main.luc:8:12: call to `check`\n    main.luc:5:12: call to `mutate`\n    main.luc:2:5: evaluation may mutate observable state")
+
+    let helper = named_source_module("helper", "src/helper.luc", "pub func announce() -> bool:\n    print(\"checking\")\n    return true\n")
+    let main = named_source_module("main", "src/main.luc", "from helper import announce\nfunc verify(): assert(announce())\n")
+    let cross_module = analysis_failure_in([helper, main])
+    assert(cross_module == "src/main.luc:2:23: assertion condition is not effect-free; evaluation may perform input or output\n  operational call path:\n    src/main.luc:2:23: call to `announce`\n    src/helper.luc:2:5: evaluation may perform input or output")
+
+pub func test_assertion_effect_proof_rejects_allocation_io_external_and_dynamic_calls():
+    let allocation = "func has_value() -> bool:\n    let values = [1]\n    return values.length > 0\nfunc run(): assert(has_value())\n"
+    expect_failure(allocation, "main.luc:4:20: assertion condition is not effect-free; evaluation may allocate\n  operational call path:\n    main.luc:4:20: call to `has_value`\n    main.luc:2:18: evaluation may allocate")
+
+    let output = "func announce() -> bool:\n    print(\"checking\")\n    return true\nfunc run(): assert(announce())\n"
+    expect_failure(output, "main.luc:4:20: assertion condition is not effect-free; evaluation may perform input or output\n  operational call path:\n    main.luc:4:20: call to `announce`\n    main.luc:2:5: evaluation may perform input or output")
+
+    let external = "extern func ready() -> bool\nfunc run(): assert(ready())\n"
+    expect_failure(external, "main.luc:2:20: assertion condition is not effect-free; evaluation may access native or external state")
+
+    let dynamic = "func yes() -> bool: return true\nfunc verify(predicate: func() -> bool): assert(predicate())\nfunc run(): verify(yes)\n"
+    expect_failure(dynamic, "main.luc:2:48: assertion condition is not effect-free; a dynamic call has no statically proven effect-free target")
+
+    let termination = "func stop() -> bool: trap(\"stopped\")\nfunc run(): assert(stop())\n"
+    expect_failure(termination, "main.luc:2:20: assertion condition is not effect-free; evaluation may terminate instead of returning a Boolean\n  operational call path:\n    main.luc:2:20: call to `stop`\n    main.luc:1:22: evaluation may terminate instead of returning a Boolean")
+
+pub func test_assertion_effect_proof_rejects_shared_cells_and_mutating_value_receivers():
+    let shared = "func checker() -> func() -> bool:\n    var value = false\n    return func () -> bool:\n        value = true\n        return value\nfunc run():\n    let read = checker()\n    assert(read())\n"
+    expect_failure(shared, "main.luc:8:12: assertion condition is not effect-free; a dynamic call has no statically proven effect-free target")
+
+    let captured = analyze_source("func checker() -> func() -> bool:\n    var value = false\n    return func () -> bool:\n        value = true\n        return value\n")
+    assert(len(captured.hir.shared_cells) == 1)
+    var found_shared_mutation = false
+    for summary in captured.operational_summaries:
+        if summary_has_effect(summary, OperationalEffectKind.state_mutation): found_shared_mutation = true
+    assert(found_shared_mutation)
+
+    let mutating_receiver = "struct Counter:\n    var value: i64\n    mutating func advance(self) -> bool:\n        self.value += 1\n        return true\nfunc run():\n    var counter = Counter(value = 0)\n    assert(counter.advance())\n"
+    expect_failure(mutating_receiver, "main.luc:8:12: assertion condition is not effect-free; evaluation may mutate observable state\n  operational call path:\n    main.luc:8:12: call to `advance`\n    main.luc:4:9: evaluation may mutate observable state")
