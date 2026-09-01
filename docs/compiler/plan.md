@@ -236,15 +236,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   owner and a 28-line backend emission record instead of coupling presentation
   to HIR, MIR, QBE, or Wasm. Its out-of-band function provenance follows
   package composition and optimizer remapping without adding source or generic
-  facts to canonical MIR. The declaration collector and now 4,255-line
-  function walk were reviewed again for structural hashing. The 57-line HIR
-  protocol owner is independent, but MIR hashing recursively shares the same
-  register, slot, aggregate-address, and structured-region transaction as
-  equality. Extracting its 230-line marked section today would duplicate that
-  machinery or add a forwarding interface, so it remains cohesive until a
+  facts to canonical MIR. The declaration collector and now 4,434-line
+  function walk were reviewed again after recursive equality. The 57-line HIR
+  protocol owner and generated-helper identity queue are independent, but MIR
+  hashing and equality recursively share the same register, slot,
+  aggregate-address, call, and structured-region transaction as the enclosing
+  expression walk. Extracting either marked section today would duplicate that
+  machinery or add a forwarding interface, so they remain cohesive until a
   reusable function-emission owner can replace—not wrap—the shared helpers.
   Keep the parser and
-  2,305-line Wasm encoder sectioned
+  2,333-line Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
   into arbitrary helper files just to lower a line count.
 
@@ -258,8 +259,19 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   memory operations. Only execution-local IEEE scalar coding remains a
   verified canonical primitive. Both semantic oracles, QBE, Wasm, and
   `examples/hashing.luc` prove equal-value consistency without freezing a
-  numeric hash algorithm. Mutable collection equality remains the separate
-  cycle-aware work required before maps/sets can close.
+  numeric hash algorithm.
+- [x] **Cycle-aware structural list equality** (2026-08-31,
+  `done.md` §2). Recursive value declarations may close through list
+  indirection, so one source comparison owns an opaque ordered-pair
+  transaction. Finite types remain one allocation-free canonical loop;
+  recursive types use lazily reserved private helpers that close the compiler
+  type graph without expanding it. Element/tag/shape semantics stay in HIR and
+  canonical MIR, while the sealed runtime owns only pair-set storage and QBE
+  and Wasm only pass their list handles. Both semantic oracles, verifier and
+  optimizer gates, the differential native corpus, and `examples/lists.luc`
+  prove identity, finite contents, self/deep cycles, mismatches, alias-topology
+  independence, and context growth. Maps and sets can now build on one settled
+  equality/hash baseline.
 - [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
 - [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
 - [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
@@ -550,11 +562,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   target-independent semantic decoder with the complete escape vocabulary.
   Triple-quoted values remain paired with the canonical formatter because §4.4
   makes their indentation trimming formatter-owned; preserving source
-  indentation in HIR would establish the wrong semantics. Continue with maps,
-  sets, text/bytes builders, formatted/triple strings, and the formatter.
-  Structural list equality also waits for a cycle-aware comparison
-  context: recursive value/list graphs are already constructible, so an
-  acyclic inline element loop would be an incorrect partial implementation.
+  indentation in HIR would establish the wrong semantics. Cycle-aware
+  structural list equality is complete without making runtime or backend
+  callbacks responsible for element semantics. Continue with maps, sets,
+  text/bytes builders, formatted/triple strings, and the formatter.
   The bytes implementation follows §12.6 for both static and dynamic sources:
   `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners
   retainable without exposing runtime layout. Do not promote the broad §12

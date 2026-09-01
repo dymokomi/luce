@@ -310,6 +310,19 @@ perform only the unchecked storage operation after the backend guard.
 Capacity, header layout, concatenation allocation/copy policy, and geometric
 growth remain ordinary freestanding Luce runtime policy.
 
+Structural list equality is expanded by the shared lowerer, not delegated to
+a backend. Finite list element shapes use one ordinary canonical loop and
+allocate no comparison state. A type graph recursive through a list reserves
+one private generated equality function per concrete recursive HIR type before
+emitting any body, so `Node -> list[Node] -> Node` closes with a call instead
+of recursively expanding the compiler stack. The root operation creates one
+opaque equality context; `EqualityContextVisit` records an ordered pair of
+list handles and reports whether that pair was already visited. Generated MIR
+still performs identity, length, tag, field, and element comparisons. The
+sealed runtime owns only the pair-set storage policy, and each backend only
+passes its concrete list handles to the exact bound service. No target layout,
+callback representation, or backend comparison rule enters canonical MIR.
+
 Existential storage follows the same boundary. `InterfaceCreate` names one
 canonical conformance and the address of its concrete source storage. The
 conformance supplies the concrete type; backend legalization supplies that
@@ -771,6 +784,9 @@ ElementAddress(element_type, base, index) -> r: Ptr     scaled by element size
 Memcpy(destination, source, type)                       one value of `type`
 MoveElements(destination, source, element_type, count)  overlap-safe typed range move
 AllocateStorage(element_type, count: u64) -> r: Ptr     typed runtime storage (§12)
+EqualityContextCreate() -> r: Ptr                        one recursive comparison transaction
+EqualityContextRelease(Ptr)
+EqualityContextVisit(Ptr, List(T), List(T)) -> r: bool   true when the ordered pair was visited
 ListCreate()                            -> r: List(T)    T is the result-register type
 ListCopy(value: List(T))                -> r: List(T)    shallow, independent storage
 ListConcat(left: List(T), right: List(T)) -> r: List(T)  fresh shallow ordered result
@@ -871,6 +887,12 @@ AllocateStorage(TypeId, u64 count) -> Ptr     canonical typed request
   bound private function: (u64 byte_count, u64 byte_align) -> Ptr
 DeallocateStorage(Ptr, TypeId, u64 count)      canonical typed release
   bound private function: (Ptr, u64 byte_count, u64 byte_align) -> unit
+EqualityContextCreate() -> Ptr
+  bound private function: () -> Ptr
+EqualityContextRelease(Ptr)
+  bound private function: (Ptr) -> unit
+EqualityContextVisit(Ptr, List(T), List(T)) -> bool
+  bound private function: (Ptr, Ptr, Ptr) -> bool; backends pass list handles
 ListCreate() -> List(T)                      typed semantic handle
 ListCopy(List(T)) -> List(T)                 backend supplies size/alignment
 ListConcat(List(T), List(T)) -> List(T)       backend supplies size/alignment

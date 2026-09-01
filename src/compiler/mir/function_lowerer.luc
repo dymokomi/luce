@@ -30,7 +30,7 @@ from compiler.frontend.source import SourceSpan
 import std.strings
 from compiler.mir.lowering_model import CExternContract, CExternSlot, COutputSlot, CWrapper, DeferredAction, ExternalGlobalContract
 from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, LoweredFunction, MatchExit, MirLoweringState, contains_symbol
-from compiler.mir.lowering_model import CellStorage, OwnershipHelper, RecoverTarget, Region
+from compiler.mir.lowering_model import CellStorage, EqualityHelper, GeneratedHelper, OwnershipHelper, RecoverTarget, Region
 
 ## The non-owning result of adapting a source `Class?` for a weak sink. Presence
 ## is kept separately from the weak handle because a dying `self` is already
@@ -171,6 +171,26 @@ pub class FunctionLowerer:
         self.state.next_generated_function += 2
         let helper = OwnershipHelper(value_type = value_type, retain = retain, release = release)
         self.state.ownership_helpers.append(helper)
+        self.state.generated_helpers.append(GeneratedHelper.Ownership(value_type = value_type, retaining = true, function = retain))
+        self.state.generated_helpers.append(GeneratedHelper.Ownership(value_type = value_type, retaining = false, function = release))
+        return helper
+
+    # Reserve before body generation so `Node -> list[Node] -> Node` closes by
+    # calling the already named helper instead of recursively expanding the
+    # compiler's own lowering stack.
+    func equality_helper_for(module: HirModule, function: HirFunction, hir_type: ir.TypeId) -> EqualityHelper!:
+        for helper in self.state.equality_helpers:
+            if helper.hir_type.value == hir_type.value: return helper
+        let helper = EqualityHelper(
+            module = module.id,
+            owner = function.symbol,
+            hir_type = hir_type,
+            value_type = try self.state.lower_mir_type(hir_type),
+            function = FunctionId(value = self.state.next_generated_function),
+        )
+        self.state.next_generated_function += 1
+        self.state.equality_helpers.append(helper)
+        self.state.generated_helpers.append(GeneratedHelper.Equality(helper = helper))
         return helper
 
     pub func lower_ownership_helper(value_type: TypeId, retaining: bool, identity: FunctionId) -> MirFunction:
@@ -775,6 +795,9 @@ pub class FunctionLowerer:
                 try self.lower_prologue_node(module, function, pointer, body)
                 try self.lower_prologue_node(module, function, count, body)
             NativeIsNull(pointer): try self.lower_prologue_node(module, function, pointer, body)
+            NativeIsSame(left, right):
+                try self.lower_prologue_node(module, function, left, body)
+                try self.lower_prologue_node(module, function, right, body)
             NativeArena(end): try self.lower_prologue_node(module, function, end, body)
             NumericConvert(value): try self.lower_prologue_node(module, function, value, body)
             Discard(value): try self.lower_prologue_node(module, function, value, body)
@@ -1765,6 +1788,13 @@ pub class FunctionLowerer:
                 let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
                 body.append(MirInstruction(form = InstructionForm.Binary(result = result, operation = BinaryOp.eq, left = address, right = null), span = span))
                 return result
+            NativeIsSame(left, right):
+                let span = node_span(self.state.program, expression)
+                let left_address = try self.lower_expression(module, function, left, body)
+                let right_address = try self.lower_expression(module, function, right, body)
+                let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = result, operation = BinaryOp.eq, left = left_address, right = right_address), span = span))
+                return result
             Discard(value):
                 let discarded = try self.lower_expression(module, function, value, body)
                 return RegisterId(value = no_register)
@@ -2512,6 +2542,8 @@ pub class FunctionLowerer:
                             List(element):
                                 match operation:
                                     Add(item): return try self.lower_list_concatenation(module, function, span, left_type, left_register, right_register, body)
+                                    Equal(item): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
+                                    NotEqual(item): return try self.lower_aggregate_comparison(module, function, span, operation, left_type, left_register, right_register, body)
                                     else: pass
                             Bytes:
                                 match operation:
@@ -3477,7 +3509,7 @@ pub class FunctionLowerer:
     # `payload_cases[position..]` compared in turn: `If(tag == case)` compares
     # that case's fields, its else-arm tries the next; past the last, two
     # values with equal tags and no payload are equal.
-    func lower_enum_case_chain(module: HirModule, function: HirFunction, span: SourceSpan, hir_enum_type: ir.TypeId, enum_type: TypeId, left: RegisterId, right: RegisterId, left_tag: RegisterId, payload_cases: list[i64], position: i64, body: list[MirInstruction]) -> RegisterId!:
+    func lower_enum_case_chain(module: HirModule, function: HirFunction, span: SourceSpan, hir_enum_type: ir.TypeId, enum_type: TypeId, left: RegisterId, right: RegisterId, left_tag: RegisterId, payload_cases: list[i64], position: i64, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
         if position >= len(payload_cases): return self.bool_constant(true, span, body)
         let case_index = payload_cases[position]
         let tag_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
@@ -3496,10 +3528,10 @@ pub class FunctionLowerer:
             let element_type = try self.state.mir_type_of(module, function, span, fields[field_index].value_type)
             let left_value = self.load_value(element_type, self.field_address(case_type, left_payload, field_index, span, body), span, body)
             let right_value = self.load_value(element_type, self.field_address(case_type, right_payload, field_index, span, body), span, body)
-            so_far = try self.lower_and_then(module, function, span, so_far, fields[field_index].value_type, left_value, right_value, body)
+            so_far = try self.lower_and_then(module, function, span, so_far, fields[field_index].value_type, left_value, right_value, context, body)
         self.emit_yield(so_far, span, body)
         self.emit_else(span, body)
-        let rest = try self.lower_enum_case_chain(module, function, span, hir_enum_type, enum_type, left, right, left_tag, payload_cases, position + 1, body)
+        let rest = try self.lower_enum_case_chain(module, function, span, hir_enum_type, enum_type, left, right, left_tag, payload_cases, position + 1, context, body)
         self.emit_yield(rest, span, body)
         self.emit_end(span, body)
         return compared
@@ -3946,9 +3978,11 @@ pub class FunctionLowerer:
 
     # mark: Aggregate equality ==================================================================
     #
-    # Aggregates support `==` and `!=` only. Equality is structural and short-
-    # circuits: `If(so_far, then: next test, else: false)`, so an unequal
-    # tuple element or length stops the comparison there.
+    # Ordinary finite value graphs expand once into structured MIR. A type
+    # graph recursive through mutable lists instead calls one generated helper
+    # per concrete recursive type and carries one opaque visited-pair context.
+    # This prevents both compiler recursion and runtime recursion while keeping
+    # element semantics in canonical MIR rather than a backend/runtime callback.
 
     func lower_aggregate_comparison(module: HirModule, function: HirFunction, span: SourceSpan, operation: BinaryOperation, operand_type: ir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
         var negate = false
@@ -3962,49 +3996,132 @@ pub class FunctionLowerer:
         body.append(MirInstruction(form = InstructionForm.Unary(result = unequal, operation = UnaryOp.bool_not, operand = equal), span = span))
         return unequal
 
-    # `left == right` for any HIR type, given registers under the aggregate
-    # protocol (addresses for aggregates, values for scalars).
+    # The source operation owns exactly one comparison transaction. Finite
+    # shapes allocate nothing; only a genuinely recursive collection type
+    # creates the opaque context used by its generated helpers.
     func lower_equality(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        if not self.equality_type_is_recursive(value_type):
+            return try self.lower_equality_definition(module, function, span, value_type, left, right, none, body)
+        let context = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.EqualityContextCreate(result = context), span = span))
+        let equal = try self.lower_nested_equality(module, function, span, value_type, left, right, context, body)
+        body.append(MirInstruction(form = InstructionForm.EqualityContextRelease(value = context), span = span))
+        return equal
+
+    # Emit one generated recursive equality body. Its parameters follow the
+    # canonical value protocol: aggregates arrive by address, scalars by value,
+    # and the final pointer is the shared comparison context.
+    pub func lower_equality_helper(helper: EqualityHelper) -> MirFunction!:
+        let module = self.state.program.modules[helper.module.value]
+        let owner_index = self.state.function_index_of(helper.owner)
+        if owner_index < 0: trap("equality helper lost its source owner")
+        let owner = self.state.program.functions[owner_index]
+        self.begin_function()
+        let parameter_type = self.register_type_for(helper.value_type)
+        let left = self.state.new_register(parameter_type)
+        let right = self.state.new_register(parameter_type)
+        let context = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        let body = list[MirInstruction]()
+        let equal = try self.lower_equality_definition(module, owner, owner.span, helper.hir_type, left, right, context, body)
+        body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run([equal])), span = owner.span))
+        return MirFunction(
+            # HIR identity is part of the generated function identity. Two
+            # nominal recursive types may lower to one structural MIR shape;
+            # naming only that shape would collide in the program-wide
+            # function namespace even though the helpers compare different
+            # source definitions.
+            name = ".luce_equal_h" + str(helper.hir_type.value) + "_t" + str(helper.value_type.value),
+            convention = CallingConvention.luce,
+            signature = MirSignature(parameters = [parameter_type, parameter_type, builtin_mir_type(BuiltinMirType.pointer)], results = [builtin_mir_type(BuiltinMirType.boolean)], is_fallible = false),
+            registers = self.state.registers,
+            slots = self.state.slots,
+            body = body,
+            operands = self.state.operands.operands,
+            is_public = false,
+            is_exported = false,
+            span = owner.span,
+        )
+
+    # A repeated HIR type on one structural path means collection indirection
+    # closed a cycle; direct value cycles were rejected before lowering.
+    func equality_type_is_recursive(value_type: ir.TypeId) -> bool:
+        let visiting = list[bool]()
+        for definition in self.state.program.types.definitions: visiting.append(false)
+        return self.equality_type_is_recursive_once(value_type, visiting)
+
+    func equality_type_is_recursive_once(value_type: ir.TypeId, visiting: list[bool]) -> bool:
+        if visiting[value_type.value]: return true
+        visiting[value_type.value] = true
+        var recursive = false
+        match self.state.program.types.definitions[value_type.value].form:
+            Range(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
+            Array(inner, count): recursive = self.equality_type_is_recursive_once(inner, visiting)
+            List(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
+            Optional(inner): recursive = self.equality_type_is_recursive_once(inner, visiting)
+            Tuple(elements):
+                for element in elements:
+                    if self.equality_type_is_recursive_once(element, visiting):
+                        recursive = true
+                        break
+            Struct(index, arguments):
+                for field in ir.nominal_fields(self.state.program, value_type):
+                    if self.equality_type_is_recursive_once(field.value_type, visiting):
+                        recursive = true
+                        break
+            Enum(index, arguments):
+                for case_value in ir.nominal_cases(self.state.program, value_type):
+                    for field in case_value.payload:
+                        if self.equality_type_is_recursive_once(field.value_type, visiting):
+                            recursive = true
+                            break
+                    if recursive: break
+            else: pass
+        visiting[value_type.value] = false
+        return recursive
+
+    # Recursive children call their already-reserved helper. Finite children
+    # remain inline, preserving the compact path for ordinary equality.
+    func lower_nested_equality(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, left: RegisterId, right: RegisterId, context: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        if not self.equality_type_is_recursive(value_type):
+            return try self.lower_equality_definition(module, function, span, value_type, left, right, context, body)
+        let helper = try self.equality_helper_for(module, function, value_type)
+        let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Call(
+            results = self.state.operands.run([result]),
+            function = helper.function,
+            arguments = self.state.operands.run([left, right, context]),
+        ), span = span))
+        return result
+
+    # Compare one concrete type definition. `context` is present only while a
+    # recursive graph is active; non-recursive list types use the same loop
+    # without allocating or consulting a pair set.
+    func lower_equality_definition(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
         let mir_value_type = try self.state.mir_type_of(module, function, span, value_type)
+        match self.state.program.types.definitions[value_type.value].form:
+            List(element): return try self.lower_list_equality(module, function, span, element, left, right, context, body)
+            else: pass
         if not self.is_aggregate(mir_value_type):
             return try self.lower_binary_operation(module, function, span, BinaryOperation.Equal(operand_type = value_type), mir_value_type, left, right, body)
         match self.state.program.types.definitions[value_type.value].form:
             Tuple(elements):
                 var so_far = self.bool_constant(true, span, body)
                 for index in range(0, len(elements)):
-                    let left_field = self.field_address(mir_value_type, left, index, span, body)
-                    let right_field = self.field_address(mir_value_type, right, index, span, body)
                     let element_type = try self.state.mir_type_of(module, function, span, elements[index])
-                    let left_value = self.load_value(element_type, left_field, span, body)
-                    let right_value = self.load_value(element_type, right_field, span, body)
-                    so_far = try self.lower_and_then(module, function, span, so_far, elements[index], left_value, right_value, body)
+                    let left_value = self.load_value(element_type, self.field_address(mir_value_type, left, index, span, body), span, body)
+                    let right_value = self.load_value(element_type, self.field_address(mir_value_type, right, index, span, body), span, body)
+                    so_far = try self.lower_and_then(module, function, span, so_far, elements[index], left_value, right_value, context, body)
                 return so_far
             Array(element, count):
-                return try self.lower_array_equality(module, function, span, element, count, left, right, body)
+                return try self.lower_array_equality(module, function, span, element, count, left, right, context, body)
             Range(inner):
-                var so_far = self.bool_constant(true, span, body)
-                let field_types = [inner, inner, resolve_builtin_type(BuiltinType.boolean)]
-                for index in range(0, len(field_types)):
-                    let left_field = self.field_address(mir_value_type, left, index, span, body)
-                    let right_field = self.field_address(mir_value_type, right, index, span, body)
-                    let element_type = try self.state.mir_type_of(module, function, span, field_types[index])
-                    let left_value = self.load_value(element_type, left_field, span, body)
-                    let right_value = self.load_value(element_type, right_field, span, body)
-                    so_far = try self.lower_and_then(module, function, span, so_far, field_types[index], left_value, right_value, body)
-                return so_far
+                let fields = [inner, inner, resolve_builtin_type(BuiltinType.boolean)]
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, context, body)
             Struct(index, arguments):
-                var so_far = self.bool_constant(true, span, body)
-                let fields = ir.nominal_fields(self.state.program, value_type)
-                for field_index in range(0, len(fields)):
-                    let left_field = self.field_address(mir_value_type, left, field_index, span, body)
-                    let right_field = self.field_address(mir_value_type, right, field_index, span, body)
-                    let element_type = try self.state.mir_type_of(module, function, span, fields[field_index].value_type)
-                    let left_value = self.load_value(element_type, left_field, span, body)
-                    let right_value = self.load_value(element_type, right_field, span, body)
-                    so_far = try self.lower_and_then(module, function, span, so_far, fields[field_index].value_type, left_value, right_value, body)
-                return so_far
+                let fields = list[ir.TypeId]()
+                for field in ir.nominal_fields(self.state.program, value_type): fields.append(field.value_type)
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, context, body)
             Optional(inner):
-                # Tags equal, and when both are present, payloads equal.
                 let left_present = self.load_present(left, span, body)
                 let right_present = self.load_present(right, span, body)
                 let tags_equal = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
@@ -4016,28 +4133,30 @@ pub class FunctionLowerer:
                 let inner_type = try self.state.mir_type_of(module, function, span, inner)
                 let left_payload = self.load_value(inner_type, self.payload_address(mir_value_type, left, span, body), span, body)
                 let right_payload = self.load_value(inner_type, self.payload_address(mir_value_type, right, span, body), span, body)
-                let payloads_equal = try self.lower_equality(module, function, span, inner, left_payload, right_payload, body)
+                var payloads_equal = self.bool_constant(true, span, body)
+                if context != none:
+                    let active = context
+                    payloads_equal = try self.lower_nested_equality(module, function, span, inner, left_payload, right_payload, active, body)
+                else:
+                    payloads_equal = try self.lower_equality_definition(module, function, span, inner, left_payload, right_payload, none, body)
                 self.emit_yield(payloads_equal, span, body)
                 self.emit_else(span, body)
-                let absent = self.bool_constant(true, span, body)
-                self.emit_yield(absent, span, body)
+                self.emit_yield(self.bool_constant(true, span, body), span, body)
                 self.emit_end(span, body)
                 self.emit_yield(compared, span, body)
                 self.emit_else(span, body)
-                let no = self.bool_constant(false, span, body)
-                self.emit_yield(no, span, body)
+                self.emit_yield(self.bool_constant(false, span, body), span, body)
                 self.emit_end(span, body)
                 return result
             String: return try self.lower_buffer_equality(mir_value_type, left, right, span, body)
             Bytes: return try self.lower_buffer_equality(mir_value_type, left, right, span, body)
             ErrorCode:
                 let fields = [resolve_builtin_type(BuiltinType.string), resolve_builtin_type(BuiltinType.unsigned_u32)]
-                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, body)
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, context, body)
             Error:
                 let fields = [resolve_builtin_type(BuiltinType.error_code), resolve_builtin_type(BuiltinType.string)]
-                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, body)
+                return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, context, body)
             Enum(index, arguments):
-                # Same tag, then the same payload for that case.
                 let left_tag = self.load_tag(left, span, body)
                 let right_tag = self.load_tag(right, span, body)
                 let tags_equal = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
@@ -4048,19 +4167,73 @@ pub class FunctionLowerer:
                 let cases = ir.nominal_cases(self.state.program, value_type)
                 for case_index in range(0, len(cases)):
                     if len(cases[case_index].payload) > 0: payload_cases.append(case_index)
-                let compared = try self.lower_enum_case_chain(module, function, span, value_type, mir_value_type, left, right, left_tag, payload_cases, 0, body)
+                let compared = try self.lower_enum_case_chain(module, function, span, value_type, mir_value_type, left, right, left_tag, payload_cases, 0, context, body)
                 self.emit_yield(compared, span, body)
                 self.emit_else(span, body)
-                let different = self.bool_constant(false, span, body)
-                self.emit_yield(different, span, body)
+                self.emit_yield(self.bool_constant(false, span, body), span, body)
                 self.emit_end(span, body)
                 return result
             else: error(self.state.unsupported(module, function, span, "equality on `" + describe_type(self.state.program.types, value_type) + "`"))
 
-    # Compare fixed arrays with one canonical MIR loop, independent of their
-    # count. Element equality remains recursive, so floats keep IEEE equality
-    # and nested value aggregates retain their language semantics.
-    func lower_array_equality(module: HirModule, function: HirFunction, span: SourceSpan, hir_element_type: ir.TypeId, count: i64, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+    # Lists compare identity first, then ordered contents. An existing pair in
+    # the active context is a coinductive success; every new pair still checks
+    # length and each element before the root can succeed.
+    func lower_list_equality(module: HirModule, function: HirFunction, span: SourceSpan, hir_element_type: ir.TypeId, left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
+        let boolean = builtin_mir_type(BuiltinMirType.boolean)
+        let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let yes = self.bool_constant(true, span, body)
+        let no = self.bool_constant(false, span, body)
+        let result = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
+
+        let same_identity = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = same_identity, operation = BinaryOp.eq, left = left, right = right), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = same_identity, depth = 0, values = self.state.operands.run([yes])), span = span))
+        let left_length = self.state.new_register(index_type)
+        let right_length = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.ListLength(result = left_length, value = left), span = span))
+        body.append(MirInstruction(form = InstructionForm.ListLength(result = right_length, value = right), span = span))
+        let lengths_differ = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = lengths_differ, operation = BinaryOp.ne, left = left_length, right = right_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = lengths_differ, depth = 0, values = self.state.operands.run([no])), span = span))
+        if context != none:
+            let active = context
+            let visited = self.state.new_register(boolean)
+            body.append(MirInstruction(form = InstructionForm.EqualityContextVisit(result = visited, context = active, left = left, right = right), span = span))
+            body.append(MirInstruction(form = InstructionForm.BrIf(condition = visited, depth = 0, values = self.state.operands.run([yes])), span = span))
+
+        let counter = self.new_temp(index_type, span, body)
+        self.store_value(index_type, counter, self.integer_constant(index_type, 0, span, body), span, body)
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        let index = self.load_value(index_type, counter, span, body)
+        let done = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = left_length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = self.state.operands.run([yes])), span = span))
+        let element_type = try self.state.mir_type_of(module, function, span, hir_element_type)
+        let left_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        let right_address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = left_address, value = left, index = index), span = span))
+        body.append(MirInstruction(form = InstructionForm.ListElementAddress(result = right_address, value = right, index = index), span = span))
+        let left_value = self.load_value(element_type, left_address, span, body)
+        let right_value = self.load_value(element_type, right_address, span, body)
+        var element_equal = self.bool_constant(true, span, body)
+        if context != none:
+            let active = context
+            element_equal = try self.lower_nested_equality(module, function, span, hir_element_type, left_value, right_value, active, body)
+        else:
+            element_equal = try self.lower_equality_definition(module, function, span, hir_element_type, left_value, right_value, none, body)
+        let differs = self.state.new_register(boolean)
+        body.append(MirInstruction(form = InstructionForm.Unary(result = differs, operation = UnaryOp.bool_not, operand = element_equal), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = differs, depth = 1, values = self.state.operands.run([no])), span = span))
+        let next = self.state.new_register(index_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
+        self.store_value(index_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.emit_end(span, body)
+        self.emit_end(span, body)
+        return result
+
+    func lower_array_equality(module: HirModule, function: HirFunction, span: SourceSpan, hir_element_type: ir.TypeId, count: i64, left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
         let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
         let boolean_type = builtin_mir_type(BuiltinMirType.boolean)
         let element_type = try self.state.mir_type_of(module, function, span, hir_element_type)
@@ -4070,21 +4243,23 @@ pub class FunctionLowerer:
         let equal_value = self.bool_constant(true, span, body)
         let unequal_value = self.bool_constant(false, span, body)
         let result = self.state.new_register(boolean_type)
-
         body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
         body.append(MirInstruction(form = InstructionForm.Loop, span = span))
         let index = self.load_value(index_type, counter, span, body)
         let done = self.state.new_register(boolean_type)
         body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = index, right = length), span = span))
         body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = self.state.operands.run([equal_value])), span = span))
-
         let left_value = self.load_value(element_type, self.element_address(element_type, left, index, span, body), span, body)
         let right_value = self.load_value(element_type, self.element_address(element_type, right, index, span, body), span, body)
-        let element_equal = try self.lower_equality(module, function, span, hir_element_type, left_value, right_value, body)
+        var element_equal = self.bool_constant(true, span, body)
+        if context != none:
+            let active = context
+            element_equal = try self.lower_nested_equality(module, function, span, hir_element_type, left_value, right_value, active, body)
+        else:
+            element_equal = try self.lower_equality_definition(module, function, span, hir_element_type, left_value, right_value, none, body)
         let differs = self.state.new_register(boolean_type)
         body.append(MirInstruction(form = InstructionForm.Unary(result = differs, operation = UnaryOp.bool_not, operand = element_equal), span = span))
         body.append(MirInstruction(form = InstructionForm.BrIf(condition = differs, depth = 1, values = self.state.operands.run([unequal_value])), span = span))
-
         let next = self.state.new_register(index_type)
         body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = index, right = self.integer_constant(index_type, 1, span, body)), span = span))
         self.store_value(index_type, counter, next, span, body)
@@ -4093,24 +4268,28 @@ pub class FunctionLowerer:
         self.emit_end(span, body)
         return result
 
-    func lower_structural_fields(module: HirModule, function: HirFunction, span: SourceSpan, mir_value_type: TypeId, fields: list[ir.TypeId], left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+    func lower_structural_fields(module: HirModule, function: HirFunction, span: SourceSpan, mir_value_type: TypeId, fields: list[ir.TypeId], left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
         var so_far = self.bool_constant(true, span, body)
         for index in range(0, len(fields)):
             let field_type = try self.state.mir_type_of(module, function, span, fields[index])
             let left_value = self.load_value(field_type, self.field_address(mir_value_type, left, index, span, body), span, body)
             let right_value = self.load_value(field_type, self.field_address(mir_value_type, right, index, span, body), span, body)
-            so_far = try self.lower_and_then(module, function, span, so_far, fields[index], left_value, right_value, body)
+            so_far = try self.lower_and_then(module, function, span, so_far, fields[index], left_value, right_value, context, body)
         return so_far
 
     # `so_far and left == right`, evaluated only when `so_far` holds.
-    func lower_and_then(module: HirModule, function: HirFunction, span: SourceSpan, so_far: RegisterId, value_type: ir.TypeId, left: RegisterId, right: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+    func lower_and_then(module: HirModule, function: HirFunction, span: SourceSpan, so_far: RegisterId, value_type: ir.TypeId, left: RegisterId, right: RegisterId, context: RegisterId?, body: list[MirInstruction]) -> RegisterId!:
         let result = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
         self.open_if(so_far, [result], span, body)
-        let equal = try self.lower_equality(module, function, span, value_type, left, right, body)
+        var equal = self.bool_constant(true, span, body)
+        if context != none:
+            let active = context
+            equal = try self.lower_nested_equality(module, function, span, value_type, left, right, active, body)
+        else:
+            equal = try self.lower_equality_definition(module, function, span, value_type, left, right, none, body)
         self.emit_yield(equal, span, body)
         self.emit_else(span, body)
-        let no = self.bool_constant(false, span, body)
-        self.emit_yield(no, span, body)
+        self.emit_yield(self.bool_constant(false, span, body), span, body)
         self.emit_end(span, body)
         return result
 

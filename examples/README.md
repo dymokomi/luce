@@ -112,7 +112,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   cycles and distinguish same-class cleanup from reentrant user callbacks.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases, `let` fields, and `is`/`is not`, checked
-  indexed mutation,
+  indexed mutation, ordered structural equality for finite and recursive
+  contents—including self/deep cycles, mismatches, pair-set growth, and alias
+  topology independent from value—
   typed list parameters/results, mutating aggregate elements, insertion,
   removal, clearing, reservation, shallow independent copying and `+`
   concatenation, O(1) immutable snapshot slicing, ordered iteration with
