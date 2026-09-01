@@ -709,14 +709,21 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   stored weak value fields, destruction-time creation from borrowed `self`,
   and C-boundary rejection agree through HIR, MIR, QBE, and Wasm without user
   generic machinery or target layout.
-- [ ] **Finish the remaining §11 resource contract.** Direct self-field,
+- [x] **Finish the remaining §11 resource contract** (2026-09-01). Direct self-field,
   self-owned collection, stored-closure, immutable-alias, and weak-back-edge
   cases now have a precise negative matrix. `deinit` follows known same-class
   cleanup transitively and emits structured `L1101` advisories only where
   defined/indirect user code can reenter; direct external C cleanup is not
-  guessed to be user code. Resource-shape advisories and runtime leak census remain.
-  Do not infer ownership from a bare extern/native handle: finish those rules
-  when the richer C boundary records owned/borrowed resource semantics.
+  guessed to be user code. An opt-in, target-neutral census now records live
+  source classes and allocation sites, collapses owning paths through values,
+  collections, closures/cells, and interfaces, ignores weak edges, and reports
+  probable SCCs with deterministic iterative analysis. HIR and MIR agree on
+  the report; QBE executes the same dynamic ownership graph without carrying
+  test-only branches in the production runtime. `examples/classes.luc` proves
+  idempotent explicit `close`, `defer`, and the `deinit` safety net. A bare
+  extern/native handle still does not imply resource ownership; richer C
+  boundary metadata will own any future checked-resource policy rather than a
+  false-positive lifecycle heuristic.
 - [x] **Core managed closures** (2026-08-31). Expression and block closures,
   capture-free elision, explicit value snapshots, default immutable captures,
   shared mutable cells, nested escaping environments, and weak class captures

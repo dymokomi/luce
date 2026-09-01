@@ -1,0 +1,164 @@
+from luce.compiler.backends.interpreter import HirInterpreter
+from luce.compiler.backends.layout import LayoutRules
+from luce.compiler.backends.mir_interpreter import MirInterpreter, MirValue
+from luce.compiler.frontend.parser import Parser
+from luce.compiler.frontend.source import SourceSpan
+from luce.compiler.frontend.tokenizer import Tokenizer
+from luce.compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
+from luce.compiler.hir.generation_model import SourceModule
+from luce.compiler.hir.generator import HirGenerator
+from luce.compiler.hir.ir import ModuleAuthority
+from luce.compiler.mir.lowerer import Lowerer
+from luce.compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
+
+# mark: Source observation helpers =============================================================
+
+func analyzed_source(source: str) -> AnalyzedProgram:
+    let tokens = Tokenizer(source).tokenize() catch reason:
+        trap(reason)
+    let syntax = Parser(tokens).parse() catch reason:
+        trap(reason)
+    let module = SourceModule(name = "main", path = "main.luc", authority = ModuleAuthority.safe, syntax = syntax)
+    let hir = HirGenerator("org.luce.resource-reporting-test", [module]).generate() catch reason:
+        trap(reason)
+    let analyzed = SemanticAnalyzer(hir).analyze() catch reason:
+        trap(reason)
+    return analyzed
+
+func hir_census(program: AnalyzedProgram) -> ResourceCensus:
+    let census = HirInterpreter().run_with_resource_census(program, "main", "answer") catch reason:
+        trap(reason)
+    return census
+
+func mir_census(program: AnalyzedProgram) -> ResourceCensus:
+    let mir = Lowerer(program).lower() catch reason:
+        trap(reason)
+    let interpreter = MirInterpreter(mir, LayoutRules(pointer_size = 4, pointer_align = 4))
+    let results = interpreter.run("main.answer", list[MirValue]()) catch reason:
+        trap(reason)
+    discard(results)
+    return interpreter.resource_census()
+
+func assert_cycle_agreement(source: str, class_name: str, first_line: u32):
+    let program = analyzed_source(source)
+    let hir = hir_census(program)
+    let mir = mir_census(program)
+    assert(len(hir.live_classes) == 2 and len(mir.live_classes) == 2)
+    assert(len(hir.strong_references) == 2 and len(mir.strong_references) == 2)
+    assert(len(hir.probable_cycles) == 1 and len(mir.probable_cycles) == 1)
+    assert(mir.live_classes[0].class_name == class_name)
+    assert(mir.live_classes[0].site.path == "")
+    assert(mir.live_classes[0].site.function == "main.answer")
+    assert(mir.live_classes[0].site.span.line == first_line)
+
+# mark: Canonical graph analysis ===============================================================
+
+func span(line: u32, column: u32) -> SourceSpan:
+    return SourceSpan(start = 0, end = 0, line = line, column = column)
+
+func allocation(id: i64, name: str, line: u32) -> LiveClassAllocation:
+    return LiveClassAllocation(
+        allocation_id = id,
+        class_name = name,
+        site = ClassAllocationSite(path = "main.luc", function = "main.answer", span = span(line, 5)),
+    )
+
+pub func test_resource_census_reports_only_cyclic_strong_components():
+    let census = resource_census(
+        [allocation(0, "Root", 2), allocation(1, "Left", 3), allocation(2, "Right", 4), allocation(3, "Leaf", 5)],
+        [
+            StrongReferenceEdge(source = 0, target = 1),
+            StrongReferenceEdge(source = 1, target = 2),
+            StrongReferenceEdge(source = 2, target = 1),
+            StrongReferenceEdge(source = 2, target = 3),
+            StrongReferenceEdge(source = 2, target = 3),
+        ],
+    )
+    assert(len(census.live_classes) == 4)
+    assert(len(census.strong_references) == 4)
+    assert(len(census.probable_cycles) == 1)
+    assert(len(census.probable_cycles[0].allocations) == 2)
+    assert(census.probable_cycles[0].allocations[0] == 1)
+    assert(census.probable_cycles[0].allocations[1] == 2)
+    assert(census.render() == "live class allocations: 4\n  #0 Root at main.luc in main.answer:2:5\n  #1 Left at main.luc in main.answer:3:5\n  #2 Right at main.luc in main.answer:4:5\n  #3 Leaf at main.luc in main.answer:5:5\nprobable strong-reference cycles: 1\n  {#1, #2}")
+
+pub func test_resource_census_distinguishes_self_cycles_and_acyclic_live_roots():
+    let census = resource_census(
+        [allocation(4, "Root", 8), allocation(1000000000, "Self", 9)],
+        [StrongReferenceEdge(source = 1000000000, target = 1000000000)],
+    )
+    assert(len(census.probable_cycles) == 1)
+    assert(len(census.probable_cycles[0].allocations) == 1)
+    assert(census.probable_cycles[0].allocations[0] == 1000000000)
+    assert(census.render() == "live class allocations: 2\n  #4 Root at main.luc in main.answer:8:5\n  #1000000000 Self at main.luc in main.answer:9:5\nprobable strong-reference cycles: 1\n  {#1000000000}")
+
+pub func test_resource_census_empty_graph_is_a_stable_success_report():
+    let census = resource_census(list[LiveClassAllocation](), list[StrongReferenceEdge]())
+    assert(census.render() == "live class allocations: 0\nprobable strong-reference cycles: 0")
+
+# mark: Semantic-oracle agreement ==============================================================
+
+pub func test_opt_in_resource_census_reports_dynamic_cycles_and_allocation_sites():
+    let source = (
+        "class Node:\n    var next: Node?\n    func init(self): self.next = none\n    func link(self, other: Node): self.next = other\n"
+        + "pub func clean():\n    let first = new Node()\n    let second = new Node()\n    first.link(second)\n"
+        + "pub func answer():\n    let first = new Node()\n    let second = new Node()\n    first.link(second)\n    second.link(first)\n"
+    )
+    let program = analyzed_source(source)
+    let clean = HirInterpreter().run_with_resource_census(program, "main", "clean") catch reason:
+        trap(reason)
+    assert(len(clean.live_classes) == 0)
+    assert(len(clean.probable_cycles) == 0)
+
+    let leaked = hir_census(program)
+    assert(len(leaked.live_classes) == 2)
+    assert(len(leaked.strong_references) == 2)
+    assert(len(leaked.probable_cycles) == 1)
+    assert(leaked.probable_cycles[0].allocations[0] == 0)
+    assert(leaked.probable_cycles[0].allocations[1] == 1)
+    assert(leaked.live_classes[0].site.path == "main.luc")
+    assert(leaked.live_classes[0].site.span.line == 10)
+    assert(leaked.live_classes[1].site.span.line == 11)
+
+pub func test_resource_census_collapses_container_paths_and_ignores_weak_back_edges():
+    let strong = (
+        "class Group:\n    let peers: list[Group]\n    func init(self): self.peers = []\n    func connect(self, other: Group): self.peers.append(other)\n"
+        + "pub func answer():\n    let left = new Group()\n    let right = new Group()\n    left.connect(right)\n    right.connect(left)\n"
+    )
+    assert_cycle_agreement(strong, "Group", 6)
+
+    let weak_source = (
+        "class Node:\n    var child: Node?\n    weak var parent: Node?\n    func init(self):\n        self.child = none\n        self.parent = none\n    func attach(self, child: Node):\n        self.child = child\n        child.parent = self\n"
+        + "pub func answer():\n    let parent = new Node()\n    let child = new Node()\n    parent.attach(child)\n"
+    )
+    let weak_program = analyzed_source(weak_source)
+    let weak_hir = hir_census(weak_program)
+    let weak_mir = mir_census(weak_program)
+    assert(len(weak_hir.live_classes) == 0 and len(weak_mir.live_classes) == 0)
+    assert(len(weak_hir.strong_references) == 0 and len(weak_mir.strong_references) == 0)
+    assert(len(weak_hir.probable_cycles) == 0 and len(weak_mir.probable_cycles) == 0)
+
+pub func test_resource_census_follows_interface_boxes_and_closure_cells():
+    let through_interface = (
+        "interface Peer:\n    func touch(self)\n"
+        + "class Group implements Peer:\n    let peers: list[Peer]\n    func init(self): self.peers = []\n    pub func touch(self): return\n    func connect(self, other: Peer): self.peers.append(other)\n"
+        + "pub func answer():\n    let left = new Group()\n    let right = new Group()\n    left.connect(right)\n    right.connect(left)\n"
+    )
+    assert_cycle_agreement(through_interface, "Group", 9)
+
+    let through_closure_cell = (
+        "func noop(): return\n"
+        + "class Holder:\n    var callback: func() -> unit\n    func init(self): self.callback = noop\n    func touch(self): return\n    func connect(self, callback: func() -> unit): self.callback = callback\n"
+        + "pub func answer():\n    let left = new Holder()\n    let right = new Holder()\n    var left_target = left\n    var right_target = right\n    left.connect(func(): right_target.touch())\n    right.connect(func(): left_target.touch())\n"
+    )
+    assert_cycle_agreement(through_closure_cell, "Holder", 8)
+
+pub func test_resource_census_counts_the_complete_slice_owner_not_only_its_visible_range():
+    let source = (
+        "class Holder:\n    var view: slice[Holder]\n    func init(self):\n        let empty = list[Holder]()\n        self.view = empty[0u64..<0u64]\n    func retain_snapshot(self, values: list[Holder]): self.view = values[0u64..<0u64]\n"
+        + "pub func answer():\n    let left = new Holder()\n    let right = new Holder()\n    left.retain_snapshot([right])\n    right.retain_snapshot([left])\n"
+    )
+    # The views are empty, but each slice owns its complete one-element
+    # snapshot buffer. Ignoring values outside the visible range would miss
+    # both strong edges and incorrectly report a clean execution.
+    assert_cycle_agreement(source, "Holder", 8)

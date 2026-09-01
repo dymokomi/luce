@@ -38,8 +38,10 @@ from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, f
 from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_identity_type, is_int_type, is_ptr_type, is_reference_type
 from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match, uint_maximum
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
+from compiler.frontend.source import SourceSpan
 from compiler.formatting.float_display import display_float32, display_float64
 from compiler.formatting.ieee import ieee_float_bits, normalize_ieee_float
+from compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
 import std.strings
 
 # mark: Values and flow ========================================================================
@@ -243,20 +245,33 @@ class MirSlice:
 class MirClassObject:
     let class_index: i64
     let fields: list[i64]
+    let field_types: list[TypeId]
     let destroyer: FunctionId
+    let allocation_id: i64
+    let allocation_site: ClassAllocationSite?
     var references: i64
     var is_initialized: bool
     var is_alive: bool
     var is_destroying: bool
 
-    pub init(class_index: i64, fields: list[i64], destroyer: FunctionId):
+    pub init(class_index: i64, fields: list[i64], field_types: list[TypeId], destroyer: FunctionId, allocation_id: i64, allocation_site: ClassAllocationSite?):
         self.class_index = class_index
         self.fields = fields
+        self.field_types = field_types
         self.destroyer = destroyer
+        self.allocation_id = allocation_id
+        self.allocation_site = allocation_site
         self.references = 1
         self.is_initialized = false
         self.is_alive = true
         self.is_destroying = false
+
+## One structural value awaiting inspection in the MIR oracle's private
+## memory. Runtime handles remain typed and are never reinterpreted as raw
+## target addresses by the census.
+struct MirGraphValue:
+    let value_type: TypeId
+    let address: i64
 
 ## A separately owned weak slot. Its referent index remains stable after death
 ## because oracle storage is append-only; promotion consults `is_alive`.
@@ -337,6 +352,7 @@ pub class MirInterpreter: MirExternMemory:
     let classes: list[MirClassObject]
     let weak_classes: list[MirWeakClassSlot]
     let interfaces: list[MirInterfaceBox]
+    var next_class_allocation_id: i64
     var arena_address: i64
     var arena_committed: i64
     var external_host: MirExternHost?
@@ -365,6 +381,7 @@ pub class MirInterpreter: MirExternMemory:
         self.classes = list[MirClassObject]()
         self.weak_classes = list[MirWeakClassSlot]()
         self.interfaces = list[MirInterfaceBox]()
+        self.next_class_allocation_id = 0
         self.arena_address = 0
         self.arena_committed = 0
         self.external_host = none
@@ -450,6 +467,166 @@ pub class MirInterpreter: MirExternMemory:
         let index = find_mir_function(self.program, function_name)
         if index < 0: error("mir interpreter: unknown function `" + function_name + "`")
         return try self.call(index, arguments)
+
+    # mark: Resource census ====================================================================
+
+    ## Observe live source classes after a run. The MIR oracle already owns
+    ## append-only semantic runtime state, so graph reconstruction is entirely
+    ## opt-in and execution pays only the allocation-site fields required for
+    ## a useful report.
+    pub func resource_census() -> ResourceCensus:
+        let allocations = list[LiveClassAllocation]()
+        let edges = list[StrongReferenceEdge]()
+        for storage in self.classes:
+            if storage.class_index < 0 or not storage.is_alive: continue
+            let site = storage.allocation_site else trap("live source class has no MIR allocation site")
+            let metadata = self.program.classes[storage.class_index]
+            allocations.append(LiveClassAllocation(
+                allocation_id = storage.allocation_id,
+                class_name = metadata.name,
+                site = site,
+            ))
+            let references = self.collect_class_references(storage)
+            for target in references:
+                edges.append(StrongReferenceEdge(source = storage.allocation_id, target = target))
+        return resource_census(allocations, edges)
+
+    # Flatten structural and managed storage paths until the next source
+    # class. This mirrors the HIR oracle over canonical MIR types while using
+    # only this backend's private layout and handle tables.
+    func collect_class_references(root: MirClassObject) -> list[i64]:
+        let pending = list[MirGraphValue]()
+        for index in range(0, len(root.fields)):
+            pending.append(MirGraphValue(value_type = root.field_types[index], address = root.fields[index]))
+        let references = list[i64]()
+        let visited_handles = list[i64]()
+        let visited_buffers = list[MirListBuffer]()
+
+        while len(pending) > 0:
+            let position = len(pending) - 1
+            let current = pending[position]
+            pending.remove(position)
+            match mir_type(self.program.types, current.value_type):
+                Struct(fields):
+                    for field_index in range(0, len(fields)):
+                        pending.append(MirGraphValue(
+                            value_type = fields[field_index].value_type,
+                            address = current.address + self.layout.field_offset(current.value_type, field_index),
+                        ))
+                Array(element, count):
+                    let stride = self.layout.size_of(element)
+                    for index in range(0, count):
+                        pending.append(MirGraphValue(value_type = element, address = current.address + index * stride))
+                Enum(tag, cases):
+                    let selected = i64(unsigned_int_of(self.load(tag, current.address)))
+                    if selected < 0 or selected >= len(cases): trap("MIR resource census observed an invalid enum tag")
+                    pending.append(MirGraphValue(
+                        value_type = cases[selected],
+                        address = current.address + self.layout.enum_payload_offset(current.value_type),
+                    ))
+                Class(identity):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0: continue
+                    let target = self.graph_class(handle)
+                    if target.class_index < 0: trap("MIR class value names hidden managed storage")
+                    if target.is_alive and not contains_graph_id(references, target.allocation_id):
+                        references.append(target.allocation_id)
+                WeakClass(identity): pass
+                Cell(element):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    self.append_managed_fields(pending, self.graph_class(handle))
+                Func(signature):
+                    let handle = ptr_of(self.load(builtin_mir_type(BuiltinMirType.pointer), current.address + self.layout.pointer_size()))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    self.append_managed_fields(pending, self.graph_class(handle))
+                List(element):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_list(handle)
+                    self.append_list_buffer(pending, visited_buffers, storage.buffer, element)
+                Map(key, value):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_hash(handle)
+                    for index in range(0, len(storage.keys)):
+                        pending.append(MirGraphValue(value_type = key, address = storage.keys[index]))
+                        pending.append(MirGraphValue(value_type = value, address = storage.values[index]))
+                Set(element):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_hash(handle)
+                    for address in storage.keys:
+                        pending.append(MirGraphValue(value_type = element, address = address))
+                Slice(element):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_slice(handle)
+                    match storage.backing:
+                        # A slice exposes one range but retains the complete
+                        # immutable snapshot buffer, so every buffered value
+                        # remains an ownership edge even when it is outside
+                        # the visible range.
+                        List(buffer, start): self.append_list_buffer(pending, visited_buffers, buffer, element)
+                        Bytes(owner, data): pass
+                Interface(identity):
+                    let handle = ptr_of(self.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_interface(handle)
+                    let concrete = self.program.conformances[storage.conformance].value_type
+                    pending.append(MirGraphValue(value_type = concrete, address = storage.payload))
+                # Scalars, raw pointers, immutable buffers, and builders own
+                # no source class edge.
+                else: pass
+        return references
+
+    func append_managed_fields(pending: list[MirGraphValue], storage: MirClassObject):
+        for index in range(0, len(storage.fields)):
+            pending.append(MirGraphValue(value_type = storage.field_types[index], address = storage.fields[index]))
+
+    func append_list_buffer(pending: list[MirGraphValue], visited: list[MirListBuffer], buffer: MirListBuffer, element: TypeId):
+        if contains_graph_buffer(visited, buffer): return
+        visited.append(buffer)
+        for address in buffer.elements:
+            pending.append(MirGraphValue(value_type = element, address = address))
+
+    func graph_class(handle: i64) -> MirClassObject:
+        let index = handle - class_address_base
+        if index < 0 or index >= len(self.classes): trap("MIR resource census observed an invalid managed handle")
+        return self.classes[index]
+
+    func graph_list(handle: i64) -> MirList:
+        let index = handle - list_address_base
+        if index < 0 or index >= len(self.lists) or not self.lists[index].is_alive:
+            trap("MIR resource census observed an invalid list handle")
+        return self.lists[index]
+
+    func graph_hash(handle: i64) -> MirHash:
+        let index = handle - hash_address_base
+        if index < 0 or index >= len(self.hashes) or not self.hashes[index].is_alive:
+            trap("MIR resource census observed an invalid hash handle")
+        return self.hashes[index]
+
+    func graph_slice(handle: i64) -> MirSlice:
+        let index = handle - slice_address_base
+        if index < 0 or index >= len(self.slices) or not self.slices[index].is_alive:
+            trap("MIR resource census observed an invalid slice handle")
+        return self.slices[index]
+
+    func graph_interface(handle: i64) -> MirInterfaceBox:
+        let index = handle - interface_address_base
+        if index < 0 or index >= len(self.interfaces) or not self.interfaces[index].is_alive:
+            trap("MIR resource census observed an invalid interface handle")
+        return self.interfaces[index]
+
+    # mark: Program loading ====================================================================
 
     # Lay out data and globals once. Address 0 is null; nothing lives there.
     func load_program():
@@ -1073,9 +1250,21 @@ pub class MirInterpreter: MirExternMemory:
                     Bytes(owner, data): frame.registers[result.value] = MirValue.Ptr(value = data + position)
             ClassCreate(result, identity):
                 let fields = list[i64]()
+                let field_types = list[TypeId]()
                 for field in self.program.classes[identity.value].fields:
                     fields.append(self.allocate(self.layout.size_of(field.storage_type), self.layout.align_of(field.storage_type)))
-                self.classes.append(MirClassObject(i64(identity.value), fields, self.program.classes[identity.value].destroyer))
+                    field_types.append(field.storage_type)
+                let metadata = self.program.classes[identity.value]
+                let allocation_id = self.next_class_allocation_id
+                self.next_class_allocation_id += 1
+                self.classes.append(MirClassObject(
+                    i64(identity.value),
+                    fields,
+                    field_types,
+                    metadata.destroyer,
+                    allocation_id,
+                    ClassAllocationSite(path = "", function = frame.function.name, span = instruction.span),
+                ))
                 frame.registers[result.value] = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
             ClassMarkInitialized(value):
                 let storage = try self.class_at(frame.registers[value.value], false)
@@ -1184,7 +1373,7 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = MirValue.Ptr(value = storage.payload)
             CellCreate(result, element_type, destroyer):
                 let fields = [self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))]
-                self.classes.append(MirClassObject(-1, fields, destroyer))
+                self.classes.append(MirClassObject(-1, fields, [element_type], destroyer, -1, none))
                 frame.registers[result.value] = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
             CellMarkInitialized(value):
                 let storage = try self.class_at(frame.registers[value.value], false)
@@ -1232,9 +1421,11 @@ pub class MirInterpreter: MirExternMemory:
             ClosureCreate(environment, destination, function_type, closure):
                 let metadata = self.program.closures[closure.value]
                 let fields = list[i64]()
+                let field_types = list[TypeId]()
                 for capture in metadata.captures:
                     fields.append(self.allocate(self.layout.size_of(capture.value_type), self.layout.align_of(capture.value_type)))
-                self.classes.append(MirClassObject(-1, fields, metadata.destroyer))
+                    field_types.append(capture.value_type)
+                self.classes.append(MirClassObject(-1, fields, field_types, metadata.destroyer, -1, none))
                 let handle = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
                 frame.registers[environment.value] = handle
                 let address = ptr_of(frame.registers[destination.value])
@@ -1890,6 +2081,16 @@ func case_matches(candidate: i64, selected: MirValue) -> bool:
         else: trap("verified MIR switch received a non-integer tag")
 
 # mark: Value helpers ==========================================================================
+
+func contains_graph_id(values: list[i64], sought: i64) -> bool:
+    for value in values:
+        if value == sought: return true
+    return false
+
+func contains_graph_buffer(values: list[MirListBuffer], sought: MirListBuffer) -> bool:
+    for value in values:
+        if value is sought: return true
+    return false
 
 pub func signed_int_of(value: MirValue) -> i64:
     match value:

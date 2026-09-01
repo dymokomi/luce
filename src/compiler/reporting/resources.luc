@@ -1,0 +1,250 @@
+#==============================================================================================
+#
+#   resource_reporting - Target-neutral ARC census and probable-cycle analysis
+#
+#   DESCRIPTION:
+#       Interpreter and test-harness instrumentation describe live source
+#       class allocations using this one model. The gatherer owns runtime
+#       representation; this module owns only source locations, strong graph
+#       edges, deterministic SCC analysis, and presentation.
+#
+#       The graph walk is iterative so a leak report cannot itself exhaust the
+#       language call stack on a large ownership graph. Weak references never
+#       enter `StrongReferenceEdge`, and an SCC is reported only when it has
+#       multiple allocations or an explicit self-edge.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+
+## Where one source class identity was allocated. `function` may be empty
+## when an oracle can retain a source path and span but not a callable name.
+pub struct ClassAllocationSite:
+    pub let path: str
+    pub let function: str
+    pub let span: SourceSpan
+
+## One class identity still alive when the isolated execution was observed.
+## IDs are execution-local, monotonically assigned, and never reused.
+pub struct LiveClassAllocation:
+    pub let allocation_id: i64
+    pub let class_name: str
+    pub let site: ClassAllocationSite
+
+## One owning path from a live source class to another. Containers, optionals,
+## closures, cells, and interfaces on the path are deliberately collapsed:
+## they are storage details, while the two class identities define the ARC
+## cycle graph a programmer must break.
+pub struct StrongReferenceEdge:
+    pub let source: i64
+    pub let target: i64
+
+## One probable leak: a maximal strongly connected set of live allocations.
+pub struct ProbableReferenceCycle:
+    pub let allocations: list[i64]
+
+## Final harness metadata. This is not source reflection and is never needed
+## by an ordinary production execution.
+pub struct ResourceCensus:
+    pub let live_classes: list[LiveClassAllocation]
+    pub let strong_references: list[StrongReferenceEdge]
+    pub let probable_cycles: list[ProbableReferenceCycle]
+
+    ## Stable text for command-line and future test-runner presentation.
+    pub func render() -> str:
+        var text = "live class allocations: " + str(len(self.live_classes))
+        for allocation in self.live_classes:
+            text = text + "\n  #" + str(allocation.allocation_id) + " " + allocation.class_name
+            text = text + " at " + render_site(allocation.site)
+        text = text + "\nprobable strong-reference cycles: " + str(len(self.probable_cycles))
+        for cycle in self.probable_cycles:
+            # SCC members are sorted for stability, not arranged as a
+            # particular cycle path; braces avoid inventing nonexistent
+            # pairwise edges in a component with three or more members.
+            text = text + "\n  {"
+            for index in range(0, len(cycle.allocations)):
+                if index > 0: text = text + ", "
+                text = text + "#" + str(cycle.allocations[index])
+            text = text + "}"
+        return text
+
+# mark: Census construction ==================================================================
+
+## Canonicalize a live strong graph and find every cyclic SCC. The two
+## Kosaraju passes are O(V + E); deterministic presentation is sorted after
+## analysis and does not change the graph walk. Allocations must retain their
+## monotonically assigned execution order; IDs may be arbitrarily sparse.
+## A dangling edge or duplicate allocation identity is an instrumentation bug,
+## not malformed user input, so it traps at this internal contract boundary.
+pub func resource_census(allocations: list[LiveClassAllocation], edges: list[StrongReferenceEdge]) -> ResourceCensus:
+    validate_allocations(allocations)
+    let canonical_edges = canonicalize_edges(edges, allocations)
+    let adjacency = empty_graph(len(allocations))
+    let reverse = empty_graph(len(allocations))
+    for edge in canonical_edges:
+        let source = allocation_index(allocations, edge.source)
+        let target = allocation_index(allocations, edge.target)
+        if source < 0 or target < 0: trap("resource census lost a validated allocation")
+        adjacency[source].append(target)
+        reverse[target].append(source)
+
+    let finish_order = graph_finish_order(adjacency)
+    let cycles = graph_cycles(allocations, adjacency, reverse, finish_order)
+    sort_cycles(cycles)
+    return ResourceCensus(
+        live_classes = allocations,
+        strong_references = canonical_edges,
+        probable_cycles = cycles,
+    )
+
+func validate_allocations(allocations: list[LiveClassAllocation]):
+    var previous = -1
+    for allocation in allocations:
+        if allocation.allocation_id < 0: trap("resource census received a negative allocation identity")
+        if allocation.allocation_id <= previous:
+            trap("resource census allocations are not in unique allocation order")
+        previous = allocation.allocation_id
+
+# Survivors can have sparse IDs after short-lived earlier objects disappear.
+# Binary search keeps auxiliary memory O(V) rather than scaling with the
+# largest identity while retaining logarithmic edge resolution.
+func allocation_index(allocations: list[LiveClassAllocation], sought: i64) -> i64:
+    var lower = 0
+    var upper = len(allocations)
+    while lower < upper:
+        let middle = lower + (upper - lower) // 2
+        let candidate = allocations[middle].allocation_id
+        if candidate < sought: lower = middle + 1
+        else: upper = middle
+    if lower < len(allocations) and allocations[lower].allocation_id == sought: return lower
+    return -1
+
+func canonicalize_edges(edges: list[StrongReferenceEdge], allocations: list[LiveClassAllocation]) -> list[StrongReferenceEdge]:
+    let canonical = list[StrongReferenceEdge]()
+    for edge in edges:
+        if allocation_index(allocations, edge.source) < 0:
+            trap("resource census edge names a source allocation that is not live")
+        if allocation_index(allocations, edge.target) < 0:
+            trap("resource census edge names a target allocation that is not live")
+        if not contains_edge(canonical, edge): canonical.append(edge)
+    sort_edges(canonical)
+    return canonical
+
+func contains_edge(edges: list[StrongReferenceEdge], sought: StrongReferenceEdge) -> bool:
+    for edge in edges:
+        if edge.source == sought.source and edge.target == sought.target: return true
+    return false
+
+func empty_graph(count: i64) -> list[list[i64]]:
+    let graph = list[list[i64]]()
+    for node in range(0, count): graph.append(list[i64]())
+    return graph
+
+# mark: Iterative SCC analysis ================================================================
+
+# First Kosaraju pass. Parallel stacks retain the next outgoing edge for each
+# open DFS frame without allocating one host object per graph node.
+func graph_finish_order(adjacency: list[list[i64]]) -> list[i64]:
+    let visited = false_flags(len(adjacency))
+    let finished = list[i64]()
+    for start in range(0, len(adjacency)):
+        if visited[start]: continue
+        let nodes = [start]
+        let next_edges = [0]
+        visited[start] = true
+        while len(nodes) > 0:
+            let top = len(nodes) - 1
+            let node = nodes[top]
+            let next = next_edges[top]
+            if next < len(adjacency[node]):
+                next_edges[top] = next + 1
+                let target = adjacency[node][next]
+                if not visited[target]:
+                    visited[target] = true
+                    nodes.append(target)
+                    next_edges.append(0)
+            else:
+                finished.append(node)
+                nodes.remove(top)
+                next_edges.remove(top)
+    return finished
+
+# Second pass over reversed edges. Components are sorted by allocation ID so
+# reports do not depend on DFS or collection insertion order.
+func graph_cycles(allocations: list[LiveClassAllocation], adjacency: list[list[i64]], reverse: list[list[i64]], finish_order: list[i64]) -> list[ProbableReferenceCycle]:
+    let visited = false_flags(len(reverse))
+    let cycles = list[ProbableReferenceCycle]()
+    var position = len(finish_order) - 1
+    while position >= 0:
+        let start = finish_order[position]
+        position -= 1
+        if visited[start]: continue
+        let stack = [start]
+        let component = list[i64]()
+        visited[start] = true
+        while len(stack) > 0:
+            let top = len(stack) - 1
+            let node = stack[top]
+            stack.remove(top)
+            component.append(node)
+            for target in reverse[node]:
+                if visited[target]: continue
+                visited[target] = true
+                stack.append(target)
+        if not component_is_cycle(component, adjacency): continue
+        let ids = list[i64]()
+        for node in component: ids.append(allocations[node].allocation_id)
+        sort_numbers(ids)
+        cycles.append(ProbableReferenceCycle(allocations = ids))
+    return cycles
+
+func component_is_cycle(component: list[i64], adjacency: list[list[i64]]) -> bool:
+    if len(component) > 1: return true
+    let node = component[0]
+    for target in adjacency[node]:
+        if target == node: return true
+    return false
+
+func false_flags(count: i64) -> list[bool]:
+    let values = list[bool]()
+    for index in range(0, count): values.append(false)
+    return values
+
+# mark: Deterministic ordering and presentation ===============================================
+
+func sort_numbers(values: list[i64]):
+    for index in range(1, len(values)):
+        let value = values[index]
+        var destination = index
+        while destination > 0 and values[destination - 1] > value:
+            values[destination] = values[destination - 1]
+            destination -= 1
+        values[destination] = value
+
+func sort_edges(edges: list[StrongReferenceEdge]):
+    for index in range(1, len(edges)):
+        let value = edges[index]
+        var destination = index
+        while destination > 0 and edge_after(edges[destination - 1], value):
+            edges[destination] = edges[destination - 1]
+            destination -= 1
+        edges[destination] = value
+
+func edge_after(left: StrongReferenceEdge, right: StrongReferenceEdge) -> bool:
+    if left.source != right.source: return left.source > right.source
+    return left.target > right.target
+
+func sort_cycles(cycles: list[ProbableReferenceCycle]):
+    for index in range(1, len(cycles)):
+        let value = cycles[index]
+        var destination = index
+        while destination > 0 and cycles[destination - 1].allocations[0] > value.allocations[0]:
+            cycles[destination] = cycles[destination - 1]
+            destination -= 1
+        cycles[destination] = value
+
+func render_site(site: ClassAllocationSite) -> str:
+    var owner = site.path
+    if len(owner) == 0: owner = site.function
+    elif len(site.function) > 0: owner = owner + " in " + site.function
+    return owner + ":" + str(i64(site.span.line)) + ":" + str(i64(site.span.column))

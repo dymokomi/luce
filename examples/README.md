@@ -126,10 +126,13 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `classes.luc` proves explicit class construction, alias identity and shared
   mutation, zeroing weak fields, first-class `Weak[T]` collections,
   destruction-time weak stores and dead-weak fallback, transitive borrowed
-  `deinit` helper methods, reverse field destruction, and failed-initializer
-  cleanup through both semantic oracles, Wasm, and native QBE. Focused
-  conformance fixtures additionally reject direct strong field/list/closure
-  cycles and distinguish same-class cleanup from reentrant user callbacks.
+  `deinit` helper methods, reverse field destruction, idempotent explicit
+  `close` through both `defer` and the `deinit` safety net, and
+  failed-initializer cleanup through both semantic oracles, Wasm, and native
+  QBE. Focused conformance fixtures additionally reject direct strong
+  field/list/closure cycles, distinguish same-class cleanup from reentrant
+  user callbacks, and report dynamic SCCs with allocation sites as isolated
+  harness metadata rather than production reflection.
 - `lists.luc` is the first runtime-backed collection example. It proves
   shared identity through aliases, `let` fields, and `is`/`is not`, checked
   indexed mutation, ordered structural equality for finite and recursive

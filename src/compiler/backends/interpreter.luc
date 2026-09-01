@@ -16,13 +16,15 @@
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
+from compiler.backends.hir_resources import collect_hir_class_references
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCFunctionIdentity, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
-from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_type, nominal_cases, nominal_fields
+from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_module, node_span, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_weak_field_step
 from compiler.hir.analyzer import AnalyzedProgram
+from compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
 from compiler.formatting.float_display import display_float32, display_float64
 from compiler.formatting.ieee import normalize_ieee_float
 import std.strings
@@ -92,6 +94,21 @@ union PlaceEvaluation:
     EvaluatedPlace(place: Place, value: Value)
     TransferredPlace(execution: Execution)
 
+## One weak observation of an allocated source class. The observation cannot
+## keep its target alive and therefore does not perturb the ARC result it
+## later reports.
+class HirClassObservation:
+    let allocation_id: i64
+    let class_type: TypeId
+    let site: ClassAllocationSite
+    let reference: WeakClassStorage
+
+    pub init(allocation_id: i64, class_type: TypeId, site: ClassAllocationSite, target: ClassStorage):
+        self.allocation_id = allocation_id
+        self.class_type = class_type
+        self.site = site
+        self.reference = WeakClassStorage(target = target)
+
 ## Deterministic bindings for source `extern func` declarations. Artifact
 ## backends bind the same callable by their own host mechanism; the semantic
 ## oracle receives behavior explicitly and never consults ambient symbols.
@@ -126,30 +143,46 @@ pub class HirInterpreter: HirExecutionBackend:
 
     ## Run one selected function from an analyzed HIR program.
     pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
-        return try HirInterpreterRun(program.hir, none, none, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, none, none, none, false).run(module_name, function_name)
+
+    ## Run with opt-in live-class and probable-cycle instrumentation. Ordinary
+    ## `run` does not allocate observations or walk the resulting object graph.
+    pub func run_with_resource_census(program: AnalyzedProgram, module_name: str, function_name: str) -> ResourceCensus!:
+        let execution = HirInterpreterRun(program.hir, none, none, none, true)
+        let value = execution.run(module_name, function_name) catch reason:
+            execution.discard_resource_domain()
+            error(reason)
+        match value:
+            Unit: pass
+            else:
+                execution.discard_resource_domain()
+                error("interpreter: resource census entry must return unit")
+        let census = execution.resource_census()
+        execution.discard_resource_domain()
+        return census
 
     ## Run with explicit behavior for any host-supplied C functions reached.
     pub func run_with_host(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternHost) -> Value!:
-        return try HirInterpreterRun(program.hir, host, none, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, host, none, none, false).run(module_name, function_name)
 
     ## Run with C-owned global storage but no callable C imports.
     pub func run_with_globals(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternVariableHost) -> Value!:
-        return try HirInterpreterRun(program.hir, none, host, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, none, host, none, false).run(module_name, function_name)
 
     ## Run a program that uses both callable imports and C-owned globals.
     pub func run_with_hosts(program: AnalyzedProgram, module_name: str, function_name: str, functions: HirExternHost?, variables: HirExternVariableHost?) -> Value!:
-        return try HirInterpreterRun(program.hir, functions, variables, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, functions, variables, none, false).run(module_name, function_name)
 
     ## Run with both named extern bindings and arbitrary C function pointers.
     pub func run_with_c_function_pointers(program: AnalyzedProgram, module_name: str, function_name: str, functions: HirExternHost, pointers: HirCFunctionPointerHost) -> Value!:
-        return try HirInterpreterRun(program.hir, functions, none, pointers).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, functions, none, pointers, false).run(module_name, function_name)
 
     ## Invoke one exact C export as an external caller would: arguments arrive
     ## in C boundary form and the result leaves in that form. This keeps export
     ## adaptation inside the semantic oracle instead of teaching tests or
     ## hosts how tagged Luce optionals happen to be represented.
     pub func call_c_export(program: AnalyzedProgram, function_name: str, arguments: list[Value]) -> Value!:
-        return try HirInterpreterRun(program.hir, none, none, none).call_c_export(function_name, arguments)
+        return try HirInterpreterRun(program.hir, none, none, none, false).call_c_export(function_name, arguments)
 
 # Executes one checked program directly by symbol identity.
 # Frames the interpreter allows before reporting exhaustion. Unbounded
@@ -214,10 +247,12 @@ class HirInterpreterRun: ClassFinalizer:
     ## Luce-owned module state belongs to one interpreter instance and is
     ## distinct from C-owned globals supplied by `external_variable_host`.
     let globals: list[Value]
+    let class_observations: list[HirClassObservation]?
+    var next_allocation_id: i64
     var depth: i64
 
     # Retain the immutable semantic program used for all calls in this run.
-    pub init(program: HirProgram, external_host: HirExternHost?, external_variable_host: HirExternVariableHost?, c_function_pointer_host: HirCFunctionPointerHost?):
+    pub init(program: HirProgram, external_host: HirExternHost?, external_variable_host: HirExternVariableHost?, c_function_pointer_host: HirCFunctionPointerHost?, collects_resources: bool):
         self.program = program
         self.external_host = external_host
         self.external_variable_host = external_variable_host
@@ -225,6 +260,10 @@ class HirInterpreterRun: ClassFinalizer:
         self.globals = list[Value]()
         for global in program.globals:
             self.globals.append(zero_hir_value(program, global.value_type))
+        var observations: list[HirClassObservation]? = none
+        if collects_resources: observations = list[HirClassObservation]()
+        self.class_observations = observations
+        self.next_allocation_id = 0
         self.depth = 0
 
     ## Host ARC reaches this callback exactly when an interpreted class loses
@@ -243,7 +282,7 @@ class HirInterpreterRun: ClassFinalizer:
             # callback argument. A non-finalizing proxy over the same payload
             # supplies the borrowed source receiver without resurrecting the
             # original identity or recursively invoking finalization.
-            let proxy = ClassStorage(class_type, fields, self, false, false, true)
+            let proxy = ClassStorage(class_type, fields, -1, self, false, false, true)
             let invocation = try self.call(target, [Value.Class(storage = proxy)])
             match invocation.value:
                 Unit: pass
@@ -274,6 +313,38 @@ class HirInterpreterRun: ClassFinalizer:
             FallibleFailure(failure):
                 error("interpreter: unhandled failure from `" + module_name + "." + function_name + "`: " + render_error(failure.value))
             else: return result
+
+    ## Observe the post-run ownership graph without retaining it. Every edge
+    ## is collapsed to source class identities; weak slots are absent.
+    pub func resource_census() -> ResourceCensus:
+        let observations = self.class_observations else trap("resource census was not enabled for this HIR execution")
+        let allocations = list[LiveClassAllocation]()
+        let edges = list[StrongReferenceEdge]()
+        for observation in observations:
+            let target = observation.reference.target
+            if target == none: continue
+            allocations.append(LiveClassAllocation(
+                allocation_id = observation.allocation_id,
+                class_name = describe_type(self.program.types, observation.class_type),
+                site = observation.site,
+            ))
+            let references = collect_hir_class_references(target.fields)
+            for referenced in references:
+                edges.append(StrongReferenceEdge(source = observation.allocation_id, target = referenced))
+        return resource_census(allocations, edges)
+
+    # A census executes in the same isolated, unit-returning domain promised
+    # by the future test harness. Tear down intentional cycles after their
+    # metadata has been copied out so the compiler host does not inherit the
+    # program-under-test's leak.
+    pub func discard_resource_domain():
+        let observations = self.class_observations else trap("resource census was not enabled for this HIR execution")
+        for observation in observations:
+            let target = observation.reference.target
+            if target != none: target.suppress_finalization()
+        for observation in observations:
+            let target = observation.reference.target
+            if target != none: target.discard_owned_fields()
 
     func call_c_export(function_name: str, arguments: list[Value]) -> Value!:
         var selected: HirFunction? = none
@@ -1421,7 +1492,7 @@ class HirInterpreterRun: ClassFinalizer:
                     WeakClass(storage): return Evaluation.Evaluated(value = weak_class_value(storage))
                     else: trap("weak capture reference names owning storage")
             IndirectCall(callee, arguments): return try self.evaluate_indirect_call(callee, arguments, bindings)
-            Initialize(function, arguments): return try self.evaluate_initializer(function, arguments, bindings)
+            Initialize(function, arguments): return try self.evaluate_initializer(expression, function, arguments, bindings)
             ErrorCodeLiteral(value):
                 return Evaluation.Evaluated(value = Value.Record(fields = [
                     BoxedValue(value = Value.Text(value = self.program.package_identity)),
@@ -2059,7 +2130,7 @@ class HirInterpreterRun: ClassFinalizer:
     # Construction owns fresh receiver storage. The initializer's source
     # result is unit-shaped; success substitutes the completed receiver while
     # failure preserves the Error unchanged.
-    func evaluate_initializer(function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
+    func evaluate_initializer(site_node: NodeId, function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
         let target = self.find_function(function)
         let receiver = target.receiver else trap("initializer without a receiver")
         if receiver.kind != HirReceiverKind.initializer: trap("Initialize names a non-initializer")
@@ -2077,7 +2148,24 @@ class HirInterpreterRun: ClassFinalizer:
                         fields.append(BoxedValue(value = Value.WeakClass(storage = WeakClassStorage(none))))
                     else:
                         fields.append(BoxedValue(value = Value.Unit))
-                let storage = ClassStorage(receiver.owner, fields, self, true, true, false)
+                var allocation_id = -1
+                if self.class_observations != none:
+                    allocation_id = self.next_allocation_id
+                    self.next_allocation_id += 1
+                let storage = ClassStorage(receiver.owner, fields, allocation_id, self, true, true, false)
+                if self.class_observations != none:
+                    let observations = self.class_observations else trap("resource census observations disappeared")
+                    let module = node_module(self.program, site_node)
+                    observations.append(HirClassObservation(
+                        allocation_id,
+                        receiver.owner,
+                        ClassAllocationSite(
+                            path = self.program.modules[module.value].path,
+                            function = "",
+                            span = node_span(self.program, site_node),
+                        ),
+                        storage,
+                    ))
                 values[0] = Value.Class(storage = storage)
             else: trap("initializer receiver is not a struct or class")
         for pair in range(0, i64(arguments.count) // 2):
