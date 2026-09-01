@@ -15,11 +15,11 @@ from compiler.core_types import is_core_type_name, is_reserved_core_name
 from compiler.frontend.source import SourceSpan
 from compiler.frontend.syntax import ConstantSyntax, EnumSyntax, ExternFunctionSyntax, ExternStructSyntax, ExternTypeSyntax, ExternVariableSyntax, FunctionSyntax, GenericParameterSyntax, InterfaceSyntax, NominalTypeKind, NominalTypeSyntax
 from compiler.frontend.syntax import PathSyntax, RuntimeGlobalSyntax, TypeAliasSyntax, TypeArgumentSyntax, TypeSyntax
-from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirConformance, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirFunctionImplementation, HirInterfaceOrigin, HirInterfaceRequirement, HirNodeForm, HirParameter, HirPayloadField, HirReceiver, HirReceiverKind, HirTypeParameter
+from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirConformance, HirConformanceAdaptation, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirFunctionImplementation, HirInterfaceOrigin, HirInterfaceRequirement, HirNodeForm, HirParameter, HirPayloadField, HirReceiver, HirReceiverKind, HirTypeParameter
 from compiler.hir.ir import HirRuntimeBinding, ModuleAuthority, ModuleId, NodeId, PackageRole, StandardInterface, SymbolId, SymbolKind, TypeForm, TypeId, no_node
 from compiler.hir.ir import is_floating_type, is_integer_type, resolve_builtin_type, types_match
 from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource, CollectedInterface, CollectedNominalCallable
-from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, CollectedStructSource, ConformanceMethodAdaptation, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
+from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, CollectedStructSource, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
 from compiler.hir.generation_model import ImportedValue, ImportedValueBinding, ModuleBindings, PendingGenericApplication, RuntimeBindingRequest, builtin_type_id
 from compiler.hir.generation_model import TypeBinding, collected_struct_is_extern
 from compiler.hir.interfaces.standard import ensure_standard_interface, standard_interface_element, standard_interface_named, standard_interface_of, standard_interfaces_share_role
@@ -67,7 +67,7 @@ pub class DeclarationCollector:
             if function_index < 0:
                 error("runtime binding `" + str(request.service) + "` names missing function `" + request.module_name + "." + request.function_name + "`")
             let function = self.state.functions[function_index]
-            if function.is_public or self.state.sources[module_index].authority != ModuleAuthority.native:
+            if function.is_public or self.state.modules[module_index].authority != ModuleAuthority.native:
                 try self.state.fail_at(module_index, function.span, "runtime binding `" + str(request.service) + "` must name a private native function")
             match function.source:
                 Defined(syntax): pass
@@ -398,10 +398,12 @@ pub class DeclarationCollector:
 
     # Two files may not claim the same module name; the second one loses.
     pub func validate_module_names() -> !:
-        for index in range(0, len(self.state.sources)):
+        for index in range(0, len(self.state.modules)):
             for previous in range(0, index):
-                if self.state.sources[previous].name == self.state.sources[index].name:
-                    try self.state.fail_at(index, self.state.sources[index].syntax.span, "duplicate module `" + self.state.sources[index].name + "`")
+                if self.state.modules[previous].name == self.state.modules[index].name:
+                    if index < len(self.state.sources):
+                        try self.state.fail_at(index, self.state.sources[index].syntax.span, "duplicate module `" + self.state.modules[index].name + "`")
+                    error("typed package import: duplicate module `" + self.state.modules[index].name + "`")
 
     # `mutating` describes replacement of a value receiver. Module functions
     # have no receiver, while classes already mutate through shared identity;
@@ -569,7 +571,7 @@ pub class DeclarationCollector:
                     Constant(constant):
                         try self.collect_constant(module_index, declaration.is_public, constant, declaration.span)
                     TypeAlias(type_alias):
-                        try self.collect_alias(module_index, declaration.is_public, type_alias, declaration.span)
+                        try self.collect_alias(module_index, declaration.is_public, declaration.documentation, type_alias, declaration.span)
                     else: pass
 
         # Interface signatures precede functions and nominal members so
@@ -617,12 +619,13 @@ pub class DeclarationCollector:
                         try self.collect_extern_struct_members(module_index, extern_struct)
         try self.collect_conformances()
 
-    func collect_alias(module_index: i64, is_public: bool, type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
+    func collect_alias(module_index: i64, is_public: bool, documentation: list[str], type_alias: TypeAliasSyntax, span: SourceSpan) -> !:
         try self.require_free_module_name(module_index, type_alias.name, span)
         self.state.aliases.append(CollectedAlias(
             module_index = module_index,
             name = type_alias.name,
             is_public = is_public,
+            documentation = documentation,
             syntax = type_alias,
             span = span,
             resolved = none,
@@ -709,7 +712,14 @@ pub class DeclarationCollector:
 
     pub func enter_module(module_index: i64):
         self.state.current_module = module_index
-        self.state.bindings = self.state.module_bindings[module_index]
+        if module_index < len(self.state.module_bindings):
+            self.state.bindings = self.state.module_bindings[module_index]
+        else:
+            # Imported bodies are already resolved; specialization needs only
+            # their semantic identities, never dependency import syntax.
+            self.state.bindings = ModuleBindings(
+                modules = list[ImportedModule](), values = list[ImportedValueBinding](),
+            )
 
     pub func resolve_aliases() -> !:
         for index in range(0, len(self.state.aliases)):
@@ -726,13 +736,15 @@ pub class DeclarationCollector:
         self.state.alias_stack.append(key)
         let previous_module = self.state.current_module
         self.state.current_module = item.module_index
-        let resolved = try self.resolve_type(item.module_index, item.syntax.value)
+        let syntax = item.syntax else trap("unresolved alias has no source syntax")
+        let resolved = try self.resolve_type(item.module_index, syntax.value)
         self.state.current_module = previous_module
         self.state.alias_stack.remove(len(self.state.alias_stack) - 1)
         self.state.aliases[index] = CollectedAlias(
             module_index = item.module_index,
             name = item.name,
             is_public = item.is_public,
+            documentation = item.documentation,
             syntax = item.syntax,
             span = item.span,
             resolved = resolved,
@@ -949,6 +961,7 @@ pub class DeclarationCollector:
                 ExportedC(value): syntax = value
                 ExternalC(contract): pass
                 Specialized: pass
+                Imported: pass
             if syntax == none: continue
             let declaration = syntax
             let parameters = list[HirParameter]()
@@ -1443,7 +1456,7 @@ pub class DeclarationCollector:
         let interface_index = self.find_interface_in_module(owner_module, name)
         if interface_index < 0: try self.state.fail_at(module_index, span, "unknown interface `" + name + "`")
         if owner_module != module_index and not self.state.interfaces[interface_index].is_public:
-            try self.state.fail_at(module_index, span, "`" + name + "` is private to module `" + self.state.sources[owner_module].name + "`")
+            try self.state.fail_at(module_index, span, "`" + name + "` is private to module `" + self.state.modules[owner_module].name + "`")
         return interface_index
 
     ## Validate every explicit conformance only after all nominal methods are
@@ -1459,19 +1472,25 @@ pub class DeclarationCollector:
                     else:
                         self.state.current_type_bindings = item.type_bindings
                         try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, nominal.interfaces, item.name, false)
-                External: pass
+                else: pass
         for item in self.state.classes:
+            let syntax = item.syntax
+            if syntax == none: continue
+            let nominal = syntax
             if len(item.type_parameters) == 0:
-                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, true)
+                try self.collect_nominal_conformances(item.module_index, item.type_id, nominal.interfaces, item.name, true)
             else:
                 self.state.current_type_bindings = item.type_bindings
-                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, true)
+                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, nominal.interfaces, item.name, true)
         for item in self.state.enums:
+            let syntax = item.syntax
+            if syntax == none: continue
+            let enumeration = syntax
             if len(item.type_parameters) == 0:
-                try self.collect_nominal_conformances(item.module_index, item.type_id, item.syntax.interfaces, item.name, false)
+                try self.collect_nominal_conformances(item.module_index, item.type_id, enumeration.interfaces, item.name, false)
             else:
                 self.state.current_type_bindings = item.type_bindings
-                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, item.syntax.interfaces, item.name, false)
+                try self.collect_generic_nominal_conformances(item.module_index, item.generic_id, item.type_id, enumeration.interfaces, item.name, false)
         self.state.current_type_bindings = saved_type_bindings
 
     ## Prove every source-written generic application after conformances are
@@ -1573,7 +1592,7 @@ pub class DeclarationCollector:
                     for argument in arguments: interface_arguments.append(argument)
                 else: trap("resolved interface reference is not an interface type")
             let contract = self.state.interfaces[interface_index]
-            let adaptations = list[ConformanceMethodAdaptation]()
+            let adaptations = list[HirConformanceAdaptation]()
             for requirement in contract.requirements:
                 let method_index = self.find_generic_method(value_type, requirement.name)
                 if method_index < 0:
@@ -1710,7 +1729,7 @@ pub class DeclarationCollector:
             if existing_element != none and not types_match(existing_element, element_type):
                 try self.state.fail_at(module_index, span, "type `" + name + "` cannot use more than one element type across standard iteration protocols")
 
-    func validate_conformance_method(module_index: i64, owner_name: str, method: FunctionSymbol, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], is_class: bool, span: SourceSpan) -> ConformanceMethodAdaptation!:
+    func validate_conformance_method(module_index: i64, owner_name: str, method: FunctionSymbol, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], is_class: bool, span: SourceSpan) -> HirConformanceAdaptation!:
         let receiver = method.receiver else trap("conformance method has no receiver")
         if receiver.kind == HirReceiverKind.type_function or receiver.kind == HirReceiverKind.initializer or receiver.kind == HirReceiverKind.deinitializer:
             try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` is not an instance method required by the interface")
@@ -1729,10 +1748,10 @@ pub class DeclarationCollector:
             if actual.name != requirement.parameters[index].name or not types_match(actual.value_type, expected):
                 try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` does not match parameter `" + requirement.parameters[index].name + "` of the interface")
         let expected_result = self.state.substitute_type(requirement.result, generic_id, arguments)
-        if types_match(method.result, expected_result): return ConformanceMethodAdaptation.direct
+        if types_match(method.result, expected_result): return HirConformanceAdaptation.direct
         let successful = self.state.fallible_inner(expected_result)
         if successful != none and types_match(method.result, successful):
-            return ConformanceMethodAdaptation.fallible_lift
+            return HirConformanceAdaptation.fallible_lift
         try self.state.fail_at(module_index, span, "method `" + owner_name + "." + method.name + "` returns `" + self.state.describe_type(method.result) + "`, but the interface requires `" + self.state.describe_type(expected_result) + "`")
         trap("invalid conformance result did not fail")
 
@@ -1740,8 +1759,8 @@ pub class DeclarationCollector:
         if method.generic_origin >= 0: return self.state.generic_functions[method.generic_origin].is_public
         return method.is_public
 
-    func conformance_implementation(module_index: i64, method: FunctionSymbol, adaptation: ConformanceMethodAdaptation, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], span: SourceSpan) -> SymbolId:
-        if adaptation == ConformanceMethodAdaptation.direct: return method.symbol
+    func conformance_implementation(module_index: i64, method: FunctionSymbol, adaptation: HirConformanceAdaptation, requirement: HirInterfaceRequirement, generic_id: u32, arguments: list[TypeId], span: SourceSpan) -> SymbolId:
+        if adaptation == HirConformanceAdaptation.direct: return method.symbol
         let result = self.state.substitute_type(requirement.result, generic_id, arguments)
         return self.make_fallible_requirement_adapter(module_index, method, result, span)
 
@@ -2562,7 +2581,7 @@ pub class DeclarationCollector:
         let nominal = self.find_nominal_in_module(owner_module, name)
         if nominal == none: return none
         if owner_module != module_index and not self.nominal_is_public(nominal):
-            try self.state.fail_at(module_index, span, "`" + name + "` is private to module `" + self.state.sources[owner_module].name + "`")
+            try self.state.fail_at(module_index, span, "`" + name + "` is private to module `" + self.state.modules[owner_module].name + "`")
         return nominal
 
     # Turn a type spelling into a checked value type. A known-but-unimplemented
@@ -2581,17 +2600,17 @@ pub class DeclarationCollector:
                     let foreign_alias = self.state.find_alias_in_module(imported, path.parts[1])
                     if foreign_alias >= 0:
                         if not self.state.aliases[foreign_alias].is_public:
-                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.modules[imported].name + "`")
                         return try self.resolve_alias(foreign_alias)
                     let foreign_interface = self.find_interface_in_module(imported, path.parts[1])
                     if foreign_interface >= 0:
                         if not self.state.interfaces[foreign_interface].is_public:
-                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                            try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.modules[imported].name + "`")
                         return try self.resolve_value_interface_reference(module_index, value)
                     let foreign_extern = self.state.find_extern_type_in_module(imported, path.parts[1])
-                    if foreign_extern < 0: try self.state.fail_at(module_index, path.span, "module `" + self.state.sources[imported].name + "` has no type `" + path.parts[1] + "`")
+                    if foreign_extern < 0: try self.state.fail_at(module_index, path.span, "module `" + self.state.modules[imported].name + "` has no type `" + path.parts[1] + "`")
                     if not self.state.extern_types[foreign_extern].is_public:
-                        try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.sources[imported].name + "`")
+                        try self.state.fail_at(module_index, path.span, "`" + path.parts[1] + "` is private to module `" + self.state.modules[imported].name + "`")
                     return self.state.extern_types[foreign_extern].type_id
                 if len(path.parts) != 1:
                     try self.state.fail_at(module_index, path.span, "unknown type `" + path.dotted() + "`")
@@ -2630,7 +2649,7 @@ pub class DeclarationCollector:
                 let nominal = try self.resolve_nominal_path(module_index, path.parts, path.span)
                 if nominal != none: return try self.nominal_application(module_index, nominal, arguments, value.span)
                 if path.dotted() == "native_ptr" or path.dotted() == "native_mut_ptr":
-                    if self.state.sources[module_index].authority != ModuleAuthority.native:
+                    if self.state.modules[module_index].authority != ModuleAuthority.native:
                         try self.state.fail_at(module_index, value.span, "native pointer types require a `.native.luc` module")
                     if len(arguments) != 1:
                         try self.state.fail_at(module_index, value.span, "`" + path.dotted() + "` needs exactly one pointee type")

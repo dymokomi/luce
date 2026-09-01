@@ -1,0 +1,282 @@
+#==============================================================================================
+#
+#   package_import_arena - Exact HIR graph rewrite for package import
+#
+#   DESCRIPTION:
+#       Rewrites one flat executable or retained-template arena through a
+#       complete semantic import map. Operand runs are rebuilt by meaning,
+#       rather than copied as untyped integers, so nested suite runs, placed
+#       arguments, symbols, types, and table identities are translated once.
+#
+#==============================================================================================
+
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, HirBodyArena, HirIteration
+from compiler.hir.ir import HirNode, HirNodeForm, ModuleId, NodeId, Operands, PackageId, SymbolId, TypeId, UnaryOperation, no_node
+from compiler.hir.ir import place_element_step, place_list_element_step, place_map_element_step
+from compiler.hir.ir import place_mutable_slice_element_step
+from compiler.packages.import_model import HirImportMap, import_module_id, import_package_id
+from compiler.packages.import_model import import_symbol_id, import_type_id
+
+## Stateful only while one isolated destination arena is assembled. Callers
+## publish `arena` only after their complete enclosing program validates.
+pub class HirArenaImporter:
+    pub let arena: HirBodyArena
+    let source: HirBodyArena
+    let remap: HirImportMap
+    let closure_base: u32
+    let node_map: list[NodeId]
+    let value_base: u32
+
+    pub init(destination: HirBodyArena, source: HirBodyArena, remap: HirImportMap, closure_base: u32):
+        self.arena = destination
+        self.source = source
+        self.remap = remap
+        self.closure_base = closure_base
+        self.node_map = list[NodeId]()
+        for node in source.nodes: self.node_map.append(NodeId(value = no_node))
+        self.value_base = u32(len(destination.values))
+        for value in source.values: destination.values.append(value)
+
+    # mark: Complete graph =====================================================================
+
+    pub func import_all() -> !:
+        for index in range(0, len(self.source.nodes)):
+            discard(try self.import_node(NodeId(value = u32(index))))
+
+    pub func import_optional_node(source_id: NodeId) -> NodeId!:
+        if source_id.value == no_node: return source_id
+        return try self.import_node(source_id)
+
+    pub func import_node_run(source_run: Operands) -> Operands!:
+        let entries = list[u32]()
+        for index in range(0, i64(source_run.count)):
+            let source_id = NodeId(value = self.source.extra[i64(source_run.start) + index])
+            entries.append((try self.import_optional_node(source_id)).value)
+        return self.push_run(entries)
+
+    func import_node(source_id: NodeId) -> NodeId!:
+        let existing = self.node_map[source_id.value]
+        if existing.value != no_node: return existing
+        let source_form = self.source.nodes[source_id.value].form
+        var form = HirNodeForm.NoneLiteral
+        match source_form:
+            BreakStatement: form = HirNodeForm.BreakStatement
+            ContinueStatement: form = HirNodeForm.ContinueStatement
+            Binding(symbol, is_mutable, value): form = HirNodeForm.Binding(symbol = self.symbol(symbol), is_mutable = is_mutable, value = try self.import_node(value))
+            Assignment(symbol, operation, value): form = HirNodeForm.Assignment(symbol = self.symbol(symbol), operation = self.assignment(operation), value = try self.import_node(value))
+            ExternStore(variable, operation, value): form = HirNodeForm.ExternStore(variable = u32(self.remap.extern_variable_offset) + variable, operation = self.assignment(operation), value = try self.import_node(value))
+            GlobalStore(global, operation, value): form = HirNodeForm.GlobalStore(global = u32(self.remap.global_offset) + global, operation = self.assignment(operation), value = try self.import_node(value))
+            PlaceAssignment(symbol, steps, operation, value): form = HirNodeForm.PlaceAssignment(symbol = self.symbol(symbol), steps = try self.place_steps(steps), operation = self.assignment(operation), value = try self.import_node(value))
+            GlobalPlaceAssignment(global, steps, operation, value): form = HirNodeForm.GlobalPlaceAssignment(global = u32(self.remap.global_offset) + global, steps = try self.place_steps(steps), operation = self.assignment(operation), value = try self.import_node(value))
+            PrintText(value): form = HirNodeForm.PrintText(value = value)
+            PrintValue(value): form = HirNodeForm.PrintValue(value = try self.import_node(value))
+            ReturnStatement(value): form = HirNodeForm.ReturnStatement(value = try self.import_optional_node(value))
+            RecoverStatement(value): form = HirNodeForm.RecoverStatement(value = try self.import_optional_node(value))
+            DeferStatement(action): form = HirNodeForm.DeferStatement(action = try self.import_node(action))
+            ExpressionStatement(value): form = HirNodeForm.ExpressionStatement(value = try self.import_node(value))
+            IfStatement(branches, has_fallback, fallback): form = HirNodeForm.IfStatement(branches = try self.if_branches(branches), has_fallback = has_fallback, fallback = try self.import_node_run(fallback))
+            WhileStatement(condition, body): form = HirNodeForm.WhileStatement(condition = try self.import_node(condition), body = try self.import_node_run(body))
+            ForStatement(symbol, iteration, body): form = HirNodeForm.ForStatement(symbol = self.symbol(symbol), iteration = try self.iteration(iteration), body = try self.import_node_run(body))
+            Constant(value): form = HirNodeForm.Constant(value = self.value_base + value)
+            Reference(symbol): form = HirNodeForm.Reference(symbol = self.symbol(symbol))
+            ExternLoad(variable): form = HirNodeForm.ExternLoad(variable = u32(self.remap.extern_variable_offset) + variable)
+            GlobalLoad(global): form = HirNodeForm.GlobalLoad(global = u32(self.remap.global_offset) + global)
+            NativeLoad(pointer): form = HirNodeForm.NativeLoad(pointer = try self.import_node(pointer))
+            NativeStore(pointer, value): form = HirNodeForm.NativeStore(pointer = try self.import_node(pointer), value = try self.import_node(value))
+            NativeAdvance(pointer, count): form = HirNodeForm.NativeAdvance(pointer = try self.import_node(pointer), count = try self.import_node(count))
+            NativeRebind(pointer): form = HirNodeForm.NativeRebind(pointer = try self.import_node(pointer))
+            NativeMove(destination, moved_source, count): form = HirNodeForm.NativeMove(destination = try self.import_node(destination), source = try self.import_node(moved_source), count = try self.import_node(count))
+            NativeAllocate(element_type, count): form = HirNodeForm.NativeAllocate(element_type = self.value_type(element_type), count = try self.import_node(count))
+            NativeDeallocate(pointer, element_type, count): form = HirNodeForm.NativeDeallocate(pointer = try self.import_node(pointer), element_type = self.value_type(element_type), count = try self.import_node(count))
+            NativeIsNull(pointer): form = HirNodeForm.NativeIsNull(pointer = try self.import_node(pointer))
+            NativeIsSame(left, right): form = HirNodeForm.NativeIsSame(left = try self.import_node(left), right = try self.import_node(right))
+            NativeAddressHash(pointer): form = HirNodeForm.NativeAddressHash(pointer = try self.import_node(pointer))
+            NativeFloatBits(value): form = HirNodeForm.NativeFloatBits(value = try self.import_node(value))
+            NativeArena(end): form = HirNodeForm.NativeArena(end = try self.import_node(end))
+            NumericConvert(value): form = HirNodeForm.NumericConvert(value = try self.import_node(value))
+            Discard(value): form = HirNodeForm.Discard(value = try self.import_node(value))
+            NeverCoercion(value): form = HirNodeForm.NeverCoercion(value = try self.import_node(value))
+            DivergingSequence(values): form = HirNodeForm.DivergingSequence(values = try self.import_node_run(values))
+            StringScalarCount(value): form = HirNodeForm.StringScalarCount(value = try self.import_node(value))
+            BuiltinDisplay(value): form = HirNodeForm.BuiltinDisplay(value = try self.import_node(value))
+            FormattedString(parts): form = HirNodeForm.FormattedString(parts = try self.import_node_run(parts))
+            Hash(value): form = HirNodeForm.Hash(value = try self.import_node(value))
+            SequenceLength(value): form = HirNodeForm.SequenceLength(value = try self.import_node(value))
+            SequenceIndex(value, index): form = HirNodeForm.SequenceIndex(value = try self.import_node(value), index = try self.import_node(index))
+            Unary(operation, operand): form = HirNodeForm.Unary(operation = self.unary(operation), operand = try self.import_node(operand))
+            Binary(left, operation, right): form = HirNodeForm.Binary(left = try self.import_node(left), operation = self.binary(operation), right = try self.import_node(right))
+            Conditional(value, condition, alternative): form = HirNodeForm.Conditional(value = try self.import_node(value), condition = try self.import_node(condition), alternative = try self.import_node(alternative))
+            Range(lower, upper, inclusive): form = HirNodeForm.Range(lower = try self.import_node(lower), upper = try self.import_node(upper), inclusive = inclusive)
+            Call(function, arguments): form = HirNodeForm.Call(function = self.symbol(function), arguments = try self.placed_run(arguments))
+            GenericCall(generic, type_arguments, arguments, kind): form = HirNodeForm.GenericCall(generic = u32(self.remap.generic_offset) + generic, type_arguments = self.type_run(type_arguments), arguments = try self.placed_run(arguments), kind = kind)
+            GenericFunctionAddress(generic, type_arguments): form = HirNodeForm.GenericFunctionAddress(generic = u32(self.remap.generic_offset) + generic, type_arguments = self.type_run(type_arguments))
+            GenericDefaultArgument(generic, parameter, type_arguments): form = HirNodeForm.GenericDefaultArgument(generic = u32(self.remap.generic_offset) + generic, parameter = parameter, type_arguments = self.type_run(type_arguments))
+            GenericRequirementCall(interface_type, requirement, arguments): form = HirNodeForm.GenericRequirementCall(interface_type = self.value_type(interface_type), requirement = requirement, arguments = try self.placed_run(arguments))
+            GenericInterfaceValue(value): form = HirNodeForm.GenericInterfaceValue(value = try self.import_node(value))
+            InterfaceValue(value, conformance): form = HirNodeForm.InterfaceValue(value = try self.import_node(value), conformance = u32(self.remap.conformance_offset) + conformance)
+            InterfaceCall(receiver, interface_type, requirement, arguments): form = HirNodeForm.InterfaceCall(receiver = try self.import_node(receiver), interface_type = self.value_type(interface_type), requirement = requirement, arguments = try self.placed_run(arguments))
+            FunctionAddress(function): form = HirNodeForm.FunctionAddress(function = self.symbol(function))
+            ClosureValue(closure, initializers): form = HirNodeForm.ClosureValue(closure = self.closure_base + closure, initializers = try self.import_node_run(initializers))
+            WeakCaptureReference(symbol): form = HirNodeForm.WeakCaptureReference(symbol = self.symbol(symbol))
+            IndirectCall(callee, arguments): form = HirNodeForm.IndirectCall(callee = try self.import_node(callee), arguments = try self.import_node_run(arguments))
+            Initialize(function, arguments): form = HirNodeForm.Initialize(function = self.symbol(function), arguments = try self.placed_run(arguments))
+            ErrorCodeLiteral(package, value): form = HirNodeForm.ErrorCodeLiteral(package = PackageId(value = import_package_id(self.remap, package.value)), value = value)
+            Raise(code, message): form = HirNodeForm.Raise(code = try self.import_node(code), message = try self.import_node(message))
+            Trap(message): form = HirNodeForm.Trap(message = try self.import_node(message))
+            Assert(condition, message): form = HirNodeForm.Assert(condition = try self.import_node(condition), message = try self.import_node(message))
+            Try(value): form = HirNodeForm.Try(value = try self.import_node(value))
+            Catch(value, failure, body): form = HirNodeForm.Catch(value = try self.import_node(value), failure = self.symbol(failure), body = try self.import_node_run(body))
+            Tuple(elements): form = HirNodeForm.Tuple(elements = try self.import_node_run(elements))
+            Array(elements): form = HirNodeForm.Array(elements = try self.import_node_run(elements))
+            List(elements): form = HirNodeForm.List(elements = try self.import_node_run(elements))
+            ListCopy(value): form = HirNodeForm.ListCopy(value = try self.import_node(value))
+            ListWithMutableSlice(value, callback): form = HirNodeForm.ListWithMutableSlice(value = try self.import_node(value), callback = try self.import_node(callback))
+            SequenceSlice(value, start, end): form = HirNodeForm.SequenceSlice(value = try self.import_node(value), start = try self.import_optional_node(start), end = try self.import_optional_node(end))
+            ListAppend(value, element): form = HirNodeForm.ListAppend(value = try self.import_node(value), element = try self.import_node(element))
+            ListInsert(value, index, element): form = HirNodeForm.ListInsert(value = try self.import_node(value), index = try self.import_node(index), element = try self.import_node(element))
+            ListRemoveAt(value, index): form = HirNodeForm.ListRemoveAt(value = try self.import_node(value), index = try self.import_node(index))
+            ListClear(value): form = HirNodeForm.ListClear(value = try self.import_node(value))
+            ListReserve(value, minimum_capacity): form = HirNodeForm.ListReserve(value = try self.import_node(value), minimum_capacity = try self.import_node(minimum_capacity))
+            Map(entries): form = HirNodeForm.Map(entries = try self.import_node_run(entries))
+            Set(elements): form = HirNodeForm.Set(elements = try self.import_node_run(elements))
+            MapLookup(value, key): form = HirNodeForm.MapLookup(value = try self.import_node(value), key = try self.import_node(key))
+            MapRemove(value, key): form = HirNodeForm.MapRemove(value = try self.import_node(value), key = try self.import_node(key))
+            MapClear(value): form = HirNodeForm.MapClear(value = try self.import_node(value))
+            MapReserve(value, minimum_capacity): form = HirNodeForm.MapReserve(value = try self.import_node(value), minimum_capacity = try self.import_node(minimum_capacity))
+            MapCopy(value): form = HirNodeForm.MapCopy(value = try self.import_node(value))
+            SetContains(value, element): form = HirNodeForm.SetContains(value = try self.import_node(value), element = try self.import_node(element))
+            SetInsert(value, element): form = HirNodeForm.SetInsert(value = try self.import_node(value), element = try self.import_node(element))
+            SetRemove(value, element): form = HirNodeForm.SetRemove(value = try self.import_node(value), element = try self.import_node(element))
+            SetClear(value): form = HirNodeForm.SetClear(value = try self.import_node(value))
+            SetReserve(value, minimum_capacity): form = HirNodeForm.SetReserve(value = try self.import_node(value), minimum_capacity = try self.import_node(minimum_capacity))
+            SetCopy(value): form = HirNodeForm.SetCopy(value = try self.import_node(value))
+            WeakCreate(value): form = HirNodeForm.WeakCreate(value = try self.import_node(value))
+            WeakGet(value): form = HirNodeForm.WeakGet(value = try self.import_node(value))
+            Element(value, index): form = HirNodeForm.Element(value = try self.import_node(value), index = index)
+            StructValue(struct_index, fields): form = HirNodeForm.StructValue(struct_index = self.remap.struct_offset + struct_index, fields = try self.placed_run(fields))
+            FieldAccess(value, field): form = HirNodeForm.FieldAccess(value = try self.import_node(value), field = field)
+            NoneLiteral: form = HirNodeForm.NoneLiteral
+            Some(value): form = HirNodeForm.Some(value = try self.import_node(value))
+            ElseFallback(value, arm): form = HirNodeForm.ElseFallback(value = try self.import_node(value), arm = try self.import_node(arm))
+            EnumValue(enum_index, case_index, payload): form = HirNodeForm.EnumValue(enum_index = self.remap.enum_offset + enum_index, case_index = case_index, payload = try self.placed_run(payload))
+            Match(subject, arms, has_result): form = HirNodeForm.Match(subject = try self.import_node(subject), arms = try self.import_node_run(arms), has_result = has_result)
+            MatchArm(patterns, statements, value): form = HirNodeForm.MatchArm(patterns = try self.import_node_run(patterns), statements = try self.import_node_run(statements), value = try self.import_optional_node(value))
+            PatternWildcard: form = HirNodeForm.PatternWildcard
+            PatternLiteral(value): form = HirNodeForm.PatternLiteral(value = self.value_base + value)
+            PatternRange(lower, upper, inclusive): form = HirNodeForm.PatternRange(lower = self.value_base + lower, upper = self.value_base + upper, inclusive = inclusive)
+            PatternCase(case_index, bindings): form = HirNodeForm.PatternCase(case_index = case_index, bindings = self.symbol_run(bindings))
+
+        let destination = NodeId(value = u32(len(self.arena.nodes)))
+        self.arena.nodes.append(HirNode(form = form))
+        self.arena.node_types.append(self.value_type(self.source.node_types[source_id.value]))
+        self.arena.node_modules.append(ModuleId(value = import_module_id(self.remap, self.source.node_modules[source_id.value].value)))
+        self.arena.node_spans.append(self.source.node_spans[source_id.value])
+        self.node_map[source_id.value] = destination
+        return destination
+
+    # mark: Operand runs =======================================================================
+
+    func placed_run(source_run: Operands) -> Operands!:
+        let entries = list[u32]()
+        for pair in range(0, i64(source_run.count) // 2):
+            let offset = i64(source_run.start) + pair * 2
+            entries.append(self.source.extra[offset])
+            entries.append((try self.import_node(NodeId(value = self.source.extra[offset + 1]))).value)
+        return self.push_run(entries)
+
+    func symbol_run(source_run: Operands) -> Operands:
+        let entries = list[u32]()
+        for index in range(0, i64(source_run.count)):
+            entries.append(import_symbol_id(self.remap, self.source.extra[i64(source_run.start) + index]))
+        return self.push_run(entries)
+
+    func type_run(source_run: Operands) -> Operands:
+        let entries = list[u32]()
+        for index in range(0, i64(source_run.count)):
+            let source_type = TypeId(value = self.source.extra[i64(source_run.start) + index])
+            entries.append(self.value_type(source_type).value)
+        return self.push_run(entries)
+
+    func if_branches(source_run: Operands) -> Operands!:
+        let entries = list[u32]()
+        for branch in range(0, i64(source_run.count) // 3):
+            let offset = i64(source_run.start) + branch * 3
+            let condition = try self.import_node(NodeId(value = self.source.extra[offset]))
+            let suite = try self.import_node_run(Operands(
+                start = self.source.extra[offset + 1], count = self.source.extra[offset + 2],
+            ))
+            entries.append(condition.value)
+            entries.append(suite.start)
+            entries.append(suite.count)
+        return self.push_run(entries)
+
+    func place_steps(source_run: Operands) -> Operands!:
+        let entries = list[u32]()
+        for pair in range(0, i64(source_run.count) // 2):
+            let offset = i64(source_run.start) + pair * 2
+            let kind = self.source.extra[offset]
+            var payload = self.source.extra[offset + 1]
+            if kind == place_element_step or kind == place_list_element_step or kind == place_map_element_step or kind == place_mutable_slice_element_step:
+                payload = (try self.import_node(NodeId(value = payload))).value
+            entries.append(kind)
+            entries.append(payload)
+        return self.push_run(entries)
+
+    func push_run(entries: list[u32]) -> Operands:
+        let start = u32(len(self.arena.extra))
+        for value in entries: self.arena.extra.append(value)
+        return Operands(start = start, count = u32(len(entries)))
+
+    # mark: Semantic fields ====================================================================
+
+    func iteration(source_value: HirIteration) -> HirIteration!:
+        match source_value:
+            Builtin(value): return HirIteration.Builtin(value = try self.import_node(value))
+            Protocol(iterator_symbol, iterator, next):
+                return HirIteration.Protocol(
+                    iterator_symbol = self.symbol(iterator_symbol),
+                    iterator = try self.import_node(iterator),
+                    next = try self.import_node(next),
+                )
+
+    func assignment(source_value: AssignmentOperation) -> AssignmentOperation:
+        match source_value:
+            Replace: return AssignmentOperation.Replace
+            Combine(operation): return AssignmentOperation.Combine(operation = self.binary(operation))
+
+    func unary(source_value: UnaryOperation) -> UnaryOperation:
+        match source_value:
+            LogicalNot: return UnaryOperation.LogicalNot
+            NumericIdentity(operand_type): return UnaryOperation.NumericIdentity(operand_type = self.value_type(operand_type))
+            NumericNegate(operand_type): return UnaryOperation.NumericNegate(operand_type = self.value_type(operand_type))
+            IntegerBitwiseNot(operand_type): return UnaryOperation.IntegerBitwiseNot(operand_type = self.value_type(operand_type))
+
+    func binary(source_value: BinaryOperation) -> BinaryOperation:
+        match source_value:
+            LogicalAnd: return BinaryOperation.LogicalAnd
+            LogicalOr: return BinaryOperation.LogicalOr
+            Equal(operand_type): return BinaryOperation.Equal(operand_type = self.value_type(operand_type))
+            NotEqual(operand_type): return BinaryOperation.NotEqual(operand_type = self.value_type(operand_type))
+            Identity(operand_type): return BinaryOperation.Identity(operand_type = self.value_type(operand_type))
+            NotIdentity(operand_type): return BinaryOperation.NotIdentity(operand_type = self.value_type(operand_type))
+            Less(operand_type): return BinaryOperation.Less(operand_type = self.value_type(operand_type))
+            LessEqual(operand_type): return BinaryOperation.LessEqual(operand_type = self.value_type(operand_type))
+            Greater(operand_type): return BinaryOperation.Greater(operand_type = self.value_type(operand_type))
+            GreaterEqual(operand_type): return BinaryOperation.GreaterEqual(operand_type = self.value_type(operand_type))
+            Add(operand_type): return BinaryOperation.Add(operand_type = self.value_type(operand_type))
+            Subtract(operand_type): return BinaryOperation.Subtract(operand_type = self.value_type(operand_type))
+            Multiply(operand_type): return BinaryOperation.Multiply(operand_type = self.value_type(operand_type))
+            Divide(operand_type): return BinaryOperation.Divide(operand_type = self.value_type(operand_type))
+            FloorDivide(operand_type): return BinaryOperation.FloorDivide(operand_type = self.value_type(operand_type))
+            Remainder(operand_type): return BinaryOperation.Remainder(operand_type = self.value_type(operand_type))
+            BitwiseAnd(operand_type): return BinaryOperation.BitwiseAnd(operand_type = self.value_type(operand_type))
+            BitwiseOr(operand_type): return BinaryOperation.BitwiseOr(operand_type = self.value_type(operand_type))
+            BitwiseXor(operand_type): return BinaryOperation.BitwiseXor(operand_type = self.value_type(operand_type))
+            ShiftLeft(operand_type): return BinaryOperation.ShiftLeft(operand_type = self.value_type(operand_type))
+            ShiftRight(operand_type): return BinaryOperation.ShiftRight(operand_type = self.value_type(operand_type))
+
+    func symbol(value: SymbolId) -> SymbolId:
+        return SymbolId(value = import_symbol_id(self.remap, value.value))
+
+    func value_type(value: TypeId) -> TypeId:
+        return import_type_id(self.remap, value)

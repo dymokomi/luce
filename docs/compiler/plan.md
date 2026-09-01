@@ -759,7 +759,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   executable interface example agree on generic interfaces, struct/class/enum
   conformers, nested ownership, returned existentials, mutation, fallibility
   adaptation, and propagation (`done.md` §2).
-- [ ] **Finish the remaining generic surface.** Memberwise generic structs,
+- [x] **Finish the remaining generic surface.** Memberwise generic structs,
   enums, and classes, including their owner-parameterized
   value/mutating/lifecycle methods, independently generic instance methods,
   custom initializers and type functions, and concrete conformances are
@@ -768,34 +768,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   source-parent paths, HIR/MIR size, check/codegen timing, backend code-size
   accounting, `luce explain`, and `build --time-report` are also complete.
   The complete source/executable §15 rule and deliberate-limit audit is closed.
-  Serialized typed bodies in package artifacts belong to the package-artifact
-  owner, not canonical MIR. Keep monomorphization out of canonical MIR. HIR
-  now has the required composable package table, module ownership, and
-  package-owned `ErrorCodeLiteral`. The canonical typed payload and strict
-  decoder now reconstruct the exact complete `HirProgram`, including ordinary
-  executable HIR and every declaration/runtime table, without a second IR.
-  The remaining work is one import/seeding transaction with package-local
-  semantic-identity allocation and remapping, followed by dependency-origin
-  generic specialization. HIR generation now checks every
-  abstract definition in an independent `HirBodyArena` and clones typed
-  declaration defaults across the arena boundary without source replay. That
-  arena is now retained with its body/default runs and template-local closure
-  metadata; canonical package types and symbols remain shared identities.
-  HIR-only deferred calls retain resolved generic declarations, inferred type
-  arguments, placed operands, and conformance requirement positions; neither
-  source syntax nor spelling enters the contract. One focused HIR specializer
-  now substitutes canonical `TypeId`s, remaps template-local symbols and
-  closures, resolves deferred calls/conformances, and emits only ordinary
-  concrete `HirFunction`s before MIR. Concrete `FunctionSymbol`s carry a
-  closed source-less variant, and the former span-indexed source replay path is
-  gone. The retained body section now has one canonical codec for every HIR
-  node/operation/literal, flat arena, default, local symbol, closure, shared
-  cell, and generated function, plus a strict postorder/reference validator.
-  Abstract existential conversion has its own template-only form, so no
-  rolled-back probe conformance identity enters an artifact. The next step is
-  to remap package-local semantic identities once during import, seed imported
-  HIR into generation, and prove dependency-origin specialization through a
-  real multi-package QBE build. No generic form may reach MIR.
+  Serialized typed bodies remain owned by the package-artifact layer, not
+  canonical MIR. The strict artifact reconstructs the complete `HirProgram`;
+  one atomic import plan remaps all package-local semantic identities, interns
+  structural types and standard interfaces, and seeds dependency HIR before
+  root-source collection. Dependency-origin generic bodies, closures,
+  callable defaults, field defaults, aliases, and generic conformances now
+  specialize without dependency syntax. A real separately encoded dependency
+  executes through HIR, canonical MIR, Wasm, and QBE. No generic form reaches
+  MIR (`done.md` §2).
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it

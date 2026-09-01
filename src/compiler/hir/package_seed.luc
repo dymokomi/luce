@@ -1,0 +1,305 @@
+#==============================================================================================
+#
+#   hir_package_seed - Complete typed dependencies into one HIR generation transaction
+#
+#   DESCRIPTION:
+#       Builds a valid root identity graph, composes independently checked HIR
+#       artifacts into it, then hydrates the mutable source-generation model.
+#       Imported declarations and executable bodies retain their semantic
+#       identities; dependency source syntax is neither present nor replayed.
+#
+#==============================================================================================
+
+from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant
+from compiler.hir.generation_model import CollectedEnum, CollectedExternType, CollectedExternVariable
+from compiler.hir.generation_model import CollectedFunctionSource, CollectedGlobal, CollectedInterface
+from compiler.hir.generation_model import CollectedNominalCallable, CollectedStruct, CollectedStructSource
+from compiler.hir.generation_model import FunctionSymbol, GenericConformanceTemplate
+from compiler.hir.generation_model import GenericFunctionInstance, GenericFunctionTemplate
+from compiler.hir.generation_model import HirGenerationState, TypeBinding
+from compiler.hir.ir import HirFunctionImplementation, HirProgram, HirTypeParameter, NodeId
+from compiler.hir.ir import SymbolId, TypeForm, TypeId, create_empty_hir_program
+from compiler.packages.importer import import_typed_hir_package
+
+# mark: Public transaction =====================================================================
+
+## Decode and compose every dependency before publishing any of it to source
+## generation. A failed import leaves the generation state untouched.
+pub func seed_hir_dependencies(state: HirGenerationState, artifacts: list[list[u8]]) -> !:
+    if len(artifacts) == 0: return
+    var program = create_root_seed(state)
+    for artifact in artifacts:
+        program = try import_typed_hir_package(program, artifact)
+    hydrate_dependencies(state, program)
+
+func create_root_seed(state: HirGenerationState) -> HirProgram:
+    let program = create_empty_hir_program()
+    program.packages.remove(0)
+    for value in state.packages: program.packages.append(value)
+    for value in state.modules: program.modules.append(value)
+    for definition in program.types.definitions:
+        program.nominal_applications.append(none)
+    return program
+
+# mark: Semantic table hydration ===============================================================
+
+func hydrate_dependencies(state: HirGenerationState, program: HirProgram):
+    let root_module_count = len(state.modules)
+    let builtin_count = len(state.types.definitions)
+    for index in range(builtin_count, len(program.types.definitions)):
+        state.types.definitions.append(program.types.definitions[index])
+    for value in program.symbols: state.symbols.append(value)
+    state.next_symbol = len(state.symbols)
+    for index in range(1, len(program.packages)): state.packages.append(program.packages[index])
+    for index in range(root_module_count, len(program.modules)): state.modules.append(program.modules[index])
+
+    copy_program_arena(state, program)
+    hydrate_functions(state, program)
+    hydrate_generics(state, program)
+    hydrate_declarations(state, program)
+    for value in program.conformances: state.conformances.append(value)
+    for value in program.closures: state.closures.append(value)
+    for value in program.shared_cells: state.shared_cells.append(value)
+    for value in program.functions: state.imported_functions.append(value)
+    state.imported_function_count = len(state.functions)
+    state.next_generic_identity = next_generic_identity(program)
+
+func copy_program_arena(state: HirGenerationState, program: HirProgram):
+    for value in program.nodes: state.program_arena.nodes.append(value)
+    for value in program.node_types: state.program_arena.node_types.append(value)
+    for value in program.node_modules: state.program_arena.node_modules.append(value)
+    for value in program.node_spans: state.program_arena.node_spans.append(value)
+    for value in program.extra: state.program_arena.extra.append(value)
+    for value in program.values: state.program_arena.values.append(value)
+
+# mark: Callable model =========================================================================
+
+func hydrate_functions(state: HirGenerationState, program: HirProgram):
+    for value in program.functions:
+        var source = CollectedFunctionSource.Imported
+        match value.implementation:
+            ExternalC(contract): source = CollectedFunctionSource.ExternalC(contract = contract)
+            else: pass
+        state.functions.append(FunctionSymbol(
+            symbol = value.symbol,
+            module_index = i64(value.module.value),
+            name = value.name,
+            is_public = value.is_public,
+            documentation = value.documentation,
+            receiver = value.receiver,
+            parameters = value.parameters,
+            result = value.result,
+            source = source,
+            span = value.span,
+            generic_origin = -1,
+            generic_instance = -1,
+            type_bindings = list[TypeBinding](),
+        ))
+
+func hydrate_generics(state: HirGenerationState, program: HirProgram):
+    for index in range(0, len(program.generic_functions)):
+        let value = program.generic_functions[index]
+        let bindings = type_bindings(value.type_parameters)
+        let signature = FunctionSymbol(
+            symbol = value.symbol,
+            module_index = i64(value.module.value),
+            name = value.name,
+            is_public = value.is_public,
+            documentation = value.documentation,
+            receiver = value.receiver,
+            parameters = value.parameters,
+            result = value.result,
+            source = CollectedFunctionSource.Imported,
+            span = value.span,
+            generic_origin = index,
+            generic_instance = -1,
+            type_bindings = bindings,
+        )
+        state.generic_functions.append(GenericFunctionTemplate(
+            generic_id = value.generic_id,
+            module_index = i64(value.module.value),
+            name = value.name,
+            is_public = value.is_public,
+            documentation = value.documentation,
+            owner_parameter_count = value.owner_parameter_count,
+            type_parameters = value.type_parameters,
+            signature = signature,
+            syntax = none,
+            body = value.body,
+            span = value.span,
+        ))
+    for value in program.generic_instances:
+        state.generic_instances.append(GenericFunctionInstance(
+            generic_index = i64(value.generic),
+            arguments = value.arguments,
+            function_index = function_index(program, value.function),
+            origin_module = i64(value.origin_module.value),
+            origin_span = value.origin_span,
+            parent = optional_index(value.parent),
+            checked_nodes = i64(value.checked_nodes),
+            check_time_ms = value.check_time_ms,
+        ))
+
+# mark: Declaration model ======================================================================
+
+enum NominalDeclarationKind:
+    struct_type
+    class_type
+    enum_type
+
+func hydrate_declarations(state: HirGenerationState, program: HirProgram):
+    for value in program.aliases:
+        state.aliases.append(CollectedAlias(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            syntax = none, span = value.span, resolved = value.value_type,
+        ))
+    for value in program.constants:
+        state.constants.append(CollectedConstant(
+            symbol = value.symbol, module_index = i64(value.module.value),
+            name = value.name, is_public = value.is_public,
+            annotation = none, value = none, span = program.node_spans[value.value.value],
+            typed = value.value,
+        ))
+
+    for index in range(0, len(program.structs)):
+        let value = program.structs[index]
+        var source = CollectedStructSource.Imported
+        if value.is_extern: source = CollectedStructSource.External
+        state.structs.append(CollectedStruct(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = value.generic_id, type_parameters = value.type_parameters,
+            type_bindings = type_bindings(value.type_parameters),
+            type_id = declaration_type(
+                program, NominalDeclarationKind.struct_type, index, value.type_parameters,
+            ),
+            fields = value.fields,
+            initializer = callable(state, value.initializer), source = source, span = value.span,
+        ))
+    for index in range(0, len(program.classes)):
+        let value = program.classes[index]
+        state.classes.append(CollectedClass(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = value.generic_id, type_parameters = value.type_parameters,
+            type_bindings = type_bindings(value.type_parameters),
+            type_id = declaration_type(
+                program, NominalDeclarationKind.class_type, index, value.type_parameters,
+            ),
+            fields = value.fields,
+            initializer = callable(state, value.initializer),
+            deinitializer = callable(state, value.deinitializer), syntax = none, span = value.span,
+        ))
+    for index in range(0, len(program.enums)):
+        let value = program.enums[index]
+        state.enums.append(CollectedEnum(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = value.generic_id, type_parameters = value.type_parameters,
+            type_bindings = type_bindings(value.type_parameters),
+            type_id = declaration_type(
+                program, NominalDeclarationKind.enum_type, index, value.type_parameters,
+            ),
+            cases = value.cases,
+            syntax = none, span = value.span,
+        ))
+    for value in program.interfaces:
+        state.interfaces.append(CollectedInterface(
+            origin = value.origin, name = value.name, is_public = value.is_public,
+            documentation = value.documentation, generic_id = value.generic_id,
+            type_parameters = value.type_parameters,
+            type_bindings = type_bindings(value.type_parameters),
+            requirements = value.requirements, syntax = none, span = value.span,
+        ))
+    for value in program.generic_conformances:
+        state.generic_conformances.append(GenericConformanceTemplate(
+            module_index = i64(value.module.value), generic_id = value.generic_id,
+            value_type = value.value_type, interface_type = value.interface_type,
+            is_class = value.is_class, adaptations = value.adaptations, span = value.span,
+        ))
+    for value in program.extern_types:
+        state.extern_types.append(CollectedExternType(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            type_id = extern_type(program, len(state.extern_types)),
+            representation = value.representation, span = value.span,
+        ))
+    for value in program.extern_variables:
+        state.extern_variables.append(CollectedExternVariable(
+            module_index = i64(value.module.value), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            value_type = value.value_type, span = value.span,
+        ))
+    for value in program.globals:
+        state.globals.append(CollectedGlobal(
+            symbol = value.symbol, module_index = i64(value.module.value),
+            name = value.name, value_type = value.value_type, span = value.span,
+        ))
+
+# mark: Identity recovery ======================================================================
+
+func type_bindings(parameters: list[HirTypeParameter]) -> list[TypeBinding]:
+    let values = list[TypeBinding]()
+    for value in parameters: values.append(TypeBinding(name = value.name, value_type = value.value_type))
+    return values
+
+func function_index(program: HirProgram, symbol: SymbolId) -> i64:
+    for index in range(0, len(program.functions)):
+        if program.functions[index].symbol.value == symbol.value: return index
+    trap("typed dependency generic instance has no executable function")
+
+func callable(state: HirGenerationState, symbol: SymbolId?) -> CollectedNominalCallable?:
+    if symbol == none: return none
+    let identity = symbol
+    for index in range(0, len(state.functions)):
+        if state.functions[index].symbol.value == identity.value:
+            return CollectedNominalCallable.Concrete(index = index)
+    for index in range(0, len(state.generic_functions)):
+        if state.generic_functions[index].signature.symbol.value == identity.value:
+            return CollectedNominalCallable.Generic(index = index)
+    trap("typed dependency nominal callable has no declaration")
+
+func declaration_type(
+    program: HirProgram,
+    kind: NominalDeclarationKind,
+    declaration: i64,
+    parameters: list[HirTypeParameter],
+) -> TypeId:
+    for definition in program.types.definitions:
+        match definition.form:
+            Struct(index, arguments):
+                if kind == NominalDeclarationKind.struct_type and index == declaration and declared_arguments(arguments, parameters): return definition.id
+            Class(index, arguments):
+                if kind == NominalDeclarationKind.class_type and index == declaration and declared_arguments(arguments, parameters): return definition.id
+            Enum(index, arguments):
+                if kind == NominalDeclarationKind.enum_type and index == declaration and declared_arguments(arguments, parameters): return definition.id
+            else: pass
+    trap("typed dependency nominal declaration has no abstract TypeId")
+
+func declared_arguments(arguments: list[TypeId], parameters: list[HirTypeParameter]) -> bool:
+    if len(arguments) != len(parameters): return false
+    for position in range(0, len(arguments)):
+        if arguments[position].value != parameters[position].value_type.value: return false
+    return true
+
+func extern_type(program: HirProgram, declaration: i64) -> TypeId:
+    for definition in program.types.definitions:
+        match definition.form:
+            Extern(index):
+                if index == declaration: return definition.id
+            else: pass
+    trap("typed dependency extern declaration has no TypeId")
+
+func optional_index(value: u32?) -> i64:
+    if value == none: return -1
+    return i64(value)
+
+func next_generic_identity(program: HirProgram) -> u32:
+    var next: u32 = 0
+    for definition in program.types.definitions:
+        match definition.form:
+            TypeParameter(generic, position):
+                if generic >= next: next = generic + 1
+            else: pass
+    return next

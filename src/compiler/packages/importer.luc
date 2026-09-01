@@ -1,0 +1,570 @@
+#==============================================================================================
+#
+#   package_importer - Atomic typed HIR dependency composition
+#
+#   DESCRIPTION:
+#       Decodes one complete dependency artifact, allocates every destination
+#       identity, rewrites the exact HIR graph, and validates the resulting
+#       program before returning it. The caller's program is never mutated and
+#       no partially remapped package can escape this transaction.
+#
+#==============================================================================================
+
+from compiler.hir.ir import HirBodyArena, HirCFunction, HirCSlot, HirCapture, HirClass
+from compiler.hir.ir import HirClassApplication, HirClosure, HirConformance, HirConstant, HirEnum
+from compiler.hir.ir import HirEnumCase, HirExternRepresentation, HirExternType, HirExternVariable
+from compiler.hir.ir import HirField, HirFunction, HirFunctionImplementation, HirGenericBody
+from compiler.hir.ir import HirGenericConformance, HirGenericFunction, HirGenericInstance, HirGlobal, HirInterface
+from compiler.hir.ir import HirInterfaceApplication, HirInterfaceOrigin, HirInterfaceRequirement
+from compiler.hir.ir import HirModule, HirNominalApplication, HirNominalField, HirPackage, HirParameter
+from compiler.hir.ir import HirPayloadField, HirProgram, HirReceiver, HirStruct, HirSymbol, HirTypeAlias, HirTypeParameter
+from compiler.hir.ir import HirRuntimeBinding, ModuleId, NodeId, PackageId, PackageRole, SymbolId, TypeId, no_node
+from compiler.hir.ir import create_hir_body_arena
+from compiler.packages.import_arena import HirArenaImporter
+from compiler.packages.import_model import HirImportMap, build_hir_import_map, import_generic_id
+from compiler.packages.import_model import import_interface_index, import_module_id, import_package_id
+from compiler.packages.import_model import import_symbol_id, import_type_id
+from compiler.packages.program_codec import decode_typed_hir_package, validate_typed_hir_package
+
+# mark: Public transaction =====================================================================
+
+## Import one independently validated ordinary package graph. Runtime package
+## composition remains a separate sealed compiler transaction.
+pub func import_typed_hir_package(destination: HirProgram, artifact: list[u8]) -> HirProgram!:
+    try validate_typed_hir_package(destination)
+    let source = try decode_typed_hir_package(artifact)
+    try validate_import_boundary(destination, source)
+    let remap = try build_hir_import_map(destination, source)
+
+    let executable = HirArenaImporter(
+        copy_program_arena(destination), program_arena(source), remap,
+        u32(remap.closure_offset),
+    )
+    try executable.import_all()
+
+    let program = HirProgram(
+        packages = import_packages(destination, source, remap),
+        root_package = destination.root_package,
+        runtime_bindings = copy_runtime_bindings(destination),
+        types = remap.types,
+        symbols = import_symbols(destination, source, remap),
+        modules = import_modules(destination, source, remap),
+        aliases = import_aliases(destination, source, remap),
+        constants = try import_constants(destination, source, remap, executable),
+        structs = try import_structs(destination, source, remap, executable),
+        classes = try import_classes(destination, source, remap, executable),
+        enums = import_enums(destination, source, remap),
+        nominal_applications = import_nominal_applications(destination, source, remap),
+        interfaces = try import_interfaces(destination, source, remap, executable),
+        interface_applications = try import_interface_applications(destination, source, remap, executable),
+        conformances = import_conformances(destination, source, remap),
+        generic_conformances = import_generic_conformances(destination, source, remap),
+        extern_types = import_extern_types(destination, source, remap),
+        extern_variables = import_extern_variables(destination, source, remap),
+        globals = import_globals(destination, source, remap),
+        closures = import_closures(destination, source, remap),
+        shared_cells = import_shared_cells(destination, source, remap),
+        generic_functions = try import_generic_functions(destination, source, remap),
+        generic_instances = import_generic_instances(destination, source, remap),
+        generic_specialization_budget = destination.generic_specialization_budget,
+        functions = try import_functions(destination, source, remap, executable),
+        nodes = executable.arena.nodes,
+        node_types = executable.arena.node_types,
+        node_modules = executable.arena.node_modules,
+        node_spans = executable.arena.node_spans,
+        extra = executable.arena.extra,
+        values = executable.arena.values,
+    )
+    try validate_typed_hir_package(program)
+    return program
+
+# mark: Boundary policy ========================================================================
+
+func validate_import_boundary(destination: HirProgram, source: HirProgram) -> !:
+    for imported in source.packages:
+        if imported.role != PackageRole.ordinary:
+            error("typed package import: a sealed runtime package cannot be imported as a source dependency")
+        for existing in destination.packages:
+            if existing.identity == imported.identity:
+                error("typed package import: duplicate package identity `" + imported.identity + "`")
+    if len(source.runtime_bindings) > 0 or len(source.globals) > 0:
+        error("typed package import: an ordinary dependency cannot own sealed runtime state")
+
+# mark: Identity tables ========================================================================
+
+func import_packages(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirPackage]:
+    let values = list[HirPackage]()
+    for value in destination.packages: values.append(value)
+    for value in source.packages:
+        values.append(HirPackage(
+            id = PackageId(value = import_package_id(remap, value.id.value)),
+            identity = value.identity,
+            role = value.role,
+        ))
+    return values
+
+func import_modules(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirModule]:
+    let values = list[HirModule]()
+    for value in destination.modules: values.append(value)
+    for value in source.modules:
+        values.append(HirModule(
+            id = ModuleId(value = import_module_id(remap, value.id.value)),
+            package = PackageId(value = import_package_id(remap, value.package.value)),
+            name = value.name,
+            path = value.path,
+            authority = value.authority,
+            documentation = value.documentation,
+        ))
+    return values
+
+func import_aliases(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirTypeAlias]:
+    let values = list[HirTypeAlias]()
+    for value in destination.aliases: values.append(value)
+    for value in source.aliases:
+        values.append(HirTypeAlias(
+            module = ModuleId(value = import_module_id(remap, value.module.value)),
+            name = value.name,
+            is_public = value.is_public,
+            documentation = value.documentation,
+            value_type = import_type_id(remap, value.value_type),
+            span = value.span,
+        ))
+    return values
+
+func import_symbols(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirSymbol]:
+    let values = list[HirSymbol]()
+    for value in destination.symbols: values.append(value)
+    for value in source.symbols:
+        values.append(HirSymbol(
+            id = SymbolId(value = import_symbol_id(remap, value.id.value)),
+            name = value.name,
+            kind = value.kind,
+            value_type = import_type_id(remap, value.value_type),
+        ))
+    return values
+
+# mark: Nominal declarations ===================================================================
+
+func import_constants(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirConstant]!:
+    let values = list[HirConstant]()
+    for value in destination.constants: values.append(value)
+    for value in source.constants:
+        values.append(HirConstant(
+            symbol = symbol(remap, value.symbol),
+            module = module(remap, value.module),
+            name = value.name,
+            is_public = value.is_public,
+            value = try arena.import_optional_node(value.value),
+        ))
+    return values
+
+func import_structs(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirStruct]!:
+    let values = list[HirStruct]()
+    for value in destination.structs: values.append(value)
+    for value in source.structs:
+        var initializer: SymbolId? = none
+        let source_initializer = value.initializer
+        if source_initializer != none: initializer = symbol(remap, source_initializer)
+        values.append(HirStruct(
+            module = module(remap, value.module), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = declaration_generic_id(remap, value.generic_id, value.type_parameters),
+            type_parameters = import_type_parameters(remap, value.type_parameters),
+            is_extern = value.is_extern,
+            fields = try import_fields(remap, value.fields, arena),
+            initializer = initializer, span = value.span,
+        ))
+    return values
+
+func import_classes(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirClass]!:
+    let values = list[HirClass]()
+    for value in destination.classes: values.append(value)
+    for value in source.classes:
+        var deinitializer: SymbolId? = none
+        let source_deinitializer = value.deinitializer
+        if source_deinitializer != none: deinitializer = symbol(remap, source_deinitializer)
+        values.append(HirClass(
+            module = module(remap, value.module), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = declaration_generic_id(remap, value.generic_id, value.type_parameters),
+            type_parameters = import_type_parameters(remap, value.type_parameters),
+            fields = try import_fields(remap, value.fields, arena),
+            initializer = symbol(remap, value.initializer),
+            deinitializer = deinitializer, span = value.span,
+        ))
+    return values
+
+func import_enums(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirEnum]:
+    let values = list[HirEnum]()
+    for value in destination.enums: values.append(value)
+    for value in source.enums:
+        values.append(HirEnum(
+            module = module(remap, value.module), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            generic_id = declaration_generic_id(remap, value.generic_id, value.type_parameters),
+            type_parameters = import_type_parameters(remap, value.type_parameters),
+            cases = import_cases(remap, value.cases), span = value.span,
+        ))
+    return values
+
+func import_nominal_applications(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirNominalApplication?]:
+    let values = list[HirNominalApplication?]()
+    for value in destination.nominal_applications: values.append(value)
+    for index in range(0, len(source.nominal_applications)):
+        if not remap.imports_type[index]: continue
+        let value = source.nominal_applications[index]
+        if value == none:
+            values.append(none)
+            continue
+        match value:
+            StructApplication(fields): values.append(HirNominalApplication.StructApplication(fields = import_nominal_fields(remap, fields)))
+            ClassApplication(application):
+                var deinitializer: SymbolId? = none
+                let source_deinitializer = application.deinitializer
+                if source_deinitializer != none: deinitializer = symbol(remap, source_deinitializer)
+                values.append(HirNominalApplication.ClassApplication(application = HirClassApplication(
+                    fields = import_nominal_fields(remap, application.fields),
+                    deinitializer = deinitializer,
+                )))
+            EnumApplication(cases): values.append(HirNominalApplication.EnumApplication(cases = import_cases(remap, cases)))
+    return values
+
+func import_fields(remap: HirImportMap, source: list[HirField], arena: HirArenaImporter) -> list[HirField]!:
+    let values = list[HirField]()
+    for value in source:
+        values.append(HirField(
+            name = value.name, value_type = import_type_id(remap, value.value_type),
+            is_mutable = value.is_mutable, is_weak = value.is_weak,
+            is_public = value.is_public, documentation = value.documentation,
+            default_value = try arena.import_optional_node(value.default_value),
+        ))
+    return values
+
+func import_nominal_fields(remap: HirImportMap, source: list[HirNominalField]) -> list[HirNominalField]:
+    let values = list[HirNominalField]()
+    for value in source:
+        values.append(HirNominalField(
+            name = value.name, value_type = import_type_id(remap, value.value_type),
+            is_mutable = value.is_mutable, is_weak = value.is_weak,
+            is_public = value.is_public, documentation = value.documentation,
+        ))
+    return values
+
+func import_cases(remap: HirImportMap, source: list[HirEnumCase]) -> list[HirEnumCase]:
+    let values = list[HirEnumCase]()
+    for value in source:
+        let payload = list[HirPayloadField]()
+        for field in value.payload:
+            payload.append(HirPayloadField(name = field.name, value_type = import_type_id(remap, field.value_type)))
+        values.append(HirEnumCase(name = value.name, documentation = value.documentation, payload = payload))
+    return values
+
+# mark: Interfaces =============================================================================
+
+func import_interfaces(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirInterface]!:
+    let values = list[HirInterface]()
+    for value in destination.interfaces: values.append(value)
+    for index in range(0, len(source.interfaces)):
+        let value = source.interfaces[index]
+        if not remap.imports_interface[index]:
+            try validate_standard_interface(value, values[remap.interface_map[index]], remap)
+            continue
+        var origin = value.origin
+        match value.origin:
+            Source(source_module): origin = HirInterfaceOrigin.Source(module = module(remap, source_module))
+            Standard(identity): pass
+        values.append(HirInterface(
+            origin = origin, name = value.name, is_public = value.is_public,
+            documentation = value.documentation,
+            generic_id = declaration_generic_id(remap, value.generic_id, value.type_parameters),
+            type_parameters = import_type_parameters(remap, value.type_parameters),
+            requirements = try import_requirements(remap, value.requirements, arena),
+            span = value.span,
+        ))
+    return values
+
+func import_interface_applications(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirInterfaceApplication]!:
+    let values = list[HirInterfaceApplication]()
+    for value in destination.interface_applications: values.append(value)
+    for value in source.interface_applications:
+        let value_type = import_type_id(remap, value.value_type)
+        var existing = false
+        for candidate in values:
+            if candidate.value_type.value == value_type.value: existing = true
+        if existing: continue
+        values.append(HirInterfaceApplication(
+            value_type = value_type,
+            declaration = u32(import_interface_index(remap, i64(value.declaration))),
+            requirements = try import_requirements(remap, value.requirements, arena),
+        ))
+    return values
+
+func import_conformances(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirConformance]:
+    let values = list[HirConformance]()
+    for value in destination.conformances: values.append(value)
+    for value in source.conformances:
+        let implementations = list[SymbolId]()
+        for implementation in value.implementations: implementations.append(symbol(remap, implementation))
+        values.append(HirConformance(
+            value_type = import_type_id(remap, value.value_type),
+            interface_type = import_type_id(remap, value.interface_type),
+            implementations = implementations,
+        ))
+    return values
+
+func import_generic_conformances(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirGenericConformance]:
+    let values = list[HirGenericConformance]()
+    for value in destination.generic_conformances: values.append(value)
+    for value in source.generic_conformances:
+        values.append(HirGenericConformance(
+            module = ModuleId(value = import_module_id(remap, value.module.value)),
+            generic_id = import_generic_id(remap, value.generic_id),
+            value_type = import_type_id(remap, value.value_type),
+            interface_type = import_type_id(remap, value.interface_type),
+            is_class = value.is_class,
+            adaptations = value.adaptations,
+            span = value.span,
+        ))
+    return values
+
+func import_requirements(remap: HirImportMap, source: list[HirInterfaceRequirement], arena: HirArenaImporter) -> list[HirInterfaceRequirement]!:
+    let values = list[HirInterfaceRequirement]()
+    for value in source:
+        values.append(HirInterfaceRequirement(
+            symbol = symbol(remap, value.symbol), name = value.name,
+            is_mutating = value.is_mutating, documentation = value.documentation,
+            parameters = try import_parameters(remap, value.parameters, arena),
+            result = import_type_id(remap, value.result), span = value.span,
+        ))
+    return values
+
+func validate_standard_interface(source: HirInterface, destination: HirInterface, remap: HirImportMap) -> !:
+    if source.name != destination.name or len(source.type_parameters) != len(destination.type_parameters):
+        error("typed package import: compiler-known interface metadata does not match the destination")
+    if len(source.requirements) != len(destination.requirements):
+        error("typed package import: compiler-known interface metadata does not match the destination")
+    for index in range(0, len(source.requirements)):
+        let left = source.requirements[index]
+        let right = destination.requirements[index]
+        if left.name != right.name or left.is_mutating != right.is_mutating:
+            error("typed package import: compiler-known interface metadata does not match the destination")
+        if import_type_id(remap, left.result).value != right.result.value or len(left.parameters) != len(right.parameters):
+            error("typed package import: compiler-known interface signature does not match the destination")
+        for parameter_index in range(0, len(left.parameters)):
+            if import_type_id(remap, left.parameters[parameter_index].value_type).value != right.parameters[parameter_index].value_type.value:
+                error("typed package import: compiler-known interface signature does not match the destination")
+
+# mark: Executable declarations ================================================================
+
+func import_extern_types(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirExternType]:
+    let values = list[HirExternType]()
+    for value in destination.extern_types: values.append(value)
+    for value in source.extern_types:
+        var representation = value.representation
+        match value.representation:
+            Pointer: pass
+            Integer(value_type): representation = HirExternRepresentation.Integer(value_type = import_type_id(remap, value_type))
+        values.append(HirExternType(
+            module = module(remap, value.module), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            representation = representation, span = value.span,
+        ))
+    return values
+
+func import_extern_variables(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirExternVariable]:
+    let values = list[HirExternVariable]()
+    for value in destination.extern_variables: values.append(value)
+    for value in source.extern_variables:
+        values.append(HirExternVariable(
+            module = module(remap, value.module), name = value.name,
+            is_public = value.is_public, documentation = value.documentation,
+            value_type = import_type_id(remap, value.value_type), span = value.span,
+        ))
+    return values
+
+func import_globals(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirGlobal]:
+    let values = list[HirGlobal]()
+    for value in destination.globals: values.append(value)
+    for value in source.globals:
+        values.append(HirGlobal(
+            symbol = symbol(remap, value.symbol), module = module(remap, value.module),
+            name = value.name, value_type = import_type_id(remap, value.value_type), span = value.span,
+        ))
+    return values
+
+func import_closures(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirClosure]:
+    let values = list[HirClosure]()
+    for value in destination.closures: values.append(value)
+    for value in source.closures: values.append(import_closure(remap, value))
+    return values
+
+func import_closure(remap: HirImportMap, value: HirClosure) -> HirClosure:
+    let captures = list[HirCapture]()
+    for capture in value.captures:
+        var source_symbol: SymbolId? = none
+        let captured_source = capture.source
+        if captured_source != none: source_symbol = symbol(remap, captured_source)
+        captures.append(HirCapture(
+            symbol = symbol(remap, capture.symbol), source = source_symbol,
+            value_type = import_type_id(remap, capture.value_type),
+            kind = capture.kind, span = capture.span,
+        ))
+    return HirClosure(function = symbol(remap, value.function), captures = captures, span = value.span)
+
+func import_shared_cells(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[SymbolId]:
+    let values = list[SymbolId]()
+    for value in destination.shared_cells: values.append(value)
+    for value in source.shared_cells: values.append(symbol(remap, value))
+    return values
+
+func import_functions(destination: HirProgram, source: HirProgram, remap: HirImportMap, arena: HirArenaImporter) -> list[HirFunction]!:
+    let values = list[HirFunction]()
+    for value in destination.functions: values.append(value)
+    for value in source.functions:
+        values.append(try import_function(remap, value, arena, u32(remap.closure_offset)))
+    return values
+
+func import_function(remap: HirImportMap, value: HirFunction, arena: HirArenaImporter, closure_base: u32) -> HirFunction!:
+    var closure: u32? = none
+    let source_closure = value.closure
+    if source_closure != none: closure = closure_base + source_closure
+    var implementation = value.implementation
+    match value.implementation:
+        Defined(body): implementation = HirFunctionImplementation.Defined(body = try arena.import_node_run(body))
+        ExportedC(body): implementation = HirFunctionImplementation.ExportedC(body = try arena.import_node_run(body))
+        ExternalC(contract): implementation = HirFunctionImplementation.ExternalC(contract = import_c_contract(remap, contract))
+    return HirFunction(
+        symbol = symbol(remap, value.symbol), module = module(remap, value.module),
+        name = value.name, is_public = value.is_public, documentation = value.documentation,
+        receiver = import_receiver(remap, value.receiver), closure = closure,
+        parameters = try import_parameters(remap, value.parameters, arena),
+        result = import_type_id(remap, value.result), implementation = implementation,
+        span = value.span,
+    )
+
+func import_c_contract(remap: HirImportMap, value: HirCFunction) -> HirCFunction:
+    let slots = list[HirCSlot]()
+    for slot in value.slots:
+        match slot:
+            Input(parameter): slots.append(HirCSlot.Input(parameter = parameter))
+            Output(name, value_type): slots.append(HirCSlot.Output(name = name, value_type = import_type_id(remap, value_type)))
+    return HirCFunction(
+        is_blocking = value.is_blocking, slots = slots,
+        declared_result = import_type_id(remap, value.declared_result),
+    )
+
+# mark: Retained generics ======================================================================
+
+func import_generic_functions(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirGenericFunction]!:
+    let values = list[HirGenericFunction]()
+    for value in destination.generic_functions: values.append(value)
+    for value in source.generic_functions:
+        let arena = HirArenaImporter(create_hir_body_arena(), value.body.arena, remap, 0)
+        try arena.import_all()
+        let defaults = list[NodeId]()
+        for default_value in value.body.defaults: defaults.append(try arena.import_optional_node(default_value))
+        let local_symbols = list[SymbolId]()
+        for local in value.body.local_symbols: local_symbols.append(symbol(remap, local))
+        let closures = list[HirClosure]()
+        for closure in value.body.closures: closures.append(import_closure(remap, closure))
+        let shared_cells = list[SymbolId]()
+        for shared in value.body.shared_cells: shared_cells.append(symbol(remap, shared))
+        let generated_functions = list[HirFunction]()
+        for generated in value.body.generated_functions:
+            generated_functions.append(try import_function(remap, generated, arena, 0))
+        let body = HirGenericBody(
+            arena = arena.arena,
+            body = try arena.import_node_run(value.body.body),
+            defaults = defaults,
+            local_symbols = local_symbols,
+            closures = closures,
+            shared_cells = shared_cells,
+            generated_functions = generated_functions,
+        )
+        values.append(HirGenericFunction(
+            symbol = symbol(remap, value.symbol), module = module(remap, value.module),
+            name = value.name, is_public = value.is_public, documentation = value.documentation,
+            receiver = import_receiver(remap, value.receiver),
+            generic_id = import_generic_id(remap, value.generic_id),
+            owner_parameter_count = value.owner_parameter_count,
+            type_parameters = import_type_parameters(remap, value.type_parameters),
+            parameters = try import_parameters(remap, value.parameters, arena),
+            result = import_type_id(remap, value.result), body = body, span = value.span,
+        ))
+    return values
+
+func import_generic_instances(destination: HirProgram, source: HirProgram, remap: HirImportMap) -> list[HirGenericInstance]:
+    let values = list[HirGenericInstance]()
+    for value in destination.generic_instances: values.append(value)
+    for value in source.generic_instances:
+        let arguments = list[TypeId]()
+        for argument in value.arguments: arguments.append(import_type_id(remap, argument))
+        var parent: u32? = none
+        let source_parent = value.parent
+        if source_parent != none: parent = u32(remap.generic_instance_offset) + source_parent
+        values.append(HirGenericInstance(
+            generic = u32(remap.generic_offset) + value.generic,
+            function = symbol(remap, value.function), arguments = arguments,
+            origin_module = module(remap, value.origin_module), origin_span = value.origin_span,
+            parent = parent, checked_nodes = value.checked_nodes, check_time_ms = value.check_time_ms,
+        ))
+    return values
+
+# mark: Shared signatures and arenas ============================================================
+
+func import_parameters(remap: HirImportMap, source: list[HirParameter], arena: HirArenaImporter) -> list[HirParameter]!:
+    let values = list[HirParameter]()
+    for value in source:
+        values.append(HirParameter(
+            symbol = symbol(remap, value.symbol), name = value.name,
+            value_type = import_type_id(remap, value.value_type),
+            default_value = try arena.import_optional_node(value.default_value),
+        ))
+    return values
+
+func import_type_parameters(remap: HirImportMap, source: list[HirTypeParameter]) -> list[HirTypeParameter]:
+    let values = list[HirTypeParameter]()
+    for value in source:
+        let constraints = list[TypeId]()
+        for constraint in value.constraints: constraints.append(import_type_id(remap, constraint))
+        values.append(HirTypeParameter(
+            name = value.name, value_type = import_type_id(remap, value.value_type),
+            constraints = constraints,
+        ))
+    return values
+
+func import_receiver(remap: HirImportMap, source: HirReceiver?) -> HirReceiver?:
+    if source == none: return none
+    return HirReceiver(owner = import_type_id(remap, source.owner), kind = source.kind)
+
+func declaration_generic_id(remap: HirImportMap, value: u32, parameters: list[HirTypeParameter]) -> u32:
+    if len(parameters) == 0: return value
+    return import_generic_id(remap, value)
+
+func copy_program_arena(program: HirProgram) -> HirBodyArena:
+    let arena = create_hir_body_arena()
+    for value in program.nodes: arena.nodes.append(value)
+    for value in program.node_types: arena.node_types.append(value)
+    for value in program.node_modules: arena.node_modules.append(value)
+    for value in program.node_spans: arena.node_spans.append(value)
+    for value in program.extra: arena.extra.append(value)
+    for value in program.values: arena.values.append(value)
+    return arena
+
+func program_arena(program: HirProgram) -> HirBodyArena:
+    return HirBodyArena(
+        nodes = program.nodes, node_types = program.node_types,
+        node_modules = program.node_modules, node_spans = program.node_spans,
+        extra = program.extra, values = program.values,
+    )
+
+func copy_runtime_bindings(program: HirProgram) -> list[HirRuntimeBinding]:
+    let values = list[HirRuntimeBinding]()
+    for value in program.runtime_bindings: values.append(value)
+    return values
+
+func symbol(remap: HirImportMap, value: SymbolId) -> SymbolId:
+    return SymbolId(value = import_symbol_id(remap, value.value))
+
+func module(remap: HirImportMap, value: ModuleId) -> ModuleId:
+    return ModuleId(value = import_module_id(remap, value.value))
