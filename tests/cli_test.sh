@@ -59,7 +59,7 @@ expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure"
 expect 1 "cannot read" "$cli" check --package org.luce.tests "$test_dir/missing.luc"
 expect 1 "expected \`i64\`, found \`bool\`" "$cli" check --package org.luce.tests "$test_dir/wrong.luc"
 expect 1 "generic specialization budget of 2 was exceeded" "$cli" check --package org.luce.tests --generic-specializations 2 examples/generic_functions.luc
-expect 0 "generic specializations for \`org.luce.tests\`: 4/4" "$cli" explain --package org.luce.tests --generic-specializations 4 examples/generic_functions.luc
+expect 0 "generic specializations for \`org.luce.tests\`: 5/5" "$cli" explain --package org.luce.tests --generic-specializations 5 examples/generic_functions.luc
 expect 0 "expansion path:" "$cli" explain --package org.luce.tests examples/generic_functions.luc
 
 expect 0 "5" "$cli" run --package org.luce.tests main.main "$test_dir/main.luc"
@@ -68,7 +68,7 @@ expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luc
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests other.main "$test_dir/main.luc"
 
 expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --generic-specializations 4 --time-report --runtime src/runtime/allocator.native.luc "$test_dir/generic.wasm" examples/generic_functions.luc
+expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --generic-specializations 5 --time-report --runtime src/runtime/allocator.native.luc "$test_dir/generic.wasm" examples/generic_functions.luc
 expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --runtime src/runtime/allocator.native.luc "$test_dir/strings.wasm" examples/strings.luc
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" build --package org.luce.tests --runtime src/runtime/allocator.native.luc "$test_dir/shared.wasm" "$test_dir/shared.luc"
 expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --target native "$test_dir/out" examples/compiled_core/main.luc
@@ -79,7 +79,7 @@ if [ "$native_output" != "Hello, world!" ]; then
     echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
     exit 1
 fi
-expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --generic-specializations 4 --time-report --target native --runtime src/runtime/allocator.native.luc "$test_dir/generic-native" examples/generic_functions.luc
+expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --generic-specializations 5 --time-report --target native --runtime src/runtime/allocator.native.luc "$test_dir/generic-native" examples/generic_functions.luc
 
 # A host-tool failure must preserve an existing destination and report the
 # tool that failed. An empty PATH makes qbe unavailable without relying on the

@@ -780,13 +780,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   metadata; canonical package types and symbols remain shared identities.
   HIR-only deferred calls retain resolved generic declarations, inferred type
   arguments, placed operands, and conformance requirement positions; neither
-  source syntax nor spelling enters the contract. The next step is one HIR
-  specializer that substitutes canonical `TypeId`s, remaps template-local
-  symbols and closures, resolves those calls, and emits ordinary concrete
-  `HirFunction`s before MIR, replacing the current concrete source recheck.
-  Then serialize/decode retained bodies, remap package-local semantic
-  identities once during import, and prove dependency-origin specialization
-  through a real multi-package QBE build. No generic form may reach MIR.
+  source syntax nor spelling enters the contract. One focused HIR specializer
+  now substitutes canonical `TypeId`s, remaps template-local symbols and
+  closures, resolves deferred calls/conformances, and emits only ordinary
+  concrete `HirFunction`s before MIR. Concrete `FunctionSymbol`s carry a
+  closed source-less variant, and the former span-indexed source replay path is
+  gone. The next step is to serialize/decode retained bodies, remap
+  package-local semantic identities once during import, and prove
+  dependency-origin specialization through a real multi-package QBE build.
+  No generic form may reach MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it

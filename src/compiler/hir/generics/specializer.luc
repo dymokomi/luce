@@ -1,0 +1,466 @@
+#==============================================================================================
+#
+#   generic_specializer - Retained typed HIR into executable HIR
+#
+#   DESCRIPTION:
+#       Substitutes one abstract generic body without revisiting source syntax.
+#       Types remain canonical program identities; template-local symbols,
+#       closure indexes, nodes, operands, and values receive executable
+#       identities. Template-only calls are resolved through the generic and
+#       conformance owner before the resulting ordinary HIR reaches MIR.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.hir.generation_model import FunctionSymbol, HirGenerationState, HirSemanticChecker
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, HirCapture, HirClosure, HirFunction, HirFunctionImplementation, HirGenericBody, HirGenericCallKind, HirIteration, HirNode, HirNodeForm, HirParameter, HirReceiver, ModuleId, NodeId, Operands, SymbolId, SymbolKind, TypeId, UnaryOperation, no_node
+from compiler.hir.ir import place_element_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step
+
+# mark: Resolution boundary ===================================================================
+
+## The graph copier owns no declaration lookup or monomorphization policy.
+## Those operations remain with the generic/declaration owners and are exposed
+## here only by stable semantic identities.
+pub interface GenericSpecializationResolver:
+    func instantiate_for_specializer(semantics: HirSemanticChecker, generic: u32, arguments: list[TypeId], span: SourceSpan) -> i64!
+    func conformance_for_specializer(semantics: HirSemanticChecker, value_type: TypeId, interface_type: TypeId, span: SourceSpan) -> i64!
+
+# mark: Specialization transaction ============================================================
+
+## Coordinates one specialization while the recursive copier owns the graph
+## walk. Defaults use the same copier with their declaration's substitution
+## environment but no local-symbol or closure publication.
+pub class HirGenericSpecializer:
+    let state: HirGenerationState
+
+    pub init(state: HirGenerationState):
+        self.state = state
+
+    pub func specialize_defaults(resolver: GenericSpecializationResolver, semantics: HirSemanticChecker, generic_index: i64, arguments: list[TypeId]) -> list[NodeId]!:
+        let generic = self.state.generic_functions[generic_index]
+        let body = generic.body else trap("generic defaults lost their retained body")
+        let context = SpecializationContext(
+            self.state,
+            resolver,
+            semantics,
+            body,
+            generic.generic_id,
+            arguments,
+            u32(len(self.state.closures)),
+        )
+        let defaults = list[NodeId]()
+        for value in body.defaults:
+            defaults.append(try context.clone_optional_node(value))
+        return defaults
+
+    pub func specialize_function(resolver: GenericSpecializationResolver, semantics: HirSemanticChecker, function: FunctionSymbol) -> HirFunction!:
+        if function.generic_instance < 0: trap("ordinary function reached generic specializer")
+        let instance = self.state.generic_instances[function.generic_instance]
+        let generic = self.state.generic_functions[instance.generic_index]
+        let body = generic.body else trap("generic instance lost its retained body")
+        let closure_base = u32(len(self.state.closures))
+        let context = SpecializationContext(
+            self.state,
+            resolver,
+            semantics,
+            body,
+            generic.generic_id,
+            instance.arguments,
+            closure_base,
+        )
+
+        context.bind_symbol(generic.signature.symbol, function.symbol)
+        if len(generic.signature.parameters) != len(function.parameters): trap("specialized parameter count changed")
+        for index in range(0, len(function.parameters)):
+            context.bind_symbol(generic.signature.parameters[index].symbol, function.parameters[index].symbol)
+
+        # Allocate every template-local identity before cloning any graph edge.
+        # This permits nested closures and mutually referring generated bodies
+        # to use one O(1) symbol remap regardless of traversal order.
+        for source_id in body.local_symbols:
+            let source = self.state.symbols[source_id.value]
+            var name = source.name
+            if source.kind == SymbolKind.function:
+                name = name + "$generic" + str(function.generic_instance)
+            let mapped = self.state.make_symbol(name, source.kind, context.specialize_type(source.value_type))
+            context.bind_symbol(source_id, mapped)
+
+        for source in body.closures:
+            let captures = list[HirCapture]()
+            for capture in source.captures:
+                var captured_source: SymbolId? = none
+                let source_symbol = capture.source
+                if source_symbol != none:
+                    captured_source = context.map_symbol(source_symbol)
+                captures.append(HirCapture(
+                    symbol = context.map_symbol(capture.symbol),
+                    source = captured_source,
+                    value_type = context.specialize_type(capture.value_type),
+                    kind = capture.kind,
+                    span = capture.span,
+                ))
+            self.state.closures.append(HirClosure(
+                function = context.map_symbol(source.function),
+                captures = captures,
+                span = source.span,
+            ))
+
+        for source in body.shared_cells:
+            self.state.mark_shared_cell(context.map_symbol(source))
+
+        let executable_body = try context.clone_node_run(body.body)
+        for generated in body.generated_functions:
+            self.state.generated_functions.append(try self.clone_generated_function(context, generated, closure_base))
+
+        return HirFunction(
+            symbol = function.symbol,
+            module = ModuleId(value = u32(generic.module_index)),
+            name = function.name,
+            is_public = function.is_public,
+            documentation = function.documentation,
+            receiver = function.receiver,
+            closure = none,
+            parameters = function.parameters,
+            result = function.result,
+            implementation = HirFunctionImplementation.Defined(body = executable_body),
+            span = function.span,
+        )
+
+    func clone_generated_function(context: SpecializationContext, source: HirFunction, closure_base: u32) -> HirFunction!:
+        let parameters = list[HirParameter]()
+        for parameter in source.parameters:
+            parameters.append(HirParameter(
+                symbol = context.map_symbol(parameter.symbol),
+                name = parameter.name,
+                value_type = context.specialize_type(parameter.value_type),
+                default_value = try context.clone_optional_node(parameter.default_value),
+            ))
+        var receiver: HirReceiver? = none
+        let source_receiver = source.receiver
+        if source_receiver != none:
+            let concrete = source_receiver
+            receiver = HirReceiver(owner = context.specialize_type(concrete.owner), kind = concrete.kind)
+        var closure: u32? = none
+        let source_closure = source.closure
+        if source_closure != none: closure = closure_base + source_closure
+        var implementation = HirFunctionImplementation.Defined(body = Operands(start = 0, count = 0))
+        match source.implementation:
+            Defined(body): implementation = HirFunctionImplementation.Defined(body = try context.clone_node_run(body))
+            ExportedC(body): trap("generated generic closure cannot be exported to C")
+            ExternalC(contract): trap("generated generic closure cannot be external C")
+        let symbol = context.map_symbol(source.symbol)
+        return HirFunction(
+            symbol = symbol,
+            module = source.module,
+            name = self.state.symbols[symbol.value].name,
+            is_public = false,
+            documentation = source.documentation,
+            receiver = receiver,
+            closure = closure,
+            parameters = parameters,
+            result = context.specialize_type(source.result),
+            implementation = implementation,
+            span = source.span,
+        )
+
+# mark: Recursive graph copier ================================================================
+
+class SpecializationContext:
+    let state: HirGenerationState
+    let resolver: GenericSpecializationResolver
+    let semantics: HirSemanticChecker
+    let body: HirGenericBody
+    let generic_id: u32
+    let arguments: list[TypeId]
+    let closure_base: u32
+    let symbol_map: list[SymbolId]
+    let node_map: list[NodeId]
+    let value_map: list[u32]
+
+    init(state: HirGenerationState, resolver: GenericSpecializationResolver, semantics: HirSemanticChecker, body: HirGenericBody, generic_id: u32, arguments: list[TypeId], closure_base: u32):
+        self.state = state
+        self.resolver = resolver
+        self.semantics = semantics
+        self.body = body
+        self.generic_id = generic_id
+        self.arguments = arguments
+        self.closure_base = closure_base
+        self.symbol_map = list[SymbolId]()
+        for symbol in state.symbols: self.symbol_map.append(symbol.id)
+        self.node_map = list[NodeId]()
+        for node in body.arena.nodes: self.node_map.append(NodeId(value = no_node))
+        self.value_map = list[u32]()
+        for value in body.arena.values: self.value_map.append(no_node)
+
+    func bind_symbol(source: SymbolId, destination: SymbolId):
+        if i64(source.value) >= len(self.symbol_map): trap("template-local symbol is outside specialization map")
+        self.symbol_map[source.value] = destination
+
+    func map_symbol(source: SymbolId) -> SymbolId:
+        if i64(source.value) >= len(self.symbol_map): return source
+        return self.symbol_map[source.value]
+
+    func specialize_type(source: TypeId) -> TypeId:
+        return self.state.substitute_type(source, self.generic_id, self.arguments)
+
+    func clone_optional_node(source: NodeId) -> NodeId!:
+        if source.value == no_node: return source
+        return try self.clone_node(source)
+
+    func clone_node(source: NodeId) -> NodeId!:
+        let existing = self.node_map[source.value]
+        if existing.value != no_node: return existing
+        let arena = self.body.arena
+        let span = arena.node_spans[source.value]
+        var form = HirNodeForm.NoneLiteral
+        match arena.nodes[source.value].form:
+            BreakStatement: form = HirNodeForm.BreakStatement
+            ContinueStatement: form = HirNodeForm.ContinueStatement
+            Binding(symbol, is_mutable, value): form = HirNodeForm.Binding(symbol = self.map_symbol(symbol), is_mutable = is_mutable, value = try self.clone_node(value))
+            Assignment(symbol, operation, value): form = HirNodeForm.Assignment(symbol = self.map_symbol(symbol), operation = self.clone_assignment(operation), value = try self.clone_node(value))
+            ExternStore(variable, operation, value): form = HirNodeForm.ExternStore(variable = variable, operation = self.clone_assignment(operation), value = try self.clone_node(value))
+            GlobalStore(global, operation, value): form = HirNodeForm.GlobalStore(global = global, operation = self.clone_assignment(operation), value = try self.clone_node(value))
+            PlaceAssignment(symbol, steps, operation, value): form = HirNodeForm.PlaceAssignment(symbol = self.map_symbol(symbol), steps = try self.clone_place_steps(steps), operation = self.clone_assignment(operation), value = try self.clone_node(value))
+            GlobalPlaceAssignment(global, steps, operation, value): form = HirNodeForm.GlobalPlaceAssignment(global = global, steps = try self.clone_place_steps(steps), operation = self.clone_assignment(operation), value = try self.clone_node(value))
+            PrintText(value): form = HirNodeForm.PrintText(value = value)
+            PrintValue(value): form = HirNodeForm.PrintValue(value = try self.clone_node(value))
+            ReturnStatement(value): form = HirNodeForm.ReturnStatement(value = try self.clone_optional_node(value))
+            RecoverStatement(value): form = HirNodeForm.RecoverStatement(value = try self.clone_optional_node(value))
+            DeferStatement(action): form = HirNodeForm.DeferStatement(action = try self.clone_node(action))
+            ExpressionStatement(value): form = HirNodeForm.ExpressionStatement(value = try self.clone_node(value))
+            IfStatement(branches, has_fallback, fallback): form = HirNodeForm.IfStatement(branches = try self.clone_if_branches(branches), has_fallback = has_fallback, fallback = try self.clone_node_run(fallback))
+            WhileStatement(condition, body): form = HirNodeForm.WhileStatement(condition = try self.clone_node(condition), body = try self.clone_node_run(body))
+            ForStatement(symbol, iteration, body): form = HirNodeForm.ForStatement(symbol = self.map_symbol(symbol), iteration = try self.clone_iteration(iteration), body = try self.clone_node_run(body))
+            Constant(value): form = HirNodeForm.Constant(value = self.clone_value(value))
+            Reference(symbol): form = HirNodeForm.Reference(symbol = self.map_symbol(symbol))
+            ExternLoad(variable): form = HirNodeForm.ExternLoad(variable = variable)
+            GlobalLoad(global): form = HirNodeForm.GlobalLoad(global = global)
+            NativeLoad(pointer): form = HirNodeForm.NativeLoad(pointer = try self.clone_node(pointer))
+            NativeStore(pointer, value): form = HirNodeForm.NativeStore(pointer = try self.clone_node(pointer), value = try self.clone_node(value))
+            NativeAdvance(pointer, count): form = HirNodeForm.NativeAdvance(pointer = try self.clone_node(pointer), count = try self.clone_node(count))
+            NativeRebind(pointer): form = HirNodeForm.NativeRebind(pointer = try self.clone_node(pointer))
+            NativeMove(destination, moved_source, count): form = HirNodeForm.NativeMove(destination = try self.clone_node(destination), source = try self.clone_node(moved_source), count = try self.clone_node(count))
+            NativeAllocate(element_type, count): form = HirNodeForm.NativeAllocate(element_type = self.specialize_type(element_type), count = try self.clone_node(count))
+            NativeDeallocate(pointer, element_type, count): form = HirNodeForm.NativeDeallocate(pointer = try self.clone_node(pointer), element_type = self.specialize_type(element_type), count = try self.clone_node(count))
+            NativeIsNull(pointer): form = HirNodeForm.NativeIsNull(pointer = try self.clone_node(pointer))
+            NativeIsSame(left, right): form = HirNodeForm.NativeIsSame(left = try self.clone_node(left), right = try self.clone_node(right))
+            NativeAddressHash(pointer): form = HirNodeForm.NativeAddressHash(pointer = try self.clone_node(pointer))
+            NativeFloatBits(value): form = HirNodeForm.NativeFloatBits(value = try self.clone_node(value))
+            NativeArena(end): form = HirNodeForm.NativeArena(end = try self.clone_node(end))
+            NumericConvert(value): form = HirNodeForm.NumericConvert(value = try self.clone_node(value))
+            Discard(value): form = HirNodeForm.Discard(value = try self.clone_node(value))
+            NeverCoercion(value): form = HirNodeForm.NeverCoercion(value = try self.clone_node(value))
+            DivergingSequence(values): form = HirNodeForm.DivergingSequence(values = try self.clone_node_run(values))
+            StringScalarCount(value): form = HirNodeForm.StringScalarCount(value = try self.clone_node(value))
+            BuiltinDisplay(value): form = HirNodeForm.BuiltinDisplay(value = try self.clone_node(value))
+            FormattedString(parts): form = HirNodeForm.FormattedString(parts = try self.clone_node_run(parts))
+            Hash(value): form = HirNodeForm.Hash(value = try self.clone_node(value))
+            SequenceLength(value): form = HirNodeForm.SequenceLength(value = try self.clone_node(value))
+            SequenceIndex(value, index): form = HirNodeForm.SequenceIndex(value = try self.clone_node(value), index = try self.clone_node(index))
+            Unary(operation, operand): form = HirNodeForm.Unary(operation = self.clone_unary(operation), operand = try self.clone_node(operand))
+            Binary(left, operation, right): form = HirNodeForm.Binary(left = try self.clone_node(left), operation = self.clone_binary(operation), right = try self.clone_node(right))
+            Conditional(value, condition, alternative): form = HirNodeForm.Conditional(value = try self.clone_node(value), condition = try self.clone_node(condition), alternative = try self.clone_node(alternative))
+            Range(lower, upper, inclusive): form = HirNodeForm.Range(lower = try self.clone_node(lower), upper = try self.clone_node(upper), inclusive = inclusive)
+            Call(function, call_arguments): form = HirNodeForm.Call(function = self.map_symbol(function), arguments = try self.clone_placed_run(call_arguments))
+            GenericCall(generic, type_arguments, call_arguments, kind):
+                let placed = try self.clone_placed_run(call_arguments)
+                let concrete_arguments = self.specialize_type_arguments(type_arguments)
+                let function_index = try self.resolver.instantiate_for_specializer(self.semantics, generic, concrete_arguments, span)
+                let target = self.state.functions[function_index].symbol
+                if kind == HirGenericCallKind.initializer:
+                    form = HirNodeForm.Initialize(function = target, arguments = placed)
+                else:
+                    form = HirNodeForm.Call(function = target, arguments = placed)
+            GenericFunctionAddress(generic, type_arguments):
+                let function_index = try self.resolver.instantiate_for_specializer(self.semantics, generic, self.specialize_type_arguments(type_arguments), span)
+                form = HirNodeForm.FunctionAddress(function = self.state.functions[function_index].symbol)
+            GenericDefaultArgument(generic, parameter, type_arguments):
+                let function_index = try self.resolver.instantiate_for_specializer(self.semantics, generic, self.specialize_type_arguments(type_arguments), span)
+                let value = self.state.functions[function_index].parameters[parameter].default_value
+                if value.value == no_node: trap("retained generic default disappeared during specialization")
+                self.node_map[source.value] = value
+                return value
+            GenericRequirementCall(interface_type, requirement, call_arguments):
+                let placed = try self.clone_placed_run(call_arguments)
+                let receiver = self.placed_receiver(placed)
+                let concrete_interface = self.specialize_type(interface_type)
+                let conformance = try self.resolver.conformance_for_specializer(self.semantics, self.state.type_of(receiver), concrete_interface, span)
+                if conformance < 0: trap("validated generic requirement has no concrete conformance")
+                let target = self.state.conformances[conformance].implementations[requirement]
+                form = HirNodeForm.Call(function = target, arguments = placed)
+            InterfaceValue(value, conformance):
+                let concrete_value = try self.clone_node(value)
+                let concrete_interface = self.specialize_type(arena.node_types[source.value])
+                let concrete_conformance = try self.resolver.conformance_for_specializer(self.semantics, self.state.type_of(concrete_value), concrete_interface, span)
+                if concrete_conformance < 0: trap("validated generic existential has no concrete conformance")
+                form = HirNodeForm.InterfaceValue(value = concrete_value, conformance = u32(concrete_conformance))
+            InterfaceCall(receiver, interface_type, requirement, call_arguments): form = HirNodeForm.InterfaceCall(receiver = try self.clone_node(receiver), interface_type = self.specialize_type(interface_type), requirement = requirement, arguments = try self.clone_placed_run(call_arguments))
+            FunctionAddress(function): form = HirNodeForm.FunctionAddress(function = self.map_symbol(function))
+            ClosureValue(closure, initializers): form = HirNodeForm.ClosureValue(closure = self.closure_base + closure, initializers = try self.clone_node_run(initializers))
+            WeakCaptureReference(symbol): form = HirNodeForm.WeakCaptureReference(symbol = self.map_symbol(symbol))
+            IndirectCall(callee, call_arguments): form = HirNodeForm.IndirectCall(callee = try self.clone_node(callee), arguments = try self.clone_node_run(call_arguments))
+            Initialize(function, call_arguments): form = HirNodeForm.Initialize(function = self.map_symbol(function), arguments = try self.clone_placed_run(call_arguments))
+            ErrorCodeLiteral(package, value): form = HirNodeForm.ErrorCodeLiteral(package = package, value = value)
+            Raise(code, message): form = HirNodeForm.Raise(code = try self.clone_node(code), message = try self.clone_node(message))
+            Trap(message): form = HirNodeForm.Trap(message = try self.clone_node(message))
+            Assert(condition, message): form = HirNodeForm.Assert(condition = try self.clone_node(condition), message = try self.clone_node(message))
+            Try(value): form = HirNodeForm.Try(value = try self.clone_node(value))
+            Catch(value, failure, catch_body): form = HirNodeForm.Catch(value = try self.clone_node(value), failure = self.map_symbol(failure), body = try self.clone_node_run(catch_body))
+            Tuple(elements): form = HirNodeForm.Tuple(elements = try self.clone_node_run(elements))
+            Array(elements): form = HirNodeForm.Array(elements = try self.clone_node_run(elements))
+            List(elements): form = HirNodeForm.List(elements = try self.clone_node_run(elements))
+            ListCopy(value): form = HirNodeForm.ListCopy(value = try self.clone_node(value))
+            ListWithMutableSlice(value, callback): form = HirNodeForm.ListWithMutableSlice(value = try self.clone_node(value), callback = try self.clone_node(callback))
+            SequenceSlice(value, start, end): form = HirNodeForm.SequenceSlice(value = try self.clone_node(value), start = try self.clone_optional_node(start), end = try self.clone_optional_node(end))
+            ListAppend(value, element): form = HirNodeForm.ListAppend(value = try self.clone_node(value), element = try self.clone_node(element))
+            ListInsert(value, index, element): form = HirNodeForm.ListInsert(value = try self.clone_node(value), index = try self.clone_node(index), element = try self.clone_node(element))
+            ListRemoveAt(value, index): form = HirNodeForm.ListRemoveAt(value = try self.clone_node(value), index = try self.clone_node(index))
+            ListClear(value): form = HirNodeForm.ListClear(value = try self.clone_node(value))
+            ListReserve(value, minimum_capacity): form = HirNodeForm.ListReserve(value = try self.clone_node(value), minimum_capacity = try self.clone_node(minimum_capacity))
+            Map(entries): form = HirNodeForm.Map(entries = try self.clone_node_run(entries))
+            Set(elements): form = HirNodeForm.Set(elements = try self.clone_node_run(elements))
+            MapLookup(value, key): form = HirNodeForm.MapLookup(value = try self.clone_node(value), key = try self.clone_node(key))
+            MapRemove(value, key): form = HirNodeForm.MapRemove(value = try self.clone_node(value), key = try self.clone_node(key))
+            MapClear(value): form = HirNodeForm.MapClear(value = try self.clone_node(value))
+            MapReserve(value, minimum_capacity): form = HirNodeForm.MapReserve(value = try self.clone_node(value), minimum_capacity = try self.clone_node(minimum_capacity))
+            MapCopy(value): form = HirNodeForm.MapCopy(value = try self.clone_node(value))
+            SetContains(value, element): form = HirNodeForm.SetContains(value = try self.clone_node(value), element = try self.clone_node(element))
+            SetInsert(value, element): form = HirNodeForm.SetInsert(value = try self.clone_node(value), element = try self.clone_node(element))
+            SetRemove(value, element): form = HirNodeForm.SetRemove(value = try self.clone_node(value), element = try self.clone_node(element))
+            SetClear(value): form = HirNodeForm.SetClear(value = try self.clone_node(value))
+            SetReserve(value, minimum_capacity): form = HirNodeForm.SetReserve(value = try self.clone_node(value), minimum_capacity = try self.clone_node(minimum_capacity))
+            SetCopy(value): form = HirNodeForm.SetCopy(value = try self.clone_node(value))
+            WeakCreate(value): form = HirNodeForm.WeakCreate(value = try self.clone_node(value))
+            WeakGet(value): form = HirNodeForm.WeakGet(value = try self.clone_node(value))
+            Element(value, index): form = HirNodeForm.Element(value = try self.clone_node(value), index = index)
+            StructValue(struct_index, fields): form = HirNodeForm.StructValue(struct_index = struct_index, fields = try self.clone_placed_run(fields))
+            FieldAccess(value, field): form = HirNodeForm.FieldAccess(value = try self.clone_node(value), field = field)
+            NoneLiteral: form = HirNodeForm.NoneLiteral
+            Some(value): form = HirNodeForm.Some(value = try self.clone_node(value))
+            ElseFallback(value, arm): form = HirNodeForm.ElseFallback(value = try self.clone_node(value), arm = try self.clone_node(arm))
+            EnumValue(enum_index, case_index, payload): form = HirNodeForm.EnumValue(enum_index = enum_index, case_index = case_index, payload = try self.clone_placed_run(payload))
+            Match(subject, arms, has_result): form = HirNodeForm.Match(subject = try self.clone_node(subject), arms = try self.clone_node_run(arms), has_result = has_result)
+            MatchArm(patterns, statements, value): form = HirNodeForm.MatchArm(patterns = try self.clone_node_run(patterns), statements = try self.clone_node_run(statements), value = try self.clone_optional_node(value))
+            PatternWildcard: form = HirNodeForm.PatternWildcard
+            PatternLiteral(value): form = HirNodeForm.PatternLiteral(value = self.clone_value(value))
+            PatternRange(lower, upper, inclusive): form = HirNodeForm.PatternRange(lower = self.clone_value(lower), upper = self.clone_value(upper), inclusive = inclusive)
+            PatternCase(case_index, bindings): form = HirNodeForm.PatternCase(case_index = case_index, bindings = self.clone_symbol_run(bindings))
+
+        let destination = NodeId(value = u32(len(self.state.arena.nodes)))
+        self.state.arena.nodes.append(HirNode(form = form))
+        self.state.arena.node_types.append(self.specialize_type(arena.node_types[source.value]))
+        self.state.arena.node_modules.append(arena.node_modules[source.value])
+        self.state.arena.node_spans.append(span)
+        self.node_map[source.value] = destination
+        return destination
+
+    # mark: Operand and operation remapping ====================================================
+
+    func clone_node_run(source: Operands) -> Operands!:
+        let entries = list[u32]()
+        for index in range(0, i64(source.count)):
+            entries.append((try self.clone_optional_node(NodeId(value = self.body.arena.extra[i64(source.start) + index]))).value)
+        return self.state.push_run(entries)
+
+    func clone_placed_run(source: Operands) -> Operands!:
+        let entries = list[u32]()
+        for pair in range(0, i64(source.count) // 2):
+            entries.append(self.body.arena.extra[i64(source.start) + pair * 2])
+            entries.append((try self.clone_node(NodeId(value = self.body.arena.extra[i64(source.start) + pair * 2 + 1]))).value)
+        return self.state.push_run(entries)
+
+    func clone_symbol_run(source: Operands) -> Operands:
+        let entries = list[u32]()
+        for index in range(0, i64(source.count)):
+            entries.append(self.map_symbol(SymbolId(value = self.body.arena.extra[i64(source.start) + index])).value)
+        return self.state.push_run(entries)
+
+    func clone_if_branches(source: Operands) -> Operands!:
+        let entries = list[u32]()
+        for branch in range(0, i64(source.count) // 3):
+            let offset = i64(source.start) + branch * 3
+            let condition = try self.clone_node(NodeId(value = self.body.arena.extra[offset]))
+            let suite = try self.clone_node_run(Operands(start = self.body.arena.extra[offset + 1], count = self.body.arena.extra[offset + 2]))
+            entries.append(condition.value)
+            entries.append(suite.start)
+            entries.append(suite.count)
+        return self.state.push_run(entries)
+
+    func clone_place_steps(source: Operands) -> Operands!:
+        let entries = list[u32]()
+        for pair in range(0, i64(source.count) // 2):
+            let offset = i64(source.start) + pair * 2
+            let kind = self.body.arena.extra[offset]
+            var payload = self.body.arena.extra[offset + 1]
+            if kind == place_element_step or kind == place_list_element_step or kind == place_map_element_step or kind == place_mutable_slice_element_step:
+                payload = (try self.clone_node(NodeId(value = payload))).value
+            entries.append(kind)
+            entries.append(payload)
+        return self.state.push_run(entries)
+
+    func specialize_type_arguments(source: Operands) -> list[TypeId]:
+        let concrete = list[TypeId]()
+        for index in range(0, i64(source.count)):
+            concrete.append(self.specialize_type(TypeId(value = self.body.arena.extra[i64(source.start) + index])))
+        return concrete
+
+    func placed_receiver(arguments: Operands) -> NodeId:
+        for pair in range(0, i64(arguments.count) // 2):
+            let offset = i64(arguments.start) + pair * 2
+            if self.state.arena.extra[offset] == 0:
+                return NodeId(value = self.state.arena.extra[offset + 1])
+        trap("generic requirement call has no receiver")
+
+    func clone_iteration(source: HirIteration) -> HirIteration!:
+        match source:
+            Builtin(value): return HirIteration.Builtin(value = try self.clone_node(value))
+            Protocol(iterator_symbol, iterator, next):
+                return HirIteration.Protocol(
+                    iterator_symbol = self.map_symbol(iterator_symbol),
+                    iterator = try self.clone_node(iterator),
+                    next = try self.clone_node(next),
+                )
+
+    func clone_assignment(source: AssignmentOperation) -> AssignmentOperation:
+        match source:
+            Replace: return AssignmentOperation.Replace
+            Combine(operation): return AssignmentOperation.Combine(operation = self.clone_binary(operation))
+
+    func clone_unary(source: UnaryOperation) -> UnaryOperation:
+        match source:
+            LogicalNot: return UnaryOperation.LogicalNot
+            NumericIdentity(operand_type): return UnaryOperation.NumericIdentity(operand_type = self.specialize_type(operand_type))
+            NumericNegate(operand_type): return UnaryOperation.NumericNegate(operand_type = self.specialize_type(operand_type))
+            IntegerBitwiseNot(operand_type): return UnaryOperation.IntegerBitwiseNot(operand_type = self.specialize_type(operand_type))
+
+    func clone_binary(source: BinaryOperation) -> BinaryOperation:
+        match source:
+            LogicalAnd: return BinaryOperation.LogicalAnd
+            LogicalOr: return BinaryOperation.LogicalOr
+            Equal(operand_type): return BinaryOperation.Equal(operand_type = self.specialize_type(operand_type))
+            NotEqual(operand_type): return BinaryOperation.NotEqual(operand_type = self.specialize_type(operand_type))
+            Identity(operand_type): return BinaryOperation.Identity(operand_type = self.specialize_type(operand_type))
+            NotIdentity(operand_type): return BinaryOperation.NotIdentity(operand_type = self.specialize_type(operand_type))
+            Less(operand_type): return BinaryOperation.Less(operand_type = self.specialize_type(operand_type))
+            LessEqual(operand_type): return BinaryOperation.LessEqual(operand_type = self.specialize_type(operand_type))
+            Greater(operand_type): return BinaryOperation.Greater(operand_type = self.specialize_type(operand_type))
+            GreaterEqual(operand_type): return BinaryOperation.GreaterEqual(operand_type = self.specialize_type(operand_type))
+            Add(operand_type): return BinaryOperation.Add(operand_type = self.specialize_type(operand_type))
+            Subtract(operand_type): return BinaryOperation.Subtract(operand_type = self.specialize_type(operand_type))
+            Multiply(operand_type): return BinaryOperation.Multiply(operand_type = self.specialize_type(operand_type))
+            Divide(operand_type): return BinaryOperation.Divide(operand_type = self.specialize_type(operand_type))
+            FloorDivide(operand_type): return BinaryOperation.FloorDivide(operand_type = self.specialize_type(operand_type))
+            Remainder(operand_type): return BinaryOperation.Remainder(operand_type = self.specialize_type(operand_type))
+            BitwiseAnd(operand_type): return BinaryOperation.BitwiseAnd(operand_type = self.specialize_type(operand_type))
+            BitwiseOr(operand_type): return BinaryOperation.BitwiseOr(operand_type = self.specialize_type(operand_type))
+            BitwiseXor(operand_type): return BinaryOperation.BitwiseXor(operand_type = self.specialize_type(operand_type))
+            ShiftLeft(operand_type): return BinaryOperation.ShiftLeft(operand_type = self.specialize_type(operand_type))
+            ShiftRight(operand_type): return BinaryOperation.ShiftRight(operand_type = self.specialize_type(operand_type))
+
+    func clone_value(source: u32) -> u32:
+        let existing = self.value_map[source]
+        if existing != no_node: return existing
+        self.state.arena.values.append(self.body.arena.values[source])
+        let destination = u32(len(self.state.arena.values) - 1)
+        self.value_map[source] = destination
+        return destination

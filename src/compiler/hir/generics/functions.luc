@@ -15,7 +15,8 @@ from compiler.frontend.source import SourceSpan
 from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generics.inference import GenericInference
-from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, GenericFunctionTemplate, GenericRequirementUse, HirGenerationState, HirSemanticChecker, TypeBinding
+from compiler.hir.generics.specializer import GenericSpecializationResolver, HirGenericSpecializer
+from compiler.hir.generation_model import CollectedFunctionSource, FunctionSymbol, GenericFunctionInstance, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, TypeBinding
 from compiler.hir.ir import BuiltinType, HirClosure, HirFunction, HirGenericBody, HirGenericCallKind, HirInterfaceRequirement, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind, NodeId, Operands, SymbolId, SymbolKind, TypeForm, TypeId, function_body, no_node
 from compiler.hir.ir import create_hir_body_arena, resolve_builtin_type, types_match
 
@@ -47,16 +48,18 @@ struct GenericCallShape:
 
 ## Coordinates generic semantics with the ordinary body checker through the
 ## narrow operations that require expression or closure knowledge.
-pub class GenericFunctionChecker:
+pub class GenericFunctionChecker: GenericSpecializationResolver:
     let state: HirGenerationState
     let declarations: DeclarationCollector
     let inference: GenericInference
+    let specializer: HirGenericSpecializer
     var probing: bool
 
     pub init(state: HirGenerationState, declarations: DeclarationCollector):
         self.state = state
         self.declarations = declarations
         self.inference = GenericInference(state)
+        self.specializer = HirGenericSpecializer(state)
         self.probing = false
 
     # mark: Abstract declaration checking ======================================================
@@ -568,46 +571,24 @@ pub class GenericFunctionChecker:
         return try semantics.check_function_address_for_feature(try self.instantiate(semantics, generic_index, inferred, span), span, expected)
 
     ## Type-check a method selected from an abstract parameter's written
-    ## constraints. The abstract decision is retained by source identity and
-    ## replayed against the conformance during every concrete specialization.
+    ## constraints. Its exact interface and requirement position become one
+    ## template-only HIR node that the specializer resolves by identity.
     pub func check_requirement_call(semantics: HirSemanticChecker, owner_type: TypeId, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId?!:
-        if not self.probing and self.state.current_generic_origin >= 0:
-            let use = self.find_requirement_use(self.state.current_generic_origin, callee_span)
-            if use != none:
-                return try self.check_concrete_requirement_call(semantics, use, receiver, name, arguments, callee_span, span, expected)
         let resolved = try self.find_requirement(owner_type, name, callee_span)
         if resolved == none: return none
-        if self.probing and self.state.current_generic_origin >= 0:
-            self.state.generic_requirement_uses.append(GenericRequirementUse(
-                generic_index = self.state.current_generic_origin,
-                span = callee_span,
-                interface_type = resolved.interface_type,
-                requirement_index = resolved.requirement_index,
-            ))
         let abstract_result = self.interface_requirement_result(resolved.requirement, resolved.interface_type)
-        return try self.check_requirement_arguments(semantics, resolved.requirement, resolved.interface_type, resolved.requirement.symbol, abstract_result, receiver, name, arguments, callee_span, span, expected, none, resolved.requirement_index)
+        return try self.check_requirement_arguments(semantics, resolved.requirement, resolved.interface_type, resolved.requirement.symbol, abstract_result, receiver, name, arguments, callee_span, span, expected, resolved.requirement_index)
 
     ## Resolve a compiler-owned semantic operation against one exact written
     ## constraint. Source member syntax continues to use name lookup above;
     ## language syntax such as `for` must not become ambiguous merely because
     ## an unrelated constraint also declares a method named `iterator`.
     pub func check_selected_requirement_call(semantics: HirSemanticChecker, receiver: NodeId, interface_type: TypeId, requirement_index: u32, callee_span: SourceSpan, span: SourceSpan) -> NodeId!:
-        if not self.probing and self.state.current_generic_origin >= 0:
-            let use = self.find_requirement_use(self.state.current_generic_origin, callee_span)
-            if use == none: trap("specialized standard protocol call lost its abstract requirement")
-            return try self.check_concrete_requirement_call(semantics, use, receiver, "iterator", list[ArgumentSyntax](), callee_span, span, none)
         var interface_index = -1
         match self.state.types.definitions[interface_type.value].form:
             Interface(index, arguments): interface_index = index
             else: trap("selected generic requirement is not an interface")
         let requirement = self.state.interfaces[interface_index].requirements[requirement_index]
-        if self.probing and self.state.current_generic_origin >= 0:
-            self.state.generic_requirement_uses.append(GenericRequirementUse(
-                generic_index = self.state.current_generic_origin,
-                span = callee_span,
-                interface_type = interface_type,
-                requirement_index = i64(requirement_index),
-            ))
         let result = self.interface_requirement_result(requirement, interface_type)
         return try self.check_requirement_arguments(
             semantics,
@@ -621,36 +602,10 @@ pub class GenericFunctionChecker:
             callee_span,
             span,
             none,
-            none,
             i64(requirement_index),
         )
 
-    func check_concrete_requirement_call(semantics: HirSemanticChecker, use: GenericRequirementUse, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
-        let generic = self.state.generic_functions[use.generic_index]
-        let generic_arguments = list[TypeId]()
-        for parameter in generic.type_parameters:
-            var found = false
-            for binding in self.state.current_type_bindings:
-                if binding.name == parameter.name:
-                    generic_arguments.append(binding.value_type)
-                    found = true
-                    break
-            if not found: trap("concrete generic binding is missing")
-        let interface_type = self.state.substitute_type(use.interface_type, generic.generic_id, generic_arguments)
-        var interface_index = -1
-        match self.state.types.definitions[interface_type.value].form:
-            Interface(index, values): interface_index = index
-            else: trap("concrete constraint is not an interface")
-        let contract = self.state.interfaces[interface_index]
-        let requirement = contract.requirements[use.requirement_index]
-        let conformance_index = self.state.find_conformance(self.state.type_of(receiver), interface_type)
-        if conformance_index < 0: trap("validated generic constraint has no conformance")
-        let implementation_symbol = self.state.conformances[conformance_index].implementations[use.requirement_index]
-        let required_result = self.interface_requirement_result(requirement, interface_type)
-        let implementation_result = self.state.symbols[implementation_symbol.value].value_type
-        return try self.check_requirement_arguments(semantics, requirement, interface_type, implementation_symbol, implementation_result, receiver, name, arguments, callee_span, span, expected, required_result)
-
-    func check_requirement_arguments(semantics: HirSemanticChecker, requirement: HirInterfaceRequirement, interface_type: TypeId, function: SymbolId, call_result: TypeId, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?, required_result: TypeId? = none, deferred_requirement: i64 = -1) -> NodeId!:
+    func check_requirement_arguments(semantics: HirSemanticChecker, requirement: HirInterfaceRequirement, interface_type: TypeId, function: SymbolId, call_result: TypeId, receiver: NodeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?, deferred_requirement: i64 = -1) -> NodeId!:
         var interface_index = -1
         let interface_arguments = list[TypeId]()
         match self.state.types.definitions[interface_type.value].form:
@@ -684,9 +639,7 @@ pub class GenericFunctionChecker:
             ), call_result, span)
         else:
             call = self.state.push_node(HirNodeForm.Call(function = function, arguments = placed_arguments), call_result, span)
-        var adapted = call
-        if required_result != none: adapted = try semantics.require_type_for_feature(call, required_result)
-        return try semantics.require_type_for_feature(adapted, expected)
+        return try semantics.require_type_for_feature(call, expected)
 
     func interface_requirement_result(requirement: HirInterfaceRequirement, interface_type: TypeId) -> TypeId:
         match self.state.types.definitions[interface_type.value].form:
@@ -731,15 +684,25 @@ pub class GenericFunctionChecker:
                 return self.state.substitute_type(requirement.parameters[index].value_type, self.state.interfaces[interface_index].generic_id, arguments)
             else: trap("requirement owner is not an interface")
 
-    func find_requirement_use(generic_index: i64, span: SourceSpan) -> GenericRequirementUse?:
-        for use in self.state.generic_requirement_uses:
-            if use.generic_index == generic_index and self.spans_match(use.span, span): return use
-        return none
-
-    func spans_match(left: SourceSpan, right: SourceSpan) -> bool:
-        return left.start == right.start and left.end == right.end and left.line == right.line and left.column == right.column
-
     # mark: Concrete instances =================================================================
+
+    ## Substitute a retained typed body into one ordinary executable function.
+    ## The specializer calls back through this owner only for operations that
+    ## can create another instance or materialize a conformance.
+    pub func specialize_function(semantics: HirSemanticChecker, function: FunctionSymbol) -> HirFunction!:
+        let saved_instance = self.state.current_generic_instance
+        self.state.current_generic_instance = function.generic_instance
+        let specialized = self.specializer.specialize_function(self, semantics, function) catch reason:
+            self.state.current_generic_instance = saved_instance
+            error(reason)
+        self.state.current_generic_instance = saved_instance
+        return specialized
+
+    pub func instantiate_for_specializer(semantics: HirSemanticChecker, generic: u32, arguments: list[TypeId], span: SourceSpan) -> i64!:
+        return try self.instantiate(semantics, i64(generic), arguments, span)
+
+    pub func conformance_for_specializer(semantics: HirSemanticChecker, value_type: TypeId, interface_type: TypeId, span: SourceSpan) -> i64!:
+        return try self.declarations.ensure_conformance(semantics, value_type, interface_type, span)
 
     ## Select and memoize the method template for one applied nominal owner.
     ## The returned entry is an ordinary concrete function; no abstract type
@@ -778,15 +741,11 @@ pub class GenericFunctionChecker:
             let template_parameter = generic.signature.parameters[index]
             let value_type = self.state.substitute_type(template_parameter.value_type, generic.generic_id, arguments)
             try self.state.validate_substituted_parameter_type(generic.module_index, template_parameter.value_type, value_type, span, "parameter `" + template_parameter.name + "`")
-            var default_value = NodeId(value = no_node)
-            let default_syntax = generic.syntax.parameters[index].default_value
-            if default_syntax != none:
-                default_value = try semantics.check_constant_expression(generic.module_index, default_syntax, value_type, "default of parameter `" + template_parameter.name + "`")
             parameters.append(HirParameter(
                 symbol = self.state.make_symbol(template_parameter.name, SymbolKind.parameter, value_type),
                 name = template_parameter.name,
                 value_type = value_type,
-                default_value = default_value,
+                default_value = NodeId(value = no_node),
             ))
         let result = self.state.substitute_type(generic.signature.result, generic.generic_id, arguments)
         try self.state.validate_function_result(generic.module_index, result, span)
@@ -812,7 +771,7 @@ pub class GenericFunctionChecker:
             receiver = receiver,
             parameters = parameters,
             result = result,
-            source = CollectedFunctionSource.Defined(syntax = generic.syntax),
+            source = CollectedFunctionSource.Specialized,
             span = generic.span,
             generic_origin = generic_index,
             generic_instance = instance_index,
@@ -830,6 +789,41 @@ pub class GenericFunctionChecker:
             checked_nodes = 0,
             check_time_ms = 0,
         ))
+        if not self.probing:
+            # Publish the instance before specializing defaults. A default may
+            # reference this same specialization through a function value; the
+            # memoized identity breaks that otherwise-spurious recursion.
+            let saved_instance = self.state.current_generic_instance
+            self.state.current_generic_instance = instance_index
+            let defaults = self.specializer.specialize_defaults(self, semantics, generic_index, arguments) catch reason:
+                self.state.current_generic_instance = saved_instance
+                error(reason)
+            self.state.current_generic_instance = saved_instance
+            let specialized_parameters = list[HirParameter]()
+            for index in range(0, len(parameters)):
+                let parameter = parameters[index]
+                specialized_parameters.append(HirParameter(
+                    symbol = parameter.symbol,
+                    name = parameter.name,
+                    value_type = parameter.value_type,
+                    default_value = defaults[index],
+                ))
+            let provisional = self.state.functions[function_index]
+            self.state.functions[function_index] = FunctionSymbol(
+                symbol = provisional.symbol,
+                module_index = provisional.module_index,
+                name = provisional.name,
+                is_public = provisional.is_public,
+                documentation = provisional.documentation,
+                receiver = provisional.receiver,
+                parameters = specialized_parameters,
+                result = provisional.result,
+                source = provisional.source,
+                span = provisional.span,
+                generic_origin = provisional.generic_origin,
+                generic_instance = provisional.generic_instance,
+                type_bindings = provisional.type_bindings,
+            )
         self.state.current_type_bindings = saved_bindings
         return function_index
 
