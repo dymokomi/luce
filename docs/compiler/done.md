@@ -1174,6 +1174,23 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   link; QBE and Wasm now normalize managed payload alignment only at their
   backend boundaries.
 
+- [x] **The executable §16 interface rule audit is closed** (2026-09-01).
+  Interface calls now borrow the ordinary declaration-call placement
+  transaction, so arbitrary named order, source evaluation order, exact
+  labels, duplicate/missing arguments, and diagnostics have one owner. HIR
+  stores source-ordered `(requirement parameter, node)` pairs consistently;
+  typed-package validation/import/specialization, effect analysis, both
+  semantic oracles, canonical MIR, QBE, and Wasm consume that same shape. A
+  separately encoded dependency executes a reordered dynamic call after
+  identity remapping. The rule matrix also proves exact arity, receiver
+  mutability and instance-method requirements, the one safe fallibility lift,
+  no interface inheritance/defaults/optional requirements/retroactive
+  conformance/interface-to-interface conversion, and no automatic equality,
+  hashing, type tests, or downcasts. `luce explain` now reports every concrete
+  existential box and dynamic call, including value COW versus shared class
+  identity, while statically constrained generic dispatch reports no
+  existential cost. `examples/interfaces.luc` exercises the full product path.
+
 - [x] **Compiler-known iteration protocols and executable `try for`**
   (2026-08-31). `Iterator[T]`, `Iterable[T]`, `FallibleIterator[T]`, and
   `FallibleIterable[T]` are closed language-owned interface identities

@@ -758,7 +758,12 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   their own descriptor/witness encodings, and both semantic oracles plus the
   executable interface example agree on generic interfaces, struct/class/enum
   conformers, nested ownership, returned existentials, mutation, fallibility
-  adaptation, and propagation (`done.md` §2).
+  adaptation, and propagation (`done.md` §2). The 2026-09-01 S17 audit closes
+  the complete §16 rule matrix: interface calls share declaration argument
+  placement across HIR artifacts and every execution path; deliberate
+  inheritance/default/downcast/reflection exclusions have stable tests; and
+  `luce explain` reports boxing, dynamic calls, and value-versus-class payload
+  semantics without placing layout or ABI facts before the backend boundary.
 - [x] **Finish the remaining generic surface.** Memberwise generic structs,
   enums, and classes, including their owner-parameterized
   value/mutating/lifecycle methods, independently generic instance methods,

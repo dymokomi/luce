@@ -61,6 +61,7 @@ expect 1 "expected \`i64\`, found \`bool\`" "$cli" check --package org.luce.test
 expect 1 "generic specialization budget of 2 was exceeded" "$cli" check --package org.luce.tests --generic-specializations 2 examples/generic_functions.luc
 expect 0 "generic specializations for \`org.luce.tests\`: 5/5" "$cli" explain --package org.luce.tests --generic-specializations 5 examples/generic_functions.luc
 expect 0 "expansion path:" "$cli" explain --package org.luce.tests examples/generic_functions.luc
+expect 0 "interface costs for \`org.luce.tests\`: 5 box(es), 5 dynamic call(s)" "$cli" explain --package org.luce.tests examples/interfaces.luc
 
 expect 0 "5" "$cli" run --package org.luce.tests main.main "$test_dir/main.luc"
 expect 0 "help: use \`copy count = count\`" "$cli" run --package org.luce.tests shared.main "$test_dir/shared.luc"
