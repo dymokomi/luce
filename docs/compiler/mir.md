@@ -770,16 +770,17 @@ BoolNot                        Bool
 Extend(r, to)  Wrap(r, to)     integer width changes; checked construction guards before Wrap
 IntReinterpret(r, to)          equal-width signedness change after representability guards
 IntToFloat  FloatToInt         explicit; FloatToInt traps out of range
-FloatHash(r) -> u64            execution-local code for one IEEE scalar
+FloatBits(r) -> u64            exact IEEE encoding; binary32 occupies low 32 bits
 ```
 
 Short-circuit `and`/`or` are control flow (`If`), not instructions.
 Source `hash(value)` is otherwise fully expanded once by the shared lowerer:
 ordinary integer, control, field, element, and memory instructions traverse
-the resolved structural value. `FloatHash` is the sole primitive because the
-numeric hash is deliberately private to an execution/backend; lowering
-normalizes equal signed zeros before it. Backends never choose aggregate
-hashing semantics or re-walk HIR types.
+the resolved structural value. `FloatBits` is the sole primitive because exact
+IEEE encodings are also required by the sealed runtime's shortest-decimal
+conversion. Lowering normalizes equal signed zeros before hashing. Backends
+only select their native bit reinterpretation; they never choose aggregate
+hashing semantics, decimal presentation, or re-walk HIR types.
 
 **Memory**
 

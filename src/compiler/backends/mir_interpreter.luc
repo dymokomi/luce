@@ -38,6 +38,8 @@ from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, f
 from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_identity_type, is_int_type, is_ptr_type, is_reference_type
 from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match, uint_maximum
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
+from compiler.formatting.float_display import display_float32, display_float64
+from compiler.formatting.ieee import ieee_float_bits
 import std.strings
 
 # mark: Values and flow ========================================================================
@@ -87,6 +89,8 @@ pub let interface_address_base: i64 = 0x8000000
 pub let equality_context_address_base: i64 = 0x9000000
 ## Hash-collection identities are disjoint from every other oracle handle.
 pub let hash_address_base: i64 = 0xA000000
+## Linear buffer builders occupy their own oracle-only opaque range.
+pub let buffer_builder_address_base: i64 = 0xB000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -190,6 +194,14 @@ class MirImmutableBuffer:
         self.data = data
         self.length = length
         self.references = 1
+        self.is_alive = true
+
+class MirBufferBuilder:
+    let bytes: list[u8]
+    var is_alive: bool
+
+    pub init():
+        self.bytes = list[u8]()
         self.is_alive = true
 
 union MirSliceBacking:
@@ -304,6 +316,7 @@ pub class MirInterpreter: MirExternMemory:
     let hashes: list[MirHash]
     let equality_contexts: list[MirEqualityContext]
     let immutable_buffers: list[MirImmutableBuffer]
+    let buffer_builders: list[MirBufferBuilder]
     let slices: list[MirSlice]
     let classes: list[MirClassObject]
     let weak_classes: list[MirWeakClassSlot]
@@ -330,6 +343,7 @@ pub class MirInterpreter: MirExternMemory:
         self.hashes = list[MirHash]()
         self.equality_contexts = list[MirEqualityContext]()
         self.immutable_buffers = list[MirImmutableBuffer]()
+        self.buffer_builders = list[MirBufferBuilder]()
         self.slices = list[MirSlice]()
         self.classes = list[MirClassObject]()
         self.weak_classes = list[MirWeakClassSlot]()
@@ -530,8 +544,11 @@ pub class MirInterpreter: MirExternMemory:
                 frame.registers[result.value] = try self.evaluate_unary(operation, frame.function.registers[operand.value], frame.registers[operand.value])
             Convert(result, operation, operand):
                 frame.registers[result.value] = try self.evaluate_convert(operation, frame.function.registers[operand.value], frame.function.registers[result.value], frame.registers[operand.value])
-            FloatHash(result, operand):
-                frame.registers[result.value] = MirValue.UnsignedInt(value = semantic_float_hash(float_of(frame.registers[operand.value])))
+            FloatBits(result, operand):
+                frame.registers[result.value] = MirValue.UnsignedInt(value = ieee_float_bits(
+                    float_of(frame.registers[operand.value]),
+                    bits_of(types, frame.function.registers[operand.value]),
+                ))
             PointerHash(result, operand):
                 frame.registers[result.value] = MirValue.UnsignedInt(value = semantic_pointer_hash(ptr_of(frame.registers[operand.value])))
             Alloca(result, slot):
@@ -879,6 +896,40 @@ pub class MirInterpreter: MirExternMemory:
             BufferData(result, owner):
                 let storage = try self.immutable_buffer_at(ptr_of(frame.registers[owner.value]))
                 frame.registers[result.value] = MirValue.Ptr(value = storage.data)
+            BufferLength(result, owner):
+                let storage = try self.immutable_buffer_at(ptr_of(frame.registers[owner.value]))
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(storage.length))
+            BufferBuilderCreate(result):
+                self.buffer_builders.append(MirBufferBuilder())
+                frame.registers[result.value] = MirValue.Ptr(value = buffer_builder_address_base + len(self.buffer_builders) - 1)
+            BufferBuilderAppend(builder, data, length):
+                let storage = try self.buffer_builder_at(ptr_of(frame.registers[builder.value]))
+                let address = ptr_of(frame.registers[data.value])
+                let count = try host_count_of(frame.registers[length.value], "buffer builder append length")
+                for offset in range(0, count): storage.bytes.append(self.memory[address + offset])
+            BufferBuilderFinish(result, builder):
+                let storage = try self.buffer_builder_at(ptr_of(frame.registers[builder.value]))
+                let data = self.allocate(len(storage.bytes), 1)
+                for offset in range(0, len(storage.bytes)): self.memory[data + offset] = storage.bytes[offset]
+                storage.is_alive = false
+                self.immutable_buffers.append(MirImmutableBuffer(data, len(storage.bytes)))
+                frame.registers[result.value] = MirValue.Ptr(value = buffer_owner_address_base + len(self.immutable_buffers) - 1)
+            DisplaySigned(result, value):
+                self.store_display_buffer(frame, result, str(signed_int_of(frame.registers[value.value])))
+            DisplayUnsigned(result, value):
+                self.store_display_buffer(frame, result, str(unsigned_int_of(frame.registers[value.value])))
+            DisplayFloat(result, value):
+                let displayed = float_of(frame.registers[value.value])
+                if bits_of(types, frame.function.registers[value.value]) == 32:
+                    self.store_display_buffer(frame, result, display_float32(f32(displayed)))
+                else:
+                    self.store_display_buffer(frame, result, display_float64(displayed))
+            DisplayCharacter(result, value):
+                self.store_display_buffer(frame, result, str(char(u32(unsigned_int_of(frame.registers[value.value])))))
+            DisplayBoolean(result, value):
+                var text = "false"
+                if bool_of(frame.registers[value.value]): text = "true"
+                self.store_display_buffer(frame, result, text)
             StringScalarCount(result, data, length):
                 let address = ptr_of(frame.registers[data.value])
                 let byte_length = try host_count_of(frame.registers[length.value], "string byte length")
@@ -1263,6 +1314,20 @@ pub class MirInterpreter: MirExternMemory:
         let storage = self.immutable_buffers[index]
         if not storage.is_alive: error("mir interpreter: trap: released buffer owner")
         return storage
+
+    func buffer_builder_at(value: i64) -> MirBufferBuilder!:
+        let index = value - buffer_builder_address_base
+        if index < 0 or index >= len(self.buffer_builders): error("mir interpreter: trap: invalid buffer builder")
+        let storage = self.buffer_builders[index]
+        if not storage.is_alive: error("mir interpreter: trap: consumed buffer builder")
+        return storage
+
+    func store_display_buffer(frame: Frame, result: RegisterId, text: str):
+        let encoded = strings.to_bytes(text)
+        let data = self.allocate(len(encoded), 1)
+        for offset in range(0, len(encoded)): self.memory[data + offset] = encoded[offset]
+        self.immutable_buffers.append(MirImmutableBuffer(data, len(encoded)))
+        frame.registers[result.value] = MirValue.Ptr(value = buffer_owner_address_base + len(self.immutable_buffers) - 1)
 
     func release_immutable_buffer(owner: i64) -> !:
         if owner == 0: return
@@ -1898,20 +1963,6 @@ func evaluate_float_binary(operation: BinaryOp, operand_type: TypeId, left: f64,
 func normalize_mir_float(value: f64, value_type: TypeId, types: MirTypeTable) -> f64:
     if bits_of(types, value_type) == 32: return f64(f32(value))
     return value
-
-# `FloatHash` is deliberately execution-local. The semantic oracle has no
-# host bit-cast, so it hashes Stage-0's stable value spelling; machine
-# backends may use IEEE bits. Both normalize signed zero before the operation,
-# and equal nonzero values always have one spelling/bit pattern in a run.
-func semantic_float_hash(value: f64) -> u64:
-    if value == 0.0: return u64(0)
-    var result = u64(1469598103934665603)
-    for byte in strings.to_bytes(str(value)):
-        result = result ^ u64(byte)
-        result = result ^ shift_left_unsigned(result, 13, 64)
-        result = result ^ (result >> u64(7))
-        result = result ^ shift_left_unsigned(result, 17, 64)
-    return result
 
 # Oracle-only address tokens are non-negative. Mix them into a process-local
 # code without exposing an integer conversion operation to canonical MIR.

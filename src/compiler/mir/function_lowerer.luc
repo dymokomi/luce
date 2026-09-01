@@ -19,7 +19,7 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
-from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_float_type, is_int_type, is_ptr_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, uint_maximum
+from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_form, node_span, node_type, resolve_builtin_type, types_match
@@ -844,6 +844,7 @@ pub class FunctionLowerer:
                 try self.lower_prologue_node(module, function, left, body)
                 try self.lower_prologue_node(module, function, right, body)
             NativeAddressHash(pointer): try self.lower_prologue_node(module, function, pointer, body)
+            NativeFloatBits(value): try self.lower_prologue_node(module, function, value, body)
             NativeArena(end): try self.lower_prologue_node(module, function, end, body)
             NumericConvert(value): try self.lower_prologue_node(module, function, value, body)
             Discard(value): try self.lower_prologue_node(module, function, value, body)
@@ -881,6 +882,8 @@ pub class FunctionLowerer:
                         try self.lower_prologue_node(module, function, next, body)
             SequenceLength(value): try self.lower_prologue_node(module, function, value, body)
             StringScalarCount(value): try self.lower_prologue_node(module, function, value, body)
+            BuiltinDisplay(value): try self.lower_prologue_node(module, function, value, body)
+            FormattedString(parts): try self.lower_prologue_run(module, function, parts, body)
             Hash(value): try self.lower_prologue_node(module, function, value, body)
             SequenceIndex(value, index):
                 try self.lower_prologue_node(module, function, value, body)
@@ -1980,6 +1983,12 @@ pub class FunctionLowerer:
                 let result = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                 body.append(MirInstruction(form = InstructionForm.PointerHash(result = result, operand = address), span = span))
                 return result
+            NativeFloatBits(value):
+                let span = node_span(self.state.program, expression)
+                let scalar = try self.lower_expression(module, function, value, body)
+                let result = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+                body.append(MirInstruction(form = InstructionForm.FloatBits(result = result, operand = scalar), span = span))
+                return result
             Discard(value):
                 let discarded = try self.lower_expression(module, function, value, body)
                 return RegisterId(value = no_register)
@@ -2379,10 +2388,75 @@ pub class FunctionLowerer:
         body.append(MirInstruction(form = InstructionForm.BufferData(result = data, owner = owner), span = span))
         let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
         body.append(MirInstruction(form = InstructionForm.Binary(result = length, operation = BinaryOp.add, left = left_length, right = right_length), span = span))
+        return self.materialize_buffer_value(value_type, owner, data, length, span, body)
+
+    func materialize_buffer_value(value_type: TypeId, owner: RegisterId, data: RegisterId, length: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let owner_type = builtin_mir_type(BuiltinMirType.buffer_owner)
         let result = self.new_temp(value_type, span, body)
         self.store_value(owner_type, self.field_address(value_type, result, self.state.buffer_owner_field(), span, body), owner, span, body)
         self.store_value(builtin_mir_type(BuiltinMirType.pointer), self.field_address(value_type, result, self.state.buffer_data_field(), span, body), data, span, body)
         self.store_value(builtin_mir_type(BuiltinMirType.unsigned_u64), self.field_address(value_type, result, self.state.buffer_length_field(), span, body), length, span, body)
+        return result
+
+    # Evaluate every canonical string piece before allocating the builder.
+    # A field therefore transfers before mutable assembly state exists; after
+    # that point append/freeze can only complete or trap.
+    func lower_formatted_string(module: HirModule, function: HirFunction, expression: NodeId, parts: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let text_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.string))
+        let values = list[RegisterId]()
+        for position in range(0, i64(parts.count)):
+            values.append(try self.lower_expression(module, function, node_at(self.state.program, parts, position), body))
+
+        let builder = self.state.new_register(intern_mir_type(self.state.types, MirType.BufferBuilder))
+        body.append(MirInstruction(form = InstructionForm.BufferBuilderCreate(result = builder), span = span))
+        for value in values:
+            let data = try self.load_field(text_type, value, self.state.buffer_data_field(), span, body)
+            let length = try self.load_field(text_type, value, self.state.buffer_length_field(), span, body)
+            body.append(MirInstruction(form = InstructionForm.BufferBuilderAppend(builder = builder, data = data, length = length), span = span))
+        let owner = self.state.new_register(builtin_mir_type(BuiltinMirType.buffer_owner))
+        body.append(MirInstruction(form = InstructionForm.BufferBuilderFinish(result = owner, builder = builder), span = span))
+        let data = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.BufferData(result = data, owner = owner), span = span))
+        let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+        body.append(MirInstruction(form = InstructionForm.BufferLength(result = length, owner = owner), span = span))
+        return self.materialize_buffer_value(text_type, owner, data, length, span, body)
+
+    func lower_builtin_display(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let source_hir_type = node_type(self.state.program, value)
+        let source_type = try self.state.mir_type_of(module, function, span, source_hir_type)
+        var operand = try self.lower_expression(module, function, value, body)
+        let owner = self.state.new_register(builtin_mir_type(BuiltinMirType.buffer_owner))
+
+        match self.state.program.types.definitions[source_hir_type.value].form:
+            Boolean: body.append(MirInstruction(form = InstructionForm.DisplayBoolean(result = owner, value = operand), span = span))
+            Character: body.append(MirInstruction(form = InstructionForm.DisplayCharacter(result = owner, value = operand), span = span))
+            else:
+                if is_int_type(self.state.types, source_type):
+                    if is_signed_int_type(self.state.types, source_type):
+                        operand = self.extend_display_operand(operand, source_type, builtin_mir_type(BuiltinMirType.signed_i64), span, body)
+                        body.append(MirInstruction(form = InstructionForm.DisplaySigned(result = owner, value = operand), span = span))
+                    else:
+                        operand = self.extend_display_operand(operand, source_type, builtin_mir_type(BuiltinMirType.unsigned_u64), span, body)
+                        body.append(MirInstruction(form = InstructionForm.DisplayUnsigned(result = owner, value = operand), span = span))
+                elif is_float_type(self.state.types, source_type):
+                    body.append(MirInstruction(form = InstructionForm.DisplayFloat(result = owner, value = operand), span = span))
+                else: trap("BuiltinDisplay reached a non-displayable MIR type")
+
+        let data = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.BufferData(result = data, owner = owner), span = span))
+        let length = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
+        body.append(MirInstruction(form = InstructionForm.BufferLength(result = length, owner = owner), span = span))
+        let text_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.string))
+        return self.materialize_buffer_value(text_type, owner, data, length, span, body)
+
+    func extend_display_operand(value: RegisterId, source: TypeId, destination: TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if source.value == destination.value: return value
+        let result = self.state.new_register(destination)
+        var operation = ConvertOp.extend
+        if is_float_type(self.state.types, source): operation = ConvertOp.float_resize
+        body.append(MirInstruction(form = InstructionForm.Convert(result = result, operation = operation, operand = value), span = span))
         return result
 
     # mark: Immutable sequence snapshots =======================================================
@@ -2809,6 +2883,8 @@ pub class FunctionLowerer:
                 let result = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
                 body.append(MirInstruction(form = InstructionForm.StringScalarCount(result = result, data = data, length = length), span = span))
                 return result
+            BuiltinDisplay(value): return try self.lower_builtin_display(module, function, expression, value, body)
+            FormattedString(parts): return try self.lower_formatted_string(module, function, expression, parts, body)
             Hash(value):
                 let lowered = try self.lower_expression(module, function, value, body)
                 return try self.lower_structural_hash(module, function, span, node_type(self.state.program, value), lowered, body)
@@ -4201,9 +4277,9 @@ pub class FunctionLowerer:
     #
     # Hashing is expanded into ordinary canonical integer/control/memory
     # operations here, once. Backends therefore never re-walk source types or
-    # choose aggregate semantics. `FloatHash` is the sole primitive whose
-    # numeric code may differ per execution/backend; signed zero is normalized
-    # before it, preserving the required equality implication.
+    # choose aggregate semantics. `FloatBits` is the sole IEEE representation
+    # primitive; signed zero is normalized before hashing, preserving the
+    # required equality implication.
 
     func lower_structural_hash(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
         let seed = self.hash_constant(1469598103934665603, span, body)
@@ -4308,7 +4384,7 @@ pub class FunctionLowerer:
         self.emit_yield(self.hash_constant(0, span, body), span, body)
         self.emit_else(span, body)
         let raw = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
-        body.append(MirInstruction(form = InstructionForm.FloatHash(result = raw, operand = value), span = span))
+        body.append(MirInstruction(form = InstructionForm.FloatBits(result = raw, operand = value), span = span))
         self.emit_yield(raw, span, body)
         self.emit_end(span, body)
         return result

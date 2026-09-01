@@ -550,7 +550,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `std.os.executable_path()` capability rather than embedding a
   checkout-relative path, environment convention, or platform syscall in the
   compiler.
-  `write`, `trap`, and future builder/codec primitives remain.
+  Public builder/codec APIs and the remaining standard-library policy remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
@@ -576,7 +576,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   triple-specific node survives the source boundary. Cycle-aware
   structural list/map equality and insertion-ordered maps/sets are complete
   without making runtime or backend callbacks responsible for value
-  semantics. Continue with text/bytes builders, formatted strings, and the
+  semantics. The target-neutral affine buffer-builder substrate and formatted
+  strings are complete through both semantic oracles, QBE, and Wasm
+  (`done.md` §2). Continue with public text/bytes builder APIs, codecs, and the
   rest of the formatter.
   The bytes implementation follows §12.6 for both static and dynamic sources:
   `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners

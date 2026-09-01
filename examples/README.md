@@ -131,6 +131,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   owned concatenation and explicit disposal of an owned temporary, distinct
   byte/scalar lengths, Unicode scalar iteration, and lexicographic ordering
   through both compiled backends and the semantic oracles.
+- `formatted_strings.luc` proves one closed `Display` protocol for builtin,
+  concrete, constrained-generic, and existential values. Nested builders,
+  Unicode and escaped braces, triple normalization, integer extrema, and both
+  float widths execute through both semantic oracles, native QBE, and Wasm.
 - `traps.luc` proves that a nonrecoverable source trap accepts dynamically
   owned text, reports it through each execution path, and does not run
   deferred cleanup.
@@ -156,11 +160,11 @@ artifacts are never imported.
 | `hello` | entry arguments, strings, output | Intent represented by `hello.luc`; compiled on both artifact paths. |
 | `calc` | byte scanning, checked indexing, recursion, tuples, recoverable failure | Adopted as `stage0_calculator.luc`; native QBE execution green. |
 | `sort`, `stats` | lists, iteration, indexing, sorting, numeric library | `sort` remains adopted as the fixed-array `stage0_sort.luc`; growable lists, iteration, and removal now work, while the numeric library and remaining source/API differences still block the original shape and `stats`. |
-| `bf` | arrays, byte indexing, nested loops/match, wrapping cells, output construction | Adopted as allocation-free `stage0_brainfuck.luc`; the interpreter executes through every current product path, while general builders still wait for the runtime. |
-| `dice` | RNG, arrays/lists, formatted strings, files | Catalogued; waits for collections, formatting, and the standard runtime. |
+| `bf` | arrays, byte indexing, nested loops/match, wrapping cells, output construction | Adopted as allocation-free `stage0_brainfuck.luc`; the interpreter executes through every current product path. The general runtime builder now has separate formatting coverage. |
+| `dice` | RNG, arrays/lists, formatted strings, files | Collections and formatting are complete; adoption now waits for deterministic RNG, files, and the corresponding standard-library surface. |
 | `life` | two-dimensional arrays, terminal input/output, timing | Fixed-array storage is now covered; the full program still waits for terminal and timing host services. |
-| `wordcount` | maps, string scanning, builders, files | Catalogued; waits for collections and string operations. |
-| `zipper` | byte/list processing, filesystem safety, ZIP library | Catalogued; waits for collections and the standard runtime. |
+| `wordcount` | maps, string scanning, builders, files | Maps and internal builders are complete; adoption waits for the remaining string-scanning and file APIs. |
+| `zipper` | byte/list processing, filesystem safety, ZIP library | Collections are complete; adoption waits for filesystem safety and the ZIP/stream library surface. |
 | `adventure` | a cohesive multi-module application with collections, text, files, and input | Catalogued as the first broad application gate after those foundations. |
 | `editor` | classes/ARC, closures, collections, terminal UI, files, LSP client | Catalogued for the host proving-program phase. |
 | `lsp` | interfaces, classes, JSON, byte framing, I/O, processes | Catalogued for the host proving-program phase. |
@@ -168,8 +172,8 @@ artifacts are never imported.
 The fixed-array slice, Brainfuck gate, and first runtime-backed list slice
 remove allocation-free dense storage, nontrivial byte-driven interpreter
 control flow, and basic growable sequence storage from this map. The remaining
-small and medium programs still need maps/sets, text construction, files, and
-host services. Canonical MIR never manufactures
+small and medium programs still need numeric/text algorithms, files, and host
+services. Canonical MIR never manufactures
 target byte sizes or prescribes memory growth; allocator and collection policy
 remain in the runtime rather than HIR, MIR, or the compiler itself.
 

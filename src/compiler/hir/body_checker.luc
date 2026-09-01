@@ -11,7 +11,7 @@
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan, format_diagnostic
-from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, CaptureSyntax, ExpressionSyntax, FunctionSyntax, IfBranchSyntax, ParameterSyntax, StatementSyntax
+from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, CaptureSyntax, ExpressionSyntax, FormatPartSyntax, FunctionSyntax, IfBranchSyntax, ParameterSyntax, StatementSyntax
 from compiler.frontend.syntax import MapEntrySyntax, MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.closure_context import ClosureContext
@@ -27,10 +27,12 @@ from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, Hir
 from compiler.hir.generation_model import LocalBinding, LocalStorage, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
 from compiler.hir.generics.functions import GenericFunctionChecker
 from compiler.hir.generics.nominals import GenericNominalChecker
+from compiler.hir.interfaces.display import DisplayChecker
 from compiler.hir.interfaces.iteration import IterationChecker
 from compiler.hir.interfaces.structural import StructuralProtocolChecker
 from compiler.hir.interfaces.values import InterfaceValueChecker
-from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_text_literal
+from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_formatted_text, decode_text_literal
+from compiler.formatting.formatted_strings import FormattedSourcePart, normalize_formatted_parts
 
 # Largest finite IEEE binary32 value, represented exactly in binary64.
 let maximum_f32_value: f64 = 3.4028234663852886e38
@@ -43,6 +45,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     let generics: GenericFunctionChecker
     let nominals: GenericNominalChecker
     let interfaces: InterfaceValueChecker
+    let displays: DisplayChecker
     let iterations: IterationChecker
     let structural: StructuralProtocolChecker
 
@@ -55,6 +58,7 @@ pub class HirBodyChecker: HirSemanticChecker:
         self.generics = generics
         self.nominals = GenericNominalChecker(state, declarations)
         self.interfaces = interfaces
+        self.displays = DisplayChecker(state, declarations, generics, interfaces)
         self.iterations = IterationChecker(state, declarations, generics, interfaces)
         self.structural = StructuralProtocolChecker(state, declarations)
 
@@ -833,7 +837,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             ElseValue(optional_value, arm):
                 return try self.check_else(optional_value, arm, value.span, expected)
             FormattedString(start, parts):
-                error(self.diagnostic(value.span, "formatted strings are not implemented yet"))
+                return try self.check_formatted_string(start, parts, value.span, expected)
             CaseValue(name, arguments):
                 # `.case(...)`: the enum comes from context, looking through
                 # an optional (`let s: Shape? = .dot`).
@@ -1122,6 +1126,42 @@ pub class HirBodyChecker: HirSemanticChecker:
         else:
             error(self.diagnostic(token.span, "this literal is not implemented yet"))
         return try self.require_type(self.push_constant(value, value_type, token.span), expected)
+
+    # A formatted template first becomes canonical string pieces. Field
+    # conversion is checked in source order and retains either a closed
+    # builtin conversion or an ordinary resolved Display call in HIR.
+    func check_formatted_string(start: Token, parts: list[FormatPartSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let source_parts = list[FormattedSourcePart]()
+        for part in parts:
+            match part:
+                Text(token): source_parts.append(FormattedSourcePart.Text(value = token.text))
+                Field(value, field_span): source_parts.append(FormattedSourcePart.Field)
+        let normalized = normalize_formatted_parts(source_parts, start.text == "f\"\"\"") catch reason:
+            error(self.diagnostic(span, reason))
+
+        let checked = list[NodeId]()
+        var text_index = 0
+        for part in parts:
+            match part:
+                Text(token):
+                    let decoded = decode_formatted_text(normalized[text_index]) catch reason:
+                        error(self.diagnostic(token.span, reason))
+                    text_index += 1
+                    if decoded != "":
+                        checked.append(self.push_constant(Value.Text(value = decoded), resolve_builtin_type(BuiltinType.string), token.span))
+                Field(field, field_span):
+                    let value = try self.check_expression(field, none)
+                    checked.append(try self.displays.check(self, value, field_span))
+
+        if len(checked) == 0:
+            return try self.require_type(self.push_constant(Value.Text(value = ""), resolve_builtin_type(BuiltinType.string), span), expected)
+        if len(checked) == 1: return try self.require_type(checked[0], expected)
+        let result = self.state.push_node(
+            HirNodeForm.FormattedString(parts = self.state.push_nodes(checked)),
+            resolve_builtin_type(BuiltinType.string),
+            span,
+        )
+        return try self.require_type(result, expected)
 
     func integer_literal_type(token: Token, expected: TypeId?) -> TypeId!:
         if token.suffix != "":
@@ -1550,6 +1590,15 @@ pub class HirBodyChecker: HirSemanticChecker:
             let pointer = try self.check_expression(arguments[0].value, none)
             discard(try self.require_native_pointer(self.state.type_of(pointer), arguments[0].span, "`native.address_hash`"))
             let typed = self.state.push_node(HirNodeForm.NativeAddressHash(pointer = pointer), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+            return try self.require_type(typed, expected)
+        if name == "float_bits":
+            if self.state.package_role != PackageRole.sealed_runtime:
+                try self.fail(span, "`native.float_bits` is reserved for the sealed runtime package")
+            if len(arguments) != 1: try self.fail(span, "`native.float_bits` takes one `f32` or `f64` value")
+            let value = try self.check_expression(arguments[0].value, none)
+            if floating_bit_width(self.state.types, self.state.type_of(value)) == 0:
+                try self.fail(arguments[0].span, "`native.float_bits` needs `f32` or `f64`, found `" + self.describe_type(self.state.type_of(value)) + "`")
+            let typed = self.state.push_node(HirNodeForm.NativeFloatBits(value = value), resolve_builtin_type(BuiltinType.unsigned_u64), span)
             return try self.require_type(typed, expected)
         if name == "arena":
             if self.state.package_role != PackageRole.sealed_runtime:

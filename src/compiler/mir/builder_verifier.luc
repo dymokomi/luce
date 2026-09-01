@@ -1,0 +1,158 @@
+#==============================================================================================
+#
+#   builder_verifier - Prove linear formatted-buffer construction
+#
+#   DESCRIPTION:
+#       Buffer builders are affine compiler/runtime capabilities, not ordinary
+#       references. This focused MIR proof rejects forged aliases, use after
+#       finish, multiple finish, and any normal control-flow edge that lets a
+#       live builder escape its lexical region path. It runs after the general
+#       verifier has already established register, type, and region validity.
+#
+#       Traps and `Unreachable` deliberately skip language cleanup and may
+#       abandon builders created on their terminating path. Returns, raises,
+#       branches, and yields are normal transfers and must finish them first.
+#       Nested regions may execute between operations, but a builder operation
+#       itself stays on the path that created the capability; crossing arms
+#       would require an explicit affine ownership phi that canonical MIR does
+#       not provide.
+#
+#==============================================================================================
+
+from compiler.mir.canonical import MirFunction, MirInstruction, MirProgram, MirType, RegisterId, TypeId, mir_type
+
+enum BuilderState:
+    not_created
+    live
+    consumed
+
+struct PathComponent:
+    let opener: i64
+    let arm: i64
+
+# mark: Affine verification ====================================================================
+
+## Prove every buffer-builder register in one already structurally valid
+## function is created and consumed exactly once on every normal path.
+pub func verify_buffer_builder_lifetimes(program: MirProgram, function: MirFunction) -> !:
+    try BufferBuilderVerifier(program, function).verify()
+
+class BufferBuilderVerifier:
+    let program: MirProgram
+    let function: MirFunction
+
+    init(program: MirProgram, function: MirFunction):
+        self.program = program
+        self.function = function
+
+    func verify() -> !:
+        let states = list[BuilderState]()
+        let creation_paths = list[list[PathComponent]]()
+        for register_type in self.function.registers:
+            states.append(BuilderState.not_created)
+            creation_paths.append(list[PathComponent]())
+
+        let path = list[PathComponent]()
+        for index in range(0, len(self.function.body)):
+            let instruction = self.function.body[index]
+            match instruction.form:
+                BufferBuilderCreate(result):
+                    if states[result.value] != BuilderState.not_created:
+                        try self.fail_at(instruction, "`BufferBuilderCreate` must introduce a fresh builder")
+                    states[result.value] = BuilderState.live
+                    creation_paths[result.value] = copy_path(path)
+                BufferBuilderAppend(builder, data, length):
+                    try self.require_live(instruction, builder, states, creation_paths, path, "`BufferBuilderAppend`")
+                BufferBuilderFinish(result, builder):
+                    try self.require_live(instruction, builder, states, creation_paths, path, "`BufferBuilderFinish`")
+                    states[builder.value] = BuilderState.consumed
+                Return(values): try self.require_no_live(instruction, states, "`Return`")
+                Raise(failure): try self.require_no_live(instruction, states, "`Raise`")
+                Trap(message): self.abandon_terminating_path(states, creation_paths, path)
+                Unreachable: self.abandon_terminating_path(states, creation_paths, path)
+                Br(depth, values): try self.require_branch_target(instruction, depth, states, creation_paths, path, "`Br`")
+                BrIf(condition, depth, values): try self.require_branch_target(instruction, depth, states, creation_paths, path, "`BrIf`")
+                Yield(values):
+                    if len(path) > 0: try self.require_target_depth(instruction, len(path) - 1, states, creation_paths, "`Yield`")
+                Else:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Else`")
+                    advance_arm(path)
+                Case(value):
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Case`")
+                    advance_arm(path)
+                Default:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Default`")
+                    advance_arm(path)
+                End:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`End`")
+                    path.remove(len(path) - 1)
+                Block(results): path.append(PathComponent(opener = index, arm = 0))
+                Loop: path.append(PathComponent(opener = index, arm = 0))
+                If(condition, results): path.append(PathComponent(opener = index, arm = 0))
+                Switch(value): path.append(PathComponent(opener = index, arm = 0))
+                else: pass
+
+        for register in range(0, len(self.function.registers)):
+            if self.is_builder_type(self.function.registers[register]):
+                if states[register] == BuilderState.not_created:
+                    try self.fail("declares buffer-builder r" + str(register) + " that is not produced by `BufferBuilderCreate`")
+                if states[register] == BuilderState.live:
+                    try self.fail("leaves buffer-builder r" + str(register) + " without exactly one `BufferBuilderFinish`")
+
+    func is_builder_type(value_type: TypeId) -> bool:
+        match mir_type(self.program.types, value_type):
+            BufferBuilder: return true
+            else: return false
+
+    func require_live(instruction: MirInstruction, builder: RegisterId, states: list[BuilderState], creation_paths: list[list[PathComponent]], path: list[PathComponent], operation: str) -> !:
+        if states[builder.value] == BuilderState.not_created: try self.fail_at(instruction, operation + " uses a builder not produced by `BufferBuilderCreate`")
+        if states[builder.value] == BuilderState.consumed: try self.fail_at(instruction, operation + " uses a builder after `BufferBuilderFinish`")
+        if not paths_match(creation_paths[builder.value], path):
+            try self.fail_at(instruction, operation + " must stay in its builder's lexical region path")
+
+    func require_no_live(instruction: MirInstruction, states: list[BuilderState], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == BuilderState.live and self.is_builder_type(self.function.registers[register]):
+                try self.fail_at(instruction, operation + " bypasses `BufferBuilderFinish` for r" + str(register))
+
+    func require_branch_target(instruction: MirInstruction, depth: i64, states: list[BuilderState], creation_paths: list[list[PathComponent]], path: list[PathComponent], operation: str) -> !:
+        try self.require_target_depth(instruction, len(path) - 1 - depth, states, creation_paths, operation)
+
+    func require_target_depth(instruction: MirInstruction, target_depth: i64, states: list[BuilderState], creation_paths: list[list[PathComponent]], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == BuilderState.live and len(creation_paths[register]) > target_depth:
+                try self.fail_at(instruction, operation + " bypasses `BufferBuilderFinish` for r" + str(register))
+
+    func require_no_live_on_path(instruction: MirInstruction, states: list[BuilderState], creation_paths: list[list[PathComponent]], path: list[PathComponent], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == BuilderState.live and paths_match(creation_paths[register], path):
+                try self.fail_at(instruction, operation + " crosses a live buffer-builder lifetime for r" + str(register))
+
+    func abandon_terminating_path(states: list[BuilderState], creation_paths: list[list[PathComponent]], path: list[PathComponent]):
+        for register in range(0, len(states)):
+            if states[register] == BuilderState.live and paths_match(creation_paths[register], path):
+                states[register] = BuilderState.consumed
+
+    func fail(message: str) -> !:
+        error("MIR verifier: `" + self.function.name + "` " + message)
+
+    func fail_at(instruction: MirInstruction, message: str) -> !:
+        error("MIR verifier: `" + self.function.name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + message)
+
+# mark: Path helpers ===========================================================================
+
+func copy_path(path: list[PathComponent]) -> list[PathComponent]:
+    let copied = list[PathComponent]()
+    for component in path: copied.append(component)
+    return copied
+
+func paths_match(left: list[PathComponent], right: list[PathComponent]) -> bool:
+    if len(left) != len(right): return false
+    for index in range(0, len(left)):
+        if left[index].opener != right[index].opener or left[index].arm != right[index].arm: return false
+    return true
+
+func advance_arm(path: list[PathComponent]):
+    let index = len(path) - 1
+    let current = path[index]
+    path[index] = PathComponent(opener = current.opener, arm = current.arm + 1)
