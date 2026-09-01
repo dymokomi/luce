@@ -304,6 +304,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `luce_rt_trap(Ptr, u64)` contract followed by canonical `Unreachable`; QBE
   and Wasm alone choose stderr and their terminating instruction. Complete
   source-location/stack diagnostics remain part of the §13 audit.
+- [x] **Source-level `never` callables and bottom flow** (2026-08-31,
+  `done.md` §2). `-> never` and `-> never!` survive direct, generic,
+  function-value, closure, and interface signatures. HIR records contextual
+  bottom coercion and the exact eager prefix before a terminating operand;
+  canonical MIR records only target-neutral `returns_never` and structured
+  termination. Illegal storage is rejected before lowering, including after
+  generic/interface substitution and inside native-pointer pointees. Both
+  oracles, the verifier, QBE, Wasm, and the focused trap example agree.
 - [x] **Source `assert(condition, message?)` execution** (2026-08-31,
   `done.md` §2). One unit-valued HIR form preserves ordinary eager argument
   order and supplies the exact default `"assertion failed"` message. Shared

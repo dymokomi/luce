@@ -135,9 +135,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   concrete, constrained-generic, and existential values. Nested builders,
   Unicode and escaped braces, triple normalization, integer extrema, and both
   float widths execute through both semantic oracles, native QBE, and Wasm.
-- `traps.luc` proves that a nonrecoverable source trap accepts dynamically
-  owned text, reports it through each execution path, and does not run
-  deferred cleanup.
+- `traps.luc` proves that a `never` callable accepts dynamically owned text,
+  preserves the eager owned prefix of a nested call while omitting its
+  unreachable outer operation, reports through each execution path, and does
+  not run deferred cleanup.
 - `assertions.luc` proves the optional default and eager dynamic assertion
   messages, unit-valued successful continuation, captured QBE/Wasm failure
   diagnostics, and skipped deferred cleanup.

@@ -65,6 +65,20 @@ As implementation advances, broad `partial` rows are split until every
 normative rule has a named positive and negative fixture. No broad row may be
 promoted merely because its common case works.
 
+## Current `never` evidence
+
+`never` has no runtime representation. HIR preserves contextual bottom flow
+and eager source order; MIR preserves only the callable's inability to return
+successfully. Neither stage introduces a target or platform fact.
+
+| §5.2/§8/§13 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Direct and fallible `never` results; exact function, closure, generic, and interface callables | yes | yes | yes, plus Wasm | `traps.luc` and focused signature fixtures | complete |
+| Bottom coercion in returns, conditionals, matches, optional fallback, and short-circuit flow | yes | yes | yes, plus Wasm | differential control-flow corpus | complete |
+| Eager prefix runs once; unreachable outer/later operands do not run | yes | yes | yes, exact output | `traps.luc` and differential trapping corpus | complete |
+| Direct, nested, generic-substituted, callable-parameter, and native-pointee storage rejection | stable diagnostics | n/a | n/a | focused HIR negative fixtures | complete |
+| No successful MIR value/return; malformed signatures and calls rejected | n/a | yes | yes, plus Wasm | verifier/backend fixtures | complete |
+
 ## Current numeric-construction evidence
 
 The broad §7 row remains partial. Explicit construction now has one resolved
@@ -274,7 +288,7 @@ module. This is positive and negative coverage, not a comment/text search.
 | `bytes.luc` | Immutable owned byte concatenation/comparison and ownership-retaining escaping slices | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `strings.luc` | Ordinary/raw/triple text and bytes, owned UTF-8 concatenation/discard, Unicode scalar length/iteration, and scalar-preserving ordering | HIR and MIR oracles plus native QBE and Wasm execution. |
 | `formatted_strings.luc` | Builtin/concrete/generic/existential `Display`, nested affine construction, triples/braces, Unicode, integer extrema, and both IEEE widths | HIR and MIR oracles plus native QBE and Wasm execution. |
-| `traps.luc` | Dynamic nonrecoverable diagnostics and skipped deferred cleanup | HIR and MIR oracles plus captured native QBE and Wasm failure diagnostics. |
+| `traps.luc` | Dynamic nonrecoverable diagnostics, `never` callables, nested eager-prefix termination, and skipped deferred cleanup | HIR and MIR oracles plus captured native QBE and Wasm failure diagnostics. |
 | `assertions.luc` | Default/dynamic assertion messages, successful continuation, and failed no-cleanup termination | HIR and MIR oracles plus captured native QBE and Wasm failure diagnostics. |
 | `language_tour.luc` | Broad 1.0 declaration/control/managed surface | Parser only; each section migrates into focused executable examples as it lands. |
 | `operators_and_literals.luc` | Literal, collection, type, and operator surface | Parser only beyond the already executable scalar subset. |

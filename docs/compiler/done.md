@@ -20,7 +20,7 @@ Last updated: 2026-08-31 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, and managed-class examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 708 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 711 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -465,6 +465,26 @@ Last updated: 2026-08-31 (Stage-0 0.30).
   exact backend output, differential trapping, and `examples/traps.luc` are
   covered. Rich source locations and stack traces remain an explicit §13
   diagnostic audit rather than being claimed here.
+- [x] **`never` is complete target-neutral control flow, not a zero-result
+  value** (2026-08-31). Source functions, fallible functions, exact function
+  values, closures, generic specializations, interface requirements, and
+  dynamic witnesses preserve an explicit uninhabited successful result.
+  Storage validation rejects `never` directly or transitively in parameters,
+  fields, bindings, containers, aggregates, callable parameters, and native
+  pointees, and revalidates concrete generic/interface substitutions; a
+  callable returning `never` remains an ordinary storable descriptor. HIR
+  makes bottom coercion explicit and replaces an unreachable outer operation
+  with its exact left-to-right eager prefix, without flattening conditional or
+  short-circuit operands. Whole-program initialization and deinitializer
+  analysis traverse that form. Canonical MIR carries `returns_never` beside
+  the shared signature, has no `never` value type, rejects successful returns
+  or results for that signature, and emits structured `Unreachable` only
+  after calls that cannot return. Owned compile-time temporary records on a
+  terminating path are forgotten without emitting unreachable cleanup, while
+  lexical `defer` retains the terminator's existing policy. Direct, indirect,
+  closure, generic, interface, conditional, match, optional fallback,
+  short-circuit, fallible, nested eager-call, malformed-MIR, both-oracle,
+  native QBE, Wasm, and focused-example evidence agree.
 - [x] **Source assertions reuse the trap seam without creating backend work**
   (2026-08-31). Compiler-known `assert(condition, message?)` checks one
   Boolean, eagerly evaluates the optional ordinary string message, inserts the
