@@ -17,7 +17,7 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
-from compiler.hir.ir import HirCFunction, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import HirCFunction, HirCFunctionIdentity, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
@@ -104,6 +104,12 @@ pub struct HirExternResult:
 pub interface HirExternHost:
     func call(function: HirFunction, arguments: list[Value]) -> HirExternResult!
 
+## Behavior for an opaque C function pointer returned by an extern. Keeping
+## this separate from named declarations forces semantic tests to prove that
+## the pointer identity really survived the boundary.
+pub interface HirCFunctionPointerHost:
+    func call(pointer: i64, arguments: list[Value]) -> Value!
+
 ## Explicit mutable storage for source `extern var` declarations. Keeping it
 ## separate from callable bindings lets an oracle host provide only the kind
 ## of foreign state a test uses.
@@ -120,26 +126,30 @@ pub class HirInterpreter: HirExecutionBackend:
 
     ## Run one selected function from an analyzed HIR program.
     pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
-        return try HirInterpreterRun(program.hir, none, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, none, none, none).run(module_name, function_name)
 
     ## Run with explicit behavior for any host-supplied C functions reached.
     pub func run_with_host(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternHost) -> Value!:
-        return try HirInterpreterRun(program.hir, host, none).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, host, none, none).run(module_name, function_name)
 
     ## Run with C-owned global storage but no callable C imports.
     pub func run_with_globals(program: AnalyzedProgram, module_name: str, function_name: str, host: HirExternVariableHost) -> Value!:
-        return try HirInterpreterRun(program.hir, none, host).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, none, host, none).run(module_name, function_name)
 
     ## Run a program that uses both callable imports and C-owned globals.
     pub func run_with_hosts(program: AnalyzedProgram, module_name: str, function_name: str, functions: HirExternHost?, variables: HirExternVariableHost?) -> Value!:
-        return try HirInterpreterRun(program.hir, functions, variables).run(module_name, function_name)
+        return try HirInterpreterRun(program.hir, functions, variables, none).run(module_name, function_name)
+
+    ## Run with both named extern bindings and arbitrary C function pointers.
+    pub func run_with_c_function_pointers(program: AnalyzedProgram, module_name: str, function_name: str, functions: HirExternHost, pointers: HirCFunctionPointerHost) -> Value!:
+        return try HirInterpreterRun(program.hir, functions, none, pointers).run(module_name, function_name)
 
     ## Invoke one exact C export as an external caller would: arguments arrive
     ## in C boundary form and the result leaves in that form. This keeps export
     ## adaptation inside the semantic oracle instead of teaching tests or
     ## hosts how tagged Luce optionals happen to be represented.
     pub func call_c_export(program: AnalyzedProgram, function_name: str, arguments: list[Value]) -> Value!:
-        return try HirInterpreterRun(program.hir, none, none).call_c_export(function_name, arguments)
+        return try HirInterpreterRun(program.hir, none, none, none).call_c_export(function_name, arguments)
 
 # Executes one checked program directly by symbol identity.
 # Frames the interpreter allows before reporting exhaustion. Unbounded
@@ -200,16 +210,18 @@ class HirInterpreterRun: ClassFinalizer:
     let program: HirProgram
     let external_host: HirExternHost?
     let external_variable_host: HirExternVariableHost?
+    let c_function_pointer_host: HirCFunctionPointerHost?
     ## Luce-owned module state belongs to one interpreter instance and is
     ## distinct from C-owned globals supplied by `external_variable_host`.
     let globals: list[Value]
     var depth: i64
 
     # Retain the immutable semantic program used for all calls in this run.
-    pub init(program: HirProgram, external_host: HirExternHost?, external_variable_host: HirExternVariableHost?):
+    pub init(program: HirProgram, external_host: HirExternHost?, external_variable_host: HirExternVariableHost?, c_function_pointer_host: HirCFunctionPointerHost?):
         self.program = program
         self.external_host = external_host
         self.external_variable_host = external_variable_host
+        self.c_function_pointer_host = c_function_pointer_host
         self.globals = list[Value]()
         for global in program.globals:
             self.globals.append(zero_hir_value(program, global.value_type))
@@ -371,6 +383,8 @@ class HirInterpreterRun: ClassFinalizer:
             CapturedCell(storage): storage.value = BoxedValue(value = value)
             else: bindings[index] = Binding(symbol = bindings[index].symbol, value = value)
 
+    # mark: C boundary ==========================================================================
+
     # Encode ordinary semantic values into the C-shaped values an explicit
     # host receives. This is a boundary operation: tagged optionals become a
     # zero/nonzero token, and a zero token in a bare pointer slot traps.
@@ -383,38 +397,28 @@ class HirInterpreterRun: ClassFinalizer:
     func encode_c_value(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
         if self.is_extern_struct(value_type):
             return try self.transcode_extern_struct(function, value, value_type, slot, true)
-        let optional_inner = self.optional_pointer_handle(value_type)
-        if optional_inner != none:
+        let optional_cfunc = self.optional_c_function(value_type)
+        if optional_cfunc != none:
             match value:
-                Absent: return Value.Foreign(token = 0)
+                Absent: return Value.CFunction(identity = HirCFunctionIdentity.ForeignPointer(token = 0))
                 Present(item):
                     match item.value:
-                        Foreign(token): return Value.Foreign(token = token)
-                        else: trap("typed pointer-handle optional contains a non-handle value")
-                else: trap("typed pointer-handle optional has a non-optional value")
-
+                        CFunction(identity): return item.value
+                        else: trap("typed nullable cfunc contains a non-cfunc value")
+                else: trap("typed nullable cfunc has a non-optional value")
         match self.program.types.definitions[value_type.value].form:
             CFunction(parameters, result):
                 match value:
-                    CFunction(symbol): return value
+                    CFunction(identity):
+                        match identity:
+                            ForeignPointer(token):
+                                if token == 0: error(self.null_foreign(function, slot))
+                            Declared(symbol): pass
+                        return value
                     else: trap("typed cfunc slot contains a non-cfunc value")
             else: pass
 
-        let extern_index = self.extern_type_index(value_type)
-        if extern_index >= 0:
-            match value:
-                Foreign(token):
-                    match self.program.extern_types[extern_index].representation:
-                        Pointer:
-                            if token == 0: error(self.null_foreign(function, slot))
-                        Integer(representation):
-                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
-                                trap("typed integer handle is outside its declared representation")
-                    return value
-                else: trap("typed handle slot contains a non-handle value")
-
-        if self.scalar_value_matches(value, value_type): return self.canonical_scalar_value(value, value_type)
-        trap("typed C argument is incompatible with its HIR slot")
+        return try self.encode_c_component(value, value_type, self.null_foreign(function, slot))
 
     # Decode the declared return and every output immediately after a C call,
     # then apply the one source result-shaping rule from HirGenerator.
@@ -447,72 +451,102 @@ class HirInterpreterRun: ClassFinalizer:
         return Value.Tuple(elements = values)
 
     # Decode one raw C value. A nullable pointer token becomes an ordinary
-    # tagged optional; a bare null never enters HIR.
+    # tagged optional. A bare handle still rejects null, while a bare cfunc may
+    # retain it inertly until invocation or its next C input crossing.
     func decode_c_value(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
         if self.is_extern_struct(value_type):
             return try self.transcode_extern_struct(function, value, value_type, slot, false)
-        let optional_inner = self.optional_pointer_handle(value_type)
-        if optional_inner != none:
+        let optional_cfunc = self.optional_c_function(value_type)
+        if optional_cfunc != none:
             match value:
-                Foreign(token):
-                    if token == 0: return Value.Absent
-                    return Value.Present(value = BoxedValue(value = Value.Foreign(token = token)))
+                CFunction(identity):
+                    match identity:
+                        ForeignPointer(token):
+                            if token == 0: return Value.Absent
+                        Declared(symbol): pass
+                    return Value.Present(value = BoxedValue(value = value))
                 else: error(self.incompatible_c_result(function, slot, value_type))
-
         match self.program.types.definitions[value_type.value].form:
             CFunction(parameters, result):
                 match value:
-                    CFunction(symbol): return value
+                    CFunction(identity): return value
                     else: error(self.incompatible_c_result(function, slot, value_type))
             else: pass
 
+        return try self.decode_c_component(value, value_type, self.null_foreign(function, slot), self.incompatible_c_result(function, slot, value_type))
+
+    func decode_c_argument(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
+        let optional_cfunc = self.optional_c_function(value_type)
+        if optional_cfunc != none:
+            match value:
+                CFunction(identity):
+                    match identity:
+                        ForeignPointer(token):
+                            if token == 0: return Value.Absent
+                        Declared(symbol): pass
+                    return Value.Present(value = BoxedValue(value = value))
+                else: error(self.incompatible_c_argument(function, slot, value_type))
+        match self.program.types.definitions[value_type.value].form:
+            CFunction(parameters, result):
+                match value:
+                    CFunction(identity):
+                        match identity:
+                            ForeignPointer(token):
+                                if token == 0: error(self.null_foreign(function, slot))
+                            Declared(symbol): pass
+                        return value
+                    else: error(self.incompatible_c_argument(function, slot, value_type))
+            else: pass
+
+        return try self.decode_c_component(value, value_type, self.null_foreign(function, slot), self.incompatible_c_argument(function, slot, value_type))
+
+    # Shared scalar/handle boundary vocabulary for declarations, exports, and
+    # raw cfunc invocation. Aggregate and cfunc-container shapes are handled
+    # by their explicit callers before entering this closed component path.
+    func encode_c_component(value: Value, value_type: TypeId, null_error: str) -> Value!:
+        if self.optional_pointer_handle(value_type) != none:
+            match value:
+                Absent: return Value.Foreign(token = 0)
+                Present(item):
+                    match item.value:
+                        Foreign(token): return Value.Foreign(token = token)
+                        else: trap("typed pointer-handle optional contains a non-handle value")
+                else: trap("typed pointer-handle optional has a non-optional value")
         let extern_index = self.extern_type_index(value_type)
         if extern_index >= 0:
             match value:
                 Foreign(token):
                     match self.program.extern_types[extern_index].representation:
                         Pointer:
-                            if token == 0: error(self.null_foreign(function, slot))
+                            if token == 0: error(null_error)
                         Integer(representation):
                             if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
-                                error(self.incompatible_c_result(function, slot, value_type))
+                                trap("typed integer handle is outside its declared representation")
                     return value
-                else: error(self.incompatible_c_result(function, slot, value_type))
-
+                else: trap("typed handle slot contains a non-handle value")
         if self.scalar_value_matches(value, value_type): return self.canonical_scalar_value(value, value_type)
-        error(self.incompatible_c_result(function, slot, value_type))
+        trap("typed C argument is incompatible with its HIR slot")
 
-    func decode_c_argument(function: HirFunction, value: Value, value_type: TypeId, slot: str) -> Value!:
-        let optional_inner = self.optional_pointer_handle(value_type)
-        if optional_inner != none:
+    func decode_c_component(value: Value, value_type: TypeId, null_error: str, incompatible: str) -> Value!:
+        if self.optional_pointer_handle(value_type) != none:
             match value:
                 Foreign(token):
                     if token == 0: return Value.Absent
                     return Value.Present(value = BoxedValue(value = Value.Foreign(token = token)))
-                else: error(self.incompatible_c_argument(function, slot, value_type))
-
-        match self.program.types.definitions[value_type.value].form:
-            CFunction(parameters, result):
-                match value:
-                    CFunction(symbol): return value
-                    else: error(self.incompatible_c_argument(function, slot, value_type))
-            else: pass
-
+                else: error(incompatible)
         let extern_index = self.extern_type_index(value_type)
         if extern_index >= 0:
             match value:
                 Foreign(token):
                     match self.program.extern_types[extern_index].representation:
                         Pointer:
-                            if token == 0: error(self.null_foreign(function, slot))
+                            if token == 0: error(null_error)
                         Integer(representation):
-                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
-                                error(self.incompatible_c_argument(function, slot, value_type))
+                            if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation): error(incompatible)
                     return value
-                else: error(self.incompatible_c_argument(function, slot, value_type))
-
+                else: error(incompatible)
         if self.scalar_value_matches(value, value_type): return self.canonical_scalar_value(value, value_type)
-        error(self.incompatible_c_argument(function, slot, value_type))
+        error(incompatible)
 
     func canonical_scalar_value(value: Value, value_type: TypeId) -> Value:
         if is_floating_type(self.program.types, value_type):
@@ -572,7 +606,7 @@ class HirInterpreterRun: ClassFinalizer:
 
     # The semantic oracle models packing as a fresh field-by-field record.
     # It has no target layout, but it enforces the same closed values and bare
-    # out-field handle rule as canonical MIR's explicit boundary copy.
+    # out-field handle/cfunc rule as canonical MIR's explicit boundary copy.
     func transcode_extern_struct(function: HirFunction, value: Value, value_type: TypeId, slot: str, encoding: bool) -> Value!:
         let source_fields = list[BoxedValue]()
         match value:
@@ -589,6 +623,18 @@ class HirInterpreterRun: ClassFinalizer:
             if self.is_extern_struct(field.value_type):
                 copied.append(BoxedValue(value = try self.transcode_extern_struct(function, item, field.value_type, field_slot, encoding)))
                 continue
+            match self.program.types.definitions[field.value_type.value].form:
+                CFunction(parameters, result):
+                    match item:
+                        CFunction(identity):
+                            match identity:
+                                ForeignPointer(token):
+                                    if encoding and token == 0: error(self.null_foreign(function, field_slot))
+                                Declared(symbol): pass
+                        else: error(self.incompatible_c_result(function, field_slot, field.value_type))
+                    copied.append(BoxedValue(value = item))
+                    continue
+                else: pass
             let extern_index = self.extern_type_index(field.value_type)
             if extern_index >= 0:
                 match item:
@@ -615,6 +661,14 @@ class HirInterpreterRun: ClassFinalizer:
                 match self.program.extern_types[index].representation:
                     Pointer: return inner
                     Integer(representation): return none
+            else: return none
+
+    func optional_c_function(value_type: TypeId) -> TypeId?:
+        match self.program.types.definitions[value_type.value].form:
+            Optional(inner):
+                match self.program.types.definitions[inner.value].form:
+                    CFunction(parameters, result): return inner
+                    else: return none
             else: return none
 
     func incompatible_c_result(function: HirFunction, slot: str, value_type: TypeId) -> str:
@@ -1270,7 +1324,7 @@ class HirInterpreterRun: ClassFinalizer:
                 return try self.evaluate_interface_call(receiver, interface_type, requirement, arguments, bindings)
             FunctionAddress(function):
                 match self.program.types.definitions[node_type(self.program, expression).value].form:
-                    CFunction(parameters, result): return Evaluation.Evaluated(value = Value.CFunction(symbol = function))
+                    CFunction(parameters, result): return Evaluation.Evaluated(value = Value.CFunction(identity = HirCFunctionIdentity.Declared(symbol = function)))
                     else: return Evaluation.Evaluated(value = Value.Function(symbol = function))
             ClosureValue(closure, initializers):
                 let capture_table = self.program.closures[closure].captures
@@ -1847,12 +1901,16 @@ class HirInterpreterRun: ClassFinalizer:
     func evaluate_indirect_call(callee: NodeId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
         let selected = try self.evaluate(callee, bindings)
         var function = SymbolId(value = 0)
+        var raw_c_function: i64? = none
         let captures = list[Value]()
         match selected:
             Evaluated(value):
                 match value:
                     Function(symbol): function = symbol
-                    CFunction(symbol): function = symbol
+                    CFunction(identity):
+                        match identity:
+                            Declared(symbol): function = symbol
+                            ForeignPointer(token): raw_c_function = token
                     Closure(storage):
                         function = self.program.closures[storage.closure].function
                         for capture in storage.captures: captures.append(capture.value)
@@ -1863,7 +1921,33 @@ class HirInterpreterRun: ClassFinalizer:
             match try self.evaluate(node_at(self.program, arguments, position), bindings):
                 Evaluated(value): values.append(value)
                 Transferred(execution): return Evaluation.Transferred(execution = execution)
+        if raw_c_function != none:
+            return Evaluation.Evaluated(value = try self.call_c_function_pointer(raw_c_function, node_type(self.program, callee), values))
         return Evaluation.Evaluated(value = (try self.call_with_captures(self.find_function(function), values, captures)).value)
+
+    # Invoke one opaque pointer through the exact checked cfunc signature.
+    # The semantic host sees raw C-shaped components; it never receives a
+    # fabricated HIR symbol standing in for the pointer.
+    func call_c_function_pointer(pointer_value: i64, function_type: TypeId, arguments: list[Value]) -> Value!:
+        if pointer_value == 0: error("interpreter: null_foreign invoking cfunc")
+        let host = self.c_function_pointer_host else error("interpreter: cfunc pointer " + str(pointer_value) + " has no host binding")
+        let parameters = list[TypeId]()
+        var result_type = resolve_builtin_type(BuiltinType.unit)
+        match self.program.types.definitions[function_type.value].form:
+            CFunction(items, result):
+                for item in items: parameters.append(item)
+                result_type = result
+            else: trap("raw C function pointer has a non-cfunc HIR type")
+        if len(arguments) != len(parameters): trap("typed cfunc call has the wrong argument count")
+        let encoded = list[Value]()
+        for index in range(0, len(arguments)):
+            encoded.append(try self.encode_c_component(arguments[index], parameters[index], "interpreter: null_foreign crossing cfunc parameter " + str(index)))
+        let raw_result = try host.call(pointer_value, encoded)
+        if types_match(result_type, resolve_builtin_type(BuiltinType.unit)):
+            match raw_result:
+                Unit: return Value.Unit
+                else: error("interpreter: cfunc pointer returned a value incompatible with `unit`")
+        return try self.decode_c_component(raw_result, result_type, "interpreter: null_foreign crossing cfunc result", "interpreter: cfunc pointer returned a value incompatible with `" + describe_type(self.program.types, result_type) + "`")
 
     # Evaluate one mutable receiver exactly once while retaining where its
     # final value must be copied back after the method returns.
@@ -2306,7 +2390,7 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         Function(symbol): trap("function values have no binary operations")
         Closure(storage): trap("closure values have no binary operations")
         Interface(storage): trap("interface values have no binary operations")
-        CFunction(symbol): trap("cfunc values have no binary operations")
+        CFunction(identity): trap("cfunc values have no binary operations")
         Record(left_fields):
             match right:
                 Record(right_fields): return try evaluate_tuple_binary(left_fields, operation, right_fields, types)
@@ -2866,7 +2950,7 @@ func structural_hash(value: Value) -> u64:
         Function(symbol): trap("functions are not structurally hashable")
         Closure(storage): trap("closures are not structurally hashable")
         Interface(storage): trap("interface values are not structurally hashable")
-        CFunction(symbol): trap("C functions are not structurally hashable")
+        CFunction(identity): trap("C functions are not structurally hashable")
         Class(storage): trap("classes are not structurally hashable")
         WeakClass(storage): trap("weak handles are not structurally hashable")
         CapturedCell(storage): trap("captured cells are not structurally hashable")

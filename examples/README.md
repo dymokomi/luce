@@ -148,8 +148,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   diagnostics, and skipped deferred cleanup.
 - `native_interop.native.luc` checks and executes raw `extern` types,
   functions, output parameters, variables, and ordinary value-shaped extern
-  structs. Its `clock_gettime` call crosses a real QBE/libc pointer boundary;
-  the same file keeps the audited native rebind/move surface visible.
+  structs. Its `clock_gettime` call crosses a real QBE/libc data pointer
+  boundary, while two `signal` calls return and invoke an opaque C function
+  pointer; the same file keeps the audited native rebind/move surface visible.
 
 ## Stage-0 example corpus as a progress gate
 

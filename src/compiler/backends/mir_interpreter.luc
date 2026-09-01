@@ -60,9 +60,15 @@ pub union MirValue:
 ## interpreter retains ownership of layout, bounds, and value validation.
 pub interface MirExternMemory:
     func store_external(address: MirValue, value_type: TypeId, value: MirValue) -> !
+    func store_external_field(address: MirValue, aggregate_type: TypeId, field: i64, value: MirValue) -> !
 
 pub interface MirExternHost:
     func call(external: MirExtern, arguments: list[MirValue], memory: MirExternMemory) -> list[MirValue]!
+
+## An arbitrary C code pointer has no `MirExtern` identity. The exact verified
+## signature accompanies the call while the host supplies only its behavior.
+pub interface MirCFunctionPointerHost:
+    func call(pointer: i64, signature: MirSignature, arguments: list[MirValue], memory: MirExternMemory) -> list[MirValue]!
 
 pub interface MirExternalGlobalHost:
     func load(global: MirExternalGlobal) -> MirValue!
@@ -324,6 +330,7 @@ pub class MirInterpreter: MirExternMemory:
     var arena_address: i64
     var arena_committed: i64
     var external_host: MirExternHost?
+    var c_function_pointer_host: MirCFunctionPointerHost?
     var external_global_host: MirExternalGlobalHost?
     var is_loaded: bool
     ## Everything `luce_rt_write` has written, in order.
@@ -351,6 +358,7 @@ pub class MirInterpreter: MirExternMemory:
         self.arena_address = 0
         self.arena_committed = 0
         self.external_host = none
+        self.c_function_pointer_host = none
         self.external_global_host = none
         self.is_loaded = false
         self.output = ""
@@ -358,6 +366,11 @@ pub class MirInterpreter: MirExternMemory:
     ## Bind source C imports for subsequent executions of this instance.
     pub func bind_externs(host: MirExternHost):
         self.external_host = host
+
+    ## Bind behavior for raw C function pointers independently of named
+    ## extern declarations.
+    pub func bind_c_function_pointers(host: MirCFunctionPointerHost):
+        self.c_function_pointer_host = host
 
     ## Bind C-owned global storage independently from callable imports.
     pub func bind_external_globals(host: MirExternalGlobalHost):
@@ -370,6 +383,21 @@ pub class MirInterpreter: MirExternMemory:
         if not self.external_value_matches(value, value_type):
             error("mir interpreter: extern tried to store an incompatible value")
         self.store(value_type, ptr_of(address), value)
+
+    ## Store one logical aggregate field without exposing byte offsets to an
+    ## extern host. Aggregate structure belongs to canonical MIR; this backend
+    ## alone applies its configured layout when locating the selected field.
+    pub func store_external_field(address: MirValue, aggregate_type: TypeId, field: i64, value: MirValue) -> !:
+        match mir_type(self.program.types, aggregate_type):
+            Struct(fields):
+                if field < 0 or field >= len(fields):
+                    error("mir interpreter: extern selected a field outside its struct")
+                let field_type = fields[field].value_type
+                if not self.external_value_matches(value, field_type):
+                    error("mir interpreter: extern tried to store an incompatible struct field")
+                let field_address = ptr_of(address) + self.layout.field_offset(aggregate_type, field)
+                self.store(field_type, field_address, self.canonical_external_value(value, field_type))
+            else: error("mir interpreter: extern field store requires a struct type")
 
     ## Run one function by name and return its results; a fallible function's
     ## last result is its caller-owned error-slot pointer, or `Ptr(0)` on
@@ -1189,13 +1217,19 @@ pub class MirInterpreter: MirExternMemory:
                     self.bind(frame, results, values)
                 else:
                     let external_index = address - extern_address_base
-                    if convention != CallingConvention.c or external_index < 0 or external_index >= len(self.program.externs):
-                        error("mir interpreter: trap: indirect call through " + str(address) + ", which is not a compatible function address")
-                    let external = self.program.externs[external_index]
-                    if external.convention != convention or not signatures_match(external.signature, signature):
-                        error("mir interpreter: trap: indirect extern call signature or convention mismatch")
-                    let values = try self.call_extern(external, self.collect(frame, arguments))
-                    self.bind(frame, results, values)
+                    if convention == CallingConvention.c and external_index >= 0 and external_index < len(self.program.externs):
+                        let external = self.program.externs[external_index]
+                        if external.convention != convention or not signatures_match(external.signature, signature):
+                            error("mir interpreter: trap: indirect extern call signature or convention mismatch")
+                        let values = try self.call_extern(external, self.collect(frame, arguments))
+                        self.bind(frame, results, values)
+                    else:
+                        if convention != CallingConvention.c or address == 0:
+                            error("mir interpreter: trap: indirect call through " + str(address) + ", which is not a compatible function address")
+                        let host = self.c_function_pointer_host else error("mir interpreter: C function pointer " + str(address) + " is not available")
+                        let values = try host.call(address, signature, self.collect(frame, arguments), self)
+                        try self.validate_external_results("C function pointer " + str(address), signature, values)
+                        self.bind(frame, results, values)
             CallClosure(results, signature, target, arguments):
                 let target_address = ptr_of(frame.registers[target.value])
                 let code = ptr_of(self.load(builtin_mir_type(BuiltinMirType.pointer), target_address))
@@ -1645,12 +1679,7 @@ pub class MirInterpreter: MirExternMemory:
         if external.convention == CallingConvention.c:
             let host = self.external_host else error("mir interpreter: extern `" + external.name + "` is not available")
             let results = try host.call(external, arguments, self)
-            if len(results) != len(external.signature.results):
-                error("mir interpreter: extern `" + external.name + "` returned " + str(len(results)) + " value(s), expected " + str(len(external.signature.results)))
-            for index in range(0, len(results)):
-                if not self.external_value_matches(results[index], external.signature.results[index]):
-                    error("mir interpreter: extern `" + external.name + "` returned a value incompatible with result " + str(index))
-                results[index] = self.canonical_external_value(results[index], external.signature.results[index])
+            try self.validate_external_results("extern `" + external.name + "`", external.signature, results)
             return results
         let name = external.name
         if name == "luce_rt_arena":
@@ -1669,6 +1698,14 @@ pub class MirInterpreter: MirExternMemory:
         if name == "luce_rt_weak_make" or name == "luce_rt_weak_get":
             return [arguments[0]]
         error("mir interpreter: extern `" + name + "` is not available")
+
+    func validate_external_results(subject: str, signature: MirSignature, results: list[MirValue]) -> !:
+        if len(results) != len(signature.results):
+            error("mir interpreter: " + subject + " returned " + str(len(results)) + " value(s), expected " + str(len(signature.results)))
+        for index in range(0, len(results)):
+            if not self.external_value_matches(results[index], signature.results[index]):
+                error("mir interpreter: " + subject + " returned a value incompatible with result " + str(index))
+            results[index] = self.canonical_external_value(results[index], signature.results[index])
 
     func external_value_matches(value: MirValue, value_type: TypeId) -> bool:
         if is_float_type(self.program.types, value_type):

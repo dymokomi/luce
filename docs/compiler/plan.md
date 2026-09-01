@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-08-31 (Stage-0 0.30).
+Last updated: 2026-09-01 (Stage-0 0.30).
 
 ## Recovery audit of the unpublished native branch
 
@@ -244,7 +244,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   expression walk. Extracting either marked section today would duplicate that
   machinery or add a forwarding interface, so they remain cohesive until a
   reusable function-emission owner can replace—not wrap—the shared helpers.
-  The completed map/set slice raised that shared function walk to 4,991 lines
+  The incoming-cfunc slice raised that shared function walk to 5,206 lines
   and the Wasm encoder to 2,475 lines; both were reviewed again at the slice
   boundary. Keep the parser and Wasm encoder sectioned
   until new work establishes real component boundaries; do not split any pass
@@ -368,9 +368,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   methods, field defaults, and interface conformance remain available while
   the grammar and parser deliberately admit only plain fields; that
   specification inconsistency must be resolved before calling §21.17 closed.
-  Strings, lists, `foreign`, exported structs/enums, dynamically supplied C
-  function pointers—including cfunc fields in extern structs—and nullable
-  cfunc slots remain on this item.
+  Incoming bare/nullable C function pointers and cfunc fields are now complete
+  in the separate rung below. Strings, lists, `foreign`, exported
+  structs/enums, generated adapters, and callback runtime enforcement remain
+  on this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
@@ -442,9 +443,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   generated adapter invoked back from libc through `atexit`. Stored fields,
   parameters/results, aliases and selection run in
   the differential corpus and `examples/cfunc_values.luc`. This rung does
-  **not** claim pointers dynamically returned by C, nullable cfunc slots, or
-  lambda/closure conversion; those need the explicit foreign-pointer oracle
-  and managed-environment work rather than an implicit representation trick.
+  originally did **not** claim pointers dynamically returned by C, nullable
+  cfunc slots, or lambda/closure conversion; the next rung closes those
+  representation questions explicitly.
+- [x] **Incoming and nullable `cfunc` pointers remain opaque until invocation**
+  (2026-09-01). HIR distinguishes compiler-resolved adapters/symbols from an
+  arbitrary C-supplied code token; raw pointers never masquerade as source
+  symbols. Direct results, `out` slots, nullable results, and extern-struct
+  fields preserve that identity through both semantic oracles and canonical
+  MIR's existing abstract pointer. A separate function-pointer host executes
+  an exact verified C signature, while the MIR memory view lets tests populate
+  a logical aggregate field without learning backend byte offsets. Bare zero
+  remains inert when read and traps `null_foreign` only at invocation or the
+  next bare input crossing; nullable zero decodes to `none`. Capture-free names
+  and lambdas share generated adapters, while captured closures remain rejected.
+  Focused HIR/MIR tests, the differential corpus, and real libc `signal`
+  round-tripping prove the path. The callback thread/runtime-context contract
+  and the remaining C-export callback matrix stay open.
 - [x] **Settle the target-neutral runtime allocation contract before coding
   it** (2026-08-30, spec §§21.12 and 23.4). Canonical MIR requests storage for
   a runtime count of one structural `TypeId`; it never manufactures target
@@ -700,7 +715,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   honest boundary: abstract probing, structural inference, and concrete
   function/method specialization live in `hir/generics/functions.luc` and
   borrow a narrow semantic interface without duplicating the generation
-  transaction. The 2,308-line declaration collector now owns one cohesive,
+  transaction. The 2,671-line declaration collector now owns one cohesive,
   marked interface declaration/conformance section because it directly shares
   name, type, method, visibility, generic-specialization, and adapter
   resolution; its generic-conformance threshold review found that splitting
@@ -710,16 +725,21 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   declaration collector. Standard protocol identity and iteration selection
   established sibling 137- and 210-line owners. Structural marker use adds a
   focused 57-line sibling. The remaining 3,013-line HIR body checker and
-  4,255-line MIR function lowerer stay intact after the hashing review above;
+  5,206-line MIR function lowerer stay intact after the cfunc review above;
   the lowerer's next major slice must include another transaction-boundary
-  review. The 2,495-line HIR
-  interpreter
-  likewise remains one semantic state machine: expression evaluation,
+  review. The 3,048-line HIR interpreter likewise remains one semantic state
+  machine: expression evaluation,
   mutable-place access, calls, and control transfer recurse through each
   other, while their stack-heavy arms already live in focused helpers.
   The class audit found no such seam: lifecycle semantics are inseparable from
   the same expression/place/call transaction, and a class-only helper would
-  be forwarding rather than ownership. Line count alone does not. Parser
+  be forwarding rather than ownership. The 2,001-line MIR interpreter reached
+  the same review threshold in the incoming-cfunc slice: host contracts,
+  logical extern-memory writes, instruction execution, and backend-owned
+  layout form one oracle boundary, while region planning and value helpers are
+  already marked independent sections. Splitting only the public host
+  contracts would create another data-only forwarding module. Line count
+  alone does not. Parser
   grammar is already frozen; separate its
   byte/token plumbing only where one owner can retain the cursor and
   diagnostic state.
