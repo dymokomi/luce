@@ -319,20 +319,21 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   there is no assertion MIR instruction or backend-specific lowering. The
   remaining effect-free-condition proof waits for real operational summaries,
   and source-location/stack reporting remains in the §13 diagnostic audit.
-- [x] **Complete explicit numeric construction for the implemented scalar
-  widths** (2026-08-31). One `NumericConvert` HIR node covers every
-  integer/integer, integer/float, float/integer, and f32/f64 pair without
+- [x] **Complete explicit numeric construction for every scalar width**
+  (2026-09-01). One `NumericConvert` HIR node covers every integer/integer,
+  integer/float, float/integer, and f16/f32/f64 pair without
   source-family duplication. §7.5 now states the policy explicitly:
   integer-to-float and float narrowing round to nearest/ties-to-even,
   float-to-integer truncates toward zero after rejecting NaN, infinity, and
   values outside the destination interval, and only finite floating narrowing
-  overflow traps. HIR constants and every f32 operation round at binary32;
+  overflow traps. HIR constants and operations round at their declared width;
   canonical MIR retains typed `Convert` operations and target-independent
-  guards. QBE supplies explicit invalid-conversion guards plus `truncd`/`exts`;
-  Wasm uses its trapping conversions and promote/demote instructions. Both
-  oracles, external host seams, the full differential corpus, and
-  `examples/numeric_conversions.luc` agree through native QBE and Wasm. `f16`
-  remains a separate missing scalar width, not an ambiguity in construction.
+  guards. QBE and Wasm legalize f16 only behind their backend boundaries,
+  with exact IEEE rounding and two-byte storage. Both oracles, structural
+  hashing and display, the full differential corpus, and
+  `examples/numeric_conversions.luc` agree through native QBE and Wasm. Direct
+  f16 C ABI crossings remain part of the generated rich-boundary adapter work;
+  the compiler rejects them instead of silently widening the signature.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

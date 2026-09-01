@@ -24,6 +24,7 @@
 
 from compiler.backends.layout import LayoutRules, TypeLayout
 from compiler.backends.emission import FunctionEmission, TextEmission
+from compiler.backends.qbe_float16 import qbe_float16_helpers
 from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
 from compiler.mir.canonical import MirClass, MirFunction, MirProgram, MirSignature, RegisterId, RegisterRun, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
@@ -78,6 +79,7 @@ class QbeEmitter:
     var temporaries: i64
     var regions: list[Region]
     var terminated: bool
+    var uses_float16: bool
 
     init(program: MirProgram, clock: (func() -> i64)?):
         self.program = program
@@ -89,6 +91,7 @@ class QbeEmitter:
         self.temporaries = 0
         self.regions = list[Region]()
         self.terminated = false
+        self.uses_float16 = false
 
     func emit() -> TextEmission!:
         try self.emit_data()
@@ -102,6 +105,7 @@ class QbeEmitter:
                 code_bytes = u64(len(self.output) - output_start),
                 codegen_time_ms = self.elapsed_ms(started),
             ))
+        if self.uses_float16: self.output = self.output + qbe_float16_helpers() + "\n\n"
         return TextEmission(text = self.output, functions = self.function_emissions)
 
     func clock_ms() -> i64:
@@ -304,7 +308,16 @@ class QbeEmitter:
     func emit_operation(function: MirFunction, form: InstructionForm) -> !:
         match form:
             Const(result, value):
-                self.line(self.reg(result) + " =" + try self.base_type(self.register_type(function, result)) + " copy " + try self.constant(function, result, value))
+                let value_type = self.register_type(function, result)
+                if self.is_float16(value_type):
+                    let raw = self.temp()
+                    match value:
+                        Float(item):
+                            self.line(raw + " =d copy d_" + str(item))
+                            self.emit_float64_to_float16(self.reg(result), raw)
+                        else: error("qbe backend: Float(16) constant is not floating")
+                else:
+                    self.line(self.reg(result) + " =" + try self.base_type(value_type) + " copy " + try self.constant(function, result, value))
             Copy(result, source):
                 self.line(self.reg(result) + " =" + try self.base_type(self.register_type(function, result)) + " copy " + self.reg(source))
             Binary(result, operation, left, right):
@@ -315,7 +328,10 @@ class QbeEmitter:
                 try self.emit_convert(function, result, operation, operand)
             FloatBits(result, operand):
                 let source = self.register_type(function, operand)
-                if bits_of(self.program.types, source) == 32:
+                if bits_of(self.program.types, source) == 16:
+                    let raw = self.emit_float16_bits(self.reg(operand))
+                    self.line(self.reg(result) + " =l extuw " + raw)
+                elif bits_of(self.program.types, source) == 32:
                     let raw = self.temp()
                     self.line(raw + " =w cast " + self.reg(operand))
                     self.line(self.reg(result) + " =l extuw " + raw)
@@ -596,9 +612,9 @@ class QbeEmitter:
                 let service = find_runtime_binding(self.program, RuntimeService.class_payload) else trap("verified `CellValueAddress` has no runtime binding")
                 self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + ")")
             Load(result, value_type, address):
-                self.line(self.reg(result) + " =" + try self.base_type(value_type) + " " + try self.load_instruction(value_type) + " " + self.reg(address))
+                try self.emit_load(self.reg(result), value_type, self.reg(address))
             Store(value_type, address, value):
-                self.line(try self.store_instruction(value_type) + " " + self.reg(value) + ", " + self.reg(address))
+                try self.emit_store(value_type, self.reg(address), self.reg(value))
             FieldAddress(result, struct_type, base, field):
                 self.line(self.reg(result) + " =l add " + self.reg(base) + ", " + str(self.layout.field_offset(struct_type, field)))
             EnumPayloadAddress(result, enum_type, base):
@@ -617,10 +633,10 @@ class QbeEmitter:
                 self.line(self.reg(result) + " =l copy $g" + str(global.value))
             LoadExternalGlobal(result, global):
                 let declaration = self.program.external_globals[global.value]
-                self.line(self.reg(result) + " =" + try self.base_type(declaration.value_type) + " " + try self.load_instruction(declaration.value_type) + " extern $" + declaration.name)
+                try self.emit_load(self.reg(result), declaration.value_type, "extern $" + declaration.name)
             StoreExternalGlobal(global, value):
                 let declaration = self.program.external_globals[global.value]
-                self.line(try self.store_instruction(declaration.value_type) + " " + self.reg(value) + ", extern $" + declaration.name)
+                try self.emit_store(declaration.value_type, "extern $" + declaration.name, self.reg(value))
             FunctionAddress(result, target):
                 self.line(self.reg(result) + " =l copy $" + self.function_name(target))
             ExternAddress(result, target):
@@ -907,7 +923,7 @@ class QbeEmitter:
         if result_storage != "":
             let value_result = register_at(function, results, 0)
             let value_type = self.register_type(function, value_result)
-            self.line(self.reg(value_result) + " =" + try self.base_type(value_type) + " " + try self.load_instruction(value_type) + " " + result_storage)
+            try self.emit_load(self.reg(value_result), value_type, result_storage)
 
     func emit_closure_call(function: MirFunction, results: RegisterRun, signature: MirSignature, target: RegisterId, arguments: RegisterRun) -> !:
         let code = self.temp()
@@ -945,7 +961,12 @@ class QbeEmitter:
                 mul: name = "mul"
                 div: name = "div"
                 else: error("qbe backend: floating `" + str(operation) + "` is not implemented")
-            self.line(self.reg(result) + " =" + try self.base_type(value_type) + " " + name + " " + self.reg(left) + ", " + self.reg(right))
+            if self.is_float16(value_type):
+                let raw = self.temp()
+                self.line(raw + " =s " + name + " " + self.reg(left) + ", " + self.reg(right))
+                self.emit_float16_round(self.reg(result), raw)
+            else:
+                self.line(self.reg(result) + " =" + try self.base_type(value_type) + " " + name + " " + self.reg(left) + ", " + self.reg(right))
             return
         if not is_int_type(self.program.types, value_type): error("qbe backend: binary operation on `" + describe_mir_type(self.program.types, value_type) + "`")
 
@@ -1132,7 +1153,11 @@ class QbeEmitter:
         let value_type = self.register_type(function, result)
         match operation:
             neg:
-                if is_float_type(self.program.types, value_type): self.line(self.reg(result) + " =" + try self.base_type(value_type) + " neg " + self.reg(operand))
+                if self.is_float16(value_type):
+                    let raw = self.temp()
+                    self.line(raw + " =s neg " + self.reg(operand))
+                    self.emit_float16_round(self.reg(result), raw)
+                elif is_float_type(self.program.types, value_type): self.line(self.reg(result) + " =" + try self.base_type(value_type) + " neg " + self.reg(operand))
                 else:
                     let bits = bits_of(self.program.types, value_type)
                     if bits < 64:
@@ -1170,7 +1195,12 @@ class QbeEmitter:
                 if is_signed_int_type(self.program.types, source): prefix = "s"
                 var width = "l"
                 if bits_of(self.program.types, source) <= 32: width = "w"
-                self.line(self.reg(result) + " =" + try self.base_type(destination) + " " + prefix + width + "tof " + self.reg(operand))
+                if self.is_float16(destination):
+                    let raw = self.temp()
+                    self.line(raw + " =s " + prefix + width + "tof " + self.reg(operand))
+                    self.emit_float16_round(self.reg(result), raw)
+                else:
+                    self.line(self.reg(result) + " =" + try self.base_type(destination) + " " + prefix + width + "tof " + self.reg(operand))
             float_to_int:
                 try self.guard_float_to_integer(source, destination, operand)
                 var prefix = "d"
@@ -1185,7 +1215,16 @@ class QbeEmitter:
                     try self.guard_range(destination, wide)
                 self.canonicalize_integer(destination, result, converted)
             float_resize:
-                if bits_of(self.program.types, source) == 32:
+                if self.is_float16(destination):
+                    if bits_of(self.program.types, source) == 64:
+                        self.emit_float64_to_float16(self.reg(result), self.reg(operand))
+                    else: self.emit_float16_round(self.reg(result), self.reg(operand))
+                elif bits_of(self.program.types, source) == 16:
+                    if bits_of(self.program.types, destination) == 64:
+                        self.line(self.reg(result) + " =d exts " + self.reg(operand))
+                    else:
+                        self.line(self.reg(result) + " =s copy " + self.reg(operand))
+                elif bits_of(self.program.types, source) == 32:
                     self.line(self.reg(result) + " =d exts " + self.reg(operand))
                 else:
                     self.line(self.reg(result) + " =s truncd " + self.reg(operand))
@@ -1303,7 +1342,7 @@ class QbeEmitter:
             if values.count == 2:
                 let value = register_at(function, values, 0)
                 let value_type = self.register_type(function, value)
-                self.line(try self.store_instruction(value_type) + " " + self.reg(value) + ", %q_result_out")
+                try self.emit_store(value_type, "%q_result_out", self.reg(value))
                 self.terminate("\tret " + self.reg(register_at(function, values, 1)) + "\n")
             elif values.count == 1:
                 self.terminate("\tret " + self.reg(register_at(function, values, 0)) + "\n")
@@ -1324,6 +1363,45 @@ class QbeEmitter:
         if depth < 0 or depth >= len(self.regions): error("qbe backend: branch depth is outside its regions")
         return len(self.regions) - 1 - depth
 
+    # mark: Binary16 legalization --------------------------------------------------------------
+
+    func is_float16(value_type: TypeId) -> bool:
+        match mir_type(self.program.types, value_type):
+            Float(bits): return bits == 16
+            else: return false
+
+    func emit_float16_bits(value: str) -> str:
+        self.uses_float16 = true
+        let bits = self.temp()
+        self.line(bits + " =w call $luce.f16.to_bits(s " + value + ")")
+        return bits
+
+    func emit_float16_round(destination: str, value: str):
+        let bits = self.emit_float16_bits(value)
+        self.line(destination + " =s call $luce.f16.from_bits(w " + bits + ")")
+
+    func emit_float64_to_float16(destination: str, value: str):
+        self.uses_float16 = true
+        let bits = self.temp()
+        self.line(bits + " =w call $luce.f16.double_to_bits(d " + value + ")")
+        self.line(destination + " =s call $luce.f16.from_bits(w " + bits + ")")
+
+    func emit_load(destination: str, value_type: TypeId, address: str) -> !:
+        if self.is_float16(value_type):
+            self.uses_float16 = true
+            let bits = self.temp()
+            self.line(bits + " =w loaduh " + address)
+            self.line(destination + " =s call $luce.f16.from_bits(w " + bits + ")")
+            return
+        self.line(destination + " =" + try self.base_type(value_type) + " " + try self.load_instruction(value_type) + " " + address)
+
+    func emit_store(value_type: TypeId, address: str, value: str) -> !:
+        if self.is_float16(value_type):
+            let bits = self.emit_float16_bits(value)
+            self.line("storeh " + bits + ", " + address)
+            return
+        self.line(try self.store_instruction(value_type) + " " + value + ", " + address)
+
     # mark: Type and text helpers ---------------------------------------------------------------
 
     func base_type(id: TypeId) -> str!:
@@ -1332,6 +1410,9 @@ class QbeEmitter:
                 if bits <= 32: return "w"
                 return "l"
             Float(bits):
+                if bits == 16:
+                    self.uses_float16 = true
+                    return "s"
                 if bits == 32: return "s"
                 return "d"
             Bool: return "w"

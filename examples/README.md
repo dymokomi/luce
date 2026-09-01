@@ -91,6 +91,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   ranges, tuples, optionals, structs, and payload enums. Equal-value behavior
   runs through both semantic oracles, Wasm, and native QBE without pinning a
   backend's numeric hash code.
+- `numeric_conversions.luc` proves checked conversions across every integer
+  and IEEE width, including binary16 literal and per-operation rounding,
+  non-finite preservation, finite-overflow traps, and adjacent two-byte f16
+  aggregate storage through both semantic oracles, Wasm, and native QBE.
 - `closures.luc` proves capture-free and managed anonymous functions,
   explicit value snapshots, shared mutable capture cells, fallible calls and
   infallible-value lifting, nested escaping environments, function ownership

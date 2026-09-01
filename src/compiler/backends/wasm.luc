@@ -63,6 +63,9 @@ from compiler.runtime_contract import RuntimeService
 from compiler.mir.canonical import bits_of, find_runtime_binding, int_maximum, int_minimum, mir_type
 from compiler.backends.layout import TypeLayout, align_up
 from compiler.backends.emission import BinaryEmission, FunctionEmission
+from compiler.backends.wasm_encoding import append_signed, append_unsigned
+from compiler.backends.wasm_float16 import append_float16_bits, append_float16_round, append_float16_value, append_float64_to_float16_bits
+from compiler.backends.wasm_float16 import float16_i32_scratch_count, float16_i64_scratch_count
 from compiler.formatting.ieee import ieee_float_bits
 from compiler.backends.wasm_plan import ModulePlan, WasmSignature, defined_function_index, frame_alignment, has_start, i32_value_type
 from compiler.backends.wasm_plan import plan_module, signature_index, stack_top, start_function_index, wasm_signature, wasm_value_type
@@ -424,7 +427,7 @@ func encode_code_entries(program: MirProgram, plan: ModulePlan, clock: (func() -
     for function_index in range(0, len(program.functions)):
         let function = program.functions[function_index]
         let started = clock_ms(clock)
-        let frame = plan_frame(plan.layout, function)
+        let frame = plan_frame(program.types, plan.layout, function)
         let body = list[u8]()
         try encode_locals(program.types, function, frame, body)
         encode_prologue(frame, plan, body)
@@ -566,6 +569,9 @@ func encode_locals(types: MirTypeTable, function: MirFunction, frame: FramePlan,
     for index in range(parameter_count, len(function.registers)):
         let value_type = try wasm_value_type(types, function.registers[index])
         append_local_run(runs, run_counts, value_type)
+    if frame.float16_scratch >= 0:
+        for index in range(0, float16_i32_scratch_count): append_local_run(runs, run_counts, i32_value_type)
+        for index in range(0, float16_i64_scratch_count): append_local_run(runs, run_counts, i64_value_type)
     # Even an all-zero-size frame needs an address local: `Alloca` still
     # names each logical slot, and all such addresses may equal the current
     # stack pointer because no byte can be read or written through them.
@@ -605,8 +611,14 @@ struct FramePlan:
     let slot_offsets: list[i64]
     let size: i64
     let frame_pointer_local: i64
+    # Five backend-private i32 locals hold the pieces of an IEEE binary16
+    # conversion. Five adjacent i64 locals prevent binary64 narrowing from
+    # double-rounding through binary32. Both groups exist only in functions
+    # whose MIR mentions Float(16).
+    let float16_scratch: i64
+    let float16_wide_scratch: i64
 
-func plan_frame(layout: TypeLayout, function: MirFunction) -> FramePlan:
+func plan_frame(types: MirTypeTable, layout: TypeLayout, function: MirFunction) -> FramePlan:
     let offsets = list[i64]()
     var offset = 0
     for slot in function.slots:
@@ -615,7 +627,28 @@ func plan_frame(layout: TypeLayout, function: MirFunction) -> FramePlan:
         offset += layout.size_of(slot.value_type)
     var size = 0
     if len(function.slots) > 0: size = align_up(offset, frame_alignment)
-    return FramePlan(slot_offsets = offsets, size = size, frame_pointer_local = len(function.registers))
+    var float16_scratch = -1
+    var float16_wide_scratch = -1
+    var frame_pointer_local = len(function.registers)
+    if function_uses_float16(types, function):
+        float16_scratch = frame_pointer_local
+        float16_wide_scratch = float16_scratch + float16_i32_scratch_count
+        frame_pointer_local = float16_wide_scratch + float16_i64_scratch_count
+    return FramePlan(
+        slot_offsets = offsets,
+        size = size,
+        frame_pointer_local = frame_pointer_local,
+        float16_scratch = float16_scratch,
+        float16_wide_scratch = float16_wide_scratch,
+    )
+
+func function_uses_float16(types: MirTypeTable, function: MirFunction) -> bool:
+    for value_type in function.registers:
+        match mir_type(types, value_type):
+            Float(bits):
+                if bits == 16: return true
+            else: pass
+    return false
 
 # `global.get sp; i32.const size; i32.sub; local.tee fp; global.set sp`,
 # then the overflow guard: `local.get fp; i32.const data_end; i32.lt_u; if
@@ -785,26 +818,34 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
                     else: append_constant(body, 0, false)
                 Null: append_constant(body, 0, false)
                 Float(item):
-                    if kind.is_wide: append_f64_constant(body, item)
-                    else: append_f32_constant(body, item)
+                    if kind.bits == 16:
+                        append_f64_constant(body, item)
+                        append_float64_to_float16_bits(body, frame.float16_wide_scratch)
+                        append_float16_value(body, frame.float16_scratch)
+                    elif kind.is_wide: append_f64_constant(body, item)
+                    else:
+                        append_f32_constant(body, item)
             local_set(body, result)
         Copy(result, source):
             local_get(body, source)
             local_set(body, result)
         Binary(result, operation, left, right):
             let kind = try register_kind(types, function, left)
-            try encode_binary(body, operation, kind, result, left, right)
+            try encode_binary(body, operation, kind, frame, result, left, right)
         Unary(result, operation, operand):
             let kind = try register_kind(types, function, operand)
-            try encode_unary(body, operation, kind, result, operand)
+            try encode_unary(body, operation, kind, frame, result, operand)
         Convert(result, operation, operand):
             let from = try register_kind(types, function, operand)
             let to = try register_kind(types, function, result)
-            try encode_convert(body, operation, from, to, result, operand)
+            try encode_convert(body, operation, from, to, frame, result, operand)
         FloatBits(result, operand):
             let from = try register_kind(types, function, operand)
             local_get(body, operand)
-            if from.is_wide: body.append(opcode_i64_reinterpret_f64)
+            if from.bits == 16:
+                append_float16_bits(body, frame.float16_scratch)
+                body.append(opcode_i64_extend_i32_u)
+            elif from.is_wide: body.append(opcode_i64_reinterpret_f64)
             else:
                 body.append(opcode_i32_reinterpret_f32)
                 body.append(opcode_i64_extend_i32_u)
@@ -1336,13 +1377,13 @@ func encode_instruction(program: MirProgram, plan: ModulePlan, function: MirFunc
         Load(result, value_type, address):
             let kind = try kind_of(types, value_type)
             local_get(body, address)
-            append_load(body, kind)
+            append_load(body, kind, frame)
             local_set(body, result)
         Store(value_type, address, value):
             let kind = try kind_of(types, value_type)
             local_get(body, address)
             local_get(body, value)
-            append_store(body, kind)
+            append_store(body, kind, frame)
         FieldAddress(result, struct_type, base, field):
             # `base + offset`, computed under WebAssembly's layout rules.
             match mir_type(types, struct_type):
@@ -1867,9 +1908,12 @@ func set_region_results(body: list[u8], function: MirFunction, target: Region, v
 # (`load8_s` for i8, `load8_u` for u8, ...); stores keep only the low bytes.
 # The memarg is alignment (log2 of the natural size) and offset 0.
 
-func append_load(body: list[u8], kind: Kind):
+func append_load(body: list[u8], kind: Kind, frame: FramePlan):
     if kind.is_float:
-        if kind.is_wide: append_memory_op(body, opcode_f64_load, 3)
+        if kind.bits == 16:
+            append_memory_op(body, opcode_i32_load16_u, 1)
+            append_float16_value(body, frame.float16_scratch)
+        elif kind.is_wide: append_memory_op(body, opcode_f64_load, 3)
         else: append_memory_op(body, opcode_f32_load, 2)
     elif kind.is_int:
         if kind.bits == 64: append_memory_op(body, opcode_i64_load, 3)
@@ -1885,9 +1929,12 @@ func append_load(body: list[u8], kind: Kind):
     else:
         append_memory_op(body, opcode_i32_load, 2)
 
-func append_store(body: list[u8], kind: Kind):
+func append_store(body: list[u8], kind: Kind, frame: FramePlan):
     if kind.is_float:
-        if kind.is_wide: append_memory_op(body, opcode_f64_store, 3)
+        if kind.bits == 16:
+            append_float16_bits(body, frame.float16_scratch)
+            append_memory_op(body, opcode_i32_store16, 1)
+        elif kind.is_wide: append_memory_op(body, opcode_f64_store, 3)
         else: append_memory_op(body, opcode_f32_store, 2)
     elif kind.is_int:
         if kind.bits == 64: append_memory_op(body, opcode_i64_store, 3)
@@ -1945,9 +1992,9 @@ func encode_trap_newline(body: list[u8], import_index: i64):
 
 # mark: Binary operations =====================================================================
 
-func encode_binary(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId) -> !:
+func encode_binary(body: list[u8], operation: BinaryOp, kind: Kind, frame: FramePlan, result: RegisterId, left: RegisterId, right: RegisterId) -> !:
     if kind.is_float:
-        encode_float_binary(body, operation, kind, result, left, right)
+        encode_float_binary(body, operation, kind, frame, result, left, right)
         return
     if operation == BinaryOp.add or operation == BinaryOp.sub or operation == BinaryOp.mul:
         encode_checked_arithmetic(body, operation, kind, result, left, right)
@@ -1989,7 +2036,7 @@ func integer_comparison_opcode(operation: BinaryOp, kind: Kind) -> u8:
     return pick(wide, opcode_i64_ge_u, opcode_i32_ge_u)
 
 # Floats: wasm's IEEE operations are the language's; nothing to check.
-func encode_float_binary(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+func encode_float_binary(body: list[u8], operation: BinaryOp, kind: Kind, frame: FramePlan, result: RegisterId, left: RegisterId, right: RegisterId):
     let wide = kind.is_wide
     local_get(body, left)
     local_get(body, right)
@@ -2003,6 +2050,8 @@ func encode_float_binary(body: list[u8], operation: BinaryOp, kind: Kind, result
     elif operation == BinaryOp.le: body.append(pick(wide, opcode_f64_le, opcode_f32_le))
     elif operation == BinaryOp.gt: body.append(pick(wide, opcode_f64_gt, opcode_f32_gt))
     else: body.append(pick(wide, opcode_f64_ge, opcode_f32_ge))
+    if kind.bits == 16 and (operation == BinaryOp.add or operation == BinaryOp.sub or operation == BinaryOp.mul or operation == BinaryOp.div):
+        append_float16_round(body, frame.float16_scratch)
     local_set(body, result)
 
 # mark: Checked arithmetic ====================================================================
@@ -2284,7 +2333,7 @@ func encode_shift(body: list[u8], operation: BinaryOp, kind: Kind, result: Regis
 
 # mark: Unary operations ======================================================================
 
-func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, result: RegisterId, operand: RegisterId) -> !:
+func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, frame: FramePlan, result: RegisterId, operand: RegisterId) -> !:
     match operation:
         bool_not:
             local_get(body, operand)
@@ -2302,6 +2351,7 @@ func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, result: Regist
             if kind.is_float:
                 local_get(body, operand)
                 body.append(pick(kind.is_wide, opcode_f64_neg, opcode_f32_neg))
+                if kind.bits == 16: append_float16_round(body, frame.float16_scratch)
                 local_set(body, result)
             elif is_narrow(kind):
                 # `0 - x` fits in i32; only `-minimum` leaves the range.
@@ -2331,7 +2381,7 @@ func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, result: Regist
 # value does not fit — wasm's `trunc` does that for i32/i64 and a range test
 # does it for narrow targets.
 
-func encode_convert(body: list[u8], operation: ConvertOp, from: Kind, to: Kind, result: RegisterId, operand: RegisterId) -> !:
+func encode_convert(body: list[u8], operation: ConvertOp, from: Kind, to: Kind, frame: FramePlan, result: RegisterId, operand: RegisterId) -> !:
     local_get(body, operand)
     match operation:
         extend:
@@ -2349,6 +2399,7 @@ func encode_convert(body: list[u8], operation: ConvertOp, from: Kind, to: Kind, 
             else:
                 if from.is_wide: body.append(pick(from.is_signed, opcode_f32_convert_i64_s, opcode_f32_convert_i64_u))
                 else: body.append(pick(from.is_signed, opcode_f32_convert_i32_s, opcode_f32_convert_i32_u))
+            if to.bits == 16: append_float16_round(body, frame.float16_scratch)
         float_to_int:
             if to.is_wide:
                 if from.is_wide: body.append(pick(to.is_signed, opcode_i64_trunc_f64_s, opcode_i64_trunc_f64_u))
@@ -2357,8 +2408,15 @@ func encode_convert(body: list[u8], operation: ConvertOp, from: Kind, to: Kind, 
                 if from.is_wide: body.append(pick(to.is_signed, opcode_i32_trunc_f64_s, opcode_i32_trunc_f64_u))
                 else: body.append(pick(to.is_signed, opcode_i32_trunc_f32_s, opcode_i32_trunc_f32_u))
         float_resize:
-            if from.is_wide: body.append(opcode_f32_demote_f64)
-            else: body.append(opcode_f64_promote_f32)
+            if to.bits == 16:
+                if from.is_wide:
+                    append_float64_to_float16_bits(body, frame.float16_wide_scratch)
+                    append_float16_value(body, frame.float16_scratch)
+                else: append_float16_round(body, frame.float16_scratch)
+            elif to.is_wide:
+                body.append(opcode_f64_promote_f32)
+            elif from.is_wide:
+                body.append(opcode_f32_demote_f64)
     local_set(body, result)
     if operation == ConvertOp.float_to_int and is_narrow(to): append_range_trap(body, result, to)
 
@@ -2423,26 +2481,6 @@ func append_name(output: list[u8], value: str):
     let encoded = strings.to_bytes(value)
     append_unsigned(output, len(encoded))
     append_all(output, encoded)
-
-# Unsigned LEB128: seven value bits per byte, high bit says "more follows".
-func append_unsigned(output: list[u8], number: i64):
-    var value = number
-    while value >= 0x80:
-        output.append(u8(value & 0x7F | 0x80))
-        value = value >> 7
-    output.append(u8(value))
-
-# Signed LEB128: same shape, but the sign lives in bit six of the last byte,
-# so an extra byte is emitted when that bit would read as the wrong sign.
-func append_signed(output: list[u8], number: i64):
-    var value = number
-    while true:
-        var byte = value & 0x7F
-        value = value >> 7
-        let finished = (value == 0 and byte & 0x40 == 0) or (value == -1 and byte & 0x40 != 0)
-        if not finished: byte = byte | 0x80
-        output.append(u8(byte))
-        if finished: return
 
 func append_fixed_u32(output: list[u8], number: i64):
     var value = number

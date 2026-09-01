@@ -7,20 +7,20 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-08-31 (Stage-0 0.30).
+Last updated: 2026-09-01 (Stage-0 0.30).
 
 ## 1. Where things stand
 
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generic functions with abstract checking, bounded generic structs, enums, and classes with memberwise or custom construction where defined, generic nominal type functions, independently generic instance methods, concrete value/mutating/lifecycle method specializations and conformances, interface constraints and memoized concrete callable instances, nominal and compiler-known standard interfaces, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, infallible-to-fallible adapters, resolved infallible/fallible protocol iteration, closed derived `Equatable`/`Hashable` constraint proofs with resolved equality/hash operations, and formatted strings with builtin/concrete/generic/existential `Display`; direct calls, exact named `func`/`cfunc` values and shared indirect calls; managed closures, classes, lists, maps, sets, slices, failure, control flow, native authority, triple-literal normalization, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: `f16`, assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, and the remaining rich C boundary (strings, extern structs, exported structs/enums, dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
-| HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including compiler-known protocol iteration, structural hashing, and cycle-aware mutable collection equality, existential interface storage, dynamic calls and value/class mutation semantics; escaping/nested closures, shared mutable capture cells and weak captures; shared class identity, atomic weak promotion/zeroing, fallible construction cleanup, deterministic deinitialization, and isolated sealed-runtime state. Runs `main(arguments: slice[str])` with an empty slice. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generic functions with abstract checking, bounded generic structs, enums, and classes with memberwise or custom construction where defined, generic nominal type functions, independently generic instance methods, concrete value/mutating/lifecycle method specializations and conformances, interface constraints and memoized concrete callable instances, nominal and compiler-known standard interfaces, explicit struct/class/enum conformance, static requirement dispatch, existential conversion/dynamic calls, infallible-to-fallible adapters, resolved infallible/fallible protocol iteration, closed derived `Equatable`/`Hashable` constraint proofs with resolved equality/hash operations, and formatted strings with builtin/concrete/generic/existential `Display`; direct calls, exact named `func`/`cfunc` values and shared indirect calls; every scalar width; managed closures, classes, lists, maps, sets, slices, failure, control flow, native authority, triple-literal normalization, and the remaining executable slice described below. Documentation and defaults are retained. **Not yet**: assertion-condition effect proofs, resource-shape/leak tooling and closure sendability, and the remaining rich C boundary (including a generated f16 C adapter, strings, extern structs, exported structs/enums, and dynamically supplied/nullable cfunc pointers). Each unsupported form fails with a span. |
+| HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact f16/f32/f64 rounding, compiler-known protocol iteration, structural hashing, and cycle-aware mutable collection equality, existential interface storage, dynamic calls and value/class mutation semantics; escaping/nested closures, shared mutable capture cells and weak captures; shared class identity, atomic weak promotion/zeroing, fallible construction cleanup, deterministic deinitialization, and isolated sealed-runtime state. Runs `main(arguments: slice[str])` with an empty slice. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed list/map/set/slice handles, nominal interface handles and normalized requirement/conformance metadata, typed function descriptors, closure schemas, mutable cells, nominal strong/weak class handles, payload schemas, and generated ownership helpers with no physical layout; the verifier proves every rule, reachability removes unreachable closed-world functions/resources, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
-| WebAssembly backend (`backends/wasm.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, and managed-class examples execute under Wasmtime. It is not the stage-1 portability boundary. |
-| QBE backend (`backends/qbe.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 711 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
+| QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
+| Tests | 716 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -408,19 +408,24 @@ Last updated: 2026-08-31 (Stage-0 0.30).
   `u64.max`, the whole upper half, maximum-ended ranges, signed/unsigned
   construction, exact storage, successful QBE/Wasmtime execution, and true
   overflow at `u64.max + 1`; the complete 560-test product gate is green.
-- [x] **Floating construction has one explicit checked IEEE policy**
-  (2026-08-31). `NumericConvert` also covers integer/float, float/integer, and
-  f32/f64 width changes. Contextual f32 literals and every binary32 operation
-  round at binary32 rather than leaking the oracles' f64 carrier. Narrowing
+- [x] **Floating construction has one explicit checked IEEE policy for every
+  scalar width** (2026-09-01). `NumericConvert` covers integer/float,
+  float/integer, and f16/f32/f64 width changes. Contextual literals and every
+  operation round at their declared width rather than leaking the oracles'
+  f64 carrier. Narrowing
   uses nearest/ties-to-even and traps only finite overflow; NaN and infinity
   remain IEEE values. Float-to-integer truncates toward zero after rejecting
   NaN, infinity, and the destination interval's exterior. Canonical MIR adds
   only typed `float_resize`; target-independent lowering supplies semantic
-  guards, QBE legalizes its otherwise target-defined integer conversions and
-  uses `truncd`/`exts`, while Wasm uses its native trapping and promote/demote
-  operations. Host seams canonicalize f32 too. Positive, rounding-boundary,
-  non-finite, constant-error, runtime-trap, verifier, native QBE, Wasm, and
-  executable-example evidence agree. `f16` remains the separate missing width.
+  guards. QBE and Wasm each keep f16 legalization private to the backend,
+  carrying live values in f32 while storing exact two-byte IEEE encodings;
+  neither representation enters HIR or MIR. Host seams canonicalize all three
+  widths. Direct f64 narrowing operates on the original binary64 bits, avoiding
+  a binary32 midpoint double-round. Positive, ties-to-even, subnormal,
+  signed-zero, structural-hash and display, finite-overflow, two-byte storage,
+  native QBE, Wasmtime, and executable-example evidence agree. Direct f16 C
+  ABI crossings remain rejected until the rich-boundary adapter can preserve
+  `_Float16` without pretending it is f32.
 - [x] **Fixed-array slices own a selected value snapshot** (2026-08-31).
   HIR admits array slicing as the explicit `array[T, N]` to `slice[T]`
   conversion and its oracle copies the selected values into immutable backing.

@@ -31,8 +31,8 @@ column because it does not determine stage-1 completion.
 | Spec | Capability | Frontend | HIR/oracle | MIR/oracle | QBE | Example | First open work |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
-| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw/formatted/triple text and bytes, character and byte escapes, list/map literals, and set construction execute; `f16` and remaining contextual collection cases keep the broad row open. |
-| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | `f16` and managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs. |
+| §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | partial | partial | partial | partial | Ordinary/raw/formatted/triple text and bytes, every IEEE width, character and byte escapes, list/map literals, and set construction execute; remaining contextual collection cases keep the broad row open. |
+| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | Every scalar width executes; managed forms beyond the completed generic-class/list/map/set/slice/bytes/interface ownership graphs remain. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | partial | partial | partial | partial | Class/custom-construction definite initialization, shared mutable closure cells, and interface value/class mutation execute; generic-nominal managed places remain. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values, core managed function environments, generic functions and independently generic methods, interface-requirement fallibility lifts, and dynamic interface calls execute; the complete default-argument audit remains. |
@@ -48,7 +48,7 @@ column because it does not determine stage-1 completion.
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
 | §20 | Modules, imports, visibility, entry points, manifests, dependency identity | complete | partial | partial | partial | partial | Manifest/dependency graph and the complete package/entry diagnostic matrix. |
-| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | FIIR generation, extern structs/richer boundary adapters, and remaining callback/lifetime rules. |
+| §21 | C/native imports and exports, ownership/nullability, raw native source | complete | partial | partial | partial | partial | FIIR generation, the f16 C adapter, extern structs/richer boundary adapters, and remaining callback/lifetime rules. |
 | §22 | Compiler/runtime versus standard-library boundary | complete | partial | partial | partial | partial | Implement and execute the standard modules required by the language examples. |
 | §23 | Semantic pipeline, runtime services, ABI, artifacts, backends | complete | partial | partial | partial | partial | Arena/runtime completion and full-language QBE artifact proof. Deferred subsections stay deferred by the spec. |
 | §24 | Command/diagnostic contract, formatter, source `test` declarations | complete | partial | partial | n/a | partial | Structured non-fatal analysis reports reach check/run/build and the CLI; source tests, formatter, and the remaining stable diagnostic contracts remain. |
@@ -89,10 +89,10 @@ to QBE or Wasm.
 | §7.5 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
 | --- | --- | --- | --- | --- | --- |
 | Every signed/unsigned integer pair checks the destination interval | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and differential boundaries | complete |
-| Integer-to-float rounds to nearest, ties to even | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete for f32/f64 |
-| Float-to-integer truncates toward zero and traps NaN/infinity/out-of-range | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and trapping corpus | complete for f32/f64 |
-| f32/f64 widening and checked narrowing; contextual f32 literals and per-operation f32 rounding | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete |
-| f16 construction and arithmetic | rejected at first missing stage | n/a | n/a | focused negative fixture | open with f16 |
+| Integer-to-float rounds to nearest, ties to even | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete for f16/f32/f64 |
+| Float-to-integer truncates toward zero and traps NaN/infinity/out-of-range | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and trapping corpus | complete for f16/f32/f64 |
+| f16/f32/f64 widening and checked narrowing; contextual literals and per-operation width rounding | yes | yes | yes, plus Wasm | `numeric_conversions.luc` | complete |
+| f16 canonical bits, structural hash, display, and two-byte aggregate storage | yes | yes | yes, plus Wasm | `numeric_conversions.luc` and differential corpus | complete |
 
 ## Current fixed-array slice evidence
 
