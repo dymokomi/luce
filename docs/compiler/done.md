@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 822 unit tests across 26 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 830 unit tests across 29 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1079,6 +1079,27 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   closures, all six executable generic examples, every node and operation tag,
   and deliberately malformed decoded graphs. The complete 822-test and
   product gate is the checkpoint proof.
+
+- [x] **The canonical typed HIR package payload is complete** (2026-09-01).
+  One envelope composes the existing package identity, canonical type,
+  nominal declaration, interface/conformance, executable, and retained-generic
+  sections and reconstructs the exact existing `HirProgram`; it introduces no
+  package-only IR and no backend or layout fact. The executable section owns
+  the ordinary and C function variants, complete C boundary slots, constants,
+  extern types and variables, globals, runtime bindings, closures, shared
+  cells, specialization provenance, and the program's ordinary flat HIR arena.
+
+  Encoding and decoding both validate the complete graph before exposing it:
+  envelope/root identity, sealed-runtime ownership, every cross-table index,
+  closure/function ownership, generic-instance provenance, exact function and
+  nominal call identities, aggregate positions, and the strict separation
+  between executable and template-only HIR nodes. Rich generated programs are
+  byte-stable after reconstruction; one reconstructed program is re-analyzed
+  and executed by the HIR oracle, and all six generic examples plus the broad
+  executable corpus round-trip through the complete payload. The 830-test,
+  CLI, Wasm, differential-QBE, and native-QBE gate is green. Import-time
+  identity allocation/remapping and dependency-origin specialization remain
+  the next package transaction.
 
 - [x] **The executable §15 generic rule audit is closed** (2026-09-01).
   Named type parameters, local inference, explicit arguments, nominal owner

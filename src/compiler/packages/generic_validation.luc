@@ -12,7 +12,9 @@
 #==============================================================================================
 
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, HirFunctionImplementation
-from compiler.hir.ir import HirGenericBody, HirGenericCallKind, HirGenericFunction, HirInterface, HirIteration, HirNodeForm
+from compiler.hir.ir import HirBodyArena, HirClosure, HirFunction, HirGenericBody, HirGenericCallKind
+from compiler.hir.ir import HirGenericFunction, HirInterface, HirIteration, HirNodeForm, HirNominalApplication
+from compiler.hir.ir import HirReceiverKind
 from compiler.hir.ir import NodeId, Operands, SymbolId, TypeForm, TypeId, TypeTable, UnaryOperation, no_node, types_match
 from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step
 from compiler.hir.ir import place_list_element_step, place_map_element_step
@@ -33,6 +35,8 @@ pub struct HirGenericValidationContext:
     pub let struct_count: i64
     pub let enum_count: i64
     pub let interfaces: list[HirInterface]
+    pub let functions: list[HirFunction]
+    pub let nominal_applications: list[HirNominalApplication?]
 
 # mark: Declaration graph ======================================================================
 
@@ -62,30 +66,72 @@ pub func validate_generic_functions(values: list[HirGenericFunction], context: H
     for value in values:
         try BodyValidator(value.body, values, context).validate()
 
+## Validate the shared flat HIR graph for an executable program arena. The
+## same closed walk validates generic bodies, but the admitted template-only
+## forms and concrete conformance references are deliberately opposite.
+pub func validate_executable_hir_arena(
+    arena: HirBodyArena,
+    closures: list[HirClosure],
+    functions: list[HirFunction],
+    generics: list[HirGenericFunction],
+    context: HirGenericValidationContext,
+    conformance_count: i64,
+) -> !:
+    let empty = HirGenericBody(
+        arena = arena,
+        body = Operands(start = 0, count = 0),
+        defaults = list[NodeId](),
+        local_symbols = list[SymbolId](),
+        closures = closures,
+        shared_cells = list[SymbolId](),
+        generated_functions = list[HirFunction](),
+    )
+    let validator = BodyValidator(empty, generics, context, false, conformance_count)
+    try validator.validate_arena()
+    try validator.validate_executable_roots(functions)
+
 # mark: Body ownership =========================================================================
 
 class BodyValidator:
     let body: HirGenericBody
     let generics: list[HirGenericFunction]
     let context: HirGenericValidationContext
+    let allow_templates: bool
+    let conformance_count: i64
 
-    init(body: HirGenericBody, generics: list[HirGenericFunction], context: HirGenericValidationContext):
+    init(
+        body: HirGenericBody,
+        generics: list[HirGenericFunction],
+        context: HirGenericValidationContext,
+        allow_templates: bool = true,
+        conformance_count: i64 = 0,
+    ):
         self.body = body
         self.generics = generics
         self.context = context
+        self.allow_templates = allow_templates
+        self.conformance_count = conformance_count
 
     func validate() -> !:
+        try self.validate_arena()
         let arena = self.body.arena
-        if len(arena.nodes) != len(arena.node_types) or len(arena.nodes) != len(arena.node_modules) or len(arena.nodes) != len(arena.node_spans):
-            error("typed package artifact: retained HIR arena parallel tables have different lengths")
-        for index in range(0, len(arena.nodes)):
-            try validate_type_id(arena.node_types[index], len(self.context.types.definitions))
-            try validate_module_id(arena.node_modules[index], self.context.module_count)
-            try self.validate_node(arena.nodes[index].form, index)
         try self.validate_node_run(self.body.body, len(arena.nodes), false)
         for value in self.body.defaults:
             try validate_optional_node_id(value, len(arena.nodes))
 
+        try self.validate_body_ownership()
+
+    func validate_arena() -> !:
+        let arena = self.body.arena
+        if len(arena.nodes) != len(arena.node_types) or len(arena.nodes) != len(arena.node_modules) or len(arena.nodes) != len(arena.node_spans):
+            error("typed package artifact: HIR arena parallel tables have different lengths")
+        for index in range(0, len(arena.nodes)):
+            try validate_type_id(arena.node_types[index], len(self.context.types.definitions))
+            try validate_module_id(arena.node_modules[index], self.context.module_count)
+            try self.validate_node(arena.nodes[index].form, index)
+
+    func validate_body_ownership() -> !:
+        let arena = self.body.arena
         for index in range(0, len(self.body.local_symbols)):
             let symbol = self.body.local_symbols[index]
             try validate_symbol_id(symbol, self.context.symbol_count)
@@ -130,6 +176,13 @@ class BodyValidator:
                 if function.symbol.value == closure.function.value: found = true
             if not found:
                 error("typed package artifact: retained closure has no generated function")
+
+    func validate_executable_roots(functions: list[HirFunction]) -> !:
+        for function in functions:
+            match function.implementation:
+                Defined(body): try self.validate_node_run(body, len(self.body.arena.nodes), false)
+                ExportedC(body): try self.validate_node_run(body, len(self.body.arena.nodes), false)
+                ExternalC(contract): pass
 
     func require_local_symbol(symbol: SymbolId, what: str) -> !:
         try validate_symbol_id(symbol, self.context.symbol_count)
@@ -197,6 +250,7 @@ class BodyValidator:
             WeakGet(value): try self.validate_single(value, owner)
             Some(value): try self.validate_single(value, owner)
             GenericInterfaceValue(value):
+                try self.require_template_node()
                 try self.validate_single(value, owner)
                 discard(try self.require_interface_type(self.body.arena.node_types[owner]))
             Trap(value): try self.validate_single(value, owner)
@@ -222,7 +276,8 @@ class BodyValidator:
                 try self.validate_index(upper, len(self.body.arena.values), "literal")
             Reference(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
             WeakCaptureReference(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
-            FunctionAddress(symbol): try validate_symbol_id(symbol, self.context.symbol_count)
+            FunctionAddress(symbol):
+                discard(try self.require_function(symbol))
             ExternLoad(variable): try self.validate_index(variable, self.context.extern_variable_count, "external variable")
             GlobalLoad(global): try self.validate_index(global, self.context.global_count, "global")
             NativeStore(left, right): try self.validate_pair(left, right, owner)
@@ -274,26 +329,32 @@ class BodyValidator:
                 try self.validate_child(lower, owner, false)
                 try self.validate_child(upper, owner, false)
             Call(function, arguments):
-                try validate_symbol_id(function, self.context.symbol_count)
-                try self.validate_placed_run(arguments, owner)
+                try self.validate_direct_call(function, arguments, false, owner)
             Initialize(function, arguments):
-                try validate_symbol_id(function, self.context.symbol_count)
-                try self.validate_placed_run(arguments, owner)
+                try self.validate_direct_call(function, arguments, true, owner)
             GenericCall(generic, type_arguments, arguments, kind):
+                try self.require_template_node()
                 try self.validate_generic_reference(generic, type_arguments)
                 try self.validate_generic_call_arguments(generic, arguments, kind, owner)
-            GenericFunctionAddress(generic, type_arguments): try self.validate_generic_reference(generic, type_arguments)
+            GenericFunctionAddress(generic, type_arguments):
+                try self.require_template_node()
+                try self.validate_generic_reference(generic, type_arguments)
             GenericDefaultArgument(generic, parameter, type_arguments):
+                try self.require_template_node()
                 try self.validate_generic_reference(generic, type_arguments)
                 if i64(parameter) >= len(self.generics[generic].parameters):
                     error("typed package artifact: generic default references a missing parameter")
                 if self.generics[generic].body.defaults[parameter].value == no_node:
                     error("typed package artifact: generic default references a parameter without a default")
             GenericRequirementCall(interface_type, requirement, arguments):
+                try self.require_template_node()
                 let parameter_count = try self.validate_requirement(interface_type, requirement)
                 try self.validate_requirement_arguments(arguments, parameter_count, owner)
             InterfaceValue(value, conformance):
-                error("typed package artifact: executable interface conversion appears in a retained generic body")
+                if self.allow_templates:
+                    error("typed package artifact: executable interface conversion appears in a retained generic body")
+                try self.validate_child(value, owner, false)
+                try self.validate_index(conformance, self.conformance_count, "conformance")
             InterfaceCall(receiver, interface_type, requirement, arguments):
                 try self.validate_child(receiver, owner, false)
                 let parameter_count = try self.validate_requirement(interface_type, requirement)
@@ -307,7 +368,14 @@ class BodyValidator:
                     error("typed package artifact: closure initializer count does not match its captures")
             IndirectCall(callee, arguments):
                 try self.validate_child(callee, owner, false)
+                var parameter_count = -1
+                match self.context.types.definitions[self.body.arena.node_types[callee.value].value].form:
+                    Function(parameters, result): parameter_count = len(parameters)
+                    CFunction(parameters, result): parameter_count = len(parameters)
+                    else: error("typed package artifact: HIR indirect callee is not a function value")
                 try self.validate_node_run(arguments, owner, false)
+                if i64(arguments.count) != parameter_count:
+                    error("typed package artifact: HIR indirect call has the wrong argument count")
             ErrorCodeLiteral(package, value): try validate_package_id(package, self.context.package_count)
             Catch(value, failure, body):
                 try self.validate_child(value, owner, false)
@@ -320,18 +388,54 @@ class BodyValidator:
             Element(value, index):
                 try self.validate_child(value, owner, false)
                 if index < 0: error("typed package artifact: HIR element index is negative")
+                var element_count = -1
+                match self.context.types.definitions[self.body.arena.node_types[value.value].value].form:
+                    Tuple(elements): element_count = len(elements)
+                    Array(element, count): element_count = count
+                    else: error("typed package artifact: HIR element access has no fixed aggregate type")
+                if index >= element_count: error("typed package artifact: HIR element index is outside its aggregate")
             StructValue(struct_index, fields):
                 if struct_index < 0 or struct_index >= self.context.struct_count:
                     error("typed package artifact: HIR struct value references a missing declaration")
-                try self.validate_placed_run(fields, owner)
+                let application = try self.require_nominal_application(self.body.arena.node_types[owner])
+                match application:
+                    StructApplication(values):
+                        try self.validate_placed_positions(fields, len(values), 0, "struct field", owner)
+                    else: error("typed package artifact: HIR struct value has no struct application")
+                match self.context.types.definitions[self.body.arena.node_types[owner].value].form:
+                    Struct(declaration, arguments):
+                        if declaration != struct_index:
+                            error("typed package artifact: HIR struct value names the wrong declaration")
+                    else: error("typed package artifact: HIR struct value has non-struct result type")
             FieldAccess(value, field):
                 try self.validate_child(value, owner, false)
                 if field < 0: error("typed package artifact: HIR field index is negative")
+                var field_count = -1
+                match self.context.types.definitions[self.body.arena.node_types[value.value].value].form:
+                    Error: field_count = 2
+                    else:
+                        let application = try self.require_nominal_application(self.body.arena.node_types[value.value])
+                        match application:
+                            StructApplication(values): field_count = len(values)
+                            ClassApplication(class_value): field_count = len(class_value.fields)
+                            EnumApplication(cases): error("typed package artifact: HIR field access targets an enum")
+                if field >= field_count: error("typed package artifact: HIR field index is outside its nominal type")
             EnumValue(enum_index, case_index, payload):
                 if enum_index < 0 or enum_index >= self.context.enum_count:
                     error("typed package artifact: HIR enum value references a missing declaration")
                 if case_index < 0: error("typed package artifact: HIR enum case index is negative")
-                try self.validate_placed_run(payload, owner)
+                let application = try self.require_nominal_application(self.body.arena.node_types[owner])
+                match application:
+                    EnumApplication(cases):
+                        if case_index >= len(cases):
+                            error("typed package artifact: HIR enum case index is outside its declaration")
+                        try self.validate_placed_positions(payload, len(cases[case_index].payload), 0, "enum payload", owner)
+                    else: error("typed package artifact: HIR enum value has no enum application")
+                match self.context.types.definitions[self.body.arena.node_types[owner].value].form:
+                    Enum(declaration, arguments):
+                        if declaration != enum_index:
+                            error("typed package artifact: HIR enum value names the wrong declaration")
+                    else: error("typed package artifact: HIR enum value has non-enum result type")
             MatchArm(patterns, statements, value):
                 try self.validate_node_run(patterns, owner, false)
                 try self.validate_node_run(statements, owner, false)
@@ -372,6 +476,26 @@ class BodyValidator:
             let node = NodeId(value = self.body.arena.extra[i64(value.start) + pair * 2 + 1])
             try self.validate_child(node, owner, false)
 
+    func validate_placed_positions(
+        value: Operands,
+        count: i64,
+        first: i64,
+        family: str,
+        owner: i64,
+    ) -> !:
+        try self.validate_placed_run(value, owner)
+        if count < first or i64(value.count) // 2 != count - first:
+            error("typed package artifact: HIR " + family + " has the wrong argument count")
+        let seen = list[bool]()
+        for index in range(0, count): seen.append(false)
+        for pair in range(0, i64(value.count) // 2):
+            let position = self.body.arena.extra[i64(value.start) + pair * 2]
+            if i64(position) < first or i64(position) >= count:
+                error("typed package artifact: HIR " + family + " references a missing position")
+            if seen[position]:
+                error("typed package artifact: HIR " + family + " supplies a position more than once")
+            seen[position] = true
+
     func validate_generic_call_arguments(generic: u32, value: Operands, kind: HirGenericCallKind, owner: i64) -> !:
         try self.validate_placed_run(value, owner)
         let parameter_count = len(self.generics[generic].parameters)
@@ -394,6 +518,20 @@ class BodyValidator:
                 function: pass
             if seen[position]: error("typed package artifact: generic call supplies a parameter more than once")
             seen[position] = true
+
+    func validate_direct_call(function: SymbolId, value: Operands, initializer: bool, owner: i64) -> !:
+        let target = try self.require_function(function)
+        var first = 0
+        if initializer:
+            let receiver = target.receiver else error("typed package artifact: HIR initialization target is not an initializer")
+            if receiver.kind != HirReceiverKind.initializer:
+                error("typed package artifact: HIR initialization target is not an initializer")
+            first = 1
+        else:
+            let receiver = target.receiver
+            if receiver != none and receiver.kind == HirReceiverKind.initializer:
+                error("typed package artifact: HIR call target is an initializer")
+        try self.validate_placed_positions(value, len(target.parameters), first, "call", owner)
 
     func validate_requirement_arguments(value: Operands, parameter_count: i64, owner: i64) -> !:
         try self.validate_placed_run(value, owner)
@@ -441,6 +579,27 @@ class BodyValidator:
                 error("typed package artifact: unknown retained HIR place-step tag " + str(u64(kind)))
 
 # mark: Referenced semantic identities =========================================================
+
+    func require_template_node() -> !:
+        if not self.allow_templates:
+            error("typed package artifact: template-only node appears in executable HIR")
+
+    func require_function(symbol: SymbolId) -> HirFunction!:
+        try validate_symbol_id(symbol, self.context.symbol_count)
+        for function in self.context.functions:
+            if function.symbol.value == symbol.value: return function
+        for function in self.body.generated_functions:
+            if function.symbol.value == symbol.value: return function
+        error("typed package artifact: HIR callable symbol has no function declaration")
+
+    func require_nominal_application(value_type: TypeId) -> HirNominalApplication!:
+        try validate_type_id(value_type, len(self.context.types.definitions))
+        if i64(value_type.value) >= len(self.context.nominal_applications):
+            error("typed package artifact: HIR nominal type has no application table entry")
+        let application = self.context.nominal_applications[value_type.value]
+        if application == none:
+            error("typed package artifact: HIR nominal type has no application metadata")
+        return application
 
     func validate_iteration(value: HirIteration, owner: i64) -> !:
         match value:

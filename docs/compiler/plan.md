@@ -768,12 +768,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   source-parent paths, HIR/MIR size, check/codegen timing, backend code-size
   accounting, `luce explain`, and `build --time-report` are also complete.
   The complete source/executable §15 rule and deliberate-limit audit is closed.
-  Serialized typed bodies in package artifacts remain and belong to the
-  package-artifact owner, not canonical MIR. Keep monomorphization out of
-  canonical MIR. HIR now has the required composable package table, module
-  ownership, and package-owned `ErrorCodeLiteral`; the remaining work is the
-  canonical typed artifact, strict decoder, import/seeding transaction, and
-  dependency-origin generic specialization. HIR generation now checks every
+  Serialized typed bodies in package artifacts belong to the package-artifact
+  owner, not canonical MIR. Keep monomorphization out of canonical MIR. HIR
+  now has the required composable package table, module ownership, and
+  package-owned `ErrorCodeLiteral`. The canonical typed payload and strict
+  decoder now reconstruct the exact complete `HirProgram`, including ordinary
+  executable HIR and every declaration/runtime table, without a second IR.
+  The remaining work is one import/seeding transaction with package-local
+  semantic-identity allocation and remapping, followed by dependency-origin
+  generic specialization. HIR generation now checks every
   abstract definition in an independent `HirBodyArena` and clones typed
   declaration defaults across the arena boundary without source replay. That
   arena is now retained with its body/default runs and template-local closure
@@ -790,10 +793,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   cell, and generated function, plus a strict postorder/reference validator.
   Abstract existential conversion has its own template-only form, so no
   rolled-back probe conformance identity enters an artifact. The next step is
-  to compose the existing identity/type/nominal/interface/generic sections
-  into one typed payload, remap package-local semantic identities once during
-  import, and prove dependency-origin specialization through a real
-  multi-package QBE build. No generic form may reach MIR.
+  to remap package-local semantic identities once during import, seed imported
+  HIR into generation, and prove dependency-origin specialization through a
+  real multi-package QBE build. No generic form may reach MIR.
 - [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
