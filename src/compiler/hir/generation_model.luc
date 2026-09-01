@@ -650,6 +650,9 @@ pub class HirGenerationState:
             Array(elements): self.append_node_run(eager, elements)
             List(elements): self.append_node_run(eager, elements)
             ListCopy(value): eager.append(value)
+            ListWithMutableSlice(value, callback):
+                eager.append(value)
+                eager.append(callback)
             SequenceSlice(value, start, end):
                 eager.append(value)
                 if start.value != no_node: eager.append(start)
@@ -916,6 +919,7 @@ pub class HirGenerationState:
                 if i64(position) >= len(arguments): trap("generic substitution argument is missing")
                 return arguments[position]
             Slice(element): return self.intern_slice(self.substitute_type(element, generic_id, arguments))
+            MutableSlice(element): return self.intern_mutable_slice(self.substitute_type(element, generic_id, arguments))
             List(element): return self.intern_list(self.substitute_type(element, generic_id, arguments))
             Map(key, element):
                 return self.intern_map(
@@ -1044,6 +1048,9 @@ pub class HirGenerationState:
 
     pub func intern_slice(inner: TypeId) -> TypeId:
         return self.intern_named("slice[" + self.describe_type(inner) + "]", TypeForm.Slice(element = inner))
+
+    pub func intern_mutable_slice(inner: TypeId) -> TypeId:
+        return self.intern_named("mutable_slice[" + self.describe_type(inner) + "]", TypeForm.MutableSlice(element = inner))
 
     pub func intern_list(inner: TypeId) -> TypeId:
         return self.intern_named("list[" + self.describe_type(inner) + "]", TypeForm.List(element = inner))
@@ -1214,6 +1221,7 @@ pub class HirGenerationState:
             Fallible(inner): return true
             Optional(inner): return self.contains_fallible_once(inner, visited)
             Slice(inner): return self.contains_fallible_once(inner, visited)
+            MutableSlice(inner): return self.contains_fallible_once(inner, visited)
             List(inner): return self.contains_fallible_once(inner, visited)
             Map(key, inner): return self.contains_fallible_once(key, visited) or self.contains_fallible_once(inner, visited)
             Set(inner): return self.contains_fallible_once(inner, visited)
@@ -1254,6 +1262,7 @@ pub class HirGenerationState:
             Never: return true
             Optional(inner): return self.contains_never_value_once(inner, visited)
             Slice(inner): return self.contains_never_value_once(inner, visited)
+            MutableSlice(inner): return self.contains_never_value_once(inner, visited)
             List(inner): return self.contains_never_value_once(inner, visited)
             Map(key, inner): return self.contains_never_value_once(key, visited) or self.contains_never_value_once(inner, visited)
             Set(inner): return self.contains_never_value_once(inner, visited)
@@ -1294,12 +1303,80 @@ pub class HirGenerationState:
                 return false
             else: return false
 
-    ## Reject an uninhabited control type at a value-storage boundary. A
-    ## callable returning `never` remains storable because the descriptor is
-    ## inhabited; `contains_never_value` deliberately skips callable results.
+    ## Whether a shape directly or transitively contains callback-scoped
+    ## access. A function descriptor stores callable identity, not the values
+    ## that will later cross its parameter boundary.
+    pub func contains_non_storable_value(value: TypeId) -> bool:
+        let visited = list[bool]()
+        for index in range(0, len(self.types.definitions)): visited.append(false)
+        return self.contains_non_storable_value_once(value, visited)
+
+    func contains_non_storable_value_once(value: TypeId, visited: list[bool]) -> bool:
+        if i64(value.value) >= len(self.types.definitions): return false
+        while len(visited) < len(self.types.definitions): visited.append(false)
+        if visited[value.value]: return false
+        visited[value.value] = true
+        match self.types.definitions[value.value].form:
+            MutableSlice(inner): return true
+            Optional(inner): return self.contains_non_storable_value_once(inner, visited)
+            Fallible(inner): return self.contains_non_storable_value_once(inner, visited)
+            Slice(inner): return self.contains_non_storable_value_once(inner, visited)
+            List(inner): return self.contains_non_storable_value_once(inner, visited)
+            Map(key, inner): return self.contains_non_storable_value_once(key, visited) or self.contains_non_storable_value_once(inner, visited)
+            Set(inner): return self.contains_non_storable_value_once(inner, visited)
+            Weak(inner): return self.contains_non_storable_value_once(inner, visited)
+            Range(inner): return self.contains_non_storable_value_once(inner, visited)
+            Array(inner, count): return self.contains_non_storable_value_once(inner, visited)
+            Tuple(elements):
+                for element in elements:
+                    if self.contains_non_storable_value_once(element, visited): return true
+                return false
+            Struct(index, arguments):
+                let item = self.structs[index]
+                for field in item.fields:
+                    if self.contains_non_storable_value_once(self.substitute_type(field.value_type, item.generic_id, arguments), visited): return true
+                return false
+            Class(index, arguments):
+                let item = self.classes[index]
+                for field in item.fields:
+                    if self.contains_non_storable_value_once(self.substitute_type(field.value_type, item.generic_id, arguments), visited): return true
+                return false
+            Enum(index, arguments):
+                let item = self.enums[index]
+                for case_value in item.cases:
+                    for field in case_value.payload:
+                        if self.contains_non_storable_value_once(self.substitute_type(field.value_type, item.generic_id, arguments), visited): return true
+                return false
+            Function(parameters, result): return false
+            CFunction(parameters, result): return false
+            else: return false
+
+    ## Reject an uninhabited or callback-scoped type at a value-storage
+    ## boundary. Callable descriptors remain ordinary stored values.
     pub func validate_stored_type(module_index: i64, value: TypeId, span: SourceSpan, what: str) -> !:
         if self.contains_never_value(value):
             try self.fail_at(module_index, span, what + " cannot store `never`; it is permitted only as a function's complete successful result")
+        if self.contains_non_storable_value(value):
+            try self.fail_at(module_index, span, what + " cannot store callback-scoped `mutable_slice`")
+
+    ## A direct mutable slice is valid only as a function parameter. Nested
+    ## occurrences would place the view inside unrestricted value storage.
+    pub func validate_parameter_type(module_index: i64, value: TypeId, span: SourceSpan, what: str) -> !:
+        match self.types.definitions[value.value].form:
+            MutableSlice(element):
+                if self.contains_fallible(element) or self.contains_never_value(element) or self.contains_non_storable_value(element):
+                    try self.fail_at(module_index, span, what + " has an invalid `mutable_slice` element type")
+                return
+            else: try self.validate_stored_type(module_index, value, span, what)
+
+    ## Generic substitution may preserve an explicitly scoped parameter, but
+    ## it must not turn an ordinary abstract `T` into a mutable slice. The
+    ## latter body was checked under storable-value rules and could otherwise
+    ## hide the view in storage without ever spelling the scoped type.
+    pub func validate_substituted_parameter_type(module_index: i64, template: TypeId, value: TypeId, span: SourceSpan, what: str) -> !:
+        match self.types.definitions[template.value].form:
+            MutableSlice(element): try self.validate_parameter_type(module_index, value, span, what)
+            else: try self.validate_stored_type(module_index, value, span, what)
 
     # Whether a value shape directly or transitively stores a native pointer.
     # The pointer itself is the boundary: its pointee is a type description,
@@ -1319,6 +1396,7 @@ pub class HirGenerationState:
             Optional(inner): return self.contains_native_pointer_once(inner, visited)
             Fallible(inner): return self.contains_native_pointer_once(inner, visited)
             Slice(inner): return self.contains_native_pointer_once(inner, visited)
+            MutableSlice(inner): return self.contains_native_pointer_once(inner, visited)
             List(inner): return self.contains_native_pointer_once(inner, visited)
             Map(key, inner): return self.contains_native_pointer_once(key, visited) or self.contains_native_pointer_once(inner, visited)
             Set(inner): return self.contains_native_pointer_once(inner, visited)
@@ -1374,6 +1452,8 @@ pub class HirGenerationState:
             else: return false
 
     pub func validate_function_result(module_index: i64, result: TypeId, span: SourceSpan) -> !:
+        if self.contains_non_storable_value(result):
+            try self.fail_at(module_index, span, "a function cannot return callback-scoped `mutable_slice`")
         let successful = self.fallible_inner(result)
         if successful != none:
             if self.contains_fallible(successful):

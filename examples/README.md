@@ -78,6 +78,13 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   through both semantic oracles, Wasm, and native QBE. Together with
   `array_slices.luc`, `generic_enums.luc`, and `hashing.luc`, it is the
   readable product proof for the complete ordinary §10 value-data model.
+- `mutable_slices.luc` proves the restricted `mutable_slice[T]` contract.
+  A list lends synchronous indexed mutation to an explicitly typed callback;
+  ordinary aliases observe replacement, immutable slices retain both pre-call
+  and callback-time snapshots, and the same scoped HIR/MIR transaction runs
+  through both semantic oracles, Wasm, and native QBE. Storage, capture,
+  return, generic erasure, and native-boundary exclusions are enforced
+  by the compiler rather than represented as user-visible lifetime machinery.
 - `expressions_and_calls.luc` closes the core expression/function audit with
   observable receiver, argument, literal, interpolation, binary, assignment,
   and constructor order; pure defaults, named placement, tuples, exact

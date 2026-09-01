@@ -32,14 +32,14 @@ column because it does not determine stage-1 completion.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | complete | complete | complete | complete | Every normative literal rule and the width-explicit `math` special-value surface execute through both oracles and QBE/Wasm. |
-| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit is complete; `mutable_slice`, `task`, and explicit total ordering remain in S11/S18/S19. |
+| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit and restricted `mutable_slice` are complete; `task` and explicit total ordering remain in S18/S19. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | complete | complete | complete | complete | Every binding, tuple, copy/reference, checked-place, and definite-initialization rule has positive, negative, oracle, and artifact evidence. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | The S06 eager-order/operator audit is complete; named arithmetic-policy APIs remain in S30. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | complete | complete | complete | complete | Exact direct/generic/function/closure callables, defaults, tuples, methods, mutation, and recursion execute through both oracles, QBE, and Wasm. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | complete | complete | complete | complete | Every branch, loop, match, return, and lexical-cleanup rule has stable negative and executable product evidence. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | complete | complete | complete | complete | Every ordinary value-data rule has positive, negative, oracle, and artifact evidence; explicit native representation remains the §21 boundary concern. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | complete | complete | complete | complete | Exact lifecycle semantics, weak edges, direct-cycle diagnostics, reentrancy advisories, opt-in SCC/location census, and explicit resource shutdown have oracle and product evidence. |
-| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
+| §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, restricted mutable slices, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure. Assertion condition-effect proofs, error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | partial | partial | partial | partial | Generic functions, generic structs/enums/classes with memberwise or custom construction where defined, owner-parameterized type functions, owner-parameterized and independently generic instance methods, concrete conformances, interface constraints/intersections, abstract body checking, structural inference, contextual values, defaults, recursion, memoized instances, configurable package budgets, infinite-expansion detection, source paths, and HIR/MIR/backend size/time accounting reach QBE; serialized typed bodies in package artifacts remain. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S11 | §12.6 | Restricted non-storable `mutable_slice[T]` plus closure-scoped mutable access | Syntax only; requires a scoped runtime operation and escape/send/native checks. |
 | S12 | §§12.7–12.8, §22.2 | Public text/bytes builders, UTF codecs, parsing/formatting, arenas/pools/generational handles | Internal affine builder and owned text/bytes substrate are complete. |
 | S13 | §§13.3–13.7 | Error context/source traces, complete trap provenance, structured fatal outcomes, and stack-budget reporting | Error data/control and dynamic traps execute; trace/fatal runtime path is incomplete. |
 | S14 | §13.8 | Prove assertion conditions effect-free from operational summaries | Runtime assertion semantics execute; static proof is absent. |
@@ -264,6 +263,24 @@ working list path from being mistaken for the complete §12.4 contract.
 | Typed storage reclamation and allocator block reuse | runtime HIR | yes | yes, real exhaustion/reuse gate | internal runtime fixture | storage substrate complete |
 | Recursive ARC of list identities, shared buffers, slices, and managed elements; last-owner reclamation | semantic value lifetime | yes | yes, plus Wasm | `lists.luc` | complete |
 | Ordered content `==`/`!=`, identity fast path, recursive structs, self/deep cycles, scalar/shape mismatch, and alias-topology independence | yes | yes, including verified opaque pair transaction | yes, plus Wasm | `lists.luc` | complete |
+
+## Current restricted mutable-slice evidence
+
+`mutable_slice[T]` remains a distinct target-neutral HIR and MIR type until a
+backend chooses the representation of the owner handle. It is a scoped
+capability, not a second mutable collection or a general borrow system.
+
+| §12.6 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Direct callback parameter with `length`, checked read, and replacement | yes | typed `MutableSlice(T)` and scoped operations | yes, plus Wasm | `mutable_slices.luc` | complete |
+| Receiver then callback evaluated once; callback invoked synchronously | yes, observable order | one begin/call/end transaction | yes | differential fixtures | complete |
+| Ordinary list aliases observe replacement | yes | owner identity retained | yes, plus Wasm | `mutable_slices.luc` | complete |
+| Immutable snapshots made before or during access retain captured contents | copy-on-write oracle | typed retain callback at detach | yes, plus Wasm | `mutable_slices.luc` | complete |
+| Shape change through any alias and out-of-bounds access trap | yes | runtime identity-wide barrier and checked address | yes | trapping corpus | complete |
+| No construction, binding, field, payload, container, return, defer, or closure capture | exact diagnostics | non-storable type plus affine lifetime proof | n/a | focused HIR/MIR fixtures | complete |
+| Explicitly scoped generic algorithms work; an ordinary generic `T` cannot erase the restriction | structural inference and specialization check | concrete scoped signature | yes | `mutable_slices.luc` | complete |
+| Extern, exported C, and `cfunc` boundaries reject the view | exact boundary diagnostics | C verifier retains closed vocabulary | n/a | focused HIR fixtures | complete |
+| Worker transfer cannot admit the non-storable type | all worker programs remain rejected before HIR | worker MIR absent | n/a | closes operationally with S15/S19 | structurally closed; execution waits for workers |
 
 ## Current `map[K, V]` and `set[T]` evidence
 

@@ -659,6 +659,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Public builder/codec APIs and the remaining standard-library policy remain.
   Extend the checked runtime as those semantic services become expressible;
   do not move policy into the compiler or a backend.
+- [x] **Restricted mutable slices reach the stable QBE baseline** (2026-09-01,
+  `done.md` §2). `list[T].with_mutable_slice` lends one synchronous,
+  non-storable `MutableSlice(T)` capability. HIR owns escape and boundary
+  rejection; canonical MIR owns typed begin/use/end and its lexical lifetime
+  proof; the sealed runtime owns list copy-on-write and the identity-wide
+  shape barrier; only a backend supplies layout and encodes the opaque handle.
+  Both semantic oracles, QBE, Wasm, focused diagnostics, malformed-MIR tests,
+  traps, and `examples/mutable_slices.luc` agree. Worker transfer remains
+  unavailable wholesale and S15/S19 must reuse the same non-storable predicate
+  when that boundary becomes executable.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
   `list[T]` construction, identity, indexed access, append, insert,
   `remove_at`, clear, reserve, aggregate elements, growth, and immutable list

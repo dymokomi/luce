@@ -17,12 +17,12 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.backends.hir_resources import collect_hir_class_references
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, MutableSliceStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCFunctionIdentity, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_module, node_span, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
-from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_weak_field_step
+from compiler.hir.ir import place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step, place_weak_field_step
 from compiler.hir.analyzer import AnalyzedProgram
 from compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
 from compiler.formatting.float_display import display_float32, display_float64
@@ -44,6 +44,7 @@ union AssignmentPlaceStep:
     WeakField(index: i64)
     Element(index: i64)
     ListElement(index: i64)
+    MutableSliceElement(index: i64)
     MapElement(key: BoxedValue)
 
 # A mutable place: a binding and resolved field/element steps to its value.
@@ -1028,6 +1029,19 @@ class HirInterpreterRun: ClassFinalizer:
                                     else: trap("list element step applied to a non-list HIR value")
                             else: trap("typed place index is not an integer")
                     Transferred(execution): return PlaceUpdate.Transferred(execution = execution)
+            elif kind == place_mutable_slice_element_step:
+                match try self.evaluate(NodeId(value = u32(payload)), bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(element_index):
+                                match current:
+                                    MutableSlice(storage):
+                                        if element_index >= u64(len(storage.list.buffer.elements)): error("interpreter: index out of bounds")
+                                        steps.append(AssignmentPlaceStep.MutableSliceElement(index = i64(element_index)))
+                                        current = storage.list.buffer.elements[element_index].value
+                                    else: trap("mutable-slice element step applied to a non-view HIR value")
+                            else: trap("typed place index is not an integer")
+                    Transferred(execution): return PlaceUpdate.Transferred(execution = execution)
             elif kind == place_map_element_step:
                 match try self.evaluate(NodeId(value = u32(payload)), bindings):
                     Evaluated(key):
@@ -1374,6 +1388,7 @@ class HirInterpreterRun: ClassFinalizer:
                             Map(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
                             Set(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
                             Slice(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(storage.length)))
+                            MutableSlice(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.list.buffer.elements))))
                             else: trap("typed sequence length has a non-sequence value")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             SequenceIndex(value, index):
@@ -1401,6 +1416,9 @@ class HirInterpreterRun: ClassFinalizer:
                                         match storage.backing:
                                             List(buffer): return Evaluation.Evaluated(value = buffer.elements[storage.start + i64(position)].value)
                                             Bytes(payload): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(payload[storage.start + i64(position)])))
+                                    MutableSlice(storage):
+                                        if position >= u64(len(storage.list.buffer.elements)): error("interpreter: index out of bounds")
+                                        return Evaluation.Evaluated(value = storage.list.buffer.elements[position].value)
                                     else: trap("typed sequence index has a non-sequence value")
                             else: trap("typed sequence index has a non-integer index")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
@@ -1609,6 +1627,33 @@ class HirInterpreterRun: ClassFinalizer:
                         for element in storage.buffer.elements: elements.append(element)
                         return Evaluation.Evaluated(value = Value.List(storage = ListStorage(elements)))
                     TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            ListWithMutableSlice(value, callback):
+                let selected_list = try self.evaluate_list(value, bindings)
+                var storage: ListStorage? = none
+                match selected_list:
+                    EvaluatedList(item): storage = item
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+                let selected_callback = try self.evaluate(callback, bindings)
+                var callback_value = Value.Unit
+                match selected_callback:
+                    Evaluated(item): callback_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                let list_storage = storage else trap("typed mutable-slice operation has no list storage")
+                # Detach before exposing the first mutable element so every
+                # pre-existing immutable slice keeps its captured snapshot.
+                detach_list(list_storage)
+                list_storage.active_iterations += 1
+                let callback_result = self.call_function_value(
+                    callback_value,
+                    node_type(self.program, callback),
+                    [Value.MutableSlice(storage = MutableSliceStorage(list_storage))],
+                ) catch reason:
+                    list_storage.active_iterations -= 1
+                    error(reason)
+                list_storage.active_iterations -= 1
+                match callback_result:
+                    Unit: return Evaluation.Evaluated(value = Value.Unit)
+                    else: trap("typed mutable-slice callback returned a value")
             WeakCreate(value):
                 match try self.evaluate(value, bindings):
                     Evaluated(item):
@@ -2034,30 +2079,37 @@ class HirInterpreterRun: ClassFinalizer:
     # arguments left to right. HIR typing already proved the exact signature.
     func evaluate_indirect_call(callee: NodeId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
         let selected = try self.evaluate(callee, bindings)
-        var function = SymbolId(value = 0)
-        var raw_c_function: i64? = none
-        let captures = list[Value]()
+        var callable = Value.Unit
         match selected:
-            Evaluated(value):
-                match value:
-                    Function(symbol): function = symbol
-                    CFunction(identity):
-                        match identity:
-                            Declared(symbol): function = symbol
-                            ForeignPointer(token): raw_c_function = token
-                    Closure(storage):
-                        function = self.program.closures[storage.closure].function
-                        for capture in storage.captures: captures.append(capture.value)
-                    else: trap("typed indirect call has a non-function value")
+            Evaluated(value): callable = value
             Transferred(execution): return Evaluation.Transferred(execution = execution)
         let values = list[Value]()
         for position in range(0, i64(arguments.count)):
             match try self.evaluate(node_at(self.program, arguments, position), bindings):
                 Evaluated(value): values.append(value)
                 Transferred(execution): return Evaluation.Transferred(execution = execution)
+        return Evaluation.Evaluated(value = try self.call_function_value(callable, node_type(self.program, callee), values))
+
+    # Invoke an already-evaluated function value. Compiler-known scoped APIs
+    # share this path with ordinary indirect calls, preserving one callable
+    # identity and capture contract in the semantic oracle.
+    func call_function_value(callable: Value, function_type: TypeId, arguments: list[Value]) -> Value!:
+        var function = SymbolId(value = 0)
+        var raw_c_function: i64? = none
+        let captures = list[Value]()
+        match callable:
+            Function(symbol): function = symbol
+            CFunction(identity):
+                match identity:
+                    Declared(symbol): function = symbol
+                    ForeignPointer(token): raw_c_function = token
+            Closure(storage):
+                function = self.program.closures[storage.closure].function
+                for capture in storage.captures: captures.append(capture.value)
+            else: trap("typed indirect call has a non-function value")
         if raw_c_function != none:
-            return Evaluation.Evaluated(value = try self.call_c_function_pointer(raw_c_function, node_type(self.program, callee), values))
-        return Evaluation.Evaluated(value = (try self.call_with_captures(self.find_function(function), values, captures)).value)
+            return try self.call_c_function_pointer(raw_c_function, function_type, arguments)
+        return (try self.call_with_captures(self.find_function(function), arguments, captures)).value
 
     # Invoke one opaque pointer through the exact checked cfunc signature.
     # The semantic host sees raw C-shaped components; it never receives a
@@ -2342,6 +2394,12 @@ func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], s
                     if index < 0 or index >= len(storage.buffer.elements): error("interpreter: index out of bounds")
                     return try value_at_assignment_place(storage.buffer.elements[index].value, steps, start + 1)
                 else: trap("list element step applied to a non-list HIR value")
+        MutableSliceElement(index):
+            match value:
+                MutableSlice(storage):
+                    if index < 0 or index >= len(storage.list.buffer.elements): error("interpreter: index out of bounds")
+                    return try value_at_assignment_place(storage.list.buffer.elements[index].value, steps, start + 1)
+                else: trap("mutable-slice element step applied to a non-view HIR value")
         MapElement(key):
             match value:
                 Map(storage):
@@ -2406,6 +2464,14 @@ func value_with_assignment_place(value: Value, steps: list[AssignmentPlaceStep],
                     storage.buffer.elements[selected] = BoxedValue(value = try value_with_assignment_place(storage.buffer.elements[selected].value, steps, start + 1, replacement))
                     return value
                 else: trap("list element step applied to a non-list HIR value")
+        MutableSliceElement(selected):
+            match value:
+                MutableSlice(storage):
+                    if selected < 0 or selected >= len(storage.list.buffer.elements): error("interpreter: index out of bounds")
+                    detach_list(storage.list)
+                    storage.list.buffer.elements[selected] = BoxedValue(value = try value_with_assignment_place(storage.list.buffer.elements[selected].value, steps, start + 1, replacement))
+                    return value
+                else: trap("mutable-slice element step applied to a non-view HIR value")
         MapElement(key):
             if start + 1 != len(steps): trap("map element step cannot contain a nested assignment")
             match value:
@@ -2576,6 +2642,7 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         FallibleFailure(error_value): trap("fallible call outcome escaped `try` or `catch`")
         TextSlice(left_items): trap("slices have no binary operations in the current slice")
         Slice(storage): trap("slices have no binary operations in the current slice")
+        MutableSlice(storage): trap("mutable slices have no binary operations")
         List(left_storage):
             match right:
                 List(right_storage): return evaluate_list_binary(left_storage, operation, right_storage)
@@ -3098,6 +3165,7 @@ func structural_hash(value: Value) -> u64:
         Map(storage): trap("mutable maps are not structurally hashable")
         Set(storage): trap("mutable sets are not structurally hashable")
         Slice(storage): trap("slices are not structurally hashable")
+        MutableSlice(storage): trap("mutable slices are not structurally hashable")
         Function(symbol): trap("functions are not structurally hashable")
         Closure(storage): trap("closures are not structurally hashable")
         Interface(storage): trap("interface values are not structurally hashable")

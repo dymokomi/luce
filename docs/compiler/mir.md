@@ -355,6 +355,19 @@ remain valid, so the loop requests the current element address on every pass
 instead of retaining a relocated storage pointer. The active depth is
 semantic shared-identity state; its concrete header field is runtime-private.
 
+`ListMutableSliceBegin` first detaches every pre-existing immutable snapshot,
+then produces one `MutableSlice(T)` register and enters that same identity-wide
+shape barrier. `MutableSliceLength` and `MutableSliceElementAddress` always
+revisit the owner identity, so backend/runtime relocation is not retained as
+a canonical address. A write may detach again when the callback itself created
+an immutable snapshot. `MutableSliceEnd` closes the barrier after the one
+synchronous closure call. The verifier admits the type only as a direct
+function parameter or a result of `ListMutableSliceBegin`; it rejects storage,
+function results, forged origins, use after end, closing a borrowed parameter,
+and every normal path that bypasses the matching end. Trapping paths need no
+cleanup because a trap terminates the program. No pointer width, list header,
+element offset, or ABI fact enters this transaction.
+
 User-defined iteration does not add a second MIR protocol. HIR has already
 selected the exact compiler-known interface application and resolved
 `iterator()`/`next()` as static, constrained, or dynamic interface calls. The
@@ -632,8 +645,9 @@ unsigned)`; both `str` and `bytes` → an owning
 item with an inert null owner, while a dynamic value names sealed-runtime
 storage. HIR retains the language distinction; semantic string and byte MIR
 operations do not reinterpret one as the other.
-`list[T]` → `List(T)`, `map[K, V]` → `Map(K, V)`, `set[T]` → `Set(T)`, and
-`slice[T]` → `Slice(T)`, all opaque reference-sized handles whose concrete
+`list[T]` → `List(T)`, `map[K, V]` → `Map(K, V)`, `set[T]` → `Set(T)`,
+`slice[T]` → `Slice(T)`, and callback-scoped `mutable_slice[T]` →
+`MutableSlice(T)`, all opaque reference-sized handles whose concrete
 headers are runtime/backend facts; `T?` → a two-case `Enum` with a `u8` tag, including
 class optionals (foreign handles also stay tagged internally); a scalar `T!`
 result → a scalar and error pointer, never a
@@ -817,6 +831,10 @@ ListConcat(left: List(T), right: List(T)) -> r: List(T)  fresh shallow ordered r
 ListLength(value: List(T))              -> r: u64
 ListIterationBegin(value: List(T))      -> r: u64       enter traversal and capture length
 ListIterationEnd(value: List(T))                       leave one traversal depth
+ListMutableSliceBegin(value: List(T)) -> r: MutableSlice(T) enter scoped access
+MutableSliceLength(value: MutableSlice(T)) -> r: u64
+MutableSliceElementAddress(value: MutableSlice(T), index: u64) -> r: Ptr
+MutableSliceEnd(value: MutableSlice(T))                 leave scoped access
 ListAppendSlot(value: List(T))          -> r: Ptr       uninitialized typed slot
 ListInsertSlot(value: List(T), index: u64) -> r: Ptr    checked uninitialized slot
 ListRemoveAt(value: List(T), index: u64)                 checked shape mutation

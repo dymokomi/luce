@@ -1,13 +1,12 @@
 #==============================================================================================
 #
-#   builder_verifier - Prove linear formatted-buffer construction
+#   builder_verifier - Prove transient capability lifetimes
 #
 #   DESCRIPTION:
-#       Buffer builders are affine compiler/runtime capabilities, not ordinary
-#       references. This focused MIR proof rejects forged aliases, use after
-#       finish, multiple finish, and any normal control-flow edge that lets a
-#       live builder escape its lexical region path. It runs after the general
-#       verifier has already established register, type, and region validity.
+#       Buffer builders and owned mutable-slice scopes are transient compiler
+#       capabilities, not ordinary references. This focused MIR proof rejects
+#       forged aliases, use after close, multiple close, and normal control
+#       flow that lets a live capability escape its lexical region path.
 #
 #       Traps and `Unreachable` deliberately skip language cleanup and may
 #       abandon builders created on their terminating path. Returns, raises,
@@ -34,8 +33,9 @@ struct PathComponent:
 
 ## Prove every buffer-builder register in one already structurally valid
 ## function is created and consumed exactly once on every normal path.
-pub func verify_buffer_builder_lifetimes(program: MirProgram, function: MirFunction) -> !:
+pub func verify_transient_capability_lifetimes(program: MirProgram, function: MirFunction) -> !:
     try BufferBuilderVerifier(program, function).verify()
+    try MutableSliceVerifier(program, function).verify()
 
 class BufferBuilderVerifier:
     let program: MirProgram
@@ -132,6 +132,122 @@ class BufferBuilderVerifier:
         for register in range(0, len(states)):
             if states[register] == BuilderState.live and paths_match(creation_paths[register], path):
                 states[register] = BuilderState.consumed
+
+    func fail(message: str) -> !:
+        error("MIR verifier: `" + self.function.name + "` " + message)
+
+    func fail_at(instruction: MirInstruction, message: str) -> !:
+        error("MIR verifier: `" + self.function.name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + message)
+
+# mark: Scoped mutable slices =================================================================
+
+enum MutableSliceState:
+    absent
+    borrowed
+    live
+    ended
+
+## A mutable-slice parameter is borrowed for the whole callee and may return
+## to its caller without closing the caller-owned scope. A view created by
+## `ListMutableSliceBegin` is different: every normal path must close it once.
+class MutableSliceVerifier:
+    let program: MirProgram
+    let function: MirFunction
+
+    init(program: MirProgram, function: MirFunction):
+        self.program = program
+        self.function = function
+
+    func verify() -> !:
+        let states = list[MutableSliceState]()
+        let creation_paths = list[list[PathComponent]]()
+        for register in range(0, len(self.function.registers)):
+            var state = MutableSliceState.absent
+            if register < len(self.function.signature.parameters) and self.is_mutable_slice_type(self.function.registers[register]):
+                state = MutableSliceState.borrowed
+            states.append(state)
+            creation_paths.append(list[PathComponent]())
+
+        let path = list[PathComponent]()
+        for index in range(0, len(self.function.body)):
+            let instruction = self.function.body[index]
+            match instruction.form:
+                ListMutableSliceBegin(result, value, element_retain):
+                    if states[result.value] != MutableSliceState.absent:
+                        try self.fail_at(instruction, "`ListMutableSliceBegin` must introduce a fresh view")
+                    states[result.value] = MutableSliceState.live
+                    creation_paths[result.value] = copy_path(path)
+                MutableSliceLength(result, value): try self.require_available(instruction, value, states, creation_paths, path, "`MutableSliceLength`")
+                MutableSliceElementAddress(result, value, index_value, element_retain):
+                    try self.require_available(instruction, value, states, creation_paths, path, "`MutableSliceElementAddress`")
+                MutableSliceEnd(value):
+                    if states[value.value] == MutableSliceState.borrowed:
+                        try self.fail_at(instruction, "`MutableSliceEnd` cannot close a borrowed parameter")
+                    try self.require_available(instruction, value, states, creation_paths, path, "`MutableSliceEnd`")
+                    states[value.value] = MutableSliceState.ended
+                Return(values): try self.require_no_live(instruction, states, "`Return`")
+                Raise(failure): try self.require_no_live(instruction, states, "`Raise`")
+                Trap(message): self.abandon_terminating_path(states, creation_paths, path)
+                Unreachable: self.abandon_terminating_path(states, creation_paths, path)
+                Br(depth, values): try self.require_target_depth(instruction, len(path) - 1 - depth, states, creation_paths, "`Br`")
+                BrIf(condition, depth, values): try self.require_target_depth(instruction, len(path) - 1 - depth, states, creation_paths, "`BrIf`")
+                Yield(values):
+                    if len(path) > 0: try self.require_target_depth(instruction, len(path) - 1, states, creation_paths, "`Yield`")
+                Else:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Else`")
+                    advance_arm(path)
+                Case(value):
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Case`")
+                    advance_arm(path)
+                Default:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`Default`")
+                    advance_arm(path)
+                End:
+                    try self.require_no_live_on_path(instruction, states, creation_paths, path, "`End`")
+                    path.remove(len(path) - 1)
+                Block(results): path.append(PathComponent(opener = index, arm = 0))
+                Loop: path.append(PathComponent(opener = index, arm = 0))
+                If(condition, results): path.append(PathComponent(opener = index, arm = 0))
+                Switch(value): path.append(PathComponent(opener = index, arm = 0))
+                else: pass
+
+        for register in range(0, len(self.function.registers)):
+            if not self.is_mutable_slice_type(self.function.registers[register]): continue
+            if states[register] == MutableSliceState.absent:
+                try self.fail("declares mutable-slice r" + str(register) + " that is neither a parameter nor produced by `ListMutableSliceBegin`")
+            if states[register] == MutableSliceState.live:
+                try self.fail("leaves mutable-slice r" + str(register) + " without exactly one `MutableSliceEnd`")
+
+    func is_mutable_slice_type(value_type: TypeId) -> bool:
+        match mir_type(self.program.types, value_type):
+            MutableSlice(element): return true
+            else: return false
+
+    func require_available(instruction: MirInstruction, value: RegisterId, states: list[MutableSliceState], creation_paths: list[list[PathComponent]], path: list[PathComponent], operation: str) -> !:
+        if states[value.value] == MutableSliceState.absent: try self.fail_at(instruction, operation + " uses a view without an origin")
+        if states[value.value] == MutableSliceState.ended: try self.fail_at(instruction, operation + " uses a view after `MutableSliceEnd`")
+        if states[value.value] == MutableSliceState.live and not paths_match(creation_paths[value.value], path):
+            try self.fail_at(instruction, operation + " must stay in its view's lexical region path")
+
+    func require_no_live(instruction: MirInstruction, states: list[MutableSliceState], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == MutableSliceState.live:
+                try self.fail_at(instruction, operation + " bypasses `MutableSliceEnd` for r" + str(register))
+
+    func require_target_depth(instruction: MirInstruction, target_depth: i64, states: list[MutableSliceState], creation_paths: list[list[PathComponent]], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == MutableSliceState.live and len(creation_paths[register]) > target_depth:
+                try self.fail_at(instruction, operation + " bypasses `MutableSliceEnd` for r" + str(register))
+
+    func require_no_live_on_path(instruction: MirInstruction, states: list[MutableSliceState], creation_paths: list[list[PathComponent]], path: list[PathComponent], operation: str) -> !:
+        for register in range(0, len(states)):
+            if states[register] == MutableSliceState.live and paths_match(creation_paths[register], path):
+                try self.fail_at(instruction, operation + " crosses a live mutable-slice lifetime for r" + str(register))
+
+    func abandon_terminating_path(states: list[MutableSliceState], creation_paths: list[list[PathComponent]], path: list[PathComponent]):
+        for register in range(0, len(states)):
+            if states[register] == MutableSliceState.live and paths_match(creation_paths[register], path):
+                states[register] = MutableSliceState.ended
 
     func fail(message: str) -> !:
         error("MIR verifier: `" + self.function.name + "` " + message)

@@ -1347,6 +1347,28 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   versus ordinary enum tag operations explicitly. Its holistic split remains
   preferable to extracting a forwarding helper during the coverage audit.
 
+- [x] **Restricted mutable slices are complete through QBE and Wasm**
+  (2026-09-01). `list[T].with_mutable_slice` evaluates its receiver and
+  callback once, detaches existing immutable snapshots, lends one synchronous
+  `mutable_slice[T]`, and closes the identity-wide shape barrier afterward.
+  Indexed reads/writes, ordinary aliases, snapshots made before and during the
+  callback, bounds traps, and shape-mutation traps agree through both semantic
+  oracles and real artifacts.
+
+  The source type is admitted only as a direct function parameter. Exact
+  diagnostics reject construction through storage, fields, enum payloads,
+  containers, returns, hidden `defer` storage, implicit/explicit capture,
+  ordinary generic erasure, and every current native boundary. Explicit
+  `mutable_slice[T]` generic parameters retain structural inference. Canonical
+  MIR preserves `MutableSlice(T)` and four semantic operations; a focused
+  lifetime verifier proves one origin/end on every normal path and rejects
+  storage, result escape, forgery, double/end-after-use, closing borrowed
+  parameters, and element mismatch. QBE and Wasm alone supply layout while the
+  freestanding runtime owns copy-on-write and shape state. The audit caught
+  and closed both generic-erasure and hidden-`defer` escape routes before the
+  slice was declared complete. Worker transfer remains wholly unavailable and
+  S15/S19 must consume the same non-storable predicate when implemented.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.
