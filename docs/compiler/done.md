@@ -20,7 +20,7 @@ Last updated: 2026-09-01 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including standard loops expressed through existing calls/optionals/control, structural hashing and finite/cycle-aware equality expanded once into canonical operations and generated helpers, normalized erased-receiver interface witnesses, existential ownership/COW operations and dynamic calls; scalars, aggregates, managed collections/classes/closures, control and failure transfer, structural ownership on every value edge, C boundaries, exact runtime bindings, native operations, and output. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16 legalization and two-byte storage, exact indirect and interface calls, backend-owned witness and ownership descriptors, WASI preview 1, C imports/globals, shadow-stack aggregates, typed moves, and backend-local managed layout. The interface, reclaiming-list, map/set, managed-class, and numeric examples execute under Wasmtime. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_float16.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with backend-owned binary16 legalization and two-byte storage, aggregate/class/interface/hash-collection layout and descriptor tables, structured-control flattening, checked arithmetic, direct/indirect/dynamic calls, typed memory, internal globals, a stable guarded arena, the compiled Luce runtime, C symbols, and a private caller-owned fallible-result ABI. The product path keeps IL, assembly, diagnostics, and the candidate in secure same-directory scratch, connects host tools without bidirectional pipes, and atomically installs only the executable. The complete differential corpus uses this path. |
-| Tests | 750 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 752 unit tests across 16 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -468,6 +468,26 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   existing resolved-place transaction, whose register/ownership helpers are
   mutually recursive; a holistic post-coverage decomposition remains safer
   than introducing a callback-heavy fragment now.
+- [x] **Expressions and functions close their §§7–8 rule audit** (2026-09-01).
+  The audit found one declaration-order defect: ordinary parameter defaults
+  were checked while signatures were collected, before import bindings
+  existed, so a legal pure imported constant was invisible. Signature
+  collection now records only the typed parameter identity and trailing-
+  default shape. A dedicated post-import, post-constant pass resolves each
+  ordinary default in its module scope with body locals absent; generic
+  templates keep their existing abstract and concrete specialization passes.
+  Qualified and selective imports, inaccessible runtime/parameter state,
+  positional-before-named calls, arbitrary named order, duplicates, unknowns,
+  omissions, and source-order placement now have exact fixtures. The new
+  `examples/expressions_and_calls.luc` observes receiver, argument, list,
+  interpolation, binary, assignment-RHS, and constructor order and combines
+  defaults, tuples, exact function values, recursion, and mutating `self`
+  replacement. Both semantic oracles, verified canonical MIR, native QBE,
+  Wasm, and Wasmtime agree without a new HIR/MIR form or backend case. The
+  2,780-line declaration collector remains the owner of its ordered signature
+  transaction; extracting only this short second phase would add navigation
+  without independent state, so holistic post-coverage decomposition remains
+  the cleaner boundary.
 - [x] **Fixed-array slices own a selected value snapshot** (2026-08-31).
   HIR admits array slicing as the explicit `array[T, N]` to `slice[T]`
   conversion and its oracle copies the selected values into immutable backing.

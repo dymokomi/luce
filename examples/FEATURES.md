@@ -34,8 +34,8 @@ column because it does not determine stage-1 completion.
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | complete | complete | complete | complete | Every normative literal rule and the width-explicit `math` special-value surface execute through both oracles and QBE/Wasm. |
 | §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit is complete; `mutable_slice`, `task`, and explicit total ordering remain in S11/S18/S19. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | complete | complete | complete | complete | Every binding, tuple, copy/reference, checked-place, and definite-initialization rule has positive, negative, oracle, and artifact evidence. |
-| §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | Explicit `discard` executes and silent non-unit discards emit structured `L0701`; dynamic sequence operations and floating/capability-dependent conversions remain. |
-| §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | partial | partial | partial | partial | Exact named values, core managed function environments, generic functions and independently generic methods, interface-requirement fallibility lifts, and dynamic interface calls execute; the complete default-argument audit remains. |
+| §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | The S06 eager-order/operator audit is complete; named arithmetic-policy APIs remain in S30. |
+| §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | complete | complete | complete | complete | Exact direct/generic/function/closure callables, defaults, tuples, methods, mutation, and recursion execute through both oracles, QBE, and Wasm. |
 | §9 | `if`, conditional binding, loops, exhaustive match, return, and `defer` | complete | partial | partial | partial | partial | The complete §9.6 pattern/exhaustiveness contract and both standard iteration spellings execute; the remaining control-flow/return/defer rule audit is S08. |
 | §10 | Structs, tuples, fixed arrays, enums, copying, visibility | complete | partial | partial | partial | partial | Struct/enum fundamentals, generic struct/enum/class applications and methods, explicit interface conformance, ownership-safe fixed-array slicing, and immutable structural hashing execute; the remaining rule-by-rule audit keeps the broad row open. |
 | §11 | Classes, identity, ARC, weak references, destruction | complete | partial | partial | partial | partial | Core class lifetime reaches both oracles, QBE, and Wasm; direct strong-cycle rejection and `deinit` reentrancy advisories are complete. Resource-shape diagnostics and leak census remain. |
@@ -77,7 +77,6 @@ identifiers are stable planning labels, not diagnostic codes.
 | --- | --- | --- | --- |
 | S01 | §3.4, §24.4 | Canonical naming/style diagnostics and formatter ownership | Formatter not implemented. |
 | S02 | §3.5 | Exhaustive module/member/local/import/capture/test namespace and lifetime matrix | Ordinary scopes are implemented; source-test scopes wait for S26. |
-| S06 | §§7–8 | Rule audit for eager order, operators, calls/defaults, tuples, methods, mutation, recursion, and exact callable values | Major paths execute; named arithmetic-policy APIs belong to S30. |
 | S08 | §§9.1–9.5, §§9.7–9.8 | Rule audit for conditional/loop exits, return coverage, and every defer exit/error restriction | Major paths execute through both oracles and QBE. |
 | S09 | §10 | Rule audit for struct/tuple/array/enum construction, copying, recursion, visibility, and all deliberate omissions | Major paths and generic applications execute; native representation is S21–S25. |
 | S10 | §11.4–§11.5 | Resource-shape diagnostics and runtime leak/live-resource census | ARC, weak references, cycle diagnostics, destruction, and reentrancy advisories execute. |
@@ -124,6 +123,22 @@ place. MIR therefore receives neither alias spelling nor source lvalue syntax.
 | Struct/tuple/array/enum values copy; class/closure/collection references share identity and ownership | typed value/reference operations | structural copies versus retain/release | yes, plus Wasm | `types_and_bindings.luc` and ownership examples | complete |
 | A field/index destination is checked and evaluated once; value roots/fields require mutation authority while shared storage remains mutable through `let` and parameters | one target-neutral `PlaceAssignment` path with exact diagnostics | one address walk; reference parameters remain values | yes, plus Wasm | `types_and_bindings.luc` and focused list/map/aggregate fixtures | complete |
 | Struct/class initialization assigns every field once before reads, calls, escape, loops, or successful exit | whole-program three-state flow proof | initialized ownership-bearing storage | yes, plus Wasm | class/generic construction examples and analyzer negatives | complete |
+
+## Current expression-and-call evidence
+
+The closed S06 surface keeps source evaluation order in resolved HIR operand
+runs. MIR consumes those runs once and places values into declaration slots
+only after evaluation; a backend therefore receives neither argument labels
+nor permission to choose an order.
+
+| §§7–8 rule | Frontend/HIR | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Receiver, argument, literal element, interpolation field, binary operand, assignment RHS, and constructor argument order | source-ordered nodes with declaration-slot indexes | source-ordered evaluation followed by slot placement | yes, plus Wasm | `expressions_and_calls.luc` and output fixtures | complete |
+| Checked integer/IEEE arithmetic, floor division/remainder, bit operations, short-circuit logic, comparisons, identity, and conditional expressions | closed typed operations and stable domain diagnostics | typed operations, guards, and structured results | yes, plus Wasm | `operators_and_literals.luc`, `numeric_conversions.luc`, and trapping corpus | complete except named policy APIs in S30 |
+| Positional-before-named calls, arbitrary named order, duplicates/unknowns/omissions, and trailing pure defaults | one shared direct-call placement contract; exact diagnostics | declaration-order operands after source-order evaluation | yes, plus Wasm | `expressions_and_calls.luc` and focused call fixtures | complete |
+| Same-module, qualified-import, and selective-import constants in ordinary defaults | post-import default-resolution pass; body locals absent | constants embedded before lowering | yes, plus Wasm | cross-module differential fixture | complete |
+| Tuples/results, exact callable values, infallible lift, methods/type functions, value mutation/self replacement, and recursion | resolved callable identity and receiver kind | canonical direct/closure calls and caller-owned value mutation | yes, plus Wasm | `expressions_and_calls.luc`, function/closure/generic examples | complete |
+| Non-unit public results are explicit; every reachable path returns; nested named functions and overloads are absent | declaration/flow diagnostics | only complete concrete functions lower | n/a | focused parser/HIR negatives | complete |
 
 ## Current `match` evidence
 

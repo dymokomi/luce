@@ -76,6 +76,11 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   single-evaluation tuple binding, value-copy independence, shared list/class
   identity, recursive class indirection, and nested generic mutable places
   through both semantic oracles, Wasm, and native QBE.
+- `expressions_and_calls.luc` closes the core expression/function audit with
+  observable receiver, argument, literal, interpolation, binary, assignment,
+  and constructor order; pure defaults, named placement, tuples, exact
+  callable values, recursion, and value-receiver replacement through both
+  semantic oracles, Wasm, and native QBE.
 - `interfaces.luc` proves existential conversion and dynamic dispatch for
   value and class conformers. Value payload mutation detaches with copy-on-
   write, class payload mutation preserves shared identity, and infallible

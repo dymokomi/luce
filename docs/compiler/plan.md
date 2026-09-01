@@ -366,6 +366,14 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   mutable places now have named positive and negative fixtures. Reference
   parameters traverse shared list/map/class storage without becoming
   assignable roots; the same target-neutral place reaches both backends.
+- [x] **Complete the §§7–8 expression and function rule audit** (2026-09-01,
+  `done.md` §2). Every eager-order family, closed operator domain, direct and
+  exact indirect callable, named/default placement rule, tuple result,
+  method kind, mutating replacement, and recursion rule has named semantic
+  and executable evidence. Ordinary defaults now resolve after imports and
+  constants, so pure qualified/selective imported constants work without
+  leaking body locals or declaration order into signatures. Named arithmetic
+  policy APIs remain standard-library work in S30.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung
