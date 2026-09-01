@@ -767,9 +767,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Package/CLI budget configuration, immediate infinite-expansion detection,
   source-parent paths, HIR/MIR size, check/codegen timing, backend code-size
   accounting, `luce explain`, and `build --time-report` are also complete.
+  The complete source/executable §15 rule and deliberate-limit audit is closed.
   Serialized typed bodies in package artifacts remain and belong to the
-  package-artifact owner, not HIR or canonical MIR. Keep monomorphization out
-  of canonical MIR. HIR now has the required composable package table, module
+  package-artifact owner, not canonical MIR. Keep monomorphization out of
+  canonical MIR. HIR now has the required composable package table, module
   ownership, and package-owned `ErrorCodeLiteral`; the remaining work is the
   canonical typed artifact, strict decoder, import/seeding transaction, and
   dependency-origin generic specialization.

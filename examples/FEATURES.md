@@ -42,7 +42,7 @@ column because it does not determine stage-1 completion.
 | §12 | Allocation, lists, maps, sets, slices, strings/bytes, arenas | complete | partial | partial | partial | partial | Lists, restricted mutable slices, insertion-ordered maps/sets, owned strings/bytes, and the affine internal formatting builder reach QBE and Wasm. Public builders/codecs and the remaining arena contract remain. |
 | §13 | Optionals, recoverable failure, errors, traps, fatal termination, assertions | complete | partial | partial | partial | partial | Dynamic `trap(str)` and eager `assert(bool, str?)` reach both oracles and QBE/Wasm with no deferred cleanup on failure; closed operational summaries prove assertion conditions effect-free. Error context, fatal termination, and an exhaustive source-location/stack diagnostic audit remain. |
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
-| §15 | Generic declarations, constraints, monomorphization, limits | complete | partial | partial | partial | partial | Generic functions, generic structs/enums/classes with memberwise or custom construction where defined, owner-parameterized type functions, owner-parameterized and independently generic instance methods, concrete conformances, interface constraints/intersections, abstract body checking, structural inference, contextual values, defaults, recursion, memoized instances, configurable package budgets, infinite-expansion detection, source paths, and HIR/MIR/backend size/time accounting reach QBE; serialized typed bodies in package artifacts remain. |
+| §15 | Generic declarations, constraints, monomorphization, limits | complete | partial | partial | partial | partial | The complete declaration, constraint, specialization, accounting, and deliberate-limit matrix reaches QBE; serialized typed bodies in package artifacts are the sole remaining rule. |
 | §16 | Interfaces, conformance, static use, interface values | complete | partial | partial | partial | partial | Nominal requirements, generic interfaces, explicit struct/class/enum conformance, static constrained calls, fallibility adapters, and existential value/class dispatch with value COW reach both oracles, QBE, and Wasm. The remaining rule-by-rule interface audit and dynamic-call cost reporting remain. |
 | §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Iteration, closed derived equality/hashability, cycle-aware collection equality, immutable structural hashing, and closed `Display` formatting execute; ordering and encoding remain. |
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
@@ -81,7 +81,7 @@ identifiers are stable planning labels, not diagnostic codes.
 | S13 | §§13.3–13.7 | Error context/source traces, complete trap provenance, structured fatal outcomes, and stack-budget reporting | Error data/control and dynamic traps execute; trace/fatal runtime path is incomplete. |
 | S14 | §13.8 | Prove assertion conditions effect-free from operational summaries | Complete: target-neutral closed summaries accept pure recursion/reads and report the exact path to allocation, mutation, I/O, foreign access, dynamic calls, or termination. |
 | S15 | §14.4 | Closure/value sendability and all worker-boundary capture rejections | Core closure contract is complete; closes with workers. |
-| S16 | §15 | Final generic rule audit and serialized typed bodies in package artifacts | Executable generic surface and specialization accounting are complete. |
+| S16 | §15 | Final generic rule audit and serialized typed bodies in package artifacts | Rule audit complete; package artifacts remain. |
 | S17 | §16 | Final interface rule audit, including no-downcast exclusions and every static/existential adaptation | Concrete/generic/existential dispatch executes; audit remains. |
 | S18 | §17.2 | Explicit `Comparable` conformance and total-order `compare` contract | Derived equality/hashability are complete; ordering protocol is absent. |
 | S19 | §§19.1–19.5 | Workers, `task[T]`, graph-copy transfer, sendability, `wait_all`, cancellation, and supervised lifetime | Syntax only. |
@@ -402,6 +402,20 @@ and encoding work. The complete interpolation contract has this narrower proof:
 | Concrete, constrained-generic, and existential values use the same `Display` requirement | yes | existing direct/dynamic calls | yes, plus Wasm | `formatted_strings.luc` | complete |
 | Integer extrema and width-specific shortest IEEE output are locale-independent | yes | exact `FloatBits`; malformed forms rejected | yes, plus Wasm | differential boundary corpus | complete |
 | A builder is created and finished exactly once on every normal lexical path | n/a | focused affine proof and negative fixtures | yes | verifier tests | complete |
+
+## Current generic evidence
+
+Only §15.3 separate-compilation artifacts remain open. The source and
+executable generic contract is closed rule by rule:
+
+| §15 rule | HIR/oracle | MIR/verifier | QBE product | Evidence | State |
+| --- | --- | --- | --- | --- | --- |
+| Functions and struct/enum/class declarations use named type parameters without defaults | abstract checked signatures and stable duplicate/arity failures | concrete applications only | yes, plus Wasm | parser and HIR generic fixtures | complete |
+| Calls infer locally or accept explicit types; nominal owner arguments and independently declared method arguments stay distinct | one structural inference transaction and memoized specialization identity | concrete direct calls | yes, plus Wasm | all six generic examples | complete |
+| Interface intersections alone constrain abstract operations; unused bodies still check from written constraints | abstract requirement identity and exact conformance replay | concrete witnesses/calls | yes, plus Wasm | constrained-generic positives and negatives | complete |
+| Concrete applications specialize functions, methods, initializers, lifecycle, conformances, defaults, recursion, and contextual function values | exact concrete `TypeId`/`SymbolId` graph | no generic forms cross the boundary | yes, plus Wasm | HIR/MIR/oracle/backend fixtures | complete |
+| Infinite structural expansion and the package budget report complete source-parent paths and checking/codegen cost | deterministic front-end rejection/report | identity retained out of band through reachability | backend-owned exact emitted sizes | focused reporting fixtures | complete |
+| Value parameters (except compiler-owned `array[T, N]`), variadics, higher kinds, packs, conditional/partial specialization, compile-time execution/reflection, variance, and associated types have no user grammar or semantic path | explicit parser/HIR exclusions | n/a | n/a | `test_generic_deliberate_limits_have_no_source_grammar` and nominal integer-argument rejection | complete |
 
 ## Reserved and contextual words
 
