@@ -19,6 +19,7 @@ trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 "$luce" build src/luce.luc -o "$test_dir/luce"
 cli=$test_dir/luce
 runtime_source=src/runtime/allocator.native.luc
+runtime_root=src/runtime
 
 # expect STATUS EXPECTED_OUTPUT COMMAND...
 expect() {
@@ -38,20 +39,20 @@ expect() {
 }
 
 # A process entry: output through WASI fd_write, exit status through proc_exit.
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/hello.wasm" examples/hello.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello.wasm" examples/hello.luc >/dev/null
 expect 0 "Hello, world!" wasmtime run "$test_dir/hello.wasm"
 
 printf 'pub func main(arguments: slice[str]) -> i32:\n    print("one")\n    print("two")\n    return 3 * 2\n' > "$test_dir/status.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/status.wasm" "$test_dir/status.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/status.wasm" "$test_dir/status.luc" >/dev/null
 expect 6 "one
 two" wasmtime run "$test_dir/status.wasm"
 
 # Exported functions: wasmtime invokes them by name and prints the result.
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/core.wasm" examples/compiled_core/main.luc >/dev/null
-expect 0 "42" wasmtime run --invoke main.answer "$test_dir/core.wasm"
+"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/core.wasm" examples/compiled_core/main.luc >/dev/null
+expect 0 "42" wasmtime run --invoke compiled_core.main.answer "$test_dir/core.wasm"
 
 printf 'pub func answer() -> i64: return (2 + 3) * 4 - 6\npub func narrow() -> i32: return 2147483646i32 + 1i32\n' > "$test_dir/math.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/math.wasm" "$test_dir/math.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/math.wasm" "$test_dir/math.luc" >/dev/null
 expect 0 "14" wasmtime run --invoke math.answer "$test_dir/math.wasm"
 expect 0 "2147483647" wasmtime run --invoke math.narrow "$test_dir/math.wasm"
 
@@ -114,7 +115,7 @@ pub func short_or() -> i64: return 1 if true or 1 // 0 == 0 else 0
 pub func chars() -> i64: return 1 if 'a' < 'b' and 'z' == 'z' else 0
 pub func floats() -> i64: return 1 if 7.0 / 2.0 == 3.5 and 1.5f32 * 2.0f32 == 3.0f32 else 0
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/scalars.wasm" "$test_dir/scalars.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/scalars.wasm" "$test_dir/scalars.luc" >/dev/null
 check() { expect 0 "$2" wasmtime run --invoke "scalars.$1" "$test_dir/scalars.wasm"; }
 check locals 42
 check compound 13
@@ -208,7 +209,7 @@ pub func collatz() -> i64:
         steps += 1
     return steps
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/flow.wasm" "$test_dir/flow.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/flow.wasm" "$test_dir/flow.luc" >/dev/null
 flow() { expect 0 "$2" wasmtime run --invoke "flow.$1" "$test_dir/flow.wasm"; }
 flow sum_to_ten 55
 flow break_continue 50
@@ -248,7 +249,7 @@ pub func ack() -> i64: return ackermann(2, 3)
 func forever(n: i64) -> i64: return forever(n + 1) + 1
 pub func overflow_stack() -> i64: return forever(0)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/calls.wasm" "$test_dir/calls.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/calls.wasm" "$test_dir/calls.luc" >/dev/null
 calls() { expect 0 "$2" wasmtime run --invoke "calls.$1" "$test_dir/calls.wasm"; }
 calls fact10 3628800
 calls fib20 6765
@@ -268,12 +269,12 @@ fi
 # Wasm's function table without requiring managed runtime services.
 printf 'pub let scale: i64 = 3\npub func double(x: i64) -> i64: return x * 2\nfunc hidden(x: i64) -> i64: return x + 1\npub func nudge(x: i64) -> i64: return hidden(x)\npub struct Pair:\n    pub let a: i64\n    pub let b: i64\n    pub func sum(self) -> i64: return self.a + self.b\n' > "$test_dir/math.luc"
 printf 'import math\nfrom math import nudge\npub func answer() -> i64:\n    let p = math.Pair(a = 1, b = 2)\n    let operation: func(i64) -> i64 = math.double\n    return operation(20) + nudge(1) + p.sum()\n' > "$test_dir/main.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/modules.wasm" "$test_dir/math.luc" "$test_dir/main.luc" >/dev/null
 expect 0 "45" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
 
 # The complete function-value example also exercises recoverable failure, so
 # it names the same explicit sealed runtime as every installed product build.
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/function_values.wasm" examples/function_values.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/function_values.wasm" examples/function_values.luc >/dev/null
 expect 0 "42" wasmtime run --invoke function_values.answer "$test_dir/function_values.wasm"
 expect 0 "" wasmtime run "$test_dir/function_values.wasm"
 
@@ -368,7 +369,7 @@ pub func custom_init() -> i64:
     let swapped = CustomPair(value = 8, swap = true)
     return normal.left * 1000 + normal.right * 100 + swapped.left * 10 + swapped.right
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/structs.wasm" "$test_dir/structs.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/structs.wasm" "$test_dir/structs.luc" >/dev/null
 structs() { expect 0 "$2" wasmtime run --invoke "structs.$1" "$test_dir/structs.wasm"; }
 structs fields 34
 structs defaults 172
@@ -381,7 +382,7 @@ structs parameter_defaults 35
 structs custom_init 3498
 
 printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name = "luce", count = 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
 expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
 # Milestone 4: tuples, optionals, owned strings, and print of a value.
@@ -474,7 +475,7 @@ pub func string_in_tuple() -> i64:
     let c = ("y", 1)
     return (1 if a == b else 0) + (2 if a == c else 0)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/composites.wasm" "$test_dir/composites.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/composites.wasm" "$test_dir/composites.luc" >/dev/null
 composite() { expect 0 "$2" wasmtime run --invoke "composites.$1" "$test_dir/composites.wasm"; }
 composite destructure 34
 composite nested 15
@@ -491,7 +492,7 @@ composite string_values 1
 composite string_in_tuple 1
 
 printf 'func pick() -> str: return "yes"\npub func main(arguments: slice[str]) -> i32:\n    let greeting = "hi there"\n    print(greeting)\n    print(pick())\n    print("done")\n    return 0\n' > "$test_dir/print_value.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/print_value.wasm" "$test_dir/print_value.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/print_value.wasm" "$test_dir/print_value.luc" >/dev/null
 expect 0 "hi there
 yes
 done" wasmtime run "$test_dir/print_value.wasm"
@@ -511,7 +512,7 @@ func turn(d: Direction) -> i64:
         .south, .west: return 3
 pub func answer() -> i64: return turn(Direction.north) * 100 + turn(.east) * 10 + turn(Direction.west)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_directions.wasm" "$test_dir/enum_directions.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_directions.wasm" "$test_dir/enum_directions.luc" >/dev/null
 expect 0 "123" wasmtime run --invoke enum_directions.answer "$test_dir/enum_directions.wasm"
 
 cat > "$test_dir/enum_commands.luc" <<'LUCE'
@@ -526,7 +527,7 @@ func size(c: Command) -> i64:
         .quit => -1
 pub func answer() -> i64: return size(Command.open(path = 7)) + size(Command.resize(3, 4)) + size(.quit)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_commands.wasm" "$test_dir/enum_commands.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_commands.wasm" "$test_dir/enum_commands.luc" >/dev/null
 expect 0 "18" wasmtime run --invoke enum_commands.answer "$test_dir/enum_commands.wasm"
 
 cat > "$test_dir/enum_moves.luc" <<'LUCE'
@@ -540,7 +541,7 @@ func amount(m: Move) -> i64:
         .stop: return 0
 pub func answer() -> i64: return amount(.left(5)) + amount(Move.right(steps = 6)) + amount(.stop)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_moves.wasm" "$test_dir/enum_moves.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_moves.wasm" "$test_dir/enum_moves.luc" >/dev/null
 expect 0 "11" wasmtime run --invoke enum_moves.answer "$test_dir/enum_moves.wasm"
 
 cat > "$test_dir/enum_shapes.luc" <<'LUCE'
@@ -562,7 +563,7 @@ pub func answer() -> i64:
     if Shape.square(2) != Shape.square(3): n += 1000
     return n
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_shapes.wasm" "$test_dir/enum_shapes.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_shapes.wasm" "$test_dir/enum_shapes.luc" >/dev/null
 expect 0 "1111" wasmtime run --invoke enum_shapes.answer "$test_dir/enum_shapes.wasm"
 
 cat > "$test_dir/enum_scalars.luc" <<'LUCE'
@@ -595,7 +596,7 @@ func word(s: str) -> i64:
 pub func answer() -> i64:
     return classify(0) + classify(2) * 10 + classify(7) * 100 + classify(15) * 1000 + classify(-3) * 10000 + classify(99) * 100000 + opt(4) + opt(none) + flag(true) + letter('q') + letter('5') + letter('!') + word("yes") + word("maybe")
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_scalars.wasm" "$test_dir/enum_scalars.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_scalars.wasm" "$test_dir/enum_scalars.luc" >/dev/null
 expect 0 "543224" wasmtime run --invoke enum_scalars.answer "$test_dir/enum_scalars.wasm"
 
 cat > "$test_dir/enum_lights.luc" <<'LUCE'
@@ -622,7 +623,7 @@ pub func answer() -> i64:
                 if i == 6: break
     return greens * 10 + i
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_lights.wasm" "$test_dir/enum_lights.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_lights.wasm" "$test_dir/enum_lights.luc" >/dev/null
 expect 0 "36" wasmtime run --invoke enum_lights.answer "$test_dir/enum_lights.wasm"
 
 cat > "$test_dir/enum_toggle.luc" <<'LUCE'
@@ -642,7 +643,7 @@ pub func answer() -> i64:
         .red => 0
         .green => 1
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_toggle.wasm" "$test_dir/enum_toggle.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_toggle.wasm" "$test_dir/enum_toggle.luc" >/dev/null
 expect 0 "1" wasmtime run --invoke enum_toggle.answer "$test_dir/enum_toggle.wasm"
 
 cat > "$test_dir/enum_pairs.luc" <<'LUCE'
@@ -658,7 +659,7 @@ pub func answer() -> i64:
     let (z, w) = split(Pair.one(9))
     return x * 1000 + y * 100 + z * 10 + w
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_pairs.wasm" "$test_dir/enum_pairs.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_pairs.wasm" "$test_dir/enum_pairs.luc" >/dev/null
 expect 0 "4590" wasmtime run --invoke enum_pairs.answer "$test_dir/enum_pairs.wasm"
 
 cat > "$test_dir/enum_boxes.luc" <<'LUCE'
@@ -677,7 +678,7 @@ pub func answer() -> i64:
         i += 1
     return total
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/enum_boxes.wasm" "$test_dir/enum_boxes.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/enum_boxes.wasm" "$test_dir/enum_boxes.luc" >/dev/null
 expect 0 "103" wasmtime run --invoke enum_boxes.answer "$test_dir/enum_boxes.wasm"
 
 # Integer range values and `for`, including a closed maximum endpoint and
@@ -707,7 +708,7 @@ pub func passed() -> i64:
     let values = span()
     return sum(values) + (10 if values == 2..=4 else 0)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/ranges.wasm" "$test_dir/ranges.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/ranges.wasm" "$test_dir/ranges.luc" >/dev/null
 expect 0 "10" wasmtime run --invoke ranges.half_open "$test_dir/ranges.wasm"
 expect 0 "8" wasmtime run --invoke ranges.controlled "$test_dir/ranges.wasm"
 expect 0 "255" wasmtime run --invoke ranges.maximum "$test_dir/ranges.wasm"
@@ -782,7 +783,7 @@ pub func aggregate_return() -> i64:
     let (a, b) = pair()
     return a * 10 + b
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/defers.wasm" "$test_dir/defers.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/defers.wasm" "$test_dir/defers.luc" >/dev/null
 expect 0 "capture
 body
 last
@@ -881,7 +882,7 @@ func checked_init(value: i64) -> i64:
     return positive.value
 pub func initializer_answer() -> i64: return checked_init(43) + checked_init(-1)
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/failures.wasm" "$test_dir/failures.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/failures.wasm" "$test_dir/failures.luc" >/dev/null
 expect 0 "checked
 checked
 propagated
@@ -931,7 +932,7 @@ pub func missing_store() -> i64:
     values[2u64] = 3
     return 0
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/arrays.wasm" "$test_dir/arrays.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/arrays.wasm" "$test_dir/arrays.luc" >/dev/null
 expect 0 "348" wasmtime run --invoke arrays.answer "$test_dir/arrays.wasm"
 expect 0 "0" wasmtime run --invoke arrays.empty "$test_dir/arrays.wasm"
 expect 0 "7" wasmtime run --invoke arrays.method "$test_dir/arrays.wasm"
@@ -947,7 +948,7 @@ done
 
 # Maps and sets retain one semantic shape through the maintained example; the
 # composed runtime owns storage while Wasm supplies only layout and calls.
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/hash_collections.wasm" examples/maps_and_sets.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hash_collections.wasm" examples/maps_and_sets.luc >/dev/null
 expect 0 "42" wasmtime run --invoke maps_and_sets.answer "$test_dir/hash_collections.wasm"
 set +e
 wasmtime run --invoke maps_and_sets.mutation_trap "$test_dir/hash_collections.wasm" >/dev/null 2>&1; status=$?
@@ -979,7 +980,7 @@ pub func defer_trap() -> i64:
     defer print("must not run")
     return 1 // 0
 LUCE
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/traps.wasm" "$test_dir/traps.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/traps.wasm" "$test_dir/traps.luc" >/dev/null
 for name in i8_overflow u8_underflow u32_overflow i16_negate divide_by_zero minimum_by_minus_one shift_too_far shift_negative; do
     set +e
     wasmtime run --invoke "traps.$name" "$test_dir/traps.wasm" >/dev/null 2>&1; status=$?
@@ -1002,7 +1003,7 @@ fi
 
 # Checked arithmetic: overflow must trap (wasm `unreachable`), never wrap.
 printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
-"$cli" build --package org.luce.tests --runtime "$runtime_source" "$test_dir/overflow.wasm" "$test_dir/overflow.luc" >/dev/null
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/overflow.wasm" "$test_dir/overflow.luc" >/dev/null
 set +e
 wasmtime run "$test_dir/overflow.wasm" >/dev/null 2>&1; status=$?
 set -e

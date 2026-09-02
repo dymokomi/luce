@@ -1,0 +1,242 @@
+#==============================================================================================
+#
+#   imports - Module import binding and dependency validation
+#
+#   DESCRIPTION:
+#       Resolves leading source imports into one declaration namespace and
+#       validates their package graph after semantic checking has recorded
+#       every real use. Import bookkeeping is checking-only state: HIR keeps
+#       resolved declaration identities and no source-level import nodes.
+#
+#==============================================================================================
+
+from compiler.core_types import is_reserved_core_name
+from compiler.frontend.source import SourceSpan
+from compiler.hir.generation_model import HirGenerationState, ImportedBinding, ImportedDeclaration, ImportedModule, ModuleBindings
+
+# mark: Cycle evidence ========================================================================
+
+struct ImportCycleEdge:
+    let module_index: i64
+    let span: SourceSpan
+    let declaration_name: str
+
+# mark: Import checking =======================================================================
+
+## Owns the source-module dependency graph and the bindings it contributes to
+## each module. Declaration and body checking only consume resolved bindings.
+pub class ImportChecker:
+    let state: HirGenerationState
+
+    pub init(state: HirGenerationState):
+        self.state = state
+
+    ## Bind every leading import after all package declarations have identities.
+    pub func collect_bindings() -> !:
+        for module_index in range(0, len(self.state.sources)):
+            self.state.module_bindings.append(try self.resolve_module(module_index))
+
+    ## Run only after every signature, constant, default, template, and body
+    ## has been checked; those phases mark the imports they actually resolve.
+    pub func validate() -> !:
+        try self.validate_uses()
+        let cycle = self.shortest_cycle()
+        if len(cycle) == 0: return
+        let edge = self.cycle_edge(cycle[len(cycle) - 2], cycle[0])
+        var description = ""
+        for index in range(0, len(cycle)):
+            if index > 0: description += " -> "
+            description += self.state.sources[cycle[index]].name
+        try self.state.fail_at(
+            edge.module_index,
+            edge.span,
+            "module dependency cycle: `" + description + "`; move declaration `" + edge.declaration_name + "` into a lower-level module",
+        )
+
+    # mark: Binding ============================================================================
+
+    func resolve_module(module_index: i64) -> ModuleBindings!:
+        let bindings = ModuleBindings(
+            modules = list[ImportedModule](), declarations = list[ImportedBinding](),
+        )
+        var use_index = 0
+        for imported in self.state.sources[module_index].syntax.imports:
+            let imported_name = imported.path.dotted()
+            let imported_module = self.state.find_source(imported_name)
+            if imported_module < 0:
+                try self.state.fail_at(module_index, imported.path.span, "unknown module `" + imported_name + "`")
+            if imported_module == module_index:
+                try self.state.fail_at(module_index, imported.path.span, "a module cannot import itself")
+
+            if len(imported.names) == 0:
+                let local_name = imported.alias_name else imported.path.last()
+                try self.require_free_name(module_index, bindings, local_name, imported.span)
+                for previous in bindings.modules:
+                    if previous.module_index == imported_module:
+                        try self.state.fail_at(module_index, imported.span, "duplicate import of module `" + imported_name + "`")
+                bindings.modules.append(ImportedModule(
+                    name = local_name, module_index = imported_module, use_index = use_index,
+                ))
+                use_index += 1
+                continue
+
+            for selected in imported.names:
+                try self.require_free_name(module_index, bindings, selected.name, selected.span)
+                let declaration = self.find_declaration(imported_module, selected.name)
+                if declaration == none:
+                    try self.state.fail_at(module_index, selected.span, "module `" + imported_name + "` has no declaration `" + selected.name + "`")
+                let resolved = declaration else trap("resolved import disappeared")
+                if not self.declaration_is_public(resolved):
+                    try self.state.fail_at(module_index, selected.span, "`" + selected.name + "` is private to module `" + imported_name + "`")
+                bindings.declarations.append(ImportedBinding(
+                    name = selected.name, declaration = resolved, use_index = use_index,
+                ))
+                use_index += 1
+        return bindings
+
+    func find_declaration(module_index: i64, name: str) -> ImportedDeclaration?:
+        let function_index = self.state.find_function_in_module(module_index, name)
+        if function_index >= 0: return ImportedDeclaration.Function(function_index = function_index)
+        let generic_index = self.state.find_generic_function_in_module(module_index, name)
+        if generic_index >= 0: return ImportedDeclaration.GenericFunction(generic_index = generic_index)
+        let constant_index = self.state.find_constant_in_module(module_index, name)
+        if constant_index >= 0: return ImportedDeclaration.Constant(constant_index = constant_index)
+        let variable_index = self.state.find_extern_variable_in_module(module_index, name)
+        if variable_index >= 0: return ImportedDeclaration.ExternalVariable(variable_index = variable_index)
+        let alias_index = self.state.find_alias_in_module(module_index, name)
+        if alias_index >= 0: return ImportedDeclaration.Alias(alias_index = alias_index)
+        for index in range(0, len(self.state.structs)):
+            if self.state.structs[index].module_index == module_index and self.state.structs[index].name == name:
+                return ImportedDeclaration.Struct(struct_index = index)
+        for index in range(0, len(self.state.classes)):
+            if self.state.classes[index].module_index == module_index and self.state.classes[index].name == name:
+                return ImportedDeclaration.Class(class_index = index)
+        for index in range(0, len(self.state.enums)):
+            if self.state.enums[index].module_index == module_index and self.state.enums[index].name == name:
+                return ImportedDeclaration.Enum(enum_index = index)
+        for index in range(0, len(self.state.interfaces)):
+            let item = self.state.interfaces[index]
+            match item.origin:
+                Source(module):
+                    if i64(module.value) == module_index and item.name == name:
+                        return ImportedDeclaration.Interface(interface_index = index)
+                Standard(identity): pass
+        let extern_index = self.state.find_extern_type_in_module(module_index, name)
+        if extern_index >= 0: return ImportedDeclaration.ExternalType(type_index = extern_index)
+        return none
+
+    func declaration_is_public(declaration: ImportedDeclaration) -> bool:
+        match declaration:
+            Function(index): return self.state.functions[index].is_public
+            GenericFunction(index): return self.state.generic_functions[index].is_public
+            Constant(index): return self.state.constants[index].is_public
+            ExternalVariable(index): return self.state.extern_variables[index].is_public
+            Alias(index): return self.state.aliases[index].is_public
+            Struct(index): return self.state.structs[index].is_public
+            Class(index): return self.state.classes[index].is_public
+            Enum(index): return self.state.enums[index].is_public
+            Interface(index): return self.state.interfaces[index].is_public
+            ExternalType(index): return self.state.extern_types[index].is_public
+
+    func require_free_name(module_index: i64, bindings: ModuleBindings, name: str, span: SourceSpan) -> !:
+        if is_reserved_core_name(name):
+            try self.state.fail_at(module_index, span, "`" + name + "` belongs to the compiler-known core namespace")
+        if self.find_declaration(module_index, name) != none or self.state.find_global_in_module(module_index, name) >= 0:
+            try self.state.fail_at(module_index, span, "imported name `" + name + "` conflicts with a declaration")
+        for imported in bindings.modules:
+            if imported.name == name:
+                try self.state.fail_at(module_index, span, "duplicate imported name `" + name + "`")
+        for imported in bindings.declarations:
+            if imported.name == name:
+                try self.state.fail_at(module_index, span, "duplicate imported name `" + name + "`")
+
+    # mark: Usage validation ===================================================================
+
+    func validate_uses() -> !:
+        for module_index in range(0, len(self.state.sources)):
+            var use_index = 0
+            for imported in self.state.sources[module_index].syntax.imports:
+                let imported_name = imported.path.dotted()
+                if len(imported.names) == 0:
+                    if not self.state.import_uses[module_index][use_index]:
+                        try self.state.fail_at(module_index, imported.span, "unused import `" + imported_name + "`; remove this import")
+                    use_index += 1
+                    continue
+                for selected in imported.names:
+                    if not self.state.import_uses[module_index][use_index]:
+                        try self.state.fail_at(module_index, selected.span, "unused import `" + selected.name + "` from module `" + imported_name + "`; remove this import")
+                    use_index += 1
+
+    # mark: Dependency cycles ==================================================================
+
+    func shortest_cycle() -> list[i64]:
+        let shortest = list[i64]()
+        for start in range(0, len(self.state.sources)):
+            let candidate = self.shortest_cycle_from(start)
+            if len(candidate) > 0 and (len(shortest) == 0 or len(candidate) < len(shortest)):
+                shortest.clear()
+                for module_index in candidate: shortest.append(module_index)
+        return shortest
+
+    # Breadth-first paths from one module make the first edge back to `start`
+    # the shortest directed cycle containing it.
+    func shortest_cycle_from(start: i64) -> list[i64]:
+        let visited = list[bool]()
+        let parents = list[i64]()
+        for module_index in range(0, len(self.state.sources)):
+            visited.append(false)
+            parents.append(-1)
+        let queue = list[i64]()
+        visited[start] = true
+        queue.append(start)
+        var head = 0
+        while head < len(queue):
+            let current = queue[head]
+            head += 1
+            for imported in self.state.sources[current].syntax.imports:
+                let target = self.state.find_source(imported.path.dotted())
+                if target == start:
+                    return self.build_cycle(start, current, parents)
+                if target >= 0 and target < len(self.state.sources) and not visited[target]:
+                    visited[target] = true
+                    parents[target] = current
+                    queue.append(target)
+        return list[i64]()
+
+    func build_cycle(start: i64, last: i64, parents: list[i64]) -> list[i64]:
+        let reverse = list[i64]()
+        var current = last
+        while current != start:
+            reverse.append(current)
+            current = parents[current]
+        let cycle = list[i64]()
+        cycle.append(start)
+        var index = len(reverse) - 1
+        while index >= 0:
+            cycle.append(reverse[index])
+            index -= 1
+        cycle.append(start)
+        return cycle
+
+    func cycle_edge(from_module: i64, to_module: i64) -> ImportCycleEdge:
+        var use_index = 0
+        for imported in self.state.sources[from_module].syntax.imports:
+            let target = self.state.find_source(imported.path.dotted())
+            if len(imported.names) == 0:
+                if target == to_module and self.state.import_uses[from_module][use_index]:
+                    return ImportCycleEdge(
+                        module_index = from_module,
+                        span = imported.span,
+                        declaration_name = self.state.import_use_names[from_module][use_index],
+                    )
+                use_index += 1
+                continue
+            for selected in imported.names:
+                if target == to_module and self.state.import_uses[from_module][use_index]:
+                    return ImportCycleEdge(
+                        module_index = from_module,
+                        span = selected.span,
+                        declaration_name = self.state.import_use_names[from_module][use_index],
+                    )
+                use_index += 1
+        trap("cycle edge has no used import")

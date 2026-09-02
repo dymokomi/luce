@@ -12,7 +12,8 @@ trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 
 "$luce" build src/luce.luc -o "$test_dir/luce"
 runtime_source=src/runtime/allocator.native.luc
-"$test_dir/luce" build --package org.luce.tests --target native --runtime "$runtime_source" "$test_dir/hello" examples/hello.luc
+runtime_root=src/runtime
+"$test_dir/luce" build --package org.luce.tests --root examples --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello" examples/hello.luc
 
 description=$(file "$test_dir/hello")
 case "$(uname -s)-$(uname -m)" in
@@ -43,7 +44,7 @@ if [ "$output" != "Hello, world!" ]; then
 fi
 
 printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
-"$test_dir/luce" build --package org.luce.tests --target native --runtime "$runtime_source" "$test_dir/overflow" "$test_dir/overflow.luc"
+"$test_dir/luce" build --package org.luce.tests --root "$test_dir" --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/overflow" "$test_dir/overflow.luc"
 set +e
 { "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2>/dev/null
 set -e

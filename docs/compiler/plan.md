@@ -660,8 +660,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   (`done.md` §2). One compiler-owned sealed-runtime descriptor now maps the
   closed service vocabulary to source identities; callers supply only the
   resource location, so tests and future installations cannot drift into
-  separate manifests. The CLI accepts repeated explicit `--runtime FILE`
-  inputs and composes that reviewed package before either backend. Automatic
+  separate manifests. The CLI accepts an explicit `--runtime-root DIR` with
+  repeated `--runtime FILE` inputs and composes that reviewed package before
+  either backend. Automatic
   discovery in an installed toolchain still awaits a Stage-0 host
   `std.os.executable_path()` capability rather than embedding a
   checkout-relative path, environment convention, or platform syscall in the

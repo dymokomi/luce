@@ -33,9 +33,9 @@ The compiler is now available at `build/luce`. It can check source files, run a
 function through the HIR interpreter, or build an artifact:
 
 ```sh
-./build/luce check --package org.luce.examples examples/semantic_core/math.luc examples/semantic_core/main.luc
-./build/luce run --package org.luce.examples main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
-./build/luce build --package org.luce.examples build/answer.wasm examples/compiled_core/main.luc
+./build/luce check --package org.luce.examples --root examples/semantic_core examples/semantic_core/math.luc examples/semantic_core/main.luc
+./build/luce run --package org.luce.examples --root examples/semantic_core main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
+./build/luce build --package org.luce.examples --root examples/compiled_core build/answer.wasm examples/compiled_core/main.luc
 ```
 
 The package identity is explicit because it is embedded in stable `ErrorCode`
@@ -45,13 +45,13 @@ Features backed by the reviewed Luce runtime pass its source explicitly; the
 compiler owns the sealed service manifest, so callers provide locations only:
 
 ```sh
-./build/luce build --package org.luce.examples --runtime src/runtime/allocator.native.luc build/strings.wasm examples/strings.luc
+./build/luce build --package org.luce.examples --root examples --runtime-root src/runtime --runtime src/runtime/allocator.native.luc build/strings.wasm examples/strings.luc
 ```
 
 Native output uses the pinned QBE toolchain for the current host:
 
 ```sh
-./build/luce build --package org.luce.examples --target native build/hello examples/hello.luc
+./build/luce build --package org.luce.examples --root examples --target native build/hello examples/hello.luc
 ./build/hello
 ```
 
