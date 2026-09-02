@@ -268,6 +268,13 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   verified canonical primitive. Both semantic oracles, QBE, Wasm, and
   `examples/hashing.luc` prove equal-value consistency without freezing a
   numeric hash algorithm.
+- [x] **Explicit exact-same-type ordering** (2026-09-01, `done.md` §2).
+  Compiler-known `Comparable` binds its implicit `Self` operand at each
+  constraint or conformance, then reuses ordinary interface substitution and
+  static generic specialization. It adds no operator, existential, associated
+  type, MIR instruction, runtime service, or backend case. Exact diagnostics,
+  typed-package reconstruction/import, both semantic oracles, QBE, Wasm, and
+  `examples/comparable.luc` close §17.2 ordering.
 - [x] **Cycle-aware structural list equality** (2026-08-31,
   `done.md` §2). Recursive value declarations may close through list
   indirection, so one source comparison owns an opaque ordered-pair

@@ -32,7 +32,7 @@ column because it does not determine stage-1 completion.
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | §3 | UTF-8 source, layout, comments, documentation, names, scope | complete | partial | n/a | n/a | partial | Generic-nominal and source-test scopes remain with those features. |
 | §4 | Boolean, absence, numeric, character, string, byte, raw, formatted, triple, and collection literals | complete | complete | complete | complete | complete | Every normative literal rule and the width-explicit `math` special-value surface execute through both oracles and QBE/Wasm. |
-| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit and restricted `mutable_slice` are complete; `task` and explicit total ordering remain in S18/S19. |
+| §5 | Scalar, composite, alias, inference, structural operations, and recursive type rules | complete | partial | partial | partial | partial | The S05 alias/inference/recursion/copying audit, restricted `mutable_slice`, and explicit total-order contract are complete; `task` remains in S19. |
 | §6 | Immutable/mutable bindings, assignment, initialization | complete | complete | complete | complete | complete | Every binding, tuple, copy/reference, checked-place, and definite-initialization rule has positive, negative, oracle, and artifact evidence. |
 | §7 | Evaluation order, arithmetic, bits, comparisons, conversions, calls, indexing, and discarded values | complete | partial | partial | partial | partial | The S06 eager-order/operator audit is complete; named arithmetic-policy APIs remain in S30. |
 | §8 | Functions, arguments/defaults, tuples, methods, mutation, recursion, and function values | complete | complete | complete | complete | complete | Exact direct/generic/function/closure callables, defaults, tuples, methods, mutation, and recursion execute through both oracles, QBE, and Wasm. |
@@ -44,7 +44,7 @@ column because it does not determine stage-1 completion.
 | §14 | Lambdas, closures, captures, escape, cycles, sendability | complete | partial | partial | partial | partial | The executable capture/lifting/storage/direct-cycle matrix and shared-cell advisory are complete; worker sendability remains. |
 | §15 | Generic declarations, constraints, monomorphization, limits | complete | complete | complete | complete | complete | Abstract checking, specialization, limits/accounting, retained typed bodies, and dependency-origin package specialization are complete through QBE. |
 | §16 | Interfaces, conformance, static use, interface values | complete | complete | complete | complete | complete | Every declaration, conformance, static-dispatch, existential, mutation, fallibility, and deliberate no-downcast rule has positive/negative proof. `luce explain` reports boxing, dynamic calls, and value-versus-class payload semantics. |
-| §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Iteration, closed derived equality/hashability, cycle-aware collection equality, immutable structural hashing, and closed `Display` formatting execute; ordering and encoding remain. |
+| §17 | Iteration, equality, hashing, ordering, formatting, encoding protocols | complete | partial | partial | partial | partial | Iteration, closed derived equality/hashability, cycle-aware collection equality, immutable structural hashing, explicit `Comparable`, and closed `Display` formatting execute; encoding remains. |
 | §18 | Effects are deliberately absent | complete | complete | n/a | n/a | n/a | Keep exclusion tests and prevent effect syntax from entering the grammar. |
 | §19 | Isolated workers, transfer, cancellation, task lifetime | complete | syntax | — | — | syntax | Sendability checking, worker MIR operations, runtime, and QBE execution. |
 | §20 | Modules, imports, visibility, entry points, and compile-time constants | complete | partial | partial | partial | partial | Module-cycle and import-use diagnostics, the public-signature/API-surface matrix, the complete constant subset, and the package/entry diagnostic matrix remain. Manifest, dependency identity, and platform variation are explicitly post-1.0. |
@@ -83,7 +83,7 @@ identifiers are stable planning labels, not diagnostic codes.
 | S15 | §14.4 | Closure/value sendability and all worker-boundary capture rejections | Core closure contract is complete; closes with workers. |
 | S16 | §15 | Final generic rule audit and serialized typed bodies in package artifacts | Complete: typed artifacts compose and dependency-origin generics specialize without source replay. |
 | S17 | §16 | Final interface rule audit, including no-downcast exclusions and every static/existential adaptation | Complete: one declaration-call placement protocol reaches typed packages, both oracles, QBE, and Wasm; exclusions and interface-cost reporting are covered. |
-| S18 | §17.2 | Explicit `Comparable` conformance and total-order `compare` contract | Derived equality/hashability are complete; ordering protocol is absent. |
+| S18 | §17.2 | Explicit `Comparable` conformance and total-order `compare` contract | Complete: exact-Self constraints/conformances specialize to ordinary calls; existential/argument/synthesis exclusions, typed dependencies, both oracles, QBE, and Wasm are covered. |
 | S19 | §§19.1–19.5 | Workers, `task[T]`, graph-copy transfer, sendability, `wait_all`, cancellation, and supervised lifetime | Syntax only. |
 | S20 | §§20.1–20.5 | Module-cycle, import-use, public-signature, constant-expression, and complete entry-point diagnostics | Imports/modules/constants/entry work in common paths; exact matrix remains. |
 | S21 | §§21.1–21.15 | FIIR, C/C++ import and wrapper/thunk generation, recipes, provenance, and support diagnostics | Architecture is specified; generator is absent. |
@@ -388,6 +388,20 @@ family has this narrower proof:
 | Equal values hash equally, including IEEE signed zero | yes | yes | yes, plus Wasm | `hashing.luc` | complete |
 | IEEE scalar codes are exact; aggregate mixing remains in shared lowering | yes | `FloatBits` only | bit reinterpretation only | focused source tests | complete |
 | Mutable reference collections/classes are not hashable keys | stable rejection | n/a | n/a | focused negative fixtures | complete |
+
+## Current explicit-ordering evidence
+
+`Comparable` is a source-level semantic contract, not an operator or backend
+facility. Its implicit exact `Self` operand is bound by the generic parameter
+or conforming nominal before ordinary interface substitution runs.
+
+| §17.2 rule | HIR/oracle | MIR/verifier | QBE product | Example | State |
+| --- | --- | --- | --- | --- | --- |
+| Compiler-known `compare(self, other: Self) -> i64` uses negative/zero/positive ordering | one hidden owner-bound interface argument | concrete calls only | yes, plus Wasm | `comparable.luc` | complete |
+| Conformance and implementation are explicit; no field-order synthesis or operator enabling occurs | exact conformance validation | no special ordering form | unchanged | focused HIR negatives | complete |
+| Generic constraints dispatch statically through ordinary specialization, including generic nominal conformances | exact requirement identity and substitution | direct concrete call | yes, plus Wasm | `comparable.luc` | complete |
+| `Comparable` has no source type arguments, existential value, associated type, reflection, or downcast path | stable rejection | n/a | n/a | focused HIR/parser fixtures | complete |
+| Typed package reconstruction and dependency-origin conformances preserve the hidden same-type binding | byte-stable artifact/import remapping | concrete imported specialization | yes | package importer/codec fixtures | complete |
 
 ## Current formatted-string evidence
 

@@ -109,6 +109,11 @@ examples and tests link back here rather than restating it.
   resolved HIR operation and one canonical MIR expansion; equal values agree
   through both semantic oracles, QBE, and Wasm while numeric hash codes remain
   deliberately execution-local.
+- Explicit `Comparable` conformances provide one exact-same-type, three-way
+  ordering contract to statically specialized generic code. The contract
+  remains an ordinary target-neutral interface through HIR and disappears
+  into direct calls before MIR; heterogeneous ordering existentials and
+  synthesized field order are deliberately absent.
 - The HIR interpreter is the reference implementation of language behavior for
   the slice it supports.
 - Canonical MIR is designed for the whole language (typed registers,

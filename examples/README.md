@@ -98,6 +98,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   applications, enum conformers, returned existentials, and existentials in
   managed collections travel through both semantic oracles, Wasm, and native
   QBE using the same HIR and MIR shapes.
+- `comparable.luc` proves the compiler-known exact-same-type `Comparable`
+  contract through an explicit nominal conformance, a generic nominal
+  conformance, and statically specialized generic `maximum`. Both semantic
+  oracles, Wasm, typed-package reconstruction, and native QBE consume the
+  ordinary interface/call shapes; no comparison operator, synthesized field
+  order, or heterogeneous existential is introduced.
 - `iteration.luc` proves the four compiler-known iteration interfaces through
   concrete, constrained-generic, and existential dispatch. Ordinary `for`,
   propagating `try for`, item/end/error separation, break/continue, and the
