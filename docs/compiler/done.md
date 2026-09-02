@@ -20,7 +20,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 881 unit tests across 32 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 882 unit tests across 32 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1392,10 +1392,13 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   forwarding shell.
 
 - [x] **Extern structs remain ordinary values until the C pointer boundary**
-  (2026-09-01). The field-only raw declaration enters the existing nominal
-  struct table with one boundary capability; construction, field access,
-  copies, equality where every field is equatable, zero values, visibility,
-  HIR execution, and structural MIR lowering reuse the ordinary value paths.
+  (completed 2026-09-02). The terse raw fields normalize into the existing
+  nominal member model with one boundary capability; documentation, constant
+  defaults, methods, custom initializers, interface conformance, construction,
+  field access, copies, equality where every field is equatable, zero values,
+  visibility, HIR execution, and structural MIR lowering reuse the ordinary
+  value paths. Fields are immutable and implicitly public for raw-wrapper
+  access; methods retain ordinary visibility, receiver, and body rules.
   HIR rejects nullable extern structs, by-value C results, ordinary/nonnative
   aggregate fields, recursive storage, and every field outside the currently
   executable scalar/handle/nested-extern/cfunc vocabulary. Canonical MIR records no
@@ -1403,12 +1406,11 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   storage and reads fresh output storage back field by field, while QBE and
   Wasm alone choose offsets, alignment, pointer width, and stack placement.
   The semantic oracle models the same crossing as a fresh checked record;
-  focused HIR/MIR diagnostics and a real QBE/libc `clock_gettime` execution
-  prove natural host layout and writable `out` crossing. The executable
-  `native_interop.native.luc` example carries the product proof. Language
-  §21.17's claim that the field-only syntax also retains methods, defaults,
-  and explicit conformances conflicts with the grammar and remains recorded
-  in the plan rather than being silently interpreted.
+  focused parser/HIR/package/MIR diagnostics and a real QBE/libc
+  `clock_gettime` execution followed by an ordinary Luce method prove natural
+  host layout, writable `out` crossing, and immediate return to value
+  semantics. The executable `native_interop.native.luc` example carries the
+  product proof.
 
 - [x] **Incoming and nullable `cfunc` pointers remain opaque until invocation**
   (2026-09-01). HIR now distinguishes one declared C adapter/symbol from an

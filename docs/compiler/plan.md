@@ -450,16 +450,18 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   and Wasm imports one mutable `env` global. Bare pointer-handle zero is
   ordinary global state; null translation remains confined to callable C
   boundaries. Exact named `cfunc` values are complete in the separate rung
-  below. The field-only `extern struct` declaration is now executable too:
-  HIR keeps one nominal value-struct capability, MIR stays structurally
-  target-neutral, and the call adapter recursively packs inputs and unpacks
-  outputs field by field into call-owned pointer slots. Both semantic oracles,
-  focused MIR verification, backend-generic aggregate legalization, and real
-  QBE/libc `clock_gettime` execution prove the path. By-value results and
-  nullable extern structs are refused. The prose in language §21.17 also says
-  methods, field defaults, and interface conformance remain available while
-  the grammar and parser deliberately admit only plain fields; that
-  specification inconsistency must be resolved before calling §21.17 closed.
+  below. The `extern struct` declaration is complete too: its terse raw fields
+  normalize into the ordinary nominal-member model, so documentation,
+  constant defaults, methods, custom initializers, and explicit interface
+  conformances have no parallel semantic implementation. HIR keeps one
+  nominal value-struct capability, package artifacts preserve initializers
+  and witnesses, and MIR stays structurally target-neutral. The call adapter
+  recursively packs inputs and unpacks outputs field by field into call-owned
+  pointer slots. Both semantic oracles, focused MIR verification,
+  backend-generic aggregate legalization, and real QBE/libc `clock_gettime`
+  execution followed by an ordinary Luce method prove the path. By-value
+  results, nullable extern structs, generic declarations, and empty C shapes
+  are refused.
   Incoming bare/nullable C function pointers and cfunc fields are now complete
   in the separate rung below. Exported structs/enums, generated adapters, the
   explicit inbound-memory verbs, and callback runtime enforcement remain on
