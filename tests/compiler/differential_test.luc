@@ -12,13 +12,13 @@
 #
 #==============================================================================================
 
-from luce.compiler.backends.interpreter import HirExternHost, HirExternResult, HirExternVariableHost, HirInterpreter
+from luce.compiler.backends.interpreter import HirExternHost, HirExternResult, HirExternVariableHost, HirForeignMemoryHost, HirInterpreter
 from luce.compiler.backends.mir_interpreter import MirExternHost, MirExternMemory, MirExternalGlobalHost, MirInterpreter, MirValue, signed_int_of
 from luce.compiler.backends.layout import LayoutRules
 from luce.compiler.backends.qbe import QbeBackend
 from luce.compiler.backends.qbe_toolchain import QbeToolchain
 from luce.compiler.backends.wasm import WasmBackend
-from luce.compiler.mir.canonical import BuiltinMirType, InstructionForm, MirExtern, MirExternalGlobal, MirProgram, builtin_mir_type
+from luce.compiler.mir.canonical import BuiltinMirType, InstructionForm, MirExtern, MirExternalGlobal, MirProgram, builtin_mir_type, find_runtime_binding
 from luce.compiler.hir.ir import HirExternVariable, HirFunction, ModuleAuthority, PackageRole, Value
 from luce.compiler.hir.generator import HirGenerator
 from luce.compiler.hir.generation_model import SourceModule
@@ -29,6 +29,7 @@ from luce.compiler.mir.verifier import MirVerifier
 from luce.compiler.pipeline import PackageInput, RuntimePackageInput, compile_runtime, compile_with_runtime
 from luce.compiler.packages.program_codec import encode_typed_hir_package
 from luce.compiler.runtime_package import sealed_runtime_package
+from luce.compiler.runtime_contract import RuntimeService
 from luce.compiler.frontend.parser import Parser
 from luce.compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
 from luce.compiler.frontend.tokenizer import Tokenizer
@@ -814,6 +815,13 @@ func source_module(name: str, source: str) -> SourceModule:
         trap(reason)
     return SourceModule(name = name, path = name + ".luc", authority = ModuleAuthority.safe, syntax = syntax_tree)
 
+func standard_source_module(name: str, source: str) -> SourceModule:
+    let tokens = Tokenizer(source).tokenize() catch reason:
+        trap(reason)
+    let syntax_tree = Parser(tokens).parse() catch reason:
+        trap(reason)
+    return SourceModule(name = name, path = name + ".luc", authority = ModuleAuthority.standard, syntax = syntax_tree)
+
 func analyzed_modules(modules: list[SourceModule]) -> AnalyzedProgram:
     let hir = HirGenerator("test.luce", modules).generate() catch reason:
         trap(reason)
@@ -1058,6 +1066,77 @@ class MirCStringHost: MirExternHost:
         if len(input) != 3 or input[0] != u8(104) or input[1] != u8(195) or input[2] != u8(169):
             error("unexpected MIR C string input")
         return [memory.allocate_external_bytes([u8(111), u8(107), u8(0)])]
+
+class HirInboundMemoryHost: HirExternHost:
+    pub var disposals: i64
+    let null_data: bool
+
+    pub init(null_data: bool = false):
+        self.disposals = 0
+        self.null_data = null_data
+
+    pub func call(function: HirFunction, arguments: list[Value]) -> HirExternResult!:
+        if function.name == "data":
+            var token = 41
+            if self.null_data: token = 0
+            return HirExternResult(result = Value.Foreign(token = token), outputs = list[Value]())
+        if function.name == "owned": return HirExternResult(result = Value.Foreign(token = 42), outputs = list[Value]())
+        if function.name == "release":
+            match arguments[0]:
+                Foreign(token):
+                    if token != 42: error("HIR disposer received the wrong token")
+                else: error("HIR disposer received a non-foreign value")
+            self.disposals += 1
+            return HirExternResult(result = Value.Unit, outputs = list[Value]())
+        error("unexpected inbound-memory extern")
+
+class HirInboundMemory: HirForeignMemoryHost:
+    let invalid_owned: bool
+
+    pub init(invalid_owned: bool = false): self.invalid_owned = invalid_owned
+
+    pub func copy_bytes(pointer: i64, count: u64) -> list[u8]!:
+        if pointer != 41 or count != u64(2): error("unexpected HIR foreign byte read")
+        return [u8(65), u8(66)]
+
+    pub func copy_c_string(pointer: i64) -> list[u8]!:
+        if pointer == 41: return [u8(65), u8(66)]
+        if pointer == 42:
+            if self.invalid_owned: return [u8(255)]
+            return [u8(111), u8(107)]
+        error("unexpected HIR foreign C-string read")
+
+class MirInboundMemoryHost: MirExternHost:
+    pub var disposals: i64
+    var owned: i64
+    let null_data: bool
+    let invalid_owned: bool
+
+    pub init(null_data: bool = false, invalid_owned: bool = false):
+        self.disposals = 0
+        self.owned = 0
+        self.null_data = null_data
+        self.invalid_owned = invalid_owned
+
+    pub func call(external: MirExtern, arguments: list[MirValue], memory: MirExternMemory) -> list[MirValue]!:
+        if external.name == "data":
+            if self.null_data: return [MirValue.Ptr(value = 0)]
+            return [memory.allocate_external_bytes([u8(65), u8(66), u8(0)])]
+        if external.name == "owned":
+            var value = memory.allocate_external_bytes([u8(111), u8(107), u8(0)])
+            if self.invalid_owned: value = memory.allocate_external_bytes([u8(255), u8(0)])
+            match value:
+                Ptr(pointer): self.owned = pointer
+                else: error("MIR owned C string was not a pointer")
+            return [value]
+        if external.name == "release":
+            match arguments[0]:
+                Ptr(pointer):
+                    if pointer != self.owned: error("MIR disposer received the wrong pointer")
+                else: error("MIR disposer received a non-pointer")
+            self.disposals += 1
+            return list[MirValue]()
+        error("unexpected inbound-memory extern")
 
 class HirBorrowedListHost: HirExternHost:
     pub init(): return
@@ -1467,6 +1546,85 @@ pub func test_c_string_boundaries_agree_through_hir_mir_and_artifact_encoders():
     let qbe = QbeBackend().emit_il(mir) catch reason:
         trap(reason)
     assert(strings.contains(qbe, "call $inspect(l"))
+
+pub func test_inbound_c_memory_helpers_agree_through_both_oracles_and_artifact_encoders():
+    let c_source = files.read("src/standard/c.luc") catch reason:
+        trap(reason)
+    let source = "import c\nextern func data() -> foreign\nextern func owned() -> foreign\nextern func release(value: foreign)\npub func answer() -> i32:\n    let raw = c.bytes_at(data(), 2u64)\n    let borrowed = c.cstring_at(data())\n    let taken = c.take_str(owned(), release)\n    return 42 if raw.length == 2u64 and raw[0u64] == 65u8 and raw[1u64] == 66u8 and borrowed == \"AB\" and taken == \"ok\" else 1\n"
+    let program = analyzed_modules([
+        standard_source_module("c", c_source),
+        source_module("main", source),
+    ])
+    let hir_host = HirInboundMemoryHost()
+    let oracle = HirInterpreter().run_with_c_memory(program, "main", "answer", hir_host, none, HirInboundMemory()) catch reason:
+        trap(reason)
+    assert(hir_integer(oracle) == 42)
+    assert(hir_host.disposals == 1)
+
+    let mir = lowered(program)
+    let mir_host = MirInboundMemoryHost()
+    let interpreter = MirInterpreter(mir, interpreter_layout())
+    interpreter.bind_externs(mir_host)
+    let results = interpreter.run("main.answer", list[MirValue]()) catch reason:
+        trap(reason)
+    assert(mir_integer(results) == 42)
+    assert(mir_host.disposals == 1)
+    let wasm = WasmBackend().emit(mir) catch reason:
+        trap(reason)
+    assert(len(wasm) > 8)
+    let qbe = QbeBackend().emit_il(mir) catch reason:
+        trap(reason)
+    let builder_append = find_runtime_binding(mir, RuntimeService.buffer_builder_append) else trap("missing buffer-builder append runtime binding")
+    let string_copy = find_runtime_binding(mir, RuntimeService.c_string_copy) else trap("missing C string-copy runtime binding")
+    assert(strings.contains(qbe, "call $luce_f" + str(builder_append.value) + "(l"))
+    assert(strings.contains(qbe, "call $luce_f" + str(string_copy.value) + "(l"))
+
+pub func test_inbound_c_memory_traps_before_read_or_disposal():
+    let c_source = files.read("src/standard/c.luc") catch reason:
+        trap(reason)
+    let null_source = "import c\nextern func data() -> foreign\npub func answer() -> i32:\n    discard(c.bytes_at(data(), 0u64))\n    return 0\n"
+    let null_program = analyzed_modules([
+        standard_source_module("c", c_source),
+        source_module("main", null_source),
+    ])
+    let hir_null = HirInboundMemoryHost(true)
+    var hir_null_trapped = false
+    discard(HirInterpreter().run_with_c_memory(null_program, "main", "answer", hir_null, none, HirInboundMemory())) catch reason:
+        assert(strings.contains(reason, "null_foreign"))
+        hir_null_trapped = true
+    assert(hir_null_trapped)
+    let null_mir = lowered(null_program)
+    let mir_null = MirInboundMemoryHost(true)
+    let null_interpreter = MirInterpreter(null_mir, interpreter_layout())
+    null_interpreter.bind_externs(mir_null)
+    var mir_null_trapped = false
+    discard(null_interpreter.run("main.answer", list[MirValue]())) catch reason:
+        if not strings.contains(reason, "null_foreign"): trap("unexpected MIR null trap: " + reason)
+        mir_null_trapped = true
+    assert(mir_null_trapped)
+
+    let invalid_source = "import c\nextern func owned() -> foreign\nextern func release(value: foreign)\npub func answer() -> i32:\n    discard(c.take_str(owned(), release))\n    return 0\n"
+    let invalid_program = analyzed_modules([
+        standard_source_module("c", c_source),
+        source_module("main", invalid_source),
+    ])
+    let hir_invalid_host = HirInboundMemoryHost()
+    var hir_invalid_trapped = false
+    discard(HirInterpreter().run_with_c_memory(invalid_program, "main", "answer", hir_invalid_host, none, HirInboundMemory(true))) catch reason:
+        assert(strings.contains(reason, "invalid_utf8"))
+        hir_invalid_trapped = true
+    assert(hir_invalid_trapped)
+    assert(hir_invalid_host.disposals == 0)
+    let invalid_mir = lowered(invalid_program)
+    let mir_invalid_host = MirInboundMemoryHost(false, true)
+    let invalid_interpreter = MirInterpreter(invalid_mir, interpreter_layout())
+    invalid_interpreter.bind_externs(mir_invalid_host)
+    var mir_invalid_trapped = false
+    discard(invalid_interpreter.run("main.answer", list[MirValue]())) catch reason:
+        assert(strings.contains(reason, "invalid_utf8"))
+        mir_invalid_trapped = true
+    assert(mir_invalid_trapped)
+    assert(mir_invalid_host.disposals == 0)
 
 pub func test_borrowed_c_lists_agree_through_hir_mir_and_artifact_encoders():
     let source = "extern func sum(values: list[i32], count: u64) -> i32\npub func answer() -> i32: return sum([20i32, 99i32], 1u64) + sum([22i32], 1u64) + sum([], 0u64)\n"

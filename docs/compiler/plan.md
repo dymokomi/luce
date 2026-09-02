@@ -485,9 +485,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   fixed enum fields, floating fields, and aggregate-bearing indirect C calls.
   Generated C11 headers and versioned QBE ABI reports are complete in the
   product slice below.
-  Incoming bare/nullable C function pointers and cfunc fields are now complete
-  in the separate rung below. The explicit inbound-memory verbs and callback
-  runtime enforcement remain on this item.
+  Incoming bare/nullable C function pointers, cfunc fields, and the three
+  explicit inbound-memory verbs are now complete in the separate rungs below.
+  Generated f16 adaptation and callback runtime enforcement remain on this
+  item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
