@@ -368,6 +368,49 @@ and every normal path that bypasses the matching end. Trapping paths need no
 cleanup because a trap terminates the program. No pointer width, list header,
 element offset, or ABI fact enters this transaction.
 
+`Task(T)` is a locally storable, non-owning handle into the current invocation's
+structured task group. `TaskGroup` is compiler-internal and cannot appear in a
+source signature or value. A function that contains a spawn begins one group;
+`TaskSpawn` records the exact concrete `FunctionId` and a `TransferRun` into the
+function-local typed transfer arena. Each transfer retains both its evaluated
+register and its source `TypeId`; aggregate call arguments are represented by
+`Ptr`, so the structural type is indispensable for proving and performing an
+isolated copy. `Task(T, Error)` likewise retains the structural failure type:
+the ordinary error result is a raw caller-owned pointer only at the call ABI,
+not at the task boundary. `TaskWait` returns a copied successful value plus the
+ordinary failure channel, and `TaskCancel` requests cancellation. `TaskWaitAll`
+is the typed bulk form over `List(Task(T))`; its ordering and first-failure
+rules are fixed by §19 rather than a backend runtime API. Its successful empty
+`List(Never)` uses canonical `Uninhabited`, a zero-size element marker distinct
+from the empty struct used for `unit`; it can never occupy a register.
+
+The lowerer emits `TaskGroupFinish` on every ordinary return and propagated
+error before it runs the function-scope cleanup suffix. It cancels and joins
+only children that the current invocation spawned; task parameters remain
+owned by their caller's group. Traps and forced termination do not execute the
+finish operation, matching the language's no-cleanup trap rule. The verifier
+proves one group origin, exact spawn signature/result agreement, sendable
+transfer types, task-handle provenance, and a finish on every ordinary exit.
+Task handles require no independent retain/release: the group keeps each child
+record alive through the invocation, while local aliases and collections carry
+the same opaque identity.
+
+HIR and MIR define transfer as a recursive value-graph copy and cache a
+completed outcome for repeated waits. Neither representation contains a
+thread, process, pipe, signal, scheduler, serializer format, pointer width, or
+host cancellation primitive. The semantic interpreters may schedule workers
+deterministically while preserving isolation and observable task behavior.
+The MIR oracle serializes verified sendable values into a pointer-free semantic
+tree, executes the exact worker in a fresh interpreter domain, then decodes its
+cached result or Error into caller-owned storage. Parent memory addresses,
+collection identities, buffer owners, globals, and managed handle tables can
+therefore never cross the oracle boundary accidentally. Scalars, structs,
+arrays, enums, optionals, buffers, immutable slices, and frozen collections all
+use this one type-directed copy rather than feature-specific task paths.
+QBE chooses its native worker domain and transfer encoding behind the backend
+boundary; a backend without an isolated-worker facility reports the feature as
+unsupported without changing canonical MIR.
+
 User-defined iteration does not add a second MIR protocol. HIR has already
 selected the exact compiler-known interface application and resolved
 `iterator()`/`next()` as static, constrained, or dynamic interface calls. The
@@ -552,6 +595,7 @@ backend translates canonical MIR directly into QBE IL:
 | `CallExtern`, `FunctionAddress`, `ExternAddress`, `DataAddress` | direct C call, defined/imported callable tokens, named data | direct |
 | checked `Add`, trapping shifts, floor `//` | no overflow flags in QBE: compare sequences | the one place QBE costs more than hand-written native code |
 | typed `List(T)` operations | `l` handle plus direct calls to exact composed runtime functions | QBE layout supplies `sizeof(T)`/alignment; MIR stays structural |
+| `TaskSpawn` / `TaskWait` / `TaskWaitAll` | supervised POSIX worker plus generated typed codec | process and transport policy exists only in the native backend |
 | fallible `(value, error pointer)` plus caller-owned error parameter | error pointer return plus a private scalar-result out pointer | backend-local ABI |
 | narrow integer types | `w` temporaries plus explicit extension, guards, and sub-word memory operations | direct legalization |
 
@@ -567,6 +611,27 @@ atomic same-filesystem rename. A later Luce-native backend can be
 differential-tested against this baseline. Both paths consume the same
 canonical MIR; neither adds target-specific lowering before the backend
 boundary.
+
+For a task-bearing product, the QBE toolchain links one small POSIX companion
+beside the generated assembly. A spawn forks immediately after the backend has
+captured the worker's QBE call values, so copy-on-write supplies a snapshot of
+the complete source runtime domain without teaching HIR or MIR about a host
+process. Only a framed outcome returns through the pipe. Compiler-generated,
+type-directed codecs rebuild scalars, aggregates, buffers, slices, and frozen
+collections into new parent-owned storage; mutable identities and raw pointers
+are excluded earlier by sendability. The companion owns `fork`, `pipe`,
+`waitpid`, signals, cached bytes, and process records, but knows nothing about
+MIR layout or the sealed collection runtime. The ordinary emitter and worker
+codecs share one QBE representation module, including exact narrow loads,
+stores, alignment, symbols, and binary16 memory encoding.
+
+Repeated waits decode fresh values from the cached frame. `wait_all` joins
+every distinct process, then decodes in input order or reports the first input
+failure after all joins. Function-scope group finish cancels and reaps every
+unobserved child before source cleanup; nested workers form independent groups
+inside their own copied domains. Source traps publish their message as
+`task.trapped`, explicit cancellation becomes `task.cancelled`, and host
+allocation/transport exhaustion becomes `task.resource_exhausted`.
 
 Two consequences for the design record:
 
@@ -584,7 +649,10 @@ Two consequences for the design record:
   locals, externs to imports; it legalizes checked arithmetic. Its host
   contract is WASI preview 1 — `luce_rt_write` becomes `fd_write`, an
   entry gains `_start` and `proc_exit` — so a module runs under any wasm
-  runtime with no bespoke host.
+  runtime with no bespoke host. Frozen snapshots remain ordinary canonical
+  handles and encode normally. Isolated tasks are rejected explicitly at this
+  backend boundary because WASI preview 1 provides no worker-domain primitive;
+  MIR is not weakened or specialized to accommodate that target.
 - **QBE native** links C externs and the current compiled `libluce_rt` through the host
   toolchain. Luce-native backends begin only after the language and runtime
   baseline is complete, and must prove the same canonical MIR against QBE.

@@ -61,6 +61,14 @@ pub struct MirSignature:
     pub let is_fallible: bool
     pub let returns_never: bool
 
+## A task's successful result is part of the handle's canonical type. Unit and
+## never both have no value representation, but they are not interchangeable:
+## a unit worker can complete successfully while a never worker cannot.
+pub union MirTaskResult:
+    Unit
+    Never
+    Value(value_type: TypeId)
+
 ## Target-neutral storage types. Scalars, abstract pointers, and typed
 ## reference handles live in registers; aggregates live in memory. Backends
 ## compute byte layout and legalize a `List` handle to their pointer shape.
@@ -68,6 +76,10 @@ pub union MirType:
     Int(bits: i64, is_signed: bool)
     Float(bits: i64)
     Bool
+    ## Zero-size, uninhabited element marker for containers such as the
+    ## successful empty result of `wait_all(list[task[never]])`. It never
+    ## occupies a register and does not represent source `unit`.
+    Uninhabited
     Ptr
     ## Opaque ownership identity for immutable string/byte storage. It is
     ## pointer-shaped only after backend legalization and is never address
@@ -78,14 +90,31 @@ pub union MirType:
     ## cannot be used as address authority or confused with a frozen owner.
     BufferBuilder
     List(element: TypeId)
+    ## Immutable collection snapshots are distinct semantic handles. They
+    ## permit read-only traversal and structural equality/hash, but no
+    ## identity comparison or shape mutation.
+    FrozenList(element: TypeId)
     ## Opaque insertion-ordered hash collection identities. Probing and
     ## physical tables begin in the sealed runtime/backend boundary.
     Map(key: TypeId, value: TypeId)
     Set(element: TypeId)
+    FrozenMap(key: TypeId, value: TypeId)
+    FrozenSet(element: TypeId)
     Slice(element: TypeId)
     ## Opaque callback-scoped mutable sequence view. It is register-shaped
     ## but prohibited from every storage/result boundary by the verifier.
     MutableSlice(element: TypeId)
+    ## A locally scoped handle into one invocation's structured task group.
+    ## The handle itself is non-owning; the group keeps every child record
+    ## alive until `TaskGroupFinish`.
+    ## Every task may also report the language's canonical Error value for a
+    ## worker failure, trap, or cancellation. Retaining that structural type
+    ## is necessary when a backend copies failure data between isolated
+    ## domains; a raw caller-owned pointer carries no such information.
+    Task(result: MirTaskResult, failure_type: TypeId)
+    ## Compiler-internal owner for children spawned by one invocation. Source
+    ## types and signatures can never name this handle.
+    TaskGroup
     ## An owning, non-null identity handle. Its payload schema lives in the
     ## program's class table; only a backend chooses the handle's pointer shape.
     Class(identity: ClassId)
@@ -189,6 +218,10 @@ pub func mir_types_match(left: MirType, right: MirType) -> bool:
             match right:
                 Bool: return true
                 else: return false
+        Uninhabited:
+            match right:
+                Uninhabited: return true
+                else: return false
         Ptr:
             match right:
                 Ptr: return true
@@ -205,6 +238,10 @@ pub func mir_types_match(left: MirType, right: MirType) -> bool:
             match right:
                 List(other_element): return element.value == other_element.value
                 else: return false
+        FrozenList(element):
+            match right:
+                FrozenList(other_element): return element.value == other_element.value
+                else: return false
         Map(key, value):
             match right:
                 Map(other_key, other_value): return key.value == other_key.value and value.value == other_value.value
@@ -213,6 +250,14 @@ pub func mir_types_match(left: MirType, right: MirType) -> bool:
             match right:
                 Set(other_element): return element.value == other_element.value
                 else: return false
+        FrozenMap(key, value):
+            match right:
+                FrozenMap(other_key, other_value): return key.value == other_key.value and value.value == other_value.value
+                else: return false
+        FrozenSet(element):
+            match right:
+                FrozenSet(other_element): return element.value == other_element.value
+                else: return false
         Slice(element):
             match right:
                 Slice(other_element): return element.value == other_element.value
@@ -220,6 +265,14 @@ pub func mir_types_match(left: MirType, right: MirType) -> bool:
         MutableSlice(element):
             match right:
                 MutableSlice(other_element): return element.value == other_element.value
+                else: return false
+        Task(result, failure_type):
+            match right:
+                Task(other_result, other_failure): return task_results_match(result, other_result) and failure_type.value == other_failure.value
+                else: return false
+        TaskGroup:
+            match right:
+                TaskGroup: return true
                 else: return false
         Class(identity):
             match right:
@@ -260,6 +313,21 @@ pub func mir_types_match(left: MirType, right: MirType) -> bool:
         Func(signature):
             match right:
                 Func(other_signature): return signatures_match(signature, other_signature)
+                else: return false
+
+func task_results_match(left: MirTaskResult, right: MirTaskResult) -> bool:
+    match left:
+        Unit:
+            match right:
+                Unit: return true
+                else: return false
+        Never:
+            match right:
+                Never: return true
+                else: return false
+        Value(value_type):
+            match right:
+                Value(other_type): return value_type.value == other_type.value
                 else: return false
 
 pub func signatures_match(left: MirSignature, right: MirSignature) -> bool:
@@ -319,10 +387,15 @@ pub func is_reference_type(types: MirTypeTable, id: TypeId) -> bool:
         BufferOwner: return true
         BufferBuilder: return true
         List(element): return true
+        FrozenList(element): return true
         Map(key, value): return true
         Set(element): return true
+        FrozenMap(key, value): return true
+        FrozenSet(element): return true
         Slice(element): return true
         MutableSlice(element): return true
+        Task(result, failure_type): return true
+        TaskGroup: return true
         Class(identity): return true
         WeakClass(identity): return true
         Interface(identity): return true
@@ -348,6 +421,22 @@ pub func is_aggregate_type(types: MirTypeTable, id: TypeId) -> bool:
         Array(element, count): return true
         Enum(tag, cases): return true
         Func(signature): return true
+        else: return false
+
+## True only for the canonical `{owner, data, length}` representation shared
+## by immutable strings and bytes. Consumers ask this semantic question here
+## instead of independently recognizing one structural runtime protocol.
+pub func is_buffer_value_type(types: MirTypeTable, id: TypeId) -> bool:
+    match mir_type(types, id):
+        Struct(fields):
+            if len(fields) != 3: return false
+            match mir_type(types, fields[0].value_type):
+                BufferOwner: pass
+                else: return false
+            match mir_type(types, fields[1].value_type):
+                Ptr: pass
+                else: return false
+            return fields[2].value_type.value == builtin_mir_type(BuiltinMirType.unsigned_u64).value
         else: return false
 
 pub func is_numeric_mir_type(types: MirTypeTable, id: TypeId) -> bool:
@@ -413,14 +502,24 @@ func describe_mir_type_on_path(types: MirTypeTable, id: TypeId, path: list[bool]
             return "u" + str(bits)
         Float(bits): return "f" + str(bits)
         Bool: return "bool"
+        Uninhabited: return "never"
         Ptr: return "ptr"
         BufferOwner: return "buffer-owner"
         BufferBuilder: return "buffer-builder"
         List(element): return "list[" + describe_mir_type_on_path(types, element, nested) + "]"
+        FrozenList(element): return "frozen-list[" + describe_mir_type_on_path(types, element, nested) + "]"
         Map(key, value): return "map[" + describe_mir_type_on_path(types, key, nested) + ", " + describe_mir_type_on_path(types, value, nested) + "]"
         Set(element): return "set[" + describe_mir_type_on_path(types, element, nested) + "]"
+        FrozenMap(key, value): return "frozen-map[" + describe_mir_type_on_path(types, key, nested) + ", " + describe_mir_type_on_path(types, value, nested) + "]"
+        FrozenSet(element): return "frozen-set[" + describe_mir_type_on_path(types, element, nested) + "]"
         Slice(element): return "slice[" + describe_mir_type_on_path(types, element, nested) + "]"
         MutableSlice(element): return "mutable-slice[" + describe_mir_type_on_path(types, element, nested) + "]"
+        Task(result, failure_type):
+            match result:
+                Unit: return "task[unit]"
+                Never: return "task[never]"
+                Value(value_type): return "task[" + describe_mir_type_on_path(types, value_type, nested) + "]"
+        TaskGroup: return "task-group"
         Class(identity): return "class#" + str(identity.value)
         WeakClass(identity): return "weak-class#" + str(identity.value)
         Interface(identity): return "interface#" + str(identity.value)
@@ -489,18 +588,46 @@ pub func registers_of(function: MirFunction, run: RegisterRun) -> list[RegisterI
     for index in range(0, i64(run.count)): registers.append(register_at(function, run, index))
     return registers
 
+## One value copied into an isolated worker domain. `value_type` preserves the
+## source value shape after ordinary call lowering has represented an
+## aggregate argument by address. Without it, a backend could see only `Ptr`
+## and could neither prove nor perform the required structural copy.
+pub struct MirTransfer:
+    pub let value: RegisterId
+    pub let value_type: TypeId
+
+## A contiguous run in `MirFunction.transfers`. Task spawn is the only current
+## consumer; keeping the side table function-local preserves fixed-size
+## instructions and makes register ownership unambiguous.
+pub struct TransferRun:
+    pub let start: u32
+    pub let count: u32
+
+pub func transfer_at(function: MirFunction, run: TransferRun, index: i64) -> MirTransfer:
+    return function.transfers[i64(run.start) + index]
+
 ## Collects a function's operand table while its body is built: `run`
-## appends the registers and returns where they landed.
+## appends the registers and returns where they landed. Typed worker transfers
+## have their own parallel arena because aggregate call operands are pointers.
 pub class OperandBuilder:
     pub let operands: list[u32]
+    pub let transfers: list[MirTransfer]
 
     pub init():
         self.operands = list[u32]()
+        self.transfers = list[MirTransfer]()
 
     pub func run(registers: list[RegisterId]) -> RegisterRun:
         let start = len(self.operands)
         for register in registers: self.operands.append(register.value)
         return RegisterRun(start = u32(start), count = u32(len(registers)))
+
+    pub func transfer_run(values: list[RegisterId], value_types: list[TypeId]) -> TransferRun:
+        if len(values) != len(value_types): trap("MIR transfer values and types have different lengths")
+        let start = len(self.transfers)
+        for index in range(0, len(values)):
+            self.transfers.append(MirTransfer(value = values[index], value_type = value_types[index]))
+        return TransferRun(start = u32(start), count = u32(len(values)))
 
 pub struct FunctionId:
     pub let value: u32
@@ -728,6 +855,10 @@ pub union InstructionForm:
     ListMutableElementAddress(result: RegisterId, value: RegisterId, index: RegisterId, element_retain: FunctionId)
     ## Capture one immutable half-open list snapshot after checked bounds.
     ListSlice(result: RegisterId, value: RegisterId, start: RegisterId, end: RegisterId)
+    ## Snapshot one mutable list into a distinct immutable identity. Elements
+    ## are copied in order and the exact helper retains immutable references
+    ## nested in each copied value; no mutable collection can be sendable.
+    ListSnapshot(result: RegisterId, value: RegisterId, element_retain: FunctionId)
     ## Immutable strings and bytes carry `{owner, data, byte_length}`. Static
     ## data has a null inert owner; dynamically produced data names one sealed
     ## runtime owner.
@@ -762,6 +893,25 @@ pub union InstructionForm:
     SliceRelease(value: RegisterId, element_release: FunctionId)
     SliceLength(result: RegisterId, value: RegisterId)
     SliceElementAddress(result: RegisterId, value: RegisterId, index: RegisterId)
+    ## Snapshot an insertion-ordered map or set into its immutable counterpart.
+    ## The frozen type preserves map-versus-set and exact key/value structure.
+    HashSnapshot(result: RegisterId, value: RegisterId, key_retain: FunctionId, value_retain: FunctionId)
+    ## One invocation-owned structured group. Task handles remain non-owning;
+    ## every ordinary function exit finishes the group before function-scope
+    ## resources are released.
+    TaskGroupCreate(result: RegisterId)
+    TaskGroupFinish(group: RegisterId)
+    ## Begin one exact named Luce function in the group's isolated domain.
+    ## Arguments are already evaluated in source order and copied immediately.
+    TaskSpawn(result: RegisterId, group: RegisterId, function: FunctionId, arguments: TransferRun)
+    ## Observe one task. Scalar success defines `result`; aggregate success is
+    ## copied into `destination`; unit/never use neither. `failure` is null on
+    ## success or names the copied Error in caller-owned `error_destination`.
+    TaskWait(result: RegisterId, destination: RegisterId, failure: RegisterId, error_destination: RegisterId, task: RegisterId)
+    ## Observe every handle in one `List(Task(T))`, preserving order and first
+    ## failure after joining all distinct children. Success creates `List(T)`.
+    TaskWaitAll(result: RegisterId, failure: RegisterId, error_destination: RegisterId, tasks: RegisterId)
+    TaskCancel(task: RegisterId)
     ## Allocate one uninitialized identity. The class table supplies its
     ## payload schema and exact destroyer; the backend supplies only layout.
     ClassCreate(result: RegisterId, identity: ClassId)
@@ -863,6 +1013,8 @@ pub struct MirFunction:
     pub let body: list[MirInstruction]
     ## The register runs the body's instructions name (see `RegisterRun`).
     pub let operands: list[u32]
+    ## Typed worker-domain copies named by `TransferRun`.
+    pub let transfers: list[MirTransfer]
     ## Source-package API visibility. Backends may expose a package API in
     ## their artifact model, but this is not itself a native ABI export.
     pub let is_public: bool

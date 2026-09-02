@@ -17,7 +17,7 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.backends.hir_resources import collect_hir_class_references
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, InterfaceStorage, ListBuffer, ListStorage, MutableSliceStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, FrozenHashEntry, FrozenHashStorage, FrozenListStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, HirTaskOutcome, HirTaskStorage, InterfaceStorage, ListBuffer, ListStorage, MutableSliceStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
 from compiler.hir.ir import HirCFunction, HirCFunctionIdentity, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_module, node_span, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
@@ -94,6 +94,14 @@ union HashEvaluation:
 union PlaceEvaluation:
     EvaluatedPlace(place: Place, value: Value)
     TransferredPlace(execution: Execution)
+
+## One invocation-owned set of children. Handles may be copied freely inside
+## the invocation, but only this group decides exit-time cancellation/join.
+class HirTaskGroup:
+    pub let children: list[HirTaskStorage]
+
+    pub init():
+        self.children = list[HirTaskStorage]()
 
 ## One weak observation of an allocated source class. The observation cannot
 ## keep its target alive and therefore does not perturb the ARC result it
@@ -249,7 +257,11 @@ class HirInterpreterRun: ClassFinalizer:
     ## distinct from C-owned globals supplied by `external_variable_host`.
     let globals: list[Value]
     let class_observations: list[HirClassObservation]?
+    ## Active synchronous call groups, outermost first. A worker itself gets
+    ## a fresh HirInterpreterRun and therefore an isolated global/task domain.
+    let task_groups: list[HirTaskGroup]
     var next_allocation_id: i64
+    var next_task_identity: u64
     var depth: i64
 
     # Retain the immutable semantic program used for all calls in this run.
@@ -264,7 +276,9 @@ class HirInterpreterRun: ClassFinalizer:
         var observations: list[HirClassObservation]? = none
         if collects_resources: observations = list[HirClassObservation]()
         self.class_observations = observations
+        self.task_groups = list[HirTaskGroup]()
         self.next_allocation_id = 0
+        self.next_task_identity = u64(0)
         self.depth = 0
 
     ## Host ARC reaches this callback exactly when an interpreted class loses
@@ -400,11 +414,15 @@ class HirInterpreterRun: ClassFinalizer:
             bindings.append(Binding(symbol = function.parameters[index].symbol, value = self.initial_binding(function.parameters[index].symbol, arguments[index])))
             index += 1
 
+        let task_group = HirTaskGroup()
+        self.task_groups.append(task_group)
         self.depth += 1
-        let outcome = self.execute_scope(function_body(function), bindings) catch reason:
+        let outcome = self.execute_scope_with_task_group(function_body(function), bindings, task_group) catch reason:
             self.depth -= 1
+            self.task_groups.remove(len(self.task_groups) - 1)
             error(reason)
         self.depth -= 1
+        self.task_groups.remove(len(self.task_groups) - 1)
         var receiver = Value.Unit
         if len(bindings) > 0: receiver = bindings[0].value
         match outcome:
@@ -822,6 +840,11 @@ class HirInterpreterRun: ClassFinalizer:
     # A suite is one lexical scope: bindings made inside it are trimmed away
     # however the suite exits.
     func execute_scope(statements: Operands, bindings: list[Binding]) -> Execution!:
+        return try self.execute_scope_with_task_group(statements, bindings, none)
+
+    # A function scope finishes its structured group before its own deferred
+    # suffix. Nested lexical scopes pass no group and retain ordinary cleanup.
+    func execute_scope_with_task_group(statements: Operands, bindings: list[Binding], task_group: HirTaskGroup?) -> Execution!:
         let outer_count = len(bindings)
         let deferred = list[NodeId]()
         for position in range(0, i64(statements.count)):
@@ -835,9 +858,11 @@ class HirInterpreterRun: ClassFinalizer:
             match result:
                 Next: continue
                 else:
+                    if task_group != none: self.finish_task_group(task_group)
                     try self.execute_deferred(deferred, bindings)
                     trim_bindings(bindings, outer_count)
                     return result
+        if task_group != none: self.finish_task_group(task_group)
         try self.execute_deferred(deferred, bindings)
         trim_bindings(bindings, outer_count)
         return Execution.Next
@@ -1097,6 +1122,12 @@ class HirInterpreterRun: ClassFinalizer:
             List(element): return try self.execute_list_for(symbol, value, body, bindings)
             Map(key, element): return try self.execute_hash_for(symbol, value, true, body, bindings)
             Set(element): return try self.execute_hash_for(symbol, value, false, body, bindings)
+            FrozenList(element):
+                match value:
+                    FrozenList(storage): return try self.execute_immutable_for(symbol, storage.elements, body, bindings)
+                    else: trap("typed frozen-list iteration received the wrong value")
+            FrozenMap(key, element): return try self.execute_frozen_hash_for(symbol, value, true, body, bindings)
+            FrozenSet(element): return try self.execute_frozen_hash_for(symbol, value, false, body, bindings)
             String: return try self.execute_string_for(symbol, value, body, bindings)
             else: trap("typed `for` received a non-iterable value")
 
@@ -1291,6 +1322,38 @@ class HirInterpreterRun: ClassFinalizer:
         storage.active_iterations -= 1
         return outcome
 
+    # Frozen collections expose no identity-wide mutation barrier. Iteration
+    # therefore needs only the ordinary lexical binding/control transaction;
+    # the immutable storage may be shared safely inside this worker domain.
+    func execute_immutable_for(symbol: SymbolId, elements: list[BoxedValue], body: Operands, bindings: list[Binding]) -> Execution!:
+        let outer_count = len(bindings)
+        for element in elements:
+            bindings.append(Binding(symbol = symbol, value = element.value))
+            let outcome = self.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return Execution.Next
+                Returned(value): return Execution.Returned(value = value)
+                Raised(error_value): return Execution.Raised(error_value = error_value)
+                Recovered(value): return Execution.Recovered(value = value)
+                else: pass
+        return Execution.Next
+
+    func execute_frozen_hash_for(symbol: SymbolId, iterated: Value, is_map: bool, body: Operands, bindings: list[Binding]) -> Execution!:
+        var storage: FrozenHashStorage? = none
+        match iterated:
+            FrozenMap(value):
+                if is_map: storage = value
+            FrozenSet(value):
+                if not is_map: storage = value
+            else: pass
+        let collection = storage else trap("typed frozen hash-collection iteration received the wrong value")
+        let keys = list[BoxedValue]()
+        for entry in collection.entries: keys.append(entry.key)
+        return try self.execute_immutable_for(symbol, keys, body, bindings)
+
     func execute_match(subject: NodeId, arms: Operands, bindings: list[Binding]) -> Execution!:
         let evaluated = try self.evaluate(subject, bindings)
         var selected = Value.Unit
@@ -1387,6 +1450,9 @@ class HirInterpreterRun: ClassFinalizer:
                             List(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.buffer.elements))))
                             Map(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
                             Set(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
+                            FrozenList(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.elements))))
+                            FrozenMap(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
+                            FrozenSet(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.entries))))
                             Slice(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(storage.length)))
                             MutableSlice(storage): return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(len(storage.list.buffer.elements))))
                             else: trap("typed sequence length has a non-sequence value")
@@ -1411,6 +1477,9 @@ class HirInterpreterRun: ClassFinalizer:
                                     List(storage):
                                         if position >= u64(len(storage.buffer.elements)): error("interpreter: index out of bounds")
                                         return Evaluation.Evaluated(value = storage.buffer.elements[position].value)
+                                    FrozenList(storage):
+                                        if position >= u64(len(storage.elements)): error("interpreter: index out of bounds")
+                                        return Evaluation.Evaluated(value = storage.elements[position].value)
                                     Slice(storage):
                                         if position >= u64(storage.length): error("interpreter: index out of bounds")
                                         match storage.backing:
@@ -1468,6 +1537,7 @@ class HirInterpreterRun: ClassFinalizer:
                         ]))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Call(function, arguments): return try self.evaluate_call(function, arguments, bindings)
+            Spawn(function, arguments): return try self.evaluate_spawn(function, arguments, bindings)
             InterfaceValue(value, conformance):
                 match try self.evaluate(value, bindings):
                     Evaluated(item): return Evaluation.Evaluated(value = Value.Interface(storage = InterfaceStorage(conformance, item)))
@@ -1557,6 +1627,23 @@ class HirInterpreterRun: ClassFinalizer:
                             else: trap("typed `try` received a non-fallible HIR value")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Catch(value, failure, body): return try self.evaluate_catch(value, failure, body, bindings)
+            TaskWait(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Task(storage): return Evaluation.Evaluated(value = try self.wait_task(storage))
+                            else: trap("typed task wait has a non-task value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TaskCancel(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Task(storage):
+                                self.cancel_task(storage)
+                                return Evaluation.Evaluated(value = Value.Unit)
+                            else: trap("typed task cancellation has a non-task value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TaskWaitAll(tasks): return try self.evaluate_wait_all(tasks, bindings)
             StructValue(struct_index, fields):
                 let field_count = len(nominal_fields(self.program, node_type(self.program, expression)))
                 match try self.evaluate_placed_run(fields, field_count, bindings):
@@ -1627,6 +1714,10 @@ class HirInterpreterRun: ClassFinalizer:
                         for element in storage.buffer.elements: elements.append(element)
                         return Evaluation.Evaluated(value = Value.List(storage = ListStorage(elements)))
                     TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            CollectionSnapshot(value):
+                match try self.evaluate(value, bindings):
+                    Evaluated(item): return Evaluation.Evaluated(value = try snapshot_collection(item))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
             ListWithMutableSlice(value, callback):
                 let selected_list = try self.evaluate_list(value, bindings)
                 var storage: ListStorage? = none
@@ -1746,17 +1837,24 @@ class HirInterpreterRun: ClassFinalizer:
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             MapLookup(value, key):
                 let receiver = try self.evaluate(value, bindings)
-                var storage: HashStorage? = none
+                var mutable_storage: HashStorage? = none
+                var frozen_storage: FrozenHashStorage? = none
                 match receiver:
                     Evaluated(item):
                         match item:
-                            Map(found): storage = found
+                            Map(found): mutable_storage = found
+                            FrozenMap(found): frozen_storage = found
                             else: trap("typed map lookup has a non-map receiver")
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
                 match try self.evaluate(key, bindings):
                     Evaluated(item):
-                        let found = storage else trap("map lookup lost its storage")
-                        let selected = try find_hash_entry(found, item)
+                        if mutable_storage != none:
+                            let found = mutable_storage
+                            let selected = try find_hash_entry(found, item)
+                            if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                            return Evaluation.Evaluated(value = Value.Present(value = found.entries[selected].value))
+                        let found = frozen_storage else trap("map lookup lost its storage")
+                        let selected = try find_frozen_hash_entry(found, item)
                         if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
                         return Evaluation.Evaluated(value = Value.Present(value = found.entries[selected].value))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
@@ -1773,7 +1871,7 @@ class HirInterpreterRun: ClassFinalizer:
             MapRemove(value, key): return try self.evaluate_map_remove(value, key, bindings)
             MapClear(value): return try self.evaluate_hash_clear(value, true, bindings)
             MapReserve(value, minimum_capacity): return try self.evaluate_hash_reserve(value, true, minimum_capacity, bindings)
-            SetContains(value, element): return try self.evaluate_set_membership(value, element, 0, bindings)
+            SetContains(value, element): return try self.evaluate_set_contains(value, element, bindings)
             SetInsert(value, element): return try self.evaluate_set_membership(value, element, 1, bindings)
             SetRemove(value, element): return try self.evaluate_set_membership(value, element, 2, bindings)
             SetClear(value): return try self.evaluate_hash_clear(value, false, bindings)
@@ -1929,6 +2027,23 @@ class HirInterpreterRun: ClassFinalizer:
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             TransferredHash(execution): return Evaluation.Transferred(execution = execution)
 
+    # `contains` is the one hash-set operation shared by mutable and frozen
+    # values. Mutation keeps using evaluate_set_membership, whose receiver
+    # assertion deliberately admits only mutable Set storage.
+    func evaluate_set_contains(value: NodeId, element: NodeId, bindings: list[Binding]) -> Evaluation!:
+        let receiver = try self.evaluate(value, bindings)
+        var selected = Value.Unit
+        match receiver:
+            Evaluated(item): selected = item
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+        match try self.evaluate(element, bindings):
+            Evaluated(item):
+                match selected:
+                    Set(storage): return Evaluation.Evaluated(value = Value.Boolean(value = try find_hash_entry(storage, item) >= 0))
+                    FrozenSet(storage): return Evaluation.Evaluated(value = Value.Boolean(value = try find_frozen_hash_entry(storage, item) >= 0))
+                    else: trap("typed set membership has a non-set receiver")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
     func evaluate_sequence_slice(value: NodeId, start: NodeId, end: NodeId, bindings: list[Binding]) -> Evaluation!:
         match try self.evaluate(value, bindings):
             Evaluated(sequence):
@@ -1974,6 +2089,110 @@ class HirInterpreterRun: ClassFinalizer:
                     Bytes(payload): backing = SliceBacking.Bytes(value = payload)
                     else: trap("typed slice operation has a non-contiguous receiver")
                 return Evaluation.Evaluated(value = Value.Slice(storage = SliceStorage(backing, offset, upper - lower)))
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    # mark: Structured task lifetimes ==========================================================
+
+    # Evaluate the existing declaration-placed argument run, copy the values
+    # into a fresh worker domain, and register exactly one group-owned child.
+    # Scheduling is deliberately deterministic in the semantic oracle: a
+    # pending child starts when first joined. Queuing it here still makes the
+    # task immediately live and lets cancellation win before that safe point.
+    func evaluate_spawn(function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
+        let target = self.find_function(function)
+        let values = list[Value]()
+        for parameter in target.parameters: values.append(Value.Unit)
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            match try self.evaluate(argument, bindings):
+                Evaluated(item): values[parameter_index] = try copy_sendable_value(item)
+                Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+        if len(self.task_groups) == 0: trap("spawn executed outside a function task group")
+        let copied = list[BoxedValue]()
+        for value in values: copied.append(BoxedValue(value = value))
+        let storage = HirTaskStorage(self.next_task_identity, function, copied)
+        self.next_task_identity += u64(1)
+        self.task_groups[len(self.task_groups) - 1].children.append(storage)
+        return Evaluation.Evaluated(value = Value.Task(storage = storage))
+
+    # Execute a pending child once in an isolated interpreter domain. Program
+    # metadata and explicit host capabilities are immutable inputs; globals,
+    # call frames, class storage, task groups, and allocation identities are
+    # fresh. The completed remote value stays cached until each wait copies it.
+    func start_task(storage: HirTaskStorage):
+        if storage.outcome != none: return
+        let worker = HirInterpreterRun(
+            self.program,
+            self.external_host,
+            self.external_variable_host,
+            self.c_function_pointer_host,
+            false,
+        )
+        let arguments = list[Value]()
+        for argument in storage.arguments: arguments.append(argument.value)
+        let result = worker.invoke(worker.find_function(storage.function), arguments) catch reason:
+            storage.outcome = HirTaskOutcome.Trapped(message = reason)
+            return
+        match result:
+            FallibleSuccess(value): storage.outcome = HirTaskOutcome.Succeeded(value = BoxedValue(value = value.value))
+            FallibleFailure(error_value): storage.outcome = HirTaskOutcome.Failed(error_value = BoxedValue(value = error_value.value))
+            else: storage.outcome = HirTaskOutcome.Succeeded(value = BoxedValue(value = result))
+
+    # Return one fresh local-domain copy of the cached result. The compiler
+    # has already proven both successful results and Error are sendable.
+    func wait_task(storage: HirTaskStorage) -> Value!:
+        self.start_task(storage)
+        let outcome = storage.outcome else trap("joined task has no terminal outcome")
+        match outcome:
+            Succeeded(value):
+                return Value.FallibleSuccess(value = BoxedValue(value = try copy_sendable_value(value.value)))
+            Failed(error_value):
+                return Value.FallibleFailure(error_value = BoxedValue(value = try copy_sendable_value(error_value.value)))
+            Trapped(message):
+                return Value.FallibleFailure(error_value = BoxedValue(value = task_runtime_error(1, message)))
+            Cancelled:
+                return Value.FallibleFailure(error_value = BoxedValue(value = task_runtime_error(2, "task cancelled")))
+
+    # Cancellation is idempotent. A deterministic pending child has not yet
+    # crossed its first join safe point; completed outcomes remain unchanged.
+    func cancel_task(storage: HirTaskStorage):
+        if storage.outcome == none: storage.outcome = HirTaskOutcome.Cancelled
+
+    # Function exit requests cancellation for every unfinished child and
+    # joins the group before function-scope deferred cleanup begins. Waiting
+    # on an already completed child is unnecessary: its cached storage is
+    # retained by the group until this method returns.
+    func finish_task_group(group: HirTaskGroup):
+        for child in group.children:
+            if child.outcome == none: child.outcome = HirTaskOutcome.Cancelled
+
+    # Observe every child even after a failure, preserving source list order.
+    # Calling wait_task again for a repeated handle only copies its cache and
+    # therefore never starts a second worker execution.
+    func evaluate_wait_all(tasks: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate(tasks, bindings):
+            Evaluated(item):
+                match item:
+                    List(storage):
+                        let values = list[BoxedValue]()
+                        var first_failure: BoxedValue? = none
+                        for element in storage.buffer.elements:
+                            let task = element.value
+                            match task:
+                                Task(child):
+                                    match try self.wait_task(child):
+                                        FallibleSuccess(value): values.append(BoxedValue(value = value.value))
+                                        FallibleFailure(error_value):
+                                            if first_failure == none:
+                                                first_failure = BoxedValue(value = error_value.value)
+                                        else: trap("task wait produced a non-fallible result")
+                                else: trap("typed wait_all list contains a non-task value")
+                        if first_failure != none:
+                            return Evaluation.Evaluated(value = Value.FallibleFailure(error_value = first_failure))
+                        return Evaluation.Evaluated(value = Value.FallibleSuccess(value = BoxedValue(value = Value.List(storage = ListStorage(values)))))
+                    else: trap("typed wait_all has a non-list value")
             Transferred(execution): return Evaluation.Transferred(execution = execution)
 
     func evaluate_call(function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
@@ -2500,6 +2719,129 @@ func find_binding(bindings: list[Binding], symbol: SymbolId) -> i64:
         index -= 1
     return -1
 
+# mark: Worker-domain transfer =================================================================
+
+# Snapshot is an explicit graph-copy boundary even before a value crosses a
+# worker. Mutable identities never become the backing of frozen values, so a
+# later source mutation cannot affect the snapshot. The sendability checker
+# has already proved every recursively copied member belongs to the closed
+# value vocabulary accepted by copy_sendable_value.
+func snapshot_collection(value: Value) -> Value!:
+    match value:
+        List(storage):
+            let copied = list[BoxedValue]()
+            for element in storage.buffer.elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.FrozenList(storage = FrozenListStorage(copied))
+        Map(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = try copy_sendable_value(entry.value.value)),
+                ))
+            return Value.FrozenMap(storage = FrozenHashStorage(copied))
+        Set(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = Value.Unit),
+                ))
+            return Value.FrozenSet(storage = FrozenHashStorage(copied))
+        else: trap("typed collection snapshot has a non-collection value")
+
+# Copy precisely the closed sendable runtime vocabulary. HIR type checking
+# has already derived this property structurally; keeping the oracle copier
+# exhaustive makes a checker/runtime disagreement fail loudly instead of
+# sharing mutable host storage across supposedly isolated domains.
+func copy_sendable_value(value: Value) -> Value!:
+    match value:
+        Unit: return Value.Unit
+        Boolean(item): return Value.Boolean(value = item)
+        SignedInteger(item): return Value.SignedInteger(value = item)
+        UnsignedInteger(item): return Value.UnsignedInteger(value = item)
+        Floating(item): return Value.Floating(value = item)
+        Character(item): return Value.Character(value = item)
+        Text(item): return Value.Text(value = item)
+        Bytes(item):
+            let copied = list[u8]()
+            for byte in item: copied.append(byte)
+            return Value.Bytes(value = copied)
+        TextSlice(items):
+            let copied = list[str]()
+            for item in items: copied.append(item)
+            return Value.TextSlice(items = copied)
+        Tuple(elements):
+            let copied = list[BoxedValue]()
+            for element in elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.Tuple(elements = copied)
+        Array(elements):
+            let copied = list[BoxedValue]()
+            for element in elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.Array(elements = copied)
+        FrozenList(storage):
+            let copied = list[BoxedValue]()
+            for element in storage.elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.FrozenList(storage = FrozenListStorage(copied))
+        FrozenMap(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = try copy_sendable_value(entry.value.value)),
+                ))
+            return Value.FrozenMap(storage = FrozenHashStorage(copied))
+        FrozenSet(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = Value.Unit),
+                ))
+            return Value.FrozenSet(storage = FrozenHashStorage(copied))
+        Slice(storage):
+            let copied = list[BoxedValue]()
+            match storage.backing:
+                List(buffer):
+                    for offset in range(0, storage.length):
+                        copied.append(BoxedValue(value = try copy_sendable_value(buffer.elements[storage.start + offset].value)))
+                    return Value.Slice(storage = SliceStorage(SliceBacking.List(buffer = ListBuffer(copied)), 0, storage.length))
+                Bytes(source_bytes):
+                    let payload = list[u8]()
+                    for offset in range(0, storage.length): payload.append(source_bytes[storage.start + offset])
+                    return Value.Slice(storage = SliceStorage(SliceBacking.Bytes(value = payload), 0, storage.length))
+        Record(fields):
+            let copied = list[BoxedValue]()
+            for field in fields:
+                copied.append(BoxedValue(value = try copy_sendable_value(field.value)))
+            return Value.Record(fields = copied)
+        Variant(case_index, payload):
+            let copied = list[BoxedValue]()
+            for field in payload:
+                copied.append(BoxedValue(value = try copy_sendable_value(field.value)))
+            return Value.Variant(case_index = case_index, payload = copied)
+        Absent: return Value.Absent
+        Present(item): return Value.Present(value = BoxedValue(value = try copy_sendable_value(item.value)))
+        else: trap("HIR sendability proof admitted a mutable or domain-bound runtime value")
+
+# The compiler-owned task error domain is independent of the application
+# package identity. Values 1 and 2 are `task.trapped` and `task.cancelled`;
+# value 3 is reserved for `task.resource_exhausted` once resource failures
+# carry a typed internal reason rather than an interpreter diagnostic string.
+func task_runtime_error(code: u64, message: str) -> Value:
+    let error_code = Value.Record(fields = [
+        BoxedValue(value = Value.Text(value = "luce.task")),
+        BoxedValue(value = Value.UnsignedInteger(value = code)),
+    ])
+    return Value.Record(fields = [
+        BoxedValue(value = error_code),
+        BoxedValue(value = Value.Text(value = message)),
+    ])
+
 # mark: Operators =============================================================================
 
 # Extract the bool proven by HIR typing, trapping only on a compiler defect.
@@ -2611,6 +2953,10 @@ func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, type
         Closure(storage): trap("closure values have no binary operations")
         Interface(storage): trap("interface values have no binary operations")
         CFunction(identity): trap("cfunc values have no binary operations")
+        Task(storage): trap("task handles have no binary operations")
+        FrozenList(storage): trap("frozen lists have no non-structural binary operations")
+        FrozenMap(storage): trap("frozen maps have no non-structural binary operations")
+        FrozenSet(storage): trap("frozen sets have no non-structural binary operations")
         Record(left_fields):
             match right:
                 Record(right_fields): return try evaluate_tuple_binary(left_fields, operation, right_fields, types)
@@ -3002,6 +3348,11 @@ func find_hash_entry(storage: HashStorage, key: Value) -> i64!:
         if try values_equal(storage.entries[index].key.value, key, EqualityContext()): return index
     return -1
 
+func find_frozen_hash_entry(storage: FrozenHashStorage, key: Value) -> i64!:
+    for index in range(0, len(storage.entries)):
+        if try values_equal(storage.entries[index].key.value, key, EqualityContext()): return index
+    return -1
+
 func values_equal(left: Value, right: Value, context: EqualityContext) -> bool!:
     match left:
         Unit:
@@ -3094,6 +3445,30 @@ func values_equal(left: Value, right: Value, context: EqualityContext) -> bool!:
                         if try find_hash_entry(other, entry.key.value) < 0: return false
                     return true
                 else: return false
+        FrozenList(storage):
+            match right:
+                FrozenList(other): return try boxed_values_equal(storage.elements, other.elements, context)
+                else: return false
+        FrozenMap(storage):
+            match right:
+                FrozenMap(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        let found = try find_frozen_hash_entry(other, entry.key.value)
+                        if found < 0: return false
+                        if not (try values_equal(entry.value.value, other.entries[found].value.value, context)): return false
+                    return true
+                else: return false
+        FrozenSet(storage):
+            match right:
+                FrozenSet(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        if try find_frozen_hash_entry(other, entry.key.value) < 0: return false
+                    return true
+                else: return false
         else: trap("non-equatable HIR value reached structural equality")
 
 func require_list_shape_mutable(storage: ListStorage) -> !:
@@ -3133,6 +3508,17 @@ func hash_values(state: u64, values: list[BoxedValue]) -> u64:
     for value in values: result = mix_structural_hash(result, structural_hash(value.value))
     return result
 
+# Map and set equality ignores insertion order, so their structural hash must
+# combine entries commutatively. Each individual map entry still distinguishes
+# key from value and the outer type-specific state distinguishes map from set.
+func hash_frozen_entries(state: u64, entries: list[FrozenHashEntry], include_values: bool) -> u64:
+    var combined = u64(0)
+    for entry in entries:
+        var item = mix_structural_hash(u64(29), structural_hash(entry.key.value))
+        if include_values: item = mix_structural_hash(item, structural_hash(entry.value.value))
+        combined = combined ^ item
+    return mix_structural_hash(mix_structural_hash(state, u64(len(entries))), combined)
+
 func structural_hash(value: Value) -> u64:
     let seed = u64(1469598103934665603)
     match value:
@@ -3162,6 +3548,9 @@ func structural_hash(value: Value) -> u64:
             return hash_values(tagged, payload)
         Absent: return mix_structural_hash(seed, u64(16))
         Present(item): return mix_structural_hash(mix_structural_hash(seed, u64(17)), structural_hash(item.value))
+        FrozenList(storage): return hash_values(mix_structural_hash(seed, u64(18)), storage.elements)
+        FrozenMap(storage): return hash_frozen_entries(mix_structural_hash(seed, u64(19)), storage.entries, true)
+        FrozenSet(storage): return hash_frozen_entries(mix_structural_hash(seed, u64(20)), storage.entries, false)
         Foreign(token): trap("foreign handles are not structurally hashable")
         TextSlice(items): trap("slices are not structurally hashable")
         List(storage): trap("mutable lists are not structurally hashable")
@@ -3173,6 +3562,7 @@ func structural_hash(value: Value) -> u64:
         Closure(storage): trap("closures are not structurally hashable")
         Interface(storage): trap("interface values are not structurally hashable")
         CFunction(identity): trap("C functions are not structurally hashable")
+        Task(storage): trap("task handles are not structurally hashable")
         Class(storage): trap("classes are not structurally hashable")
         WeakClass(storage): trap("weak handles are not structurally hashable")
         CapturedCell(storage): trap("captured cells are not structurally hashable")

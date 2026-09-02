@@ -32,12 +32,13 @@
 #==============================================================================================
 
 from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, FunctionId, InstructionForm
-from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirFunction, MirInstruction, MirProgram, MirSignature, MirType, MirTypeTable
-from compiler.mir.canonical import RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
+from compiler.mir.canonical import MirConstant, MirExtern, MirExternalGlobal, MirField, MirFunction, MirInstruction, MirProgram, MirSignature, MirType, MirTypeTable
+from compiler.mir.canonical import MirTaskResult, RegisterId, RegisterRun, no_register, no_registers, register_at, transfer_at, TypeId, UnaryOp
 from compiler.mir.canonical import bits_of, builtin_mir_type, find_mir_extern, find_mir_function, int_maximum
 from compiler.mir.canonical import int_minimum, is_bool_type, is_float_type, is_identity_type, is_int_type, is_ptr_type, is_reference_type
-from compiler.mir.canonical import is_signed_int_type, mir_type, signatures_match, uint_maximum
+from compiler.mir.canonical import is_aggregate_type, is_signed_int_type, mir_type, signatures_match, uint_maximum
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
+from compiler.backends.mir_task_runtime import MirTaskGroup, MirTaskOutcome, MirTaskStorage, MirTransferredForm, MirTransferredHashEntry, MirTransferredValue
 from compiler.frontend.source import SourceSpan
 from compiler.formatting.float_display import display_float32, display_float64
 from compiler.formatting.ieee import ieee_float_bits, normalize_ieee_float
@@ -109,6 +110,9 @@ pub let equality_context_address_base: i64 = 0x9000000
 pub let hash_address_base: i64 = 0xA000000
 ## Linear buffer builders occupy their own oracle-only opaque range.
 pub let buffer_builder_address_base: i64 = 0xB000000
+## Structured task identities and group capabilities use oracle-only ranges.
+pub let task_address_base: i64 = 0xC000000
+pub let task_group_address_base: i64 = 0xD000000
 
 # How a body finished: fell off its end, or left the function.
 union Flow:
@@ -336,6 +340,7 @@ let frame_limit: i64 = 2000
 
 pub class MirInterpreter: MirExternMemory:
     let program: MirProgram
+    let rules: LayoutRules
     let layout: TypeLayout
     var depth: i64
     let memory: list[u8]
@@ -352,6 +357,8 @@ pub class MirInterpreter: MirExternMemory:
     let classes: list[MirClassObject]
     let weak_classes: list[MirWeakClassSlot]
     let interfaces: list[MirInterfaceBox]
+    let tasks: list[MirTaskStorage]
+    let task_groups: list[MirTaskGroup]
     var next_class_allocation_id: i64
     var arena_address: i64
     var arena_committed: i64
@@ -365,6 +372,7 @@ pub class MirInterpreter: MirExternMemory:
     ## Prepare to run one program; memory is laid out on the first `run`.
     pub init(program: MirProgram, rules: LayoutRules):
         self.program = program
+        self.rules = rules
         self.layout = TypeLayout(program.types, rules)
         self.depth = 0
         self.memory = list[u8]()
@@ -381,6 +389,8 @@ pub class MirInterpreter: MirExternMemory:
         self.classes = list[MirClassObject]()
         self.weak_classes = list[MirWeakClassSlot]()
         self.interfaces = list[MirInterfaceBox]()
+        self.tasks = list[MirTaskStorage]()
+        self.task_groups = list[MirTaskGroup]()
         self.next_class_allocation_id = 0
         self.arena_address = 0
         self.arena_committed = 0
@@ -872,20 +882,11 @@ pub class MirInterpreter: MirExternMemory:
                         storage.is_alive = false
             HashCopy(result, value, key_retain, value_retain):
                 let source = try self.hash_at(frame.registers[value.value])
-                let copied = MirHash(source.key_type, source.value_type)
-                for position in range(0, len(source.keys)):
-                    copied.hashes.append(source.hashes[position])
-                    let key_address = self.allocate(self.layout.size_of(source.key_type), self.layout.align_of(source.key_type))
-                    self.copy_bytes(source.keys[position], key_address, self.layout.size_of(source.key_type))
-                    discard(try self.call(i64(key_retain.value), [MirValue.Ptr(value = key_address)]))
-                    copied.keys.append(key_address)
-                    var value_address = 0
-                    if source.value_type != none:
-                        let item_type = source.value_type else trap("map hash storage lost its value type")
-                        value_address = self.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
-                        self.copy_bytes(source.values[position], value_address, self.layout.size_of(item_type))
-                    discard(try self.call(i64(value_retain.value), [MirValue.Ptr(value = value_address)]))
-                    copied.values.append(value_address)
+                let copied = try self.copy_hash(source, key_retain, value_retain)
+                self.hashes.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashSnapshot(result, value, key_retain, value_retain):
+                let copied = try self.copy_hash(try self.hash_at(frame.registers[value.value]), key_retain, value_retain)
                 self.hashes.append(copied)
                 frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
             HashLength(result, value):
@@ -1024,6 +1025,76 @@ pub class MirInterpreter: MirExternMemory:
                 try self.append_copied_list_elements(copied, source, size, alignment, element_retain)
                 self.lists.append(copied)
                 frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            ListSnapshot(result, value, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let source = try self.list_at(frame.registers[value.value])
+                if source.element_type.value != element_type.value: trap("verified list snapshot changed element type")
+                let copied = MirList(element_type)
+                try self.append_copied_list_elements(copied, source, self.layout.size_of(element_type), self.layout.align_of(element_type), element_retain)
+                self.lists.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            TaskGroupCreate(result):
+                self.task_groups.append(MirTaskGroup())
+                frame.registers[result.value] = MirValue.Ptr(value = task_group_address_base + len(self.task_groups) - 1)
+            TaskGroupFinish(group):
+                let storage = try self.task_group_at(frame.registers[group.value])
+                if storage.is_finished: error("mir interpreter: trap: task group finished twice")
+                for child in storage.children:
+                    if child.outcome == none: child.outcome = MirTaskOutcome.Cancelled
+                storage.is_finished = true
+            TaskSpawn(result, group, function, arguments):
+                let owner = try self.task_group_at(frame.registers[group.value])
+                if owner.is_finished: error("mir interpreter: trap: spawned into a finished task group")
+                var task_result = MirTaskResult.Unit
+                var failure_type = TypeId(value = 0)
+                match mir_type(types, frame.function.registers[result.value]):
+                    Task(value, error_value):
+                        task_result = value
+                        failure_type = error_value
+                    else: trap("verified task spawn has a non-task result")
+                let copied = list[MirTransferredValue]()
+                let copied_types = list[TypeId]()
+                for index in range(0, i64(arguments.count)):
+                    let transfer = transfer_at(frame.function, arguments, index)
+                    copied.append(try self.encode_transfer(transfer.value_type, frame.registers[transfer.value.value]))
+                    copied_types.append(transfer.value_type)
+                let task = MirTaskStorage(function, copied, copied_types, task_result, failure_type)
+                self.tasks.append(task)
+                owner.children.append(task)
+                frame.registers[result.value] = MirValue.Ptr(value = task_address_base + len(self.tasks) - 1)
+            TaskWait(result, destination, failure, error_destination, task):
+                let storage = try self.task_at(frame.registers[task.value])
+                try self.start_task(storage)
+                let outcome = storage.outcome else trap("joined MIR task has no terminal outcome")
+                match outcome:
+                    Succeeded(value):
+                        match storage.result:
+                            Unit: pass
+                            Never: trap("never-returning MIR task completed successfully")
+                            Value(value_type):
+                                let transferred = value else trap("value-producing MIR task cached unit success")
+                                if destination.value != no_register:
+                                    try self.decode_transfer_into(value_type, ptr_of(frame.registers[destination.value]), transferred)
+                                else:
+                                    frame.registers[result.value] = try self.decode_transfer(value_type, transferred)
+                        frame.registers[failure.value] = MirValue.Ptr(value = 0)
+                    Failed(error_value):
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.decode_transfer_into(storage.failure_type, address, error_value)
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+                    Trapped(message):
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.store_task_runtime_error(storage.failure_type, address, 1, message)
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+                    Cancelled:
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.store_task_runtime_error(storage.failure_type, address, 2, "task cancelled")
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+            TaskWaitAll(result, failure, error_destination, tasks):
+                try self.execute_task_wait_all(frame, result, failure, error_destination, tasks)
+            TaskCancel(task):
+                let storage = try self.task_at(frame.registers[task.value])
+                if storage.outcome == none: storage.outcome = MirTaskOutcome.Cancelled
             ListConcat(result, left, right, element_retain):
                 let element_type = self.list_element_type(frame.function, left)
                 let left_list = try self.list_at(frame.registers[left.value])
@@ -1533,6 +1604,327 @@ pub class MirInterpreter: MirExternMemory:
                 trap("verified MIR reached `Unreachable`")
             else: trap("control-flow instruction reached the straight-line interpreter")
 
+    # mark: Isolated task domains ==============================================================
+
+    ## Execute a pending child once in a fresh interpreter. Program metadata and
+    ## explicit foreign hosts are shared immutable inputs; memory, globals,
+    ## managed handles, task groups, and allocation identities begin empty.
+    func start_task(storage: MirTaskStorage) -> !:
+        if storage.outcome != none: return
+        let worker = MirInterpreter(self.program, self.rules)
+        worker.external_host = self.external_host
+        worker.c_function_pointer_host = self.c_function_pointer_host
+        worker.external_global_host = self.external_global_host
+        worker.load_program()
+
+        let target = self.program.functions[storage.function.value]
+        let arguments = list[MirValue]()
+        var result_address = 0
+        if target.signature.is_fallible:
+            let error_address = worker.allocate(worker.layout.size_of(storage.failure_type), worker.layout.align_of(storage.failure_type))
+            arguments.append(MirValue.Ptr(value = error_address))
+        match storage.result:
+            Value(value_type):
+                if is_aggregate_type(self.program.types, value_type):
+                    result_address = worker.allocate(worker.layout.size_of(value_type), worker.layout.align_of(value_type))
+                    arguments.append(MirValue.Ptr(value = result_address))
+            else: pass
+        for index in range(0, len(storage.arguments)):
+            arguments.append(try worker.decode_transfer(storage.argument_types[index], storage.arguments[index]))
+
+        let returned = worker.call(i64(storage.function.value), arguments) catch reason:
+            storage.outcome = MirTaskOutcome.Trapped(message = normalized_task_trap(reason))
+            return
+        if target.signature.is_fallible:
+            let failure = ptr_of(returned[len(returned) - 1])
+            if failure != 0:
+                let copied_error = worker.encode_transfer_from_storage(storage.failure_type, failure) catch reason:
+                    storage.outcome = MirTaskOutcome.Trapped(message = reason)
+                    return
+                storage.outcome = MirTaskOutcome.Failed(error_value = copied_error)
+                return
+
+        match storage.result:
+            Unit: storage.outcome = MirTaskOutcome.Succeeded(value = none)
+            Never: storage.outcome = MirTaskOutcome.Trapped(message = "mir interpreter: trap: never-returning worker returned")
+            Value(value_type):
+                var copied: MirTransferredValue
+                if is_aggregate_type(self.program.types, value_type):
+                    copied = try worker.encode_transfer_from_storage(value_type, result_address)
+                else:
+                    copied = try worker.encode_transfer(value_type, returned[0])
+                storage.outcome = MirTaskOutcome.Succeeded(value = copied)
+
+    ## `wait_all` observes every distinct child even after the first failure.
+    ## Successful values are materialized only if the complete join succeeds,
+    ## preserving source order and avoiding a partially visible result list.
+    func execute_task_wait_all(frame: Frame, result: RegisterId, failure: RegisterId, error_destination: RegisterId, tasks_register: RegisterId) -> !:
+        let task_list = try self.list_at(frame.registers[tasks_register.value])
+        var task_result = MirTaskResult.Unit
+        var failure_type = TypeId(value = 0)
+        match mir_type(self.program.types, task_list.element_type):
+            Task(value, error_value):
+                task_result = value
+                failure_type = error_value
+            else: trap("verified wait_all list contains non-task elements")
+
+        let successes = list[MirTransferredValue]()
+        var failed = false
+        let error_address = ptr_of(frame.registers[error_destination.value])
+        for task_address in task_list.buffer.elements:
+            let child = try self.task_at(self.load(task_list.element_type, task_address))
+            try self.start_task(child)
+            let outcome = child.outcome else trap("joined MIR task has no terminal outcome")
+            match outcome:
+                Succeeded(value):
+                    match task_result:
+                        Unit: successes.append(MirTransferredValue(form = MirTransferredForm.Aggregate(fields = list[MirTransferredValue]())))
+                        Never: trap("never-returning MIR task completed successfully")
+                        Value(value_type):
+                            let transferred = value else trap("value-producing MIR task cached unit success")
+                            successes.append(transferred)
+                Failed(error_value):
+                    if not failed:
+                        try self.decode_transfer_into(failure_type, error_address, error_value)
+                        failed = true
+                Trapped(message):
+                    if not failed:
+                        try self.store_task_runtime_error(failure_type, error_address, 1, message)
+                        failed = true
+                Cancelled:
+                    if not failed:
+                        try self.store_task_runtime_error(failure_type, error_address, 2, "task cancelled")
+                        failed = true
+
+        if failed:
+            frame.registers[failure.value] = MirValue.Ptr(value = error_address)
+            return
+        frame.registers[failure.value] = MirValue.Ptr(value = 0)
+        if result.value == no_register: return
+        var element_type = TypeId(value = 0)
+        match mir_type(self.program.types, frame.function.registers[result.value]):
+            List(element): element_type = element
+            else: trap("verified wait_all result is not a list")
+        let values = MirList(element_type)
+        for transferred in successes:
+            let address = self.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+            try self.decode_transfer_into(element_type, address, transferred)
+            values.buffer.elements.append(address)
+        self.lists.append(values)
+        frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+
+    ## Encode one canonical value without retaining an address or handle from
+    ## this interpreter domain. Aggregate registers already contain storage
+    ## addresses by canonical MIR convention.
+    func encode_transfer(value_type: TypeId, value: MirValue) -> MirTransferredValue!:
+        if is_aggregate_type(self.program.types, value_type):
+            return try self.encode_transfer_from_storage(value_type, ptr_of(value))
+        match mir_type(self.program.types, value_type):
+            Int(bits, is_signed):
+                if is_signed: return MirTransferredValue(form = MirTransferredForm.Signed(value = signed_int_of(value)))
+                return MirTransferredValue(form = MirTransferredForm.Unsigned(value = unsigned_int_of(value)))
+            Float(bits): return MirTransferredValue(form = MirTransferredForm.Floating(value = float_of(value)))
+            Bool: return MirTransferredValue(form = MirTransferredForm.Boolean(value = bool_of(value)))
+            FrozenList(element):
+                let source = try self.list_at(value)
+                let elements = list[MirTransferredValue]()
+                for address in source.buffer.elements:
+                    elements.append(try self.encode_transfer_from_storage(element, address))
+                return MirTransferredValue(form = MirTransferredForm.Sequence(elements = elements))
+            FrozenMap(key, item): return try self.encode_hash_transfer(value, key, item)
+            FrozenSet(element): return try self.encode_hash_transfer(value, element, none)
+            Slice(element):
+                let source = try self.slice_at(value)
+                let elements = list[MirTransferredValue]()
+                for index in range(0, source.length):
+                    match source.backing:
+                        List(buffer, start): elements.append(try self.encode_transfer_from_storage(element, buffer.elements[start + index]))
+                        Bytes(owner, data): elements.append(try self.encode_transfer_from_storage(element, data + index))
+                return MirTransferredValue(form = MirTransferredForm.Sequence(elements = elements))
+            else: error("mir interpreter: task transfer reached a non-sendable canonical type")
+
+    func encode_transfer_from_storage(value_type: TypeId, address: i64) -> MirTransferredValue!:
+        match mir_type(self.program.types, value_type):
+            Struct(fields):
+                if self.is_buffer_value_shape(fields):
+                    let data = ptr_of(self.load(fields[1].value_type, address + self.layout.field_offset(value_type, 1)))
+                    let length = try host_count_of(self.load(fields[2].value_type, address + self.layout.field_offset(value_type, 2)), "task buffer length")
+                    let payload = list[u8]()
+                    for offset in range(0, length): payload.append(self.memory[data + offset])
+                    return MirTransferredValue(form = MirTransferredForm.Buffer(bytes = payload))
+                let copied = list[MirTransferredValue]()
+                for index in range(0, len(fields)):
+                    copied.append(try self.encode_transfer_from_storage(fields[index].value_type, address + self.layout.field_offset(value_type, index)))
+                return MirTransferredValue(form = MirTransferredForm.Aggregate(fields = copied))
+            Array(element, count):
+                let copied = list[MirTransferredValue]()
+                let stride = self.layout.size_of(element)
+                for index in range(0, count): copied.append(try self.encode_transfer_from_storage(element, address + index * stride))
+                return MirTransferredValue(form = MirTransferredForm.Aggregate(fields = copied))
+            Enum(tag, cases):
+                let copied_tag = try self.encode_transfer_from_storage(tag, address)
+                let selected = try transferred_index(copied_tag)
+                if selected < 0 or selected >= len(cases): error("mir interpreter: task transfer observed an invalid enum tag")
+                let payload = try self.encode_transfer_from_storage(cases[selected], address + self.layout.enum_payload_offset(value_type))
+                return MirTransferredValue(form = MirTransferredForm.Variant(tag = copied_tag, payload = payload))
+            else: return try self.encode_transfer(value_type, self.load(value_type, address))
+
+    func encode_hash_transfer(value: MirValue, key_type: TypeId, value_type: TypeId?) -> MirTransferredValue!:
+        let source = try self.hash_at(value)
+        let entries = list[MirTransferredHashEntry]()
+        for index in range(0, len(source.keys)):
+            var copied_value: MirTransferredValue? = none
+            if value_type != none:
+                let item_type = value_type
+                copied_value = try self.encode_transfer_from_storage(item_type, source.values[index])
+            entries.append(MirTransferredHashEntry(
+                hash = source.hashes[index],
+                key = try self.encode_transfer_from_storage(key_type, source.keys[index]),
+                value = copied_value,
+            ))
+        return MirTransferredValue(form = MirTransferredForm.Hash(entries = entries))
+
+    ## Decode a pointer-free transfer into this interpreter's fresh memory and
+    ## semantic handle tables. No source-domain identity can survive.
+    func decode_transfer(value_type: TypeId, transferred: MirTransferredValue) -> MirValue!:
+        if is_aggregate_type(self.program.types, value_type):
+            let address = self.allocate(self.layout.size_of(value_type), self.layout.align_of(value_type))
+            try self.decode_transfer_into(value_type, address, transferred)
+            return MirValue.Ptr(value = address)
+        match mir_type(self.program.types, value_type):
+            Int(bits, is_signed):
+                match transferred.form:
+                    Signed(value): return MirValue.SignedInt(value = value)
+                    Unsigned(value): return MirValue.UnsignedInt(value = value)
+                    else: error("mir interpreter: transferred integer has the wrong shape")
+            Float(bits):
+                match transferred.form:
+                    Floating(value): return MirValue.Float(value = normalize_mir_float(value, value_type, self.program.types))
+                    else: error("mir interpreter: transferred float has the wrong shape")
+            Bool:
+                match transferred.form:
+                    Boolean(value): return MirValue.Bool(value = value)
+                    else: error("mir interpreter: transferred bool has the wrong shape")
+            FrozenList(element):
+                match transferred.form:
+                    Sequence(elements):
+                        let storage = MirList(element)
+                        for item in elements:
+                            let address = self.allocate(self.layout.size_of(element), self.layout.align_of(element))
+                            try self.decode_transfer_into(element, address, item)
+                            storage.buffer.elements.append(address)
+                        self.lists.append(storage)
+                        return MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+                    else: error("mir interpreter: transferred frozen list has the wrong shape")
+            FrozenMap(key, item): return try self.decode_hash_transfer(transferred, key, item)
+            FrozenSet(element): return try self.decode_hash_transfer(transferred, element, none)
+            Slice(element):
+                match transferred.form:
+                    Sequence(elements):
+                        let buffer = MirListBuffer()
+                        for item in elements:
+                            let address = self.allocate(self.layout.size_of(element), self.layout.align_of(element))
+                            try self.decode_transfer_into(element, address, item)
+                            buffer.elements.append(address)
+                        self.slices.append(MirSlice(element, MirSliceBacking.List(buffer = buffer, start = 0), len(elements)))
+                        return MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+                    else: error("mir interpreter: transferred slice has the wrong shape")
+            else: error("mir interpreter: task transfer decoded a non-sendable canonical type")
+
+    func decode_transfer_into(value_type: TypeId, address: i64, transferred: MirTransferredValue) -> !:
+        match mir_type(self.program.types, value_type):
+            Struct(fields):
+                if self.is_buffer_value_shape(fields):
+                    match transferred.form:
+                        Buffer(payload):
+                            let data = self.allocate(len(payload), 1)
+                            for offset in range(0, len(payload)): self.memory[data + offset] = payload[offset]
+                            self.immutable_buffers.append(MirImmutableBuffer(data, len(payload)))
+                            self.store(fields[0].value_type, address + self.layout.field_offset(value_type, 0), MirValue.Ptr(value = buffer_owner_address_base + len(self.immutable_buffers) - 1))
+                            self.store(fields[1].value_type, address + self.layout.field_offset(value_type, 1), MirValue.Ptr(value = data))
+                            self.store(fields[2].value_type, address + self.layout.field_offset(value_type, 2), MirValue.UnsignedInt(value = u64(len(payload))))
+                            return
+                        else: error("mir interpreter: transferred buffer has the wrong shape")
+                match transferred.form:
+                    Aggregate(values):
+                        if len(values) != len(fields): error("mir interpreter: transferred struct field count changed")
+                        for index in range(0, len(fields)):
+                            try self.decode_transfer_into(fields[index].value_type, address + self.layout.field_offset(value_type, index), values[index])
+                    else: error("mir interpreter: transferred struct has the wrong shape")
+            Array(element, count):
+                match transferred.form:
+                    Aggregate(values):
+                        if len(values) != count: error("mir interpreter: transferred array length changed")
+                        let stride = self.layout.size_of(element)
+                        for index in range(0, count): try self.decode_transfer_into(element, address + index * stride, values[index])
+                    else: error("mir interpreter: transferred array has the wrong shape")
+            Enum(tag, cases):
+                match transferred.form:
+                    Variant(copied_tag, payload):
+                        try self.decode_transfer_into(tag, address, copied_tag)
+                        let selected = try transferred_index(copied_tag)
+                        if selected < 0 or selected >= len(cases): error("mir interpreter: transferred enum tag is invalid")
+                        try self.decode_transfer_into(cases[selected], address + self.layout.enum_payload_offset(value_type), payload)
+                    else: error("mir interpreter: transferred enum has the wrong shape")
+            else: self.store(value_type, address, try self.decode_transfer(value_type, transferred))
+
+    func decode_hash_transfer(transferred: MirTransferredValue, key_type: TypeId, value_type: TypeId?) -> MirValue!:
+        match transferred.form:
+            Hash(entries):
+                let storage = MirHash(key_type, value_type)
+                for entry in entries:
+                    let key_address = self.allocate(self.layout.size_of(key_type), self.layout.align_of(key_type))
+                    try self.decode_transfer_into(key_type, key_address, entry.key)
+                    var value_address = 0
+                    if value_type != none:
+                        let item_type = value_type
+                        let item = entry.value else error("mir interpreter: transferred frozen map entry has no value")
+                        value_address = self.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                        try self.decode_transfer_into(item_type, value_address, item)
+                    elif entry.value != none:
+                        error("mir interpreter: transferred frozen set entry unexpectedly has a value")
+                    storage.hashes.append(entry.hash)
+                    storage.keys.append(key_address)
+                    storage.values.append(value_address)
+                self.hashes.append(storage)
+                return MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            else: error("mir interpreter: transferred frozen hash has the wrong shape")
+
+    func is_buffer_value_shape(fields: list[MirField]) -> bool:
+        if len(fields) != 3: return false
+        match mir_type(self.program.types, fields[0].value_type):
+            BufferOwner: pass
+            else: return false
+        return is_ptr_type(self.program.types, fields[1].value_type) and fields[2].value_type.value == builtin_mir_type(BuiltinMirType.unsigned_u64).value
+
+    func store_task_runtime_error(error_type: TypeId, address: i64, code: u64, message: str) -> !:
+        match mir_type(self.program.types, error_type):
+            Struct(fields):
+                if len(fields) != 2: error("mir interpreter: task Error has the wrong field count")
+                let code_address = address + self.layout.field_offset(error_type, 0)
+                match mir_type(self.program.types, fields[0].value_type):
+                    Struct(code_fields):
+                        if len(code_fields) != 2: error("mir interpreter: task ErrorCode has the wrong field count")
+                        try self.store_transferred_text(code_fields[0].value_type, code_address + self.layout.field_offset(fields[0].value_type, 0), "luce.task")
+                        self.store(code_fields[1].value_type, code_address + self.layout.field_offset(fields[0].value_type, 1), MirValue.UnsignedInt(value = code))
+                    else: error("mir interpreter: task Error code is not structural")
+                try self.store_transferred_text(fields[1].value_type, address + self.layout.field_offset(error_type, 1), message)
+            else: error("mir interpreter: task failure type is not Error")
+
+    func store_transferred_text(value_type: TypeId, address: i64, value: str) -> !:
+        let payload = strings.to_bytes(value)
+        try self.decode_transfer_into(value_type, address, MirTransferredValue(form = MirTransferredForm.Buffer(bytes = payload)))
+
+    func task_at(value: MirValue) -> MirTaskStorage!:
+        let index = ptr_of(value) - task_address_base
+        if index < 0 or index >= len(self.tasks): error("mir interpreter: trap: invalid task handle")
+        return self.tasks[index]
+
+    func task_group_at(value: MirValue) -> MirTaskGroup!:
+        let index = ptr_of(value) - task_group_address_base
+        if index < 0 or index >= len(self.task_groups): error("mir interpreter: trap: invalid task group handle")
+        return self.task_groups[index]
+
     func collect(frame: Frame, registers: RegisterRun) -> list[MirValue]:
         let values = list[MirValue]()
         for position in range(0, i64(registers.count)):
@@ -1642,13 +2034,33 @@ pub class MirInterpreter: MirExternMemory:
     func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, function.registers[value.value]):
             List(element): return element
+            FrozenList(element): return element
             else: trap("verified list instruction has a non-list handle")
 
     func hash_types(function: MirFunction, value: RegisterId) -> list[TypeId]:
         match mir_type(self.program.types, function.registers[value.value]):
             Map(key, item): return [key, item]
             Set(element): return [element]
+            FrozenMap(key, item): return [key, item]
+            FrozenSet(element): return [element]
             else: trap("verified hash instruction has a non-map/set handle")
+
+    func copy_hash(source: MirHash, key_retain: FunctionId, value_retain: FunctionId) -> MirHash!:
+        let copied = MirHash(source.key_type, source.value_type)
+        for position in range(0, len(source.keys)):
+            copied.hashes.append(source.hashes[position])
+            let key_address = self.allocate(self.layout.size_of(source.key_type), self.layout.align_of(source.key_type))
+            self.copy_bytes(source.keys[position], key_address, self.layout.size_of(source.key_type))
+            discard(try self.call(i64(key_retain.value), [MirValue.Ptr(value = key_address)]))
+            copied.keys.append(key_address)
+            var value_address = 0
+            if source.value_type != none:
+                let item_type = source.value_type else trap("map hash storage lost its value type")
+                value_address = self.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                self.copy_bytes(source.values[position], value_address, self.layout.size_of(item_type))
+            discard(try self.call(i64(value_retain.value), [MirValue.Ptr(value = value_address)]))
+            copied.values.append(value_address)
+        return copied
 
     func slice_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, function.registers[value.value]):
@@ -2173,6 +2585,29 @@ func host_integer_of(value: MirValue, what: str) -> i64!:
                 error("mir interpreter: trap: " + what + " exceeds semantic-oracle capacity")
             return i64(item)
         else: trap("verified MIR register holds a non-integer where an integer was expected")
+
+# Decode the integer tag carried by one transferred enum. Canonical enum tags
+# are integer types; signed tags remain accepted because the verifier owns the
+# exact structural declaration and the bounds check rejects negative cases.
+func transferred_index(value: MirTransferredValue) -> i64!:
+    match value.form:
+        Signed(item): return item
+        Unsigned(item):
+            if item > u64(9223372036854775807):
+                error("mir interpreter: transferred enum tag exceeds oracle capacity")
+            return i64(item)
+        else: error("mir interpreter: transferred enum tag is not an integer")
+
+# The two semantic oracles have different top-level diagnostic prefixes.
+# A caught worker trap is language data, so remove only this oracle's leading
+# `mir ` and preserve the same remote diagnostic text the HIR oracle caches.
+func normalized_task_trap(reason: str) -> str:
+    let encoded = strings.to_bytes(reason)
+    if len(encoded) < 4 or encoded[0] != u8(109) or encoded[1] != u8(105) or encoded[2] != u8(114) or encoded[3] != u8(32):
+        return reason
+    let payload = list[u8]()
+    for index in range(4, len(encoded)): payload.append(encoded[index])
+    return strings.from_bytes(payload) else reason
 
 # Reinterpret the low destination-width bits, choosing the semantic variant
 # from the destination type. `extend`, `wrap`, and equal-width reinterpret

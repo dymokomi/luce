@@ -826,10 +826,17 @@ pub union HirNodeForm:
     Conditional(value: NodeId, condition: NodeId, alternative: NodeId)
     Range(lower: NodeId, upper: NodeId, inclusive: bool)
     Call(function: SymbolId, arguments: Operands)
+    ## Start one statically named Luce function in an isolated worker. Placed
+    ## arguments retain ordinary call evaluation order; the node type is the
+    ## locally scoped `Task(result)` handle.
+    Spawn(function: SymbolId, arguments: Operands)
     ## Template-only call retaining the resolved generic declaration and its
     ## inferred semantic type arguments. `arguments` uses the ordinary placed
     ## call convention. The specializer removes this node before MIR.
     GenericCall(generic: u32, type_arguments: Operands, arguments: Operands, kind: HirGenericCallKind)
+    ## Template-only spawn. Specialization resolves the concrete worker
+    ## function before canonical MIR, exactly as for `GenericCall`.
+    GenericSpawn(generic: u32, type_arguments: Operands, arguments: Operands)
     ## Template-only reference to one generic callable with all arguments
     ## inferred from its contextual function type.
     GenericFunctionAddress(generic: u32, type_arguments: Operands)
@@ -870,6 +877,9 @@ pub union HirNodeForm:
     Assert(condition: NodeId, message: NodeId)
     Try(value: NodeId)
     Catch(value: NodeId, failure: SymbolId, body: Operands)
+    TaskWait(value: NodeId)
+    TaskCancel(value: NodeId)
+    TaskWaitAll(tasks: NodeId)
     Tuple(elements: Operands)
     Array(elements: Operands)
     ## Construct a fresh reference-identity list and append each element in
@@ -877,6 +887,10 @@ pub union HirNodeForm:
     List(elements: Operands)
     ## Produce a shallow copy with independent list identity and storage.
     ListCopy(value: NodeId)
+    ## Recursively copy one mutable collection graph into its immutable,
+    ## sendable value counterpart. The node result distinguishes frozen
+    ## list/map/set; no runtime representation or serializer enters HIR.
+    CollectionSnapshot(value: NodeId)
     ## Invoke one function value synchronously with shape-stable mutable
     ## access to the list's current element sequence.
     ListWithMutableSlice(value: NodeId, callback: NodeId)
@@ -1026,6 +1040,16 @@ pub union TypeForm:
     ## source key/value identities needed for checking and semantic execution.
     Map(key: TypeId, value: TypeId)
     Set(element: TypeId)
+    ## Immutable value snapshots are core semantic shapes because transfer,
+    ## iteration, lookup, and ownership cannot be implemented by an ordinary
+    ## struct wrapping mutable collection identity. Standard-library modules
+    ## own algorithms over these closed representations.
+    FrozenList(element: TypeId)
+    FrozenMap(key: TypeId, value: TypeId)
+    FrozenSet(element: TypeId)
+    ## A locally storable handle owned by the current invocation's implicit
+    ## task group. The result is a semantic type, never a worker layout.
+    Task(result: TypeId)
     ## Storable non-owning handle to one nominal class identity. This is a
     ## compiler-known value family, not an instantiation of user generics.
     Weak(value: TypeId)
@@ -1257,6 +1281,22 @@ pub func type_forms_match(left: TypeForm, right: TypeForm) -> bool:
             match right:
                 Set(other): return element.value == other.value
                 else: return false
+        FrozenList(element):
+            match right:
+                FrozenList(other): return element.value == other.value
+                else: return false
+        FrozenMap(key, value):
+            match right:
+                FrozenMap(other_key, other_value): return key.value == other_key.value and value.value == other_value.value
+                else: return false
+        FrozenSet(element):
+            match right:
+                FrozenSet(other): return element.value == other.value
+                else: return false
+        Task(result):
+            match right:
+                Task(other): return result.value == other.value
+                else: return false
         Weak(value):
             match right:
                 Weak(other): return value.value == other.value
@@ -1354,6 +1394,10 @@ func type_contains_parameter_once(types: TypeTable, value: TypeId, visited: list
         List(element): return type_contains_parameter_once(types, element, visited)
         Map(key, element): return type_contains_parameter_once(types, key, visited) or type_contains_parameter_once(types, element, visited)
         Set(element): return type_contains_parameter_once(types, element, visited)
+        FrozenList(element): return type_contains_parameter_once(types, element, visited)
+        FrozenMap(key, element): return type_contains_parameter_once(types, key, visited) or type_contains_parameter_once(types, element, visited)
+        FrozenSet(element): return type_contains_parameter_once(types, element, visited)
+        Task(result): return type_contains_parameter_once(types, result, visited)
         Weak(element): return type_contains_parameter_once(types, element, visited)
         Range(element): return type_contains_parameter_once(types, element, visited)
         Optional(element): return type_contains_parameter_once(types, element, visited)
@@ -1646,6 +1690,28 @@ pub class HashStorage:
         self.entries = entries
         self.active_iterations = 0
 
+## Immutable ordered elements behind one frozen list value. Copies may share
+## this storage inside a domain because source exposes no identity or mutation;
+## worker transfer still recursively creates a fresh domain graph.
+pub class FrozenListStorage:
+    pub let elements: list[BoxedValue]
+
+    pub init(elements: list[BoxedValue]):
+        self.elements = elements
+
+## One immutable insertion-ordered frozen map/set entry. Sets carry unit in
+## `value`, mirroring the mutable semantic hash model without mutable slots.
+pub struct FrozenHashEntry:
+    pub let key: BoxedValue
+    pub let value: BoxedValue
+
+## Immutable insertion-ordered storage shared only inside one worker domain.
+pub class FrozenHashStorage:
+    pub let entries: list[FrozenHashEntry]
+
+    pub init(entries: list[FrozenHashEntry]):
+        self.entries = entries
+
 ## The semantic oracle keeps the concrete backing category only so it can
 ## read elements. Both cases are immutable owner-retaining snapshots with the
 ## same source-level `slice[T]` behavior.
@@ -1671,6 +1737,32 @@ pub class MutableSliceStorage:
 
     pub init(list: ListStorage):
         self.list = list
+
+## The cached terminal state of one interpreted worker. The HIR semantic
+## oracle keeps this state beside the opaque task identity so aliases and
+## repeated waits observe one execution. Compiled worker representation and
+## scheduling remain backend/runtime concerns.
+pub union HirTaskOutcome:
+    Succeeded(value: BoxedValue)
+    Failed(error_value: BoxedValue)
+    Trapped(message: str)
+    Cancelled
+
+## One semantic task identity owned by an invocation's implicit task group.
+## Arguments are already copied into the isolated worker domain. A handle is
+## non-owning in canonical MIR; this oracle class merely lets the host model
+## that identity without choosing a physical runtime layout.
+pub class HirTaskStorage:
+    pub let identity: u64
+    pub let function: SymbolId
+    pub let arguments: list[BoxedValue]
+    pub var outcome: HirTaskOutcome?
+
+    pub init(identity: u64, function: SymbolId, arguments: list[BoxedValue]):
+        self.identity = identity
+        self.function = function
+        self.arguments = arguments
+        self.outcome = none
 
 ## A C-callable value is either a compiler-resolved declaration/adapter or an
 ## opaque code token supplied by C. Keeping those origins explicit prevents
@@ -1708,10 +1800,16 @@ pub union Value:
     List(storage: ListStorage)
     Map(storage: HashStorage)
     Set(storage: HashStorage)
+    FrozenList(storage: FrozenListStorage)
+    FrozenMap(storage: FrozenHashStorage)
+    FrozenSet(storage: FrozenHashStorage)
     ## An immutable snapshot over one retained backing buffer.
     Slice(storage: SliceStorage)
     ## A non-storable mutable view valid only in its active callback frame.
     MutableSlice(storage: MutableSliceStorage)
+    ## A locally storable, non-escaping handle into the creating invocation's
+    ## structured task group. The group, not this value, owns worker lifetime.
+    Task(storage: HirTaskStorage)
     ## A capture-free Luce function value, named by its resolved symbol.
     Function(symbol: SymbolId)
     ## Anonymous function with a managed capture environment.
@@ -1754,6 +1852,7 @@ pub union Value:
             Text(item): return item
             Bytes(item): return str(len(item)) + " bytes"
             TextSlice(items): return str(len(items)) + " argument(s)"
+            Task(storage): return "<task " + str(storage.identity) + ">"
             Variant(case_index, payload):
                 var text = "case " + str(case_index)
                 if len(payload) == 0: return text
@@ -1805,6 +1904,16 @@ pub union Value:
                 return text + "]"
             Map(storage): return "<map " + str(len(storage.entries)) + " entry(s)>"
             Set(storage): return "<set " + str(len(storage.entries)) + " element(s)>"
+            FrozenList(storage):
+                var text = "["
+                var index = 0
+                for element in storage.elements:
+                    if index > 0: text = text + ", "
+                    text = text + element.value.render()
+                    index += 1
+                return text + "]"
+            FrozenMap(storage): return "<frozen-map " + str(len(storage.entries)) + " entry(s)>"
+            FrozenSet(storage): return "<frozen-set " + str(len(storage.entries)) + " element(s)>"
             Slice(storage):
                 var text = "["
                 for index in range(0, storage.length):

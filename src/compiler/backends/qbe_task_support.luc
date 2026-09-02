@@ -1,0 +1,216 @@
+#==============================================================================================
+#
+#   qbe_task_support - POSIX process supervision for QBE worker domains
+#
+#   DESCRIPTION:
+#       QBE's native oracle realizes an isolated Luce worker as a child
+#       process. `fork` gives the child an immediate copy-on-write snapshot of
+#       the complete runtime domain; only a framed, compiler-generated value
+#       encoding crosses back through the pipe. This C shim owns host process
+#       APIs and byte transport only. MIR types, layout, and value codecs stay
+#       in the QBE emitter.
+#
+#==============================================================================================
+
+from compiler.mir.canonical import InstructionForm, MirProgram
+
+# mark: Detection =============================================================================
+
+## One shared predicate controls both IL legalization and companion-source
+## linking. A task group is compiler-generated whenever any spawn exists, but
+## recognizing every canonical task instruction makes malformed/unoptimized
+## fixtures fail coherently at the same backend boundary.
+pub func qbe_program_uses_tasks(program: MirProgram) -> bool:
+    for function in program.functions:
+        for instruction in function.body:
+            match instruction.form:
+                TaskGroupCreate(result): return true
+                TaskGroupFinish(group): return true
+                TaskSpawn(result, group, target, arguments): return true
+                TaskWait(result, destination, failure, error_destination, task): return true
+                TaskWaitAll(result, failure, error_destination, tasks): return true
+                TaskCancel(task): return true
+                else: pass
+    return false
+
+# mark: Companion source =======================================================================
+
+## C source linked only when canonical MIR contains a task operation. Keeping
+## it embedded makes an installed compiler self-contained while leaving host
+## process policy outside pure MIR-to-IL translation.
+pub func qbe_task_support_source() -> str:
+    return (
+        "#define _POSIX_C_SOURCE 200809L\n"
+        + "#include <errno.h>\n"
+        + "#include <signal.h>\n"
+        + "#include <stdint.h>\n"
+        + "#include <stdio.h>\n"
+        + "#include <stdlib.h>\n"
+        + "#include <string.h>\n"
+        + "#include <sys/types.h>\n"
+        + "#include <sys/wait.h>\n"
+        + "#include <unistd.h>\n\n"
+        + "enum { LUCE_TASK_PENDING = -1, LUCE_TASK_SUCCEEDED = 0, LUCE_TASK_FAILED = 1, LUCE_TASK_TRAPPED = 2, LUCE_TASK_CANCELLED = 3, LUCE_TASK_EXHAUSTED = 4 };\n\n"
+        + "typedef void (*luce_worker_fn)(void *);\n"
+        + "typedef struct { unsigned char *data; size_t length; size_t capacity; int failed; } luce_writer;\n"
+        + "typedef struct { pid_t pid; int read_fd; int state; int joined; int reaped; int cancellation_requested; unsigned char *payload; size_t payload_length; } luce_task;\n"
+        + "typedef struct { luce_task **children; size_t length; size_t capacity; int finished; } luce_group;\n\n"
+        + "static int luce_active_worker_fd = -1;\n"
+        + "static const char luce_exhausted[] = \"worker transport exhausted host resources\";\n"
+        + "static const char luce_broken[] = \"worker terminated without a valid result frame\";\n"
+        + "static const char luce_cancelled[] = \"task cancelled\";\n\n"
+        + "static int luce_write_all(int fd, const void *source, size_t length) {\n"
+        + "    const unsigned char *bytes = (const unsigned char *)source;\n"
+        + "    while (length > 0) {\n"
+        + "        ssize_t written = write(fd, bytes, length);\n"
+        + "        if (written < 0 && errno == EINTR) continue;\n"
+        + "        if (written <= 0) return 0;\n"
+        + "        bytes += (size_t)written; length -= (size_t)written;\n"
+        + "    }\n"
+        + "    return 1;\n"
+        + "}\n\n"
+        + "static int luce_read_all(int fd, void *destination, size_t length) {\n"
+        + "    unsigned char *bytes = (unsigned char *)destination;\n"
+        + "    while (length > 0) {\n"
+        + "        ssize_t read_count = read(fd, bytes, length);\n"
+        + "        if (read_count < 0 && errno == EINTR) continue;\n"
+        + "        if (read_count <= 0) return 0;\n"
+        + "        bytes += (size_t)read_count; length -= (size_t)read_count;\n"
+        + "    }\n"
+        + "    return 1;\n"
+        + "}\n\n"
+        + "static void luce_publish_raw(uint32_t state, const void *payload, uint64_t length) {\n"
+        + "    if (luce_active_worker_fd < 0) _exit(134);\n"
+        + "    int ok = luce_write_all(luce_active_worker_fd, &state, sizeof(state));\n"
+        + "    if (ok) ok = luce_write_all(luce_active_worker_fd, &length, sizeof(length));\n"
+        + "    if (ok && length > 0) (void)luce_write_all(luce_active_worker_fd, payload, (size_t)length);\n"
+        + "    close(luce_active_worker_fd);\n"
+        + "    _exit(ok ? 0 : 125);\n"
+        + "}\n\n"
+        + "void luce_qbe_task_trap(const void *message, uint64_t length) {\n"
+        + "    if (luce_active_worker_fd >= 0) luce_publish_raw(LUCE_TASK_TRAPPED, message, length);\n"
+        + "    if (length > 0) (void)luce_write_all(STDERR_FILENO, message, (size_t)length);\n"
+        + "    (void)luce_write_all(STDERR_FILENO, \"\\n\", 1);\n"
+        + "    _exit(134);\n"
+        + "}\n\n"
+        + "void *luce_qbe_task_writer_create(void) {\n"
+        + "    luce_writer *writer = (luce_writer *)calloc(1, sizeof(luce_writer));\n"
+        + "    if (writer == NULL) luce_publish_raw(LUCE_TASK_EXHAUSTED, luce_exhausted, sizeof(luce_exhausted) - 1);\n"
+        + "    return writer;\n"
+        + "}\n\n"
+        + "void luce_qbe_task_writer_write(void *opaque, const void *source, uint64_t count) {\n"
+        + "    luce_writer *writer = (luce_writer *)opaque;\n"
+        + "    if (writer->failed || count == 0) return;\n"
+        + "    if (count > SIZE_MAX - writer->length) { writer->failed = 1; return; }\n"
+        + "    size_t required = writer->length + (size_t)count;\n"
+        + "    if (required > writer->capacity) {\n"
+        + "        size_t capacity = writer->capacity == 0 ? 256 : writer->capacity;\n"
+        + "        while (capacity < required) {\n"
+        + "            if (capacity > SIZE_MAX / 2) { capacity = required; break; }\n"
+        + "            capacity *= 2;\n"
+        + "        }\n"
+        + "        unsigned char *grown = (unsigned char *)realloc(writer->data, capacity);\n"
+        + "        if (grown == NULL) { writer->failed = 1; return; }\n"
+        + "        writer->data = grown; writer->capacity = capacity;\n"
+        + "    }\n"
+        + "    memcpy(writer->data + writer->length, source, (size_t)count);\n"
+        + "    writer->length = required;\n"
+        + "}\n\n"
+        + "void luce_qbe_task_writer_publish(void *opaque, uint32_t state) {\n"
+        + "    luce_writer *writer = (luce_writer *)opaque;\n"
+        + "    if (writer->failed) luce_publish_raw(LUCE_TASK_EXHAUSTED, luce_exhausted, sizeof(luce_exhausted) - 1);\n"
+        + "    luce_publish_raw(state, writer->data, (uint64_t)writer->length);\n"
+        + "}\n\n"
+        + "static void luce_parent_fatal(const char *message) { luce_qbe_task_trap(message, (uint64_t)strlen(message)); }\n\n"
+        + "void *luce_qbe_task_group_create(void) {\n"
+        + "    luce_group *group = (luce_group *)calloc(1, sizeof(luce_group));\n"
+        + "    if (group == NULL) luce_parent_fatal(luce_exhausted);\n"
+        + "    return group;\n"
+        + "}\n\n"
+        + "void *luce_qbe_task_spawn(void *opaque_group, luce_worker_fn worker, void *context) {\n"
+        + "    luce_group *group = (luce_group *)opaque_group;\n"
+        + "    if (group == NULL || group->finished) luce_parent_fatal(\"cannot spawn into a finished task group\");\n"
+        + "    int descriptors[2];\n"
+        + "    if (pipe(descriptors) != 0) luce_parent_fatal(luce_exhausted);\n"
+        + "    pid_t pid = fork();\n"
+        + "    if (pid < 0) { close(descriptors[0]); close(descriptors[1]); luce_parent_fatal(luce_exhausted); }\n"
+        + "    if (pid == 0) {\n"
+        + "        close(descriptors[0]);\n"
+        + "        if (luce_active_worker_fd >= 0) close(luce_active_worker_fd);\n"
+        + "        luce_active_worker_fd = descriptors[1];\n"
+        + "        worker(context);\n"
+        + "        luce_publish_raw(LUCE_TASK_TRAPPED, luce_broken, sizeof(luce_broken) - 1);\n"
+        + "    }\n"
+        + "    close(descriptors[1]);\n"
+        + "    luce_task *task = (luce_task *)calloc(1, sizeof(luce_task));\n"
+        + "    if (task == NULL) { kill(pid, SIGKILL); close(descriptors[0]); while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {} luce_parent_fatal(luce_exhausted); }\n"
+        + "    task->pid = pid; task->read_fd = descriptors[0]; task->state = LUCE_TASK_PENDING;\n"
+        + "    if (group->length == group->capacity) {\n"
+        + "        size_t capacity = group->capacity == 0 ? 4 : group->capacity * 2;\n"
+        + "        luce_task **grown = (luce_task **)realloc(group->children, capacity * sizeof(luce_task *));\n"
+        + "        if (grown == NULL) { kill(pid, SIGKILL); close(descriptors[0]); while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {} free(task); luce_parent_fatal(luce_exhausted); }\n"
+        + "        group->children = grown; group->capacity = capacity;\n"
+        + "    }\n"
+        + "    group->children[group->length++] = task;\n"
+        + "    return task;\n"
+        + "}\n\n"
+        + "static void luce_task_set_message(luce_task *task, int state, const char *message) {\n"
+        + "    size_t length = strlen(message);\n"
+        + "    task->payload = (unsigned char *)malloc(length);\n"
+        + "    if (task->payload == NULL && length > 0) { state = LUCE_TASK_EXHAUSTED; message = luce_exhausted; length = sizeof(luce_exhausted) - 1; task->payload = (unsigned char *)malloc(length); }\n"
+        + "    if (task->payload != NULL && length > 0) memcpy(task->payload, message, length);\n"
+        + "    task->payload_length = task->payload == NULL ? 0 : length; task->state = state;\n"
+        + "}\n\n"
+        + "static void luce_task_collect(luce_task *task) {\n"
+        + "    if (task->joined) return;\n"
+        + "    uint32_t state = 0; uint64_t length = 0;\n"
+        + "    int framed = luce_read_all(task->read_fd, &state, sizeof(state)) && luce_read_all(task->read_fd, &length, sizeof(length));\n"
+        + "    if (framed && length <= SIZE_MAX) {\n"
+        + "        if (length > 0) { task->payload = (unsigned char *)malloc((size_t)length); if (task->payload == NULL) framed = 0; }\n"
+        + "        if (framed && length > 0) framed = luce_read_all(task->read_fd, task->payload, (size_t)length);\n"
+        + "    } else framed = 0;\n"
+        + "    close(task->read_fd); task->read_fd = -1;\n"
+        + "    int status = 0;\n"
+        + "    if (!task->reaped) { while (waitpid(task->pid, &status, 0) < 0 && errno == EINTR) {} task->reaped = 1; }\n"
+        + "    if (task->cancellation_requested) { free(task->payload); task->payload = NULL; luce_task_set_message(task, LUCE_TASK_CANCELLED, luce_cancelled); }\n"
+        + "    else if (!framed || state > LUCE_TASK_EXHAUSTED) { free(task->payload); task->payload = NULL; luce_task_set_message(task, LUCE_TASK_TRAPPED, luce_broken); }\n"
+        + "    else { task->state = (int)state; task->payload_length = (size_t)length; }\n"
+        + "    task->joined = 1;\n"
+        + "}\n\n"
+        + "int luce_qbe_task_wait(void *opaque) { luce_task *task = (luce_task *)opaque; luce_task_collect(task); return task->state; }\n\n"
+        + "void luce_qbe_task_cancel(void *opaque) {\n"
+        + "    luce_task *task = (luce_task *)opaque;\n"
+        + "    if (task == NULL || task->joined || task->cancellation_requested) return;\n"
+        + "    int status = 0; pid_t observed;\n"
+        + "    do { observed = waitpid(task->pid, &status, WNOHANG); } while (observed < 0 && errno == EINTR);\n"
+        + "    if (observed == task->pid) { task->reaped = 1; luce_task_collect(task); return; }\n"
+        + "    if (observed == 0) { task->cancellation_requested = 1; if (kill(task->pid, SIGTERM) != 0 && errno != ESRCH) luce_parent_fatal(\"cannot cancel worker process\"); }\n"
+        + "}\n\n"
+        + "void luce_qbe_task_group_finish(void *opaque) {\n"
+        + "    luce_group *group = (luce_group *)opaque; if (group == NULL || group->finished) return;\n"
+        + "    for (size_t i = 0; i < group->length; ++i) luce_qbe_task_cancel(group->children[i]);\n"
+        + "    for (size_t i = 0; i < group->length; ++i) luce_task_collect(group->children[i]);\n"
+        + "    group->finished = 1;\n"
+        + "}\n\n"
+        + "void luce_qbe_task_group_destroy(void *opaque) {\n"
+        + "    luce_group *group = (luce_group *)opaque; if (group == NULL) return;\n"
+        + "    luce_qbe_task_group_finish(group);\n"
+        + "    for (size_t i = 0; i < group->length; ++i) { free(group->children[i]->payload); free(group->children[i]); }\n"
+        + "    free(group->children); free(group);\n"
+        + "}\n\n"
+        + "uint64_t luce_qbe_task_read(void *opaque, uint64_t offset, void *destination, uint64_t count) {\n"
+        + "    luce_task *task = (luce_task *)opaque;\n"
+        + "    if (!task->joined || offset > task->payload_length || count > task->payload_length - offset) return UINT64_MAX;\n"
+        + "    if (count > 0) memcpy(destination, task->payload + (size_t)offset, (size_t)count);\n"
+        + "    return offset + count;\n"
+        + "}\n\n"
+        + "int luce_qbe_task_read_finished(void *opaque, uint64_t offset) { luce_task *task = (luce_task *)opaque; return task->joined && offset == task->payload_length; }\n"
+        + "const void *luce_qbe_task_peek(void *opaque, uint64_t offset, uint64_t count) {\n"
+        + "    luce_task *task = (luce_task *)opaque;\n"
+        + "    if (!task->joined || offset > task->payload_length || count > task->payload_length - offset) return NULL;\n"
+        + "    if (count == 0) return (const void *)task;\n"
+        + "    return task->payload + (size_t)offset;\n"
+        + "}\n"
+        + "const void *luce_qbe_task_message_data(void *opaque) { return ((luce_task *)opaque)->payload; }\n"
+        + "uint64_t luce_qbe_task_message_length(void *opaque) { return (uint64_t)((luce_task *)opaque)->payload_length; }\n"
+    )

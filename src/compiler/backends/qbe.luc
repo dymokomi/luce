@@ -25,11 +25,14 @@
 from compiler.backends.layout import LayoutRules, TypeLayout
 from compiler.backends.emission import FunctionEmission, TextEmission
 from compiler.backends.qbe_float16 import qbe_float16_helpers
-from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
-from compiler.mir.canonical import MirClass, MirFunction, MirProgram, MirSignature, RegisterId, RegisterRun, TypeId, UnaryOp
+from compiler.backends.qbe_representation import qbe_abi_type, qbe_base_type, qbe_function_name, qbe_load_instruction, qbe_store_instruction
+from compiler.backends.qbe_task_support import qbe_program_uses_tasks
+from compiler.backends.qbe_tasks import emit_qbe_task_helpers, qbe_task_decode_name, qbe_task_worker_name
+from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
+from compiler.mir.canonical import MirClass, MirField, MirFunction, MirProgram, MirSignature, MirTaskResult, RegisterId, RegisterRun, TransferRun, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
-from compiler.mir.canonical import bits_of, describe_mir_type, find_runtime_binding, is_float_type, is_int_type
-from compiler.mir.canonical import is_signed_int_type, mir_type, register_at
+from compiler.mir.canonical import bits_of, builtin_mir_type, describe_mir_type, find_runtime_binding, is_aggregate_type, is_float_type, is_int_type
+from compiler.mir.canonical import is_signed_int_type, mir_type, no_register, register_at, transfer_at
 
 ## Pure canonical-MIR to QBE-IL translation.
 pub class QbeBackend:
@@ -69,6 +72,10 @@ struct Region:
     var saw_alternative: bool
     var has_exit_edge: bool
 
+struct QbeTaskShape:
+    let result: MirTaskResult
+    let failure_type: TypeId
+
 class QbeEmitter:
     let program: MirProgram
     let layout: TypeLayout
@@ -80,6 +87,9 @@ class QbeEmitter:
     var regions: list[Region]
     var terminated: bool
     var uses_float16: bool
+    let uses_tasks: bool
+    var task_site: i64
+    var task_group: RegisterId?
 
     init(program: MirProgram, clock: (func() -> i64)?):
         self.program = program
@@ -92,6 +102,9 @@ class QbeEmitter:
         self.regions = list[Region]()
         self.terminated = false
         self.uses_float16 = false
+        self.uses_tasks = qbe_program_uses_tasks(program)
+        self.task_site = 0
+        self.task_group = none
 
     func emit() -> TextEmission!:
         try self.emit_data()
@@ -105,6 +118,7 @@ class QbeEmitter:
                 code_bytes = u64(len(self.output) - output_start),
                 codegen_time_ms = self.elapsed_ms(started),
             ))
+        if self.uses_tasks: self.output = self.output + try emit_qbe_task_helpers(self.program)
         if self.uses_float16: self.output = self.output + qbe_float16_helpers() + "\n\n"
         return TextEmission(text = self.output, functions = self.function_emissions)
 
@@ -128,6 +142,9 @@ class QbeEmitter:
             emitted = true
         if self.has_runtime_trap():
             self.output = self.output + "data $luce_rt_trap_newline = align 1 { b 10 }\n"
+            emitted = true
+        if self.uses_tasks:
+            self.output = self.output + "data $luce_qbe_task_domain = align 1 { b 108 117 99 101 46 116 97 115 107 }\n"
             emitted = true
         for index in range(0, len(self.program.functions)):
             let function = FunctionId(value = u32(index))
@@ -170,11 +187,15 @@ class QbeEmitter:
                         if key_callback.value == target.value or value_callback.value == target.value: return true
                     HashCopy(result, value, key_callback, value_callback):
                         if key_callback.value == target.value or value_callback.value == target.value: return true
+                    HashSnapshot(result, value, key_callback, value_callback):
+                        if key_callback.value == target.value or value_callback.value == target.value: return true
                     HashClear(value, key_callback, value_callback):
                         if key_callback.value == target.value or value_callback.value == target.value: return true
                     ListRelease(value, callback):
                         if callback.value == target.value: return true
                     ListCopy(result, value, callback):
+                        if callback.value == target.value: return true
+                    ListSnapshot(result, value, callback):
                         if callback.value == target.value: return true
                     ListConcat(result, left, right, callback):
                         if callback.value == target.value: return true
@@ -237,6 +258,7 @@ class QbeEmitter:
 
         self.regions = list[Region]()
         self.terminated = false
+        self.task_group = none
         var is_entry = false
         let entry = self.program.entry
         if entry != none: is_entry = entry.value == id.value
@@ -290,9 +312,11 @@ class QbeEmitter:
                 try self.emit_branch(function, 0, values)
             Return(values):
                 self.ensure_open_block()
+                self.emit_task_group_destroy()
                 try self.emit_return(function, values)
             Raise(failure):
                 self.ensure_open_block()
+                self.emit_task_group_destroy()
                 self.terminate("\tret " + self.reg(failure) + "\n")
             Trap(reason):
                 self.ensure_open_block()
@@ -376,6 +400,22 @@ class QbeEmitter:
             HashCopy(result, value, key_retain, value_retain):
                 let service = find_runtime_binding(self.program, RuntimeService.hash_copy) else trap("verified `HashCopy` has no runtime binding")
                 self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + self.hash_layout_arguments(function, value) + ", l " + self.function_descriptor(key_retain) + ", l " + self.function_descriptor(value_retain) + ")")
+            HashSnapshot(result, value, key_retain, value_retain):
+                let service = find_runtime_binding(self.program, RuntimeService.hash_copy) else trap("verified `HashSnapshot` has no runtime binding")
+                self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + self.hash_layout_arguments(function, value) + ", l " + self.function_descriptor(key_retain) + ", l " + self.function_descriptor(value_retain) + ")")
+            TaskGroupCreate(result):
+                self.line(self.reg(result) + " =l call $luce_qbe_task_group_create()")
+                self.task_group = result
+            TaskGroupFinish(group):
+                self.line("call $luce_qbe_task_group_finish(l " + self.reg(group) + ")")
+            TaskSpawn(result, group, target, arguments):
+                try self.emit_task_spawn(function, result, group, arguments)
+            TaskWait(result, destination, failure, error_destination, task):
+                try self.emit_task_wait(function, result, destination, failure, error_destination, task)
+            TaskWaitAll(result, failure, error_destination, tasks):
+                try self.emit_task_wait_all(function, result, failure, error_destination, tasks)
+            TaskCancel(task):
+                self.line("call $luce_qbe_task_cancel(l " + self.reg(task) + ")")
             HashLength(result, value):
                 let service = find_runtime_binding(self.program, RuntimeService.hash_length) else trap("verified `HashLength` has no runtime binding")
                 self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + ")")
@@ -424,6 +464,10 @@ class QbeEmitter:
             ListCopy(result, value, element_retain):
                 let element_type = self.list_element_type(function, value)
                 let service = find_runtime_binding(self.program, RuntimeService.list_copy) else trap("verified `ListCopy` has no runtime binding")
+                self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + ", l " + str(self.layout.size_of(element_type)) + ", l " + str(self.storage_alignment(element_type)) + ", l " + self.function_descriptor(element_retain) + ")")
+            ListSnapshot(result, value, element_retain):
+                let element_type = self.list_element_type(function, value)
+                let service = find_runtime_binding(self.program, RuntimeService.list_copy) else trap("verified `ListSnapshot` has no runtime binding")
                 self.line(self.reg(result) + " =l call $" + self.function_name(service) + "(l " + self.reg(value) + ", l " + str(self.layout.size_of(element_type)) + ", l " + str(self.storage_alignment(element_type)) + ", l " + self.function_descriptor(element_retain) + ")")
             ListConcat(result, left, right, element_retain):
                 let element_type = self.list_element_type(function, left)
@@ -701,8 +745,14 @@ class QbeEmitter:
                 elif symbol.convention == CallingConvention.runtime and symbol.name == "luce_rt_write":
                     try self.emit_runtime_write(function, arguments, 1)
                 elif symbol.convention == CallingConvention.runtime and symbol.name == "luce_rt_trap":
-                    try self.emit_runtime_write(function, arguments, 2)
-                    self.line("call $write(w 2, l $luce_rt_trap_newline, l 1)")
+                    if self.uses_tasks:
+                        if arguments.count != 2: error("qbe backend: verified runtime trap has an invalid call shape")
+                        let data = register_at(function, arguments, 0)
+                        let length = register_at(function, arguments, 1)
+                        self.line("call $luce_qbe_task_trap(l " + self.reg(data) + ", l " + self.reg(length) + ")")
+                    else:
+                        try self.emit_runtime_write(function, arguments, 2)
+                        self.line("call $write(w 2, l $luce_rt_trap_newline, l 1)")
                     self.terminate("\thlt\n")
                 else:
                     try self.emit_call(function, results, "$" + symbol.name, symbol.signature, symbol.convention, arguments)
@@ -762,6 +812,325 @@ class QbeEmitter:
         self.emit_guard(outside)
         let result = register_at(function, results, 0)
         self.line(self.reg(result) + " =l copy $luce_rt_arena_storage")
+
+    # mark: Isolated tasks ---------------------------------------------------------------------
+
+    ## Capture only the worker's call representation in the transient fork
+    ## context. `fork` occurs inside this call, before the parent can mutate or
+    ## unwind any source storage; the child therefore observes one immediate
+    ## copy-on-write snapshot of the complete reachable value graph.
+    func emit_task_spawn(function: MirFunction, result: RegisterId, group: RegisterId, arguments: TransferRun) -> !:
+        var context_size = i64(arguments.count) * 8
+        if context_size == 0: context_size = 1
+        let context = self.temp()
+        self.line(context + " =l alloc16 " + str(context_size))
+        for index in range(0, i64(arguments.count)):
+            let transfer = transfer_at(function, arguments, index)
+            let representation = self.register_type(function, transfer.value)
+            var address = context
+            if index > 0:
+                address = self.temp()
+                self.line(address + " =l add " + context + ", " + str(index * 8))
+            self.line(try self.task_context_store(representation) + " " + self.reg(transfer.value) + ", " + address)
+        self.line(self.reg(result) + " =l call $luce_qbe_task_spawn(l " + self.reg(group) + ", l $" + qbe_task_worker_name(self.task_site) + ", l " + context + ")")
+        self.task_site += 1
+
+    func task_context_store(value_type: TypeId) -> str!:
+        match mir_type(self.program.types, value_type):
+            Float(bits):
+                if bits <= 32: return "stores"
+                return "stored"
+            Int(bits, is_signed):
+                if bits <= 32: return "storew"
+                return "storel"
+            Bool: return "storew"
+            else:
+                if is_aggregate_type(self.program.types, value_type) or try self.base_type(value_type) == "l": return "storel"
+                error("qbe task backend: unsupported spawn operand representation")
+
+    func emit_task_wait(function: MirFunction, result: RegisterId, destination: RegisterId, failure: RegisterId, error_destination: RegisterId, task: RegisterId) -> !:
+        let shape = try self.task_shape(self.register_type(function, task))
+        let state = self.temp()
+        self.line(state + " =w call $luce_qbe_task_wait(l " + self.reg(task) + ")")
+        try self.emit_observed_task(function, shape, state, self.reg(task), result, destination, failure, error_destination)
+
+    ## Join first, then decode. This guarantees `wait_all` observes every
+    ## distinct child before reporting the first failure in input order and
+    ## avoids constructing result values that would immediately be discarded.
+    func emit_task_wait_all(function: MirFunction, result: RegisterId, failure: RegisterId, error_destination: RegisterId, tasks: RegisterId) -> !:
+        var task_type = builtin_mir_type(BuiltinMirType.pointer)
+        match mir_type(self.program.types, self.register_type(function, tasks)):
+            List(element): task_type = element
+            else: error("qbe task backend: wait_all operand is not a task list")
+        let shape = try self.task_shape(task_type)
+        let length_service = find_runtime_binding(self.program, RuntimeService.list_length) else error("qbe task backend: wait_all needs list length runtime")
+        let address_service = find_runtime_binding(self.program, RuntimeService.list_element_address) else error("qbe task backend: wait_all needs list element runtime")
+        let length = self.temp()
+        self.line(length + " =l call $" + self.function_name(length_service) + "(l " + self.reg(tasks) + ")")
+        let index_slot = self.emit_stack_allocation(builtin_mir_type(BuiltinMirType.unsigned_u64))
+        let first_task_slot = self.emit_stack_allocation(builtin_mir_type(BuiltinMirType.pointer))
+        let first_state_slot = self.emit_stack_allocation(builtin_mir_type(BuiltinMirType.signed_i32))
+        self.line("storel 0, " + index_slot)
+        self.line("storel 0, " + first_task_slot)
+        self.line("storew 0, " + first_state_slot)
+        let join_loop = self.new_label("wait_all_join")
+        let join_body = self.new_label("wait_all_join_body")
+        let join_done = self.new_label("wait_all_join_done")
+        self.terminate("\tjmp @" + join_loop + "\n")
+        self.label(join_loop)
+        let index = self.temp()
+        let joined = self.temp()
+        self.line(index + " =l loadl " + index_slot)
+        self.line(joined + " =w cugel " + index + ", " + length)
+        self.terminate("\tjnz " + joined + ", @" + join_done + ", @" + join_body + "\n")
+        self.label(join_body)
+        let task_address = self.temp()
+        let task = self.temp()
+        let state = self.temp()
+        self.line(task_address + " =l call $" + self.function_name(address_service) + "(l " + self.reg(tasks) + ", l 8, l " + index + ")")
+        self.line(task + " =l loadl " + task_address)
+        self.line(state + " =w call $luce_qbe_task_wait(l " + task + ")")
+        let succeeded = self.temp()
+        let existing = self.temp()
+        let no_existing = self.temp()
+        let record = self.temp()
+        self.line(succeeded + " =w ceqw " + state + ", 0")
+        self.line(existing + " =l loadl " + first_task_slot)
+        self.line(no_existing + " =w ceql " + existing + ", 0")
+        self.line(record + " =w and " + no_existing + ", " + self.bool_not_text(succeeded))
+        let remember = self.new_label("wait_all_remember")
+        let advance = self.new_label("wait_all_advance")
+        self.terminate("\tjnz " + record + ", @" + remember + ", @" + advance + "\n")
+        self.label(remember)
+        self.line("storel " + task + ", " + first_task_slot)
+        self.line("storew " + state + ", " + first_state_slot)
+        self.terminate("\tjmp @" + advance + "\n")
+        self.label(advance)
+        let next = self.temp()
+        self.line(next + " =l add " + index + ", 1")
+        self.line("storel " + next + ", " + index_slot)
+        self.terminate("\tjmp @" + join_loop + "\n")
+        self.label(join_done)
+        let first_task = self.temp()
+        let has_failure = self.temp()
+        self.line(first_task + " =l loadl " + first_task_slot)
+        self.line(has_failure + " =w cnel " + first_task + ", 0")
+        let failed = self.new_label("wait_all_failed")
+        let successful = self.new_label("wait_all_successful")
+        let complete = self.new_label("wait_all_complete")
+        self.terminate("\tjnz " + has_failure + ", @" + failed + ", @" + successful + "\n")
+        self.label(failed)
+        let first_state = self.temp()
+        self.line(first_state + " =w loadw " + first_state_slot)
+        try self.emit_task_failure(shape.failure_type, first_state, first_task, error_destination)
+        self.line(self.reg(result) + " =l copy 0")
+        self.line(self.reg(failure) + " =l copy " + self.reg(error_destination))
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(successful)
+        try self.emit_wait_all_results(function, result, tasks, length, shape, address_service)
+        self.line(self.reg(failure) + " =l copy 0")
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(complete)
+
+    func emit_wait_all_results(function: MirFunction, result: RegisterId, tasks: RegisterId, length: str, shape: QbeTaskShape, address_service: FunctionId) -> !:
+        var element_type = builtin_mir_type(BuiltinMirType.pointer)
+        match mir_type(self.program.types, self.register_type(function, result)):
+            List(found): element_type = found
+            else: error("qbe task backend: wait_all result is not a list")
+        let create = find_runtime_binding(self.program, RuntimeService.list_create) else error("qbe task backend: wait_all needs list creation runtime")
+        let reserve = find_runtime_binding(self.program, RuntimeService.list_reserve) else error("qbe task backend: wait_all needs list reserve runtime")
+        let append = find_runtime_binding(self.program, RuntimeService.list_append_slot) else error("qbe task backend: wait_all needs list append runtime")
+        self.line(self.reg(result) + " =l call $" + self.function_name(create) + "()")
+        self.line("call $" + self.function_name(reserve) + "(l " + self.reg(result) + ", l " + str(self.layout.size_of(element_type)) + ", l " + str(self.storage_alignment(element_type)) + ", l " + length + ", l $luce_qbe_task_noop_fd)")
+        let index_slot = self.emit_stack_allocation(builtin_mir_type(BuiltinMirType.unsigned_u64))
+        self.line("storel 0, " + index_slot)
+        let loop = self.new_label("wait_all_decode")
+        let body = self.new_label("wait_all_decode_body")
+        let done = self.new_label("wait_all_decode_done")
+        self.terminate("\tjmp @" + loop + "\n")
+        self.label(loop)
+        let index = self.temp()
+        let complete = self.temp()
+        self.line(index + " =l loadl " + index_slot)
+        self.line(complete + " =w cugel " + index + ", " + length)
+        self.terminate("\tjnz " + complete + ", @" + done + ", @" + body + "\n")
+        self.label(body)
+        let task_address = self.temp()
+        let task = self.temp()
+        self.line(task_address + " =l call $" + self.function_name(address_service) + "(l " + self.reg(tasks) + ", l 8, l " + index + ")")
+        self.line(task + " =l loadl " + task_address)
+        let slot = self.temp()
+        self.line(slot + " =l call $" + self.function_name(append) + "(l " + self.reg(result) + ", l " + str(self.layout.size_of(element_type)) + ", l " + str(self.storage_alignment(element_type)) + ", l $luce_qbe_task_noop_fd)")
+        match shape.result:
+            Unit:
+                let finished = self.temp()
+                self.line(finished + " =w call $luce_qbe_task_read_finished(l " + task + ", l 0)")
+                let invalid = self.temp()
+                self.line(invalid + " =w ceqw " + finished + ", 0")
+                self.emit_guard(invalid)
+            Never: self.terminate("\thlt\n")
+            Value(value_type): try self.emit_decode_task_value(task, value_type, slot)
+        if not self.terminated:
+            let next = self.temp()
+            self.line(next + " =l add " + index + ", 1")
+            self.line("storel " + next + ", " + index_slot)
+            self.terminate("\tjmp @" + loop + "\n")
+        self.label(done)
+
+    func bool_not_text(value: str) -> str:
+        let result = self.temp()
+        self.line(result + " =w ceqw " + value + ", 0")
+        return result
+
+    func emit_observed_task(function: MirFunction, shape: QbeTaskShape, state: str, task: str, result: RegisterId, destination: RegisterId, failure: RegisterId, error_destination: RegisterId) -> !:
+        let success = self.new_label("task_success")
+        let failed = self.new_label("task_failure")
+        let complete = self.new_label("task_observed")
+        let succeeded = self.temp()
+        self.line(succeeded + " =w ceqw " + state + ", 0")
+        self.terminate("\tjnz " + succeeded + ", @" + success + ", @" + failed + "\n")
+        self.label(success)
+        match shape.result:
+            Unit: pass
+            Never: self.terminate("\thlt\n")
+            Value(value_type):
+                var address = self.reg(destination)
+                var scalar_storage = ""
+                if not is_aggregate_type(self.program.types, value_type):
+                    scalar_storage = self.emit_stack_allocation(value_type)
+                    address = scalar_storage
+                try self.emit_decode_task_value(task, value_type, address)
+                if scalar_storage != "": try self.emit_load(self.reg(result), value_type, scalar_storage)
+        self.line(self.reg(failure) + " =l copy 0")
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(failed)
+        try self.emit_task_failure(shape.failure_type, state, task, error_destination)
+        self.line(self.reg(failure) + " =l copy " + self.reg(error_destination))
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(complete)
+
+    func emit_decode_task_value(task: str, value_type: TypeId, address: str) -> !:
+        let cursor = self.temp()
+        self.line(cursor + " =l call $" + qbe_task_decode_name(value_type) + "(l " + task + ", l 0, l " + address + ")")
+        let complete = self.temp()
+        self.line(complete + " =w call $luce_qbe_task_read_finished(l " + task + ", l " + cursor + ")")
+        let invalid = self.temp()
+        self.line(invalid + " =w ceqw " + complete + ", 0")
+        self.emit_guard(invalid)
+
+    func emit_task_failure(failure_type: TypeId, state: str, task: str, destination: RegisterId) -> !:
+        let ordinary = self.new_label("task_error")
+        let runtime = self.new_label("task_runtime_error")
+        let complete = self.new_label("task_error_ready")
+        let is_failure = self.temp()
+        self.line(is_failure + " =w ceqw " + state + ", 1")
+        self.terminate("\tjnz " + is_failure + ", @" + ordinary + ", @" + runtime + "\n")
+        self.label(ordinary)
+        try self.emit_decode_task_value(task, failure_type, self.reg(destination))
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(runtime)
+        let code = self.temp()
+        let cancelled = self.temp()
+        let exhausted = self.temp()
+        self.line(code + " =w copy 1")
+        self.line(cancelled + " =w ceqw " + state + ", 3")
+        let after_cancelled = self.new_label("task_code_after_cancelled")
+        let set_cancelled = self.new_label("task_code_cancelled")
+        self.terminate("\tjnz " + cancelled + ", @" + set_cancelled + ", @" + after_cancelled + "\n")
+        self.label(set_cancelled)
+        self.line(code + " =w copy 2")
+        self.terminate("\tjmp @" + after_cancelled + "\n")
+        self.label(after_cancelled)
+        self.line(exhausted + " =w ceqw " + state + ", 4")
+        let after_exhausted = self.new_label("task_code_ready")
+        let set_exhausted = self.new_label("task_code_exhausted")
+        self.terminate("\tjnz " + exhausted + ", @" + set_exhausted + ", @" + after_exhausted + "\n")
+        self.label(set_exhausted)
+        self.line(code + " =w copy 3")
+        self.terminate("\tjmp @" + after_exhausted + "\n")
+        self.label(after_exhausted)
+        let message = self.temp()
+        let message_length = self.temp()
+        self.line(message + " =l call $luce_qbe_task_message_data(l " + task + ")")
+        self.line(message_length + " =l call $luce_qbe_task_message_length(l " + task + ")")
+        try self.emit_task_error_value(failure_type, self.reg(destination), code, message, message_length)
+        self.terminate("\tjmp @" + complete + "\n")
+        self.label(complete)
+
+    ## Materialize the language's structural Error without giving the process
+    ## supervisor any knowledge of MIR layout or the sealed buffer runtime.
+    func emit_task_error_value(failure_type: TypeId, destination: str, code: str, message: str, message_length: str) -> !:
+        var code_type = builtin_mir_type(BuiltinMirType.pointer)
+        var message_type = builtin_mir_type(BuiltinMirType.pointer)
+        match mir_type(self.program.types, failure_type):
+            Struct(fields):
+                if len(fields) != 2: error("qbe task backend: Error has the wrong field count")
+                code_type = fields[0].value_type
+                message_type = fields[1].value_type
+            else: error("qbe task backend: task failure is not structural Error")
+        var domain_type = builtin_mir_type(BuiltinMirType.pointer)
+        var numeric_type = builtin_mir_type(BuiltinMirType.unsigned_u32)
+        match mir_type(self.program.types, code_type):
+            Struct(fields):
+                if len(fields) != 2: error("qbe task backend: ErrorCode has the wrong field count")
+                domain_type = fields[0].value_type
+                numeric_type = fields[1].value_type
+            else: error("qbe task backend: task ErrorCode is not structural")
+        let code_address = self.address_text(destination, self.layout.field_offset(failure_type, 0))
+        try self.emit_buffer_value_from_bytes(domain_type, self.address_text(code_address, self.layout.field_offset(code_type, 0)), "$luce_qbe_task_domain", "9")
+        try self.emit_store(numeric_type, self.address_text(code_address, self.layout.field_offset(code_type, 1)), code)
+        try self.emit_buffer_value_from_bytes(message_type, self.address_text(destination, self.layout.field_offset(failure_type, 1)), message, message_length)
+
+    func emit_buffer_value_from_bytes(value_type: TypeId, destination: str, data: str, length: str) -> !:
+        var fields = list[MirField]()
+        match mir_type(self.program.types, value_type):
+            Struct(found): fields = found
+            else: error("qbe task backend: task diagnostic text is not a buffer value")
+        if len(fields) != 3: error("qbe task backend: task diagnostic buffer has the wrong shape")
+        let create = find_runtime_binding(self.program, RuntimeService.buffer_builder_create) else error("qbe task backend: missing buffer builder runtime")
+        let append = find_runtime_binding(self.program, RuntimeService.buffer_builder_append) else error("qbe task backend: missing buffer append runtime")
+        let finish = find_runtime_binding(self.program, RuntimeService.buffer_builder_finish) else error("qbe task backend: missing buffer finish runtime")
+        let data_service = find_runtime_binding(self.program, RuntimeService.buffer_data) else error("qbe task backend: missing buffer data runtime")
+        let length_service = find_runtime_binding(self.program, RuntimeService.buffer_length) else error("qbe task backend: missing buffer length runtime")
+        let builder = self.temp()
+        let owner = self.temp()
+        let copied_data = self.temp()
+        let copied_length = self.temp()
+        self.line(builder + " =l call $" + self.function_name(create) + "()")
+        self.line("call $" + self.function_name(append) + "(l " + builder + ", l " + data + ", l " + length + ")")
+        self.line(owner + " =l call $" + self.function_name(finish) + "(l " + builder + ")")
+        self.line(copied_data + " =l call $" + self.function_name(data_service) + "(l " + owner + ")")
+        self.line(copied_length + " =l call $" + self.function_name(length_service) + "(l " + owner + ")")
+        try self.emit_store(fields[0].value_type, self.address_text(destination, self.layout.field_offset(value_type, 0)), owner)
+        try self.emit_store(fields[1].value_type, self.address_text(destination, self.layout.field_offset(value_type, 1)), copied_data)
+        try self.emit_store(fields[2].value_type, self.address_text(destination, self.layout.field_offset(value_type, 2)), copied_length)
+
+    func task_shape(task_type: TypeId) -> QbeTaskShape!:
+        match mir_type(self.program.types, task_type):
+            Task(result, failure_type): return QbeTaskShape(result = result, failure_type = failure_type)
+            else: error("qbe task backend: task operation has a non-task handle")
+
+    func emit_stack_allocation(value_type: TypeId) -> str:
+        let align = self.layout.align_of(value_type)
+        var instruction = "alloc4"
+        if align > 8: instruction = "alloc16"
+        elif align > 4: instruction = "alloc8"
+        var size = self.layout.size_of(value_type)
+        if size == 0: size = 1
+        let result = self.temp()
+        self.line(result + " =l " + instruction + " " + str(size))
+        return result
+
+    func address_text(base: str, offset: i64) -> str:
+        if offset == 0: return base
+        let result = self.temp()
+        self.line(result + " =l add " + base + ", " + str(offset))
+        return result
+
+    func emit_task_group_destroy():
+        if self.task_group == none: return
+        let group = self.task_group else trap("QBE task group disappeared")
+        self.line("call $luce_qbe_task_group_destroy(l " + self.reg(group) + ")")
 
     # Count zero is the canonical null storage token. A positive allocation
     # keeps the element type until this boundary, where its target layout is
@@ -1423,30 +1792,8 @@ class QbeEmitter:
     # mark: Type and text helpers ---------------------------------------------------------------
 
     func base_type(id: TypeId) -> str!:
-        match mir_type(self.program.types, id):
-            Int(bits, is_signed):
-                if bits <= 32: return "w"
-                return "l"
-            Float(bits):
-                if bits == 16:
-                    self.uses_float16 = true
-                    return "s"
-                if bits == 32: return "s"
-                return "d"
-            Bool: return "w"
-            Ptr: return "l"
-            BufferOwner: return "l"
-            BufferBuilder: return "l"
-            List(element): return "l"
-            Map(key, value): return "l"
-            Set(element): return "l"
-            Slice(element): return "l"
-            MutableSlice(element): return "l"
-            Class(identity): return "l"
-            WeakClass(identity): return "l"
-            Cell(element): return "l"
-            Interface(identity): return "l"
-            else: error("qbe backend: aggregate `" + describe_mir_type(self.program.types, id) + "` cannot occupy a temporary")
+        if self.is_float16(id): self.uses_float16 = true
+        return try qbe_base_type(self.program, id)
 
     func integer_base(id: TypeId) -> str:
         if bits_of(self.program.types, id) <= 32: return "w"
@@ -1455,69 +1802,14 @@ class QbeEmitter:
     # QBE's ABI extension types appear only at C function boundaries. MIR
     # keeps the portable width/sign; this backend chooses the QBE spelling.
     func abi_type(id: TypeId) -> str!:
-        match mir_type(self.program.types, id):
-            Int(bits, is_signed):
-                if bits == 8:
-                    if is_signed: return "sb"
-                    return "ub"
-                if bits == 16:
-                    if is_signed: return "sh"
-                    return "uh"
-                return try self.base_type(id)
-            Bool: return "ub"
-            else: return try self.base_type(id)
+        if self.is_float16(id): self.uses_float16 = true
+        return try qbe_abi_type(self.program, id)
 
     func load_instruction(id: TypeId) -> str!:
-        match mir_type(self.program.types, id):
-            Int(bits, is_signed):
-                if bits == 8:
-                    if is_signed: return "loadsb"
-                    return "loadub"
-                if bits == 16:
-                    if is_signed: return "loadsh"
-                    return "loaduh"
-                if bits == 32: return "loadw"
-                return "loadl"
-            Float(bits):
-                if bits == 32: return "loads"
-                return "loadd"
-            Bool: return "loadub"
-            Ptr: return "loadl"
-            BufferOwner: return "loadl"
-            BufferBuilder: return "loadl"
-            List(element): return "loadl"
-            Map(key, value): return "loadl"
-            Set(element): return "loadl"
-            Slice(element): return "loadl"
-            Class(identity): return "loadl"
-            WeakClass(identity): return "loadl"
-            Cell(element): return "loadl"
-            Interface(identity): return "loadl"
-            else: error("qbe backend: cannot load an aggregate")
+        return try qbe_load_instruction(self.program, id)
 
     func store_instruction(id: TypeId) -> str!:
-        match mir_type(self.program.types, id):
-            Int(bits, is_signed):
-                if bits == 8: return "storeb"
-                if bits == 16: return "storeh"
-                if bits == 32: return "storew"
-                return "storel"
-            Float(bits):
-                if bits == 32: return "stores"
-                return "stored"
-            Bool: return "storeb"
-            Ptr: return "storel"
-            BufferOwner: return "storel"
-            BufferBuilder: return "storel"
-            List(element): return "storel"
-            Map(key, value): return "storel"
-            Set(element): return "storel"
-            Slice(element): return "storel"
-            Class(identity): return "storel"
-            WeakClass(identity): return "storel"
-            Cell(element): return "storel"
-            Interface(identity): return "storel"
-            else: error("qbe backend: cannot store an aggregate")
+        return try qbe_store_instruction(self.program, id)
 
     func constant(function: MirFunction, result: RegisterId, value: MirConstant) -> str!:
         match value:
@@ -1544,17 +1836,21 @@ class QbeEmitter:
     func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, self.register_type(function, value)):
             List(element): return element
+            FrozenList(element): return element
             else: trap("verified list instruction has a non-list handle")
 
     func hash_key_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, self.register_type(function, value)):
             Map(key, item): return key
+            FrozenMap(key, item): return key
             Set(element): return element
+            FrozenSet(element): return element
             else: trap("verified hash instruction has a non-map/set handle")
 
     func hash_value_type(function: MirFunction, value: RegisterId) -> TypeId:
         match mir_type(self.program.types, self.register_type(function, value)):
             Map(key, item): return item
+            FrozenMap(key, item): return item
             else: trap("verified hash value instruction has a non-map handle")
 
     func hash_layout_arguments(function: MirFunction, value: RegisterId) -> str:
@@ -1565,7 +1861,11 @@ class QbeEmitter:
             Map(found_key, item):
                 value_size = self.layout.size_of(item)
                 value_alignment = self.storage_alignment(item)
+            FrozenMap(found_key, item):
+                value_size = self.layout.size_of(item)
+                value_alignment = self.storage_alignment(item)
             Set(element): pass
+            FrozenSet(element): pass
             else: trap("verified hash instruction has a non-map/set handle")
         return ", l " + str(self.layout.size_of(key)) + ", l " + str(self.storage_alignment(key)) + ", l " + str(value_size) + ", l " + str(value_alignment)
 
@@ -1647,12 +1947,7 @@ class QbeEmitter:
         self.line(self.reg(result) + " =w " + operation + " " + value)
 
     func function_name(id: FunctionId) -> str:
-        if self.program.functions[id.value].convention == CallingConvention.c:
-            return self.program.functions[id.value].name
-        let entry = self.program.entry
-        if entry != none:
-            if entry.value == id.value: return "main"
-        return "luce_f" + str(id.value)
+        return qbe_function_name(self.program, id)
 
     func reg(id: RegisterId) -> str:
         return "%r" + str(id.value)

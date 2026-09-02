@@ -36,6 +36,7 @@ struct PathComponent:
 pub func verify_transient_capability_lifetimes(program: MirProgram, function: MirFunction) -> !:
     try BufferBuilderVerifier(program, function).verify()
     try MutableSliceVerifier(program, function).verify()
+    try TaskGroupVerifier(program, function).verify()
 
 class BufferBuilderVerifier:
     let program: MirProgram
@@ -254,6 +255,132 @@ class MutableSliceVerifier:
 
     func fail_at(instruction: MirInstruction, message: str) -> !:
         error("MIR verifier: `" + self.function.name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + message)
+
+# mark: Structured task groups ================================================================
+
+## One invocation owns at most one compiler-created group. A group may span
+## arbitrary structured control flow, but every ordinary function exit must
+## finish it on that exact arm. Finishing is deliberately permitted before
+## root ownership cleanup; only another task operation or control transfer may
+## intervene before the terminal return/raise.
+class TaskGroupVerifier:
+    let program: MirProgram
+    let function: MirFunction
+
+    init(program: MirProgram, function: MirFunction):
+        self.program = program
+        self.function = function
+
+    func verify() -> !:
+        var group: RegisterId? = none
+        let finished_paths = list[list[PathComponent]]()
+        let path = list[PathComponent]()
+        for index in range(0, len(self.function.body)):
+            let instruction = self.function.body[index]
+            match instruction.form:
+                TaskGroupCreate(result):
+                    if group != none: try self.fail_at(instruction, "a function may create only one task group")
+                    if len(path) != 0: try self.fail_at(instruction, "`TaskGroupCreate` must dominate the function from its root region")
+                    group = result
+                TaskGroupFinish(value):
+                    let expected = group else error(self.diagnostic(instruction, "`TaskGroupFinish` has no preceding `TaskGroupCreate`"))
+                    if value.value != expected.value: try self.fail_at(instruction, "`TaskGroupFinish` names a different group")
+                    if self.has_finished_path(finished_paths, path): try self.fail_at(instruction, "`TaskGroupFinish` finishes the same path twice")
+                    finished_paths.append(copy_path(path))
+                TaskSpawn(result, value, target, arguments):
+                    let expected = group else error(self.diagnostic(instruction, "`TaskSpawn` has no preceding `TaskGroupCreate`"))
+                    if value.value != expected.value: try self.fail_at(instruction, "`TaskSpawn` names a different group")
+                    if self.has_finished_prefix(finished_paths, path): try self.fail_at(instruction, "`TaskSpawn` executes after `TaskGroupFinish`")
+                TaskWait(result, destination, failure, error_destination, task):
+                    if self.has_finished_prefix(finished_paths, path): try self.fail_at(instruction, "`TaskWait` executes after `TaskGroupFinish`")
+                TaskWaitAll(result, failure, error_destination, tasks):
+                    if self.has_finished_prefix(finished_paths, path): try self.fail_at(instruction, "`TaskWaitAll` executes after `TaskGroupFinish`")
+                TaskCancel(task):
+                    # Root deferred cleanup runs after the group has joined.
+                    # Cancellation is explicitly idempotent, so a deferred
+                    # cancel of an already-completed child remains valid.
+                    pass
+                Return(values):
+                    if group != none:
+                        if not self.remove_finished_path(finished_paths, path):
+                            try self.fail_at(instruction, "ordinary function exit bypasses `TaskGroupFinish`")
+                Raise(failure):
+                    if group != none:
+                        if not self.remove_finished_path(finished_paths, path):
+                            try self.fail_at(instruction, "ordinary function exit bypasses `TaskGroupFinish`")
+                Br(depth, values):
+                    if self.has_finished_prefix(finished_paths, path):
+                        try self.fail_at(instruction, "control leaves a path after `TaskGroupFinish` without returning or raising")
+                BrIf(condition, depth, values):
+                    if self.has_finished_prefix(finished_paths, path):
+                        try self.fail_at(instruction, "control leaves a path after `TaskGroupFinish` without returning or raising")
+                Yield(values):
+                    if self.has_finished_prefix(finished_paths, path):
+                        try self.fail_at(instruction, "control leaves a path after `TaskGroupFinish` without returning or raising")
+                Trap(message):
+                    discard(self.remove_finished_path(finished_paths, path))
+                Unreachable:
+                    discard(self.remove_finished_path(finished_paths, path))
+                Else:
+                    if self.has_finished_path(finished_paths, path):
+                        try self.fail_at(instruction, "a task-group finish falls through into another region arm")
+                    advance_arm(path)
+                Case(value):
+                    if self.has_finished_path(finished_paths, path):
+                        try self.fail_at(instruction, "a task-group finish falls through into another region arm")
+                    advance_arm(path)
+                Default:
+                    if self.has_finished_path(finished_paths, path):
+                        try self.fail_at(instruction, "a task-group finish falls through into another region arm")
+                    advance_arm(path)
+                End:
+                    if self.has_finished_path(finished_paths, path):
+                        try self.fail_at(instruction, "a task-group finish falls through its enclosing region")
+                    path.remove(len(path) - 1)
+                Block(results): path.append(PathComponent(opener = index, arm = 0))
+                Loop: path.append(PathComponent(opener = index, arm = 0))
+                If(condition, results): path.append(PathComponent(opener = index, arm = 0))
+                Switch(value): path.append(PathComponent(opener = index, arm = 0))
+                else: pass
+
+        if len(finished_paths) != 0: try self.fail("leaves a finished task-group path without its terminal exit")
+        var declared_groups = 0
+        for register_type in self.function.registers:
+            match mir_type(self.program.types, register_type):
+                TaskGroup: declared_groups += 1
+                else: pass
+        if group == none and declared_groups != 0: try self.fail("declares a task group not produced by `TaskGroupCreate`")
+        if group != none and declared_groups != 1: try self.fail("must declare exactly one task-group register")
+
+    func has_finished_path(paths: list[list[PathComponent]], path: list[PathComponent]) -> bool:
+        for candidate in paths:
+            if paths_match(candidate, path): return true
+        return false
+
+    func has_finished_prefix(paths: list[list[PathComponent]], path: list[PathComponent]) -> bool:
+        for candidate in paths:
+            if len(candidate) > len(path): continue
+            var matches = true
+            for index in range(0, len(candidate)):
+                if candidate[index].opener != path[index].opener or candidate[index].arm != path[index].arm: matches = false
+            if matches: return true
+        return false
+
+    func remove_finished_path(paths: list[list[PathComponent]], path: list[PathComponent]) -> bool:
+        for index in range(0, len(paths)):
+            if paths_match(paths[index], path):
+                paths.remove(index)
+                return true
+        return false
+
+    func diagnostic(instruction: MirInstruction, message: str) -> str:
+        return "MIR verifier: `" + self.function.name + "` at " + str(instruction.span.line) + ":" + str(instruction.span.column) + ": " + message
+
+    func fail(message: str) -> !:
+        error("MIR verifier: `" + self.function.name + "` " + message)
+
+    func fail_at(instruction: MirInstruction, message: str) -> !:
+        error(self.diagnostic(instruction, message))
 
 # mark: Path helpers ===========================================================================
 

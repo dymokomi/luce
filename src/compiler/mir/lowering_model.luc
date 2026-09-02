@@ -16,7 +16,7 @@
 from compiler.mir.canonical import BuiltinMirType, CallingConvention, ClassId, ClosureId, ExternId, ExternalGlobalId, FunctionId, InterfaceId
 from compiler.mir.canonical import MirClass, MirClassField, MirClosure, MirConformance, MirData, MirExtern, MirExternalGlobal, MirField, MirFunction, MirGlobal
 from compiler.mir.canonical import MirInterface, MirInterfaceRequirement, MirRuntimeBinding, MirSignature, MirSlot, MirTypeTable, RegisterId
-from compiler.mir.canonical import MirType, TypeId, builtin_mir_type, create_builtin_mir_types
+from compiler.mir.canonical import MirTaskResult, MirType, TypeId, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, make_enum_type
 from compiler.mir.canonical import OperandBuilder, is_aggregate_type, is_ptr_type, make_struct_type, mir_type, mir_types_match, signatures_match
 from compiler.hir.ir import BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
@@ -167,6 +167,10 @@ pub class MirLoweringState:
     ## Whole-program HIR proof that these functions may receive their exact
     ## class receiver as a non-owning capability during destruction.
     pub let borrowed_receiver_methods: list[SymbolId]
+    ## Exact functions whose own bodies contain `spawn`. This analyzed HIR
+    ## fact is deliberately non-transitive because each invocation owns only
+    ## the children it creates directly.
+    pub let direct_spawn_functions: list[SymbolId]
     # Program-wide tables the lowered functions refer to by identity.
     pub let types: MirTypeTable
     pub let externs: list[MirExtern]
@@ -220,6 +224,10 @@ pub class MirLoweringState:
     # Deferred actions currently registered in enclosing lexical scopes, and
     # the first action belonging to each active source loop.
     pub var defers: list[DeferredAction]
+    ## Start of every active lexical source scope, root first. Function exits
+    ## use the first nested boundary to finish workers after nested cleanup but
+    ## before the root function-scope cleanup suffix.
+    pub var scope_defer_starts: list[i64]
     pub var loop_defer_starts: list[i64]
     pub var recover_targets: list[RecoverTarget]
     # The operand table of the function being lowered.
@@ -228,12 +236,16 @@ pub class MirLoweringState:
     # function does not use that protocol), and the newline data item.
     pub var error_slot: i64
     pub var result_slot: i64
+    ## The compiler-internal task-group register, or `-1` when this function
+    ## contains no direct spawn.
+    pub var task_group: i64
     pub var newline_data: i64
 
     ## Prepare to lower one analyzed program; `lower` walks it once for every backend.
-    pub init(program: HirProgram, borrowed_receiver_methods: list[SymbolId]):
+    pub init(program: HirProgram, borrowed_receiver_methods: list[SymbolId], direct_spawn_functions: list[SymbolId]):
         self.program = program
         self.borrowed_receiver_methods = borrowed_receiver_methods
+        self.direct_spawn_functions = direct_spawn_functions
         self.types = create_builtin_mir_types()
         self.externs = list[MirExtern]()
         self.external_globals = list[MirExternalGlobal]()
@@ -276,11 +288,13 @@ pub class MirLoweringState:
         self.parameters = list[Local]()
         self.regions = list[Region]()
         self.defers = list[DeferredAction]()
+        self.scope_defer_starts = list[i64]()
         self.loop_defer_starts = list[i64]()
         self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
         self.error_slot = -1
         self.result_slot = -1
+        self.task_group = -1
         self.newline_data = -1
 
     # mark: Program declarations ================================================================
@@ -514,6 +528,11 @@ pub class MirLoweringState:
         # Composites are interned structurally, so two `(i64, bool)` tuples
         # share one MIR type and the verifier sees each layout once.
         match self.program.types.definitions[value.value].form:
+            # Unit normally has no register, but it is a legitimate zero-size
+            # element of a collection such as the ordered result of
+            # `wait_all(list[task[unit]])`.
+            Unit: return self.intern_lowered_type(make_struct_type(list[TypeId]()))
+            Never: return self.intern_lowered_type(MirType.Uninhabited)
             String: return self.string_type()
             Bytes: return self.bytes_type()
             ErrorCode:
@@ -615,6 +634,9 @@ pub class MirLoweringState:
             List(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.List(element = element_type))
+            FrozenList(element):
+                let element_type = try self.lower_mir_type(element)
+                return self.intern_lowered_type(MirType.FrozenList(element = element_type))
             Map(key, element):
                 let key_type = try self.lower_mir_type(key)
                 let element_type = try self.lower_mir_type(element)
@@ -622,12 +644,27 @@ pub class MirLoweringState:
             Set(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.Set(element = element_type))
+            FrozenMap(key, element):
+                let key_type = try self.lower_mir_type(key)
+                let element_type = try self.lower_mir_type(element)
+                return self.intern_lowered_type(MirType.FrozenMap(key = key_type, value = element_type))
+            FrozenSet(element):
+                let element_type = try self.lower_mir_type(element)
+                return self.intern_lowered_type(MirType.FrozenSet(element = element_type))
             Slice(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.Slice(element = element_type))
             MutableSlice(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.MutableSlice(element = element_type))
+            Task(result):
+                let failure_type = try self.lower_mir_type(resolve_builtin_type(BuiltinType.error_value))
+                if types_match(result, resolve_builtin_type(BuiltinType.unit)):
+                    return self.intern_lowered_type(MirType.Task(result = MirTaskResult.Unit, failure_type = failure_type))
+                if types_match(result, resolve_builtin_type(BuiltinType.never_type)):
+                    return self.intern_lowered_type(MirType.Task(result = MirTaskResult.Never, failure_type = failure_type))
+                let result_type = try self.lower_mir_type(result)
+                return self.intern_lowered_type(MirType.Task(result = MirTaskResult.Value(value_type = result_type), failure_type = failure_type))
             Extern(index):
                 # Nominality is a source/HIR rule. Canonical MIR carries the
                 # declared target-neutral token representation; ABI placement

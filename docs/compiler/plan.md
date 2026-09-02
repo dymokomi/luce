@@ -677,8 +677,16 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   shape barrier; only a backend supplies layout and encodes the opaque handle.
   Both semantic oracles, QBE, Wasm, focused diagnostics, malformed-MIR tests,
   traps, and `examples/mutable_slices.luc` agree. Worker transfer remains
-  unavailable wholesale and S15/S19 must reuse the same non-storable predicate
-  when that boundary becomes executable.
+  forbidden for this affine capability; the completed §19 sendability proof
+  reuses the same non-storable predicate and reports the exact transfer path.
+- [x] **Structured workers and immutable transfer snapshots reach QBE**
+  (2026-09-01, `done.md` §2). Named Luce workers, recursive sendability,
+  frozen list/map/set graphs, lexical groups, cached waits, cancellation,
+  traps/errors, and ordered `wait_all` are complete through HIR and canonical
+  MIR. QBE uses immediate process isolation and generated typed codecs entirely
+  behind the backend boundary; Wasm retains snapshot support and rejects tasks
+  explicitly under WASI preview 1. No platform or transport fact enters HIR,
+  MIR, verification, optimization, or the sealed runtime contract.
 - [ ] **Complete runtime-backed collections and text.** Runtime-backed
   `list[T]` construction, identity, indexed access, append, insert,
   `remove_at`, clear, reserve, aggregate elements, growth, and immutable list
@@ -751,13 +759,15 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   `examples/closures.luc`. MIR retains only typed descriptor/environment
   contracts; physical layout begins in each backend. *Gate passed: capture
   rule.*
-- [ ] **Finish the remaining §14 worker contract.** Fallible
+- [x] **Finish the remaining §14 closure contract.** Fallible
   invocation, infallible-to-fallible function lifting, `weak self`, managed
   values in fields/collections, and directly provable stored strong cycles are
   complete (`done.md` §2). The accidental shared-cell advisory now flows as a
   structured, non-fatal analysis result through check, run, compilation, build,
   and CLI presentation; it neither changes valid capture semantics nor prints
-  from HIR generation. Sendability closes with workers.
+  from HIR generation. The §19 worker proof now closes sendability by
+  structurally rejecting every function/closure environment at the transfer
+  path; no backend-specific closure rule was added.
 - [x] **Interface values** (2026-08-31). Existential conversion and dynamic
   requirement calls retain nominal interface/conformance identities through
   HIR and target-neutral MIR. The sealed runtime owns erased payload lifetime
@@ -789,7 +799,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   specialize without dependency syntax. A real separately encoded dependency
   executes through HIR, canonical MIR, Wasm, and QBE. No generic form reaches
   MIR (`done.md` §2).
-- [ ] **Workers** (`spawn`, tasks, sendability, `wait_all`).
+- [x] **Workers** (`spawn`, tasks, sendability, frozen snapshots, cached
+  waits, cancellation, and ordered `wait_all`) through the stable QBE oracle
+  (`done.md` §2). Luce-owned native backends must reproduce this canonical
+  contract behind their own backend boundary.
 - [ ] **Luce-native backends**, only after QBE is a stable harness column;
   implement one target behind the existing MIR backend boundary, then prove it
   against QBE before adding another.

@@ -85,6 +85,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   through both semantic oracles, Wasm, and native QBE. Storage, capture,
   return, generic erasure, and native-boundary exclusions are enforced
   by the compiler rather than represented as user-visible lifetime machinery.
+- `tasks.luc` proves named isolated workers, recursively checked sendability,
+  frozen list/map/set transfer, detached mutable sources, copied worker
+  results, cached waits, ordered `wait_all`, and lexical supervision through
+  both semantic oracles and a native QBE artifact. The same canonical MIR
+  reaches every backend; Wasm rejects process-isolated tasks explicitly
+  because WASI preview 1 cannot implement their required semantics.
 - `expressions_and_calls.luc` closes the core expression/function audit with
   observable receiver, argument, literal, interpolation, binary, assignment,
   and constructor order; pure defaults, named placement, tuples, exact
@@ -130,7 +136,6 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   in collections and class fields, and named/`self` weak captures through both
   semantic oracles, Wasm, and native QBE. Default mutable capture also emits
   the non-fatal structured shared-cell advisory through check, run, and build.
-  Worker sendability stays explicit in the compiler plan.
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
