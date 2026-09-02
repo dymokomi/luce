@@ -8,20 +8,34 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 
 - `temperature.c` and `temperature.h` are the native library.
 - `../luce.toml` declares the `temperature` C binding target.
-- `temperature.raw` is generated from the header and is not checked in.
+- `temperature/raw.native.luc` and `temperature.adapter.c` are generated from
+  the header and are not checked in.
 - `temperature.luc` performs explicit `c.double` conversions and exposes a
   safe Luce-facing function.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
-The C path currently stops after parsing, before FIIR generation, native
-binding, or linking (the stages are specified in `docs/language/1.0.md`
-§21). Until those stages land, validate the two source sides
-independently:
+The first executable importer rung supports exact IEEE binary64 C `double`.
+It records Clang's target and scalar facts in FIIR, generates a nominal
+`c.double` raw module plus a checked C adapter, and links that adapter only at
+the QBE backend boundary. Integer types, pointers, records, recipes, and the
+f16 shim remain explicit generation errors until their complete contracts are
+implemented.
+
+Generate the binding products with explicit destinations:
 
 ```sh
-cc -std=c11 -Wall -Wextra -Werror -fsyntax-only examples/c_import/temperature.c
-./stage0/bin/luce-0 test tests/compiler/examples_test.luc
+mkdir -p build/temperature
+./build/luce bind --name temperature \
+  --fiir build/temperature.fiir.json \
+  --raw build/temperature/raw.native.luc \
+  --adapter build/temperature.adapter.c \
+  --clang-arg -std=c11 \
+  examples/c_import/temperature.h
 ```
 
-Once `luce bind` is implemented, this directory becomes the first end-to-end C
-import fixture.
+The CLI regression suite then builds and runs this example through the real
+QBE product path with `src/standard/c.luc`, the generated raw module and
+adapter, and `temperature.c` supplied as distinct inputs. Keeping each input
+visible is intentional: package/manifest discovery is deferred past 1.0, and
+the compiler does not guess source roots, sidecar names, include paths, or
+libraries.

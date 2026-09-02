@@ -20,7 +20,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 906 unit tests across 33 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 920 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1491,6 +1491,36 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   906-test, CLI, Wasmtime, and native-QBE gate is green. The generated f16
   adapter remains correctly dependent on S21 FIIR, while automatic inclusion
   of standard modules in compiler products remains S30.
+
+- [x] **The first Clang-to-QBE FIIR binding is an executable product path**
+  (2026-09-02). Backend-independent FIIR now records exact source origins,
+  calling convention, scalar value/object representations, boundary contract
+  fields, the Clang target and complete argument vector. Its validator rejects
+  incomplete facts before generation. Backend-owned Clang inspection uses the
+  same command and arguments for target, predefined-macro, and JSON-AST
+  queries; every host-tool failure reports captured stderr and removes its
+  owner-only temporary directory.
+
+  The first deliberately narrow generator accepts only exact IEEE binary64 C
+  `double`. It emits deterministic JSON, a raw native Luce module whose public
+  surface uses nominal `c.double`, and a C adapter with compile-time size and
+  floating-model assertions. HIR and canonical MIR therefore see only the
+  ordinary nominal wrapper and an exact `f64` adapter call; no target width,
+  layout, triple, compiler flag, or platform condition enters either shared
+  representation. Unsupported integer, pointer, variadic, and exotic-float
+  boundaries fail with explicit generation diagnostics.
+
+  `luce bind` installs explicit FIIR/raw/adapter destinations atomically per
+  product. Package loading gives compiler-supplied standard modules their own
+  root and provenance, so the generated module imports stable module `c`
+  independently of the application layout. Native `luce build` accepts
+  explicit C sources and compiler arguments only for QBE materialization; the
+  same arguments select the C target and compile/link the sources, and linker
+  failure still preserves the previous executable. Focused FIIR tests, the
+  HIR/MIR/Wasm/QBE semantic triangle, direct generated-adapter execution, and
+  the CLI's `temperature.h` → bind → native build → C execution fixture prove
+  the product loop. The remaining §21 importer vocabulary and binding recipes
+  stay open under S21.
 
 - [x] **Borrowed C lists expose their one existing dense representation**
   (2026-09-01). `extern func` input parameters now admit `list[H]` exactly

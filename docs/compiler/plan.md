@@ -844,7 +844,24 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   implement one target behind the existing MIR backend boundary, then prove it
   against QBE before adding another.
 - [ ] **Native image/link support** after native code generation is justified.
-- [ ] **C import (FIIR)** from headers via Clang, for Cocoa/Metal, OpenSSL/Monocypher, wasm3 during transition.
+- [x] **Establish the C-import FIIR product path** (2026-09-02). One
+  backend-owned Clang invocation supplies its exact target, predefined scalar
+  facts, and JSON AST to a validated, versioned FIIR module. The first closed
+  generator rung accepts exact IEEE binary64 C `double`, emits an audited
+  `.native.luc` module using nominal `c.double` plus a C adapter guarded by
+  representation assertions, and installs all three explicit text products
+  through owner-only sibling scratch directories. The application and
+  compiler-supplied standard source retain independent roots; native C source
+  files and compiler flags enter only at QBE materialization. Both semantic
+  oracles, Wasm/QBE encoders, direct QBE/C execution, and the CLI's complete
+  bind/build/run path cover the slice. Unsupported scalars and declarations
+  fail generation rather than guessing a target representation.
+- [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
+  recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
+  transition: checked nominal integers and other floats, enums/records/unions,
+  constants, arrays/pointers/function pointers/opaque types, ownership and
+  nullability recipes, typed variadic adapters, support tiers, deterministic
+  regeneration diagnostics, and the generated f16 shim.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
 - [x] **`luce build --time-report` for generics** (2026-08-31). Report source

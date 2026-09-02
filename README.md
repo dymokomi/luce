@@ -64,6 +64,13 @@ companion products explicitly with `--c-header PATH` and
 versioned JSON record of the exact host target and QBE-owned sizes,
 alignments, field offsets, symbols, and calling conventions.
 
+The first C-import rung generates inspectable FIIR, raw Luce, and C-adapter
+products from an exact Clang invocation. It currently admits only C `double`
+when Clang proves IEEE binary64; every broader scalar or declaration fails
+explicitly until its complete adapter contract lands. The end-to-end command
+and generated module layout are documented in
+[`examples/c_import/README.md`](examples/c_import/README.md).
+
 ## Vocabulary
 
 A few terms recur in the source and in this README:

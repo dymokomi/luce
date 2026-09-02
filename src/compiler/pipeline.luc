@@ -127,6 +127,7 @@ from compiler.hir.analyzer import AnalyzedProgram, SemanticAnalyzer
 from compiler.frontend.source import Diagnostic
 from compiler.frontend.tokenizer import Token, Tokenizer
 from compiler.hir.ir import ModuleAuthority, PackageRole, Value
+from compiler.product_io import install_text_atomically
 from compiler.runtime_contract import RuntimeService
 from compiler.source_modules import source_module_name
 import std.files
@@ -135,6 +136,13 @@ import std.paths
 
 # mark: Targets ===============================================================================
 
+## Compiler-supplied standard modules have their own source root. Their names
+## therefore remain `c`, `math`, and so on regardless of the application
+## layout; the loader also supplies their authority explicitly.
+pub struct StandardSourceInput:
+    pub let source_root: str
+    pub let source_paths: list[str]
+
 ## The identity and source files that make one compilation unit. Package
 ## identity is an explicit input because it is part of `ErrorCode` values;
 ## deriving it from a path would make moving a checkout change program data.
@@ -142,9 +150,9 @@ pub struct PackageInput:
     pub let identity: str
     pub let source_root: str
     pub let source_paths: list[str]
-    ## Paths supplied by the compiler's standard-library loader. Membership is
-    ## provenance, not a naming convention visible to package source.
-    pub let standard_source_paths: list[str]? = none
+    ## Source supplied by the compiler's standard-library loader. This is
+    ## provenance, not a suffix or naming convention visible to source.
+    pub let standard_sources: StandardSourceInput? = none
 
 ## Operational limits for one package compilation. These are compiler-product
 ## policy, never source semantics or MIR facts.
@@ -157,6 +165,12 @@ pub struct CompilationOptions:
 pub struct BuildOutputOptions:
     pub let c_header: str? = none
     pub let abi_report: str? = none
+
+## Native-only host-tool inputs. They are consumed after canonical MIR at the
+## QBE boundary and cannot influence source typing or lowering.
+pub struct NativeBuildOptions:
+    pub let c_sources: list[str]? = none
+    pub let c_arguments: list[str]? = none
 
 ## One semantic service named by a sealed package descriptor. The source
 ## spelling is resolved once to a HIR identity; it is not a linker convention.
@@ -211,10 +225,11 @@ pub struct CompiledProgram:
 ## Compile source files through every build stage and install the completed
 ## artifact at `output`. Native artifacts use the QBE host toolchain; QBE owns
 ## its scratch and replaces the destination only after linking succeeds.
-pub func build(target: BuildTarget, output: str, package: PackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions()) -> BuildResult!:
+pub func build(target: BuildTarget, output: str, package: PackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions(), native: NativeBuildOptions? = none) -> BuildResult!:
     try validate_build_outputs(target, output, outputs)
+    try validate_native_build_options(target, output, outputs, native)
     let compiled = try lower_and_verify(package, options)
-    let materialized = try materialize(target, output, compiled.program)
+    let materialized = try materialize(target, output, compiled.program, native)
     try install_c_products(compiled.c_api, compiled.program, materialized.native_target, outputs)
     return BuildResult(
         diagnostics = compiled.diagnostics,
@@ -224,10 +239,11 @@ pub func build(target: BuildTarget, output: str, package: PackageInput, options:
 ## Build with an explicitly supplied sealed runtime package. Keeping the
 ## package input visible makes deployment/package lookup a caller concern,
 ## while every compiler stage still consumes one composed canonical MIR.
-pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions()) -> BuildResult!:
+pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions(), native: NativeBuildOptions? = none) -> BuildResult!:
     try validate_build_outputs(target, output, outputs)
+    try validate_native_build_options(target, output, outputs, native)
     let compiled = try compile_with_runtime(package, runtime, options)
-    let materialized = try materialize(target, output, compiled.program)
+    let materialized = try materialize(target, output, compiled.program, native)
     try install_c_products(compiled.c_api, compiled.program, materialized.native_target, outputs)
     return BuildResult(
         diagnostics = compiled.diagnostics,
@@ -238,14 +254,20 @@ struct MaterializedArtifact:
     let emissions: list[FunctionEmission]
     let native_target: str?
 
-func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> MaterializedArtifact!:
+func materialize(target: BuildTarget, output: str, optimized_program: MirProgram, native: NativeBuildOptions?) -> MaterializedArtifact!:
     match target:
         wasm:
             let emission = try WasmBackend(os.clock_ms).emit_with_report(optimized_program)
             try files.write_bytes(output, emission.bytes)
             return MaterializedArtifact(emissions = emission.functions, native_target = none)
         native:
-            let emission = try QbeToolchain().materialize_with_report(optimized_program, output)
+            var c_sources: list[str]? = none
+            var c_arguments: list[str]? = none
+            if native != none:
+                let options = native
+                c_sources = options.c_sources
+                c_arguments = options.c_arguments
+            let emission = try QbeToolchain().materialize_with_report(optimized_program, output, c_sources, c_arguments)
             return MaterializedArtifact(emissions = emission.functions, native_target = emission.target)
 
 ## Run the complete frontend and semantic analysis, returning analyzed typed
@@ -351,7 +373,7 @@ func analyze_sources(package: PackageInput, options: CompilationOptions) -> Anal
 func analyze_package(package: PackageInput, role: PackageRole, bindings: list[RuntimeBindingInput], options: CompilationOptions) -> AnalyzedProgram!:
     if len(package.identity) == 0: error("package identity cannot be empty")
     if options.generic_specialization_budget <= 0: error("generic specialization budget must be positive")
-    let sources = try read_sources(package.source_root, package.source_paths, package.standard_source_paths)
+    let sources = try read_sources(package)
     let tokenized_files = try tokenize_sources(sources)
     let modules = try parse_modules(tokenized_files)
     let generator = HirGenerator(package.identity, modules, role, options.generic_specialization_budget, os.clock_ms)
@@ -387,6 +409,35 @@ func verify_and_optimize(canonical_program: MirProgram) -> OptimizationResult!:
 
 # mark: C product installation ================================================================
 
+func validate_native_build_options(target: BuildTarget, artifact: str, outputs: BuildOutputOptions, native: NativeBuildOptions?) -> !:
+    if native == none: return
+    let options = native
+    let sources = options.c_sources
+    let arguments = options.c_arguments
+    let header = outputs.c_header
+    let report = outputs.abi_report
+    var has_sources = false
+    var has_arguments = false
+    if sources != none: has_sources = len(sources) > 0
+    if arguments != none: has_arguments = len(arguments) > 0
+    if target != BuildTarget.native and (has_sources or has_arguments):
+        error("build: C sources and arguments require `--target native`")
+    if sources != none:
+        for index in range(0, len(sources)):
+            let source = sources[index]
+            if source == "": error("build: C source path cannot be empty")
+            if source == artifact: error("build: C source must differ from the primary artifact")
+            if header != none and source == header:
+                error("build: C source must differ from the C header output")
+            if report != none and source == report:
+                error("build: C source must differ from the ABI report output")
+            for earlier in range(0, index):
+                if sources[earlier] == source:
+                    error("build: duplicate C source `" + source + "`")
+    if arguments != none:
+        for argument in arguments:
+            if argument == "": error("build: C compiler argument cannot be empty")
+
 func validate_build_outputs(target: BuildTarget, artifact: str, outputs: BuildOutputOptions) -> !:
     if outputs.c_header == none and outputs.abi_report == none: return
     if target != BuildTarget.native: error("build: C header and ABI report outputs require `--target native`")
@@ -404,41 +455,35 @@ func validate_build_outputs(target: BuildTarget, artifact: str, outputs: BuildOu
 func install_c_products(api: CApiInterface, program: MirProgram, native_target: str?, outputs: BuildOutputOptions) -> !:
     if outputs.c_header != none:
         let path = outputs.c_header else trap("C header path disappeared")
-        try install_text_atomically(path, render_c_header(api), "header")
+        try install_text_atomically(path, render_c_header(api), "build: C header")
     if outputs.abi_report != none:
         let path = outputs.abi_report else trap("ABI report path disappeared")
         let target = native_target else trap("validated native build produced no target")
-        try install_text_atomically(path, try render_qbe_abi_report(api, program, target), "ABI report")
-
-func install_text_atomically(output: str, contents: str, product: str) -> !:
-    let scratch = try files.make_temporary_directory(paths.dir(output), ".luce-c-product-")
-    let candidate = paths.join(scratch, "artifact")
-    files.write(candidate, contents) catch reason:
-        error(c_product_failure(scratch, "build: cannot write C " + product + ": " + reason))
-    files.rename(candidate, output) catch reason:
-        error(c_product_failure(scratch, "build: cannot install C " + product + " `" + output + "`: " + reason))
-    files.remove_all(scratch) catch reason:
-        error("build: installed C " + product + " `" + output + "` but cannot remove scratch `" + scratch + "`: " + reason)
-
-func c_product_failure(scratch: str, reason: str) -> str:
-    files.remove_all(scratch) catch cleanup_reason:
-        return reason + "; cannot remove scratch `" + scratch + "`: " + cleanup_reason
-    return reason
+        try install_text_atomically(path, try render_qbe_abi_report(api, program, target), "build: C ABI report")
 
 # mark: Source stages =========================================================================
 
-# Read each requested path into a package-relative named source value while
-# retaining its written path for diagnostics.
-func read_sources(source_root: str, source_paths: list[str], standard_source_paths: list[str]?) -> list[SourceFile]!:
+# Read application and compiler-supplied standard roots into one semantic
+# package while retaining each written path for diagnostics.
+func read_sources(package: PackageInput) -> list[SourceFile]!:
     let sources = list[SourceFile]()
-    for path in source_paths:
-        let authority = module_authority(path, standard_source_paths)
+    for path in package.source_paths:
+        let authority = application_module_authority(path)
         sources.append(SourceFile(
-            name = try source_module_name(source_root, path, authority),
+            name = try source_module_name(package.source_root, path, authority),
             path = path,
             authority = authority,
             text = try files.read(path),
         ))
+    let standard = package.standard_sources
+    if standard != none:
+        for path in standard.source_paths:
+            sources.append(SourceFile(
+                name = try source_module_name(standard.source_root, path, ModuleAuthority.standard),
+                path = path,
+                authority = ModuleAuthority.standard,
+                text = try files.read(path),
+            ))
     return sources
 
 # Turn source text into tokens, including synthesized indent/dedent layout, and
@@ -474,11 +519,8 @@ func parse_modules(tokenized_files: list[TokenizedFile]) -> list[SourceModule]!:
 # The suffix is package-reader authority, not grammar or a naming convention
 # interpreted by HIR. Removing both suffixes keeps `arena.native.luc` as module
 # `arena`, so importing its safe wrappers does not mention the authority bit.
-func module_authority(path: str, standard_source_paths: list[str]?) -> ModuleAuthority:
+func application_module_authority(path: str) -> ModuleAuthority:
     let suffix = ".native.luc"
     if len(path) >= len(suffix) and path[len(path) - len(suffix):] == suffix:
         return ModuleAuthority.native
-    if standard_source_paths != none:
-        for standard_path in standard_source_paths:
-            if path == standard_path: return ModuleAuthority.standard
     return ModuleAuthority.safe

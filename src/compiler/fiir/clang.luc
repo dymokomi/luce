@@ -1,0 +1,327 @@
+#==============================================================================================
+#
+#   fiir.clang - Strict Clang serialized-AST ingestion
+#
+#   DESCRIPTION:
+#       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
+#       spelling conventions stop here. The decoder accepts only the complete
+#       C scalar-function slice; every other declaration or type is either
+#       outside the requested header or rejected with a stable support
+#       diagnostic.
+#
+#       Clang elides repeated file and line fields in source locations. The
+#       top-level cursor below reconstructs only those documented repetitions;
+#       an actually absent declaration position is never fabricated.
+#
+#==============================================================================================
+
+from compiler.fiir.schema import FiirBoundaryValue, FiirCallingConvention, FiirFunction, FiirLanguage, FiirModule, FiirParameter, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, scalar_boundary, validate_fiir
+import std.json
+import std.strings
+
+# mark: Target facts ===========================================================================
+
+## Width facts emitted by the same Clang invocation that parsed the header.
+## Keeping this as input makes tests independent of the machine running them
+## and prevents the decoder from treating the compiler host as the C target.
+pub struct ClangScalarFacts:
+    pub let char_size_bits: u16
+    pub let short_size_bits: u16
+    pub let short_value_bits: u16
+    pub let int_size_bits: u16
+    pub let int_value_bits: u16
+    pub let long_size_bits: u16
+    pub let long_value_bits: u16
+    pub let long_long_size_bits: u16
+    pub let long_long_value_bits: u16
+    pub let float_storage_bits: u16
+    pub let float_radix: u16
+    pub let float_significand_bits: u16
+    pub let float_maximum_exponent: i32
+    pub let double_storage_bits: u16
+    pub let double_significand_bits: u16
+    pub let double_maximum_exponent: i32
+    pub let long_double_storage_bits: u16
+    pub let long_double_significand_bits: u16
+    pub let long_double_maximum_exponent: i32
+    pub let plain_char_is_signed: bool
+    pub let bool_bits: u16
+
+## Decode Clang's predefined-macro report (`-dM -E -x c`) into the scalar
+## layout facts needed by this FIIR slice.
+pub func decode_clang_scalar_facts(macros: str) -> ClangScalarFacts!:
+    let char_bits = try required_macro_integer(macros, "__CHAR_BIT__")
+    let facts = ClangScalarFacts(
+        char_size_bits = try storage_width(macros, "__SIZEOF_CHAR__", char_bits, true),
+        short_size_bits = try storage_width(macros, "__SIZEOF_SHORT__", char_bits, false),
+        short_value_bits = try positive_u16(macros, "__SHRT_WIDTH__"),
+        int_size_bits = try storage_width(macros, "__SIZEOF_INT__", char_bits, false),
+        int_value_bits = try positive_u16(macros, "__INT_WIDTH__"),
+        long_size_bits = try storage_width(macros, "__SIZEOF_LONG__", char_bits, false),
+        long_value_bits = try positive_u16(macros, "__LONG_WIDTH__"),
+        long_long_size_bits = try storage_width(macros, "__SIZEOF_LONG_LONG__", char_bits, false),
+        long_long_value_bits = try positive_u16(macros, "__LLONG_WIDTH__"),
+        float_storage_bits = try storage_width(macros, "__SIZEOF_FLOAT__", char_bits, false),
+        float_radix = try positive_u16(macros, "__FLT_RADIX__"),
+        float_significand_bits = try positive_u16(macros, "__FLT_MANT_DIG__"),
+        float_maximum_exponent = try positive_i32(macros, "__FLT_MAX_EXP__"),
+        double_storage_bits = try storage_width(macros, "__SIZEOF_DOUBLE__", char_bits, false),
+        double_significand_bits = try positive_u16(macros, "__DBL_MANT_DIG__"),
+        double_maximum_exponent = try positive_i32(macros, "__DBL_MAX_EXP__"),
+        long_double_storage_bits = try storage_width(macros, "__SIZEOF_LONG_DOUBLE__", char_bits, false),
+        long_double_significand_bits = try positive_u16(macros, "__LDBL_MANT_DIG__"),
+        long_double_maximum_exponent = try positive_i32(macros, "__LDBL_MAX_EXP__"),
+        plain_char_is_signed = not has_macro(macros, "__CHAR_UNSIGNED__"),
+        bool_bits = try positive_u16(macros, "__BOOL_WIDTH__"),
+    )
+    return facts
+
+func storage_width(macros: str, name: str, char_bits: i64, optional_one: bool) -> u16!:
+    var byte_count = required_macro_integer(macros, name) catch reason:
+        if optional_one: return u16(char_bits)
+        error(reason)
+    let bits = byte_count * char_bits
+    if bits <= 0 or bits > 65535: error("Clang target facts: `" + name + "` is outside the supported range")
+    return u16(bits)
+
+func positive_u16(macros: str, name: str) -> u16!:
+    let value = try required_macro_integer(macros, name)
+    if value > 65535: error("Clang target facts: `" + name + "` is outside the supported range")
+    return u16(value)
+
+func positive_i32(macros: str, name: str) -> i32!:
+    let value = try required_macro_integer(macros, name)
+    if value > 2147483647: error("Clang target facts: `" + name + "` is outside the supported range")
+    return i32(value)
+
+func required_macro_integer(macros: str, name: str) -> i64!:
+    let prefix = "#define " + name + " "
+    for line in strings.split(macros, "\n"):
+        if strings.starts_with(line, prefix):
+            let value = parse_i64(line[len(prefix):]) else error("Clang target facts: `" + name + "` is not an integer")
+            if value <= 0: error("Clang target facts: `" + name + "` must be positive")
+            return value
+    error("Clang target facts: missing `" + name + "`")
+
+func has_macro(macros: str, name: str) -> bool:
+    let prefix = "#define " + name
+    for line in strings.split(macros, "\n"):
+        if line == prefix or strings.starts_with(line, prefix + " "): return true
+    return false
+
+# mark: AST document ===========================================================================
+
+class SourceCursor:
+    var path: str
+    var line: u32
+
+    init(path: str, line: u32):
+        self.path = path
+        self.line = line
+
+## Decode the translation-unit JSON produced for `header`. Only declarations
+## whose effective Clang location belongs to that exact input are imported;
+## builtins and declarations from included headers remain foreign dependencies
+## until include ownership is modeled explicitly.
+pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts) -> FiirModule!:
+    if header == "": error("Clang FIIR: source header cannot be empty")
+    if target == "": error("Clang FIIR: target cannot be empty")
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "translation unit")
+    if root_kind != "TranslationUnitDecl":
+        error("Clang FIIR: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
+    let declarations = try required_array_member(root, "inner", "translation unit")
+    let types = list[FiirType]()
+    let functions = list[FiirFunction]()
+    let cursor = SourceCursor(path = "", line = u32(0))
+
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        if origin == none or cursor.path != header: continue
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        let implicit = try optional_bool_member(declaration, "isImplicit", "declaration") else false
+        if implicit: continue
+        if kind == "FunctionDecl":
+            functions.append(try decode_function(declaration, origin, types, facts))
+        elif kind == "TypedefDecl" or kind == "RecordDecl" or kind == "EnumDecl" or kind == "VarDecl":
+            error("Clang FIIR: `" + kind + "` at " + origin_text(origin) + " is not supported by the scalar-function importer yet")
+        else:
+            error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
+
+    let module = FiirModule(
+        format_version = u32(1),
+        language = FiirLanguage.c,
+        generator_version = "luce-fiir-1",
+        header = header,
+        target = target,
+        clang_arguments = clang_arguments,
+        types = types,
+        functions = functions,
+    )
+    try validate_fiir(module)
+    return module
+
+func decode_function(value: json.Json, origin: FiirSourceOrigin, types: list[FiirType], facts: ClangScalarFacts) -> FiirFunction!:
+    let name = try required_text_member(value, "name", "function at " + origin_text(origin))
+    let signature = try required_type_spelling(value, "function `" + name + "`")
+    let delimiter = strings.find(signature, " (") else error("Clang FIIR: function `" + name + "` has unsupported type spelling `" + signature + "`")
+    let result_spelling = signature[:delimiter]
+    let result_type = try intern_scalar_type(types, result_spelling, facts, "function `" + name + "` result")
+    let parameters = list[FiirParameter]()
+    let children = try optional_array_member(value, "inner", "function `" + name + "`") else list[json.Json]()
+    for child in children:
+        let kind = try optional_text_member(child, "kind", "function `" + name + "` child") else ""
+        if kind != "ParmVarDecl": continue
+        let spelling = try required_type_spelling(child, "function `" + name + "` parameter")
+        let parameter_type = try intern_scalar_type(types, spelling, facts, "function `" + name + "` parameter")
+        let parameter_origin = try child_origin(child, origin)
+        parameters.append(FiirParameter(
+            name = try optional_text_member(child, "name", "function `" + name + "` parameter"),
+            boundary = scalar_boundary(parameter_type),
+            origin = parameter_origin,
+        ))
+    let variadic = strings.ends_with(signature, ", ...)") or strings.ends_with(signature, "(...)")
+    return FiirFunction(
+        name = name,
+        convention = FiirCallingConvention.c,
+        parameters = parameters,
+        result = scalar_boundary(result_type),
+        is_variadic = variadic,
+        can_throw = false,
+        conditions = list[str](),
+        origin = origin,
+    )
+
+# mark: C scalar types =========================================================================
+
+func intern_scalar_type(types: list[FiirType], spelling: str, facts: ClangScalarFacts, context: str) -> FiirTypeId!:
+    let canonical = strings.trim(spelling)
+    for index in range(0, len(types)):
+        if types[index].spelling == canonical: return FiirTypeId(value = u32(index))
+
+    var value_type = FiirType(spelling = canonical, form = FiirTypeForm.Unit, size_bits = none)
+    if canonical == "void":
+        pass
+    elif canonical == "_Bool" or canonical == "bool":
+        value_type = FiirType(spelling = canonical, form = FiirTypeForm.Boolean, size_bits = facts.bool_bits)
+    elif canonical == "char":
+        value_type = integer_type(canonical, facts.char_size_bits, facts.char_size_bits, facts.plain_char_is_signed)
+    elif canonical == "signed char":
+        value_type = integer_type(canonical, facts.char_size_bits, facts.char_size_bits, true)
+    elif canonical == "unsigned char":
+        value_type = integer_type(canonical, facts.char_size_bits, facts.char_size_bits, false)
+    elif canonical == "short" or canonical == "short int" or canonical == "signed short" or canonical == "signed short int":
+        value_type = integer_type(canonical, facts.short_value_bits, facts.short_size_bits, true)
+    elif canonical == "unsigned short" or canonical == "unsigned short int":
+        value_type = integer_type(canonical, facts.short_value_bits, facts.short_size_bits, false)
+    elif canonical == "int" or canonical == "signed" or canonical == "signed int":
+        value_type = integer_type(canonical, facts.int_value_bits, facts.int_size_bits, true)
+    elif canonical == "unsigned" or canonical == "unsigned int":
+        value_type = integer_type(canonical, facts.int_value_bits, facts.int_size_bits, false)
+    elif canonical == "long" or canonical == "long int" or canonical == "signed long" or canonical == "signed long int":
+        value_type = integer_type(canonical, facts.long_value_bits, facts.long_size_bits, true)
+    elif canonical == "unsigned long" or canonical == "unsigned long int":
+        value_type = integer_type(canonical, facts.long_value_bits, facts.long_size_bits, false)
+    elif canonical == "long long" or canonical == "long long int" or canonical == "signed long long" or canonical == "signed long long int":
+        value_type = integer_type(canonical, facts.long_long_value_bits, facts.long_long_size_bits, true)
+    elif canonical == "unsigned long long" or canonical == "unsigned long long int":
+        value_type = integer_type(canonical, facts.long_long_value_bits, facts.long_long_size_bits, false)
+    elif canonical == "float":
+        value_type = floating_type(canonical, facts.float_storage_bits, facts.float_radix, facts.float_significand_bits, facts.float_maximum_exponent)
+    elif canonical == "double":
+        value_type = floating_type(canonical, facts.double_storage_bits, facts.float_radix, facts.double_significand_bits, facts.double_maximum_exponent)
+    elif canonical == "long double":
+        value_type = floating_type(canonical, facts.long_double_storage_bits, facts.float_radix, facts.long_double_significand_bits, facts.long_double_maximum_exponent)
+    else:
+        error("Clang FIIR: " + context + " type `" + canonical + "` is not supported by the scalar-function importer yet")
+    types.append(value_type)
+    return FiirTypeId(value = u32(len(types) - 1))
+
+func integer_type(spelling: str, bits: u16, size_bits: u16, is_signed: bool) -> FiirType:
+    return FiirType(spelling = spelling, form = FiirTypeForm.Integer(bits = bits, is_signed = is_signed), size_bits = size_bits)
+
+func floating_type(spelling: str, size_bits: u16, radix: u16, significand_bits: u16, maximum_exponent: i32) -> FiirType:
+    return FiirType(
+        spelling = spelling,
+        form = FiirTypeForm.Floating(radix = radix, significand_bits = significand_bits, maximum_exponent = maximum_exponent),
+        size_bits = size_bits,
+    )
+
+# mark: JSON shape helpers =====================================================================
+
+func required_type_spelling(value: json.Json, context: str) -> str!:
+    let type_value = value.member("type") else error("Clang FIIR: " + context + " has no type")
+    return try required_text_member(type_value, "qualType", context + " type")
+
+func required_text_member(value: json.Json, name: str, context: str) -> str!:
+    return try optional_text_member(value, name, context) else error("Clang FIIR: " + context + " has no `" + name + "`")
+
+func optional_text_member(value: json.Json, name: str, context: str) -> str?!:
+    match value:
+        object(fields):
+            if not fields.has(name): return none
+            let text = fields[name].as_text()
+            if text == none: error("Clang FIIR: " + context + " member `" + name + "` is not text")
+            return text
+        else: error("Clang FIIR: " + context + " is not an object")
+
+func optional_bool_member(value: json.Json, name: str, context: str) -> bool?!:
+    match value:
+        object(fields):
+            if not fields.has(name): return none
+            let boolean = fields[name].as_bool()
+            if boolean == none: error("Clang FIIR: " + context + " member `" + name + "` is not Boolean")
+            return boolean
+        else: error("Clang FIIR: " + context + " is not an object")
+
+func required_array_member(value: json.Json, name: str, context: str) -> list[json.Json]!:
+    return try optional_array_member(value, name, context) else error("Clang FIIR: " + context + " has no `" + name + "`")
+
+func optional_array_member(value: json.Json, name: str, context: str) -> list[json.Json]?!:
+    match value:
+        object(fields):
+            if not fields.has(name): return none
+            match fields[name]:
+                array(items): return items
+                else: error("Clang FIIR: " + context + " member `" + name + "` is not an array")
+        else: error("Clang FIIR: " + context + " is not an object")
+
+func update_origin(cursor: SourceCursor, location: json.Json) -> FiirSourceOrigin?!:
+    let path = try optional_text_member(location, "file", "source location")
+    if path != none:
+        cursor.path = path
+    let line = try optional_integer_member(location, "line", "source location")
+    if line != none:
+        if line <= 0 or line > 4294967295: return none
+        cursor.line = u32(line)
+    let column = try optional_integer_member(location, "col", "source location")
+    if column != none:
+        if cursor.path == "" or cursor.line == u32(0) or column <= 0 or column > 4294967295: return none
+        return FiirSourceOrigin(path = cursor.path, line = cursor.line, column = u32(column))
+    return none
+
+func child_origin(value: json.Json, parent: FiirSourceOrigin) -> FiirSourceOrigin!:
+    let location = value.member("loc")
+    if location != none:
+        let line_value = try optional_integer_member(location, "line", "parameter source location") else i64(parent.line)
+        let column_value = try optional_integer_member(location, "col", "parameter source location") else i64(parent.column)
+        let path = try optional_text_member(location, "file", "parameter source location") else parent.path
+        if line_value <= 0 or line_value > 4294967295 or column_value <= 0 or column_value > 4294967295:
+            return parent
+        return FiirSourceOrigin(path = path, line = u32(line_value), column = u32(column_value))
+    return parent
+
+func optional_integer_member(value: json.Json, name: str, context: str) -> i64?!:
+    match value:
+        object(fields):
+            if not fields.has(name): return none
+            let integer = fields[name].as_i64()
+            if integer == none: error("Clang FIIR: " + context + " member `" + name + "` is not an integer")
+            return integer
+        else: error("Clang FIIR: " + context + " is not an object")
+
+func origin_text(origin: FiirSourceOrigin) -> str:
+    return origin.path + ":" + str(origin.line) + ":" + str(origin.column)
