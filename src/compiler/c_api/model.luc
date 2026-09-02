@@ -1,0 +1,309 @@
+#==============================================================================================
+#
+#   c_api.model - One target-neutral description of a package's C exports
+#
+#   DESCRIPTION:
+#       HIR is rich enough to describe the public C source API, but product
+#       generators should not each rediscover which declarations and types
+#       belong to it. This module projects validated root-package exports into
+#       one compact graph consumed by the header generator and native ABI
+#       reporters.
+#
+#       The graph contains names, documentation, fixed integer widths, and
+#       declaration-order fields. It deliberately contains no byte sizes,
+#       alignments, offsets, target triples, or ABI placement classes; those
+#       facts begin in a backend.
+#
+#==============================================================================================
+
+from compiler.hir.c_exports import validate_c_exports
+from compiler.hir.ir import HirCStructKind, HirExternRepresentation, HirFunctionImplementation, HirProgram, ModuleId, TypeForm, TypeId, Value
+
+# mark: Interface graph =======================================================================
+
+## A C spelling plus source-contract nullability. Nullability does not change
+## byte layout, but retaining it lets generated documentation and later API
+## comparison distinguish a required handle from an optional one.
+pub struct CApiType:
+    pub let value: CApiTypeForm
+    pub let is_nullable: bool = false
+
+pub union CApiTypeForm:
+    Unit
+    Boolean
+    Integer(bits: i64, is_signed: bool)
+    Floating(bits: i64)
+    ForeignPointer
+    Named(declaration: u32)
+
+pub struct CApiField:
+    pub let name: str
+    pub let documentation: list[str]
+    pub let value_type: CApiType
+
+pub struct CApiParameter:
+    pub let name: str
+    pub let value_type: CApiType
+
+pub union CApiIntegerValue:
+    Signed(value: i64)
+    Unsigned(value: u64)
+
+pub struct CApiEnumCase:
+    pub let name: str
+    pub let documentation: list[str]
+    pub let value: CApiIntegerValue
+
+## Named declarations share the C ordinary-identifier namespace. References
+## use their index in `CApiInterface.declarations`, making equal spellings or
+## structurally equal records impossible to confuse.
+pub union CApiDeclaration:
+    OpaqueHandle(name: str, documentation: list[str])
+    IntegerHandle(name: str, documentation: list[str], representation: CApiType)
+    FixedEnum(name: str, documentation: list[str], representation: CApiType, cases: list[CApiEnumCase])
+    Record(name: str, documentation: list[str], fields: list[CApiField])
+
+pub struct CApiFunction:
+    pub let name: str
+    pub let documentation: list[str]
+    pub let parameters: list[CApiParameter]
+    pub let result: CApiType
+
+## Complete source-owned C interface for one root package.
+pub struct CApiInterface:
+    pub let package_identity: str
+    pub let declarations: list[CApiDeclaration]
+    pub let functions: list[CApiFunction]
+
+    pub func is_empty() -> bool:
+        return len(self.declarations) == 0 and len(self.functions) == 0
+
+# mark: HIR projection ========================================================================
+
+## Project a checked HIR program into its target-neutral C interface. Calling
+## validation here keeps this public operation safe for decoded package HIR as
+## well as freshly generated source HIR.
+pub func c_api_interface(program: HirProgram) -> CApiInterface!:
+    try validate_c_exports(program)
+    return try CApiBuilder(program).build()
+
+class CApiBuilder:
+    let program: HirProgram
+    let reachable_externs: list[bool]
+    let visited_structs: list[bool]
+    let extern_declarations: list[u32]
+    let enum_declarations: list[u32]
+    let struct_declarations: list[u32]
+
+    init(program: HirProgram):
+        self.program = program
+        self.reachable_externs = false_table(len(program.extern_types))
+        self.visited_structs = false_table(len(program.structs))
+        self.extern_declarations = sentinel_table(len(program.extern_types))
+        self.enum_declarations = sentinel_table(len(program.enums))
+        self.struct_declarations = sentinel_table(len(program.structs))
+
+    func build() -> CApiInterface!:
+        self.discover_reachable_types()
+        self.assign_declaration_identities()
+
+        let declarations = list[CApiDeclaration]()
+        for index in range(0, len(self.program.extern_types)):
+            if not self.reachable_externs[index]: continue
+            let item = self.program.extern_types[index]
+            match item.representation:
+                Pointer:
+                    declarations.append(CApiDeclaration.OpaqueHandle(name = item.name, documentation = item.documentation))
+                Integer(representation):
+                    declarations.append(CApiDeclaration.IntegerHandle(
+                        name = item.name,
+                        documentation = item.documentation,
+                        representation = try self.translate_type(representation),
+                    ))
+        for index in range(0, len(self.program.enums)):
+            let item = self.program.enums[index]
+            if not self.is_root_module(item.module) or item.c_shape == none: continue
+            let shape = item.c_shape else trap("exported C enum lost its validated shape")
+            let cases = list[CApiEnumCase]()
+            for case_index in range(0, len(item.cases)):
+                cases.append(CApiEnumCase(
+                    name = item.cases[case_index].name,
+                    documentation = item.cases[case_index].documentation,
+                    value = integer_value(shape.values[case_index]),
+                ))
+            declarations.append(CApiDeclaration.FixedEnum(
+                name = item.name,
+                documentation = item.documentation,
+                representation = try self.translate_type(shape.representation),
+                cases = cases,
+            ))
+        for index in range(0, len(self.program.structs)):
+            let item = self.program.structs[index]
+            if not self.is_root_module(item.module) or not is_exported_struct_kind(item.c_kind): continue
+            let fields = list[CApiField]()
+            for field in item.fields:
+                fields.append(CApiField(
+                    name = field.name,
+                    documentation = field.documentation,
+                    value_type = try self.translate_type(field.value_type),
+                ))
+            declarations.append(CApiDeclaration.Record(
+                name = item.name,
+                documentation = item.documentation,
+                fields = fields,
+            ))
+
+        let functions = list[CApiFunction]()
+        for function in self.program.functions:
+            if not self.is_root_module(function.module): continue
+            match function.implementation:
+                ExportedC(body):
+                    let parameters = list[CApiParameter]()
+                    for parameter in function.parameters:
+                        parameters.append(CApiParameter(
+                            name = parameter.name,
+                            value_type = try self.translate_type(parameter.value_type),
+                        ))
+                    functions.append(CApiFunction(
+                        name = function.name,
+                        documentation = function.documentation,
+                        parameters = parameters,
+                        result = try self.translate_type(function.result),
+                    ))
+                else: pass
+        return CApiInterface(
+            package_identity = self.program.packages[self.program.root_package.value].identity,
+            declarations = declarations,
+            functions = functions,
+        )
+
+    # mark: Reachability and identities =========================================================
+
+    func discover_reachable_types():
+        for index in range(0, len(self.program.structs)):
+            let item = self.program.structs[index]
+            if not self.is_root_module(item.module) or not is_exported_struct_kind(item.c_kind): continue
+            self.discover_struct(index)
+        for function in self.program.functions:
+            if not self.is_root_module(function.module): continue
+            match function.implementation:
+                ExportedC(body):
+                    for parameter in function.parameters: self.discover_type(parameter.value_type)
+                    self.discover_type(function.result)
+                else: pass
+
+    func discover_struct(index: i64):
+        if self.visited_structs[index]: return
+        self.visited_structs[index] = true
+        for field in self.program.structs[index].fields: self.discover_type(field.value_type)
+
+    func discover_type(value: TypeId):
+        match self.program.types.definitions[value.value].form:
+            Optional(inner): self.discover_type(inner)
+            Extern(index): self.reachable_externs[index] = true
+            Struct(index, arguments): self.discover_struct(index)
+            else: pass
+
+    func assign_declaration_identities():
+        var next: u32 = 0
+        for index in range(0, len(self.program.extern_types)):
+            if self.reachable_externs[index]:
+                self.extern_declarations[index] = next
+                next += 1
+        for index in range(0, len(self.program.enums)):
+            let item = self.program.enums[index]
+            if self.is_root_module(item.module) and item.c_shape != none:
+                self.enum_declarations[index] = next
+                next += 1
+        for index in range(0, len(self.program.structs)):
+            let item = self.program.structs[index]
+            if self.is_root_module(item.module) and is_exported_struct_kind(item.c_kind):
+                self.struct_declarations[index] = next
+                next += 1
+
+    # mark: Type translation ===================================================================
+
+    func translate_type(value: TypeId) -> CApiType!:
+        match self.program.types.definitions[value.value].form:
+            Unit: return CApiType(value = CApiTypeForm.Unit)
+            Boolean: return CApiType(value = CApiTypeForm.Boolean)
+            Integer(bits, is_signed): return CApiType(value = CApiTypeForm.Integer(bits = bits, is_signed = is_signed))
+            Floating(bits): return CApiType(value = CApiTypeForm.Floating(bits = bits))
+            Foreign: return CApiType(value = CApiTypeForm.ForeignPointer)
+            Optional(inner):
+                let translated = try self.translate_type(inner)
+                return CApiType(value = translated.value, is_nullable = true)
+            Extern(index): return CApiType(value = CApiTypeForm.Named(declaration = self.require_identity(self.extern_declarations[index])))
+            Enum(index, arguments): return CApiType(value = CApiTypeForm.Named(declaration = self.require_identity(self.enum_declarations[index])))
+            Struct(index, arguments): return CApiType(value = CApiTypeForm.Named(declaration = self.require_identity(self.struct_declarations[index])))
+            else: error("C API interface: validated export contains an unsupported type")
+
+    func require_identity(value: u32) -> u32:
+        if value == no_declaration: trap("C API named type has no declaration identity")
+        return value
+
+    func is_root_module(module: ModuleId) -> bool:
+        return self.program.modules[module.value].package.value == self.program.root_package.value
+
+# mark: Helpers ================================================================================
+
+let no_declaration: u32 = 4294967295
+
+func false_table(count: i64) -> list[bool]:
+    let values = list[bool]()
+    for index in range(0, count): values.append(false)
+    return values
+
+func sentinel_table(count: i64) -> list[u32]:
+    let values = list[u32]()
+    for index in range(0, count): values.append(no_declaration)
+    return values
+
+func is_exported_struct_kind(value: HirCStructKind?) -> bool:
+    let kind = value
+    if kind == none: return false
+    return kind == HirCStructKind.exported
+
+func integer_value(value: Value) -> CApiIntegerValue:
+    match value:
+        SignedInteger(item): return CApiIntegerValue.Signed(value = item)
+        UnsignedInteger(item): return CApiIntegerValue.Unsigned(value = item)
+        else: trap("fixed C enum contains a noninteger value")
+
+## Source spelling of one declaration, shared by header and report renderers.
+pub func c_api_declaration_name(value: CApiDeclaration) -> str:
+    match value:
+        OpaqueHandle(name, documentation): return name
+        IntegerHandle(name, documentation, representation): return name
+        FixedEnum(name, documentation, representation, cases): return name
+        Record(name, documentation, fields): return name
+
+## Record declarations in dependency-first order. Both header generation and
+## backend layout use this one graph walk; source order remains presentation
+## metadata and cannot make a nested by-value declaration incomplete.
+pub func c_api_record_order(api: CApiInterface) -> list[u32]:
+    let states = list[i64]()
+    for declaration in api.declarations: states.append(0)
+    let order = list[u32]()
+    for index in range(0, len(api.declarations)):
+        match api.declarations[index]:
+            Record(name, documentation, fields): visit_record(api, u32(index), states, order)
+            else: pass
+    return order
+
+func visit_record(api: CApiInterface, declaration: u32, states: list[i64], order: list[u32]):
+    if states[declaration] == 2: return
+    if states[declaration] == 1: trap("validated C API contains a recursive by-value record")
+    states[declaration] = 1
+    match api.declarations[declaration]:
+        Record(name, documentation, fields):
+            for field in fields:
+                match field.value_type.value:
+                    Named(dependency):
+                        match api.declarations[dependency]:
+                            Record(dependency_name, dependency_documentation, dependency_fields): visit_record(api, dependency, states, order)
+                            else: pass
+                    else: pass
+        else: trap("record traversal reached a non-record declaration")
+    states[declaration] = 2
+    order.append(declaration)

@@ -40,6 +40,7 @@ expect() {
 printf 'pub func answer() -> i64: return 5\n' > "$test_dir/main.luc"
 printf 'pub func answer() -> i64: return true\n' > "$test_dir/wrong.luc"
 printf 'pub func main(arguments: slice[str]) -> i32!:\n    var count = 5i32\n    let read: func() -> i32 = () => count\n    return read()\n' > "$test_dir/shared.luc"
+printf 'export c enum Status as i16:\n    ready = -2\n    done = 42\nexport c struct Pair:\n    let left: i32\n    let right: i32\nexport c func luce_pair(value: Pair) -> Status: return .done\npub func main(arguments: slice[str]) -> i32!: return 0i32\n' > "$test_dir/c_api.luc"
 
 expect 0 "Luce v" "$cli" --version
 expect 2 "usage:" "$cli"
@@ -53,6 +54,7 @@ expect 2 "--generic-specializations may be supplied once" "$cli" check --package
 expect 2 "run: entry must be MODULE.FUNCTION" "$cli" run --package org.luce.tests --root "$test_dir" main "$test_dir/main.luc"
 expect 2 "build: unknown target" "$cli" build --package org.luce.tests --root "$test_dir" --target z80 out "$test_dir/main.luc"
 expect 2 "build: --runtime expects a source path" "$cli" build --package org.luce.tests --root "$test_dir" --runtime
+expect 2 "build: --c-header may be supplied once" "$cli" build --package org.luce.tests --root "$test_dir" --c-header one.h --c-header two.h out "$test_dir/main.luc"
 
 expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/main.luc"
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/shared.luc"
@@ -81,6 +83,15 @@ if [ "$native_output" != "Hello, world!" ]; then
     exit 1
 fi
 expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/generic-native" examples/generic_functions.luc
+expect 1 "C header and ABI report outputs require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-header "$test_dir/api.h" "$test_dir/api.wasm" "$test_dir/c_api.luc"
+expect 1 "C header output must differ from the primary artifact" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/collision" "$test_dir/collision" "$test_dir/c_api.luc"
+expect 0 "built $test_dir/c-api-native" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/api.h" --abi-report "$test_dir/api.abi.json" --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/c-api-native" "$test_dir/c_api.luc"
+grep -q 'typedef struct Pair Pair;' "$test_dir/api.h"
+grep -q '#define Status_done ((Status)(INT64_C(42)))' "$test_dir/api.h"
+grep -q 'Status luce_pair(Pair value);' "$test_dir/api.h"
+grep -q '"format": "luce-c-abi-1"' "$test_dir/api.abi.json"
+grep -q '"target":' "$test_dir/api.abi.json"
+grep -q '"offset": 4' "$test_dir/api.abi.json"
 
 # A host-tool failure must preserve an existing destination and report the
 # tool that failed. An empty PATH makes qbe unavailable without relying on the

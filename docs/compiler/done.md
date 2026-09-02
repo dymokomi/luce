@@ -14,13 +14,13 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. **Not yet**: the remaining rich C boundary (including generated string/list/f16 adapters, headers/ABI reports, and callback runtime enforcement). Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. **Not yet**: the remaining rich C boundary, including generated string/list/f16 adapters and callback runtime enforcement. Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Its process runner accepts explicit arguments as the ordinary `slice[str]` semantic shape. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed mutable/frozen collections and slices, nominal interfaces/classes/weak handles, closures/cells, generated ownership helpers, structured task groups and typed transfer runs, with no physical layout or execution-domain policy. The verifier proves every rule, reachability removes unreachable closed-world resources while retaining only each transfer graph's semantic service closure, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 896 unit tests across 32 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 901 unit tests across 33 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1634,8 +1634,8 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   tests, Wasm encoding, and real QBE calls through libc in both directions
   prove the slice. C globals intentionally remain closed until their distinct
   storage adapter exists; C-record fields now use the exported-struct adapter
-  below. Generated headers and ABI reports remain on the parent C-boundary
-  milestone.
+  below. Generated headers and ABI reports were completed by the later parent
+  C-boundary product milestone.
 
 - [x] **Exported C structs are ordinary values with a backend-owned ABI**
   (2026-09-02). `export c struct` normalizes into the one HIR nominal-struct
@@ -1657,6 +1657,31 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   prove nested records, signed fixed-enum values, floating fields, extern and
   exported arguments/results, and aggregate-bearing indirect C calls.
   `examples/c_api.luc` is the checked source half of that executable proof.
+
+- [x] **Exported C products have one neutral model and one backend layout**
+  (2026-09-02). Checked HIR now projects the root package's exact C surface
+  into a compact `c_api` graph containing names, documentation, nullability,
+  fixed integer values, and declaration-order fields—but no size, alignment,
+  offset, target, or placement class. Exact names must be portable in the
+  header's C and C++ inclusion modes, share one collision-free external
+  namespace across Luce modules, and cannot expose dependency-owned native
+  declarations through a guessed include.
+
+  The header renderer emits standalone C11: opaque handle forwards,
+  exact-width integer/enum typedefs, exact `Enum_case` macros, dependency-first
+  record definitions, and C++ linkage guards. QBE ABI reporting reuses the
+  emitter's backend-owned 64-bit layout rules and the shared `TypeLayout`, then
+  structurally compares every reported signature with the optimized C wrapper
+  QBE will actually receive. Its versioned JSON records the C compiler's exact
+  target triple, size, alignment, field offsets, fixed values, nullability,
+  symbol names, and calling convention.
+
+  `luce build --target native --c-header PATH --abi-report PATH` installs each
+  requested product through an owned temporary directory. The QBE toolchain
+  now queries the linker target and selects QBE's target explicitly rather
+  than relying on the QBE binary's build-time default. Golden graph/header/
+  report tests, a strict real C11 compile, optimized-MIR agreement, CLI output,
+  and existing native QBE execution cover the product path.
 
 ## 3. Bugs the multi-backend harness found
 

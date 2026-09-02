@@ -106,6 +106,9 @@
 #==============================================================================================
 
 from compiler.backend import HirExecutionBackend
+from compiler.c_api.header import render_c_header
+from compiler.c_api.model import CApiInterface, c_api_interface
+from compiler.backends.qbe_abi import render_qbe_abi_report
 from compiler.mir.canonical import MirProgram
 from compiler.mir.composer import compose_runtime
 from compiler.backends.interpreter import HirInterpreter
@@ -144,6 +147,13 @@ pub struct PackageInput:
 ## policy, never source semantics or MIR facts.
 pub struct CompilationOptions:
     pub let generic_specialization_budget: i64 = 256
+
+## Optional native C products installed beside (or independently from) the
+## primary artifact. Paths are explicit so a build never surprises callers
+## with guessed sidecar names.
+pub struct BuildOutputOptions:
+    pub let c_header: str? = none
+    pub let abi_report: str? = none
 
 ## One semantic service named by a sealed package descriptor. The source
 ## spelling is resolved once to a HIR identity; it is not a linker convention.
@@ -189,6 +199,7 @@ pub struct ExplainResult:
 ## the source-level facts.
 pub struct CompiledProgram:
     pub let program: MirProgram
+    pub let c_api: CApiInterface
     pub let diagnostics: list[Diagnostic]
     pub let generic_reports: list[GenericReport]
 
@@ -197,33 +208,42 @@ pub struct CompiledProgram:
 ## Compile source files through every build stage and install the completed
 ## artifact at `output`. Native artifacts use the QBE host toolchain; QBE owns
 ## its scratch and replaces the destination only after linking succeeds.
-pub func build(target: BuildTarget, output: str, package: PackageInput, options: CompilationOptions = CompilationOptions()) -> BuildResult!:
+pub func build(target: BuildTarget, output: str, package: PackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions()) -> BuildResult!:
+    try validate_build_outputs(target, output, outputs)
     let compiled = try lower_and_verify(package, options)
-    let emissions = try materialize(target, output, compiled.program)
+    let materialized = try materialize(target, output, compiled.program)
+    try install_c_products(compiled.c_api, compiled.program, materialized.native_target, outputs)
     return BuildResult(
         diagnostics = compiled.diagnostics,
-        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, emissions),
+        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, materialized.emissions),
     )
 
 ## Build with an explicitly supplied sealed runtime package. Keeping the
 ## package input visible makes deployment/package lookup a caller concern,
 ## while every compiler stage still consumes one composed canonical MIR.
-pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions()) -> BuildResult!:
+pub func build_with_runtime(target: BuildTarget, output: str, package: PackageInput, runtime: RuntimePackageInput, options: CompilationOptions = CompilationOptions(), outputs: BuildOutputOptions = BuildOutputOptions()) -> BuildResult!:
+    try validate_build_outputs(target, output, outputs)
     let compiled = try compile_with_runtime(package, runtime, options)
-    let emissions = try materialize(target, output, compiled.program)
+    let materialized = try materialize(target, output, compiled.program)
+    try install_c_products(compiled.c_api, compiled.program, materialized.native_target, outputs)
     return BuildResult(
         diagnostics = compiled.diagnostics,
-        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, emissions),
+        generic_reports = with_compilation_metrics(compiled.generic_reports, compiled.program, materialized.emissions),
     )
 
-func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> list[FunctionEmission]!:
+struct MaterializedArtifact:
+    let emissions: list[FunctionEmission]
+    let native_target: str?
+
+func materialize(target: BuildTarget, output: str, optimized_program: MirProgram) -> MaterializedArtifact!:
     match target:
         wasm:
             let emission = try WasmBackend(os.clock_ms).emit_with_report(optimized_program)
             try files.write_bytes(output, emission.bytes)
-            return emission.functions
+            return MaterializedArtifact(emissions = emission.functions, native_target = none)
         native:
-            return try QbeToolchain().materialize_with_report(optimized_program, output)
+            let emission = try QbeToolchain().materialize_with_report(optimized_program, output)
+            return MaterializedArtifact(emissions = emission.functions, native_target = emission.target)
 
 ## Run the complete frontend and semantic analysis, returning analyzed typed
 ## HIR. For example, editor tooling can call this without choosing a target.
@@ -294,6 +314,7 @@ pub func compile_runtime(package: RuntimePackageInput, options: CompilationOptio
     try MirVerifier(program).verify()
     return CompiledProgram(
         program = program,
+        c_api = try c_api_interface(analyzed.hir),
         diagnostics = analyzed.diagnostics,
         generic_reports = [bind_lowered_functions(report_generics(analyzed.hir), program)],
     )
@@ -313,6 +334,7 @@ pub func compile_with_runtime(application: PackageInput, runtime: RuntimePackage
         reports.append(offset_functions(report, len(application_program.functions)))
     return CompiledProgram(
         program = optimized.program,
+        c_api = try c_api_interface(analyzed_application.hir),
         diagnostics = combine_diagnostics(analyzed_application.diagnostics, compiled_runtime.diagnostics),
         generic_reports = remap_optimized_functions(reports, optimized.function_remap),
     )
@@ -343,6 +365,7 @@ func lower_and_verify(package: PackageInput, options: CompilationOptions) -> Com
     let optimized = try verify_and_optimize(canonical_program)
     return CompiledProgram(
         program = optimized.program,
+        c_api = try c_api_interface(analyzed_hir.hir),
         diagnostics = analyzed_hir.diagnostics,
         generic_reports = remap_optimized_functions([report], optimized.function_remap),
     )
@@ -358,6 +381,46 @@ func verify_and_optimize(canonical_program: MirProgram) -> OptimizationResult!:
     let optimized = Optimizer(canonical_program).optimize()
     try MirVerifier(optimized.program).verify()
     return optimized
+
+# mark: C product installation ================================================================
+
+func validate_build_outputs(target: BuildTarget, artifact: str, outputs: BuildOutputOptions) -> !:
+    if outputs.c_header == none and outputs.abi_report == none: return
+    if target != BuildTarget.native: error("build: C header and ABI report outputs require `--target native`")
+    let header = outputs.c_header
+    let report = outputs.abi_report
+    if header != none:
+        if len(header) == 0: error("build: C header output path cannot be empty")
+        if header == artifact: error("build: C header output must differ from the primary artifact")
+    if report != none:
+        if len(report) == 0: error("build: ABI report output path cannot be empty")
+        if report == artifact: error("build: ABI report output must differ from the primary artifact")
+    if header != none and report != none and header == report:
+        error("build: C header and ABI report outputs must differ")
+
+func install_c_products(api: CApiInterface, program: MirProgram, native_target: str?, outputs: BuildOutputOptions) -> !:
+    if outputs.c_header != none:
+        let path = outputs.c_header else trap("C header path disappeared")
+        try install_text_atomically(path, render_c_header(api), "header")
+    if outputs.abi_report != none:
+        let path = outputs.abi_report else trap("ABI report path disappeared")
+        let target = native_target else trap("validated native build produced no target")
+        try install_text_atomically(path, try render_qbe_abi_report(api, program, target), "ABI report")
+
+func install_text_atomically(output: str, contents: str, product: str) -> !:
+    let scratch = try files.make_temporary_directory(paths.dir(output), ".luce-c-product-")
+    let candidate = paths.join(scratch, "artifact")
+    files.write(candidate, contents) catch reason:
+        error(c_product_failure(scratch, "build: cannot write C " + product + ": " + reason))
+    files.rename(candidate, output) catch reason:
+        error(c_product_failure(scratch, "build: cannot install C " + product + " `" + output + "`: " + reason))
+    files.remove_all(scratch) catch reason:
+        error("build: installed C " + product + " `" + output + "` but cannot remove scratch `" + scratch + "`: " + reason)
+
+func c_product_failure(scratch: str, reason: str) -> str:
+    files.remove_all(scratch) catch cleanup_reason:
+        return reason + "; cannot remove scratch `" + scratch + "`: " + cleanup_reason
+    return reason
 
 # mark: Source stages =========================================================================
 

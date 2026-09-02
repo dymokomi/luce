@@ -1,0 +1,246 @@
+#==============================================================================================
+#
+#   qbe_abi - QBE-native layout report for a target-neutral C API
+#
+#   DESCRIPTION:
+#       The C API model owns names and structural source contracts. This QBE
+#       backend projection attaches the physical facts required by §21.5:
+#       target, C calling convention, size, alignment, and record offsets.
+#
+#       It lowers API types into a private MIR type table solely to reuse the
+#       backend's canonical `TypeLayout` algorithm. No layout result flows
+#       back into HIR, canonical MIR, or the API model, and QBE IL emission and
+#       this report share the same pointer rules.
+#
+#==============================================================================================
+
+from compiler.backends.layout import TypeLayout
+from compiler.backends.qbe_representation import qbe_layout_rules
+from compiler.c_api.header import render_c_type
+from compiler.c_api.model import CApiDeclaration, CApiInterface, CApiIntegerValue, CApiType, CApiTypeForm, c_api_record_order
+from compiler.mir.canonical import CallingConvention, MirProgram, MirType, MirTypeTable, TypeId, create_builtin_mir_types, intern_mir_type, make_struct_type, mir_type
+
+# mark: Public report =========================================================================
+
+## Render the stable version-1 ABI report for the exact native target selected
+## by the QBE toolchain. JSON values that may exceed consumer integer precision
+## (fixed enum values) are strings by design.
+pub func render_qbe_abi_report(api: CApiInterface, program: MirProgram, target: str) -> str!:
+    if len(target) == 0: error("QBE ABI report: target cannot be empty")
+    let graph = try lower_api_types(api)
+    try validate_emitted_interface(api, graph, program)
+    let layout = TypeLayout(graph.types, qbe_layout_rules())
+    var output = "{\n"
+    output += "  \"format\": \"luce-c-abi-1\",\n"
+    output += "  \"package\": " + json_string(api.package_identity) + ",\n"
+    output += "  \"target\": " + json_string(target) + ",\n"
+    output += "  \"types\": ["
+    if len(api.declarations) > 0: output += "\n"
+    for index in range(0, len(api.declarations)):
+        if index > 0: output += ",\n"
+        output += render_declaration(api, graph, layout, index)
+    if len(api.declarations) > 0: output += "\n  "
+    output += "],\n"
+    output += "  \"symbols\": ["
+    if len(api.functions) > 0: output += "\n"
+    for index in range(0, len(api.functions)):
+        if index > 0: output += ",\n"
+        output += render_function(api, index)
+    if len(api.functions) > 0: output += "\n  "
+    output += "]\n}\n"
+    return output
+
+# mark: Declaration reports ===================================================================
+
+func render_declaration(api: CApiInterface, graph: QbeApiTypeGraph, layout: TypeLayout, index: i64) -> str:
+    let value_type = graph.declaration_types[index]
+    let size = layout.size_of(value_type)
+    let alignment = layout.align_of(value_type)
+    match api.declarations[index]:
+        OpaqueHandle(name, documentation):
+            return report_prefix("opaque_handle", name, size, alignment) + "}"
+        IntegerHandle(name, documentation, representation):
+            return (
+                report_prefix("integer_handle", name, size, alignment)
+                + ", \"representation\": " + json_string(render_c_type(api, representation)) + "}"
+            )
+        FixedEnum(name, documentation, representation, cases):
+            var output = report_prefix("fixed_enum", name, size, alignment)
+            output += ", \"representation\": " + json_string(render_c_type(api, representation)) + ", \"values\": ["
+            for case_index in range(0, len(cases)):
+                if case_index > 0: output += ", "
+                output += "{\"name\": " + json_string(cases[case_index].name)
+                output += ", \"value\": " + json_string(integer_text(cases[case_index].value)) + "}"
+            return output + "]}"
+        Record(name, documentation, fields):
+            var output = report_prefix("record", name, size, alignment) + ", \"fields\": ["
+            for field_index in range(0, len(fields)):
+                if field_index > 0: output += ", "
+                let field = fields[field_index]
+                let field_type = try_lowered_type(graph, field.value_type)
+                output += "{\"name\": " + json_string(field.name)
+                output += ", \"type\": " + json_string(render_c_type(api, field.value_type))
+                output += ", \"offset\": " + str(layout.field_offset(value_type, field_index))
+                output += ", \"size\": " + str(layout.size_of(field_type))
+                output += ", \"alignment\": " + str(layout.align_of(field_type)) + "}"
+            return output + "]}"
+
+func report_prefix(kind: str, name: str, size: i64, alignment: i64) -> str:
+    return (
+        "    {\"kind\": " + json_string(kind) + ", \"name\": " + json_string(name)
+        + ", \"size\": " + str(size) + ", \"alignment\": " + str(alignment)
+    )
+
+func render_function(api: CApiInterface, index: i64) -> str:
+    let function = api.functions[index]
+    var output = "    {\"name\": " + json_string(function.name) + ", \"calling_convention\": \"c\", \"parameters\": ["
+    for parameter_index in range(0, len(function.parameters)):
+        if parameter_index > 0: output += ", "
+        let parameter = function.parameters[parameter_index]
+        output += "{\"name\": " + json_string(parameter.name)
+        output += ", \"type\": " + json_string(render_c_type(api, parameter.value_type))
+        output += ", \"nullable\": " + bool_text(parameter.value_type.is_nullable) + "}"
+    output += "], \"result\": {\"type\": " + json_string(render_c_type(api, function.result))
+    output += ", \"nullable\": " + bool_text(function.result.is_nullable) + "}}"
+    return output
+
+# mark: Backend type projection ================================================================
+
+struct QbeApiTypeGraph:
+    let types: MirTypeTable
+    let declaration_types: list[TypeId]
+
+func lower_api_types(api: CApiInterface) -> QbeApiTypeGraph!:
+    let graph = QbeApiTypeGraph(
+        types = create_builtin_mir_types(),
+        declaration_types = sentinel_types(len(api.declarations)),
+    )
+    # Non-record declarations cannot depend on records under the closed C API
+    # vocabulary, so establish every alias identity before walking aggregates.
+    for index in range(0, len(api.declarations)):
+        match api.declarations[index]:
+            OpaqueHandle(name, documentation): graph.declaration_types[index] = intern_mir_type(graph.types, MirType.Ptr)
+            IntegerHandle(name, documentation, representation): graph.declaration_types[index] = try_lowered_type(graph, representation)
+            FixedEnum(name, documentation, representation, cases): graph.declaration_types[index] = try_lowered_type(graph, representation)
+            Record(name, documentation, fields): pass
+    for declaration in c_api_record_order(api):
+        match api.declarations[declaration]:
+            Record(name, documentation, fields):
+                let field_types = list[TypeId]()
+                for field in fields: field_types.append(try_lowered_type(graph, field.value_type))
+                graph.declaration_types[declaration] = intern_mir_type(graph.types, make_struct_type(field_types))
+            else: trap("C API record order contains a non-record")
+    return graph
+
+func try_lowered_type(graph: QbeApiTypeGraph, value: CApiType) -> TypeId:
+    match value.value:
+        Unit: return intern_mir_type(graph.types, MirType.Uninhabited)
+        Boolean: return intern_mir_type(graph.types, MirType.Bool)
+        Integer(bits, is_signed): return intern_mir_type(graph.types, MirType.Int(bits = bits, is_signed = is_signed))
+        Floating(bits): return intern_mir_type(graph.types, MirType.Float(bits = bits))
+        ForeignPointer: return intern_mir_type(graph.types, MirType.Ptr)
+        Named(declaration):
+            let identity = graph.declaration_types[declaration]
+            if identity.value == no_type: trap("C API named type was lowered before its declaration")
+            return identity
+
+# mark: Emitted-MIR agreement =================================================================
+
+# Compare the named source API against the exact optimized C wrappers QBE
+# receives. The two graphs intentionally have different TypeIds; recursive
+# structural comparison proves that distinction cannot hide a lowering drift.
+func validate_emitted_interface(api: CApiInterface, graph: QbeApiTypeGraph, program: MirProgram) -> !:
+    for function in api.functions:
+        var found = -1
+        for index in range(0, len(program.functions)):
+            let emitted = program.functions[index]
+            if emitted.name == function.name and emitted.is_exported and emitted.convention == CallingConvention.c:
+                if found >= 0: error("QBE ABI report: duplicate emitted C symbol `" + function.name + "`")
+                found = index
+        if found < 0: error("QBE ABI report: exported C symbol `" + function.name + "` is missing from optimized MIR")
+        let emitted = program.functions[found]
+        if len(emitted.signature.parameters) != len(function.parameters):
+            error("QBE ABI report: exported C symbol `" + function.name + "` parameter count disagrees with optimized MIR")
+        for index in range(0, len(function.parameters)):
+            let expected = try_lowered_type(graph, function.parameters[index].value_type)
+            if not cross_type_match(graph.types, expected, program.types, emitted.signature.parameters[index]):
+                error("QBE ABI report: exported C symbol `" + function.name + "` parameter `" + function.parameters[index].name + "` disagrees with optimized MIR")
+        match function.result.value:
+            Unit:
+                if len(emitted.signature.results) != 0:
+                    error("QBE ABI report: exported C symbol `" + function.name + "` result disagrees with optimized MIR")
+            else:
+                if len(emitted.signature.results) != 1:
+                    error("QBE ABI report: exported C symbol `" + function.name + "` result disagrees with optimized MIR")
+                let expected = try_lowered_type(graph, function.result)
+                if not cross_type_match(graph.types, expected, program.types, emitted.signature.results[0]):
+                    error("QBE ABI report: exported C symbol `" + function.name + "` result disagrees with optimized MIR")
+
+    for emitted in program.functions:
+        if not emitted.is_exported or emitted.convention != CallingConvention.c: continue
+        var found = false
+        for function in api.functions:
+            if function.name == emitted.name: found = true
+        if not found: error("QBE ABI report: optimized MIR exports unreported C symbol `" + emitted.name + "`")
+
+func cross_type_match(left_types: MirTypeTable, left: TypeId, right_types: MirTypeTable, right: TypeId) -> bool:
+    match mir_type(left_types, left):
+        Int(bits, is_signed):
+            match mir_type(right_types, right):
+                Int(other_bits, other_signed): return bits == other_bits and is_signed == other_signed
+                else: return false
+        Float(bits):
+            match mir_type(right_types, right):
+                Float(other_bits): return bits == other_bits
+                else: return false
+        Bool:
+            match mir_type(right_types, right):
+                Bool: return true
+                else: return false
+        Ptr:
+            match mir_type(right_types, right):
+                Ptr: return true
+                else: return false
+        Struct(fields):
+            match mir_type(right_types, right):
+                Struct(other_fields):
+                    if len(fields) != len(other_fields): return false
+                    for index in range(0, len(fields)):
+                        if not cross_type_match(left_types, fields[index].value_type, right_types, other_fields[index].value_type): return false
+                    return true
+                else: return false
+        else: return false
+
+let no_type: u32 = 4294967295
+
+func sentinel_types(count: i64) -> list[TypeId]:
+    let values = list[TypeId]()
+    for index in range(0, count): values.append(TypeId(value = no_type))
+    return values
+
+# mark: JSON primitives =======================================================================
+
+func bool_text(value: bool) -> str:
+    if value: return "true"
+    return "false"
+
+func integer_text(value: CApiIntegerValue) -> str:
+    match value:
+        Signed(item): return str(item)
+        Unsigned(item): return str(item)
+
+func json_string(value: str) -> str:
+    var output = "\""
+    for character in value:
+        if character == '\"': output += "\\\""
+        elif character == '\\': output += "\\\\"
+        elif character == '\n': output += "\\n"
+        elif character == '\r': output += "\\r"
+        elif character == '\t': output += "\\t"
+        elif u32(character) < u32(32):
+            output += "\\u00" + hex_digit(i64(u32(character)) // 16) + hex_digit(i64(u32(character)) % 16)
+        else: output += str(character)
+    return output + "\""
+
+func hex_digit(value: i64) -> str:
+    return ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"][value]

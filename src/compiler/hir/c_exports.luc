@@ -1,0 +1,248 @@
+#==============================================================================================
+#
+#   c_exports - Validate the source-owned C export namespace
+#
+#   DESCRIPTION:
+#       `export c` publishes exact spellings into C's flat identifier
+#       namespace. Luce modules and packages have richer namespaces, so this
+#       pass proves that one root package can generate a standalone portable C
+#       header without mangling, guessed includes, or declarations owned by a
+#       dependency.
+#
+#       Representation remains elsewhere: HIR records semantic C roles,
+#       canonical MIR records structural boundary values, and only a backend
+#       computes byte layout. This file validates names and ownership only.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan, format_diagnostic
+from compiler.hir.ir import HirCStructKind, HirExternRepresentation, HirFunctionImplementation, HirProgram, ModuleId, TypeForm, TypeId
+
+# mark: Export surface ========================================================================
+
+## Validate every exact identifier and named type reachable from the root
+## package's C exports. A generated header is intentionally standalone: a
+## package may wrap dependency values internally, but cannot publish a native
+## type whose declaration belongs to another package.
+pub func validate_c_exports(program: HirProgram) -> !:
+    let validator = CExportValidator(program)
+    try validator.validate()
+
+class CExportValidator:
+    let program: HirProgram
+    let names: list[str]
+    let struct_visits: list[bool]
+    let enum_visits: list[bool]
+    let extern_visits: list[bool]
+
+    init(program: HirProgram):
+        self.program = program
+        self.names = list[str]()
+        self.struct_visits = false_table(len(program.structs))
+        self.enum_visits = false_table(len(program.enums))
+        self.extern_visits = false_table(len(program.extern_types))
+
+    func validate() -> !:
+        # Register explicit exports first. This makes diagnostics independent
+        # of which function happens to reference a declaration first.
+        for item in self.program.structs:
+            if self.is_root_module(item.module) and is_exported_struct_kind(item.c_kind):
+                try self.register_global(item.name, item.module, item.span, "exported C type")
+        for item in self.program.enums:
+            if self.is_root_module(item.module) and item.c_shape != none:
+                try self.register_global(item.name, item.module, item.span, "exported C type")
+                for case_value in item.cases:
+                    try self.require_portable_component(case_value.name, item.module, item.span, "exported C enum case")
+                    try self.register_generated_global(item.name + "_" + case_value.name, item.module, item.span)
+        for function in self.program.functions:
+            if not self.is_root_module(function.module): continue
+            match function.implementation:
+                ExportedC(body): try self.register_global(function.name, function.module, function.span, "exported C function")
+                else: pass
+
+        for index in range(0, len(self.program.structs)):
+            let item = self.program.structs[index]
+            if not self.is_root_module(item.module) or not is_exported_struct_kind(item.c_kind): continue
+            self.struct_visits[index] = true
+            for field in item.fields:
+                try self.require_portable_identifier(field.name, item.module, item.span, "exported C field")
+                try self.visit_type(field.value_type, item.module, item.span)
+
+        for function in self.program.functions:
+            if not self.is_root_module(function.module): continue
+            match function.implementation:
+                ExportedC(body):
+                    for parameter in function.parameters:
+                        try self.require_portable_identifier(parameter.name, function.module, function.span, "exported C parameter")
+                        try self.visit_type(parameter.value_type, function.module, function.span)
+                    try self.visit_type(function.result, function.module, function.span)
+                else: pass
+
+    # mark: Reachable named types ===============================================================
+
+    func visit_type(value: TypeId, use_module: ModuleId, use_span: SourceSpan) -> !:
+        match self.program.types.definitions[value.value].form:
+            Unit: return
+            Boolean: return
+            Integer(bits, is_signed): return
+            Floating(bits): return
+            Foreign: return
+            Optional(inner):
+                try self.visit_type(inner, use_module, use_span)
+            Extern(index):
+                let item = self.program.extern_types[index]
+                try self.require_root_owner(item.module, use_module, use_span, item.name)
+                if self.extern_visits[index]: return
+                self.extern_visits[index] = true
+                try self.register_global(item.name, item.module, item.span, "C handle type")
+                match item.representation:
+                    Pointer: pass
+                    Integer(representation): try self.visit_type(representation, use_module, use_span)
+            Enum(index, arguments):
+                let item = self.program.enums[index]
+                try self.require_root_owner(item.module, use_module, use_span, item.name)
+                if item.c_shape == none: trap("validated C export reached an ordinary enum")
+                if not self.enum_visits[index]:
+                    self.enum_visits[index] = true
+                    let shape = item.c_shape else trap("validated C enum lost its representation")
+                    try self.visit_type(shape.representation, use_module, use_span)
+            Struct(index, arguments):
+                let item = self.program.structs[index]
+                try self.require_root_owner(item.module, use_module, use_span, item.name)
+                if not is_exported_struct_kind(item.c_kind): trap("validated C export reached a non-exported struct")
+                if self.struct_visits[index]: return
+                self.struct_visits[index] = true
+                for field in item.fields:
+                    try self.visit_type(field.value_type, use_module, use_span)
+            else: trap("validated C export reached an unsupported boundary type")
+
+    func require_root_owner(owner: ModuleId, use_module: ModuleId, use_span: SourceSpan, name: str) -> !:
+        if self.is_root_module(owner): return
+        try self.fail(use_module, use_span, "C export references dependency-owned native type `" + name + "`; declare a root-package wrapper type")
+
+    # mark: Portable C namespace ================================================================
+
+    func register_global(name: str, module: ModuleId, span: SourceSpan, kind: str) -> !:
+        try self.require_portable_identifier(name, module, span, kind)
+        try self.register_generated_global(name, module, span)
+
+    func register_generated_global(name: str, module: ModuleId, span: SourceSpan) -> !:
+        if not is_portable_c_identifier_spelling(name):
+            try self.fail(module, span, "generated C identifier `" + name + "` is not portable across C and C++")
+        if is_generated_header_name(name):
+            try self.fail(module, span, "generated C identifier `" + name + "` conflicts with the generated header's standard C names")
+        for existing in self.names:
+            if existing == name:
+                try self.fail(module, span, "generated C identifier `" + name + "` collides with another exported declaration")
+        self.names.append(name)
+
+    func require_portable_component(name: str, module: ModuleId, span: SourceSpan, kind: str) -> !:
+        if not is_portable_c_identifier_spelling(name):
+            try self.fail(module, span, kind + " `" + name + "` is not a portable C identifier")
+
+    func require_portable_identifier(name: str, module: ModuleId, span: SourceSpan, kind: str) -> !:
+        try self.require_portable_component(name, module, span, kind)
+        if is_c_or_cpp_keyword(name):
+            try self.fail(module, span, kind + " `" + name + "` is a reserved C or C++ word")
+        if is_generated_header_name(name):
+            try self.fail(module, span, kind + " `" + name + "` conflicts with the generated header's standard C names")
+
+    func is_root_module(module: ModuleId) -> bool:
+        return self.program.modules[module.value].package.value == self.program.root_package.value
+
+    func fail(module: ModuleId, span: SourceSpan, message: str) -> !:
+        error(format_diagnostic(self.program.modules[module.value].path, span, message))
+
+# mark: Identifier rules ======================================================================
+
+func false_table(count: i64) -> list[bool]:
+    let values = list[bool]()
+    for index in range(0, count): values.append(false)
+    return values
+
+func is_exported_struct_kind(value: HirCStructKind?) -> bool:
+    let kind = value
+    if kind == none: return false
+    return kind == HirCStructKind.exported
+
+# The generated header promises portable C, so accepting implementation-
+# specific Unicode identifiers would make the same Luce package fail on a
+# different C compiler. Leading underscores are excluded because global
+# underscore names occupy implementation-reserved namespaces in C. A double
+# underscore is reserved everywhere in C++, and the generated linkage guard
+# promises that the same header is safe to include from either language.
+func is_portable_c_identifier_spelling(value: str) -> bool:
+    if len(value) == 0 or value[0] == '_': return false
+    if not is_ascii_letter(value[0]): return false
+    for index in range(1, len(value)):
+        let character = value[index]
+        if not is_ascii_letter(character) and not is_ascii_digit(character) and character != '_': return false
+        if character == '_' and value[index - 1] == '_': return false
+    return true
+
+func is_ascii_letter(value: char) -> bool:
+    return (value >= 'a' and value <= 'z') or (value >= 'A' and value <= 'Z')
+
+func is_ascii_digit(value: char) -> bool:
+    return value >= '0' and value <= '9'
+
+func is_c_or_cpp_keyword(value: str) -> bool:
+    # Union of the standard C90 through C23 and C++23 keyword sets. The header
+    # carries an `extern "C"` guard, so a declaration that only parses as C
+    # would break the generated source contract for C++ consumers.
+    for keyword in [
+        "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor", "bool",
+        "break", "case", "catch", "char", "char8_t", "char16_t", "char32_t", "class",
+        "compl", "concept", "const", "consteval", "constexpr", "constinit", "const_cast",
+        "continue", "co_await", "co_return", "co_yield", "decltype", "default", "delete",
+        "do", "double", "dynamic_cast", "else", "enum", "explicit", "export", "extern",
+        "false", "float", "for", "friend", "goto", "if", "inline", "int", "long",
+        "module", "mutable", "namespace", "new", "noexcept", "not", "not_eq", "nullptr",
+        "operator", "or", "or_eq", "private", "protected", "public", "register",
+        "reinterpret_cast", "requires", "restrict", "return", "short", "signed", "sizeof",
+        "static", "static_assert", "static_cast", "struct", "switch", "template", "this",
+        "thread_local", "throw", "true", "try", "typedef", "typeid", "typename", "typeof",
+        "typeof_unqual", "union", "unsigned", "using", "virtual", "void", "volatile",
+        "wchar_t", "while", "xor", "xor_eq", "_Alignas", "_Alignof", "_Atomic", "_Bool",
+        "_Complex", "_Generic", "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local",
+    ]:
+        if value == keyword: return true
+    return false
+
+func is_generated_header_name(value: str) -> bool:
+    # The header includes <stdbool.h>/<stdint.h> and uses the constant macros
+    # below. Rejecting these exact spellings is clearer than allowing a valid
+    # Luce export to become an invalid C redeclaration or macro expansion.
+    for name in [
+        "int8_t", "int16_t", "int32_t", "int64_t",
+        "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+        "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
+        "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
+        "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
+        "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
+        "intptr_t", "uintptr_t", "intmax_t", "uintmax_t",
+        "INT8_MIN", "INT16_MIN", "INT32_MIN", "INT64_MIN",
+        "INT8_MAX", "INT16_MAX", "INT32_MAX", "INT64_MAX",
+        "UINT8_MAX", "UINT16_MAX", "UINT32_MAX", "UINT64_MAX",
+        "INT_LEAST8_MIN", "INT_LEAST16_MIN", "INT_LEAST32_MIN", "INT_LEAST64_MIN",
+        "INT_LEAST8_MAX", "INT_LEAST16_MAX", "INT_LEAST32_MAX", "INT_LEAST64_MAX",
+        "UINT_LEAST8_MAX", "UINT_LEAST16_MAX", "UINT_LEAST32_MAX", "UINT_LEAST64_MAX",
+        "INT_FAST8_MIN", "INT_FAST16_MIN", "INT_FAST32_MIN", "INT_FAST64_MIN",
+        "INT_FAST8_MAX", "INT_FAST16_MAX", "INT_FAST32_MAX", "INT_FAST64_MAX",
+        "UINT_FAST8_MAX", "UINT_FAST16_MAX", "UINT_FAST32_MAX", "UINT_FAST64_MAX",
+        "INTPTR_MIN", "INTPTR_MAX", "UINTPTR_MAX", "INTMAX_MIN", "INTMAX_MAX", "UINTMAX_MAX",
+        "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN", "SIG_ATOMIC_MAX", "SIZE_MAX",
+        "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX",
+        "INT8_WIDTH", "INT16_WIDTH", "INT32_WIDTH", "INT64_WIDTH",
+        "UINT8_WIDTH", "UINT16_WIDTH", "UINT32_WIDTH", "UINT64_WIDTH",
+        "INT_LEAST8_WIDTH", "INT_LEAST16_WIDTH", "INT_LEAST32_WIDTH", "INT_LEAST64_WIDTH",
+        "UINT_LEAST8_WIDTH", "UINT_LEAST16_WIDTH", "UINT_LEAST32_WIDTH", "UINT_LEAST64_WIDTH",
+        "INT_FAST8_WIDTH", "INT_FAST16_WIDTH", "INT_FAST32_WIDTH", "INT_FAST64_WIDTH",
+        "UINT_FAST8_WIDTH", "UINT_FAST16_WIDTH", "UINT_FAST32_WIDTH", "UINT_FAST64_WIDTH",
+        "INTPTR_WIDTH", "UINTPTR_WIDTH", "INTMAX_WIDTH", "UINTMAX_WIDTH", "PTRDIFF_WIDTH",
+        "SIG_ATOMIC_WIDTH", "SIZE_WIDTH", "WCHAR_WIDTH", "WINT_WIDTH",
+        "INT8_C", "INT16_C", "INT32_C", "INT64_C",
+        "UINT8_C", "UINT16_C", "UINT32_C", "UINT64_C", "INTMAX_C", "UINTMAX_C",
+    ]:
+        if value == name: return true
+    return false

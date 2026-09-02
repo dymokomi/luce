@@ -51,11 +51,18 @@ compiler owns the sealed service manifest, so callers provide locations only:
 Native output uses the pinned QBE toolchain for the current host:
 
 ```sh
-./build/luce build --package org.luce.examples --root examples --target native build/hello examples/hello.luc
+./build/luce build --package org.luce.examples --root examples --target native \
+  --runtime-root src/runtime --runtime src/runtime/allocator.native.luc \
+  build/hello examples/hello.luc
 ./build/hello
 ```
 
 `bootstrap.sh` installs QBE; the host C driver supplies assembly and linking.
+An application that also contains `export c` declarations can request its
+companion products explicitly with `--c-header PATH` and
+`--abi-report PATH`. The first is a standalone C11 header; the second is a
+versioned JSON record of the exact host target and QBE-owned sizes,
+alignments, field offsets, symbols, and calling conventions.
 
 ## Vocabulary
 
@@ -203,6 +210,8 @@ Read in this order; each stop hands off to the next.
 - `src/compiler/frontend/` owns source spans, tokens, syntax, and parsing.
 - `src/compiler/hir/` turns syntax into resolved, typed program meaning and
   owns semantic flow analysis.
+- `src/compiler/c_api/` owns the target-neutral source description and C11
+  header for explicit C exports.
 - `src/compiler/runtime_contract.luc` is the target-neutral service vocabulary
   shared by sealed-package binding, HIR, and MIR.
 - `src/compiler/backends/interpreter.luc` runs typed HIR directly.
