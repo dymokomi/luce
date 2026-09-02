@@ -118,6 +118,7 @@ class QbeEmitter:
                 code_bytes = u64(len(self.output) - output_start),
                 codegen_time_ms = self.elapsed_ms(started),
             ))
+        if self.program.process_entry != none: try self.emit_process_entry()
         if self.uses_tasks: self.output = self.output + try emit_qbe_task_helpers(self.program)
         if self.uses_float16: self.output = self.output + qbe_float16_helpers() + "\n\n"
         return TextEmission(text = self.output, functions = self.function_emissions)
@@ -172,6 +173,10 @@ class QbeEmitter:
         if emitted: self.output = self.output + "\n"
 
     func function_descriptor_is_used(target: FunctionId) -> bool:
+        let process_entry = self.program.process_entry
+        if process_entry != none:
+            if process_entry.element_retain.value == target.value: return true
+            if process_entry.element_release.value == target.value: return true
         for conformance in self.program.conformances:
             if conformance.retain.value == target.value or conformance.release.value == target.value: return true
             for implementation in conformance.implementations:
@@ -218,6 +223,79 @@ class QbeEmitter:
                     else: pass
         return false
 
+    # mark: Process entry ======================================================================
+
+    ## Materialize the host's C `argc`/`argv` as owned Luce strings behind
+    ## the backend boundary, invoke the unchanged fallible source function,
+    ## and release both success- and failure-path values. Rich fatal error
+    ## reporting is the separate §13 runtime slice; until then an unhandled
+    ## entry error exits with status 1 after deterministic cleanup.
+    func emit_process_entry() -> !:
+        if self.program.process_entry == none: return
+        let entry = self.program.process_entry else trap("process entry disappeared")
+        self.regions = list[Region]()
+        self.terminated = false
+        self.task_group = none
+        var element_type = entry.arguments_type
+        match mir_type(self.program.types, entry.arguments_type):
+            Slice(element): element_type = element
+            else: trap("verified process entry has no slice type")
+        let create = find_runtime_binding(self.program, RuntimeService.list_create) else trap("verified process entry has no list_create binding")
+        let release_list = find_runtime_binding(self.program, RuntimeService.list_release) else trap("verified process entry has no list_release binding")
+        let append = find_runtime_binding(self.program, RuntimeService.list_append_slot) else trap("verified process entry has no list_append_slot binding")
+        let make_slice = find_runtime_binding(self.program, RuntimeService.list_slice) else trap("verified process entry has no list_slice binding")
+        let buffer_data = find_runtime_binding(self.program, RuntimeService.buffer_data) else trap("verified process entry has no buffer_data binding")
+        let buffer_length = find_runtime_binding(self.program, RuntimeService.buffer_length) else trap("verified process entry has no buffer_length binding")
+        let copy_string = find_runtime_binding(self.program, RuntimeService.c_string_copy) else trap("verified process entry has no c_string_copy binding")
+        let release_slice = find_runtime_binding(self.program, RuntimeService.slice_release) else trap("verified process entry has no slice_release binding")
+        let pointer_size = self.layout.size_of(builtin_mir_type(BuiltinMirType.pointer))
+        let size = self.layout.size_of(element_type)
+        let alignment = self.storage_alignment(element_type)
+
+        self.output = self.output + "export function w $main(w %argc, l %argv) {\n@start\n"
+        self.line("%entry_list =l call $" + self.function_name(create) + "()")
+        self.line("%entry_index =w copy 0")
+        self.terminate("\tjmp @entry_test\n")
+        self.label("entry_test")
+        self.line("%entry_more =w csltw %entry_index, %argc")
+        self.terminate("\tjnz %entry_more, @entry_argument, @entry_invoke\n")
+        self.label("entry_argument")
+        self.line("%entry_index64 =l extsw %entry_index")
+        self.line("%entry_offset =l mul %entry_index64, " + str(pointer_size))
+        self.line("%entry_argv_slot =l add %argv, %entry_offset")
+        self.line("%entry_c_string =l loadl %entry_argv_slot")
+        self.line("%entry_owner =l call $" + self.function_name(copy_string) + "(l %entry_c_string)")
+        self.line("%entry_data =l call $" + self.function_name(buffer_data) + "(l %entry_owner)")
+        self.line("%entry_length =l call $" + self.function_name(buffer_length) + "(l %entry_owner)")
+        self.line("%entry_slot =l call $" + self.function_name(append) + "(l %entry_list, l " + str(size) + ", l " + str(alignment) + ", l " + self.function_descriptor(entry.element_retain) + ")")
+        self.line("storel %entry_owner, %entry_slot")
+        let data_offset = self.layout.field_offset(element_type, 1)
+        let length_offset = self.layout.field_offset(element_type, 2)
+        self.line("%entry_data_slot =l add %entry_slot, " + str(data_offset))
+        self.line("storel %entry_data, %entry_data_slot")
+        self.line("%entry_length_slot =l add %entry_slot, " + str(length_offset))
+        self.line("storel %entry_length, %entry_length_slot")
+        self.line("%entry_index =w add %entry_index, 1")
+        self.terminate("\tjmp @entry_test\n")
+
+        self.label("entry_invoke")
+        self.line("%entry_count =l extsw %argc")
+        self.line("%entry_slice =l call $" + self.function_name(make_slice) + "(l %entry_list, l " + str(size) + ", l 0, l %entry_count)")
+        self.line("call $" + self.function_name(release_list) + "(l %entry_list, l " + str(size) + ", l " + str(alignment) + ", l " + self.function_descriptor(entry.element_release) + ")")
+        self.line("%entry_error =l alloc16 " + str(self.layout.size_of(entry.failure_type)))
+        self.line("%entry_status_out =l alloc4 4")
+        self.line("%entry_failure =l call $" + self.function_name(entry.function) + "(l %entry_error, l %entry_slice, l %entry_status_out)")
+        self.line("call $" + self.function_name(release_slice) + "(l %entry_slice, l " + str(size) + ", l " + str(alignment) + ", l " + self.function_descriptor(entry.element_release) + ")")
+        self.line("%entry_failed =w cnel %entry_failure, 0")
+        self.terminate("\tjnz %entry_failed, @entry_failure, @entry_success\n")
+        self.label("entry_failure")
+        self.line("call $" + self.function_name(entry.failure_release) + "(l %entry_error)")
+        self.terminate("\tret 1\n")
+        self.label("entry_success")
+        self.line("%entry_status =w loadw %entry_status_out")
+        self.terminate("\tret %entry_status\n")
+        self.output = self.output + "}\n\n"
+
     func function_descriptor(target: FunctionId) -> str:
         return "$luce_fd" + str(target.value)
 
@@ -259,10 +337,7 @@ class QbeEmitter:
         self.regions = list[Region]()
         self.terminated = false
         self.task_group = none
-        var is_entry = false
-        let entry = self.program.entry
-        if entry != none: is_entry = entry.value == id.value
-        if is_entry or function.is_exported: self.output = self.output + "export "
+        if function.is_exported: self.output = self.output + "export "
         self.output = self.output + "function"
         if function.signature.is_fallible:
             self.output = self.output + " l"

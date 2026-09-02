@@ -42,10 +42,18 @@ expect() {
 "$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello.wasm" examples/hello.luc >/dev/null
 expect 0 "Hello, world!" wasmtime run "$test_dir/hello.wasm"
 
-printf 'pub func main(arguments: slice[str]) -> i32:\n    print("one")\n    print("two")\n    return 3 * 2\n' > "$test_dir/status.luc"
+printf 'pub func main(arguments: slice[str]) -> i32!:\n    print("one")\n    print("two")\n    return 3 * 2\n' > "$test_dir/status.luc"
 "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/status.wasm" "$test_dir/status.luc" >/dev/null
 expect 6 "one
 two" wasmtime run "$test_dir/status.wasm"
+
+printf 'pub func main(arguments: slice[str]) -> i32!:\n    if arguments.length != 3u64: return 1\n    if arguments[1u64] != "alpha": return 2\n    if arguments[2u64] != "two words": return 3\n    print(arguments[2u64])\n    return 0\n' > "$test_dir/arguments.luc"
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/arguments.wasm" "$test_dir/arguments.luc" >/dev/null
+expect 0 "two words" wasmtime run "$test_dir/arguments.wasm" alpha "two words"
+
+printf 'let invalid: ErrorCode = ErrorCode.package(1)\npub func main(arguments: slice[str]) -> i32!: error(invalid, "failed")\n' > "$test_dir/entry_failure.luc"
+"$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/entry_failure.wasm" "$test_dir/entry_failure.luc" >/dev/null
+expect 1 "" wasmtime run "$test_dir/entry_failure.wasm"
 
 # Exported functions: wasmtime invokes them by name and prints the result.
 "$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/core.wasm" examples/compiled_core/main.luc >/dev/null
@@ -381,7 +389,7 @@ structs self_replacement 330
 structs parameter_defaults 35
 structs custom_init 3498
 
-printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32:\n    var n = Named(name = "luce", count = 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
+printf 'struct Named:\n    let name: str\n    var count: i64\npub func main(arguments: slice[str]) -> i32!:\n    var n = Named(name = "luce", count = 1)\n    print(n.name)\n    n.count += 1\n    return 0\n' > "$test_dir/struct_print.luc"
 "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/struct_print.wasm" "$test_dir/struct_print.luc" >/dev/null
 expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
@@ -491,7 +499,7 @@ composite string_equality 1011
 composite string_values 1
 composite string_in_tuple 1
 
-printf 'func pick() -> str: return "yes"\npub func main(arguments: slice[str]) -> i32:\n    let greeting = "hi there"\n    print(greeting)\n    print(pick())\n    print("done")\n    return 0\n' > "$test_dir/print_value.luc"
+printf 'func pick() -> str: return "yes"\npub func main(arguments: slice[str]) -> i32!:\n    let greeting = "hi there"\n    print(greeting)\n    print(pick())\n    print("done")\n    return 0\n' > "$test_dir/print_value.luc"
 "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/print_value.wasm" "$test_dir/print_value.luc" >/dev/null
 expect 0 "hi there
 yes
@@ -1002,7 +1010,7 @@ if [ "$status" = 0 ] || [ -n "$output" ]; then
 fi
 
 # Checked arithmetic: overflow must trap (wasm `unreachable`), never wrap.
-printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
+printf 'pub func main(arguments: slice[str]) -> i32!: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
 "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/overflow.wasm" "$test_dir/overflow.luc" >/dev/null
 set +e
 wasmtime run "$test_dir/overflow.wasm" >/dev/null 2>&1; status=$?

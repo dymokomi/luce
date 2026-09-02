@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-09-01 (Stage-0 0.30).
+Last updated: 2026-09-02 (Stage-0 0.30).
 
 ## Recovery audit of the unpublished native branch
 
@@ -391,6 +391,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   return coverage, and every deferred-cleanup exit/failure rule now have exact
   semantic and executable evidence. The already closed §9.6 match matrix makes
   all of §9 complete through QBE, with Wasm as an additional product check.
+- [x] **Exact process entry contract** (2026-09-02, `done.md` §2).
+  An ordinary root package may select one public top-level
+  `main(arguments: slice[str]) -> i32!`; near misses are rejected before body
+  checking, while imported package functions and sealed-runtime helpers can
+  never become the process root. HIR artifacts preserve the selected symbol,
+  canonical MIR preserves the unchanged fallible signature plus semantic
+  argument/error ownership identities, and optimization remaps the complete
+  root without learning a target. HIR and MIR oracles accept explicit
+  semantic argument slices. QBE alone adapts C `argc`/`argv`; Wasm alone uses
+  WASI `args_sizes_get`/`args_get`; both release arguments and unhandled
+  failures on every ordinary path.
 - [ ] **`extern` import/export** through one source-level callable model;
   C signatures verified by the MIR verifier, with Wasm namespaces and native
   symbols interpreted only by their backends. The direct scalar-function rung

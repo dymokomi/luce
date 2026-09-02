@@ -43,7 +43,7 @@ if [ "$output" != "Hello, world!" ]; then
     exit 1
 fi
 
-printf 'pub func main(arguments: slice[str]) -> i32: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
+printf 'pub func main(arguments: slice[str]) -> i32!: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
 "$test_dir/luce" build --package org.luce.tests --root "$test_dir" --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/overflow" "$test_dir/overflow.luc"
 set +e
 { "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2>/dev/null

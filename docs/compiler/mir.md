@@ -679,7 +679,7 @@ MirProgram
     globals     list[MirGlobal]     module-level mutable state
     data        list[MirData]       address-free constant bytes, such as string payloads
     functions   list[MirFunction]
-    entry       FunctionId?         process entry when the artifact is an executable
+    process_entry MirProcessEntry?  language entry plus semantic ownership identities
 ```
 
 Identities are indices: `TypeId`, `FunctionId`, `ExternId`,
@@ -768,7 +768,10 @@ needs them; target-sized relocation slots do not belong in canonical MIR.
 `is_public` retains source-package API visibility without turning it into a
 native ABI promise. `is_exported` records the orthogonal artifact decision
 made by an explicit boundary declaration; a process entry is the independent
-`MirProgram.entry` root. Reachability keeps all three root families separate.
+`MirProgram.process_entry` root. It retains the unchanged fallible
+`(slice[str]) -> i32!` function, argument/failure types, and exact ownership
+helpers; argc/argv, WASI memory, pointer widths, and host calling conventions
+begin only in a backend adapter. Reachability keeps all three root families separate.
 Wasm can expose its package API while QBE/native exports only explicit C
 symbols and the entry. A rootless private library is preserved because its
 eventual consumer set is not yet known.

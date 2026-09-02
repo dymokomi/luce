@@ -447,7 +447,7 @@ func encode_code_entries(program: MirProgram, plan: ModulePlan, clock: (func() -
             codegen_time_ms = elapsed_ms(clock, started),
         ))
     if has_start(plan):
-        let body = encode_start_body(program, plan)
+        let body = try encode_start_body(program, plan)
         append_unsigned(entries, len(body))
         append_all(entries, body)
     return BinaryEmission(bytes = entries, functions = emissions)
@@ -470,17 +470,242 @@ func ends_in_return(body: list[MirInstruction]) -> bool:
         Trap(reason): return true
         else: return false
 
-# `_start`: no locals; call the entry, hand its i32 to `proc_exit`.
-func encode_start_body(program: MirProgram, plan: ModulePlan) -> list[u8]:
-    let entry = program.entry else trap("wasm `_start` planned without an entry")
+# mark: Process entry ========================================================================
+
+# `_start` asks WASI for the raw argument vector, copies each C string into the
+# ordinary owned Luce buffer representation, and passes one retained slice to
+# the unchanged fallible source function. All offsets and pointer widths below
+# are WebAssembly backend facts; canonical MIR contains only semantic types and
+# ownership identities.
+func encode_start_body(program: MirProgram, plan: ModulePlan) -> list[u8]!:
+    let entry = program.process_entry else trap("wasm `_start` planned without an entry")
+    var element_type = entry.arguments_type
+    match mir_type(program.types, entry.arguments_type):
+        Slice(element): element_type = element
+        else: trap("verified process entry has no slice type")
+    let create = find_runtime_binding(program, RuntimeService.list_create) else trap("verified process entry has no list_create binding")
+    let release_list = find_runtime_binding(program, RuntimeService.list_release) else trap("verified process entry has no list_release binding")
+    let append = find_runtime_binding(program, RuntimeService.list_append_slot) else trap("verified process entry has no list_append_slot binding")
+    let make_slice = find_runtime_binding(program, RuntimeService.list_slice) else trap("verified process entry has no list_slice binding")
+    let buffer_data = find_runtime_binding(program, RuntimeService.buffer_data) else trap("verified process entry has no buffer_data binding")
+    let buffer_length = find_runtime_binding(program, RuntimeService.buffer_length) else trap("verified process entry has no buffer_length binding")
+    let copy_string = find_runtime_binding(program, RuntimeService.c_string_copy) else trap("verified process entry has no c_string_copy binding")
+    let release_slice = find_runtime_binding(program, RuntimeService.slice_release) else trap("verified process entry has no slice_release binding")
+    let element_size = plan.layout.size_of(element_type)
+    let element_alignment = storage_alignment(plan, element_type)
+    let failure_size = plan.layout.size_of(entry.failure_type)
+
+    # Locals 0...14 are i32; local 15 is reused for the dynamic frame size and
+    # then each string's u64 byte length.
+    let argument_count = 0
+    let argument_bytes = 1
+    let old_stack = 2
+    let frame_base = 3
+    let argv = 4
+    let argument_storage = 5
+    let list_value = 6
+    let index = 7
+    let owner = 8
+    let data = 9
+    let slot = 10
+    let slice_value = 11
+    let error_value = 12
+    let status = 13
+    let failure = 14
+    let wide_scratch = 15
+
     let body = list[u8]()
-    append_unsigned(body, 0)
+    append_unsigned(body, 2)
+    append_unsigned(body, 15)
+    body.append(i32_value_type)
+    append_unsigned(body, 1)
+    body.append(i64_value_type)
+
+    # WASI writes argc and the packed-string byte count into the backend's
+    # reserved scratch words. A nonzero errno is a host-contract trap.
+    append_constant(body, scratch_iovec_buffer, false)
+    append_constant(body, scratch_iovec_length, false)
     body.append(opcode_call)
-    append_unsigned(body, defined_function_index(plan, i64(entry.value)))
+    append_unsigned(body, plan.args_sizes_get_import)
+    append_trap_if_true(body)
+    append_constant(body, scratch_iovec_buffer, false)
+    append_memory_op(body, opcode_i32_load, 2)
+    local_set_index(body, argument_count)
+    append_constant(body, scratch_iovec_length, false)
+    append_memory_op(body, opcode_i32_load, 2)
+    local_set_index(body, argument_bytes)
+
+    # Reserve `argc * pointer_size + argument bytes + aligned Error` from the
+    # shadow stack using i64 arithmetic first, so a wrapped i32 cannot cross
+    # the static-data boundary.
+    local_get_index(body, argument_count)
+    body.append(opcode_i64_extend_i32_u)
+    append_constant(body, plan.layout.pointer_size(), true)
+    body.append(opcode_i64_mul)
+    local_get_index(body, argument_bytes)
+    body.append(opcode_i64_extend_i32_u)
+    body.append(opcode_i64_add)
+    append_constant(body, failure_size + frame_alignment - 1, true)
+    body.append(opcode_i64_add)
+    body.append(opcode_local_tee)
+    append_unsigned(body, wide_scratch)
+    append_constant(body, 4294967295, true)
+    body.append(opcode_i64_gt_u)
+    append_trap_if_true(body)
+    body.append(opcode_global_get)
+    append_unsigned(body, len(plan.global_imports))
+    local_set_index(body, old_stack)
+    local_get_index(body, wide_scratch)
+    body.append(opcode_i32_wrap_i64)
+    local_get_index(body, old_stack)
+    body.append(opcode_i32_gt_u)
+    append_trap_if_true(body)
+    local_get_index(body, old_stack)
+    local_get_index(body, wide_scratch)
+    body.append(opcode_i32_wrap_i64)
+    body.append(opcode_i32_sub)
+    append_constant(body, -frame_alignment, false)
+    body.append(opcode_i32_and)
+    body.append(opcode_local_tee)
+    append_unsigned(body, frame_base)
+    body.append(opcode_global_set)
+    append_unsigned(body, len(plan.global_imports))
+    local_get_index(body, frame_base)
+    append_constant(body, plan.data_end, false)
+    body.append(opcode_i32_lt_u)
+    append_trap_if_true(body)
+
+    local_get_index(body, frame_base)
+    local_set_index(body, argv)
+    local_get_index(body, frame_base)
+    local_get_index(body, argument_count)
+    append_constant(body, plan.layout.pointer_size(), false)
+    body.append(opcode_i32_mul)
+    body.append(opcode_i32_add)
+    local_set_index(body, argument_storage)
+    local_get_index(body, argument_storage)
+    local_get_index(body, argument_bytes)
+    body.append(opcode_i32_add)
+    append_constant(body, frame_alignment - 1, false)
+    body.append(opcode_i32_add)
+    append_constant(body, -frame_alignment, false)
+    body.append(opcode_i32_and)
+    local_set_index(body, error_value)
+
+    local_get_index(body, argv)
+    local_get_index(body, argument_storage)
+    body.append(opcode_call)
+    append_unsigned(body, plan.args_get_import)
+    append_trap_if_true(body)
+
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(create.value)))
+    local_set_index(body, list_value)
+    append_constant(body, 0, false)
+    local_set_index(body, index)
+    body.append(opcode_block)
+    body.append(empty_block_type)
+    body.append(opcode_loop)
+    body.append(empty_block_type)
+    local_get_index(body, index)
+    local_get_index(body, argument_count)
+    body.append(opcode_i32_ge_u)
+    body.append(opcode_br_if)
+    append_unsigned(body, 1)
+
+    local_get_index(body, argv)
+    local_get_index(body, index)
+    append_constant(body, plan.layout.pointer_size(), false)
+    body.append(opcode_i32_mul)
+    body.append(opcode_i32_add)
+    append_memory_op(body, opcode_i32_load, 2)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(copy_string.value)))
+    local_set_index(body, owner)
+    local_get_index(body, owner)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(buffer_data.value)))
+    local_set_index(body, data)
+    local_get_index(body, owner)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(buffer_length.value)))
+    local_set_index(body, wide_scratch)
+
+    local_get_index(body, list_value)
+    append_constant(body, element_size, true)
+    append_constant(body, element_alignment, true)
+    append_function_descriptor(plan, body, entry.element_retain)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(append.value)))
+    local_set_index(body, slot)
+    store_process_string_field(plan, body, slot, owner, element_type, 0, false)
+    store_process_string_field(plan, body, slot, data, element_type, 1, false)
+    store_process_string_field(plan, body, slot, wide_scratch, element_type, 2, true)
+
+    local_get_index(body, index)
+    append_constant(body, 1, false)
+    body.append(opcode_i32_add)
+    local_set_index(body, index)
+    body.append(opcode_br)
+    append_unsigned(body, 0)
+    body.append(opcode_end)
+    body.append(opcode_end)
+
+    local_get_index(body, list_value)
+    append_constant(body, element_size, true)
+    append_constant(body, 0, true)
+    local_get_index(body, argument_count)
+    body.append(opcode_i64_extend_i32_u)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(make_slice.value)))
+    local_set_index(body, slice_value)
+    local_get_index(body, list_value)
+    append_constant(body, element_size, true)
+    append_constant(body, element_alignment, true)
+    append_function_descriptor(plan, body, entry.element_release)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(release_list.value)))
+
+    local_get_index(body, error_value)
+    local_get_index(body, slice_value)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(entry.function.value)))
+    local_set_index(body, failure)
+    local_set_index(body, status)
+    local_get_index(body, slice_value)
+    append_constant(body, element_size, true)
+    append_constant(body, element_alignment, true)
+    append_function_descriptor(plan, body, entry.element_release)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(release_slice.value)))
+
+    local_get_index(body, failure)
+    body.append(opcode_if)
+    body.append(empty_block_type)
+    local_get_index(body, error_value)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(entry.failure_release.value)))
+    append_constant(body, 1, false)
+    local_set_index(body, status)
+    body.append(opcode_end)
+    local_get_index(body, old_stack)
+    body.append(opcode_global_set)
+    append_unsigned(body, len(plan.global_imports))
+    local_get_index(body, status)
     body.append(opcode_call)
     append_unsigned(body, plan.proc_exit_import)
     body.append(opcode_end)
     return body
+
+func store_process_string_field(plan: ModulePlan, body: list[u8], slot: i64, value: i64, element_type: TypeId, field: i64, wide: bool):
+    local_get_index(body, slot)
+    let offset = plan.layout.field_offset(element_type, field)
+    if offset > 0:
+        append_constant(body, offset, false)
+        body.append(opcode_i32_add)
+    local_get_index(body, value)
+    if wide: append_memory_op(body, opcode_i64_store, 3)
+    else: append_memory_op(body, opcode_i32_store, 2)
 
 # One active data segment per item, placed into memory 0 at its packed offset
 # when the module is instantiated.
@@ -598,6 +823,10 @@ func local_set(body: list[u8], register: RegisterId):
 
 func local_get_index(body: list[u8], index: i64):
     body.append(opcode_local_get)
+    append_unsigned(body, index)
+
+func local_set_index(body: list[u8], index: i64):
+    body.append(opcode_local_set)
     append_unsigned(body, index)
 
 # mark: The frame =============================================================================

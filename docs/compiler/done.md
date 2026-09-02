@@ -7,20 +7,20 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-09-01 (Stage-0 0.30).
+Last updated: 2026-09-02 (Stage-0 0.30).
 
 ## 1. Where things stand
 
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. **Not yet**: the exact process-entry contract and the remaining rich C boundary (including generated string/list/f16 adapters, exported structs/enums, and callback runtime enforcement). Each unsupported form fails with a span. |
-| HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Runs `main(arguments: slice[str])` with an empty slice. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. **Not yet**: the remaining rich C boundary (including generated string/list/f16 adapters, exported structs/enums, and callback runtime enforcement). Each unsupported form fails with a span. |
+| HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Its process runner accepts explicit arguments as the ordinary `slice[str]` semantic shape. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed mutable/frozen collections and slices, nominal interfaces/classes/weak handles, closures/cells, generated ownership helpers, structured task groups and typed transfer runs, with no physical layout or execution-domain policy. The verifier proves every rule, reachability removes unreachable closed-world resources while retaining only each transfer graph's semantic service closure, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 875 unit tests across 32 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 881 unit tests across 32 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -42,8 +42,23 @@ Last updated: 2026-09-01 (Stage-0 0.30).
   only the closed data subset and no longer confuse declaration-only function
   defaults with storable compile-time data. Focused positive/negative tests,
   multi-module package fixtures, examples, both semantic oracles, QBE, Wasm,
-  CLI, and native product gates agree. The exact §20.5 process entry remains
-  open rather than erasing its argument in canonical MIR.
+  CLI, and native product gates agree.
+- [x] **Exact §20.5 process entry stays semantic through MIR**
+  (2026-09-02). One focused HIR owner selects and validates exactly
+  `pub func main(arguments: slice[str]) -> i32!` in the ordinary root package;
+  private methods, dependency `main`s, and sealed-runtime helpers remain
+  ordinary functions. Typed artifacts preserve the selected `SymbolId` and
+  validate its complete source contract. MIR keeps the source parameter and
+  fallible result unchanged and records only the target-neutral slice/error
+  types and ownership functions needed by a product boundary. Both semantic
+  oracles accept real argument values through the normal slice representation.
+  QBE constructs owned strings from C `argc`/`argv`; Wasm imports WASI
+  `args_sizes_get`/`args_get`; each backend releases the slice, releases an
+  unhandled `Error`, and exits with the source status or deterministic failure
+  status 1. Focused invalid-contract tests, package round trips, differential
+  execution, real QBE arguments, Wasmtime arguments/failure, CLI, and native
+  product gates cover the slice without introducing platform facts before
+  `backends/`.
 - [x] **Canonical MIR is target-neutral** (2026-08-30). Removed target names,
   pointer width/alignment, aggregate byte sizes and offsets, slot alignment,
   and target-sized data relocations from MIR. `FieldAddress`,

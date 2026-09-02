@@ -37,9 +37,9 @@ expect() {
     esac
 }
 
-printf 'pub func main() -> i64: return 5\n' > "$test_dir/main.luc"
-printf 'pub func main() -> i64: return true\n' > "$test_dir/wrong.luc"
-printf 'pub func main(arguments: slice[str]) -> i32:\n    var count = 5i32\n    let read: func() -> i32 = () => count\n    return read()\n' > "$test_dir/shared.luc"
+printf 'pub func answer() -> i64: return 5\n' > "$test_dir/main.luc"
+printf 'pub func answer() -> i64: return true\n' > "$test_dir/wrong.luc"
+printf 'pub func main(arguments: slice[str]) -> i32!:\n    var count = 5i32\n    let read: func() -> i32 = () => count\n    return read()\n' > "$test_dir/shared.luc"
 
 expect 0 "Luce v" "$cli" --version
 expect 2 "usage:" "$cli"
@@ -63,7 +63,7 @@ expect 0 "generic specializations for \`org.luce.tests\`: 5/5" "$cli" explain --
 expect 0 "expansion path:" "$cli" explain --package org.luce.tests --root examples examples/generic_functions.luc
 expect 0 "interface costs for \`org.luce.tests\`: 5 box(es), 5 dynamic call(s)" "$cli" explain --package org.luce.tests --root examples examples/interfaces.luc
 
-expect 0 "5" "$cli" run --package org.luce.tests --root "$test_dir" main.main "$test_dir/main.luc"
+expect 0 "5" "$cli" run --package org.luce.tests --root "$test_dir" main.answer "$test_dir/main.luc"
 expect 0 "help: use \`copy count = count\`" "$cli" run --package org.luce.tests --root "$test_dir" shared.main "$test_dir/shared.luc"
 expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luce.tests --root "$test_dir" main.nope "$test_dir/main.luc"
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests --root "$test_dir" other.main "$test_dir/main.luc"
@@ -74,7 +74,7 @@ expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/shared.wasm" "$test_dir/shared.luc"
 expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --root examples/compiled_core --target native "$test_dir/out" examples/compiled_core/main.luc
 
-expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples --target native "$test_dir/native" examples/hello.luc
+expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/native" examples/hello.luc
 native_output=$("$test_dir/native")
 if [ "$native_output" != "Hello, world!" ]; then
     echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
@@ -87,7 +87,7 @@ expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root exa
 # host's installed tools.
 mkdir "$test_dir/empty-path"
 printf 'previous artifact' > "$test_dir/preserved"
-expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples --target native "$test_dir/preserved" examples/hello.luc
+expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/preserved" examples/hello.luc
 preserved=$(cat "$test_dir/preserved")
 if [ "$preserved" != "previous artifact" ]; then
     echo "cli: failed native build replaced the previous artifact" >&2
