@@ -113,11 +113,24 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
 grep -q '"format": "luce-fiir-1"' "$test_dir/temperature.fiir.json"
 grep -q '"target":' "$test_dir/temperature.fiir.json"
 grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func luce_adjust_celsius(celsius: c.int, delta: c.int) -> c.int' "$test_dir/temperature/raw.native.luc"
 grep -q '_Static_assert(FLT_RADIX == 2' "$test_dir/temperature.adapter.c"
+grep -q 'if (celsius < -INT64_C(2147483648)' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
 
+expect 0 "bound tests/fixtures/fiir/scalars.h" "$cli" bind \
+    --name scalars \
+    --fiir "$test_dir/scalars.fiir.json" \
+    --raw "$test_dir/scalars.raw.native.luc" \
+    --adapter "$test_dir/scalars.adapter.c" \
+    --clang-arg -std=c11 \
+    tests/fixtures/fiir/scalars.h
+grep -q 'pub func luce_echo_int(value: c.int) -> c.int' "$test_dir/scalars.raw.native.luc"
+grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$test_dir/scalars.raw.native.luc"
+cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
+
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import celsius_to_fahrenheit\npub func main(arguments: slice[str]) -> i32!:\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, celsius_to_fahrenheit\npub func main(arguments: slice[str]) -> i32!:\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and adjust_celsius(40, 2) == 42 else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \
