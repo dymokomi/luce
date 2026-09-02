@@ -20,7 +20,7 @@ from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirD
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
 from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, uint_maximum
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
+from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_diverges, node_form, node_span, node_type, resolve_builtin_type, types_match
 from compiler.hir.ir import executable_function_name, place_class_field_step, place_element_step, place_field_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step, place_weak_field_step
@@ -3936,6 +3936,12 @@ pub class FunctionLowerer:
     # structural conversion; a bare pointer is validated, and every other
     # admitted scalar already has its canonical C-width MIR type.
     func encode_c_boundary_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let c_enum = self.state.c_enum_shape(value_type)
+        if c_enum != none:
+            let enum_type = try self.state.mir_type_of(module, function, span, value_type)
+            let shape = c_enum
+            let representation = try self.state.mir_type_of(module, function, span, shape.representation)
+            return self.encode_c_enum(enum_type, representation, value, shape, span, body)
         if self.state.is_extern_struct(value_type):
             return try self.copy_extern_struct_boundary(module, function, span, value_type, value, true, body)
         let optional_inner = self.state.optional_c_pointer(value_type)
@@ -3961,6 +3967,12 @@ pub class FunctionLowerer:
     # C slot -> internal value. Decoding allocates the ordinary tagged
     # optional before any source operation can observe the value.
     func decode_c_boundary_value(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, value: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let c_enum = self.state.c_enum_shape(value_type)
+        if c_enum != none:
+            let enum_type = try self.state.mir_type_of(module, function, span, value_type)
+            let shape = c_enum
+            let representation = try self.state.mir_type_of(module, function, span, shape.representation)
+            return self.decode_c_enum(enum_type, representation, value, shape, span, body)
         if self.state.is_extern_struct(value_type):
             return try self.copy_extern_struct_boundary(module, function, span, value_type, value, false, body)
         if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
@@ -3995,6 +4007,48 @@ pub class FunctionLowerer:
             return decoded
         if self.state.is_c_data_pointer(value_type): self.emit_nonnull_c_guard(value, span, body)
         return value
+
+    # Exported C enums remain ordinary tagged semantic enums everywhere except
+    # an explicit C slot. Flat structured dispatch keeps IR and lowering stack
+    # depth constant even for a generated enum with many cases; backends still
+    # own physical placement and calling ABI.
+    func encode_c_enum(enum_type: TypeId, representation: TypeId, value: RegisterId, shape: HirCEnum, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let tag = self.load_enum_tag(enum_type, value, span, body)
+        let result = self.state.new_register(representation)
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
+        for index in range(0, len(shape.values)):
+            let wanted = self.integer_constant(self.enum_tag_type(enum_type), index, span, body)
+            let selected = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = selected, operation = BinaryOp.eq, left = tag, right = wanted), span = span))
+            self.open_if(selected, list[RegisterId](), span, body)
+            let encoded = self.c_enum_constant(representation, shape.values[index], span, body)
+            body.append(MirInstruction(form = InstructionForm.Br(depth = 1, values = self.state.operands.run([encoded])), span = span))
+            self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "invalid exported C enum case"), span = span))
+        self.emit_end(span, body)
+        return result
+
+    func decode_c_enum(enum_type: TypeId, representation: TypeId, value: RegisterId, shape: HirCEnum, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        let result = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        body.append(MirInstruction(form = InstructionForm.Block(results = self.state.operands.run([result])), span = span))
+        for index in range(0, len(shape.values)):
+            let wanted = self.c_enum_constant(representation, shape.values[index], span, body)
+            let selected = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = selected, operation = BinaryOp.eq, left = value, right = wanted), span = span))
+            self.open_if(selected, list[RegisterId](), span, body)
+            let decoded = self.new_temp(enum_type, span, body)
+            self.store_enum_tag(enum_type, decoded, index, span, body)
+            body.append(MirInstruction(form = InstructionForm.Br(depth = 1, values = self.state.operands.run([decoded])), span = span))
+            self.emit_end(span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "invalid C enum value"), span = span))
+        self.emit_end(span, body)
+        return result
+
+    func c_enum_constant(representation: TypeId, value: Value, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        match value:
+            SignedInteger(item): return self.signed_integer_constant(representation, item, span, body)
+            UnsignedInteger(item): return self.unsigned_integer_constant(representation, item, span, body)
+            else: trap("exported C enum has a non-integer boundary value")
 
     # Materialize call-owned boundary storage member by member. The aggregate
     # remains target-neutral; QBE or Wasm alone chooses each field offset and
