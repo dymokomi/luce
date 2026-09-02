@@ -19,7 +19,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `checkout/` is one program split across modules. From this package root,
   `checkout/catalog.luc` has the module path `checkout.catalog`; its entry point
   demonstrates both selective and aliased imports.
-- `c_api.luc` demonstrates the narrow C export surface.
+- `c_api.luc` is the executable nested-record C ABI proof: exported structs,
+  fixed enums, and by-value extern/export calls compile through QBE and link
+  against a real C harness.
 - `c_import/` contains a real C library and the Luce boundary that consumes its
   manifest-generated raw module. See its README for the current implementation
   boundary.

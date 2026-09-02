@@ -19,7 +19,7 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
-from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, uint_maximum
+from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, make_struct_type, mir_type, no_register, no_registers, signature_register_type, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirCSlot, HirCaptureKind, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, TypeForm, describe_type, no_node
 from compiler.hir.ir import entry_at, function_body, node_at, node_diverges, node_form, node_span, node_type, resolve_builtin_type, types_match
@@ -776,7 +776,7 @@ pub class FunctionLowerer:
         for parameter in function.parameters:
             let raw_type = try self.state.c_boundary_type_of(module, function, function.span, parameter.value_type)
             parameter_types.append(raw_type)
-            let raw_value = self.state.new_register(raw_type)
+            let raw_value = self.state.new_register(signature_register_type(self.state.types, CallingConvention.c, raw_type))
             internal_arguments.append(try self.decode_c_boundary_value(module, function, function.span, parameter.value_type, raw_value, body))
 
         let source_index = self.state.function_index_of(function.symbol)
@@ -3826,14 +3826,15 @@ pub class FunctionLowerer:
                     # The call operand is still one pointer, but C writes the
                     # aggregate itself into this slot rather than a pointer
                     # value into a pointer-to-pointer slot.
-                    if self.state.is_extern_struct(value_type):
-                        raw_type = try self.state.mir_type_of(module, function, span, value_type)
+                    if self.state.is_c_struct(value_type):
+                        raw_type = try self.state.c_record_type_of(module, function, span, value_type)
                     let address = self.new_temp(raw_type, span, body)
                     encoded.append(address)
                     output_slots.append(COutputSlot(value_type = value_type, raw_type = raw_type, address = address))
         let raw_results = list[RegisterId]()
         if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
-            raw_results.append(self.state.new_register(try self.state.c_boundary_type_of(module, function, span, contract.declared_result)))
+            let raw_result = try self.state.c_boundary_type_of(module, function, span, contract.declared_result)
+            raw_results.append(self.state.new_register(signature_register_type(self.state.types, CallingConvention.c, raw_result)))
         self.emit_call(target, raw_results, encoded, span, body)
 
         let values = list[RegisterId]()
@@ -3942,8 +3943,8 @@ pub class FunctionLowerer:
             let shape = c_enum
             let representation = try self.state.mir_type_of(module, function, span, shape.representation)
             return self.encode_c_enum(enum_type, representation, value, shape, span, body)
-        if self.state.is_extern_struct(value_type):
-            return try self.copy_extern_struct_boundary(module, function, span, value_type, value, true, body)
+        if self.state.is_c_struct(value_type):
+            return try self.transcode_c_record(module, function, span, value_type, value, true, body)
         let optional_inner = self.state.optional_c_pointer(value_type)
         if optional_inner != none:
             let optional_type = try self.state.mir_type_of(module, function, span, value_type)
@@ -3973,8 +3974,8 @@ pub class FunctionLowerer:
             let shape = c_enum
             let representation = try self.state.mir_type_of(module, function, span, shape.representation)
             return self.decode_c_enum(enum_type, representation, value, shape, span, body)
-        if self.state.is_extern_struct(value_type):
-            return try self.copy_extern_struct_boundary(module, function, span, value_type, value, false, body)
+        if self.state.is_c_struct(value_type):
+            return try self.transcode_c_record(module, function, span, value_type, value, false, body)
         if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
             self.emit_nonnull_c_guard(value, span, body)
             let owner = self.state.new_register(builtin_mir_type(BuiltinMirType.buffer_owner))
@@ -4050,35 +4051,52 @@ pub class FunctionLowerer:
             UnsignedInteger(item): return self.unsigned_integer_constant(representation, item, span, body)
             else: trap("exported C enum has a non-integer boundary value")
 
-    # Materialize call-owned boundary storage member by member. The aggregate
-    # remains target-neutral; QBE or Wasm alone chooses each field offset and
-    # alignment when it legalizes `FieldAddress`. This explicit adapter is the
-    # single place that must evolve if an internal representation later stops
-    # matching the corresponding C field representation.
-    func copy_extern_struct_boundary(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, source: RegisterId, encoding: bool, body: list[MirInstruction]) -> RegisterId!:
-        let aggregate_type = try self.state.mir_type_of(module, function, span, value_type)
-        let destination = self.new_temp(aggregate_type, span, body)
-        try self.copy_extern_struct_fields(module, function, span, value_type, source, destination, encoding, body)
+    # Materialize call-owned boundary storage member by member. Internal and C
+    # record shapes are distinct structural MIR types, because a nested fixed
+    # C enum is scalar only in the latter. Backends alone place either shape.
+    func transcode_c_record(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, source: RegisterId, encoding: bool, body: list[MirInstruction]) -> RegisterId!:
+        let internal_type = try self.state.mir_type_of(module, function, span, value_type)
+        let boundary_type = try self.state.c_record_type_of(module, function, span, value_type)
+        var destination_type = internal_type
+        if encoding: destination_type = boundary_type
+        let destination = self.new_temp(destination_type, span, body)
+        try self.transcode_c_record_fields(module, function, span, value_type, internal_type, boundary_type, source, destination, encoding, body)
         return destination
 
-    func copy_extern_struct_fields(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, source: RegisterId, destination: RegisterId, encoding: bool, body: list[MirInstruction]) -> !:
-        let aggregate_type = try self.state.mir_type_of(module, function, span, value_type)
+    func transcode_c_record_fields(module: HirModule, function: HirFunction, span: SourceSpan, value_type: ir.TypeId, internal_type: TypeId, boundary_type: TypeId, source: RegisterId, destination: RegisterId, encoding: bool, body: list[MirInstruction]) -> !:
+        var source_type = boundary_type
+        var destination_type = internal_type
+        if encoding:
+            source_type = internal_type
+            destination_type = boundary_type
         let fields = ir.nominal_fields(self.state.program, value_type)
         for index in range(0, len(fields)):
             let field = fields[index]
-            let field_type = try self.state.mir_type_of(module, function, span, field.value_type)
-            let source_field = self.field_address(aggregate_type, source, index, span, body)
-            let destination_field = self.field_address(aggregate_type, destination, index, span, body)
-            if self.state.is_extern_struct(field.value_type):
-                try self.copy_extern_struct_fields(module, function, span, field.value_type, source_field, destination_field, encoding, body)
+            let internal_field_type = try self.state.mir_type_of(module, function, span, field.value_type)
+            let boundary_field_type = try self.state.c_boundary_type_of(module, function, span, field.value_type)
+            let source_field = self.field_address(source_type, source, index, span, body)
+            let destination_field = self.field_address(destination_type, destination, index, span, body)
+            if self.state.is_c_struct(field.value_type):
+                let nested_boundary = try self.state.c_record_type_of(module, function, span, field.value_type)
+                try self.transcode_c_record_fields(module, function, span, field.value_type, internal_field_type, nested_boundary, source_field, destination_field, encoding, body)
                 continue
-            let field_value = self.load_value(field_type, source_field, span, body)
-            # A pointer-shaped value read from an out struct is deliberately
-            # bare and inert. Repacking it into a non-null C field is its next
-            # boundary crossing and therefore enforces the ordinary contract.
-            if encoding and (self.state.is_c_data_pointer(field.value_type) or self.state.is_c_function(field.value_type)):
-                self.emit_nonnull_c_guard(field_value, span, body)
-            self.store_value(field_type, destination_field, field_value, span, body)
+            var source_field_type = boundary_field_type
+            var destination_field_type = internal_field_type
+            if encoding:
+                source_field_type = internal_field_type
+                destination_field_type = boundary_field_type
+            let field_value = self.load_value(source_field_type, source_field, span, body)
+            var converted = field_value
+            if encoding: converted = try self.encode_c_boundary_value(module, function, span, field.value_type, field_value, body)
+            elif self.state.c_enum_shape(field.value_type) != none:
+                converted = try self.decode_c_boundary_value(module, function, span, field.value_type, field_value, body)
+            # External records are raw snapshots: pointer/cfunc fields may be
+            # null until a later explicit input crossing consumes them. An
+            # exported record is itself that public input contract, so its
+            # fields receive the ordinary inbound validation here.
+            elif self.state.is_exported_c_struct(value_type):
+                converted = try self.decode_c_boundary_value(module, function, span, field.value_type, field_value, body)
+            self.store_value(destination_field_type, destination_field, converted, span, body)
 
     func emit_nonnull_c_guard(value: RegisterId, span: SourceSpan, body: list[MirInstruction]):
         let null_value = self.null_constant(span, body)

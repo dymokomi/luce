@@ -463,20 +463,30 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   results, nullable extern structs, generic declarations, and empty C shapes
   are refused.
   Fixed-representation exported C enums are complete for direct extern,
-  `cfunc`, and exported-function slots. They reuse the ordinary payload-free
+  `cfunc`, exported-function, and C-record fields. They reuse the ordinary payload-free
   enum for every semantic operation and retain one exact case-to-integer map
   in HIR/package artifacts. Canonical MIR adds no representation kind: its
   existing C-edge adapters translate positional semantic tags to/from the
   declared integer type and trap unknown incoming values. Both semantic
   oracles, malformed package tests, imported artifacts, Wasm encoding, and
   real QBE/libc execution cover signed values in both directions. External
-  globals and aggregate fields remain closed until their own adapter shapes
-  are implemented; silently laying out the semantic enum as C storage would
-  violate the boundary-only rule.
+  globals remain closed until their own adapter shape is implemented;
+  silently laying out the semantic enum as C storage would violate the
+  boundary-only rule.
+  Exported C structs are now complete as semantic values and by-value ABI
+  records. HIR records only an exported boundary role and admits a closed,
+  recursively owned scalar/fixed-enum/exported-record field vocabulary. MIR
+  derives a separate declaration-order structural boundary type only at an
+  explicit C edge, fieldwise translates nested semantic values, and retains
+  no size, alignment, offset, or target identity. QBE alone declares and
+  classifies the aggregate ABI types for definitions, externs, and indirect
+  callbacks. Both semantic oracles, typed-package round trips/imports, focused
+  MIR verification, and a linked C harness prove nested arguments/results,
+  fixed enum fields, floating fields, and aggregate-bearing indirect C calls.
+  Generated headers and ABI reports remain separate product work.
   Incoming bare/nullable C function pointers and cfunc fields are now complete
-  in the separate rung below. Exported structs, generated headers and
-  aggregate adapters, the explicit inbound-memory verbs, and callback runtime
-  enforcement remain on this item.
+  in the separate rung below. Generated headers and ABI reports, the explicit
+  inbound-memory verbs, and callback runtime enforcement remain on this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing

@@ -737,6 +737,15 @@ because parameters are immutable). A fallible function reserves parameter 0
 for the error slot; when its success value is an aggregate, the result slot is
 parameter 1. Source parameters follow both hidden parameters.
 
+An explicit C-convention aggregate keeps its structural type in the signature
+so a backend can ask its own ABI classifier how the value is passed or
+returned. The corresponding canonical register is still `Ptr`: it names the
+value's storage and does not pretend that a multi-field value occupies a MIR
+temporary. Exported records derive a separate declaration-order boundary
+`Struct` only at this edge, allowing fixed C-enum fields to be integers there
+while their ordinary internal enum representation remains unchanged. No byte
+layout or ABI class is introduced by that derivation.
+
 ### Functions, externs, globals, data
 
 ```

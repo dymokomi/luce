@@ -18,7 +18,7 @@
 from compiler.backend import HirExecutionBackend
 from compiler.backends.hir_resources import collect_hir_class_references
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, CapturedCellStorage, ClassFinalizer, ClassStorage, ClosureStorage, FrozenHashEntry, FrozenHashStorage, FrozenListStorage, HashEntry, HashStorage, HirCaptureKind, HirNodeForm, HirTaskOutcome, HirTaskStorage, InterfaceStorage, ListBuffer, ListStorage, MutableSliceStorage, NodeId, SliceBacking, SliceStorage, WeakClassStorage
-from compiler.hir.ir import HirCEnum, HirCFunction, HirCFunctionIdentity, HirCSlot, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
+from compiler.hir.ir import HirCEnum, HirCFunction, HirCFunctionIdentity, HirCSlot, HirCStructKind, HirExternVariable, HirFunction, HirFunctionImplementation, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, UnaryOperation, Value, no_node
 from compiler.hir.ir import class_application, entry_at, node_at, node_form, node_module, node_span, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import TypeTable, floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, integer_values_match, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
@@ -30,6 +30,11 @@ from compiler.formatting.ieee import normalize_ieee_float
 import std.strings
 
 # mark: Run state =============================================================================
+
+enum CRecordDirection:
+    encode
+    decode_result
+    decode_argument
 
 # One live local: the value currently bound to a symbol in some call frame.
 struct Binding:
@@ -522,8 +527,8 @@ class HirInterpreterRun: ClassFinalizer:
                         trap("typed exported C enum contains an invalid case")
                     return shape.values[case_index]
                 else: trap("typed exported C enum slot contains a non-enum value")
-        if self.is_extern_struct(value_type):
-            return try self.transcode_extern_struct(function, value, value_type, slot, true)
+        if self.is_c_struct(value_type):
+            return try self.transcode_c_struct(function, value, value_type, slot, CRecordDirection.encode)
         match self.program.types.definitions[value_type.value].form:
             List(element_type):
                 match value:
@@ -608,8 +613,8 @@ class HirInterpreterRun: ClassFinalizer:
         let c_enum = self.c_enum_shape(value_type)
         if c_enum != none:
             return try self.decode_c_enum(value, c_enum, self.incompatible_c_result(function, slot, value_type))
-        if self.is_extern_struct(value_type):
-            return try self.transcode_extern_struct(function, value, value_type, slot, false)
+        if self.is_c_struct(value_type):
+            return try self.transcode_c_struct(function, value, value_type, slot, CRecordDirection.decode_result)
         if types_match(value_type, resolve_builtin_type(BuiltinType.string)):
             match value:
                 Foreign(token):
@@ -650,6 +655,8 @@ class HirInterpreterRun: ClassFinalizer:
         let c_enum = self.c_enum_shape(value_type)
         if c_enum != none:
             return try self.decode_c_enum(value, c_enum, self.incompatible_c_argument(function, slot, value_type))
+        if self.is_c_struct(value_type):
+            return try self.transcode_c_struct(function, value, value_type, slot, CRecordDirection.decode_argument)
         let optional_cfunc = self.optional_c_function(value_type)
         if optional_cfunc != none:
             match value:
@@ -795,8 +802,22 @@ class HirInterpreterRun: ClassFinalizer:
 
     func is_extern_struct(value_type: TypeId) -> bool:
         match self.program.types.definitions[value_type.value].form:
-            Struct(index, arguments): return self.program.structs[index].is_extern
+            Struct(index, arguments):
+                let kind = self.program.structs[index].c_kind
+                if kind == none: return false
+                return kind == HirCStructKind.external
             else: return false
+
+    func is_exported_c_struct(value_type: TypeId) -> bool:
+        match self.program.types.definitions[value_type.value].form:
+            Struct(index, arguments):
+                let kind = self.program.structs[index].c_kind
+                if kind == none: return false
+                return kind == HirCStructKind.exported
+            else: return false
+
+    func is_c_struct(value_type: TypeId) -> bool:
+        return self.is_extern_struct(value_type) or self.is_exported_c_struct(value_type)
 
     func c_enum_shape(value_type: TypeId) -> HirCEnum?:
         match self.program.types.definitions[value_type.value].form:
@@ -806,28 +827,36 @@ class HirInterpreterRun: ClassFinalizer:
     # The semantic oracle models packing as a fresh field-by-field record.
     # It has no target layout, but it enforces the same closed values and bare
     # out-field handle/cfunc rule as canonical MIR's explicit boundary copy.
-    func transcode_extern_struct(function: HirFunction, value: Value, value_type: TypeId, slot: str, encoding: bool) -> Value!:
+    func transcode_c_struct(function: HirFunction, value: Value, value_type: TypeId, slot: str, direction: CRecordDirection) -> Value!:
         let source_fields = list[BoxedValue]()
         match value:
             Record(fields):
                 for field in fields: source_fields.append(field)
-            else: error(self.incompatible_c_result(function, slot, value_type))
+            else: error(self.incompatible_c_record(function, slot, value_type, direction))
         let schema = nominal_fields(self.program, value_type)
-        if len(source_fields) != len(schema): error(self.incompatible_c_result(function, slot, value_type))
+        if len(source_fields) != len(schema): error(self.incompatible_c_record(function, slot, value_type, direction))
         let copied = list[BoxedValue]()
         for index in range(0, len(schema)):
             let field = schema[index]
             let field_slot = slot + "." + field.name
             let item = source_fields[index].value
-            if self.is_extern_struct(field.value_type):
-                copied.append(BoxedValue(value = try self.transcode_extern_struct(function, item, field.value_type, field_slot, encoding)))
+            if self.is_c_struct(field.value_type):
+                copied.append(BoxedValue(value = try self.transcode_c_struct(function, item, field.value_type, field_slot, direction)))
+                continue
+            let enum_shape = self.c_enum_shape(field.value_type)
+            if enum_shape != none:
+                let shape = enum_shape
+                if direction == CRecordDirection.encode:
+                    copied.append(BoxedValue(value = try self.encode_c_value(function, item, field.value_type, field_slot)))
+                else:
+                    copied.append(BoxedValue(value = try self.decode_c_enum(item, shape, self.incompatible_c_record(function, field_slot, field.value_type, direction))))
                 continue
             match self.program.types.definitions[field.value_type.value].form:
                 Foreign:
                     match item:
                         Foreign(token):
-                            if encoding and token == 0: error(self.null_foreign(function, field_slot))
-                        else: error(self.incompatible_c_result(function, field_slot, field.value_type))
+                            if direction == CRecordDirection.encode and token == 0: error(self.null_foreign(function, field_slot))
+                        else: error(self.incompatible_c_record(function, field_slot, field.value_type, direction))
                     copied.append(BoxedValue(value = item))
                     continue
                 CFunction(parameters, result):
@@ -835,9 +864,9 @@ class HirInterpreterRun: ClassFinalizer:
                         CFunction(identity):
                             match identity:
                                 ForeignPointer(token):
-                                    if encoding and token == 0: error(self.null_foreign(function, field_slot))
+                                    if direction == CRecordDirection.encode and token == 0: error(self.null_foreign(function, field_slot))
                                 Declared(symbol): pass
-                        else: error(self.incompatible_c_result(function, field_slot, field.value_type))
+                        else: error(self.incompatible_c_record(function, field_slot, field.value_type, direction))
                     copied.append(BoxedValue(value = item))
                     continue
                 else: pass
@@ -847,17 +876,22 @@ class HirInterpreterRun: ClassFinalizer:
                     Foreign(token):
                         match self.program.extern_types[extern_index].representation:
                             Pointer:
-                                if encoding and token == 0: error(self.null_foreign(function, field_slot))
+                                if direction == CRecordDirection.encode and token == 0: error(self.null_foreign(function, field_slot))
                             Integer(representation):
                                 if token < integer_minimum(self.program.types, representation) or token > integer_maximum(self.program.types, representation):
-                                    error(self.incompatible_c_result(function, field_slot, field.value_type))
-                    else: error(self.incompatible_c_result(function, field_slot, field.value_type))
+                                    error(self.incompatible_c_record(function, field_slot, field.value_type, direction))
+                    else: error(self.incompatible_c_record(function, field_slot, field.value_type, direction))
                 copied.append(BoxedValue(value = item))
                 continue
             if not self.scalar_value_matches(item, field.value_type):
-                error(self.incompatible_c_result(function, field_slot, field.value_type))
+                error(self.incompatible_c_record(function, field_slot, field.value_type, direction))
             copied.append(BoxedValue(value = self.canonical_scalar_value(item, field.value_type)))
         return Value.Record(fields = copied)
+
+    func incompatible_c_record(function: HirFunction, slot: str, value_type: TypeId, direction: CRecordDirection) -> str:
+        if direction == CRecordDirection.decode_argument:
+            return self.incompatible_c_argument(function, slot, value_type)
+        return self.incompatible_c_result(function, slot, value_type)
 
     func optional_data_pointer(value_type: TypeId) -> TypeId?:
         match self.program.types.definitions[value_type.value].form:
