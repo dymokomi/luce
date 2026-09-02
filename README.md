@@ -65,12 +65,12 @@ versioned JSON record of the exact host target and QBE-owned sizes,
 alignments, field offsets, symbols, and calling conventions.
 
 The C-import path generates inspectable FIIR, raw Luce, and C-adapter products
-from one exact Clang invocation. It admits C `double` when Clang proves IEEE
-binary64 and every fundamental C integer through nominal target-independent
-carriers whose target ranges are checked by the generated adapter. Every
-broader scalar or declaration still fails explicitly until its complete
-adapter contract lands. The end-to-end command and generated module layout
-are documented in
+from one exact Clang invocation. It admits C `_Bool`, C `double` when Clang
+proves IEEE binary64, and every fundamental C integer through nominal
+target-independent carriers. The generated adapter owns `_Bool` object
+representation and checks integer target ranges. Every broader scalar or
+declaration still fails explicitly until its complete adapter contract lands.
+The end-to-end command and generated module layout are documented in
 [`examples/c_import/README.md`](examples/c_import/README.md).
 
 ## Vocabulary

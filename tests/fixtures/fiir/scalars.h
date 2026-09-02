@@ -1,6 +1,8 @@
 #ifndef LUCE_TEST_FIIR_SCALARS_H
 #define LUCE_TEST_FIIR_SCALARS_H
 
+_Bool luce_echo_boolean(_Bool value);
+
 char luce_echo_plain_char(char value);
 signed char luce_echo_signed_char(signed char value);
 unsigned char luce_echo_unsigned_char(unsigned char value);

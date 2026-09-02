@@ -10,18 +10,19 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `../luce.toml` declares the `temperature` C binding target.
 - `temperature/raw.native.luc` and `temperature.adapter.c` are generated from
   the header and are not checked in.
-- `temperature.luc` performs explicit `c.double` and `c.int` crossings and
-  exposes safe Luce-facing functions.
+- `temperature.luc` performs explicit `c.boolean`, `c.double`, and `c.int`
+  crossings and exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
-The executable importer supports exact IEEE binary64 C `double` and every
-fundamental C integer family. It records Clang's target and scalar facts in
-FIIR, generates nominal `c` carriers plus a checked C adapter, and links that
-adapter only at the QBE backend boundary. Integer carriers keep one `i64` or
-`u64` shape through HIR and MIR; the adapter alone verifies the target range
-before invoking C. Boolean/other floating types, typedef identities, pointers,
-records, recipes, and the f16 shim remain explicit generation errors until
-their complete contracts are implemented.
+The executable importer supports C `_Bool`, exact IEEE binary64 C `double`,
+and every fundamental C integer family. It records Clang's target and scalar
+facts in FIIR, generates nominal `c` carriers plus a checked C adapter, and
+links that adapter only at the QBE backend boundary. Boolean retains one Luce
+`bool` shape; integer carriers retain one `i64` or `u64` shape. The adapter
+alone asserts `_Bool` object width and verifies integer target ranges before
+invoking C. Other floating types, typedef identities, pointers, records,
+recipes, and the f16 shim remain explicit generation errors until their
+complete contracts are implemented.
 
 Generate the binding products with explicit destinations:
 
