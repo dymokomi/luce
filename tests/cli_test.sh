@@ -112,6 +112,7 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     examples/c_import/temperature.h
 grep -q '"format": "luce-fiir-1"' "$test_dir/temperature.fiir.json"
 grep -q '"target":' "$test_dir/temperature.fiir.json"
+grep -q '"kind": "record"' "$test_dir/temperature.fiir.json"
 grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_adjust_celsius(celsius: c.int, delta: c.int) -> c.int' "$test_dir/temperature/raw.native.luc"
@@ -122,6 +123,10 @@ grep -q 'pub let LUCE_SCALE_CELSIUS: luce_temperature_scale' "$test_dir/temperat
 grep -q 'pub let LUCE_WATER_BOILING_CELSIUS: c.integer_constant = c.integer_constant(false, 100u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub struct luce_temperature_range:' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub struct luce_temperature_reading:' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func luce_shift_range(value: luce_temperature_range, delta: c.double) -> luce_temperature_range' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func luce_shift_reading(value: luce_temperature_reading, delta: luce_degrees) -> luce_temperature_reading' "$test_dir/temperature/raw.native.luc"
 grep -q '_Static_assert(FLT_RADIX == 2' "$test_dir/temperature.adapter.c"
 grep -q 'FLT_MANT_DIG == 24' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(CHAR_BIT \* sizeof(_Bool)' "$test_dir/temperature.adapter.c"
@@ -129,6 +134,8 @@ grep -q 'if (celsius < -INT64_C(2147483648)' "$test_dir/temperature.adapter.c"
 grep -q '_Generic(((luce_degrees)0), int: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(_Generic((LUCE_WATER_BOILING_CELSIUS), int: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_WATER_BOILING_CELSIUS == UINT64_C(100)' "$test_dir/temperature.adapter.c"
+grep -q 'offsetof(struct luce_temperature_reading, scale)' "$test_dir/temperature.adapter.c"
+grep -q 'struct __luce_fiir_temperature_record_luce_temperature_reading' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/temperature.adapter.c"
 
@@ -149,7 +156,7 @@ grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$t
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import adjust_celsius, boiling_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, scale_round_trips\npub func main(arguments: slice[str]) -> i32!:\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and scale_round_trips() and is_freezing(0.0) else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, boiling_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius) = shifted_reading(5)\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \

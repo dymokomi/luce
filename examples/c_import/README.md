@@ -13,7 +13,8 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
   `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
-  constant, and exposes safe Luce-facing functions.
+  constant and fieldwise simple/nested record crossings, and exposes safe
+  Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary32 `float`, exact
@@ -21,17 +22,20 @@ IEEE binary64 `double` and `long double`, and every fundamental C integer
 family, plus scalar typedef chains over those types. It records Clang's target
 and scalar facts in FIIR, and also accepts named or typedef-backed C enums. It
 generates nominal `c`, typedef, and sign-magnitude enum carriers plus a checked
-C adapter, and links that adapter only at the QBE backend boundary. A
-constant-only anonymous enum contributes universal sign-and-magnitude constants
+C adapter, and links that adapter only at the QBE backend boundary. Plain named
+or anonymous-typedef C records become logical Luce records and private
+fixed-carrier adapter records; Clang-evaluated layout stays in FIIR and the C
+product. A constant-only anonymous enum contributes universal
+sign-and-magnitude constants
 instead of an unusable synthetic type or a target-selected integer carrier.
 Boolean retains one Luce `bool` shape; floating types retain `f32` or `f64`;
 integer and typedef carriers retain one lossless portable shape; enum carriers
 retain one `bool` plus `u64` shape and expose the header's constants. The
 adapter alone asserts scalar representations, verifies integer target ranges,
-and maps declared enum values to the target's exact C type. Extended floating
-formats, pointers, records, macro/object constants, recipes, and the f16 shim
-remain explicit generation errors until their complete contracts are
-implemented.
+maps declared enum values to the target's exact C type, and verifies record
+size, alignment, offsets, and field types. Extended floating formats, pointers,
+unions, bit-fields, macro/object constants, recipes, and the f16 shim remain
+explicit generation errors until their complete contracts are implemented.
 
 Generate the binding products with explicit destinations:
 

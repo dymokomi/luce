@@ -74,7 +74,9 @@ use one nominal sign-magnitude carrier and typed constants; their target enum
 representation is mediated entirely by the generated C adapter, which also
 checks integer ranges and rejects undeclared enum values. Constant-only
 anonymous enums use one target-independent sign-and-magnitude constant carrier
-without fabricating a C enum type. Extended floating representations and
+without fabricating a C enum type. Plain C records use logical generated Luce
+records and private fixed field carriers; Clang-evaluated layout is asserted
+only by the backend-owned C adapter. Extended floating representations and
 broader declarations fail explicitly until their complete adapter contracts
 land.
 The end-to-end command and generated module layout are documented in

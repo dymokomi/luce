@@ -5,9 +5,9 @@
 #   DESCRIPTION:
 #       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
 #       spelling conventions stop here. The decoder accepts scalar typedefs,
-#       C enumerations, constant-only anonymous enumerations, and functions;
-#       every other declaration or type is either outside the requested header
-#       or rejected with a stable support diagnostic.
+#       C enumerations, constant-only anonymous enumerations, plain records,
+#       and functions; every other declaration or type is either outside the
+#       requested header or rejected with a stable support diagnostic.
 #
 #       Clang elides repeated file and line fields in source locations. The
 #       top-level cursor below reconstructs only those documented repetitions;
@@ -15,7 +15,7 @@
 #
 #==============================================================================================
 
-from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirParameter, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, plain_value_boundary, validate_fiir
+from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, plain_value_boundary, validate_fiir
 import std.json
 import std.strings
 
@@ -123,6 +123,7 @@ struct ClangTypedef:
     let name: str
     let target_spelling: str
     let target_enum_id: str?
+    let target_record_id: str?
     let origin: FiirSourceOrigin
 
 struct ClangEnumerationConstant:
@@ -153,10 +154,46 @@ class ClangEnumerationCatalog:
         self.by_identity = map[str, ClangEnumeration]()
         self.identity_by_spelling = map[str, str]()
 
+struct ClangRecordField:
+    let name: str?
+    let type_spelling: str
+    let is_bitfield: bool
+    let origin: FiirSourceOrigin
+
+class ClangRecord:
+    let identity: str
+    let tag_kind: str
+    let c_spelling: str?
+    let fields: list[ClangRecordField]
+    let origin: FiirSourceOrigin
+    var raw_name: str
+    var size_bits: u64
+    var alignment_bits: u64
+    var field_offsets: list[u64]
+
+    init(identity: str, tag_kind: str, c_spelling: str?, fields: list[ClangRecordField], origin: FiirSourceOrigin, raw_name: str):
+        self.identity = identity
+        self.tag_kind = tag_kind
+        self.c_spelling = c_spelling
+        self.fields = fields
+        self.origin = origin
+        self.raw_name = raw_name
+        self.size_bits = u64(0)
+        self.alignment_bits = u64(0)
+        self.field_offsets = list[u64]()
+
+class ClangRecordCatalog:
+    let by_identity: map[str, ClangRecord]
+    let identity_by_spelling: map[str, str]
+
+    init():
+        self.by_identity = map[str, ClangRecord]()
+        self.identity_by_spelling = map[str, str]()
+
 ## Decode the translation-unit JSON produced for `header`. Declarations owned
 ## by included headers remain foreign dependencies, except for typedef chains
 ## needed to express a selected header declaration exactly.
-pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts) -> FiirModule!:
+pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts, record_layout_document: str = "") -> FiirModule!:
     if header == "": error("Clang FIIR: source header cannot be empty")
     if target == "": error("Clang FIIR: target cannot be empty")
     let root = json.parse(document) catch malformed:
@@ -166,8 +203,11 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
         error("Clang FIIR: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
     let declarations = try required_array_member(root, "inner", "translation unit")
     let enumerations = try collect_enumerations(declarations)
-    let typedefs = try collect_typedefs(declarations, enumerations)
-    let interner = FiirTypeInterner(typedefs, enumerations, facts)
+    let records = try collect_records(declarations)
+    let typedefs = try collect_typedefs(declarations, enumerations, records)
+    let record_identities = try reachable_record_identities(declarations, header, records, typedefs)
+    try apply_record_layouts(records, record_identities, record_layout_document)
+    let interner = FiirTypeInterner(typedefs, enumerations, records, facts)
     let constants = list[FiirConstant]()
     let functions = list[FiirFunction]()
     let cursor = SourceCursor(path = "", line = u32(0))
@@ -190,10 +230,17 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
                     try append_anonymous_enumeration_constants(enumeration, interner, constants)
                 else:
                     discard(try interner.intern_enumeration(identity, "C enum at " + origin_text(origin)))
+        elif kind == "RecordDecl":
+            let identity = try required_text_member(declaration, "id", "C record at " + origin_text(origin))
+            if records.by_identity.has(identity):
+                let record = records.by_identity[identity]
+                if record.tag_kind != "struct":
+                    error("Clang FIIR: C `" + record.tag_kind + "` at " + origin_text(origin) + " is not supported by the plain-record importer yet")
+                discard(try interner.intern_record(identity, "C record at " + origin_text(origin)))
         elif kind == "TypedefDecl":
             let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
             discard(try interner.intern(name, "typedef `" + name + "`"))
-        elif kind == "RecordDecl" or kind == "VarDecl":
+        elif kind == "VarDecl":
             error("Clang FIIR: `" + kind + "` at " + origin_text(origin) + " is not supported by the value-function importer yet")
         else:
             error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
@@ -214,7 +261,7 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
 
 # mark: Declaration catalogs ==================================================================
 
-func collect_typedefs(declarations: list[json.Json], enumerations: ClangEnumerationCatalog) -> map[str, ClangTypedef]!:
+func collect_typedefs(declarations: list[json.Json], enumerations: ClangEnumerationCatalog, records: ClangRecordCatalog) -> map[str, ClangTypedef]!:
     let typedefs = map[str, ClangTypedef]()
     let cursor = SourceCursor(path = "", line = u32(0))
     for declaration in declarations:
@@ -229,16 +276,25 @@ func collect_typedefs(declarations: list[json.Json], enumerations: ClangEnumerat
         let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
         let target = try required_type_spelling(declaration, "typedef `" + name + "`")
         let target_enum = try typedef_enumeration_identity(declaration, "typedef `" + name + "`")
+        let target_record = try typedef_record_identity(declaration, "typedef `" + name + "`")
         if typedefs.has(name):
-            if typedefs[name].target_spelling != target or not optional_text_equal(typedefs[name].target_enum_id, target_enum):
+            if typedefs[name].target_spelling != target or not optional_text_equal(typedefs[name].target_enum_id, target_enum) or not optional_text_equal(typedefs[name].target_record_id, target_record):
                 error("Clang FIIR: typedef `" + name + "` has inconsistent accepted declarations")
             continue
-        typedefs[name] = ClangTypedef(name = name, target_spelling = target, target_enum_id = target_enum, origin = origin)
+        typedefs[name] = ClangTypedef(name = name, target_spelling = target, target_enum_id = target_enum, target_record_id = target_record, origin = origin)
         if target_enum != none:
             if not enumerations.by_identity.has(target_enum):
                 error("Clang FIIR: typedef `" + name + "` names an unknown C enum declaration")
             let enumeration = enumerations.by_identity[target_enum]
             if enumeration.raw_name == "": enumeration.raw_name = name
+        if target_record != none:
+            # Included headers commonly typedef intentionally incomplete
+            # opaque records. Keep that edge dormant unless a selected
+            # declaration reaches it; only complete by-value records enter
+            # this importer slice.
+            if records.by_identity.has(target_record):
+                let record = records.by_identity[target_record]
+                if record.raw_name == "": record.raw_name = name
     return typedefs
 
 func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCatalog!:
@@ -266,6 +322,185 @@ func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCata
         catalog.by_identity[identity] = enumeration
         if c_spelling != none: catalog.identity_by_spelling[c_spelling] = identity
     return catalog
+
+# mark: Record declarations and layout probes =================================================
+
+func collect_records(declarations: list[json.Json]) -> ClangRecordCatalog!:
+    let catalog = ClangRecordCatalog()
+    let cursor = SourceCursor(path = "", line = u32(0))
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        if kind != "RecordDecl": continue
+        let implicit = try optional_bool_member(declaration, "isImplicit", "C record declaration") else false
+        if implicit or origin == none: continue
+        let complete = try optional_bool_member(declaration, "completeDefinition", "C record declaration") else false
+        if not complete: continue
+        let identity = try required_text_member(declaration, "id", "C record at " + origin_text(origin))
+        let tag_kind = try required_text_member(declaration, "tagUsed", "C record at " + origin_text(origin))
+        let tag = try optional_text_member(declaration, "name", "C record at " + origin_text(origin))
+        let children = try optional_array_member(declaration, "inner", "C record at " + origin_text(origin)) else list[json.Json]()
+        let fields = try decode_record_fields(children, origin)
+        var c_spelling: str? = none
+        var raw_name = ""
+        if tag != none and tag != "":
+            c_spelling = tag_kind + " " + tag
+            raw_name = tag
+        let record = ClangRecord(identity, tag_kind, c_spelling, fields, origin, raw_name)
+        catalog.by_identity[identity] = record
+        if c_spelling != none: catalog.identity_by_spelling[c_spelling] = identity
+    return catalog
+
+func decode_record_fields(children: list[json.Json], record_origin: FiirSourceOrigin) -> list[ClangRecordField]!:
+    let fields = list[ClangRecordField]()
+    for child in children:
+        let kind = try optional_text_member(child, "kind", "C record child") else ""
+        if kind != "FieldDecl": continue
+        let name = try optional_text_member(child, "name", "C record field")
+        var context = "C record field"
+        if name != none: context = "C record field `" + name + "`"
+        fields.append(ClangRecordField(
+            name = name,
+            type_spelling = try required_type_spelling(child, context),
+            is_bitfield = try optional_bool_member(child, "isBitfield", context) else false,
+            origin = try child_origin(child, record_origin),
+        ))
+    return fields
+
+## Render a Clang-evaluated layout query for exactly the plain records reachable
+## from declarations owned by `header`. Luce never calculates C layout: the
+## resulting enum constants are decoded as target facts beside the source AST.
+pub func render_record_layout_probe(document: str, header: str) -> str!:
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "translation unit")
+    if root_kind != "TranslationUnitDecl":
+        error("Clang FIIR: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
+    let declarations = try required_array_member(root, "inner", "translation unit")
+    let enumerations = try collect_enumerations(declarations)
+    let records = try collect_records(declarations)
+    let typedefs = try collect_typedefs(declarations, enumerations, records)
+    let identities = try reachable_record_identities(declarations, header, records, typedefs)
+    if len(identities) == 0: return ""
+    var output = "/* Clang-evaluated FIIR record layout probe. */\n"
+    for index in range(0, len(identities)):
+        let record = records.by_identity[identities[index]]
+        try validate_plain_record_shape(record)
+        output += "#undef " + record_probe_name(index, "size_bits") + "\n"
+        output += "#undef " + record_probe_name(index, "alignment_bits") + "\n"
+        for field_index in range(0, len(record.fields)):
+            output += "#undef " + record_probe_name(index, "field_" + str(field_index)) + "\n"
+    output += "enum {\n"
+    for index in range(0, len(identities)):
+        let record = records.by_identity[identities[index]]
+        let spelling = try record_c_reference(record)
+        output += "    " + record_probe_name(index, "size_bits") + " = sizeof(" + spelling + ") * __CHAR_BIT__,\n"
+        output += "    " + record_probe_name(index, "alignment_bits") + " = __alignof__(" + spelling + ") * __CHAR_BIT__,\n"
+        for field_index in range(0, len(record.fields)):
+            output += "    " + record_probe_name(index, "field_" + str(field_index)) + " = __builtin_offsetof(" + spelling + ", " + try record_field_name(record.fields[field_index]) + ") * __CHAR_BIT__,\n"
+    return output + "};\n"
+
+func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], document: str) -> !:
+    if len(identities) == 0: return
+    if document == "": error("Clang FIIR: reachable C records have no Clang-evaluated layout probe")
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR record layout: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "record-layout translation unit")
+    if root_kind != "TranslationUnitDecl":
+        error("Clang FIIR record layout: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
+    let declarations = try required_array_member(root, "inner", "record-layout translation unit")
+    let values = map[str, u64]()
+    for declaration in declarations:
+        let kind = try optional_text_member(declaration, "kind", "record-layout declaration") else ""
+        if kind != "EnumDecl": continue
+        let children = try optional_array_member(declaration, "inner", "record-layout enum") else list[json.Json]()
+        for child in children:
+            let child_kind = try optional_text_member(child, "kind", "record-layout enum child") else ""
+            if child_kind != "EnumConstantDecl": continue
+            let name = try required_text_member(child, "name", "record-layout constant")
+            if not strings.starts_with(name, "__luce_fiir_record_"): continue
+            let value = try explicit_enumeration_value(child, "record-layout constant `" + name + "`") else error("Clang FIIR record layout: `" + name + "` has no evaluated value")
+            match value:
+                Negative(magnitude): error("Clang FIIR record layout: `" + name + "` is negative")
+                Nonnegative(integer): values[name] = integer
+    for index in range(0, len(identities)):
+        let record = records.by_identity[identities[index]]
+        record.size_bits = try required_record_probe_value(values, record_probe_name(index, "size_bits"))
+        record.alignment_bits = try required_record_probe_value(values, record_probe_name(index, "alignment_bits"))
+        let offsets = list[u64]()
+        for field_index in range(0, len(record.fields)):
+            offsets.append(try required_record_probe_value(values, record_probe_name(index, "field_" + str(field_index))))
+        record.field_offsets = offsets
+
+func required_record_probe_value(values: map[str, u64], name: str) -> u64!:
+    if not values.has(name): error("Clang FIIR record layout: missing evaluated constant `" + name + "`")
+    return values[name]
+
+func record_probe_name(index: i64, suffix: str) -> str:
+    return "__luce_fiir_record_" + str(index) + "_" + suffix
+
+func record_c_reference(record: ClangRecord) -> str!:
+    let spelling = record.c_spelling
+    if spelling != none: return spelling
+    if record.raw_name != "": return record.raw_name
+    error("Clang FIIR: anonymous C record at " + origin_text(record.origin) + " needs a typedef name before it can be imported")
+
+func validate_plain_record_shape(record: ClangRecord) -> !:
+    if record.tag_kind != "struct":
+        error("Clang FIIR: C `" + record.tag_kind + "` at " + origin_text(record.origin) + " is not supported by the plain-record importer yet")
+    for field in record.fields:
+        let name = try record_field_name(field)
+        if field.is_bitfield:
+            error("Clang FIIR: C record field `" + name + "` is a bit-field; generated plain-record adapters do not support bit-fields yet")
+
+func record_field_name(field: ClangRecordField) -> str!:
+    return field.name else error("Clang FIIR: generated plain-record adapters do not support unnamed C fields yet")
+
+func reachable_record_identities(declarations: list[json.Json], header: str, records: ClangRecordCatalog, typedefs: map[str, ClangTypedef]) -> list[str]!:
+    let identities = list[str]()
+    let cursor = SourceCursor(path = "", line = u32(0))
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        if origin == none or cursor.path != header: continue
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        if kind == "RecordDecl":
+            let identity = try required_text_member(declaration, "id", "C record at " + origin_text(origin))
+            try append_reachable_record(identity, identities, records, typedefs)
+        elif kind == "TypedefDecl":
+            let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
+            try append_record_spelling(name, identities, records, typedefs)
+        elif kind == "FunctionDecl":
+            let signature = try required_type_spelling(declaration, "C function at " + origin_text(origin))
+            let delimiter = strings.find(signature, " (")
+            if delimiter != none: try append_record_spelling(signature[:delimiter], identities, records, typedefs)
+            let children = try optional_array_member(declaration, "inner", "C function at " + origin_text(origin)) else list[json.Json]()
+            for child in children:
+                let child_kind = try optional_text_member(child, "kind", "C function child") else ""
+                if child_kind == "ParmVarDecl":
+                    try append_record_spelling(try required_type_spelling(child, "C function parameter"), identities, records, typedefs)
+    return identities
+
+func append_record_spelling(spelling: str, identities: list[str], records: ClangRecordCatalog, typedefs: map[str, ClangTypedef]) -> !:
+    let canonical = unqualified_scalar_spelling(strings.trim(spelling))
+    if records.identity_by_spelling.has(canonical):
+        try append_reachable_record(records.identity_by_spelling[canonical], identities, records, typedefs)
+    elif typedefs.has(canonical):
+        let target = typedefs[canonical].target_record_id
+        if target != none: try append_reachable_record(target, identities, records, typedefs)
+
+func append_reachable_record(identity: str, identities: list[str], records: ClangRecordCatalog, typedefs: map[str, ClangTypedef]) -> !:
+    if not records.by_identity.has(identity): return
+    let record = records.by_identity[identity]
+    if record.tag_kind != "struct": return
+    for existing in identities:
+        if existing == identity: return
+    identities.append(identity)
+    for field in record.fields:
+        try append_record_spelling(field.type_spelling, identities, records, typedefs)
 
 func decode_enumeration_constants(children: list[json.Json], origin: FiirSourceOrigin) -> list[ClangEnumerationConstant]!:
     let constants = list[ClangEnumerationConstant]()
@@ -380,6 +615,22 @@ func typedef_enumeration_identity(value: json.Json, context: str) -> str?!:
         if kind == "EnumDecl": return try required_text_member(owned, "id", context + " owned enum")
     return none
 
+func typedef_record_identity(value: json.Json, context: str) -> str?!:
+    let children = try optional_array_member(value, "inner", context) else list[json.Json]()
+    for child in children:
+        let nested = try optional_array_member(child, "inner", context + " type") else list[json.Json]()
+        for nested_type in nested:
+            let nested_kind = try optional_text_member(nested_type, "kind", context + " nested type") else ""
+            if nested_kind != "RecordType": continue
+            let declaration = nested_type.member("decl")
+            if declaration == none: continue
+            return try required_text_member(declaration, "id", context + " record type")
+        let owned = child.member("ownedTagDecl")
+        if owned == none: continue
+        let kind = try optional_text_member(owned, "kind", context + " owned tag") else ""
+        if kind == "RecordDecl": return try required_text_member(owned, "id", context + " owned record")
+    return none
+
 # mark: Function declarations =================================================================
 
 func decode_function(value: json.Json, origin: FiirSourceOrigin, interner: FiirTypeInterner) -> FiirFunction!:
@@ -422,15 +673,21 @@ class FiirTypeInterner:
     let typedefs: map[str, ClangTypedef]
     let enumerations: ClangEnumerationCatalog
     let enumeration_type_ids: map[str, FiirTypeId]
+    let records: ClangRecordCatalog
+    let record_type_ids: map[str, FiirTypeId]
+    let resolving_records: list[str]
     let facts: ClangScalarFacts
 
-    init(typedefs: map[str, ClangTypedef], enumerations: ClangEnumerationCatalog, facts: ClangScalarFacts):
+    init(typedefs: map[str, ClangTypedef], enumerations: ClangEnumerationCatalog, records: ClangRecordCatalog, facts: ClangScalarFacts):
         self.types = list[FiirType]()
         self.type_ids = map[str, FiirTypeId]()
         self.resolving = list[str]()
         self.typedefs = typedefs
         self.enumerations = enumerations
         self.enumeration_type_ids = map[str, FiirTypeId]()
+        self.records = records
+        self.record_type_ids = map[str, FiirTypeId]()
+        self.resolving_records = list[str]()
         self.facts = facts
 
     func intern(spelling: str, context: str) -> FiirTypeId!:
@@ -456,6 +713,8 @@ class FiirTypeInterner:
             )
         elif self.enumerations.identity_by_spelling.has(canonical):
             return try self.intern_enumeration(self.enumerations.identity_by_spelling[canonical], context)
+        elif self.records.identity_by_spelling.has(canonical):
+            return try self.intern_record(self.records.identity_by_spelling[canonical], context)
         elif canonical == "void":
             pass
         elif canonical == "_Bool" or canonical == "bool":
@@ -499,6 +758,9 @@ class FiirTypeInterner:
         let enumeration = declaration.target_enum_id
         if enumeration != none:
             return try self.intern_enumeration(enumeration, context)
+        let record = declaration.target_record_id
+        if record != none:
+            return try self.intern_record(record, context)
         return try self.intern(declaration.target_spelling, context)
 
     func intern_enumeration(identity: str, context: str) -> FiirTypeId!:
@@ -522,6 +784,48 @@ class FiirTypeInterner:
         self.types.append(value_type)
         let type_id = FiirTypeId(value = u32(len(self.types) - 1))
         self.enumeration_type_ids[identity] = type_id
+        let c_spelling = declaration.c_spelling
+        if c_spelling != none: self.type_ids[c_spelling] = type_id
+        return type_id
+
+    func intern_record(identity: str, context: str) -> FiirTypeId!:
+        if self.record_type_ids.has(identity): return self.record_type_ids[identity]
+        if not self.records.by_identity.has(identity):
+            error("Clang FIIR: " + context + " names an unknown C record declaration")
+        for active in self.resolving_records:
+            if active == identity: error("Clang FIIR: C record at " + origin_text(self.records.by_identity[identity].origin) + " contains itself by value")
+        let declaration = self.records.by_identity[identity]
+        try validate_plain_record_shape(declaration)
+        if declaration.raw_name == "":
+            error("Clang FIIR: anonymous C record at " + origin_text(declaration.origin) + " needs a typedef name before it can be imported")
+        if len(declaration.field_offsets) != len(declaration.fields):
+            error("Clang FIIR: C record `" + declaration.raw_name + "` has incomplete Clang-evaluated field offsets")
+        self.resolving_records.append(identity)
+        let fields = list[FiirRecordField]()
+        for index in range(0, len(declaration.fields)):
+            let field = declaration.fields[index]
+            let field_name = try record_field_name(field)
+            let value_type = self.intern(field.type_spelling, "C record `" + declaration.raw_name + "` field `" + field_name + "`") catch reason:
+                self.resolving_records.remove(len(self.resolving_records) - 1)
+                error(reason)
+            fields.append(FiirRecordField(name = field_name, value_type = value_type, offset_bits = declaration.field_offsets[index], origin = field.origin))
+        self.resolving_records.remove(len(self.resolving_records) - 1)
+        var spelling = declaration.c_spelling else "anonymous record at " + origin_text(declaration.origin)
+        let value_type = FiirType(
+            spelling = spelling,
+            form = FiirTypeForm.Record(
+                name = declaration.raw_name,
+                c_spelling = declaration.c_spelling,
+                fields = fields,
+                size_bits = declaration.size_bits,
+                alignment_bits = declaration.alignment_bits,
+                origin = declaration.origin,
+            ),
+            size_bits = none,
+        )
+        self.types.append(value_type)
+        let type_id = FiirTypeId(value = u32(len(self.types) - 1))
+        self.record_type_ids[identity] = type_id
         let c_spelling = declaration.c_spelling
         if c_spelling != none: self.type_ids[c_spelling] = type_id
         return type_id

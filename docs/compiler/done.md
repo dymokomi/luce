@@ -1613,6 +1613,39 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   `c_import` example exercise the constants. Macro/object constants and
   recipe-classified bitmasks remain.
 
+- [x] **Plain C records cross FIIR through logical field carriers, never
+  frontend layout** (2026-09-02). The Clang decoder catalogs complete structs,
+  resolves anonymous typedefs and forward declarations, and recursively keeps
+  dependency-owned records only when a selected header declaration reaches
+  them. A second deterministic Clang AST probe evaluates `sizeof`, alignment,
+  and every `offsetof`; validated FIIR retains those target facts for audit.
+  Bit-fields and unions are rejected at the reachable record boundary, while
+  unrelated unsupported dependency records remain ignored.
+
+  Generated Luce exposes an ordinary declaration-order value record plus a
+  private fixed-carrier `extern struct`. Shared fieldwise encode/decode helpers
+  preserve Boolean, integer, exact floating, typedef, enumeration, and nested
+  record semantics. The backend-owned C adapter alone defines the fixed
+  carrier's C storage, asserts the exact record size/alignment/offset/type
+  facts, reconstructs the header type, and lets the C compiler perform the
+  by-value ABI call. Static converters are emitted only for records that cross
+  a function boundary, keeping standalone declaration products warning-clean.
+  No target layout, ABI class, triple, or C spelling entered frontend, HIR, or
+  canonical MIR.
+
+  Focused tests cover target-layout variation with byte-identical generated
+  Luce, malformed/missing layout, nested dependency reachability, unrelated
+  bit-fields, and standalone records. The real temperature fixture combines
+  an anonymous typedef record with a forward-declared tagged record containing
+  a scalar typedef and enum. It executes through the HIR and MIR semantic
+  hosts, Wasm and QBE encoders, `luce bind`, warning-clean C11 (including
+  `-fshort-enums`), and linked native QBE/C calls. The MIR oracle gained only a
+  symmetric logical field-read host view beside its existing field-write view;
+  byte placement remains backend-owned. This added 15 cohesive lines to the
+  existing 2,776-line oracle, which remains a candidate for the planned
+  behavior-preserving backend refactor; splitting this one memory-boundary
+  operation now would separate it from the storage authority it must use.
+
 - [x] **Borrowed C lists expose their one existing dense representation**
   (2026-09-01). `extern func` input parameters now admit `list[H]` exactly
   where `H` is a boundary scalar, named handle, or `foreign`; results, `out`

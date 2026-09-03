@@ -873,10 +873,19 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   asserts each header constant's type and value so mismatched regeneration
   cannot compile silently. Both semantic oracles, Wasm/QBE encoding, the real
   linked QBE/C binding, and the example CLI path consume the constants.
+- [x] **Import plain C records without leaking layout into HIR or MIR**
+  (2026-09-02). Named, anonymous-typedef, forward-declared, nested, and
+  dependency-reached structs become declaration-order logical records. Clang
+  alone evaluates their size, alignment, and offsets into FIIR; generated Luce
+  uses fixed field carriers, while the backend-owned C adapter asserts every
+  layout/type fact and performs the exact by-value call. Recursive integer and
+  enum checks retain their existing adapter statuses. Focused validation,
+  both semantic oracles, Wasm/QBE emission, CLI binding, warning-clean C11,
+  and real linked QBE/C execution cover simple and nested records.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  records/unions, macro/object constants, arrays/pointers/function pointers/opaque
+  unions, macro/object constants, arrays/pointers/function pointers/opaque
   types, ownership and nullability recipes, typed variadic adapters, support
   tiers, deterministic
   regeneration diagnostics, and the generated f16 shim.

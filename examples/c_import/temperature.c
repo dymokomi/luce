@@ -27,3 +27,16 @@ luce_temperature_scale luce_invalid_scale(void) {
 bool luce_is_freezing(bool enabled, double celsius) {
     return enabled && celsius <= 0.0;
 }
+
+luce_temperature_range luce_shift_range(luce_temperature_range value, double delta) {
+    value.minimum += delta;
+    value.maximum += delta;
+    return value;
+}
+
+luce_temperature_reading luce_shift_reading(luce_temperature_reading value, luce_degrees delta) {
+    value.range.minimum += delta;
+    value.range.maximum += delta;
+    value.current += delta;
+    return value;
+}
