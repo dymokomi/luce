@@ -16,7 +16,7 @@ from compiler.frontend.syntax import ArgumentSyntax, EnumSyntax, ExpressionSynta
 from compiler.frontend.tokenizer import Token
 from compiler.hir.ir import BinaryOperation, BuiltinType, HirBodyArena, HirCEnum, HirCFunction, HirCStructKind, HirClosure, HirConformance, HirConformanceAdaptation, HirEnumCase, HirExternRepresentation, HirField, HirFunction, HirGenericBody, HirInterfaceOrigin, HirInterfaceRequirement, HirNode, HirNodeForm, HirParameter, HirReceiver, HirTypeParameter
 from compiler.hir.ir import HirModule, HirPackage, HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageId, PackageRole, StandardInterface, SymbolId, SymbolKind, TypeDefinition, TypeForm, TypeId, TypeTable, Value, no_node
-from compiler.hir.ir import create_builtin_type_table, create_hir_body_arena, describe_type, resolve_builtin_type, type_contains_parameter, type_forms_match, types_match
+from compiler.hir.ir import create_builtin_type_table, create_hir_body_arena, describe_type, resolve_builtin_type, type_contains_parameter, type_form_key, types_match
 from compiler.runtime_contract import RuntimeService
 
 # mark: Shared generation model ===============================================================
@@ -412,6 +412,32 @@ pub interface HirSemanticChecker:
 
 # mark: Generation transaction ================================================================
 
+## A hash index over one growing declaration table, keyed by a name string.
+## Tables only ever append or truncate, so the index catches up lazily and
+## rebuilds after a truncation; the first entry with a key keeps it, matching
+## a front-to-back scan.
+pub class NameIndex:
+    var entries: map[str, i64]
+    pub var indexed: i64
+
+    pub init():
+        self.entries = map[str, i64]()
+        self.indexed = 0
+
+    pub func reset():
+        self.entries = map[str, i64]()
+        self.indexed = 0
+
+    pub func add(key: str, index: i64):
+        if not self.entries.has(key): self.entries[key] = index
+
+    pub func find(key: str) -> i64:
+        if self.entries.has(key): return self.entries[key]
+        return -1
+
+pub func module_name_key(module_index: i64, name: str) -> str:
+    return str(module_index) + ":" + name
+
 ## Owns every table and cursor in one source-to-HIR transaction. Declaration
 ## collection and body checking receive the same instance, so type, symbol,
 ## node, and source identities cannot drift across their module boundary.
@@ -424,6 +450,26 @@ pub class HirGenerationState:
     pub let packages: list[HirPackage]
     pub let runtime_binding_requests: list[RuntimeBindingRequest]
     pub let types: TypeTable
+    ## Structural key of every indexed definition, kept beside the table so
+    ## interning is one hash lookup rather than a scan.
+    let type_index: map[str, u32]
+    var indexed_types: i64
+    ## Per-type memo of `contains_type_parameter`: 0 unknown, 1 no, 2 yes. The
+    ## fact depends only on interned structure, so it never changes.
+    let parameter_facts: list[u8]
+    ## Reusable visited marks for the structural type walkers: a type is
+    ## visited in the current walk when its mark equals `visit_epoch`.
+    let visit_marks: list[u32]
+    var visit_epoch: u32
+    ## Root-level results of the five structural walkers, stamped with the
+    ## nominal generation they were computed under. A republished struct,
+    ## class, or enum bumps the generation and so retires every entry.
+    var nominal_generation: u64
+    let fallible_facts: list[u64]
+    let never_facts: list[u64]
+    let storable_facts: list[u64]
+    let task_facts: list[u64]
+    let pointer_facts: list[u64]
     pub let symbols: list[HirSymbol]
     pub let aliases: list[CollectedAlias]
     pub let constants: list[CollectedConstant]
@@ -439,6 +485,15 @@ pub class HirGenerationState:
     # are here too, distinguished by `receiver`.
     pub let functions: list[FunctionSymbol]
     pub let generic_functions: list[GenericFunctionTemplate]
+    # Name indexes over the tables above; see `NameIndex`.
+    let function_names: NameIndex
+    let method_names: NameIndex
+    let generic_function_names: NameIndex
+    let alias_names: NameIndex
+    let constant_names: NameIndex
+    let extern_type_names: NameIndex
+    let extern_variable_names: NameIndex
+    let global_names: NameIndex
     pub let generic_instances: list[GenericFunctionInstance]
     pub let monomorphization_budget: i64
     ## Optional monotonic clock supplied by the compiler product. The HIR
@@ -502,6 +557,25 @@ pub class HirGenerationState:
             ))
         self.runtime_binding_requests = list[RuntimeBindingRequest]()
         self.types = create_builtin_type_table()
+        self.function_names = NameIndex()
+        self.method_names = NameIndex()
+        self.generic_function_names = NameIndex()
+        self.alias_names = NameIndex()
+        self.constant_names = NameIndex()
+        self.extern_type_names = NameIndex()
+        self.extern_variable_names = NameIndex()
+        self.global_names = NameIndex()
+        self.type_index = map[str, u32]()
+        self.indexed_types = 0
+        self.parameter_facts = list[u8]()
+        self.visit_marks = list[u32]()
+        self.visit_epoch = 0
+        self.nominal_generation = 1
+        self.fallible_facts = list[u64]()
+        self.never_facts = list[u64]()
+        self.storable_facts = list[u64]()
+        self.task_facts = list[u64]()
+        self.pointer_facts = list[u64]()
         self.symbols = list[HirSymbol]()
         self.aliases = list[CollectedAlias]()
         self.constants = list[CollectedConstant]()
@@ -965,17 +1039,35 @@ pub class HirGenerationState:
 
     # Free functions only; methods are reached through `find_method`.
     pub func find_function_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.functions)):
-            if self.functions[index].receiver != none: continue
-            if self.functions[index].module_index == module_index and self.functions[index].name == name: return index
-        return -1
+        self.index_functions()
+        return self.function_names.find(module_name_key(module_index, name))
+
+    ## The first method named `name` whose receiver owner is exactly `owner`.
+    pub func find_method_of(owner: TypeId, name: str) -> i64:
+        self.index_functions()
+        return self.method_names.find(str(owner.value) + ":" + name)
+
+    func index_functions():
+        if len(self.functions) < self.function_names.indexed:
+            self.function_names.reset()
+            self.method_names.reset()
+        while self.function_names.indexed < len(self.functions):
+            let index = self.function_names.indexed
+            let item = self.functions[index]
+            let receiver = item.receiver
+            if receiver == none: self.function_names.add(module_name_key(item.module_index, item.name), index)
+            else: self.method_names.add(str(receiver.owner.value) + ":" + item.name, index)
+            self.function_names.indexed += 1
 
     pub func find_generic_function_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.generic_functions)):
+        if len(self.generic_functions) < self.generic_function_names.indexed: self.generic_function_names.reset()
+        while self.generic_function_names.indexed < len(self.generic_functions):
+            let index = self.generic_function_names.indexed
             let generic = self.generic_functions[index]
-            if generic.signature.receiver != none: continue
-            if generic.module_index == module_index and generic.name == name: return index
-        return -1
+            if generic.signature.receiver == none:
+                self.generic_function_names.add(module_name_key(generic.module_index, generic.name), index)
+            self.generic_function_names.indexed += 1
+        return self.generic_function_names.find(module_name_key(module_index, name))
 
     pub func allocate_generic_identity() -> u32:
         let identity = self.next_generic_identity
@@ -1017,6 +1109,7 @@ pub class HirGenerationState:
     ## type. Nominal generic types will extend this same operation; callers
     ## never reconstruct types independently.
     pub func substitute_type(value: TypeId, generic_id: u32, arguments: list[TypeId]) -> TypeId:
+        if not self.contains_type_parameter(value): return value
         match self.types.definitions[value.value].form:
             TypeParameter(owner, position):
                 if owner != generic_id: return value
@@ -1080,7 +1173,74 @@ pub class HirGenerationState:
     ## Executable conformances and functions may be published only after this
     ## returns false.
     pub func contains_type_parameter(value: TypeId) -> bool:
-        return type_contains_parameter(self.types, value)
+        while len(self.parameter_facts) <= i64(value.value): self.parameter_facts.append(0)
+        let known = self.parameter_facts[value.value]
+        if known != 0: return known == 2
+        var found = false
+        match self.types.definitions[value.value].form:
+            TypeParameter(generic, position): found = true
+            Slice(element): found = self.contains_type_parameter(element)
+            MutableSlice(element): found = self.contains_type_parameter(element)
+            List(element): found = self.contains_type_parameter(element)
+            Map(key, element): found = self.contains_type_parameter(key) or self.contains_type_parameter(element)
+            Set(element): found = self.contains_type_parameter(element)
+            FrozenList(element): found = self.contains_type_parameter(element)
+            FrozenMap(key, element): found = self.contains_type_parameter(key) or self.contains_type_parameter(element)
+            FrozenSet(element): found = self.contains_type_parameter(element)
+            Task(result): found = self.contains_type_parameter(result)
+            Weak(element): found = self.contains_type_parameter(element)
+            Range(element): found = self.contains_type_parameter(element)
+            Optional(element): found = self.contains_type_parameter(element)
+            Fallible(element): found = self.contains_type_parameter(element)
+            Array(element, count): found = self.contains_type_parameter(element)
+            NativePointer(element, is_mutable): found = self.contains_type_parameter(element)
+            Tuple(elements): found = self.any_contains_type_parameter(elements)
+            Function(parameters, result): found = self.any_contains_type_parameter(parameters) or self.contains_type_parameter(result)
+            CFunction(parameters, result): found = self.any_contains_type_parameter(parameters) or self.contains_type_parameter(result)
+            Interface(index, arguments): found = self.any_contains_type_parameter(arguments)
+            Struct(index, arguments): found = self.any_contains_type_parameter(arguments)
+            Class(index, arguments): found = self.any_contains_type_parameter(arguments)
+            Enum(index, arguments): found = self.any_contains_type_parameter(arguments)
+            else: found = false
+        while len(self.parameter_facts) <= i64(value.value): self.parameter_facts.append(0)
+        if found: self.parameter_facts[value.value] = 2
+        else: self.parameter_facts[value.value] = 1
+        return found
+
+    func any_contains_type_parameter(values: list[TypeId]) -> bool:
+        for value in values:
+            if self.contains_type_parameter(value): return true
+        return false
+
+    ## Forget every cached structural fact; call after a nominal declaration
+    ## replaces its fields, methods, or cases.
+    pub func invalidate_type_facts():
+        self.nominal_generation += 1
+
+    # 0 unknown, 1 false, 2 true, for the current nominal generation.
+    func cached_fact(facts: list[u64], value: TypeId) -> i64:
+        if i64(value.value) >= len(facts): return 0
+        let entry = facts[value.value]
+        if entry >> 2 != self.nominal_generation: return 0
+        return i64(entry & u64(3))
+
+    func store_fact(facts: list[u64], value: TypeId, found: bool):
+        while len(facts) <= i64(value.value): facts.append(u64(0))
+        var answer = u64(1)
+        if found: answer = u64(2)
+        facts[value.value] = (self.nominal_generation << 2) | answer
+
+    ## Start one structural walk; `visit` then reports and records each type.
+    pub func begin_visit() -> u32:
+        self.visit_epoch += 1
+        return self.visit_epoch
+
+    ## True when `value` was already seen in walk `epoch`; marks it otherwise.
+    pub func visit(value: TypeId, epoch: u32) -> bool:
+        while len(self.visit_marks) <= i64(value.value): self.visit_marks.append(0)
+        if self.visit_marks[value.value] == epoch: return true
+        self.visit_marks[value.value] = epoch
+        return false
 
     pub func find_generic_instance(generic_index: i64, arguments: list[TypeId]) -> i64:
         for instance in self.generic_instances:
@@ -1119,38 +1279,63 @@ pub class HirGenerationState:
         return arguments
 
     pub func find_alias_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.aliases)):
-            if self.aliases[index].module_index == module_index and self.aliases[index].name == name: return index
-        return -1
+        if len(self.aliases) < self.alias_names.indexed: self.alias_names.reset()
+        while self.alias_names.indexed < len(self.aliases):
+            let index = self.alias_names.indexed
+            self.alias_names.add(module_name_key(self.aliases[index].module_index, self.aliases[index].name), index)
+            self.alias_names.indexed += 1
+        return self.alias_names.find(module_name_key(module_index, name))
 
     pub func find_constant_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.constants)):
-            if self.constants[index].module_index == module_index and self.constants[index].name == name: return index
-        return -1
+        if len(self.constants) < self.constant_names.indexed: self.constant_names.reset()
+        while self.constant_names.indexed < len(self.constants):
+            let index = self.constant_names.indexed
+            self.constant_names.add(module_name_key(self.constants[index].module_index, self.constants[index].name), index)
+            self.constant_names.indexed += 1
+        return self.constant_names.find(module_name_key(module_index, name))
 
     pub func find_extern_type_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.extern_types)):
-            if self.extern_types[index].module_index == module_index and self.extern_types[index].name == name: return index
-        return -1
+        if len(self.extern_types) < self.extern_type_names.indexed: self.extern_type_names.reset()
+        while self.extern_type_names.indexed < len(self.extern_types):
+            let index = self.extern_type_names.indexed
+            self.extern_type_names.add(module_name_key(self.extern_types[index].module_index, self.extern_types[index].name), index)
+            self.extern_type_names.indexed += 1
+        return self.extern_type_names.find(module_name_key(module_index, name))
 
     pub func find_extern_variable_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.extern_variables)):
-            if self.extern_variables[index].module_index == module_index and self.extern_variables[index].name == name: return index
-        return -1
+        if len(self.extern_variables) < self.extern_variable_names.indexed: self.extern_variable_names.reset()
+        while self.extern_variable_names.indexed < len(self.extern_variables):
+            let index = self.extern_variable_names.indexed
+            self.extern_variable_names.add(module_name_key(self.extern_variables[index].module_index, self.extern_variables[index].name), index)
+            self.extern_variable_names.indexed += 1
+        return self.extern_variable_names.find(module_name_key(module_index, name))
 
     pub func find_global_in_module(module_index: i64, name: str) -> i64:
-        for index in range(0, len(self.globals)):
-            if self.globals[index].module_index == module_index and self.globals[index].name == name: return index
-        return -1
+        if len(self.globals) < self.global_names.indexed: self.global_names.reset()
+        while self.global_names.indexed < len(self.globals):
+            let index = self.global_names.indexed
+            self.global_names.add(module_name_key(self.globals[index].module_index, self.globals[index].name), index)
+            self.global_names.indexed += 1
+        return self.global_names.find(module_name_key(module_index, name))
 
     # Intern by `TypeForm`. The diagnostic `name` is stored for messages; two
     # forms that describe the same structure share one TypeId.
     pub func intern_named(name: str, form: TypeForm) -> TypeId:
-        for existing in self.types.definitions:
-            if type_forms_match(existing.form, form): return existing.id
+        let key = type_form_key(form)
+        self.index_types()
+        if self.type_index.has(key): return TypeId(value = self.type_index[key])
         let id = TypeId(value = u32(len(self.types.definitions)))
         self.types.definitions.append(TypeDefinition(id = id, name = name, form = form))
+        self.type_index[key] = id.value
         return id
+
+    # Definitions appended directly (dependency seeding) join the index on the
+    # next lookup; the first definition of a structure keeps its identity.
+    func index_types():
+        while self.indexed_types < len(self.types.definitions):
+            let key = type_form_key(self.types.definitions[self.indexed_types].form)
+            if not self.type_index.has(key): self.type_index[key] = u32(self.indexed_types)
+            self.indexed_types += 1
 
     pub func intern_optional(inner: TypeId) -> TypeId:
         return self.intern_named(self.describe_type(inner) + "?", TypeForm.Optional(value = inner))
@@ -1339,15 +1524,15 @@ pub class HirGenerationState:
     # Follow value containers so aliases cannot hide it in storage; function
     # types are a boundary because their result may itself declare an effect.
     pub func contains_fallible(value: TypeId) -> bool:
-        let visited = list[bool]()
-        for index in range(0, len(self.types.definitions)): visited.append(false)
-        return self.contains_fallible_once(value, visited)
+        let cached = self.cached_fact(self.fallible_facts, value)
+        if cached != 0: return cached == 2
+        let found = self.contains_fallible_once(value, self.begin_visit())
+        self.store_fact(self.fallible_facts, value, found)
+        return found
 
-    func contains_fallible_once(value: TypeId, visited: list[bool]) -> bool:
+    func contains_fallible_once(value: TypeId, visited: u32) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
-        while len(visited) < len(self.types.definitions): visited.append(false)
-        if visited[value.value]: return false
-        visited[value.value] = true
+        if self.visit(value, visited): return false
         match self.types.definitions[value.value].form:
             Fallible(inner): return true
             Optional(inner): return self.contains_fallible_once(inner, visited)
@@ -1383,15 +1568,15 @@ pub class HirGenerationState:
     ## value boundary. A function value returning `never` is itself ordinary
     ## storable data, but every callable parameter still has to be inhabited.
     pub func contains_never_value(value: TypeId) -> bool:
-        let visited = list[bool]()
-        for index in range(0, len(self.types.definitions)): visited.append(false)
-        return self.contains_never_value_once(value, visited)
+        let cached = self.cached_fact(self.never_facts, value)
+        if cached != 0: return cached == 2
+        let found = self.contains_never_value_once(value, self.begin_visit())
+        self.store_fact(self.never_facts, value, found)
+        return found
 
-    func contains_never_value_once(value: TypeId, visited: list[bool]) -> bool:
+    func contains_never_value_once(value: TypeId, visited: u32) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
-        while len(visited) < len(self.types.definitions): visited.append(false)
-        if visited[value.value]: return false
-        visited[value.value] = true
+        if self.visit(value, visited): return false
         match self.types.definitions[value.value].form:
             Never: return true
             Optional(inner): return self.contains_never_value_once(inner, visited)
@@ -1448,15 +1633,15 @@ pub class HirGenerationState:
     ## access. A function descriptor stores callable identity, not the values
     ## that will later cross its parameter boundary.
     pub func contains_non_storable_value(value: TypeId) -> bool:
-        let visited = list[bool]()
-        for index in range(0, len(self.types.definitions)): visited.append(false)
-        return self.contains_non_storable_value_once(value, visited)
+        let cached = self.cached_fact(self.storable_facts, value)
+        if cached != 0: return cached == 2
+        let found = self.contains_non_storable_value_once(value, self.begin_visit())
+        self.store_fact(self.storable_facts, value, found)
+        return found
 
-    func contains_non_storable_value_once(value: TypeId, visited: list[bool]) -> bool:
+    func contains_non_storable_value_once(value: TypeId, visited: u32) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
-        while len(visited) < len(self.types.definitions): visited.append(false)
-        if visited[value.value]: return false
-        visited[value.value] = true
+        if self.visit(value, visited): return false
         match self.types.definitions[value.value].form:
             MutableSlice(inner): return true
             Optional(inner): return self.contains_non_storable_value_once(inner, visited)
@@ -1612,15 +1797,15 @@ pub class HirGenerationState:
     ## task handle. Nominal fields are followed after concrete substitution so
     ## a generic application cannot hide the invocation-scoped lifetime.
     pub func contains_task_value(value: TypeId) -> bool:
-        let visited = list[bool]()
-        for index in range(0, len(self.types.definitions)): visited.append(false)
-        return self.contains_task_value_once(value, visited)
+        let cached = self.cached_fact(self.task_facts, value)
+        if cached != 0: return cached == 2
+        let found = self.contains_task_value_once(value, self.begin_visit())
+        self.store_fact(self.task_facts, value, found)
+        return found
 
-    func contains_task_value_once(value: TypeId, visited: list[bool]) -> bool:
+    func contains_task_value_once(value: TypeId, visited: u32) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
-        while len(visited) < len(self.types.definitions): visited.append(false)
-        if visited[value.value]: return false
-        visited[value.value] = true
+        if self.visit(value, visited): return false
         match self.types.definitions[value.value].form:
             Task(result): return true
             Optional(inner): return self.contains_task_value_once(inner, visited)
@@ -1670,15 +1855,15 @@ pub class HirGenerationState:
     # The pointer itself is the boundary: its pointee is a type description,
     # not another value stored inline.
     pub func contains_native_pointer(value: TypeId) -> bool:
-        let visited = list[bool]()
-        for index in range(0, len(self.types.definitions)): visited.append(false)
-        return self.contains_native_pointer_once(value, visited)
+        let cached = self.cached_fact(self.pointer_facts, value)
+        if cached != 0: return cached == 2
+        let found = self.contains_native_pointer_once(value, self.begin_visit())
+        self.store_fact(self.pointer_facts, value, found)
+        return found
 
-    func contains_native_pointer_once(value: TypeId, visited: list[bool]) -> bool:
+    func contains_native_pointer_once(value: TypeId, visited: u32) -> bool:
         if i64(value.value) >= len(self.types.definitions): return false
-        while len(visited) < len(self.types.definitions): visited.append(false)
-        if visited[value.value]: return false
-        visited[value.value] = true
+        if self.visit(value, visited): return false
         match self.types.definitions[value.value].form:
             NativePointer(pointee, is_mutable): return true
             Optional(inner): return self.contains_native_pointer_once(inner, visited)

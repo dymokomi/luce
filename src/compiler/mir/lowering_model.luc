@@ -18,7 +18,7 @@ from compiler.mir.canonical import MirClass, MirClassField, MirClosure, MirConfo
 from compiler.mir.canonical import MirInterface, MirInterfaceRequirement, MirRuntimeBinding, MirSignature, MirSlot, MirTypeTable, RegisterId
 from compiler.mir.canonical import MirTaskResult, MirType, TypeId, builtin_mir_type, create_builtin_mir_types
 from compiler.mir.canonical import find_runtime_symbol, make_enum_type
-from compiler.mir.canonical import OperandBuilder, is_aggregate_type, is_ptr_type, make_struct_type, mir_type, mir_types_match, signatures_match
+from compiler.mir.canonical import OperandBuilder, is_aggregate_type, is_ptr_type, make_struct_type, mir_type, mir_type_key, mir_types_match, signatures_match
 from compiler.hir.ir import BuiltinType, HirCEnum, HirCFunction, HirCSlot, HirCStructKind, HirCaptureKind, HirConstant, HirFunction, HirFunctionImplementation, HirNodeForm, HirReceiverKind, Value
 from compiler.hir.ir import HirModule, HirProgram, NodeId, SymbolId, TypeForm, describe_type
 from compiler.hir.ir import nominal_cases, nominal_fields, resolve_builtin_type, types_match
@@ -208,9 +208,22 @@ pub class MirLoweringState:
     pub let lowered_enum_types: list[u32]
     pub let lowered_interface_types: list[u32]
     pub let active_nominal_types: list[u32]
+    ## Structural key of every complete definition; reservations join it once
+    ## their fields are known.
+    let type_index: map[str, u32]
     pub let c_wrappers: list[CWrapper]
     pub let c_extern_contracts: list[CExternContract]
     pub let ownership_helpers: list[OwnershipHelper]
+    # Identity-indexed lookups over the tables above and over HIR symbols.
+    let function_index_by_symbol: list[i64]
+    let constant_index_by_symbol: list[i64]
+    let shared_symbol_flags: list[bool]
+    let ownership_helper_by_type: list[i64]
+    let equality_helper_by_type: list[i64]
+    # Locals of the function being lowered, valid while the stamp matches.
+    let local_index_by_symbol: list[i64]
+    let local_stamp_by_symbol: list[u32]
+    var local_generation: u32
     pub let equality_helpers: list[EqualityHelper]
     pub let generated_helpers: list[GeneratedHelper]
     pub var next_generated_function: u32
@@ -276,9 +289,34 @@ pub class MirLoweringState:
         self.lowered_interface_types = list[u32]()
         for definition in self.program.types.definitions: self.lowered_interface_types.append(unlowered_nominal_type)
         self.active_nominal_types = list[u32]()
+        self.type_index = map[str, u32]()
+        for index in range(0, len(self.types.definitions)):
+            let key = mir_type_key(self.types.definitions[index])
+            if not self.type_index.has(key): self.type_index[key] = u32(index)
         self.c_wrappers = list[CWrapper]()
         self.c_extern_contracts = list[CExternContract]()
         self.ownership_helpers = list[OwnershipHelper]()
+        self.function_index_by_symbol = list[i64]()
+        self.constant_index_by_symbol = list[i64]()
+        self.shared_symbol_flags = list[bool]()
+        self.local_index_by_symbol = list[i64]()
+        self.local_stamp_by_symbol = list[u32]()
+        self.local_generation = 0
+        for symbol in program.symbols:
+            self.function_index_by_symbol.append(-1)
+            self.constant_index_by_symbol.append(-1)
+            self.shared_symbol_flags.append(false)
+            self.local_index_by_symbol.append(-1)
+            self.local_stamp_by_symbol.append(0)
+        for index in range(0, len(program.functions)):
+            let symbol = program.functions[index].symbol.value
+            if self.function_index_by_symbol[symbol] < 0: self.function_index_by_symbol[symbol] = index
+        for index in range(0, len(program.constants)):
+            let symbol = program.constants[index].symbol.value
+            if self.constant_index_by_symbol[symbol] < 0: self.constant_index_by_symbol[symbol] = index
+        for symbol in program.shared_cells: self.shared_symbol_flags[symbol.value] = true
+        self.ownership_helper_by_type = list[i64]()
+        self.equality_helper_by_type = list[i64]()
         self.equality_helpers = list[EqualityHelper]()
         self.generated_helpers = list[GeneratedHelper]()
         self.next_generated_function = 0
@@ -421,12 +459,10 @@ pub class MirLoweringState:
 
     # The HIR function a call symbol names, as its index in `program.functions`.
     pub func function_index_of(symbol: SymbolId) -> i64:
-        for index in range(0, len(self.program.functions)):
-            if self.program.functions[index].symbol.value == symbol.value: return index
-        return -1
+        return self.function_index_by_symbol[symbol.value]
 
     pub func is_shared_symbol(symbol: SymbolId) -> bool:
-        return contains_symbol(self.program.shared_cells, symbol)
+        return self.shared_symbol_flags[symbol.value]
 
     pub func cell_for_hir_type(value_type: ir.TypeId) -> CellStorage?:
         for cell in self.cells:
@@ -453,15 +489,47 @@ pub class MirLoweringState:
 
     # The module constant a reference names, if any.
     pub func constant_of(symbol: SymbolId) -> HirConstant?:
-        for constant in self.program.constants:
-            if constant.symbol.value == symbol.value: return constant
-        return none
+        let index = self.constant_index_by_symbol[symbol.value]
+        if index < 0: return none
+        return self.program.constants[index]
+
+    ## Forget the previous function's locals in O(1).
+    pub func begin_locals():
+        self.locals = list[Local]()
+        self.local_generation += 1
+
+    pub func add_local(symbol: SymbolId, address: RegisterId):
+        let stamp = self.local_stamp_by_symbol[symbol.value]
+        # The first slot reserved for a symbol keeps it, as a scan would.
+        if stamp != self.local_generation:
+            self.local_index_by_symbol[symbol.value] = len(self.locals)
+            self.local_stamp_by_symbol[symbol.value] = self.local_generation
+        self.locals.append(Local(symbol = symbol.value, address = address))
 
     # The slot address of a local the prologue reserved.
     pub func local_of(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId) -> Local!:
-        for local in self.locals:
-            if local.symbol == symbol.value: return local
+        if self.local_stamp_by_symbol[symbol.value] == self.local_generation:
+            return self.locals[self.local_index_by_symbol[symbol.value]]
         error(self.unsupported(module, function, span, "a reference to a symbol that is not a local"))
+
+    ## Index of the ownership helper for `value_type`, or -1.
+    pub func ownership_helper_index(value_type: TypeId) -> i64:
+        if i64(value_type.value) >= len(self.ownership_helper_by_type): return -1
+        return self.ownership_helper_by_type[value_type.value]
+
+    pub func add_ownership_helper(helper: OwnershipHelper):
+        while len(self.ownership_helper_by_type) <= i64(helper.value_type.value): self.ownership_helper_by_type.append(-1)
+        self.ownership_helper_by_type[helper.value_type.value] = len(self.ownership_helpers)
+        self.ownership_helpers.append(helper)
+
+    pub func equality_helper_index(hir_type: ir.TypeId) -> i64:
+        if i64(hir_type.value) >= len(self.equality_helper_by_type): return -1
+        return self.equality_helper_by_type[hir_type.value]
+
+    pub func add_equality_helper(helper: EqualityHelper):
+        while len(self.equality_helper_by_type) <= i64(helper.hir_type.value): self.equality_helper_by_type.append(-1)
+        self.equality_helper_by_type[helper.hir_type.value] = len(self.equality_helpers)
+        self.equality_helpers.append(helper)
 
     # Declare a runtime service once, with the signature the runtime table
     # fixes for it. Runtime services and source C declarations share the
@@ -533,7 +601,7 @@ pub class MirLoweringState:
                 let field_types = list[TypeId]()
                 for field in nominal_fields(self.program, value):
                     field_types.append(try self.lower_mir_type(field.value_type))
-                self.types.definitions[result.value] = make_struct_type(field_types)
+                self.complete_nominal_type(result, make_struct_type(field_types))
                 let completed = self.active_nominal_types.pop()
                 if completed != result.value: trap("nominal MIR type reservations are not nested")
                 return result
@@ -545,6 +613,7 @@ pub class MirLoweringState:
                 let result = TypeId(value = u32(len(self.types.definitions)))
                 self.lowered_class_types[value.value] = result.value
                 self.types.definitions.append(MirType.Class(identity = identity))
+                self.type_index[mir_type_key(MirType.Class(identity = identity))] = result.value
                 return result
             Weak(inner):
                 let class_type = try self.lower_mir_type(inner)
@@ -559,6 +628,7 @@ pub class MirLoweringState:
                 let result = TypeId(value = u32(len(self.types.definitions)))
                 self.lowered_interface_types[value.value] = result.value
                 self.types.definitions.append(MirType.Interface(identity = identity))
+                self.type_index[mir_type_key(MirType.Interface(identity = identity))] = result.value
                 self.interfaces.append(MirInterface(requirements = list[MirInterfaceRequirement]()))
                 let requirements = list[MirInterfaceRequirement]()
                 for requirement in application.requirements:
@@ -587,7 +657,7 @@ pub class MirLoweringState:
                     for field in case_value.payload:
                         field_types.append(try self.lower_mir_type(field.value_type))
                     case_types.append(self.intern_lowered_type(make_struct_type(field_types)))
-                self.types.definitions[result.value] = make_enum_type(tag_type, case_types)
+                self.complete_nominal_type(result, make_enum_type(tag_type, case_types))
                 let completed = self.active_nominal_types.pop()
                 if completed != result.value: trap("nominal MIR type reservations are not nested")
                 return result
@@ -797,14 +867,19 @@ pub class MirLoweringState:
     # references can point back to them. Structural interning skips only the
     # active reservations; no malformed sentinel type ever enters the table.
     pub func intern_lowered_type(value: MirType) -> TypeId:
-        for index in range(0, len(self.types.definitions)):
-            var active = false
-            for reserved in self.active_nominal_types:
-                if reserved == u32(index): active = true
-            if not active and mir_types_match(self.types.definitions[index], value):
-                return TypeId(value = u32(index))
+        let key = mir_type_key(value)
+        if self.type_index.has(key): return TypeId(value = self.type_index[key])
+        let result = TypeId(value = u32(len(self.types.definitions)))
         self.types.definitions.append(value)
-        return TypeId(value = u32(len(self.types.definitions) - 1))
+        self.type_index[key] = result.value
+        return result
+
+    # A completed nominal definition becomes structurally visible; the first
+    # definition of a structure keeps its identity.
+    func complete_nominal_type(id: TypeId, value: MirType):
+        self.types.definitions[id.value] = value
+        let key = mir_type_key(value)
+        if not self.type_index.has(key): self.type_index[key] = id.value
 
     pub func global_mir_type(global: ir.HirGlobal) -> TypeId!:
         let module = self.program.modules[global.module.value]
