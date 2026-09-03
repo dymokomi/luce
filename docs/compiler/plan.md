@@ -848,22 +848,24 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   backend-owned Clang invocation supplies its exact target, predefined scalar
   facts, and JSON AST to a validated, versioned FIIR module. The first closed
   generator accepts C `_Bool`, exact IEEE binary32 `float`, exact IEEE
-  binary64 `double`/`long double`, and every fundamental C integer family. It
-  emits an audited `.native.luc` module using nominal target-independent `c`
-  carriers plus a C adapter guarded by
+  binary64 `double`/`long double`, every fundamental C integer family, and
+  scalar typedef chains over those types. It emits an audited `.native.luc`
+  module using nominal target-independent `c` and generated typedef carriers
+  plus a C adapter guarded by
   representation assertions and checked integer ranges, and installs all
   three text products through owner-only sibling scratch directories. The
   application and compiler-supplied standard source retain independent roots;
   native C source files and compiler flags enter only at QBE materialization.
   Both semantic oracles, Wasm/QBE encoders, direct QBE/C execution, and the
   complete CLI bind/build/run path cover the slices. Artificial 16- and 32-bit
-  `int` and alternate-width `_Bool` fixtures prove target facts change FIIR
-  and C only while generated Luce is byte-identical. Unsupported scalars and
-  declarations fail generation rather than guessing a target representation.
+  `int`, alternate-width `_Bool`, and changing typedef-target fixtures prove
+  target facts change FIIR and C only while generated Luce is byte-identical.
+  Unsupported scalars and declarations fail generation rather than guessing a
+  target representation.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
-  transition: lossless carriers for extended floating formats and typedef
-  scalar identities, enums/records/unions, constants,
+  transition: lossless carriers for extended floating formats,
+  enums/records/unions, constants,
   arrays/pointers/function pointers/opaque
   types, ownership and nullability recipes, typed variadic adapters, support
   tiers, deterministic

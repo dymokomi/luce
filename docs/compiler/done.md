@@ -20,7 +20,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 926 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 931 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1563,6 +1563,19 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   oracles, Wasm/QBE encoding, CLI build/run, and linked QBE/C execution;
   focused synthetic facts prove same-representation family identity and the
   explicit extended-format refusal.
+
+- [x] **Scalar C typedefs retain target-independent boundary identities**
+  (2026-09-02). FIIR records each typedef as a validated, acyclic edge to an
+  earlier scalar type with its exact declaration origin. The generated raw
+  module exposes a nominal carrier over the lossless Boolean, integer, or
+  floating domain; the C adapter alone spells the typedef, asserts its size
+  and compatible target, performs integer range checks, and calls C. Nested
+  aliases and a referenced dependency-owned `size_t` are handled without
+  importing unrelated dependency declarations. Synthetic targets prove that
+  both underlying integer family and width may change while generated Luce is
+  byte-identical. The real `luce_degrees` example executes through HIR, MIR,
+  Wasm/QBE encoding, CLI materialization, and linked QBE/C; malformed edges,
+  pointer targets, and Luce-keyword names fail explicitly.
 
 - [x] **Borrowed C lists expose their one existing dense representation**
   (2026-09-01). `extern func` input parameters now admit `list[H]` exactly

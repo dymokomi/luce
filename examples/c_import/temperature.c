@@ -12,6 +12,10 @@ int luce_adjust_celsius(int celsius, int delta) {
     return celsius + delta;
 }
 
+luce_degrees luce_echo_degrees(luce_degrees celsius) {
+    return celsius;
+}
+
 bool luce_is_freezing(bool enabled, double celsius) {
     return enabled && celsius <= 0.0;
 }

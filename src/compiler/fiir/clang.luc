@@ -4,10 +4,9 @@
 #
 #   DESCRIPTION:
 #       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
-#       spelling conventions stop here. The decoder accepts only the complete
-#       C scalar-function slice; every other declaration or type is either
-#       outside the requested header or rejected with a stable support
-#       diagnostic.
+#       spelling conventions stop here. The decoder accepts scalar typedefs
+#       and functions; every other declaration or type is either outside the
+#       requested header or rejected with a stable support diagnostic.
 #
 #       Clang elides repeated file and line fields in source locations. The
 #       top-level cursor below reconstructs only those documented repetitions;
@@ -119,10 +118,14 @@ class SourceCursor:
         self.path = path
         self.line = line
 
-## Decode the translation-unit JSON produced for `header`. Only declarations
-## whose effective Clang location belongs to that exact input are imported;
-## builtins and declarations from included headers remain foreign dependencies
-## until include ownership is modeled explicitly.
+struct ClangTypedef:
+    let name: str
+    let target_spelling: str
+    let origin: FiirSourceOrigin
+
+## Decode the translation-unit JSON produced for `header`. Declarations owned
+## by included headers remain foreign dependencies, except for typedef chains
+## needed to express a selected header declaration exactly.
 pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts) -> FiirModule!:
     if header == "": error("Clang FIIR: source header cannot be empty")
     if target == "": error("Clang FIIR: target cannot be empty")
@@ -132,7 +135,8 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
     if root_kind != "TranslationUnitDecl":
         error("Clang FIIR: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
     let declarations = try required_array_member(root, "inner", "translation unit")
-    let types = list[FiirType]()
+    let typedefs = try collect_typedefs(declarations)
+    let interner = ScalarTypeInterner(typedefs, facts)
     let functions = list[FiirFunction]()
     let cursor = SourceCursor(path = "", line = u32(0))
 
@@ -145,8 +149,11 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
         let implicit = try optional_bool_member(declaration, "isImplicit", "declaration") else false
         if implicit: continue
         if kind == "FunctionDecl":
-            functions.append(try decode_function(declaration, origin, types, facts))
-        elif kind == "TypedefDecl" or kind == "RecordDecl" or kind == "EnumDecl" or kind == "VarDecl":
+            functions.append(try decode_function(declaration, origin, interner))
+        elif kind == "TypedefDecl":
+            let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
+            discard(try interner.intern(name, "typedef `" + name + "`"))
+        elif kind == "RecordDecl" or kind == "EnumDecl" or kind == "VarDecl":
             error("Clang FIIR: `" + kind + "` at " + origin_text(origin) + " is not supported by the scalar-function importer yet")
         else:
             error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
@@ -158,25 +165,46 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
         header = header,
         target = target,
         clang_arguments = clang_arguments,
-        types = types,
+        types = interner.types,
         functions = functions,
     )
     try validate_fiir(module)
     return module
 
-func decode_function(value: json.Json, origin: FiirSourceOrigin, types: list[FiirType], facts: ClangScalarFacts) -> FiirFunction!:
+func collect_typedefs(declarations: list[json.Json]) -> map[str, ClangTypedef]!:
+    let typedefs = map[str, ClangTypedef]()
+    let cursor = SourceCursor(path = "", line = u32(0))
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        if kind != "TypedefDecl": continue
+        let implicit = try optional_bool_member(declaration, "isImplicit", "typedef declaration") else false
+        if implicit: continue
+        if origin == none: continue
+        let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
+        let target = try required_type_spelling(declaration, "typedef `" + name + "`")
+        if typedefs.has(name):
+            if typedefs[name].target_spelling != target:
+                error("Clang FIIR: typedef `" + name + "` has inconsistent accepted declarations")
+            continue
+        typedefs[name] = ClangTypedef(name = name, target_spelling = target, origin = origin)
+    return typedefs
+
+func decode_function(value: json.Json, origin: FiirSourceOrigin, interner: ScalarTypeInterner) -> FiirFunction!:
     let name = try required_text_member(value, "name", "function at " + origin_text(origin))
     let signature = try required_type_spelling(value, "function `" + name + "`")
     let delimiter = strings.find(signature, " (") else error("Clang FIIR: function `" + name + "` has unsupported type spelling `" + signature + "`")
     let result_spelling = signature[:delimiter]
-    let result_type = try intern_scalar_type(types, result_spelling, facts, "function `" + name + "` result")
+    let result_type = try interner.intern(result_spelling, "function `" + name + "` result")
     let parameters = list[FiirParameter]()
     let children = try optional_array_member(value, "inner", "function `" + name + "`") else list[json.Json]()
     for child in children:
         let kind = try optional_text_member(child, "kind", "function `" + name + "` child") else ""
         if kind != "ParmVarDecl": continue
         let spelling = try required_type_spelling(child, "function `" + name + "` parameter")
-        let parameter_type = try intern_scalar_type(types, spelling, facts, "function `" + name + "` parameter")
+        let parameter_type = try interner.intern(spelling, "function `" + name + "` parameter")
         let parameter_origin = try child_origin(child, origin)
         parameters.append(FiirParameter(
             name = try optional_text_member(child, "name", "function `" + name + "` parameter"),
@@ -197,48 +225,86 @@ func decode_function(value: json.Json, origin: FiirSourceOrigin, types: list[Fii
 
 # mark: C scalar types =========================================================================
 
-func intern_scalar_type(types: list[FiirType], spelling: str, facts: ClangScalarFacts, context: str) -> FiirTypeId!:
-    let canonical = strings.trim(spelling)
-    for index in range(0, len(types)):
-        if types[index].spelling == canonical: return FiirTypeId(value = u32(index))
+class ScalarTypeInterner:
+    pub let types: list[FiirType]
+    let type_ids: map[str, FiirTypeId]
+    let resolving: list[str]
+    let typedefs: map[str, ClangTypedef]
+    let facts: ClangScalarFacts
 
-    var value_type = FiirType(spelling = canonical, form = FiirTypeForm.Unit, size_bits = none)
-    if canonical == "void":
-        pass
-    elif canonical == "_Bool" or canonical == "bool":
-        value_type = FiirType(spelling = canonical, form = FiirTypeForm.Boolean, size_bits = facts.bool_size_bits)
-    elif canonical == "char":
-        value_type = integer_type(canonical, FiirCIntegerKind.plain_char, facts.char_size_bits, facts.char_size_bits, facts.plain_char_is_signed)
-    elif canonical == "signed char":
-        value_type = integer_type(canonical, FiirCIntegerKind.signed_char, facts.char_size_bits, facts.char_size_bits, true)
-    elif canonical == "unsigned char":
-        value_type = integer_type(canonical, FiirCIntegerKind.unsigned_char, facts.char_size_bits, facts.char_size_bits, false)
-    elif canonical == "short" or canonical == "short int" or canonical == "signed short" or canonical == "signed short int":
-        value_type = integer_type(canonical, FiirCIntegerKind.signed_short, facts.short_value_bits, facts.short_size_bits, true)
-    elif canonical == "unsigned short" or canonical == "unsigned short int":
-        value_type = integer_type(canonical, FiirCIntegerKind.unsigned_short, facts.short_value_bits, facts.short_size_bits, false)
-    elif canonical == "int" or canonical == "signed" or canonical == "signed int":
-        value_type = integer_type(canonical, FiirCIntegerKind.signed_int, facts.int_value_bits, facts.int_size_bits, true)
-    elif canonical == "unsigned" or canonical == "unsigned int":
-        value_type = integer_type(canonical, FiirCIntegerKind.unsigned_int, facts.int_value_bits, facts.int_size_bits, false)
-    elif canonical == "long" or canonical == "long int" or canonical == "signed long" or canonical == "signed long int":
-        value_type = integer_type(canonical, FiirCIntegerKind.signed_long, facts.long_value_bits, facts.long_size_bits, true)
-    elif canonical == "unsigned long" or canonical == "unsigned long int":
-        value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long, facts.long_value_bits, facts.long_size_bits, false)
-    elif canonical == "long long" or canonical == "long long int" or canonical == "signed long long" or canonical == "signed long long int":
-        value_type = integer_type(canonical, FiirCIntegerKind.signed_long_long, facts.long_long_value_bits, facts.long_long_size_bits, true)
-    elif canonical == "unsigned long long" or canonical == "unsigned long long int":
-        value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long_long, facts.long_long_value_bits, facts.long_long_size_bits, false)
-    elif canonical == "float":
-        value_type = floating_type(canonical, FiirCFloatingKind.single, facts.float_storage_bits, facts.float_radix, facts.float_significand_bits, facts.float_maximum_exponent)
-    elif canonical == "double":
-        value_type = floating_type(canonical, FiirCFloatingKind.double, facts.double_storage_bits, facts.float_radix, facts.double_significand_bits, facts.double_maximum_exponent)
-    elif canonical == "long double":
-        value_type = floating_type(canonical, FiirCFloatingKind.long_double, facts.long_double_storage_bits, facts.float_radix, facts.long_double_significand_bits, facts.long_double_maximum_exponent)
-    else:
-        error("Clang FIIR: " + context + " type `" + canonical + "` is not supported by the scalar-function importer yet")
-    types.append(value_type)
-    return FiirTypeId(value = u32(len(types) - 1))
+    init(typedefs: map[str, ClangTypedef], facts: ClangScalarFacts):
+        self.types = list[FiirType]()
+        self.type_ids = map[str, FiirTypeId]()
+        self.resolving = list[str]()
+        self.typedefs = typedefs
+        self.facts = facts
+
+    func intern(spelling: str, context: str) -> FiirTypeId!:
+        var canonical = strings.trim(spelling)
+        if not self.typedefs.has(canonical): canonical = unqualified_scalar_spelling(canonical)
+        if self.type_ids.has(canonical): return self.type_ids[canonical]
+
+        var value_type = FiirType(spelling = canonical, form = FiirTypeForm.Unit, size_bits = none)
+        if self.typedefs.has(canonical):
+            for active in self.resolving:
+                if active == canonical: error("Clang FIIR: typedef `" + canonical + "` forms a cycle")
+            self.resolving.append(canonical)
+            let declaration = self.typedefs[canonical]
+            let target = self.intern(declaration.target_spelling, "typedef `" + canonical + "` target") catch reason:
+                self.resolving.remove(len(self.resolving) - 1)
+                error(reason)
+            self.resolving.remove(len(self.resolving) - 1)
+            let target_type = self.types[target.value]
+            value_type = FiirType(
+                spelling = canonical,
+                form = FiirTypeForm.Typedef(target = target, origin = declaration.origin),
+                size_bits = target_type.size_bits,
+            )
+        elif canonical == "void":
+            pass
+        elif canonical == "_Bool" or canonical == "bool":
+            value_type = FiirType(spelling = canonical, form = FiirTypeForm.Boolean, size_bits = self.facts.bool_size_bits)
+        elif canonical == "char":
+            value_type = integer_type(canonical, FiirCIntegerKind.plain_char, self.facts.char_size_bits, self.facts.char_size_bits, self.facts.plain_char_is_signed)
+        elif canonical == "signed char":
+            value_type = integer_type(canonical, FiirCIntegerKind.signed_char, self.facts.char_size_bits, self.facts.char_size_bits, true)
+        elif canonical == "unsigned char":
+            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_char, self.facts.char_size_bits, self.facts.char_size_bits, false)
+        elif canonical == "short" or canonical == "short int" or canonical == "signed short" or canonical == "signed short int":
+            value_type = integer_type(canonical, FiirCIntegerKind.signed_short, self.facts.short_value_bits, self.facts.short_size_bits, true)
+        elif canonical == "unsigned short" or canonical == "unsigned short int":
+            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_short, self.facts.short_value_bits, self.facts.short_size_bits, false)
+        elif canonical == "int" or canonical == "signed" or canonical == "signed int":
+            value_type = integer_type(canonical, FiirCIntegerKind.signed_int, self.facts.int_value_bits, self.facts.int_size_bits, true)
+        elif canonical == "unsigned" or canonical == "unsigned int":
+            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_int, self.facts.int_value_bits, self.facts.int_size_bits, false)
+        elif canonical == "long" or canonical == "long int" or canonical == "signed long" or canonical == "signed long int":
+            value_type = integer_type(canonical, FiirCIntegerKind.signed_long, self.facts.long_value_bits, self.facts.long_size_bits, true)
+        elif canonical == "unsigned long" or canonical == "unsigned long int":
+            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long, self.facts.long_value_bits, self.facts.long_size_bits, false)
+        elif canonical == "long long" or canonical == "long long int" or canonical == "signed long long" or canonical == "signed long long int":
+            value_type = integer_type(canonical, FiirCIntegerKind.signed_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, true)
+        elif canonical == "unsigned long long" or canonical == "unsigned long long int":
+            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, false)
+        elif canonical == "float":
+            value_type = floating_type(canonical, FiirCFloatingKind.single, self.facts.float_storage_bits, self.facts.float_radix, self.facts.float_significand_bits, self.facts.float_maximum_exponent)
+        elif canonical == "double":
+            value_type = floating_type(canonical, FiirCFloatingKind.double, self.facts.double_storage_bits, self.facts.float_radix, self.facts.double_significand_bits, self.facts.double_maximum_exponent)
+        elif canonical == "long double":
+            value_type = floating_type(canonical, FiirCFloatingKind.long_double, self.facts.long_double_storage_bits, self.facts.float_radix, self.facts.long_double_significand_bits, self.facts.long_double_maximum_exponent)
+        else:
+            error("Clang FIIR: " + context + " type `" + canonical + "` is not supported by the scalar-function importer yet")
+        self.types.append(value_type)
+        let identity = FiirTypeId(value = u32(len(self.types) - 1))
+        self.type_ids[canonical] = identity
+        return identity
+
+func unqualified_scalar_spelling(spelling: str) -> str:
+    var result = spelling
+    while true:
+        if strings.starts_with(result, "const "): result = strings.trim(result[6:])
+        elif strings.starts_with(result, "volatile "): result = strings.trim(result[9:])
+        else: return result
 
 func integer_type(spelling: str, kind: FiirCIntegerKind, bits: u16, size_bits: u16, is_signed: bool) -> FiirType:
     return FiirType(spelling = spelling, form = FiirTypeForm.Integer(kind = kind, bits = bits, is_signed = is_signed), size_bits = size_bits)

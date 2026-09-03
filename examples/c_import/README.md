@@ -10,20 +10,22 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `../luce.toml` declares the `temperature` C binding target.
 - `temperature/raw.native.luc` and `temperature.adapter.c` are generated from
   the header and are not checked in.
-- `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`, and
-  `c.int` crossings and exposes safe Luce-facing functions.
+- `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
+  `c.int`, and generated `luce_degrees` crossings and exposes safe Luce-facing
+  functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary32 `float`, exact
 IEEE binary64 `double` and `long double`, and every fundamental C integer
-family. It records Clang's target and scalar facts in FIIR, generates nominal
-`c` carriers plus a checked C adapter, and links that adapter only at the QBE
-backend boundary. Boolean retains one Luce `bool` shape; floating types retain
-`f32` or `f64`; integer carriers retain one `i64` or `u64` shape. The adapter
+family, plus scalar typedef chains over those types. It records Clang's target
+and scalar facts in FIIR, generates nominal `c` and typedef carriers plus a
+checked C adapter, and links that adapter only at the QBE backend boundary.
+Boolean retains one Luce `bool` shape; floating types retain `f32` or `f64`;
+integer and typedef carriers retain one lossless portable shape. The adapter
 alone asserts the C representations and verifies integer target ranges before
-invoking C. Extended floating formats, typedef identities, pointers, records,
-recipes, and the f16 shim remain explicit generation errors until their
-complete contracts are implemented.
+invoking C. Extended floating formats, pointers, records, recipes, and the f16
+shim remain explicit generation errors until their complete contracts are
+implemented.
 
 Generate the binding products with explicit destinations:
 

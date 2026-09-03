@@ -1,8 +1,14 @@
 #ifndef LUCE_TEST_FIIR_SCALARS_H
 #define LUCE_TEST_FIIR_SCALARS_H
 
+#include <stddef.h>
+
+typedef int luce_scalar_status;
+
 _Bool luce_echo_boolean(_Bool value);
 float luce_echo_float(float value);
+size_t luce_echo_size(size_t value);
+luce_scalar_status luce_echo_status(luce_scalar_status value);
 
 char luce_echo_plain_char(char value);
 signed char luce_echo_signed_char(signed char value);

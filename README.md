@@ -67,8 +67,10 @@ alignments, field offsets, symbols, and calling conventions.
 The C-import path generates inspectable FIIR, raw Luce, and C-adapter products
 from one exact Clang invocation. It admits C `_Bool`, IEEE binary32 `float`,
 IEEE binary64 `double` and `long double`, and every fundamental C integer
-through nominal target-independent carriers. The generated adapter owns C
-object representation and checks integer target ranges. Extended floating
+through nominal target-independent carriers. Scalar typedefs over those types,
+including dependency-owned names such as `size_t`, retain their own nominal
+carriers without inheriting a target width. The generated adapter owns C object
+representation and checks integer target ranges. Extended floating
 representations and broader declarations fail explicitly until their complete
 adapter contracts land.
 The end-to-end command and generated module layout are documented in
