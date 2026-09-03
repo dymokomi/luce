@@ -79,10 +79,11 @@ anonymous enums use one target-independent sign-and-magnitude constant carrier
 without fabricating a C enum type. Header-local `static const` fundamental
 integer objects join that same typed constant model after Clang proves and
 evaluates the value; volatile storage is not misrepresented as a constant.
-Declaration-only external scalar objects remain live behind generated readers
-and, when mutable, writers. Integer writes are range checked; `const` and
-`volatile` are enforced by the C product, while shared HIR and MIR see only
-ordinary fixed-carrier calls.
+Declaration-only external scalar and enumeration objects remain live behind
+generated readers and, when mutable, writers. Integer writes are range checked;
+enumerations reuse the checked sign-and-magnitude boundary; `const` and
+`volatile` are enforced by the C product. Shared HIR and MIR see only ordinary
+fixed-carrier calls.
 Plain C records use logical generated Luce records and private fixed field carriers;
 Clang-evaluated layout is asserted only by the backend-owned C adapter. Other
 extended floating representations and broader declarations fail explicitly

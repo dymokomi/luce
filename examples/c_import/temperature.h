@@ -46,6 +46,7 @@ extern volatile luce_degrees luce_temperature_offset;
 extern const unsigned long long luce_temperature_sensor_capacity;
 extern bool luce_temperature_enabled;
 extern double luce_temperature_ratio;
+extern luce_temperature_scale luce_temperature_unit;
 
 double luce_celsius_to_fahrenheit(double celsius);
 float luce_half_celsius(float celsius);

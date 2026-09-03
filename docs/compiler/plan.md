@@ -924,6 +924,17 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   generation tests, both semantic oracles, Wasm/QBE emission, CLI
   materialization, target-variation invariance, and real volatile linked C
   execution cover the slice.
+- [x] **Reuse the checked enumeration boundary for external C enum objects**
+  (2026-09-03). Mutable and const enumeration storage uses the same FIIR object
+  declaration and generated reader/writer surface as fundamental scalars, but
+  expands only at the C adapter into the existing Boolean-plus-magnitude
+  protocol. Reads reject undeclared stored values as enumeration results;
+  writes reject undeclared inputs before touching storage. Exact type and
+  qualifiers remain C assertions, alternate enum representation flags leave
+  raw Luce byte-identical, and generated C parameter names cannot shadow the
+  imported object. Both semantic oracles, Wasm/QBE emission, the example CLI,
+  ordinary and `-fshort-enums` native execution, and a real corrupted-object
+  trap cover the slice without adding HIR or MIR concepts.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,

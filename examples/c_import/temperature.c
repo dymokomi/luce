@@ -4,6 +4,7 @@ volatile luce_degrees luce_temperature_offset = 0;
 const unsigned long long luce_temperature_sensor_capacity = 4095ULL;
 bool luce_temperature_enabled = false;
 double luce_temperature_ratio = 0.0;
+luce_temperature_scale luce_temperature_unit = LUCE_SCALE_CELSIUS;
 
 double luce_celsius_to_fahrenheit(double celsius) {
     return celsius * 1.8 + 32.0;

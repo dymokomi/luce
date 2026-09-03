@@ -15,8 +15,8 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
   constant, two header-local fundamental-integer object constants, two
   explicitly selected fundamental-integer macro constants, live mutable and
-  read-only external scalar objects, and fieldwise simple/nested record
-  crossings. It exposes safe Luce-facing functions.
+  read-only external scalar and enumeration objects, and fieldwise
+  simple/nested record crossings. It exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary16 `_Float16`,
@@ -40,7 +40,8 @@ and mutable writers, while the generated C product performs the actual access.
 The example's offset is volatile, so every read and write remains observable;
 its `const` sensor capacity has no generated writer. Boolean and floating
 objects exercise the direct scalar writer path alongside the checked integer
-writer.
+writer. The mutable unit object exercises the enum's checked
+Boolean-plus-magnitude reader and writer without exposing its C storage width.
 Object-like macros enter only through repeated `--macro-constant` selections;
 Clang establishes their active definition, exact type, source origin, and
 value without Luce interpreting replacement text.
