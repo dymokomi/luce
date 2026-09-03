@@ -75,6 +75,13 @@ bool luce_is_freezing(bool enabled, double celsius);
 luce_temperature_range luce_shift_range(luce_temperature_range value, double delta);
 luce_temperature_reading luce_shift_reading(luce_temperature_reading value, luce_degrees delta);
 
+typedef struct luce_temperature_sensor luce_temperature_sensor;
+
+luce_temperature_sensor * _Nonnull luce_temperature_sensor_open(luce_degrees value);
+luce_temperature_sensor * _Nullable luce_temperature_sensor_find(luce_degrees value);
+luce_degrees luce_temperature_sensor_value(const luce_temperature_sensor * _Nonnull sensor);
+luce_temperature_sensor * _Null_unspecified luce_temperature_sensor_echo(luce_temperature_sensor * _Null_unspecified sensor);
+
 #ifdef __cplusplus
 }
 #endif

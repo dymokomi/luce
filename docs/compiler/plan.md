@@ -6,10 +6,61 @@ without the conversations that produced it. The other half,
 [`done.md`](done.md), records what exists, what each milestone proved, the
 bugs the harness caught, and where the project came from. `mir.md` explains
 the machine representation in depth. Update this file when a decision
-changes; move items to `done.md` when they are ticked. Do not let either
-drift into a wish list.
+changes. Checked items stay here only when their condensed decision or
+dependency context is needed to understand the remaining sequence;
+`done.md` owns the full evidence. Do not let either drift into a wish list.
 
 Last updated: 2026-09-03 (Stage-0 0.30).
+
+## Current resumption snapshot
+
+The only active development line is `stage1-qbe`. Its purpose is the complete
+Luce 1.0 source-to-QBE checkpoint: one target-neutral HIR and canonical MIR,
+three agreeing semantic/artifact executions, executable examples for every
+demonstrable capability, and stable diagnostics for every deliberate
+rejection. Do not merge the superseded native-backend work from `main`, and do
+not begin a Luce-owned machine backend before this checkpoint is complete and
+audited.
+
+The repository currently proves 968 compiler tests across 36 files, plus the
+CLI, Wasmtime, QBE differential, and host-native gates. The latest FIIR slice
+imports direct pointers to typedef-backed incomplete C records as nominal raw
+handles without introducing C layout or platform facts into HIR or MIR. The
+next implementation slice is **S21 binding recipes and safe wrapper
+ownership**, beginning at the unchecked row under “Complete C import (FIIR)”
+below.
+
+There are three deliberately non-overlapping sources of truth:
+
+1. [`done.md`](done.md) records only committed, full-gate-green behavior and
+   the evidence behind it.
+2. This file records architecture decisions and implementation order. Within
+   it, the nested FIIR list below is the exact S21 order.
+3. [`../../examples/FEATURES.md`](../../examples/FEATURES.md) is the normative
+   section-by-section conformance ledger. Its “Exact open stage-1 checklist”
+   is the exhaustive blocker list for the 1.0 source-to-QBE checkpoint.
+
+At this snapshot the open blocker groups are:
+
+| Order | Ledger IDs | Work remaining |
+| --- | --- | --- |
+| 1 | S21, S23, S24 | Finish FIIR recipes and declaration vocabulary, resolve the extern-struct grammar contract, and enforce callback runtime/thread rules. |
+| 2 | S12, S13, S30 | Finish public text/bytes/codecs and required runtime services, complete error/trace/fatal diagnostics, and run the remaining proving examples through QBE. |
+| 3 | S02, S26, S27 | Implement source `test` semantics and isolation, then close its namespace rules, required command modes, structured diagnostics, and canonical formatting. |
+| 4 | S01, S28 | Close the naming/style audit and map every deliberate exclusion to a stable negative fixture. |
+| 5 | S29 | Compile the compiler with stage 1, compare observable behavior, and preserve the frozen bootstrap chain. |
+| 6 | all rows | Run the final conformance, architecture, ownership, file-size, performance, examples, and multi-backend audit; then pause for review. |
+
+The longer proving-program and host roadmap in §§4–5 is design context, not an
+implicit expansion of this checkpoint. A task there blocks 1.0 only when the
+conformance ledger names it (currently through S30). The Wasm engine, complete
+host application, Luce-owned native backends, image/link writers, persistent
+services, and post-1.0 packaging/release work explicitly begin after the
+source-to-QBE review.
+
+Local milestones use brief commit subjects and the sole author/committer
+`Dy Mokomi <dy@dymokomi.com>`. Keep the branch local until Dy explicitly asks
+for a push.
 
 ## Recovery audit of the unpublished native branch
 
@@ -178,869 +229,162 @@ does not duplicate those passes in stage 1.
 
 **2 — the host in Luce (native).** Terminal, realm, storage, crypto, network and `WasmHost` as real executables on macOS (libSystem, Cocoa/Metal via dyld) and Linux (libc/OpenSSL), with the wasm engine as a Luce library — decoder + interpreter with fuel beside the existing encoder, differential-tested against `wasmtime` while both exist. Owning the engine settles the preemption blocker and frees the compiler tests from `wasmtime`.
 
-## 5. What is next — the checklist
+## 5. Active roadmap
 
-Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec *before* the feature lands in `hir_gen`. Ticked items move to `done.md` §2.
+This section intentionally contains open work only. Completed implementation
+and proof belong in [done.md](done.md); the conformance ledger identifies the
+normative gap. Architecture decisions that constrain future work remain in
+§§2–3 and §6 rather than masquerading as unfinished tasks.
 
-### Proving program 1 — the guest
+### 5.1 Source-to-QBE closure order
 
-- [x] **Recover the compact compiler shape** (2026-08-30): preserve the
-  unpublished native experiment, restart from `origin/main`, and organize the
-  existing code by frontend/HIR/MIR/backend ownership without compatibility
-  wrappers (`eb6dbfd`).
-- [x] **Enforce the backend boundary** (2026-08-30): remove concrete targets,
-  pointer width/alignment, aggregate offsets/sizes, slot alignment, and raw
-  target-sized relocations from canonical MIR. Lower once; compute cached byte
-  layout in each backend. The architecture gate rejects future platform leaks
-  before `backends/` (`b09ac68`).
-- [x] **QBE backend oracle** (2026-08-30): translate verified canonical MIR
-  directly to QBE IL, compile and execute the complete existing differential
-  corpus, and require the checksum-pinned QBE 1.3 tool in the full test gate.
-  No target IR or platform layout was added before the backend boundary
-  (`facc3c3`).
-- [x] **QBE product materialization** (2026-08-30, hardened 2026-08-31):
-  `--target native` writes canonical-MIR-derived IL, QBE assembly, diagnostics,
-  and the linked candidate inside an atomically unique, owner-only directory
-  beside the output. Regular files connect QBE and the host C driver because
-  feeding one child pipe completely before draining the other can deadlock on
-  large programs. Same-filesystem rename installs only the finished candidate
-  atomically; failures preserve the prior artifact and remove all scratch.
-  The complete differential corpus and native smoke gate use this path.
+- [ ] **S21 — finish C import through FIIR.** Follow the dependency plan in
+  §5.2. Every slice must preserve one target-neutral HIR/MIR shape and prove
+  generated raw source, both semantic oracles, Wasm encoding where applicable,
+  and real linked QBE/C execution.
+- [ ] **S23 — settle the extern-struct grammar contract.** Resolve the
+  field-only grammar versus richer prose conflict in the language document,
+  then close the resulting positive/negative matrix without creating a second
+  nominal-record implementation.
+- [ ] **S24 — enforce callback runtime and thread rules.** Complete the
+  remaining C-export callback matrix using the existing exact cfunc identity.
+  Context, lifetime, thread entry, and runtime attachment must be explicit
+  recipe/runtime contracts, not backend guesses.
+- [ ] **S12/S30 — finish the standard/runtime surface required by the
+  examples.** Public text and bytes builders, UTF codecs, numeric
+  parsing/formatting policy, remaining arena/pool/generational-handle
+  contracts, automatic standard-module loading, required host libraries, and
+  source-test resource reports remain. Existing lists, maps, sets, immutable
+  strings/bytes, affine internal formatting, classes, tasks, and explicit
+  standard-source provenance are the proven foundation.
+- [ ] **S13 — close errors, fatal outcomes, and diagnostic provenance.** Add
+  error context/source traces, structured fatal reporting, complete trap source
+  locations, and the remaining stack-budget reporting. Finish the measured
+  recursion work in [recursion.md](recursion.md) only where evidence identifies
+  an unsafe recursive owner.
+- [ ] **S26/S02 — implement source tests and their scopes.** Lower source
+  test declarations through HIR/MIR into an isolated registry and runner;
+  implement test-only import pruning, selection/reporting, and
+  testing.expect_trap; then close the namespace/lifetime matrix that depends on
+  that model.
+- [ ] **S27/S01 — finish the first-party command and formatting contract.**
+  Complete the required command modes, structured diagnostic/fix shape,
+  canonical formatter, and naming/style diagnostics. The existing check, run,
+  and build core is not the complete §24 contract.
+- [ ] **S28 — prove every deliberate exclusion.** Give each §25 exclusion a
+  stable negative fixture at its first rejecting stage; absence of an
+  implementation is not evidence.
+- [ ] **S29 — prove self-hosting and the bootstrap chain.** Compile the compiler
+  with stage 1, compare observable behavior with the pinned Stage-0 0.30 build,
+  retain one prior compiler forever, and measure source throughput before any
+  speculative representation tuning.
+- [ ] **Add generated-program and fuzzing gates.** Run deterministic generated
+  valid/invalid programs through the same HIR/MIR/QBE triangle, record seeds,
+  minimize failures, and never claim coverage that is not executing.
+- [ ] **Perform the final checkpoint audit and pause.** Reconcile every
+  conformance row, run every example and diagnostic gate, inspect ownership and
+  lifecycle seams, re-run the no-platform-before-backend check, review large
+  files and pass boundaries, measure the compiler, and run the complete test
+  suite. Then stop for Dy's review before changing main or beginning another
+  backend.
 
-- [x] **Decompose the stateful compiler passes before the next major
-  managed-language family.** The former 4,299-line HIR class is now a
-  369-line orchestration facade, a 2,308-line program-wide declaration
-  collector, a 1,194-line shared typed transaction/model, a 3,008-line body
-  checker, and focused 743- and 291-line generic function/nominal owners.
-  Declaration defaults cross that boundary through
-  one constant-expression contract; type, symbol, and node tables remain
-  singular. Statements, expressions, and patterns remain together because
-  their traversal is mutually recursive; splitting them today would add a
-  callback graph rather than a responsibility boundary. The former 3,659-line
-  MIR lowerer is likewise a 186-line whole-program coordinator, one 865-line
-  identity/type/state transaction, and one 4,025-line function walk.
-  Statements, expressions, patterns, calls, aggregates, and cleanup remain
-  together because they are mutually recursive and share one lexical
-  transaction. The class slice completed that ownership review: class ARC,
-  destruction, weak sinks, places, calls, and structured control all mutate
-  that same register/region/defer transaction, so extracting them would add a
-  forwarding graph or duplicate ownership state rather than establish a new
-  owner. The later closure review kept the recursive evaluator cohesive, while
-  existential interface resolution established an independently testable HIR
-  boundary. Standard iteration established focused 137-line declaration and
-  210-line operation owners in `hir/interfaces/`; only lexical body scope
-  restoration remains in the mutually recursive checker. Independently
-  generic methods reused the generic-function owner
-  and the existing declaration transaction rather than adding another pass.
-  Generic accounting established a separate 263-line cross-stage reporting
-  owner and a 28-line backend emission record instead of coupling presentation
-  to HIR, MIR, QBE, or Wasm. Its out-of-band function provenance follows
-  package composition and optimizer remapping without adding source or generic
-  facts to canonical MIR. The declaration collector and now 4,434-line
-  function walk were reviewed again after recursive equality. The 57-line HIR
-  protocol owner and generated-helper identity queue are independent, but MIR
-  hashing and equality recursively share the same register, slot,
-  aggregate-address, call, and structured-region transaction as the enclosing
-  expression walk. Extracting either marked section today would duplicate that
-  machinery or add a forwarding interface, so they remain cohesive until a
-  reusable function-emission owner can replace—not wrap—the shared helpers.
-  The incoming-cfunc slice raised that shared function walk to 5,206 lines
-  and the Wasm encoder to 2,475 lines; both were reviewed again at the slice
-  boundary. Keep the parser and Wasm encoder sectioned
-  until new work establishes real component boundaries; do not split any pass
-  into arbitrary helper files just to lower a line count.
+### 5.2 FIIR dependency plan (S21)
 
-- [x] **Enums and `match`** (2026-08-28; §9.6 audit closed
-  2026-09-01, `done.md` §2). Enum/optional/Boolean/literal/range patterns,
-  both arm forms, complete finite integer/Unicode-scalar coverage, overlap and
-  unreachable detection, and the enum catch-all advisory are closed through
-  both oracles and QBE/Wasm. `Switch` is still unused by the lowerer: `match`
-  is an `If` chain, because a Wasm `Switch` needs `br_table` plumbing that
-  breaks the one-region-one-label invariant; jump tables come with the native
-  pass.
-- [x] **`for`, integer ranges, and standard iteration protocols** (2026-08-31, `done.md` §2). Built-in ranges/lists/strings retain their canonical semantic paths. User values use compiler-known `Iterable[T]`/`FallibleIterable[T]` contracts through concrete, constrained-generic, or existential dispatch; `try for` applies the ordinary failure model to each `next()`. HIR resolves one target-independent loop driver, MIR reuses calls/optionals/structured control, and both oracles, QBE, and Wasm prove execution and lexical iterator cleanup.
-- [x] **Compiler-derived structural markers and immutable hashing**
-  (2026-08-31, `done.md` §2). `Equatable` and `Hashable` are closed,
-  constraint-only proofs with no source conformance or runtime witness.
-  `hash(value)` evaluates once and resolves to one HIR operation; shared MIR
-  lowering expands every structural aggregate into ordinary typed control and
-  memory operations. Only execution-local IEEE scalar coding remains a
-  verified canonical primitive. Both semantic oracles, QBE, Wasm, and
-  `examples/hashing.luc` prove equal-value consistency without freezing a
-  numeric hash algorithm.
-- [x] **Explicit exact-same-type ordering** (2026-09-01, `done.md` §2).
-  Compiler-known `Comparable` binds its implicit `Self` operand at each
-  constraint or conformance, then reuses ordinary interface substitution and
-  static generic specialization. It adds no operator, existential, associated
-  type, MIR instruction, runtime service, or backend case. Exact diagnostics,
-  typed-package reconstruction/import, both semantic oracles, QBE, Wasm, and
-  `examples/comparable.luc` close §17.2 ordering.
-- [x] **Cycle-aware structural list equality** (2026-08-31,
-  `done.md` §2). Recursive value declarations may close through list
-  indirection, so one source comparison owns an opaque ordered-pair
-  transaction. Finite types remain one allocation-free canonical loop;
-  recursive types use lazily reserved private helpers that close the compiler
-  type graph without expanding it. Element/tag/shape semantics stay in HIR and
-  canonical MIR, while the sealed runtime owns only pair-set storage and QBE
-  and Wasm only pass their list handles. Both semantic oracles, verifier and
-  optimizer gates, the differential native corpus, and `examples/lists.luc`
-  prove identity, finite contents, self/deep cycles, mismatches, alias-topology
-  independence, and context growth, providing the settled equality/hash
-  baseline used by maps and sets.
-- [x] **Insertion-ordered maps and sets** (2026-08-31, `done.md` §2).
-  Inferred/explicit construction, typed lookup and mutation, insertion order,
-  copy, identity, recursive order-independent equality, iteration guards, and
-  complete key/value ownership run through both semantic oracles, canonical
-  MIR, the sealed hash-table runtime, QBE, and Wasm. `Map(K,V)` and `Set(T)`
-  remain target-neutral through MIR; generated code owns hashing/equality and
-  structural ownership callbacks, while runtime/backend code owns only table
-  storage, process-private bucket seeding, layout, and descriptors.
-- [x] **Collection literals satisfy the complete §4.5 matrix** (2026-09-01,
-  `done.md` §2). Brackets select one inferred/contextual list, fixed array, or
-  immutable slice; map/set construction keeps homogeneous types and source
-  order. Static duplicate-map-key proof covers the closed recursively literal
-  hashable family, while computed duplicates retain ordinary replacement.
-  Contextual slices reuse the existing list-snapshot HIR/MIR ownership path;
-  this slice adds no MIR form, runtime operation, backend branch, or target
-  fact.
-- [x] **`defer`** (2026-08-29, `done.md` §2). Receiver and arguments are captured at registration; lexical cleanup is LIFO and runs on fallthrough, `return`, `break`, and `continue`, but not traps. The lowerer duplicates cleanup calls at each ordinary exit, ready for error propagation to become one more exit edge.
-- [x] **`try`/`catch`, `Error`** (2026-08-29, `done.md` §2). `T!` is an outer function-result effect, `ErrorCode` carries explicit package identity, calls use caller-owned Error slots, and propagation/recovery run active `defer`s. Scalar, unit, aggregate, conditional, and match-produced fallible values pass the three executions.
-- [x] **Custom struct `init`** (2026-08-29, `done.md` §2). Construction has an explicit HIR identity; `SemanticAnalyzer` proves every successful path initializes each field exactly once before `self` is read or escapes; fresh caller-owned receiver storage composes with the ordinary `T!` error-slot path.
-- [x] **Conditional binding** (2026-08-30, `done.md` §2). `if let`
-  checks its optional subject once and canonicalizes directly to the existing
-  exhaustive optional `Match` HIR. Payload scope, ownership, flow analysis,
-  MIR lowering, and backend behavior therefore have one implementation rather
-  than a conditional-binding-specific path.
-- [x] **Explicit `discard[T]`** (2026-08-31, `done.md` §2). One compiler-known
-  HIR node records intent, rejects unhandled `T!`, and preserves `never` flow.
-  Lowering evaluates the operand once and then uses the existing
-  full-expression ownership cleanup; there is deliberately no MIR/backend
-  discard instruction. The matching §7.8 `L0701` advisory now reports every
-  silently discarded non-`unit` result and points intentional code to the
-  explicit spelling. Flat HIR carries one cold source-module identity beside
-  each node's type/span, so this and future advisories remain linear scans
-  with exact file provenance rather than duplicate recursive walkers.
-- [x] **Dynamic source `trap(message)`** (2026-08-31, `done.md` §2). One
-  never-valued HIR form evaluates an ordinary `str` and terminates without
-  lexical cleanup. Shared lowering uses the existing target-neutral
-  `luce_rt_trap(Ptr, u64)` contract followed by canonical `Unreachable`; QBE
-  and Wasm alone choose stderr and their terminating instruction. Complete
-  source-location/stack diagnostics remain part of the §13 audit.
-- [x] **Source-level `never` callables and bottom flow** (2026-08-31,
-  `done.md` §2). `-> never` and `-> never!` survive direct, generic,
-  function-value, closure, and interface signatures. HIR records contextual
-  bottom coercion and the exact eager prefix before a terminating operand;
-  canonical MIR records only target-neutral `returns_never` and structured
-  termination. Illegal storage is rejected before lowering, including after
-  generic/interface substitution and inside native-pointer pointees. Both
-  oracles, the verifier, QBE, Wasm, and the focused trap example agree.
-- [x] **Source `assert(condition, message?)` execution** (2026-08-31,
-  `done.md` §2). One unit-valued HIR form preserves ordinary eager argument
-  order and supplies the exact default `"assertion failed"` message. Shared
-  lowering emits a structured failed arm around the existing trap contract;
-  there is no assertion MIR instruction or backend-specific lowering.
-  Target-independent HIR operational summaries now close allocation,
-  observable mutation, I/O, external access, dynamic calls, and termination
-  over resolved recursive call graphs. Assertion conditions reject the first
-  reachable effect with an exact cross-module call path; source-location/stack
-  reporting for runtime traps remains in the §13 diagnostic audit.
-- [x] **Complete explicit numeric construction for every scalar width**
-  (2026-09-01). One `NumericConvert` HIR node covers every integer/integer,
-  integer/float, float/integer, and f16/f32/f64 pair without
-  source-family duplication. §7.5 now states the policy explicitly:
-  integer-to-float and float narrowing round to nearest/ties-to-even,
-  float-to-integer truncates toward zero after rejecting NaN, infinity, and
-  values outside the destination interval, and only finite floating narrowing
-  overflow traps. HIR constants and operations round at their declared width;
-  canonical MIR retains typed `Convert` operations and target-independent
-  guards. QBE and Wasm legalize f16 only behind their backend boundaries,
-  with exact IEEE rounding and two-byte storage. Both oracles, structural
-  hashing and display, the full differential corpus, and
-  `examples/numeric_conversions.luc` agree through native QBE and Wasm. Direct
-  Unadapted direct f16 C ABI crossings remain rejected instead of silently
-  widening the signature. FIIR-generated `_Float16` crossings use the completed
-  exact private f32 adapter described below.
-- [x] **Named IEEE values live in the ordinary `math` module** (2026-09-01,
-  `done.md` §2). Nine width-explicit constants cover NaN and both infinities
-  for f16/f32/f64. Public constants now participate in the existing unified
-  qualified/selective import value namespace and resolve to ordinary HIR
-  constant symbols. Existing constant expressions, conversions, oracles, MIR,
-  QBE, and Wasm carry the values; no compiler-known name or special backend
-  operation exists. Source paths remain explicit package input until the
-  deliberately post-1.0 manifest/dependency work.
-- [x] **Complete the §§5–6 core type-and-binding rule audit** (2026-09-01,
-  `done.md` §2). Aliases are transparent, non-generic, non-recursive,
-  order-independent identities usable in every signature and through
-  qualified public modules. Public constants spell their type while private
-  inference remains local. Tuple binding, value copies, shared reference
-  identity, recursive indirection, definite initialization, and nested generic
-  mutable places now have named positive and negative fixtures. Reference
-  parameters traverse shared list/map/class storage without becoming
-  assignable roots; the same target-neutral place reaches both backends.
-- [x] **Complete the §§7–8 expression and function rule audit** (2026-09-01,
-  `done.md` §2). Every eager-order family, closed operator domain, direct and
-  exact indirect callable, named/default placement rule, tuple result,
-  method kind, mutating replacement, and recursion rule has named semantic
-  and executable evidence. Ordinary defaults now resolve after imports and
-  constants, so pure qualified/selective imported constants work without
-  leaking body locals or declaration order into signatures. Named arithmetic
-  policy APIs remain standard-library work in S30.
-- [x] **Complete the §§9.1–9.5 and §§9.7–9.8 control-flow audit**
-  (2026-09-01, `done.md` §2). Conditional joins are symmetric across bottom,
-  optional, established-interface, and function-fallibility conversions.
-  Branch/loop scope, immutable iteration, innermost exits, range endpoints,
-  return coverage, and every deferred-cleanup exit/failure rule now have exact
-  semantic and executable evidence. The already closed §9.6 match matrix makes
-  all of §9 complete through QBE, with Wasm as an additional product check.
-- [x] **Exact process entry contract** (2026-09-02, `done.md` §2).
-  An ordinary root package may select one public top-level
-  `main(arguments: slice[str]) -> i32!`; near misses are rejected before body
-  checking, while imported package functions and sealed-runtime helpers can
-  never become the process root. HIR artifacts preserve the selected symbol,
-  canonical MIR preserves the unchanged fallible signature plus semantic
-  argument/error ownership identities, and optimization remaps the complete
-  root without learning a target. HIR and MIR oracles accept explicit
-  semantic argument slices. QBE alone adapts C `argc`/`argv`; Wasm alone uses
-  WASI `args_sizes_get`/`args_get`; both release arguments and unhandled
-  failures on every ordinary path.
-- [ ] **`extern` import/export** through one source-level callable model;
-  C signatures verified by the MIR verifier, with Wasm namespaces and native
-  symbols interpreted only by their backends. The direct scalar-function rung
-  is complete: ordinary definitions, `export c func`, and `extern func` share
-  one HIR function table, symbol kind, import path, argument checker, and
-  `Call` node; lowering performs the sole split into MIR definitions/externs.
-  HIR/MIR hosts, Wasm `env` imports, exact exports, QBE ABI extension types,
-  and real libc linkage are covered. Integer- and pointer-represented nominal
-  handles are also complete: HIR preserves identity and opacity; ordinary
-  optionals remain tagged; one canonical MIR boundary adapter alone
-  encodes/decodes C null and traps `null_foreign` for bare zero tokens. C
-  exports are ordinary Luce bodies behind shared MIR wrappers, so source calls
-  never acquire boundary behavior. `out` slots are also complete: HIR retains
-  their ordered source contract, one lowerer adapter passes call-owned raw
-  pointers and shapes declared-result-then-output values, the semantic hosts
-  cover both sides of that memory boundary, and real QBE/libc
-  `posix_memalign` proves a nullable pointer output. Real QBE/libc `getpid` and
-  `malloc`/`free` execution prove both handle representations. The anonymous
-  raw data-pointer type `foreign` is complete on the same protocol: HIR retains
-  one atomic opaque/equatable token, ordinary optionals stay tagged, and the
-  sole HIR-to-MIR lowering maps it to canonical target-neutral `pointer`.
-  Direct, optional, out, cfunc-signature, and extern-struct-field crossings
-  share the existing null adapter; real QBE/libc `malloc`/`writev`/`free`
-  proves the end-to-end layout and call path. Direct C `str` inputs, results,
-  and `out` slots are complete without widening the closed `cfunc`, C-export,
-  extern-struct, or extern-variable vocabularies. Inputs receive exact
-  call-scoped NUL-terminated copies; results trap on null, scan immediately,
-  validate UTF-8, and become ordinary owned string buffers before any input
-  temporary is released. HIR and MIR hosts cover valid, null, malformed, and
-  unterminated values; the differential harness reaches both artifact
-  encoders; real QBE/libc `strchr` proves a result borrowed from its input.
-  Borrowed `list[H]` inputs are complete for the closed scalar, named-handle,
-  and `foreign` element row. The existing list identity remains intact through
-  HIR and MIR; the call adapter exposes its dense first-element address, uses
-  null for an empty value, and leaves the separately declared count untouched.
-  It emits no copy, packing path, new MIR instruction, or backend-specific
-  representation. Bare pointer elements receive a target-neutral validation
-  loop before the call. Both semantic hosts prove ordered and empty values,
-  Wasm and QBE encode the same canonical MIR, and real QBE/libc `memcmp` reads
-  the storage directly. List results, output slots, nested/text/optional
-  elements, extern-struct fields, cfunc signatures, and C exports remain
-  deliberately refused. External variables are also complete: HIR retains
-  explicit observable loads/stores,
-  canonical MIR owns a distinct external-global table and instructions, both
-  semantic oracles use explicit variable hosts, QBE binds the C object symbol,
-  and Wasm imports one mutable `env` global. Bare pointer-handle zero is
-  ordinary global state; null translation remains confined to callable C
-  boundaries. Exact named `cfunc` values are complete in the separate rung
-  below. The `extern struct` declaration is complete too: its terse raw fields
-  normalize into the ordinary nominal-member model, so documentation,
-  constant defaults, methods, custom initializers, and explicit interface
-  conformances have no parallel semantic implementation. HIR keeps one
-  nominal value-struct capability, package artifacts preserve initializers
-  and witnesses, and MIR stays structurally target-neutral. The call adapter
-  recursively packs inputs and unpacks outputs field by field into call-owned
-  pointer slots. Both semantic oracles, focused MIR verification,
-  backend-generic aggregate legalization, and real QBE/libc `clock_gettime`
-  execution followed by an ordinary Luce method prove the path. By-value
-  results, nullable extern structs, generic declarations, and empty C shapes
-  are refused.
-  Fixed-representation exported C enums are complete for direct extern,
-  `cfunc`, exported-function, and C-record fields. They reuse the ordinary payload-free
-  enum for every semantic operation and retain one exact case-to-integer map
-  in HIR/package artifacts. Canonical MIR adds no representation kind: its
-  existing C-edge adapters translate positional semantic tags to/from the
-  declared integer type and trap unknown incoming values. Both semantic
-  oracles, malformed package tests, imported artifacts, Wasm encoding, and
-  real QBE/libc execution cover signed values in both directions. External
-  globals remain closed until their own adapter shape is implemented;
-  silently laying out the semantic enum as C storage would violate the
-  boundary-only rule.
-  Exported C structs are now complete as semantic values and by-value ABI
-  records. HIR records only an exported boundary role and admits a closed,
-  recursively owned scalar/fixed-enum/exported-record field vocabulary. MIR
-  derives a separate declaration-order structural boundary type only at an
-  explicit C edge, fieldwise translates nested semantic values, and retains
-  no size, alignment, offset, or target identity. QBE alone declares and
-  classifies the aggregate ABI types for definitions, externs, and indirect
-  callbacks. Both semantic oracles, typed-package round trips/imports, focused
-  MIR verification, and a linked C harness prove nested arguments/results,
-  fixed enum fields, floating fields, and aggregate-bearing indirect C calls.
-  Generated C11 headers and versioned QBE ABI reports are complete in the
-  product slice below.
-  Incoming bare/nullable C function pointers, cfunc fields, and the three
-  explicit inbound-memory verbs are now complete in the separate rungs below.
-  Callback runtime enforcement remains on this item.
-- [x] **Checked byte access and the first adopted native example**
-  (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
-  have explicit target-neutral HIR semantics and lower to the existing
-  structural MIR field/element operations plus an explicit trap edge. String
-  and byte counts are now the spec's `u64` throughout canonical MIR and the
-  runtime seam. The adapted Stage-0 recursive-descent calculator scans UTF-8
-  bytes (never integer-indexes `str`), checks, compiles and links through the
-  product QBE path, then executes successfully. Wasm and both semantic oracles
-  agree on successful access and out-of-bounds traps.
-- [x] **Closed-world MIR reachability** (2026-08-30): package `pub` visibility
-  and explicit artifact export are orthogonal MIR facts, so `pub` no longer
-  masquerades as a native ABI promise. Package APIs, the explicit process
-  entry and explicit C-export wrappers root a deterministic graph over direct
-  calls and function addresses. Surviving identities are remapped in source
-  order; externs, C globals, Luce globals and data reachable only from
-  discarded functions are pruned and remapped too. A rootless private library
-  is conservatively unchanged because it is not a closed world. The same
-  optimized, reverified canonical MIR feeds Wasm and QBE; only the backends
-  choose whether package-public functions are exposed by their artifact model.
-- [x] **Fixed value arrays and the second adopted native example**
-  (2026-08-30): `array[T, N]` is a canonical HIR type; contextual literals,
-  value copies, structural equality, `.length`, checked `u64` reads, and
-  mutable mixed field/element places—including mutating method receivers—lower
-  once to canonical MIR `Array` and `ElementAddress`; equality uses a
-  count-independent MIR loop. HIR, MIR, Wasm, and real QBE agree on nested
-  arrays, zero length, aggregate calls/results, and bounds traps. The adapted
-  Stage-0 sort program uses allocation-free fixed storage and is a native QBE gate.
-- [x] **Fixed arrays convert to ownership-safe immutable slices**
-  (2026-08-31). `array[T, N][lower..<upper]` evaluates its source and bounds
-  once in source order, validates them before allocation, and snapshots only
-  the selected value range. Shared lowering reserves one runtime buffer,
-  copies through a count-independent loop with structural retain helpers,
-  captures the existing canonical `slice[T]`, and releases the temporary list
-  identity. Inline frame storage never escapes, reference elements stay
-  shallow, and no array layout or slice representation enters HIR/MIR.
-  Scalar and managed-element escapes, post-snapshot mutation, zero/partial
-  ranges, invalid bounds, both oracles, native QBE, and Wasm all agree.
-- [x] **The adopted Brainfuck example is a whole-program integration gate**
-  (2026-08-30): Stage-0's interpreter algorithm now runs with explicit fixed
-  tape/output capacities, retaining its bytecode loop, forward/backward
-  bracket search, nested `while`/`match`, wrapping `u8` cells and output
-  verification. HIR execution, optimized canonical MIR, Wasm encoding and the
-  native QBE product path all agree. This is deliberately an example gate,
-  not a second array implementation or a hidden builder; growable output still
-  waits for the target-neutral allocation/runtime contract.
-- [x] **Exact ordinary function values** (2026-08-30): named Luce functions
-  become statically typed HIR `FunctionAddress` values and calls through
-  locals, constants, fields, parameters, results, conditionals and imported
-  module members become `IndirectCall`. Labels/defaults remain declaration-call
-  facts; function-value calls are positional and exact. The closure slice
-  generalized canonical MIR ordinary functions to typed code/environment
-  descriptors and `CallClosure`; capture-free names retain a null environment
-  and allocate nothing. QBE and Wasm alone choose descriptor/table layout.
-  Both semantic oracles, optimized MIR, Wasmtime, real QBE and
-  `examples/function_values.luc` agree, including aggregate/fallible named
-  protocols, defer capture and evaluation order. Infallible-to-fallible lift
-  remains separate work.
-- [x] **Exact named `cfunc` values and C-convention indirect calls**
-  (2026-08-30): the contextual type is now a canonical HIR form, while calls
-  reuse the same positional `IndirectCall` node as ordinary function values.
-  A matching capture-free Luce name selects one demand-generated C adapter;
-  an exact extern name becomes an external-symbol address without a wrapper.
-  Canonical MIR adds only the facts that actually diverge at this boundary:
-  `CallIndirect` carries its calling convention and `ExternAddress` names a C
-  symbol. C null adaptation for nullable pointer-handle parameters/results is
-  shared with direct C calls. The verifier, optimizer and MIR oracle cover the
-  new identity/convention edges; Wasm maps definitions then addressed imports
-  into its backend-owned table; real QBE executes both libc addresses and a
-  generated adapter invoked back from libc through `atexit`. Stored fields,
-  parameters/results, aliases and selection run in
-  the differential corpus and `examples/cfunc_values.luc`. This rung does
-  originally did **not** claim pointers dynamically returned by C, nullable
-  cfunc slots, or lambda/closure conversion; the next rung closes those
-  representation questions explicitly.
-- [x] **Incoming and nullable `cfunc` pointers remain opaque until invocation**
-  (2026-09-01). HIR distinguishes compiler-resolved adapters/symbols from an
-  arbitrary C-supplied code token; raw pointers never masquerade as source
-  symbols. Direct results, `out` slots, nullable results, and extern-struct
-  fields preserve that identity through both semantic oracles and canonical
-  MIR's existing abstract pointer. A separate function-pointer host executes
-  an exact verified C signature, while the MIR memory view lets tests populate
-  a logical aggregate field without learning backend byte offsets. Bare zero
-  remains inert when read and traps `null_foreign` only at invocation or the
-  next bare input crossing; nullable zero decodes to `none`. Capture-free names
-  and lambdas share generated adapters, while captured closures remain rejected.
-  Focused HIR/MIR tests, the differential corpus, and real libc `signal`
-  round-tripping prove the path. The callback thread/runtime-context contract
-  and the remaining C-export callback matrix stay open.
-- [x] **Settle the target-neutral runtime allocation contract before coding
-  it** (2026-08-30, spec §§21.12 and 23.4). Canonical MIR requests storage for
-  a runtime count of one structural `TypeId`; it never manufactures target
-  byte size/alignment. Only a backend legalizes that request to the bound
-  private allocator's byte-count signature using its existing layout cache
-  and checked multiplication. The allocation starts with one strong
-  storage owner; retain/release share it and the last release returns the
-  opaque block after element cleanup. The HIR oracle keeps semantic values;
-  the MIR oracle uses explicit test layout. `libluce_rt` is a sealed Luce
-  package composed with application MIR before optimization, while its
-  `.native.luc` substrate exposes only typed load/store/advance/copy and a
-  stable, host-sized, monotonically committed byte arena. Wasm growth and
-  native reservation are backend implementations of that provider. No
-  pointer/integer casts, source `sizeof`, target layout, allocator policy, or
-  application-native authority enters HIR/MIR or the compiler. The sealed
-  package alone may own module-private mutable allocator state; it lowers as
-  an ordinary structural MIR global and cannot escape into application source.
-- [x] **Implement the canonical typed-storage substrate through every
-  backend oracle** (2026-08-30). `AllocateStorage` carries only a structural
-  `TypeId` and runtime `u64` count. `MirProgram.runtime_bindings` identifies
-  the one private Luce allocator definition by `FunctionId`; the verifier
-  proves uniqueness, privacy and `(u64, u64) -> Ptr`, and reachability follows
-  the implicit edge only from live allocations. The MIR oracle allocates by
-  semantic test layout without executing allocator policy. QBE and Wasm each
-  compute their own layout, guard multiplication, implement null for count
-  zero and one byte for positive zero-size layout, and call the composed
-  function directly. Real QBE and Wasmtime execute fixed-buffer allocator
-  fixtures, including overflow traps. The obsolete byte-shaped
-  `luce_rt_alloc` MIR extern is removed, leaving no route around the typed
-  operation. This is substrate, not yet source collection lowering or the
-  production allocator.
-- [x] **Compose a sealed runtime as canonical MIR before optimization**
-  (2026-08-30). `compose_runtime` preserves every application identity and
-  remaps the runtime's type, function, extern, external-global, global and
-  data tables exactly once. Canonical builtins are validated, equal external
-  declarations share one identity, conflicts fail before a backend, and
-  runtime service bindings follow the remapped private function. Applications
-  cannot supply bindings; the runtime cannot define an entry, package API or
-  artifact export. The combined program is then verified and optimized as one
-  closed world, where live allocation is the edge that retains its allocator.
-  This proves the composition mechanism with hand-built MIR; loading and
-  compiling the production sealed source package remains the next rung.
-- [x] **Make native source authority an explicit frontend fact** (2026-08-30).
-  The package reader alone recognizes `.native.luc`, removes the authority
-  suffix from module identity, and carries a closed `ModuleAuthority` through
-  parsed source into HIR. `native_ptr[T]` and `native_mut_ptr[T]` retain their
-  pointee and mutability in HIR, are unavailable in safe modules, and cannot
-  escape through a public alias, aggregate or function signature. Importing a
-  safe wrapper does not transfer authority. The target-neutral address token
-  erases to canonical MIR `Ptr` only in the shared lowerer. Typed native
-  operations and the sealed arena capability remain the next slice.
-- [x] **Lower the first typed native operations through the shared MIR path**
-  (2026-08-30). `native.load`, `native.store` and `native.advance` are
-  compiler-known HIR forms admitted only by native authority. Their checker
-  preserves source evaluation order, pointee identity and pointer mutability;
-  immutable stores, labels, wrong arity and non-pointer operands fail before
-  lowering. They become the existing canonical `Load`, `Store` and
-  `ElementAddress` instructions, so all backends consume one representation
-  and choose layout only at their existing boundary. The sealed arena
-  provider remains the next runtime capability.
-- [x] **Keep native reinterpretation and overlapping moves structural through
-  MIR** (2026-08-30). Contextual `native.rebind` changes an audited HIR pointee
-  view without changing an address or escalating mutability, then erases to
-  the same canonical `Ptr`. `native.move` checks equal pointees and a mutable
-  destination, and lowers to `MoveElements(TypeId, u64)` with overlap-safe
-  semantics. QBE alone scales the count and calls `memmove`; Wasm independently
-  bounds the backend-computed byte count to its 32-bit address space before
-  `memory.copy`. Both execute overlapping ranges, and MIR composition remaps
-  the retained structural type. This is the last pointer substrate needed by
-  runtime-backed contiguous collections; it does not implement a collection.
-- [x] **Give sealed runtime state an explicit source-to-QBE path**
-  (2026-08-30). `PackageRole` is a compiler input rather than a package-name
-  convention. Only that role may declare private, structurally zeroable
-  `var name: Type` module cells; applications cannot declare or import them.
-  HIR keeps observable `GlobalLoad`/`GlobalStore` nodes and its oracle owns one
-  isolated state instance. Shared lowering emits ordinary canonical
-  `MirGlobal`/`GlobalAddress`/`Load`/`Store`; reachability retains live cells,
-  and the existing verifier and composer remain their sole MIR authorities.
-  QBE lays out and mutates the same program successfully. Wasm also places
-  cells after immutable data in linear memory as a supporting regression,
-  without leaking an offset or pointer width before its backend plan.
-- [x] **Give the sealed runtime one stable arena capability** (2026-08-30).
-  `native.arena(end)` requires both native module authority and the explicit
-  runtime package role. Its HIR result retains `native_mut_ptr[u8]`; shared
-  lowering emits one verified `(u64) -> Ptr` runtime-convention call, with no
-  capacity, page, pointer width or host API in canonical MIR. The MIR oracle
-  supplies a deterministic fixed test arena. QBE alone reserves a 64 MiB
-  zero-filled BSS region, guards the requested prefix and returns its stable
-  base; repeated calls observe the same storage and over-capacity terminates.
-  A fully precommitted BSS reservation satisfies the monotonic-prefix
-  contract while allowing the host loader to commit pages lazily. Wasm is not
-  required for this QBE-complete slice and may later legalize the same service
-  with memory growth.
-- [x] **Compile the first freestanding Luce allocator through QBE**
-  (2026-08-30). A shared target-neutral `RuntimeService` contract lets the
-  sealed package descriptor resolve one private native source function to a
-  HIR `SymbolId`; lowering preserves it as the exact MIR `FunctionId` without
-  name lookup. The pipeline independently compiles and composes
-  `src/runtime/allocator.native.luc`. Its checked aligned bump policy reserves
-  byte zero and commits state only after arena success. Verification and
-  reachability retain the binding, function, global and provider as one unit;
-  real QBE proves distinct typed allocations and exhaustion.
-- [x] **Expose typed allocation only to reviewed runtime source**
-  (2026-08-30). `native.allocate[T](count)` requires both native module
-  authority and the sealed runtime package role, preserves `T` and the `u64`
-  element count in HIR, and produces a typed mutable native pointer. Shared
-  lowering maps it directly to the already-verified target-neutral
-  `AllocateStorage(TypeId, u64)` contract. Application native modules cannot
-  call it, and no other native operation accepts generic arguments. This is
-  the source bridge needed by runtime collection headers; it adds no layout,
-  byte arithmetic, allocator policy, collection operation, or new MIR form.
-- [ ] **Complete `libluce_rt` in freestanding Luce**. Typed deallocation and
-  power-of-two intrusive free-list reuse are complete (`done.md` §2): the
-  canonical request retains `TypeId`/count, backends derive matching physical
-  classes, and allocator policy remains compiled Luce. Structural list/slice
-  ownership services and managed element destruction are complete too
-  (`done.md` §2). One compiler-owned sealed-runtime descriptor now maps the
-  closed service vocabulary to source identities; callers supply only the
-  resource location, so tests and future installations cannot drift into
-  separate manifests. The CLI accepts an explicit `--runtime-root DIR` with
-  repeated `--runtime FILE` inputs and composes that reviewed package before
-  either backend. Automatic
-  discovery in an installed toolchain still awaits a Stage-0 host
-  `std.os.executable_path()` capability rather than embedding a
-  checkout-relative path, environment convention, or platform syscall in the
-  compiler.
-  Public builder/codec APIs and the remaining standard-library policy remain.
-  Extend the checked runtime as those semantic services become expressible;
-  do not move policy into the compiler or a backend.
-- [x] **Restricted mutable slices reach the stable QBE baseline** (2026-09-01,
-  `done.md` §2). `list[T].with_mutable_slice` lends one synchronous,
-  non-storable `MutableSlice(T)` capability. HIR owns escape and boundary
-  rejection; canonical MIR owns typed begin/use/end and its lexical lifetime
-  proof; the sealed runtime owns list copy-on-write and the identity-wide
-  shape barrier; only a backend supplies layout and encodes the opaque handle.
-  Both semantic oracles, QBE, Wasm, focused diagnostics, malformed-MIR tests,
-  traps, and `examples/mutable_slices.luc` agree. Worker transfer remains
-  forbidden for this affine capability; the completed §19 sendability proof
-  reuses the same non-storable predicate and reports the exact transfer path.
-- [x] **Structured workers and immutable transfer snapshots reach QBE**
-  (2026-09-01, `done.md` §2). Named Luce workers, recursive sendability,
-  frozen list/map/set graphs, lexical groups, cached waits, cancellation,
-  traps/errors, and ordered `wait_all` are complete through HIR and canonical
-  MIR. QBE uses immediate process isolation and generated typed codecs entirely
-  behind the backend boundary; Wasm retains snapshot support and rejects tasks
-  explicitly under WASI preview 1. No platform or transport fact enters HIR,
-  MIR, verification, optimization, or the sealed runtime contract.
-- [ ] **Complete runtime-backed collections and text.** Runtime-backed
-  `list[T]` construction, identity, indexed access, append, insert,
-  `remove_at`, clear, reserve, aggregate elements, growth, and immutable list
-  snapshot slicing now execute
-  through HIR, canonical MIR, and QBE (`done.md` §2). Shallow `copy` with
-  independent collection storage and shallow `+` concatenation are complete
-  too. Ordered list iteration and alias-wide shape-invalidation traps are
-  complete, as are recursive list/slice ARC, copy-on-write buffer ownership,
-  managed element destruction, and reclamation through QBE and Wasm
-  (`done.md` §2). Immutable `bytes` concatenation, lexicographic comparison,
-  and ownership-retaining `slice[u8]` views are complete through both semantic
-  oracles, QBE, and Wasm (`done.md` §2). Immutable `str` now shares that owned
-  buffer substrate; escaping concatenation, scalar length and iteration, and
-  deterministic scalar ordering are complete through the same gates. Ordinary
-  and raw text, character, and byte spellings now pass through one linear,
-  target-independent semantic decoder with the complete escape vocabulary.
-  Triple-quoted text and bytes now use one formatter-owned normalization pass:
-  the closing delimiter establishes the space baseline, physical line endings
-  become LF, and escape decoding happens only after trimming. HIR therefore
-  receives the same canonical immutable value as an ordinary spelling and no
-  triple-specific node survives the source boundary. Cycle-aware
-  structural list/map equality and insertion-ordered maps/sets are complete
-  without making runtime or backend callbacks responsible for value
-  semantics. The target-neutral affine buffer-builder substrate and formatted
-  strings are complete through both semantic oracles, QBE, and Wasm
-  (`done.md` §2). Continue with public text/bytes builder APIs, codecs, and the
-  rest of the formatter.
-  The bytes implementation follows §12.6 for both static and dynamic sources:
-  `{BufferOwner, data, length}` keeps literal owners inert and dynamic owners
-  retainable without exposing runtime layout. Do not promote the broad §12
-  row until every operation has its own conformance
-  evidence.
-- [ ] **Prism text codec in Luce** (`.prisma` encode/decode) as the first library; the guest request/reply round-trip typed.
-- [ ] **The guest itself**: `lucia_main` in Luce, the seed verbs, running under `WasmHost`; a program a non-programmer can read.
+The proven baseline is recorded in [done.md](done.md): C Boolean, every
+fundamental integer, exact IEEE binary16/32/64 values, the supported binary64
+long-double model, scalar typedef chains, open named/typedef-backed enums,
+constant-only anonymous enums, plain nested records, header-local scalar/enum
+constants, selected scalar macros, live scalar/enum objects, fixed functions,
+and direct pointers to typedef-backed incomplete records all pass Clang facts
+through deterministic FIIR/raw/C products, both semantic oracles, Wasm, and
+linked QBE/C. The most recent handle rung retains nullability, pointee
+mutability, origin, and unspecified ownership/lifetime; typed pointers and
+layout terminate in the C adapter.
 
-### Proving program 2 — the host
+Unsupported declarations must continue to fail before HIR rather than acquire
+an approximate carrier. Resume in this order; each row is one independently
+committable vertical slice and updates the spec, examples, conformance ledger,
+and diagnostics with its tests:
 
-- [x] **Core classes with ARC, weak fields, and `deinit`** (2026-08-31).
-  Nominal identities stay abstract through HIR and MIR; only backends choose
-  payload layout. The semantic analyzer proves complete initialization and
-  prevents publication from `init` and resurrection from `deinit`, including
-  transitive borrowed receiver helpers. Strong/weak runtime counts, atomic
-  weak zeroing, fallible-initializer cleanup, and reverse field destruction
-  agree through both oracles, QBE, Wasm, and `examples/classes.luc`.
-- [x] **Compiler-known `Weak[T]` values** (2026-08-31). `T` is an exact class
-  identity, `Weak(value)` creates no strong edge, copies retain only the weak
-  handle, and `get()` atomically returns owned `T?`. Dynamic weak collections,
-  stored weak value fields, destruction-time creation from borrowed `self`,
-  and C-boundary rejection agree through HIR, MIR, QBE, and Wasm without user
-  generic machinery or target layout.
-- [x] **Finish the remaining §11 resource contract** (2026-09-01). Direct self-field,
-  self-owned collection, stored-closure, immutable-alias, and weak-back-edge
-  cases now have a precise negative matrix. `deinit` follows known same-class
-  cleanup transitively and emits structured `L1101` advisories only where
-  defined/indirect user code can reenter; direct external C cleanup is not
-  guessed to be user code. An opt-in, target-neutral census now records live
-  source classes and allocation sites, collapses owning paths through values,
-  collections, closures/cells, and interfaces, ignores weak edges, and reports
-  probable SCCs with deterministic iterative analysis. HIR and MIR agree on
-  the report; QBE executes the same dynamic ownership graph without carrying
-  test-only branches in the production runtime. `examples/classes.luc` proves
-  idempotent explicit `close`, `defer`, and the `deinit` safety net. A bare
-  extern/native handle still does not imply resource ownership; richer C
-  boundary metadata will own any future checked-resource policy rather than a
-  false-positive lifecycle heuristic.
-- [x] **Core managed closures** (2026-08-31). Expression and block closures,
-  capture-free elision, explicit value snapshots, default immutable captures,
-  shared mutable cells, nested escaping environments, and weak class captures
-  agree through HIR, canonical MIR, both semantic oracles, QBE, Wasm, and
-  `examples/closures.luc`. MIR retains only typed descriptor/environment
-  contracts; physical layout begins in each backend. *Gate passed: capture
-  rule.*
-- [x] **Finish the remaining §14 closure contract.** Fallible
-  invocation, infallible-to-fallible function lifting, `weak self`, managed
-  values in fields/collections, and directly provable stored strong cycles are
-  complete (`done.md` §2). The accidental shared-cell advisory now flows as a
-  structured, non-fatal analysis result through check, run, compilation, build,
-  and CLI presentation; it neither changes valid capture semantics nor prints
-  from HIR generation. The §19 worker proof now closes sendability by
-  structurally rejecting every function/closure environment at the transfer
-  path; no backend-specific closure rule was added.
-- [x] **Interface values** (2026-08-31). Existential conversion and dynamic
-  requirement calls retain nominal interface/conformance identities through
-  HIR and target-neutral MIR. The sealed runtime owns erased payload lifetime
-  and value COW; class payloads preserve shared identity. QBE and Wasm choose
-  their own descriptor/witness encodings, and both semantic oracles plus the
-  executable interface example agree on generic interfaces, struct/class/enum
-  conformers, nested ownership, returned existentials, mutation, fallibility
-  adaptation, and propagation (`done.md` §2). The 2026-09-01 S17 audit closes
-  the complete §16 rule matrix: interface calls share declaration argument
-  placement across HIR artifacts and every execution path; deliberate
-  inheritance/default/downcast/reflection exclusions have stable tests; and
-  `luce explain` reports boxing, dynamic calls, and value-versus-class payload
-  semantics without placing layout or ABI facts before the backend boundary.
-- [x] **Finish the remaining generic surface.** Memberwise generic structs,
-  enums, and classes, including their owner-parameterized
-  value/mutating/lifecycle methods, independently generic instance methods,
-  custom initializers and type functions, and concrete conformances are
-  complete through both oracles and artifact backends (`done.md` §2).
-  Package/CLI budget configuration, immediate infinite-expansion detection,
-  source-parent paths, HIR/MIR size, check/codegen timing, backend code-size
-  accounting, `luce explain`, and `build --time-report` are also complete.
-  The complete source/executable §15 rule and deliberate-limit audit is closed.
-  Serialized typed bodies remain owned by the package-artifact layer, not
-  canonical MIR. The strict artifact reconstructs the complete `HirProgram`;
-  one atomic import plan remaps all package-local semantic identities, interns
-  structural types and standard interfaces, and seeds dependency HIR before
-  root-source collection. Dependency-origin generic bodies, closures,
-  callable defaults, field defaults, aliases, and generic conformances now
-  specialize without dependency syntax. A real separately encoded dependency
-  executes through HIR, canonical MIR, Wasm, and QBE. No generic form reaches
-  MIR (`done.md` §2).
-- [x] **Workers** (`spawn`, tasks, sendability, frozen snapshots, cached
-  waits, cancellation, and ordered `wait_all`) through the stable QBE oracle
-  (`done.md` §2). Luce-owned native backends must reproduce this canonical
-  contract behind their own backend boundary.
-- [ ] **Luce-native backends**, only after QBE is a stable harness column;
-  implement one target behind the existing MIR backend boundary, then prove it
-  against QBE before adding another.
-- [ ] **Native image/link support** after native code generation is justified.
-- [x] **Establish the C-import FIIR product path** (2026-09-02). One
-  backend-owned Clang invocation supplies its exact target, predefined scalar
-  facts, and JSON AST to a validated, versioned FIIR module. The first closed
-  generator accepts C `_Bool`, exact IEEE binary32 `float`, exact IEEE
-  binary64 `double`/`long double`, every fundamental C integer family, and
-  scalar typedef chains over those types, plus named and typedef-backed C
-  enumerations with the full signed/unsigned 64-bit constant domain. It emits
-  an audited `.native.luc` module using nominal target-independent `c` and
-  generated typedef carriers plus a C adapter guarded by
-  representation assertions and checked integer ranges, and installs all
-  three text products through owner-only sibling scratch directories. The
-  application and compiler-supplied standard source retain independent roots;
-  native C source files and compiler flags enter only at QBE materialization.
-  Both semantic oracles, Wasm/QBE encoders, direct QBE/C execution, and the
-  complete CLI bind/build/run path cover the slices. Artificial 16- and 32-bit
-  `int`, alternate-width `_Bool`, changing typedef-target fixtures, and
-  `-fshort-enums` prove
-  target facts change FIIR and C only while generated Luce is byte-identical.
-  Unsupported scalars and declarations fail generation rather than guessing a
-  target representation.
-- [x] **Import constant-only anonymous C enumerations without inventing a
-  type** (2026-09-02). Each enumerator retains its exact Clang-selected integer
-  type, canonical full-domain value, and source origin as a standalone FIIR
-  constant. Generated Luce exposes one universal `c.integer_constant`
-  sign-and-magnitude value; target widths and selected integer families affect
-  only serialized FIIR and backend-owned C assertions. That C product also
-  asserts each header constant's type and value so mismatched regeneration
-  cannot compile silently. Both semantic oracles, Wasm/QBE encoding, the real
-  linked QBE/C binding, and the example CLI path consume the constants.
-- [x] **Import plain C records without leaking layout into HIR or MIR**
-  (2026-09-02). Named, anonymous-typedef, forward-declared, nested, and
-  dependency-reached structs become declaration-order logical records. Clang
-  alone evaluates their size, alignment, and offsets into FIIR; generated Luce
-  uses fixed field carriers, while the backend-owned C adapter asserts every
-  layout/type fact and performs the exact by-value call. Recursive integer and
-  enum checks retain their existing adapter statuses. Focused validation,
-  both semantic oracles, Wasm/QBE emission, CLI binding, warning-clean C11,
-  and real linked QBE/C execution cover simple and nested records.
-- [x] **Generate exact `_Float16` imports without exposing its target ABI**
-  (2026-09-02). Clang evaluates binary16 size and format facts only when the
-  selected declaration graph reaches `_Float16`; FIIR retains its distinct C
-  identity and the generated public API remains nominal over semantic `f16`.
-  A private `f32` call carrier contains every IEEE binary16 value exactly, and
-  the backend-owned C adapter performs and asserts the explicit `_Float16`
-  conversion. Direct typedef/function and nested record-field paths agree in
-  both semantic oracles and execute against real C through QBE; Wasm validates
-  the same target-independent generated source. Regeneration under alternate
-  enum flags proves that only FIIR/C layout products vary with the C target.
-- [x] **Import header-local fundamental-integer objects as evaluated constants**
-  (2026-09-02). Only `static const` definitions with initializers enter this
-  path; Clang must prove each one constant and supplies its exact 64-bit value
-  through the target-fact pass. FIIR retains the declared C type and canonical
-  sign/magnitude value, while raw Luce reuses the universal
-  `c.integer_constant` carrier and the backend-owned C product asserts the
-  header's type and value. Full signed/unsigned extrema, const-qualified
-  typedefs, mutable/volatile definition rejection, both semantic oracles,
-  Wasm/QBE, CLI,
-  and real linked C execution cover the slice.
-- [x] **Import explicitly selected fundamental-integer macros through Clang**
-  (2026-09-03). Repeated `--macro-constant NAME` options define the complete
-  selection and output order. A preprocessor inventory proves the final active
-  object-like definition and source origin; filtered type and value AST probes
-  let Clang preserve typedef spelling, evaluate the full 64-bit integer union,
-  and, at this milestone, reject non-integer or nonconstant selections without
-  Luce interpreting replacement text. The scalar extension below supersedes
-  that temporary type boundary. FIIR records constant provenance, and the
-  generated C adapter reasserts exact type and value. Pure malformed-state coverage, both
-  semantic oracles, Wasm/QBE emission, CLI materialization, and real linked C
-  execution cover the slice.
-- [x] **Keep declaration-only external scalar C objects live behind generated
-  accessors** (2026-09-03). FIIR records the declared scalar or typedef type,
-  read-only versus read-write access, volatility, and origin. Generated Luce
-  exposes ordinary fixed-carrier readers and mutable writers; integer writers
-  reuse the checked adapter status protocol. The backend C product alone
-  verifies exact qualifiers and performs the load or store, so neither target
-  object layout nor volatile semantics enter HIR or MIR. Const objects have no
-  writer. Definitions, atomics (including desugared typedefs), thread-local
-  storage, and nonscalar objects reject explicitly. Pure validation and
-  generation tests, both semantic oracles, Wasm/QBE emission, CLI
-  materialization, target-variation invariance, and real volatile linked C
-  execution cover the slice.
-- [x] **Reuse the checked enumeration boundary for external C enum objects**
-  (2026-09-03). Mutable and const enumeration storage uses the same FIIR object
-  declaration and generated reader/writer surface as fundamental scalars, but
-  expands only at the C adapter into the existing Boolean-plus-magnitude
-  protocol. Reads reject undeclared stored values as enumeration results;
-  writes reject undeclared inputs before touching storage. Exact type and
-  qualifiers remain C assertions, alternate enum representation flags leave
-  raw Luce byte-identical, and generated C parameter names cannot shadow the
-  imported object. Both semantic oracles, Wasm/QBE emission, the example CLI,
-  ordinary and `-fshort-enums` native execution, and a real corrupted-object
-  trap cover the slice without adding HIR or MIR concepts.
-- [x] **Import header-local Boolean and exact-IEEE floating objects as
-  evaluated constants** (2026-09-03). Clang bit-casts each supported value in
-  the target-fact probe, FIIR retains its semantic kind and exact bits, and
-  generated Luce reconstructs ordinary `bool`, `f16`, `f32`, or `f64` values.
-  Finite values, infinities, and signed zero remain exact; NaN payloads collapse
-  only at the Luce semantic boundary where payload identity is unobservable.
-  The generated C product reasserts exact types and semantic values. Focused
-  validation, both semantic oracles, Wasm/QBE emission, CLI materialization,
-  and real linked C execution cover the slice without adding an HIR/MIR or
-  backend instruction.
-- [x] **Import header-local enumeration objects as open nominal constants**
-  (2026-09-03). Named, typedef-backed, and alias-backed `static const` enum
-  definitions retain their declared FIIR type and a canonical
-  sign-and-magnitude value across the complete signed-`i64`/unsigned-`u64`
-  union. The Clang target-fact probe supplies semantic sign plus the defined
-  `uint64_t` conversion, so values without a named enumerator remain valid.
-  Generated Luce reuses the existing nominal enum carrier; the backend-owned
-  C product independently asserts the declaration's exact type and value.
-  Pure malformed-state coverage, real Clang import, both semantic oracles,
-  Wasm/QBE emission, the example CLI, ordinary and `-fshort-enums` native
-  execution cover the slice without adding an HIR/MIR or backend instruction.
-- [x] **Import explicitly selected scalar macros through one exact FIIR value
-  model** (2026-09-03). Clang's separate inventory, type, and value products
-  now classify Boolean, fundamental-integer, exact binary16/binary32/binary64,
-  typedef-backed, and named-enumeration object-like macros. The value probe
-  shares the header-local constant decoder, retaining floating bits and open
-  enum sign/magnitude without interpreting replacement text. Generated Luce,
-  both semantic oracles, Wasm/QBE emission, the example CLI, warning-clean C,
-  and ordinary plus `-fshort-enums` linked QBE execution cover the same values.
-  Pointer, array, and string macros remain with the carrier/ownership work they
-  actually require; no HIR, MIR, runtime, or backend instruction was added.
-- [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
-  recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
-  transition: lossless carriers for extended floating formats,
-  unions, pointer/array/string macro constants,
-  aggregate/atomic/thread-local objects, arrays/pointers/function
-  pointers/opaque types, ownership and nullability recipes, typed variadic
-  adapters, support tiers, deterministic regeneration diagnostics.
-- [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
-- [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
-- [x] **`luce build --time-report` for generics** (2026-08-31). Report source
-  expansion paths and front-end cost before backend selection, then join
-  optimized MIR size and backend-local function emission bytes/time by
-  concrete executable identity (`done.md` §2).
-- [ ] **`luce api diff`** and **`luce describe`** as compiler products.
-- [ ] **Fuel/preemption as a wasm backend option** (when guests need it and the engine is not ours).
+- [ ] **Binding recipes and safe wrapper ownership.** Separate facts Clang
+  proves from facts a recipe supplies. Generate nullable, borrowed-for-call,
+  returned-borrow, owned-plus-disposer, and status/error wrappers. Missing safe
+  ownership facts are generation errors; only the audited raw layer may retain
+  explicit “unspecified” facts.
+- [ ] **Complete opaque-handle spellings and directions.** Add direct tagged
+  struct pointers, pointer typedef chains, const/read-only results, and
+  pointer-to-pointer/out-handle forms on the recipe model. Prove a SQLite-style
+  T-double-pointer output plus disposer without a general raw pointer in HIR or
+  MIR.
+- [ ] **Pointer-plus-count arrays and strings.** Map borrowed inputs, writable
+  call-scoped outputs, count/capacity/writeback relations, C-string copies, and
+  owned returned buffers onto the existing target-neutral list, slice, bytes,
+  string, and foreign-memory contracts. Arrays in records and returned storage
+  stay closed until ownership is explicit.
+- [ ] **Imported function pointers and callbacks.** Decode exact Clang
+  signatures into the existing cfunc model, including nullable slots and
+  context/lifetime recipes, then close S24's runtime/thread enforcement.
+- [ ] **Unions, bit-fields, and aggregate storage.** Prefer generated C thunks
+  with logical Luce carriers; never copy C byte layout into HIR/MIR. Admit
+  aggregate constants/objects only with complete value and writeback semantics.
+- [ ] **Atomic and thread-local objects.** Require explicit operation and
+  execution-domain recipes. Neither qualifier may become an ordinary shared
+  load/store.
+- [ ] **Pointer, array, and string macro constants.** Reuse the completed
+  storage/ownership carriers and keep Clang as the sole evaluator of
+  preprocessing and constant semantics.
+- [ ] **Typed variadic adapters.** Generate fixed, checked C thunks from an
+  explicitly requested signature; no untyped vararg operation enters Luce,
+  HIR, or MIR.
+- [ ] **Extended floating carriers.** Define a lossless logical carrier before
+  admitting any non-binary16/32/64 target model. Narrowing remains forbidden.
+- [ ] **Support tiers and deterministic regeneration diagnostics.** Record why
+  each declaration is direct, thunked, recipe-dependent, or unsupported;
+  compare regenerated products structurally and report stable declaration
+  origins. Freeze the FIIR format only after the vocabulary is represented;
+  no backward-compatibility layer is required while the project is in building
+  mode.
 
-### Self-hosting and compile speed
+### 5.3 Constraints while closing the checkpoint
 
-- [ ] Compiler builds itself under the Stage-0-subset rule; one pinned prior compiler kept forever for bootstrapping; bootstrap reproducibility checked in CI.
-- [x] **Dialect gap closed 2026-08-29 — our sources are legal in both compilers.** The tree is written in Stage-0's dialect, and the two spellings that differed from the 1.0 spec were resolved in the spec's favour of Stage-0: file-scope `const` became `let` (247 sites), and the named argument became `name = value` in the spec (§8.2), the parser, and every example and fixture. `=` won over `:` because `:` already means *has this type*; using it for *takes this value* put two relations behind one mark exactly where a reader confuses them (`Point(x: 10.0)` beside `x: f64`). Nothing else in the tree is known to differ; confirm by feeding our own sources to our own parser once it can parse them all.
-- [ ] **Measure first**: lines per second of the compiler compiling itself, before any layout work. Stage-0's codegen and ARC dominate until then, so layout changes are invisible before this point.
-- [x] **Data-oriented layout — shape now, tuning at the measurement.** (Items 1–5 done; 6 waits for the measurement.) Decided 2026-08-28 (`done.md` §2 for what landed): (1) ~~ids to `u32`~~; (2) ~~MIR as a flat instruction array with `Else`/`Case`/`Default`/`End` markers~~; (3) ~~spans as four `u32`s~~; ~~(4) HIR as one flat node table~~ done 2026-08-28: `HirProgram.nodes: list[HirNode]` stored inline, `HirNode.form` keeps the named union payload so `match` stays, children are `NodeId(u32)`, child lists are `Operands{start, count}` into `HirProgram.extra`, literals in `values`, and the two cold fields live in parallel arrays (`node_spans`, `node_types`) so a node is tag + payload; ~~(5) MIR operand lists as `RegisterRun`s into `MirFunction.operands`~~ done 2026-08-28; (6) tiny tokens and a flat syntax tree only if the front end shows up in the self-hosting measurement — both are walked once, unlike HIR and MIR. **Why this shape and not Zig's `{tag, lhs, rhs}`**: Zig's readability in that form is generated by `comptime`, which Luce does not have; a union payload with named fields gives the same contiguity and, with the cold fields split out, the same density, while keeping pattern matching. Going to the raw form later is mechanical because every link is already an index. Generic structure-of-arrays is a library/tooling question (hand-written for the hot tables, or generated from `luce describe`), never a reason to add compile-time execution.
-- [x] **Decompose stable pass ownership before large files become permanent.**
-  Give every cohesive source/test region a `# mark:` heading as it is touched.
-  File length is reviewed at each vertical-slice audit; roughly 2,000 lines
-  triggers an ownership review, not an arbitrary mechanical split. Wasm
-  module planning has its own owner, leaving the related instruction/section
-  encoder cohesive at 2,305 lines; its byte plumbing is
-  too small to justify another module today.
-  HIR generation now separates program declarations from mutually recursive
-  body semantics over one typed transaction. MIR lowering separates the
-  whole-program coordinator and shared identity/type transaction from one
-  cohesive function walk. Neither split duplicates pass state or introduces
-  forwarding-only collaborators. Generic callables established a further
-  honest boundary: abstract probing, structural inference, and concrete
-  function/method specialization live in `hir/generics/functions.luc` and
-  borrow a narrow semantic interface without duplicating the generation
-  transaction. The 2,671-line declaration collector now owns one cohesive,
-  marked interface declaration/conformance section because it directly shares
-  name, type, method, visibility, generic-specialization, and adapter
-  resolution; its generic-conformance threshold review found that splitting
-  it today would create a forwarding cycle rather than a new owner.
-  Existential representation and dynamic calls established the focused
-  108-line `hir/interfaces/values.luc` owner rather than extending the
-  declaration collector. Standard protocol identity and iteration selection
-  established sibling 137- and 210-line owners. Structural marker use adds a
-  focused 57-line sibling. The remaining 3,013-line HIR body checker and
-  5,206-line MIR function lowerer stay intact after the cfunc review above;
-  the lowerer's next major slice must include another transaction-boundary
-  review. The 3,048-line HIR interpreter likewise remains one semantic state
-  machine: expression evaluation,
-  mutable-place access, calls, and control transfer recurse through each
-  other, while their stack-heavy arms already live in focused helpers.
-  The class audit found no such seam: lifecycle semantics are inseparable from
-  the same expression/place/call transaction, and a class-only helper would
-  be forwarding rather than ownership. The 2,001-line MIR interpreter reached
-  the same review threshold in the incoming-cfunc slice: host contracts,
-  logical extern-memory writes, instruction execution, and backend-owned
-  layout form one oracle boundary, while region planning and value helpers are
-  already marked independent sections. Splitting only the public host
-  contracts would create another data-only forwarding module. Line count
-  alone does not. Parser
-  grammar is already frozen; separate its
-  byte/token plumbing only where one owner can retain the cursor and
-  diagnostic state.
-- [ ] **Bound recursion the way shipping compilers do** — [`recursion.md`](recursion.md) §4. Phase 1 (a 256-deep cap on expression nesting) landed 2026-08-29; phases 2–5 remain: `frame_limit` derived at startup from the host rather than declared, thinner interpreter frames, and a stack reservation on the ELF path. Statement and type nesting have their own recursions and are **unmeasured** — no evidence they crash, so they wait for evidence rather than a speculative counter.
-- [ ] Generated programs and fuzzing as release gates (not yet built; do not claim them).
-- [ ] Language freeze after the compiler and one host slice depend on every feature.
+- Keep the shared frontend, HIR, canonical MIR, verifier, optimizer, and
+  lowerer free of target names, pointer widths, byte layouts, ABI classes, and
+  platform policy. QBE, Wasm, and later native backends begin from the same MIR.
+- Add a # mark: section heading whenever a touched file gains a distinct
+  cohesive region. Roughly 2,000 lines triggers an ownership review. Split only
+  at a real state/transaction boundary; a forwarding-only file is not a
+  refactor.
+- Extend the freestanding Luce runtime only when a remaining semantic service
+  needs it. Runtime discovery must not embed checkout paths or platform
+  syscalls in the compiler; automatic installed-toolchain discovery remains
+  part of S30.
+- Every source feature needs positive and negative frontend/HIR coverage,
+  independent HIR and MIR execution, optimized QBE execution, a focused example
+  when demonstrable, and Wasm evidence where the existing backend naturally
+  supports it.
+- Keep small green commits with the sole author/committer
+  Dy Mokomi <dy@dymokomi.com>, and do not push without explicit instruction.
 
-### Deferred by decision (do not start without new evidence)
+### 5.4 Explicitly after the source-to-QBE review
 
-- System profile (atomics, volatile, interrupt ABIs, drivers): bare metal is a non-goal; runtime threading stays in `libluce_rt` via C interop.
-- Effects / `uses` clauses: removed (spec §18). Authority is a capability *value* from the platform; operational facts are compiler-internal summaries, never in function types.
-- Native rung 3, transactional heap, general effect rows, dependent types, macros, reflection, compile-time execution, incremental binary patching.
+These are real project goals, but they do not extend the current completion
+contract unless the conformance ledger explicitly promotes one:
+
+- Luce-owned native backends, one target first, proved against QBE before a
+  second target;
+- native image/link writers after native code generation justifies them;
+- a Luce Wasm decoder/validator/interpreter and the complete host application;
+- storage, crypto, terminal, realm/network, UI/Metal, and the full guest/host
+  proving products beyond the examples required by S30;
+- luce api diff, luce describe, and optional Wasm fuel/preemption;
+- post-1.0 package, cache, profile, persistent-service, documentation, and
+  release-policy work.
+
+Do not freeze the language or add backward-compatibility machinery until Dy
+explicitly ends building mode. Also keep the standing deferrals: no bare-metal
+system profile, effects/uses clauses, dependent types, source macros,
+reflection, compile-time execution, transactional heap, or incremental binary
+patching without new evidence and a deliberate plan change.
 
 ## 6. Decision gates and standing rules
 
@@ -1057,7 +401,7 @@ Gates — settle in `1.0.md` before the feature lands in `hir_gen`:
 
 Standing rules:
 
-- **Indices, not pointers, across stages.** Every program-wide table (`types`, `symbols`, `structs`, `functions`, `data`, registers, slots, and — once §5 item 4 lands — HIR nodes) is addressed by a `u32` id into a flat list; no stage hands another a pointer graph. New tables follow this. A `u32` id indexes a table directly since Stage-0 0.26; the `i64(...)` widening every index site used to carry is gone (98 of them, 2026-08-29).
+- **Indices, not pointers, across stages.** Every program-wide table (`types`, `symbols`, `structs`, `functions`, `data`, HIR nodes, registers, and slots) is addressed by a `u32` id into a flat list; no stage hands another a pointer graph. New tables follow this. A `u32` id indexes a table directly since Stage-0 0.26; the `i64(...)` widening every index site used to carry is gone (98 of them, 2026-08-29).
 - **Layout truth comes from C1, not Stage-0.** Whether Stage-0 stores a `list[struct]` with a union payload inline is unknown and does not matter: our own `make_struct_type`/`make_enum_type` lay them out inline, so the shapes chosen now become real memory when the compiler compiles itself. Of the three Stage-0 conveniences worth requesting, two landed in 0.25–0.26 (any-integer indexing, `match` arms naming several members); inline storage remains, and blocks nothing but a measurement before C1.
 - One source for wasm and native, with a module system that can *exclude* code rather than stub it, is a language requirement.
 - `assert` traps in every build and its condition is effect-free; checks are removed only by proof.

@@ -18,7 +18,11 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
   object constants, two selected fundamental-integer macros, and seven
   selected Boolean/exact-IEEE/open-enumeration macros, live mutable and
   read-only external scalar and enumeration objects, and fieldwise
-  simple/nested record crossings. It exposes safe Luce-facing functions.
+  simple/nested record crossings. It also passes direct nullable and non-null
+  pointers to the typedef-backed incomplete `luce_temperature_sensor` record
+  through the generated nominal raw handle. It exposes reviewed Luce-facing
+  functions; the sensor functions deliberately remain raw until binding
+  recipes can state ownership and lifetime.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary16 `_Float16`,
@@ -57,14 +61,20 @@ value without Luce interpreting replacement text. Selected macros use the same
 complete scalar value vocabulary as header-local constants: Boolean,
 fundamental integer, supported exact-IEEE floating, typedef-backed scalar, and
 open named-enumeration values.
+Direct pointers to typedef-backed incomplete records become one layout-free
+nominal `extern type`. `_Nonnull` is bare, `_Nullable` is optional, and absent
+or `_Null_unspecified` nullability is conservatively optional. FIIR retains
+pointee mutability plus explicitly unspecified ownership/lifetime; only the C
+adapter contains the typed pointer spelling and casts. This raw rung does not
+claim safe ownership or mutation authority.
 Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or
 `f64`; integer and typedef carriers retain one lossless portable shape; enum
 carriers retain one `bool` plus `u64` shape and expose the header's constants.
 The adapter alone asserts scalar representations, verifies integer target ranges,
 maps declared enum values to the target's exact C type, reasserts constant
 semantic values, and verifies record size, alignment, offsets, and field
-types. Other extended floating formats, pointers, unions, bit-fields,
-pointer/array/string macro constants, aggregate, atomic,
+types. Other extended floating formats, broader pointer forms, unions,
+bit-fields, pointer/array/string macro constants, aggregate, atomic,
 or thread-local external objects, and recipes remain explicit generation
 errors until their complete contracts are implemented.
 

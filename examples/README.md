@@ -23,8 +23,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   fixed enums, and by-value extern/export calls compile through QBE and link
   against a real C harness.
 - `c_import/` contains a real C library and the Luce boundary that consumes its
-  manifest-generated raw module. See its README for the current implementation
-  boundary.
+  manifest-generated raw module. Its executable gate includes exact scalar,
+  enum, record, live-object, constant/macro, and direct opaque-record-handle
+  bindings. See its README for the exact supported and rejected boundary.
 - `stage0_calculator.luc` is the stage-0 recursive-descent calculator adapted
   to the 1.0 syntax, explicit UTF-8-byte scanning, and entry contract. It
   checks, compiles through QBE, links, and executes as a native gate.

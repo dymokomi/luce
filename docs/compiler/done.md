@@ -20,10 +20,11 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 964 unit tests across 35 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. Linked QBE/C tests cover the generated products. **Not yet**: safe ownership recipes, broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
+| Tests | 968 unit tests across 36 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
-## 2. Done, in order
+## 2. Implemented milestones and evidence
 
 - [x] Tokenizer, parser, syntax tree for the whole 1.0 surface, with per-form tests.
 - [x] HIR generation for scalars, locals, control flow, calls, constants, tuples, optionals, `str`/`bytes`/`char` literals, `print` of a literal.
@@ -847,9 +848,9 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 - [x] **MIR instructions are fixed-size** (2026-08-28). `Call`/`CallExtern`/`CallIndirect`/`Block`/`If`/`Br`/`BrIf`/`Yield`/`Return` name `RegisterRun{start, count}` into `MirFunction.operands` instead of holding a `list[RegisterId]`; `OperandBuilder` collects runs while a body is built; consumers read `register_at`. With flat regions this makes a MIR body two contiguous arrays.
 - [x] **HIR is one flat node table** (2026-08-28). Statements and expressions are `HirNode`s stored inline in `HirProgram.nodes`; `form` is the named union (pattern matching unchanged), children are `NodeId`s, child lists are `Operands` runs in `extra` (suites, call argument pairs, if-branch triples, resolved place paths), literal values in `values`, result types and spans in parallel arrays. `hir_gen` builds bottom-up with `push_node`; the oracle and lowerer read through `node_form`/`node_at`/`entry_at`. Zero harness differences.
 - [x] **MIR is flat** (2026-08-28). `Block`/`Loop`/`If`/`Switch` open a region in the body list, `Else`/`Case`/`Default` separate arms, `End` closes; `MirInstruction` is a struct stored inline. Verifier, MIR interpreter, and wasm backend became single linear passes with a region stack (`mir/verifier.luc`, `mir_interpreter.luc` `plan_regions`, `wasm.luc` `encode_body`); the lowerer emits regions in place. The harness caught one bug in the rewrite (loop-restart branch popped every region). Design: `mir.md` "Control flow".
-- [x] **Layout decisions recorded** (2026-08-28, `plan.md` §5 self-hosting and §6 rules): shape now, tuning at the self-hosting measurement; hybrid flat tables (named union payloads, `u32` links, cold fields in parallel arrays) rather than Zig's raw `{tag, lhs, rhs}`, because Luce has no `comptime` to generate the readability back.
+- [x] **Layout decisions recorded** (2026-08-28, `plan.md` §6): shape now, tuning at the self-hosting measurement; hybrid flat tables (named union payloads, `u32` links, cold fields in parallel arrays) rather than Zig's raw `{tag, lhs, rhs}`, because Luce has no `comptime` to generate the readability back.
 - [x] **Spans are 16 bytes** (2026-08-28). `SourceSpan` is four `u32`s instead of four `i64`s; it sits in every token, syntax node, HIR node, and MIR instruction. Tokens keep their `str` text for now (front-end-only cost).
-- [x] **Ids are `u32`** (2026-08-28). `TypeId`, `SymbolId`, `ModuleId`, `RegisterId`, `FunctionId`, `ExternId`, `GlobalId`, `DataId` hold a `u32` index; `no_register` (`u32` max) replaces the `-1` sentinel. The first data-oriented-layout item (`plan.md` §5). The `i64(...)` widening every index site needed under Stage-0 went away in 0.26, which indexes with any integer: 98 conversions deleted 2026-08-29.
+- [x] **Ids are `u32`** (2026-08-28). `TypeId`, `SymbolId`, `ModuleId`, `RegisterId`, `FunctionId`, `ExternId`, `GlobalId`, `DataId` hold a `u32` index; `no_register` (`u32` max) replaces the `-1` sentinel. The `i64(...)` widening every index site needed under Stage-0 went away in 0.26, which indexes with any integer: 98 conversions deleted 2026-08-29.
 - [x] **Stage-0 0.26 adopted** (2026-08-29). Six `discard(...)` sites for the new unused-result rule, and a parser refactor that made 113 more unnecessary — `expect_symbol`/`expect_kind`/`expect_keyword` answer nothing now, `step()` moves past a token where `advance()` answers the one it moved past, and the eleven callers that wanted the token read `current()` first. Installed from the pre-release archive at `86b97fac`; `bootstrap.sh` holds the Linux checksum at `TBD` until CI publishes it. The exchange, including the request list and what the team answered, is in `stage0-0.26.md`.
 - [x] **Stage-0 0.27 adopted** (2026-08-30). Both release archives are
   pinned by published checksums. The reported quadratic `str` traversal is
@@ -2027,6 +2028,33 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   than relying on the QBE binary's build-time default. Golden graph/header/
   report tests, a strict real C11 compile, optimized-MIR agreement, CLI output,
   and existing native QBE execution cover the product path.
+
+- [x] **Direct pointers to incomplete C records become nominal raw handles**
+  (2026-09-03). The Clang importer recognizes exactly one direct pointer to a
+  typedef-backed incomplete record. FIIR interns one layout-free
+  `OpaqueHandle` identity and retains each boundary's nullability, pointee
+  mutability, source origin, and explicitly unspecified ownership/lifetime.
+  `_Nonnull` produces a bare handle, while `_Nullable`, `_Null_unspecified`,
+  and unannotated pointers produce the ordinary tagged optional. Indirect
+  result declarators, complete-record pointers, pointer typedefs, and multiple
+  indirection still fail before HIR with focused diagnostics.
+
+  Generated raw Luce contains one `pub extern type`; it contains no C pointer
+  spelling, size, alignment, target, or ABI fact. The checked C adapter alone
+  casts between its `void *` carrier and the exact typed C pointer. Pointee
+  mutability remains an auditable raw-boundary fact rather than being promoted
+  into a safe capability, and ownership/lifetime cannot be invented from C
+  syntax: the next FIIR slice is the explicit binding-recipe model.
+
+  Pure schema/declarator tests cover qualifier order, malformed state,
+  unsupported pointer shapes, nullable/bare generation, stable JSON, and
+  target-independent raw source. The temperature example adds real open/find/
+  read/echo functions and exercises absent and live handles through generated
+  HIR, canonical MIR, Wasm/QBE encoding, the CLI bind/build/run path, and
+  ordinary plus `-fshort-enums` linked QBE/C execution. No HIR type, MIR
+  instruction, runtime operation, layout rule, or platform branch was added.
+  The completed repository gate is 968/968 compiler tests across 36 files plus
+  CLI, Wasm, and native QBE shell gates.
 
 ## 3. Bugs the multi-backend harness found
 

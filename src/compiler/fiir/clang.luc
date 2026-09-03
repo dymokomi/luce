@@ -18,7 +18,7 @@
 #
 #==============================================================================================
 
-from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirObject, FiirObjectAccess, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, exact_ieee_floating_width, is_c_identifier, plain_value_boundary, validate_fiir
+from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirLifetime, FiirModule, FiirMutability, FiirNullability, FiirObject, FiirObjectAccess, FiirOwnership, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, exact_ieee_floating_width, is_c_identifier, plain_value_boundary, validate_fiir
 import std.json
 import std.strings
 
@@ -278,6 +278,14 @@ struct ClangObject:
 struct ClangObjectTypeSpellings:
     let declared: str
     let desugared: str
+
+## The header facts recoverable from one direct pointer spelling. Ownership
+## and lifetime cannot be inferred from C syntax and remain explicitly
+## unspecified until a binding recipe supplies them.
+struct ClangPointerBoundary:
+    let pointee: str
+    let nullability: FiirNullability
+    let mutability: FiirMutability
 
 struct ClangEnumerationConstant:
     let declaration: FiirEnumCase
@@ -1182,8 +1190,8 @@ func reachable_record_identities(declarations: list[json.Json], header: str, rec
             try append_record_spelling(name, identities, records, typedefs)
         elif kind == "FunctionDecl":
             let signature = try required_type_spelling(declaration, "C function at " + origin_text(origin))
-            let delimiter = strings.find(signature, " (")
-            if delimiter != none: try append_record_spelling(signature[:delimiter], identities, records, typedefs)
+            let result = try direct_function_result_spelling(signature, "C function at " + origin_text(origin))
+            try append_record_spelling(result, identities, records, typedefs)
             let children = try optional_array_member(declaration, "inner", "C function at " + origin_text(origin)) else list[json.Json]()
             for child in children:
                 let child_kind = try optional_text_member(child, "kind", "C function child") else ""
@@ -1213,9 +1221,8 @@ func selected_declarations_use_float16(declarations: list[json.Json], header: st
             if spelling_resolves_to_float16(try required_type_spelling(declaration, "C object `" + name + "`"), typedefs, list[str]()): return true
         elif kind == "FunctionDecl":
             let signature = try required_type_spelling(declaration, "C function at " + origin_text(origin))
-            let delimiter = strings.find(signature, " (")
-            if delimiter != none:
-                if spelling_resolves_to_float16(signature[:delimiter], typedefs, list[str]()): return true
+            let result = try direct_function_result_spelling(signature, "C function at " + origin_text(origin))
+            if spelling_resolves_to_float16(result, typedefs, list[str]()): return true
             let children = try optional_array_member(declaration, "inner", "C function at " + origin_text(origin)) else list[json.Json]()
             for child in children:
                 let child_kind = try optional_text_member(child, "kind", "C function child") else ""
@@ -1387,20 +1394,18 @@ func typedef_record_identity(value: json.Json, context: str) -> str?!:
 func decode_function(value: json.Json, origin: FiirSourceOrigin, interner: FiirTypeInterner) -> FiirFunction!:
     let name = try required_text_member(value, "name", "function at " + origin_text(origin))
     let signature = try required_type_spelling(value, "function `" + name + "`")
-    let delimiter = strings.find(signature, " (") else error("Clang FIIR: function `" + name + "` has unsupported type spelling `" + signature + "`")
-    let result_spelling = signature[:delimiter]
-    let result_type = try interner.intern(result_spelling, "function `" + name + "` result")
+    let result_spelling = try direct_function_result_spelling(signature, "function `" + name + "`")
+    let result = try interner.intern_boundary(result_spelling, "function `" + name + "` result")
     let parameters = list[FiirParameter]()
     let children = try optional_array_member(value, "inner", "function `" + name + "`") else list[json.Json]()
     for child in children:
         let kind = try optional_text_member(child, "kind", "function `" + name + "` child") else ""
         if kind != "ParmVarDecl": continue
         let spelling = try required_type_spelling(child, "function `" + name + "` parameter")
-        let parameter_type = try interner.intern(spelling, "function `" + name + "` parameter")
         let parameter_origin = try child_origin(child, origin)
         parameters.append(FiirParameter(
             name = try optional_text_member(child, "name", "function `" + name + "` parameter"),
-            boundary = plain_value_boundary(parameter_type),
+            boundary = try interner.intern_boundary(spelling, "function `" + name + "` parameter"),
             origin = parameter_origin,
         ))
     let variadic = strings.ends_with(signature, ", ...)") or strings.ends_with(signature, "(...)")
@@ -1408,7 +1413,7 @@ func decode_function(value: json.Json, origin: FiirSourceOrigin, interner: FiirT
         name = name,
         convention = FiirCallingConvention.c,
         parameters = parameters,
-        result = plain_value_boundary(result_type),
+        result = result,
         is_variadic = variadic,
         can_throw = false,
         conditions = list[str](),
@@ -1461,7 +1466,18 @@ class FiirTypeInterner:
         if self.type_ids.has(canonical): return self.type_ids[canonical]
 
         var value_type = FiirType(spelling = canonical, form = FiirTypeForm.Unit, size_bits = none)
-        if self.typedefs.has(canonical):
+        if self.typedef_is_opaque_record(canonical):
+            let declaration = self.typedefs[canonical]
+            value_type = FiirType(
+                spelling = canonical,
+                form = FiirTypeForm.OpaqueHandle(
+                    name = canonical,
+                    c_spelling = canonical + " *",
+                    origin = declaration.origin,
+                ),
+                size_bits = none,
+            )
+        elif self.typedefs.has(canonical):
             for active in self.resolving:
                 if active == canonical: error("Clang FIIR: typedef `" + canonical + "` forms a cycle")
             self.resolving.append(canonical)
@@ -1503,6 +1519,30 @@ class FiirTypeInterner:
         let identity = FiirTypeId(value = u32(len(self.types) - 1))
         self.type_ids[canonical] = identity
         return identity
+
+    ## Function boundaries are the first place where an incomplete record may
+    ## appear: by value it is invalid C, while one pointer to it is an opaque
+    ## handle. Keep all pointer facts on the FIIR edge and intern only the
+    ## nominal handle identity.
+    func intern_boundary(spelling: str, context: str) -> FiirBoundaryValue!:
+        let pointer = try clang_pointer_boundary(spelling)
+        if pointer == none: return plain_value_boundary(try self.intern(spelling, context))
+        let parsed = pointer
+        if not self.typedef_is_opaque_record(parsed.pointee):
+            error("Clang FIIR: " + context + " pointer type `" + strings.trim(spelling) + "` has no completed opaque-handle adapter")
+        let value_type = try self.intern(parsed.pointee, context)
+        return FiirBoundaryValue(
+            value_type = value_type,
+            nullability = parsed.nullability,
+            ownership = FiirOwnership.unspecified,
+            mutability = parsed.mutability,
+            lifetime = FiirLifetime.unspecified,
+        )
+
+    func typedef_is_opaque_record(name: str) -> bool:
+        if not self.typedefs.has(name): return false
+        let identity = self.typedefs[name].target_record_id
+        return identity != none and not self.records.by_identity.has(identity)
 
     func intern_typedef_target(declaration: ClangTypedef, context: str) -> FiirTypeId!:
         let enumeration = declaration.target_enum_id
@@ -1586,6 +1626,52 @@ func unqualified_scalar_spelling(spelling: str) -> str:
         if strings.starts_with(result, "const "): result = strings.trim(result[6:])
         elif strings.starts_with(result, "volatile "): result = strings.trim(result[9:])
         else: return result
+
+## Parse only a direct object pointer. Pointer-to-pointer, function-pointer,
+## array, and complete-pointee forms deliberately reach the explicit
+## unsupported diagnostic in `intern_boundary` until their own contracts land.
+func clang_pointer_boundary(spelling: str) -> ClangPointerBoundary?!:
+    var remaining = strings.trim(spelling)
+    var nullability = FiirNullability.unspecified
+    if strings.ends_with(remaining, " _Nullable"):
+        remaining = strings.trim(remaining[:len(remaining) - len(" _Nullable")])
+        nullability = FiirNullability.nullable
+    elif strings.ends_with(remaining, " _Nonnull"):
+        remaining = strings.trim(remaining[:len(remaining) - len(" _Nonnull")])
+        nullability = FiirNullability.nonnull
+    elif strings.ends_with(remaining, " _Null_unspecified"):
+        remaining = strings.trim(remaining[:len(remaining) - len(" _Null_unspecified")])
+    if not strings.ends_with(remaining, "*"): return none
+    remaining = strings.trim(remaining[:len(remaining) - 1])
+    if remaining == "" or strings.contains(remaining, "*"):
+        error("Clang FIIR: pointer type `" + strings.trim(spelling) + "` is not a direct object pointer")
+    var mutability = FiirMutability.mutable
+    # Clang preserves the source order of leading pointee qualifiers. Consume
+    # the complete qualifier run so `const volatile T *` and
+    # `volatile const T *` describe the same boundary instead of depending on
+    # header spelling.
+    while true:
+        if strings.starts_with(remaining, "const "):
+            remaining = strings.trim(remaining[6:])
+            mutability = FiirMutability.read_only
+        elif strings.starts_with(remaining, "volatile "):
+            remaining = strings.trim(remaining[9:])
+        else: break
+    if remaining == "": error("Clang FIIR: pointer type `" + strings.trim(spelling) + "` has no pointee")
+    return ClangPointerBoundary(pointee = remaining, nullability = nullability, mutability = mutability)
+
+## Clang prints a space before `(` for value results but joins `*(` for pointer
+## results. A leading `(*` or `(^` at that boundary is instead a nested
+## function/array/block declarator. Reject it here: taking the prefix would
+## silently turn a function-pointer result into an unrelated scalar result.
+func direct_function_result_spelling(signature: str, context: str) -> str!:
+    let delimiter = strings.find(signature, "(") else error("Clang FIIR: " + context + " has unsupported type spelling `" + signature + "`")
+    let declarator = signature[delimiter:]
+    if strings.starts_with(declarator, "(*") or strings.starts_with(declarator, "(^"):
+        error("Clang FIIR: " + context + " has unsupported indirect result declarator `" + signature + "`")
+    let result = strings.trim(signature[:delimiter])
+    if result == "": error("Clang FIIR: " + context + " has no result type")
+    return result
 
 ## Classify every spelling Clang may use for a fundamental integer in one
 ## place. Import admissibility and FIIR interning must never drift apart.
