@@ -14,9 +14,9 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
   `c.float16`, `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
   constant, two header-local fundamental-integer object constants, two
-  explicitly selected fundamental-integer macro constants, and
-  fieldwise simple/nested record crossings, and exposes safe Luce-facing
-  functions.
+  explicitly selected fundamental-integer macro constants, live mutable and
+  read-only external scalar objects, and fieldwise simple/nested record
+  crossings. It exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary16 `_Float16`,
@@ -34,8 +34,13 @@ product. A constant-only anonymous enum contributes universal
 sign-and-magnitude constants
 instead of an unusable synthetic type or a target-selected integer carrier.
 Header-local `static const` fundamental-integer objects use that same carrier
-after Clang proves and evaluates their complete value; mutable or external
-objects remain runtime storage and are rejected by this constant importer.
+after Clang proves and evaluates their complete value. Declaration-only
+external scalar objects remain runtime storage: the raw module exposes readers
+and mutable writers, while the generated C product performs the actual access.
+The example's offset is volatile, so every read and write remains observable;
+its `const` sensor capacity has no generated writer. Boolean and floating
+objects exercise the direct scalar writer path alongside the checked integer
+writer.
 Object-like macros enter only through repeated `--macro-constant` selections;
 Clang establishes their active definition, exact type, source origin, and
 value without Luce interpreting replacement text.
@@ -45,9 +50,9 @@ retain one `bool` plus `u64` shape and expose the header's constants. The
 adapter alone asserts scalar representations, verifies integer target ranges,
 maps declared enum values to the target's exact C type, and verifies record
 size, alignment, offsets, and field types. Other extended floating formats,
-pointers, unions, bit-fields, non-integer macro or object constants,
-external objects, and recipes remain explicit generation errors until their
-complete contracts are implemented.
+pointers, unions, bit-fields, non-integer macro or object constants, aggregate,
+atomic, or thread-local external objects, and recipes remain explicit
+generation errors until their complete contracts are implemented.
 
 Generate the binding products with explicit destinations:
 

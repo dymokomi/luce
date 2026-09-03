@@ -133,6 +133,19 @@ grep -q 'pub let LUCE_TEMPERATURE_SIGNED_MINIMUM: c.integer_constant = c.integer
 grep -q 'pub let LUCE_TEMPERATURE_UNSIGNED_MAXIMUM: c.integer_constant = c.integer_constant(false, 18446744073709551615u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_ABSOLUTE_ZERO: c.integer_constant = c.integer_constant(true, 273u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_SENSOR_LIMIT: c.integer_constant = c.integer_constant(false, 4095u64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func read_luce_temperature_offset() -> luce_degrees' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func write_luce_temperature_offset(value: luce_degrees)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func read_luce_temperature_sensor_capacity() -> c.unsigned_long_long' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func write_luce_temperature_enabled(value: c.boolean)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func write_luce_temperature_ratio(value: c.double)' "$test_dir/temperature/raw.native.luc"
+grep -q '"objects": \[' "$test_dir/temperature.fiir.json"
+grep -q '"name": "luce_temperature_offset"' "$test_dir/temperature.fiir.json"
+grep -q '"access": "read_only"' "$test_dir/temperature.fiir.json"
+grep -q '"volatile": true' "$test_dir/temperature.fiir.json"
+if grep -q 'write_luce_temperature_sensor_capacity' "$test_dir/temperature/raw.native.luc"; then
+    echo "read-only external C object unexpectedly has a writer" >&2
+    exit 1
+fi
 grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub struct luce_temperature_range:' "$test_dir/temperature/raw.native.luc"
@@ -154,6 +167,11 @@ grep -q '_Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM == UINT64_C(1844674407
 grep -q '_Generic((LUCE_TEMPERATURE_ABSOLUTE_ZERO), luce_degrees: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_ABSOLUTE_ZERO == -INT64_C(273)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_SENSOR_LIMIT == UINT64_C(4095)' "$test_dir/temperature.adapter.c"
+grep -q '_Generic(&(luce_temperature_offset), volatile luce_degrees \*: 1, default: 0)' "$test_dir/temperature.adapter.c"
+grep -q 'luce_fiir_temperature_write_luce_temperature_offset' "$test_dir/temperature.adapter.c"
+grep -q '_Generic(&(luce_temperature_sensor_capacity), const unsigned long long \*: 1, default: 0)' "$test_dir/temperature.adapter.c"
+grep -q 'luce_fiir_temperature_write_luce_temperature_enabled' "$test_dir/temperature.adapter.c"
+grep -q 'luce_fiir_temperature_write_luce_temperature_ratio' "$test_dir/temperature.adapter.c"
 grep -q 'offsetof(struct luce_temperature_reading, scale)' "$test_dir/temperature.adapter.c"
 grep -q 'struct __luce_fiir_temperature_record_luce_temperature_reading' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
@@ -190,7 +208,7 @@ grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$t
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, macro_constants, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, external_objects, half_celsius, is_freezing, macro_constants, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    let (offset, sensor_capacity, enabled, ratio) = external_objects(42)\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and offset == 42 and sensor_capacity == 4095u64 and enabled and ratio == 1.5 and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \

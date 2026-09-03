@@ -42,6 +42,11 @@ _Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM > 0, "unsigned constant must re
 extern "C" {
 #endif
 
+extern volatile luce_degrees luce_temperature_offset;
+extern const unsigned long long luce_temperature_sensor_capacity;
+extern bool luce_temperature_enabled;
+extern double luce_temperature_ratio;
+
 double luce_celsius_to_fahrenheit(double celsius);
 float luce_half_celsius(float celsius);
 luce_half_value luce_adjust_half(luce_half_value value, luce_half_value delta);

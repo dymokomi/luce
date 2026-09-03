@@ -6,9 +6,9 @@
 #       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
 #       spelling conventions stop here. The decoder accepts scalar typedefs,
 #       C enumerations, constant-only anonymous enumerations, header-local
-#       integral object constants, plain records, and functions; every other
-#       declaration or type is either outside the requested header or rejected
-#       with a stable support diagnostic.
+#       integral object constants, external scalar objects, plain records, and
+#       functions; every other declaration or type is either outside the
+#       requested header or rejected with a stable support diagnostic.
 #
 #       Clang elides repeated file and line fields in source locations. The
 #       top-level cursor below reconstructs only those documented repetitions;
@@ -16,7 +16,7 @@
 #
 #==============================================================================================
 
-from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, is_c_identifier, plain_value_boundary, validate_fiir
+from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirObject, FiirObjectAccess, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, is_c_identifier, plain_value_boundary, validate_fiir
 import std.json
 import std.strings
 
@@ -252,10 +252,20 @@ struct ClangTypedef:
     let target_record_id: str?
     let origin: FiirSourceOrigin
 
-struct ClangObjectConstant:
+union ClangObjectKind:
+    Constant
+    External(access: FiirObjectAccess)
+
+struct ClangObject:
     let name: str
     let type_spelling: str
+    let kind: ClangObjectKind
+    let is_volatile: bool
     let origin: FiirSourceOrigin
+
+struct ClangObjectTypeSpellings:
+    let declared: str
+    let desugared: str
 
 struct ClangEnumerationConstant:
     let declaration: FiirEnumCase
@@ -337,15 +347,18 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let record_identities = try reachable_record_identities(declarations, header, records, typedefs)
-    let object_constants = try collect_object_constants(declarations, header, typedefs)
+    let object_declarations = try collect_objects(declarations, header, typedefs)
+    let constant_count = count_object_constants(object_declarations)
     let needs_float16 = try selected_declarations_use_float16(declarations, header, record_identities, records, typedefs)
-    let target_facts = try decode_target_fact_values(record_identities, needs_float16, len(object_constants), target_fact_document)
+    let target_facts = try decode_target_fact_values(record_identities, needs_float16, constant_count, target_fact_document)
     try apply_record_layouts(records, record_identities, target_facts)
     let float16_facts = try decode_float16_facts(needs_float16, target_facts)
     let interner = FiirTypeInterner(typedefs, enumerations, records, facts, float16_facts)
     let constants = list[FiirConstant]()
+    let objects = list[FiirObject]()
     let functions = list[FiirFunction]()
     let cursor = SourceCursor(path = "", line = u32(0))
+    var object_index = 0
     var object_constant_index = 0
 
     for declaration in declarations:
@@ -378,18 +391,23 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
             discard(try interner.intern(name, "typedef `" + name + "`"))
         elif kind == "VarDecl":
             let name = try required_text_member(declaration, "name", "C object at " + origin_text(origin))
-            if object_constant_index >= len(object_constants) or object_constants[object_constant_index].name != name:
-                error("Clang FIIR: object constant catalog is inconsistent at `" + name + "`")
-            let object_constant = object_constants[object_constant_index]
-            try append_object_constant(object_constant, object_constant_index, target_facts, interner, constants)
-            object_constant_index += 1
+            if object_index >= len(object_declarations) or object_declarations[object_index].name != name:
+                error("Clang FIIR: object catalog is inconsistent at `" + name + "`")
+            let object = object_declarations[object_index]
+            match object.kind:
+                Constant:
+                    try append_object_constant(object, object_constant_index, target_facts, interner, constants)
+                    object_constant_index += 1
+                External(access): try append_external_object(object, access, interner, objects)
+            object_index += 1
         elif kind == "StaticAssertDecl":
             # Clang has already enforced the header assertion. It contributes
             # no declaration to FIIR and must not become generated source.
             pass
         else:
             error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
-    if object_constant_index != len(object_constants):
+    if object_index != len(object_declarations): error("Clang FIIR: object catalog was not consumed completely")
+    if object_constant_index != constant_count:
         error("Clang FIIR: object constant catalog was not consumed completely")
     if macro_products != none:
         let products = macro_products
@@ -407,6 +425,7 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
         clang_arguments = clang_arguments,
         types = interner.types,
         constants = constants,
+        objects = objects,
         functions = functions,
     )
     try validate_fiir(module)
@@ -476,13 +495,15 @@ func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCata
         if c_spelling != none: catalog.identity_by_spelling[c_spelling] = identity
     return catalog
 
-# mark: Object constants ======================================================================
+# mark: Object declarations ===================================================================
 
-## Accept only objects whose complete value is part of the header itself.
-## External objects are runtime storage, not constants, and mutable header
-## objects cannot be copied into generated source without changing semantics.
-func collect_object_constants(declarations: list[json.Json], header: str, typedefs: map[str, ClangTypedef]) -> list[ClangObjectConstant]!:
-    let constants = list[ClangObjectConstant]()
+## Classify every header-owned object before target-fact probing. Header-local
+## immutable integer definitions become values; declaration-only `extern`
+## objects remain live storage and cross through generated accessors. Other
+## definitions would bind the adapter's private copy or define storage merely
+## by including the header, so they fail rather than changing C semantics.
+func collect_objects(declarations: list[json.Json], header: str, typedefs: map[str, ClangTypedef]) -> list[ClangObject]!:
+    let objects = list[ClangObject]()
     let cursor = SourceCursor(path = "", line = u32(0))
     for declaration in declarations:
         let location = declaration.member("loc")
@@ -496,18 +517,80 @@ func collect_object_constants(declarations: list[json.Json], header: str, typede
         let name = try required_text_member(declaration, "name", "C object at " + origin_text(origin))
         let spelling = try required_type_spelling(declaration, "C object `" + name + "`")
         let storage = try optional_text_member(declaration, "storageClass", "C object `" + name + "`") else ""
-        if storage != "static" or declaration.member("init") == none or not try object_type_is_const(declaration, name):
-            error("Clang FIIR: C object `" + name + "` is not a header-local `static const` value; generated external variables are not implemented yet")
-        if not spelling_resolves_to_integer(spelling, typedefs, list[str]()):
-            error("Clang FIIR: C object constant `" + name + "` has unsupported non-integer type `" + spelling + "`")
-        constants.append(ClangObjectConstant(name = name, type_spelling = spelling, origin = origin))
+        let has_initializer = declaration.member("init") != none
+        let is_const = try object_type_has_qualifier(declaration, name, "const")
+        let is_volatile = try object_type_has_qualifier(declaration, name, "volatile")
+        if storage == "static" and has_initializer and is_const:
+            if is_volatile:
+                error("Clang FIIR: C object `" + name + "` is volatile runtime storage and cannot become a generated constant")
+            if not spelling_resolves_to_integer(spelling, typedefs, list[str]()):
+                error("Clang FIIR: C object constant `" + name + "` has unsupported non-integer type `" + spelling + "`")
+            objects.append(ClangObject(name = name, type_spelling = spelling, kind = ClangObjectKind.Constant, is_volatile = is_volatile, origin = origin))
+        elif storage == "extern" and not has_initializer:
+            if try object_has_thread_storage(declaration):
+                error("Clang FIIR: external C object `" + name + "` uses thread-local storage, which has no generated accessor contract yet")
+            if try object_type_is_atomic(declaration, name):
+                error("Clang FIIR: external C object `" + name + "` is atomic, which requires an explicit operation recipe")
+            var access = FiirObjectAccess.read_write
+            if is_const: access = FiirObjectAccess.read_only
+            objects.append(ClangObject(name = name, type_spelling = spelling, kind = ClangObjectKind.External(access = access), is_volatile = is_volatile, origin = origin))
+        else:
+            error("Clang FIIR: C object `" + name + "` must be either a header-local `static const` value or a declaration-only `extern` object")
+    return objects
+
+func count_object_constants(objects: list[ClangObject]) -> i64:
+    var count = 0
+    for object in objects:
+        match object.kind:
+            Constant: count += 1
+            External(access): pass
+    return count
+
+func constant_objects(objects: list[ClangObject]) -> list[ClangObject]:
+    let constants = list[ClangObject]()
+    for object in objects:
+        match object.kind:
+            Constant: constants.append(object)
+            External(access): pass
     return constants
 
-func object_type_is_const(declaration: json.Json, name: str) -> bool!:
+func object_type_has_qualifier(declaration: json.Json, name: str, qualifier: str) -> bool!:
+    let spellings = try object_type_spellings(declaration, name)
+    return leading_scalar_qualifier(spellings.declared, qualifier) or leading_scalar_qualifier(spellings.desugared, qualifier)
+
+func object_type_is_atomic(declaration: json.Json, name: str) -> bool!:
+    let spellings = try object_type_spellings(declaration, name)
+    return scalar_spelling_is_atomic(spellings.declared) or scalar_spelling_is_atomic(spellings.desugared)
+
+func object_type_spellings(declaration: json.Json, name: str) -> ClangObjectTypeSpellings!:
     let type_value = declaration.member("type") else error("Clang FIIR: C object `" + name + "` has no type")
     let spelling = try required_text_member(type_value, "qualType", "C object `" + name + "` type")
     let desugared = try optional_text_member(type_value, "desugaredQualType", "C object `" + name + "` type") else spelling
-    return strings.starts_with(spelling, "const ") or strings.starts_with(desugared, "const ")
+    return ClangObjectTypeSpellings(declared = spelling, desugared = desugared)
+
+func leading_scalar_qualifier(spelling: str, wanted: str) -> bool:
+    var remaining = strings.trim(spelling)
+    while true:
+        if strings.starts_with(remaining, "const "):
+            if wanted == "const": return true
+            remaining = strings.trim(remaining[6:])
+        elif strings.starts_with(remaining, "volatile "):
+            if wanted == "volatile": return true
+            remaining = strings.trim(remaining[9:])
+        else: return false
+
+func scalar_spelling_is_atomic(spelling: str) -> bool:
+    var remaining = strings.trim(spelling)
+    while true:
+        if strings.starts_with(remaining, "const "): remaining = strings.trim(remaining[6:])
+        elif strings.starts_with(remaining, "volatile "): remaining = strings.trim(remaining[9:])
+        else: return strings.starts_with(remaining, "_Atomic(") or strings.starts_with(remaining, "_Atomic ")
+
+func object_has_thread_storage(declaration: json.Json) -> bool!:
+    let tls = try optional_text_member(declaration, "tls", "C object declaration")
+    if tls != none and tls != "none": return true
+    let tls_kind = try optional_text_member(declaration, "tlsKind", "C object declaration")
+    return tls_kind != none and tls_kind != "none"
 
 func spelling_resolves_to_integer(spelling: str, typedefs: map[str, ClangTypedef], active: list[str]) -> bool:
     let canonical = unqualified_scalar_spelling(strings.trim(spelling))
@@ -581,7 +664,7 @@ pub func render_target_fact_probe(document: str, header: str) -> str!:
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let identities = try reachable_record_identities(declarations, header, records, typedefs)
-    let object_constants = try collect_object_constants(declarations, header, typedefs)
+    let object_constants = constant_objects(try collect_objects(declarations, header, typedefs))
     let needs_float16 = try selected_declarations_use_float16(declarations, header, identities, records, typedefs)
     if len(identities) == 0 and not needs_float16 and len(object_constants) == 0: return ""
     var output = "/* Clang-evaluated FIIR target-fact probe. */\n"
@@ -802,7 +885,7 @@ func macro_constant_type_probe_name(index: i64) -> str:
 func macro_constant_probe_name(index: i64, suffix: str) -> str:
     return "__luce_fiir_macro_constant_" + str(index) + "_" + suffix
 
-func append_object_constant(declaration: ClangObjectConstant, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
+func append_object_constant(declaration: ClangObject, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
     let value_type = try interner.intern(declaration.type_spelling, "C object constant `" + declaration.name + "`")
     let resolved = try interner.resolve(value_type)
     match resolved.form:
@@ -815,6 +898,20 @@ func append_object_constant(declaration: ClangObjectConstant, index: i64, values
                 origin = declaration.origin,
             ))
         else: error("Clang FIIR: C object constant `" + declaration.name + "` does not resolve to an integer type")
+
+func append_external_object(declaration: ClangObject, access: FiirObjectAccess, interner: FiirTypeInterner, objects: list[FiirObject]) -> !:
+    let value_type = try interner.intern(declaration.type_spelling, "external C object `" + declaration.name + "`")
+    let resolved = try interner.resolve(value_type)
+    match resolved.form:
+        Boolean, Integer, Floating: pass
+        else: error("Clang FIIR: external C object `" + declaration.name + "` has unsupported non-scalar type `" + declaration.type_spelling + "`")
+    objects.append(FiirObject(
+        name = declaration.name,
+        value_type = value_type,
+        access = access,
+        is_volatile = declaration.is_volatile,
+        origin = declaration.origin,
+    ))
 
 func append_macro_constant(declaration: ClangMacroConstant, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
     let resolved = try interner.resolve(declaration.value_type)
@@ -903,6 +1000,9 @@ func selected_declarations_use_float16(declarations: list[json.Json], header: st
         if kind == "TypedefDecl":
             let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
             if spelling_resolves_to_float16(name, typedefs, list[str]()): return true
+        elif kind == "VarDecl":
+            let name = try required_text_member(declaration, "name", "C object at " + origin_text(origin))
+            if spelling_resolves_to_float16(try required_type_spelling(declaration, "C object `" + name + "`"), typedefs, list[str]()): return true
         elif kind == "FunctionDecl":
             let signature = try required_type_spelling(declaration, "C function at " + origin_text(origin))
             let delimiter = strings.find(signature, " (")

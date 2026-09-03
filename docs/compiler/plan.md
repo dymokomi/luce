@@ -899,7 +899,8 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   sign/magnitude value, while raw Luce reuses the universal
   `c.integer_constant` carrier and the backend-owned C product asserts the
   header's type and value. Full signed/unsigned extrema, const-qualified
-  typedefs, mutable/external rejection, both semantic oracles, Wasm/QBE, CLI,
+  typedefs, mutable/volatile definition rejection, both semantic oracles,
+  Wasm/QBE, CLI,
   and real linked C execution cover the slice.
 - [x] **Import explicitly selected fundamental-integer macros through Clang**
   (2026-09-03). Repeated `--macro-constant NAME` options define the complete
@@ -911,10 +912,22 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   adapter reasserts exact type and value. Pure malformed-state coverage, both
   semantic oracles, Wasm/QBE emission, CLI materialization, and real linked C
   execution cover the slice.
+- [x] **Keep declaration-only external scalar C objects live behind generated
+  accessors** (2026-09-03). FIIR records the declared scalar or typedef type,
+  read-only versus read-write access, volatility, and origin. Generated Luce
+  exposes ordinary fixed-carrier readers and mutable writers; integer writers
+  reuse the checked adapter status protocol. The backend C product alone
+  verifies exact qualifiers and performs the load or store, so neither target
+  object layout nor volatile semantics enter HIR or MIR. Const objects have no
+  writer. Definitions, atomics (including desugared typedefs), thread-local
+  storage, and nonscalar objects reject explicitly. Pure validation and
+  generation tests, both semantic oracles, Wasm/QBE emission, CLI
+  materialization, target-variation invariance, and real volatile linked C
+  execution cover the slice.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, non-integer object constants, external objects,
+  unions, non-integer object constants, aggregate/atomic/thread-local objects,
   arrays/pointers/function pointers/opaque types, ownership and nullability
   recipes, typed variadic adapters, support tiers, deterministic regeneration
   diagnostics.
