@@ -14,13 +14,17 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 
 ## Current resumption snapshot
 
-The only active development line is `stage1-qbe`. Its purpose is the complete
-Luce 1.0 source-to-QBE checkpoint: one target-neutral HIR and canonical MIR,
-three agreeing semantic/artifact executions, executable examples for every
+The only active development line is `main`, which on 2026-09-03 became the
+former `stage1-qbe` line; the superseded native-backend `main` is kept as
+`archive/main-native-2026-08-30`. Its purpose is the complete Luce 1.0
+source-to-QBE checkpoint: one target-neutral HIR and canonical MIR, three
+agreeing semantic/artifact executions, executable examples for every
 demonstrable capability, and stable diagnostics for every deliberate
-rejection. Do not merge the superseded native-backend work from `main`, and do
-not begin a Luce-owned machine backend before this checkpoint is complete and
-audited.
+rejection. Do not merge the archived native-backend work, and do not begin a
+Luce-owned machine backend before this checkpoint is complete and audited.
+QBE itself is a baseline, not a destination: once Luce Base
+([`../language/base.md`](../language/base.md)) exists, the native backend is
+to be written in it against the same canonical MIR.
 
 The repository currently proves 972 compiler tests across 37 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. FIIR 2 keeps
@@ -72,18 +76,16 @@ coverage. The experiment is preserved at
 `recovery/native-backends-2026-08-30`; its unfinished framework-linking work
 is preserved in stash `pre-stage1-qbe-recovery`. Neither belongs in stage 1.
 
-The clean continuation is branch `stage1-qbe`, based on `origin/main`. Its
-first commit, `eb6dbfd`, made the permanent stage boundaries visible as
-`frontend/`, `hir/`, `mir/`, and `backends/`. The two old seed encoders were
-removed once the QBE product path replaced them; their history remains in
-`origin/main` without occupying the stage-1 architecture.
-
-`stage1-qbe` is the sole development line through complete planned 1.0
-coverage. Do not merge partial slices back into the current `main`. Once every
-planned source feature passes the frontend/HIR/MIR/QBE gates, with Wasm
-regressions wherever that supporting backend applies, audit the finished
-branch as a whole, make that history the new local `main`, and pause before
-beginning Luce-owned native backends.
+The clean continuation was branch `stage1-qbe`, based on the old
+`origin/main`. Its first commit, `eb6dbfd`, made the permanent stage
+boundaries visible as `frontend/`, `hir/`, `mir/`, and `backends/`. The two
+old seed encoders were removed once the QBE product path replaced them; their
+history remains in the archived branch without occupying the stage-1
+architecture. That line is now local `main`; the remote still holds the old
+`main` until a push is requested. Once every planned source feature passes
+the frontend/HIR/MIR/QBE gates, with Wasm regressions wherever that supporting
+backend applies, audit the finished tree as a whole and pause before beginning
+Luce-owned native backends.
 
 Every unpublished change has this disposition:
 

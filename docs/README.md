@@ -13,6 +13,10 @@
   today" in the [top-level README](../README.md).
 - [Post-1.0 platform](language/post-1.0.md) — packages, C++, backends, and
   tooling deferred past 1.0, under the same section numbers.
+- [Luce Base](language/base.md) — the design draft of the C-like profile
+  (pointers, spans, unions, atomics, `asm`, no runtime) that shares this
+  compiler; the runtime and, later, the native backend are to be written in
+  it. Not yet implemented.
 - [Compiler plan](compiler/plan.md) — the decisions and what is next;
   its pair [Compiler record](compiler/done.md) says what exists, what each
   milestone proved, the bugs the harness caught, and where the project came
