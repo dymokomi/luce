@@ -5,9 +5,10 @@
 #   DESCRIPTION:
 #       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
 #       spelling conventions stop here. The decoder accepts scalar typedefs,
-#       C enumerations, constant-only anonymous enumerations, plain records,
-#       and functions; every other declaration or type is either outside the
-#       requested header or rejected with a stable support diagnostic.
+#       C enumerations, constant-only anonymous enumerations, header-local
+#       integral object constants, plain records, and functions; every other
+#       declaration or type is either outside the requested header or rejected
+#       with a stable support diagnostic.
 #
 #       Clang elides repeated file and line fields in source locations. The
 #       top-level cursor below reconstructs only those documented repetitions;
@@ -134,6 +135,11 @@ struct ClangTypedef:
     let target_record_id: str?
     let origin: FiirSourceOrigin
 
+struct ClangObjectConstant:
+    let name: str
+    let type_spelling: str
+    let origin: FiirSourceOrigin
+
 struct ClangEnumerationConstant:
     let declaration: FiirEnumCase
     let type_spelling: str
@@ -214,14 +220,16 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let record_identities = try reachable_record_identities(declarations, header, records, typedefs)
+    let object_constants = try collect_object_constants(declarations, header, typedefs)
     let needs_float16 = try selected_declarations_use_float16(declarations, header, record_identities, records, typedefs)
-    let layout_values = try decode_layout_values(record_identities, needs_float16, target_fact_document)
-    try apply_record_layouts(records, record_identities, layout_values)
-    let float16_facts = try decode_float16_facts(needs_float16, layout_values)
+    let target_facts = try decode_target_fact_values(record_identities, needs_float16, len(object_constants), target_fact_document)
+    try apply_record_layouts(records, record_identities, target_facts)
+    let float16_facts = try decode_float16_facts(needs_float16, target_facts)
     let interner = FiirTypeInterner(typedefs, enumerations, records, facts, float16_facts)
     let constants = list[FiirConstant]()
     let functions = list[FiirFunction]()
     let cursor = SourceCursor(path = "", line = u32(0))
+    var object_constant_index = 0
 
     for declaration in declarations:
         let location = declaration.member("loc")
@@ -252,9 +260,20 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
             let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
             discard(try interner.intern(name, "typedef `" + name + "`"))
         elif kind == "VarDecl":
-            error("Clang FIIR: `" + kind + "` at " + origin_text(origin) + " is not supported by the value-function importer yet")
+            let name = try required_text_member(declaration, "name", "C object at " + origin_text(origin))
+            if object_constant_index >= len(object_constants) or object_constants[object_constant_index].name != name:
+                error("Clang FIIR: object constant catalog is inconsistent at `" + name + "`")
+            let object_constant = object_constants[object_constant_index]
+            try append_object_constant(object_constant, object_constant_index, target_facts, interner, constants)
+            object_constant_index += 1
+        elif kind == "StaticAssertDecl":
+            # Clang has already enforced the header assertion. It contributes
+            # no declaration to FIIR and must not become generated source.
+            pass
         else:
             error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
+    if object_constant_index != len(object_constants):
+        error("Clang FIIR: object constant catalog was not consumed completely")
 
     let module = FiirModule(
         format_version = u32(1),
@@ -334,6 +353,50 @@ func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCata
         if c_spelling != none: catalog.identity_by_spelling[c_spelling] = identity
     return catalog
 
+# mark: Object constants ======================================================================
+
+## Accept only objects whose complete value is part of the header itself.
+## External objects are runtime storage, not constants, and mutable header
+## objects cannot be copied into generated source without changing semantics.
+func collect_object_constants(declarations: list[json.Json], header: str, typedefs: map[str, ClangTypedef]) -> list[ClangObjectConstant]!:
+    let constants = list[ClangObjectConstant]()
+    let cursor = SourceCursor(path = "", line = u32(0))
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        if origin == none or cursor.path != header: continue
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        if kind != "VarDecl": continue
+        let implicit = try optional_bool_member(declaration, "isImplicit", "C object declaration") else false
+        if implicit: continue
+        let name = try required_text_member(declaration, "name", "C object at " + origin_text(origin))
+        let spelling = try required_type_spelling(declaration, "C object `" + name + "`")
+        let storage = try optional_text_member(declaration, "storageClass", "C object `" + name + "`") else ""
+        if storage != "static" or declaration.member("init") == none or not try object_type_is_const(declaration, name):
+            error("Clang FIIR: C object `" + name + "` is not a header-local `static const` value; generated external variables are not implemented yet")
+        if not spelling_resolves_to_integer(spelling, typedefs, list[str]()):
+            error("Clang FIIR: C object constant `" + name + "` has unsupported non-integer type `" + spelling + "`")
+        constants.append(ClangObjectConstant(name = name, type_spelling = spelling, origin = origin))
+    return constants
+
+func object_type_is_const(declaration: json.Json, name: str) -> bool!:
+    let type_value = declaration.member("type") else error("Clang FIIR: C object `" + name + "` has no type")
+    let spelling = try required_text_member(type_value, "qualType", "C object `" + name + "` type")
+    let desugared = try optional_text_member(type_value, "desugaredQualType", "C object `" + name + "` type") else spelling
+    return strings.starts_with(spelling, "const ") or strings.starts_with(desugared, "const ")
+
+func spelling_resolves_to_integer(spelling: str, typedefs: map[str, ClangTypedef], active: list[str]) -> bool:
+    let canonical = unqualified_scalar_spelling(strings.trim(spelling))
+    if fundamental_integer_kind(canonical) != none: return true
+    if not typedefs.has(canonical): return false
+    for name in active:
+        if name == canonical: return false
+    active.append(canonical)
+    let result = spelling_resolves_to_integer(typedefs[canonical].target_spelling, typedefs, active)
+    active.remove(len(active) - 1)
+    return result
+
 # mark: Record declarations and target-fact probes =============================================
 
 func collect_records(declarations: list[json.Json]) -> ClangRecordCatalog!:
@@ -381,9 +444,10 @@ func decode_record_fields(children: list[json.Json], record_origin: FiirSourceOr
     return fields
 
 ## Render one Clang-evaluated query for the target facts required by declarations
-## owned by `header`: layout for reachable plain records and the format of a
-## reachable `_Float16`. Luce never calculates these facts itself.
-pub func render_layout_probe(document: str, header: str) -> str!:
+## owned by `header`: layout for reachable plain records, the format of a
+## reachable `_Float16`, and values of accepted object constants. Luce never
+## calculates or infers these target facts itself.
+pub func render_target_fact_probe(document: str, header: str) -> str!:
     let root = json.parse(document) catch malformed:
         error("Clang FIIR: " + json.describe(malformed))
     let root_kind = try required_text_member(root, "kind", "translation unit")
@@ -394,9 +458,11 @@ pub func render_layout_probe(document: str, header: str) -> str!:
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let identities = try reachable_record_identities(declarations, header, records, typedefs)
+    let object_constants = try collect_object_constants(declarations, header, typedefs)
     let needs_float16 = try selected_declarations_use_float16(declarations, header, identities, records, typedefs)
-    if len(identities) == 0 and not needs_float16: return ""
+    if len(identities) == 0 and not needs_float16 and len(object_constants) == 0: return ""
     var output = "/* Clang-evaluated FIIR target-fact probe. */\n"
+    if len(object_constants) > 0: output += "#include <stdint.h>\n"
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
         try validate_plain_record_shape(record)
@@ -411,6 +477,10 @@ pub func render_layout_probe(document: str, header: str) -> str!:
         output += "#undef __luce_fiir_float16_radix\n"
         output += "#undef __luce_fiir_float16_significand_bits\n"
         output += "#undef __luce_fiir_float16_maximum_exponent\n"
+    for index in range(0, len(object_constants)):
+        output += "#undef " + object_constant_probe_name(index, "is_constant") + "\n"
+        for word in range(0, 4):
+            output += "#undef " + object_constant_probe_name(index, "word_" + str(word)) + "\n"
     output += "enum {\n"
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
@@ -424,15 +494,26 @@ pub func render_layout_probe(document: str, header: str) -> str!:
         output += "    __luce_fiir_float16_radix = __FLT_RADIX__,\n"
         output += "    __luce_fiir_float16_significand_bits = __FLT16_MANT_DIG__,\n"
         output += "    __luce_fiir_float16_maximum_exponent = __FLT16_MAX_EXP__,\n"
+    for index in range(0, len(object_constants)):
+        let name = object_constants[index].name
+        let constant_check = "__builtin_constant_p(" + name + ")"
+        output += "    " + object_constant_probe_name(index, "is_constant") + " = " + constant_check + ",\n"
+        for word in range(0, 4):
+            let shift = str(word * 16)
+            output += "    " + object_constant_probe_name(index, "word_" + str(word)) + " = __builtin_choose_expr(" + constant_check + ", (int)(((uint64_t)(" + name + ") >> " + shift + ") & UINT64_C(65535)), 0),\n"
     return output + "};\n"
 
-func decode_layout_values(record_identities: list[str], needs_float16: bool, document: str) -> map[str, u64]!:
+func decode_target_fact_values(record_identities: list[str], needs_float16: bool, object_constant_count: i64, document: str) -> map[str, u64]!:
     let values = map[str, u64]()
-    if len(record_identities) == 0 and not needs_float16: return values
+    if len(record_identities) == 0 and not needs_float16 and object_constant_count == 0: return values
     if document == "":
+        if object_constant_count > 0 and len(record_identities) == 0 and not needs_float16:
+            error("Clang FIIR: C object constants have no Clang-evaluated target-fact probe")
         if needs_float16 and len(record_identities) > 0:
             error("Clang FIIR: reachable C records and _Float16 have no Clang-evaluated target-fact probe")
         if needs_float16: error("Clang FIIR: reachable C _Float16 has no Clang-evaluated target-fact probe")
+        if object_constant_count > 0:
+            error("Clang FIIR: selected C declarations have no Clang-evaluated target-fact probe")
         error("Clang FIIR: reachable C records have no Clang-evaluated target-fact probe")
     let root = json.parse(document) catch malformed:
         error("Clang FIIR target facts: " + json.describe(malformed))
@@ -448,7 +529,7 @@ func decode_layout_values(record_identities: list[str], needs_float16: bool, doc
             let child_kind = try optional_text_member(child, "kind", "target-fact enum child") else ""
             if child_kind != "EnumConstantDecl": continue
             let name = try required_text_member(child, "name", "target-fact constant")
-            if not strings.starts_with(name, "__luce_fiir_record_") and not strings.starts_with(name, "__luce_fiir_float16_"): continue
+            if not strings.starts_with(name, "__luce_fiir_record_") and not strings.starts_with(name, "__luce_fiir_float16_") and not strings.starts_with(name, "__luce_fiir_object_constant_"): continue
             let value = try explicit_enumeration_value(child, "target-fact constant `" + name + "`") else error("Clang FIIR target facts: `" + name + "` has no evaluated value")
             match value:
                 Negative(magnitude): error("Clang FIIR target facts: `" + name + "` is negative")
@@ -458,11 +539,11 @@ func decode_layout_values(record_identities: list[str], needs_float16: bool, doc
 func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], values: map[str, u64]) -> !:
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
-        record.size_bits = try required_record_probe_value(values, record_probe_name(index, "size_bits"))
-        record.alignment_bits = try required_record_probe_value(values, record_probe_name(index, "alignment_bits"))
+        record.size_bits = try required_target_fact_value(values, record_probe_name(index, "size_bits"))
+        record.alignment_bits = try required_target_fact_value(values, record_probe_name(index, "alignment_bits"))
         let offsets = list[u64]()
         for field_index in range(0, len(record.fields)):
-            offsets.append(try required_record_probe_value(values, record_probe_name(index, "field_" + str(field_index))))
+            offsets.append(try required_target_fact_value(values, record_probe_name(index, "field_" + str(field_index))))
         record.field_offsets = offsets
 
 func decode_float16_facts(required: bool, values: map[str, u64]) -> ClangFloat16Facts?!:
@@ -475,17 +556,47 @@ func decode_float16_facts(required: bool, values: map[str, u64]) -> ClangFloat16
     )
 
 func required_float16_u16(values: map[str, u64], suffix: str) -> u16!:
-    let value = try required_record_probe_value(values, "__luce_fiir_float16_" + suffix)
+    let value = try required_target_fact_value(values, "__luce_fiir_float16_" + suffix)
     if value == u64(0) or value > u64(65535):
         error("Clang FIIR target facts: `_Float16` " + suffix + " is outside the supported range")
     return u16(value)
 
-func required_record_probe_value(values: map[str, u64], name: str) -> u64!:
+func required_target_fact_value(values: map[str, u64], name: str) -> u64!:
     if not values.has(name): error("Clang FIIR target facts: missing evaluated constant `" + name + "`")
     return values[name]
 
 func record_probe_name(index: i64, suffix: str) -> str:
     return "__luce_fiir_record_" + str(index) + "_" + suffix
+
+func object_constant_probe_name(index: i64, suffix: str) -> str:
+    return "__luce_fiir_object_constant_" + str(index) + "_" + suffix
+
+func append_object_constant(declaration: ClangObjectConstant, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
+    let value_type = try interner.intern(declaration.type_spelling, "C object constant `" + declaration.name + "`")
+    let resolved = try interner.resolve(value_type)
+    match resolved.form:
+        Integer(kind, bits, is_signed):
+            constants.append(FiirConstant(
+                name = declaration.name,
+                value_type = value_type,
+                value = FiirConstantValue.Integer(value = try decode_object_constant_value(declaration.name, index, is_signed, values)),
+                origin = declaration.origin,
+            ))
+        else: error("Clang FIIR: C object constant `" + declaration.name + "` does not resolve to an integer type")
+
+func decode_object_constant_value(name: str, index: i64, is_signed: bool, values: map[str, u64]) -> FiirIntegerValue!:
+    let is_constant = try required_target_fact_value(values, object_constant_probe_name(index, "is_constant"))
+    if is_constant != u64(1):
+        error("Clang FIIR: C object `" + name + "` does not have a Clang-evaluable constant value")
+    var raw = u64(0)
+    for word in range(0, 4):
+        let part = try required_target_fact_value(values, object_constant_probe_name(index, "word_" + str(word)))
+        if part > u64(65535):
+            error("Clang FIIR target facts: C object `" + name + "` word " + str(word) + " exceeds 16 bits")
+        raw = raw | (part << u64(word * 16))
+    if is_signed and raw > u64(9223372036854775807):
+        return FiirIntegerValue.Negative(magnitude = u64(18446744073709551615) - raw + u64(1))
+    return FiirIntegerValue.Nonnegative(value = raw)
 
 func record_c_reference(record: ClangRecord) -> str!:
     let spelling = record.c_spelling
@@ -778,6 +889,18 @@ class FiirTypeInterner:
         self.facts = facts
         self.float16_facts = float16_facts
 
+    ## Resolve an already-interned typedef chain while the FIIR module is still
+    ## under construction. The public schema resolver takes over after sealing.
+    func resolve(value_type: FiirTypeId) -> FiirType!:
+        var current = value_type
+        for depth in range(0, len(self.types)):
+            if i64(current.value) >= len(self.types): error("Clang FIIR: cannot resolve an unknown interned type")
+            let resolved = self.types[current.value]
+            match resolved.form:
+                Typedef(target, origin): current = target
+                else: return resolved
+        error("Clang FIIR: interned typedef graph is cyclic")
+
     func intern(spelling: str, context: str) -> FiirTypeId!:
         var canonical = strings.trim(spelling)
         if not self.typedefs.has(canonical): canonical = unqualified_scalar_spelling(canonical)
@@ -807,39 +930,21 @@ class FiirTypeInterner:
             pass
         elif canonical == "_Bool" or canonical == "bool":
             value_type = FiirType(spelling = canonical, form = FiirTypeForm.Boolean, size_bits = self.facts.bool_size_bits)
-        elif canonical == "char":
-            value_type = integer_type(canonical, FiirCIntegerKind.plain_char, self.facts.char_size_bits, self.facts.char_size_bits, self.facts.plain_char_is_signed)
-        elif canonical == "signed char":
-            value_type = integer_type(canonical, FiirCIntegerKind.signed_char, self.facts.char_size_bits, self.facts.char_size_bits, true)
-        elif canonical == "unsigned char":
-            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_char, self.facts.char_size_bits, self.facts.char_size_bits, false)
-        elif canonical == "short" or canonical == "short int" or canonical == "signed short" or canonical == "signed short int":
-            value_type = integer_type(canonical, FiirCIntegerKind.signed_short, self.facts.short_value_bits, self.facts.short_size_bits, true)
-        elif canonical == "unsigned short" or canonical == "unsigned short int":
-            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_short, self.facts.short_value_bits, self.facts.short_size_bits, false)
-        elif canonical == "int" or canonical == "signed" or canonical == "signed int":
-            value_type = integer_type(canonical, FiirCIntegerKind.signed_int, self.facts.int_value_bits, self.facts.int_size_bits, true)
-        elif canonical == "unsigned" or canonical == "unsigned int":
-            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_int, self.facts.int_value_bits, self.facts.int_size_bits, false)
-        elif canonical == "long" or canonical == "long int" or canonical == "signed long" or canonical == "signed long int":
-            value_type = integer_type(canonical, FiirCIntegerKind.signed_long, self.facts.long_value_bits, self.facts.long_size_bits, true)
-        elif canonical == "unsigned long" or canonical == "unsigned long int":
-            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long, self.facts.long_value_bits, self.facts.long_size_bits, false)
-        elif canonical == "long long" or canonical == "long long int" or canonical == "signed long long" or canonical == "signed long long int":
-            value_type = integer_type(canonical, FiirCIntegerKind.signed_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, true)
-        elif canonical == "unsigned long long" or canonical == "unsigned long long int":
-            value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, false)
-        elif canonical == "_Float16":
-            let float16 = self.float16_facts else error("Clang FIIR: " + context + " uses `_Float16` without evaluated target facts")
-            value_type = floating_type(canonical, FiirCFloatingKind.float16, float16.size_bits, float16.radix, float16.significand_bits, float16.maximum_exponent)
-        elif canonical == "float":
-            value_type = floating_type(canonical, FiirCFloatingKind.single, self.facts.float_storage_bits, self.facts.float_radix, self.facts.float_significand_bits, self.facts.float_maximum_exponent)
-        elif canonical == "double":
-            value_type = floating_type(canonical, FiirCFloatingKind.double, self.facts.double_storage_bits, self.facts.float_radix, self.facts.double_significand_bits, self.facts.double_maximum_exponent)
-        elif canonical == "long double":
-            value_type = floating_type(canonical, FiirCFloatingKind.long_double, self.facts.long_double_storage_bits, self.facts.float_radix, self.facts.long_double_significand_bits, self.facts.long_double_maximum_exponent)
         else:
-            error("Clang FIIR: " + context + " type `" + canonical + "` is not supported by the value-function importer yet")
+            let integer_kind = fundamental_integer_kind(canonical)
+            if integer_kind != none:
+                value_type = integer_type_from_facts(canonical, integer_kind, self.facts)
+            elif canonical == "_Float16":
+                let float16 = self.float16_facts else error("Clang FIIR: " + context + " uses `_Float16` without evaluated target facts")
+                value_type = floating_type(canonical, FiirCFloatingKind.float16, float16.size_bits, float16.radix, float16.significand_bits, float16.maximum_exponent)
+            elif canonical == "float":
+                value_type = floating_type(canonical, FiirCFloatingKind.single, self.facts.float_storage_bits, self.facts.float_radix, self.facts.float_significand_bits, self.facts.float_maximum_exponent)
+            elif canonical == "double":
+                value_type = floating_type(canonical, FiirCFloatingKind.double, self.facts.double_storage_bits, self.facts.float_radix, self.facts.double_significand_bits, self.facts.double_maximum_exponent)
+            elif canonical == "long double":
+                value_type = floating_type(canonical, FiirCFloatingKind.long_double, self.facts.long_double_storage_bits, self.facts.float_radix, self.facts.long_double_significand_bits, self.facts.long_double_maximum_exponent)
+            else:
+                error("Clang FIIR: " + context + " type `" + canonical + "` is not supported by the value-function importer yet")
         self.types.append(value_type)
         let identity = FiirTypeId(value = u32(len(self.types) - 1))
         self.type_ids[canonical] = identity
@@ -927,6 +1032,36 @@ func unqualified_scalar_spelling(spelling: str) -> str:
         if strings.starts_with(result, "const "): result = strings.trim(result[6:])
         elif strings.starts_with(result, "volatile "): result = strings.trim(result[9:])
         else: return result
+
+## Classify every spelling Clang may use for a fundamental integer in one
+## place. Import admissibility and FIIR interning must never drift apart.
+func fundamental_integer_kind(spelling: str) -> FiirCIntegerKind?:
+    if spelling == "char": return FiirCIntegerKind.plain_char
+    if spelling == "signed char": return FiirCIntegerKind.signed_char
+    if spelling == "unsigned char": return FiirCIntegerKind.unsigned_char
+    if spelling == "short" or spelling == "short int" or spelling == "signed short" or spelling == "signed short int": return FiirCIntegerKind.signed_short
+    if spelling == "unsigned short" or spelling == "unsigned short int": return FiirCIntegerKind.unsigned_short
+    if spelling == "int" or spelling == "signed" or spelling == "signed int": return FiirCIntegerKind.signed_int
+    if spelling == "unsigned" or spelling == "unsigned int": return FiirCIntegerKind.unsigned_int
+    if spelling == "long" or spelling == "long int" or spelling == "signed long" or spelling == "signed long int": return FiirCIntegerKind.signed_long
+    if spelling == "unsigned long" or spelling == "unsigned long int": return FiirCIntegerKind.unsigned_long
+    if spelling == "long long" or spelling == "long long int" or spelling == "signed long long" or spelling == "signed long long int": return FiirCIntegerKind.signed_long_long
+    if spelling == "unsigned long long" or spelling == "unsigned long long int": return FiirCIntegerKind.unsigned_long_long
+    return none
+
+func integer_type_from_facts(spelling: str, kind: FiirCIntegerKind, facts: ClangScalarFacts) -> FiirType:
+    return match kind:
+        plain_char => integer_type(spelling, kind, facts.char_size_bits, facts.char_size_bits, facts.plain_char_is_signed)
+        signed_char => integer_type(spelling, kind, facts.char_size_bits, facts.char_size_bits, true)
+        unsigned_char => integer_type(spelling, kind, facts.char_size_bits, facts.char_size_bits, false)
+        signed_short => integer_type(spelling, kind, facts.short_value_bits, facts.short_size_bits, true)
+        unsigned_short => integer_type(spelling, kind, facts.short_value_bits, facts.short_size_bits, false)
+        signed_int => integer_type(spelling, kind, facts.int_value_bits, facts.int_size_bits, true)
+        unsigned_int => integer_type(spelling, kind, facts.int_value_bits, facts.int_size_bits, false)
+        signed_long => integer_type(spelling, kind, facts.long_value_bits, facts.long_size_bits, true)
+        unsigned_long => integer_type(spelling, kind, facts.long_value_bits, facts.long_size_bits, false)
+        signed_long_long => integer_type(spelling, kind, facts.long_long_value_bits, facts.long_long_size_bits, true)
+        unsigned_long_long => integer_type(spelling, kind, facts.long_long_value_bits, facts.long_long_size_bits, false)
 
 func integer_type(spelling: str, kind: FiirCIntegerKind, bits: u16, size_bits: u16, is_signed: bool) -> FiirType:
     return FiirType(spelling = spelling, form = FiirTypeForm.Integer(kind = kind, bits = bits, is_signed = is_signed), size_bits = size_bits)

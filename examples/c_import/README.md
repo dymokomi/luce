@@ -13,8 +13,9 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
   `c.float16`, `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
-  constant and fieldwise simple/nested record crossings, and exposes safe
-  Luce-facing functions.
+  constant, two header-local fundamental-integer object constants, and
+  fieldwise simple/nested record crossings, and exposes safe Luce-facing
+  functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary16 `_Float16`,
@@ -31,14 +32,18 @@ fixed-carrier adapter records; Clang-evaluated layout stays in FIIR and the C
 product. A constant-only anonymous enum contributes universal
 sign-and-magnitude constants
 instead of an unusable synthetic type or a target-selected integer carrier.
+Header-local `static const` fundamental-integer objects use that same carrier
+after Clang proves and evaluates their complete value; mutable or external
+objects remain runtime storage and are rejected by this constant importer.
 Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or `f64`;
 integer and typedef carriers retain one lossless portable shape; enum carriers
 retain one `bool` plus `u64` shape and expose the header's constants. The
 adapter alone asserts scalar representations, verifies integer target ranges,
 maps declared enum values to the target's exact C type, and verifies record
 size, alignment, offsets, and field types. Other extended floating formats,
-pointers, unions, bit-fields, macro/object constants, and recipes remain
-explicit generation errors until their complete contracts are implemented.
+pointers, unions, bit-fields, macro constants, non-integer object constants,
+external objects, and recipes remain explicit generation errors until their
+complete contracts are implemented.
 
 Generate the binding products with explicit destinations:
 

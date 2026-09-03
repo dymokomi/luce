@@ -892,13 +892,22 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   both semantic oracles and execute against real C through QBE; Wasm validates
   the same target-independent generated source. Regeneration under alternate
   enum flags proves that only FIIR/C layout products vary with the C target.
+- [x] **Import header-local fundamental-integer objects as evaluated constants**
+  (2026-09-02). Only `static const` definitions with initializers enter this
+  path; Clang must prove each one constant and supplies its exact 64-bit value
+  through the target-fact pass. FIIR retains the declared C type and canonical
+  sign/magnitude value, while raw Luce reuses the universal
+  `c.integer_constant` carrier and the backend-owned C product asserts the
+  header's type and value. Full signed/unsigned extrema, const-qualified
+  typedefs, mutable/external rejection, both semantic oracles, Wasm/QBE, CLI,
+  and real linked C execution cover the slice.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, macro/object constants, arrays/pointers/function pointers/opaque
-  types, ownership and nullability recipes, typed variadic adapters, support
-  tiers, deterministic
-  regeneration diagnostics.
+  unions, macro constants, non-integer object constants, external objects,
+  arrays/pointers/function pointers/opaque types, ownership and nullability
+  recipes, typed variadic adapters, support tiers, deterministic regeneration
+  diagnostics.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
 - [x] **`luce build --time-report` for generics** (2026-08-31). Report source

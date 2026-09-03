@@ -30,6 +30,11 @@ enum {
     LUCE_WATER_BOILING_CELSIUS = 100
 };
 
+static const long long LUCE_TEMPERATURE_SIGNED_MINIMUM = (-9223372036854775807LL - 1LL);
+static const unsigned long long LUCE_TEMPERATURE_UNSIGNED_MAXIMUM = 18446744073709551615ULL;
+_Static_assert(LUCE_TEMPERATURE_SIGNED_MINIMUM < 0, "signed constant must remain negative");
+_Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM > 0, "unsigned constant must remain positive");
+
 #ifdef __cplusplus
 extern "C" {
 #endif
