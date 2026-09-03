@@ -46,11 +46,16 @@ fi
 printf 'pub func main(arguments: slice[str]) -> i32!: return 2147483647 + 1\n' > "$test_dir/overflow.luc"
 "$test_dir/luce" build --package org.luce.tests --root "$test_dir" --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/overflow" "$test_dir/overflow.luc"
 set +e
-{ "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2>/dev/null
+{ "$test_dir/overflow"; echo $? > "$test_dir/overflow.status"; } 2> "$test_dir/overflow.stderr"
 set -e
 status=$(cat "$test_dir/overflow.status")
 if [ "$status" != "$trap_status" ]; then
     echo "expected overflow to trap with status $trap_status, found: $status" >&2
+    exit 1
+fi
+# The shell appends its own signal notice after the program's message.
+if [ "$(head -n 1 "$test_dir/overflow.stderr")" != "integer overflow" ]; then
+    echo "expected the trap to name its reason, found: $(head -n 1 "$test_dir/overflow.stderr")" >&2
     exit 1
 fi
 
