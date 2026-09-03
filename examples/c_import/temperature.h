@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 double luce_celsius_to_fahrenheit(double celsius);
+float luce_half_celsius(float celsius);
 int luce_adjust_celsius(int celsius, int delta);
 bool luce_is_freezing(bool enabled, double celsius);
 

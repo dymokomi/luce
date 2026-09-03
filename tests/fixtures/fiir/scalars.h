@@ -2,6 +2,7 @@
 #define LUCE_TEST_FIIR_SCALARS_H
 
 _Bool luce_echo_boolean(_Bool value);
+float luce_echo_float(float value);
 
 char luce_echo_plain_char(char value);
 signed char luce_echo_signed_char(signed char value);
