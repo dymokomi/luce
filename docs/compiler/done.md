@@ -20,7 +20,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 931 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 938 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -1576,6 +1576,28 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   byte-identical. The real `luce_degrees` example executes through HIR, MIR,
   Wasm/QBE encoding, CLI materialization, and linked QBE/C; malformed edges,
   pointer targets, and Luce-keyword names fail explicitly.
+
+- [x] **Imported C enums remain target-independent open foreign values**
+  (2026-09-02). FIIR records named and typedef-backed enumeration identity,
+  exact source origins, forward/anonymous declaration relationships, and the
+  complete signed-`i64`/unsigned-`u64` enumerator domain. Implicit successors
+  are evaluated deterministically and duplicate-valued enumerators remain
+  equal constants. The generated raw module uses one nominal private
+  sign-magnitude carrier with public typed constants; enum typedefs are
+  transparent names for that carrier rather than duplicate semantic types.
+
+  One shared expanded-signature plan feeds the Luce declaration and C adapter.
+  The adapter maps only declared constants to the header's exact enum type,
+  initializes every output before validation, and reports invalid inputs,
+  invalid results, and impossible statuses without leaking uninitialized data.
+  No enum size, compatible integer type, layout, or ABI class enters HIR or
+  canonical MIR. Synthetic named, anonymous, forward, duplicate, implicit,
+  full-`u64`, malformed-layout, and `-fshort-enums` fixtures cover the model.
+  The real temperature binding executes a negative enumerator through both
+  semantic oracles, Wasm/QBE encoding, CLI build/run, and linked QBE/C; a real
+  C result outside the declared set traps `native_enum_value`. Constant-only
+  anonymous enums and recipe-classified bitmasks remain with the constant and
+  recipe slices.
 
 - [x] **Borrowed C lists expose their one existing dense representation**
   (2026-09-01). `extern func` input parameters now admit `list[H]` exactly

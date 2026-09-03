@@ -16,6 +16,14 @@ luce_degrees luce_echo_degrees(luce_degrees celsius) {
     return celsius;
 }
 
+luce_temperature_scale luce_echo_scale(luce_temperature_scale scale) {
+    return scale;
+}
+
+luce_temperature_scale luce_invalid_scale(void) {
+    return (luce_temperature_scale)7;
+}
+
 bool luce_is_freezing(bool enabled, double celsius) {
     return enabled && celsius <= 0.0;
 }

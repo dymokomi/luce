@@ -69,8 +69,10 @@ from one exact Clang invocation. It admits C `_Bool`, IEEE binary32 `float`,
 IEEE binary64 `double` and `long double`, and every fundamental C integer
 through nominal target-independent carriers. Scalar typedefs over those types,
 including dependency-owned names such as `size_t`, retain their own nominal
-carriers without inheriting a target width. The generated adapter owns C object
-representation and checks integer target ranges. Extended floating
+carriers without inheriting a target width. Named and typedef-backed C enums
+use one nominal sign-magnitude carrier and typed constants; their target enum
+representation is mediated entirely by the generated C adapter, which also
+checks integer ranges and rejects undeclared enum values. Extended floating
 representations and broader declarations fail explicitly until their complete
 adapter contracts land.
 The end-to-end command and generated module layout are documented in
@@ -87,6 +89,9 @@ A few terms recur in the source and in this README:
   types have meaning (`src/compiler/hir/ir.luc`). The interpreter runs it directly.
 - **MIR / canonical IR** — the flat, target-independent instruction stream the
   compiled backends consume (`src/compiler/mir/canonical.luc`).
+- **FIIR** — the Foreign Interface Intermediate Representation: validated
+  backend-independent facts decoded from a foreign frontend before raw Luce
+  and target adapter products are generated (`src/compiler/fiir/schema.luc`).
 - **Slice** — the part of the 1.0 language a stage implements today. The parser
   covers most of 1.0; HIR generation, the interpreter, and the compiled path
   each cover a smaller, growing slice.

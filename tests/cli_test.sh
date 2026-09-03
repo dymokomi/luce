@@ -117,6 +117,9 @@ grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/tem
 grep -q 'pub func luce_adjust_celsius(celsius: c.int, delta: c.int) -> c.int' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub struct luce_degrees:' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_echo_degrees(celsius: luce_degrees) -> luce_degrees' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub struct luce_temperature_scale:' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_SCALE_CELSIUS: luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.native.luc"
 grep -q '_Static_assert(FLT_RADIX == 2' "$test_dir/temperature.adapter.c"
 grep -q 'FLT_MANT_DIG == 24' "$test_dir/temperature.adapter.c"
@@ -124,6 +127,7 @@ grep -q '_Static_assert(CHAR_BIT \* sizeof(_Bool)' "$test_dir/temperature.adapte
 grep -q 'if (celsius < -INT64_C(2147483648)' "$test_dir/temperature.adapter.c"
 grep -q '_Generic(((luce_degrees)0), int: 1, default: 0)' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
+cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/temperature.adapter.c"
 
 expect 0 "bound tests/fixtures/fiir/scalars.h" "$cli" bind \
     --name scalars \
@@ -142,7 +146,7 @@ grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$t
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import adjust_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing\npub func main(arguments: slice[str]) -> i32!:\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and is_freezing(0.0) else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, scale_round_trips\npub func main(arguments: slice[str]) -> i32!:\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and scale_round_trips() and is_freezing(0.0) else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \
