@@ -907,9 +907,10 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   selection and output order. A preprocessor inventory proves the final active
   object-like definition and source origin; filtered type and value AST probes
   let Clang preserve typedef spelling, evaluate the full 64-bit integer union,
-  and reject non-integer or nonconstant selections without Luce interpreting
-  replacement text. FIIR records constant provenance, and the generated C
-  adapter reasserts exact type and value. Pure malformed-state coverage, both
+  and, at this milestone, reject non-integer or nonconstant selections without
+  Luce interpreting replacement text. The scalar extension below supersedes
+  that temporary type boundary. FIIR records constant provenance, and the
+  generated C adapter reasserts exact type and value. Pure malformed-state coverage, both
   semantic oracles, Wasm/QBE emission, CLI materialization, and real linked C
   execution cover the slice.
 - [x] **Keep declaration-only external scalar C objects live behind generated
@@ -956,10 +957,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   Pure malformed-state coverage, real Clang import, both semantic oracles,
   Wasm/QBE emission, the example CLI, ordinary and `-fshort-enums` native
   execution cover the slice without adding an HIR/MIR or backend instruction.
+- [x] **Import explicitly selected scalar macros through one exact FIIR value
+  model** (2026-09-03). Clang's separate inventory, type, and value products
+  now classify Boolean, fundamental-integer, exact binary16/binary32/binary64,
+  typedef-backed, and named-enumeration object-like macros. The value probe
+  shares the header-local constant decoder, retaining floating bits and open
+  enum sign/magnitude without interpreting replacement text. Generated Luce,
+  both semantic oracles, Wasm/QBE emission, the example CLI, warning-clean C,
+  and ordinary plus `-fshort-enums` linked QBE execution cover the same values.
+  Pointer, array, and string macros remain with the carrier/ownership work they
+  actually require; no HIR, MIR, runtime, or backend instruction was added.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, non-integer macro constants,
+  unions, pointer/array/string macro constants,
   aggregate/atomic/thread-local objects, arrays/pointers/function
   pointers/opaque types, ownership and nullability recipes, typed variadic
   adapters, support tiers, deterministic regeneration diagnostics.

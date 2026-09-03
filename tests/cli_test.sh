@@ -112,12 +112,19 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --clang-arg -Werror \
     --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
     --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
+    --macro-constant LUCE_TEMPERATURE_MACRO_ENABLED \
+    --macro-constant LUCE_TEMPERATURE_MACRO_HALF_STEP \
+    --macro-constant LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO \
+    --macro-constant LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO \
+    --macro-constant LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY \
+    --macro-constant LUCE_TEMPERATURE_MACRO_UNDEFINED \
+    --macro-constant LUCE_TEMPERATURE_MACRO_OPEN_SCALE \
     examples/c_import/temperature.h
 grep -q '"format": "luce-fiir-1"' "$test_dir/temperature.fiir.json"
 grep -q '"target":' "$test_dir/temperature.fiir.json"
 grep -q '"kind": "record"' "$test_dir/temperature.fiir.json"
 grep -q '"source": "macro"' "$test_dir/temperature.fiir.json"
-grep -q '## Selected C macro constants: LUCE_TEMPERATURE_ABSOLUTE_ZERO LUCE_TEMPERATURE_SENSOR_LIMIT' "$test_dir/temperature/raw.native.luc"
+grep -q '## Selected C macro constants: LUCE_TEMPERATURE_ABSOLUTE_ZERO LUCE_TEMPERATURE_SENSOR_LIMIT LUCE_TEMPERATURE_MACRO_ENABLED LUCE_TEMPERATURE_MACRO_HALF_STEP LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY LUCE_TEMPERATURE_MACRO_UNDEFINED LUCE_TEMPERATURE_MACRO_OPEN_SCALE' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub struct luce_half_value:' "$test_dir/temperature/raw.native.luc"
@@ -141,6 +148,13 @@ grep -q 'pub let LUCE_TEMPERATURE_POSITIVE_INFINITY: c.double = c.double(math.po
 grep -q 'pub let LUCE_TEMPERATURE_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_ABSOLUTE_ZERO: c.integer_constant = c.integer_constant(true, 273u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_SENSOR_LIMIT: c.integer_constant = c.integer_constant(false, 4095u64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_ENABLED: c.boolean = c.boolean(true)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_HALF_STEP: c.float16 = c.float16(0.25f16)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO: c.float = c.float(-0.0f32)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO: c.double = c.double(1.25f64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY: c.double = c.double(math.positive_infinity_f64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_OPEN_SCALE: luce_temperature_scale = luce_temperature_scale(false, 7u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func read_luce_temperature_offset() -> luce_degrees' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func write_luce_temperature_offset(value: luce_degrees)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func read_luce_temperature_sensor_capacity() -> c.unsigned_long_long' "$test_dir/temperature/raw.native.luc"
@@ -184,6 +198,14 @@ grep -q '__builtin_isnan(LUCE_TEMPERATURE_UNDEFINED)' "$test_dir/temperature.ada
 grep -q '_Generic((LUCE_TEMPERATURE_ABSOLUTE_ZERO), luce_degrees: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_ABSOLUTE_ZERO == -INT64_C(273)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_SENSOR_LIMIT == UINT64_C(4095)' "$test_dir/temperature.adapter.c"
+grep -q '_Generic((LUCE_TEMPERATURE_MACRO_ENABLED), _Bool: 1, default: 0)' "$test_dir/temperature.adapter.c"
+grep -q '_Static_assert(LUCE_TEMPERATURE_MACRO_HALF_STEP == (_Float16)(0.25)' "$test_dir/temperature.adapter.c"
+grep -q '1.0L / LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO < 0.0L' "$test_dir/temperature.adapter.c"
+grep -q '_Static_assert(LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO == 1.25' "$test_dir/temperature.adapter.c"
+grep -q '__builtin_isinf(LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY)' "$test_dir/temperature.adapter.c"
+grep -q '__builtin_isnan(LUCE_TEMPERATURE_MACRO_UNDEFINED)' "$test_dir/temperature.adapter.c"
+grep -q '_Generic((LUCE_TEMPERATURE_MACRO_OPEN_SCALE), luce_temperature_scale: 1, default: 0)' "$test_dir/temperature.adapter.c"
+grep -q '_Static_assert(LUCE_TEMPERATURE_MACRO_OPEN_SCALE == UINT64_C(7)' "$test_dir/temperature.adapter.c"
 grep -q '_Generic(&(luce_temperature_offset), volatile luce_degrees \*: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q 'luce_fiir_temperature_write_luce_temperature_offset' "$test_dir/temperature.adapter.c"
 grep -q '_Generic(&(luce_temperature_sensor_capacity), const unsigned long long \*: 1, default: 0)' "$test_dir/temperature.adapter.c"
@@ -207,6 +229,13 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --clang-arg -fshort-enums \
     --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
     --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
+    --macro-constant LUCE_TEMPERATURE_MACRO_ENABLED \
+    --macro-constant LUCE_TEMPERATURE_MACRO_HALF_STEP \
+    --macro-constant LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO \
+    --macro-constant LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO \
+    --macro-constant LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY \
+    --macro-constant LUCE_TEMPERATURE_MACRO_UNDEFINED \
+    --macro-constant LUCE_TEMPERATURE_MACRO_OPEN_SCALE \
     examples/c_import/temperature.h
 cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/temperature-short.adapter.c"
 
@@ -227,7 +256,7 @@ grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$t
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, enumeration_constants, external_objects, half_celsius, is_freezing, macro_constants, scalar_constants, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (default_negative, default_magnitude, open_negative, open_magnitude) = enumeration_constants()\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    let (constant_enabled, constant_half, constant_zero, constant_ratio, constant_infinity, constant_nan) = scalar_constants()\n    let (offset, sensor_capacity, enabled, ratio, uses_fahrenheit) = external_objects(42)\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and default_negative and default_magnitude == 2u64 and not open_negative and open_magnitude == 7u64 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and constant_enabled and constant_half == 0.5f16 and 1.0f32 / constant_zero < 0.0f32 and constant_ratio == 1.5 and constant_infinity and constant_nan and offset == 42 and sensor_capacity == 4095u64 and enabled and ratio == 1.5 and uses_fahrenheit and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, enumeration_constants, external_objects, half_celsius, is_freezing, macro_constants, scalar_constants, scalar_macro_constants, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (default_negative, default_magnitude, open_negative, open_magnitude) = enumeration_constants()\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    let (constant_enabled, constant_half, constant_zero, constant_ratio, constant_infinity, constant_nan) = scalar_constants()\n    let (macro_enabled, macro_half, macro_zero, macro_ratio, macro_infinity, macro_nan, macro_scale_negative, macro_scale_magnitude) = scalar_macro_constants()\n    let (offset, sensor_capacity, enabled, ratio, uses_fahrenheit) = external_objects(42)\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and default_negative and default_magnitude == 2u64 and not open_negative and open_magnitude == 7u64 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and constant_enabled and constant_half == 0.5f16 and 1.0f32 / constant_zero < 0.0f32 and constant_ratio == 1.5 and constant_infinity and constant_nan and macro_enabled and macro_half == 0.25f16 and 1.0f32 / macro_zero < 0.0f32 and macro_ratio == 1.25 and macro_infinity and macro_nan and not macro_scale_negative and macro_scale_magnitude == 7u64 and offset == 42 and sensor_capacity == 4095u64 and enabled and ratio == 1.5 and uses_fahrenheit and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \

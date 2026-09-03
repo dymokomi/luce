@@ -15,9 +15,9 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
   constant, two header-local enumeration object constants, two header-local
   fundamental-integer object constants, six header-local Boolean/exact-IEEE
-  object constants, two explicitly selected fundamental-integer macro
-  constants, live mutable and read-only external
-  scalar and enumeration objects, and fieldwise
+  object constants, two selected fundamental-integer macros, and seven
+  selected Boolean/exact-IEEE/open-enumeration macros, live mutable and
+  read-only external scalar and enumeration objects, and fieldwise
   simple/nested record crossings. It exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
@@ -53,15 +53,18 @@ writer. The mutable unit object exercises the enum's checked
 Boolean-plus-magnitude reader and writer without exposing its C storage width.
 Object-like macros enter only through repeated `--macro-constant` selections;
 Clang establishes their active definition, exact type, source origin, and
-value without Luce interpreting replacement text.
-Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or `f64`;
-integer and typedef carriers retain one lossless portable shape; enum carriers
-retain one `bool` plus `u64` shape and expose the header's constants. The
-adapter alone asserts scalar representations, verifies integer target ranges,
+value without Luce interpreting replacement text. Selected macros use the same
+complete scalar value vocabulary as header-local constants: Boolean,
+fundamental integer, supported exact-IEEE floating, typedef-backed scalar, and
+open named-enumeration values.
+Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or
+`f64`; integer and typedef carriers retain one lossless portable shape; enum
+carriers retain one `bool` plus `u64` shape and expose the header's constants.
+The adapter alone asserts scalar representations, verifies integer target ranges,
 maps declared enum values to the target's exact C type, reasserts constant
 semantic values, and verifies record size, alignment, offsets, and field
 types. Other extended floating formats, pointers, unions, bit-fields,
-non-integer macro constants, aggregate, atomic,
+pointer/array/string macro constants, aggregate, atomic,
 or thread-local external objects, and recipes remain explicit generation
 errors until their complete contracts are implemented.
 
@@ -76,6 +79,13 @@ mkdir -p build/temperature
   --clang-arg -std=c11 \
   --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
   --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
+  --macro-constant LUCE_TEMPERATURE_MACRO_ENABLED \
+  --macro-constant LUCE_TEMPERATURE_MACRO_HALF_STEP \
+  --macro-constant LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO \
+  --macro-constant LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO \
+  --macro-constant LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY \
+  --macro-constant LUCE_TEMPERATURE_MACRO_UNDEFINED \
+  --macro-constant LUCE_TEMPERATURE_MACRO_OPEN_SCALE \
   examples/c_import/temperature.h
 ```
 

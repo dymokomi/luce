@@ -1647,7 +1647,8 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   fail explicitly. A filtered local-`__auto_type` AST preserves exact typedef
   spelling without requiring a constant initializer, then a separate filtered
   value AST proves constant evaluation and supplies four bounded 16-bit words.
-  This separation gives non-integer macros stable importer diagnostics while
+  At this milestone the separation gave non-integer macros stable importer
+  diagnostics; the later scalar-macro milestone extends the same probes while
   leaving every C expression and preprocessing rule owned by Clang.
 
   FIIR now identifies anonymous-enumeration, object, and macro provenance for
@@ -1753,6 +1754,32 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   owner; the general Clang suite is 1,575 lines. The completed repository gate
   is 965/965 compiler tests across 36 files plus CLI, Wasm, and native QBE
   shell gates.
+
+- [x] **Selected scalar C macros reuse the exact FIIR constant vocabulary**
+  (2026-09-03). The explicit `--macro-constant` inventory now admits Boolean,
+  fundamental-integer, exact IEEE binary16/binary32/binary64,
+  typedef-backed, and named-enumeration values. One shared Clang value-probe
+  renderer and decoder serves both header-local objects and selected macros;
+  the macro path retains its separate preprocessing and `__auto_type` type
+  products, so Luce still never parses replacement text or guesses C types.
+  Exact floating bits preserve finite values, signed zero, infinities, and the
+  language-observable NaN class. Enumeration macros retain their nominal open
+  Boolean-plus-magnitude carrier, including unnamed value `7`.
+
+  Generated Luce uses only the existing scalar and enum carriers. The
+  backend-owned C product independently reasserts each macro's exact type and
+  semantic value. Synthetic malformed-state tests and the real temperature
+  header cover type rejection, nonconstant values, missing binary16 facts,
+  invalid Boolean/enum facts, full generated products, both semantic oracles,
+  Wasm/QBE emission, warning-clean C11, ordinary and `-fshort-enums` linked QBE
+  execution, and the complete bind/build/run CLI path. Pointer, array, and
+  string macros remain rejected until their storage/lifetime contracts land.
+  Each full C expression is evaluated once before four bounded 16-bit facts
+  refer to it; this reduces Clang's filtered object/record fact JSON from 1.84
+  MiB to 1.42 MiB and the nine-macro product from 1.86 MiB to 0.99 MiB without
+  changing the durable FIIR format. No HIR, MIR, runtime, platform branch, or
+  backend instruction was added. The completed repository gate is 967/967
+  compiler tests across 36 files plus CLI, Wasm, and native QBE shell gates.
 
 - [x] **Plain C records cross FIIR through logical field carriers, never
   frontend layout** (2026-09-02). The Clang decoder catalogs complete structs,

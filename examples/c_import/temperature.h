@@ -79,4 +79,12 @@ luce_temperature_reading luce_shift_reading(luce_temperature_reading value, luce
 }
 #endif
 
+#define LUCE_TEMPERATURE_MACRO_ENABLED ((bool)true)
+#define LUCE_TEMPERATURE_MACRO_HALF_STEP ((luce_half_value)0.25)
+#define LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO (-0.0f)
+#define LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO (1.25)
+#define LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY (__builtin_inf())
+#define LUCE_TEMPERATURE_MACRO_UNDEFINED (__builtin_nan(""))
+#define LUCE_TEMPERATURE_MACRO_OPEN_SCALE ((luce_temperature_scale)7)
+
 #endif

@@ -85,6 +85,11 @@ FIIR retains floating encodings exactly; generated Luce reconstructs semantic
 values, preserving signed zero and infinities while canonicalizing unobservable
 NaN payloads. Volatile storage is not misrepresented as a constant, and the C
 product reasserts every imported constant's exact type and semantic value.
+Explicitly selected object-like macros reuse this complete scalar constant
+model: Clang alone resolves preprocessing, type, and value semantics for
+Boolean, supported exact-IEEE floating, fundamental-integer, typedef-backed,
+and open enumeration values. Pointer, array, and string macros remain rejected
+until their storage and lifetime carriers are defined.
 Declaration-only external scalar and enumeration objects remain live behind
 generated readers and, when mutable, writers. Integer writes are range checked;
 enumerations reuse the checked sign-and-magnitude boundary; `const` and
