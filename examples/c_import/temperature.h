@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 typedef int luce_degrees;
+typedef _Float16 luce_half_value;
 
 typedef struct {
     double minimum;
@@ -21,6 +22,7 @@ struct luce_temperature_reading {
     luce_temperature_range range;
     luce_degrees current;
     luce_temperature_scale scale;
+    luce_half_value fraction;
 };
 
 enum {
@@ -34,6 +36,7 @@ extern "C" {
 
 double luce_celsius_to_fahrenheit(double celsius);
 float luce_half_celsius(float celsius);
+luce_half_value luce_adjust_half(luce_half_value value, luce_half_value delta);
 int luce_adjust_celsius(int celsius, int delta);
 luce_degrees luce_echo_degrees(luce_degrees celsius);
 luce_temperature_scale luce_echo_scale(luce_temperature_scale scale);

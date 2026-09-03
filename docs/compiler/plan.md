@@ -357,8 +357,9 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   with exact IEEE rounding and two-byte storage. Both oracles, structural
   hashing and display, the full differential corpus, and
   `examples/numeric_conversions.luc` agree through native QBE and Wasm. Direct
-  f16 C ABI crossings remain part of the generated rich-boundary adapter work;
-  the compiler rejects them instead of silently widening the signature.
+  Unadapted direct f16 C ABI crossings remain rejected instead of silently
+  widening the signature. FIIR-generated `_Float16` crossings use the completed
+  exact private f32 adapter described below.
 - [x] **Named IEEE values live in the ordinary `math` module** (2026-09-01,
   `done.md` §2). Nine width-explicit constants cover NaN and both infinities
   for f16/f32/f64. Public constants now participate in the existing unified
@@ -487,8 +488,7 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   product slice below.
   Incoming bare/nullable C function pointers, cfunc fields, and the three
   explicit inbound-memory verbs are now complete in the separate rungs below.
-  Generated f16 adaptation and callback runtime enforcement remain on this
-  item.
+  Callback runtime enforcement remains on this item.
 - [x] **Checked byte access and the first adopted native example**
   (2026-08-30): `bytes.length`, `str.byte_count`, and checked `bytes[u64]`
   have explicit target-neutral HIR semantics and lower to the existing
@@ -882,13 +882,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   enum checks retain their existing adapter statuses. Focused validation,
   both semantic oracles, Wasm/QBE emission, CLI binding, warning-clean C11,
   and real linked QBE/C execution cover simple and nested records.
+- [x] **Generate exact `_Float16` imports without exposing its target ABI**
+  (2026-09-02). Clang evaluates binary16 size and format facts only when the
+  selected declaration graph reaches `_Float16`; FIIR retains its distinct C
+  identity and the generated public API remains nominal over semantic `f16`.
+  A private `f32` call carrier contains every IEEE binary16 value exactly, and
+  the backend-owned C adapter performs and asserts the explicit `_Float16`
+  conversion. Direct typedef/function and nested record-field paths agree in
+  both semantic oracles and execute against real C through QBE; Wasm validates
+  the same target-independent generated source. Regeneration under alternate
+  enum flags proves that only FIIR/C layout products vary with the C target.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
   unions, macro/object constants, arrays/pointers/function pointers/opaque
   types, ownership and nullability recipes, typed variadic adapters, support
   tiers, deterministic
-  regeneration diagnostics, and the generated f16 shim.
+  regeneration diagnostics.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
 - [x] **`luce build --time-report` for generics** (2026-08-31). Report source

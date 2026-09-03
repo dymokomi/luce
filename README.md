@@ -65,9 +65,11 @@ versioned JSON record of the exact host target and QBE-owned sizes,
 alignments, field offsets, symbols, and calling conventions.
 
 The C-import path generates inspectable FIIR, raw Luce, and C-adapter products
-from one exact Clang invocation. It admits C `_Bool`, IEEE binary32 `float`,
-IEEE binary64 `double` and `long double`, and every fundamental C integer
-through nominal target-independent carriers. Scalar typedefs over those types,
+from one exact Clang invocation. It admits C `_Bool`, IEEE binary16 `_Float16`,
+IEEE binary32 `float`, IEEE binary64 `double` and `long double`, and every
+fundamental C integer through nominal target-independent carriers. `_Float16`
+stays `f16` in the public generated API while its private adapter call uses
+`f32`, which losslessly contains every binary16 value. Scalar typedefs over those types,
 including dependency-owned names such as `size_t`, retain their own nominal
 carriers without inheriting a target width. Named and typedef-backed C enums
 use one nominal sign-magnitude carrier and typed constants; their target enum
@@ -76,9 +78,9 @@ checks integer ranges and rejects undeclared enum values. Constant-only
 anonymous enums use one target-independent sign-and-magnitude constant carrier
 without fabricating a C enum type. Plain C records use logical generated Luce
 records and private fixed field carriers; Clang-evaluated layout is asserted
-only by the backend-owned C adapter. Extended floating representations and
-broader declarations fail explicitly until their complete adapter contracts
-land.
+only by the backend-owned C adapter. Other extended floating representations
+and broader declarations fail explicitly until their complete adapter
+contracts land.
 The end-to-end command and generated module layout are documented in
 [`examples/c_import/README.md`](examples/c_import/README.md).
 

@@ -8,6 +8,10 @@ float luce_half_celsius(float celsius) {
     return celsius / 2.0f;
 }
 
+luce_half_value luce_adjust_half(luce_half_value value, luce_half_value delta) {
+    return value + delta;
+}
+
 int luce_adjust_celsius(int celsius, int delta) {
     return celsius + delta;
 }
@@ -38,5 +42,6 @@ luce_temperature_reading luce_shift_reading(luce_temperature_reading value, luce
     value.range.minimum += delta;
     value.range.maximum += delta;
     value.current += delta;
+    value.fraction += (_Float16)0.5;
     return value;
 }

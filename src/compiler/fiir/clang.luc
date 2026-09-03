@@ -47,6 +47,14 @@ pub struct ClangScalarFacts:
     pub let plain_char_is_signed: bool
     pub let bool_size_bits: u16
 
+## `_Float16` facts are queried only when the selected declaration graph uses
+## the type because not every C target exposes binary16.
+struct ClangFloat16Facts:
+    let size_bits: u16
+    let radix: u16
+    let significand_bits: u16
+    let maximum_exponent: i32
+
 ## Decode Clang's predefined-macro report (`-dM -E -x c`) into the scalar
 ## layout facts needed by this FIIR slice.
 pub func decode_clang_scalar_facts(macros: str) -> ClangScalarFacts!:
@@ -193,7 +201,7 @@ class ClangRecordCatalog:
 ## Decode the translation-unit JSON produced for `header`. Declarations owned
 ## by included headers remain foreign dependencies, except for typedef chains
 ## needed to express a selected header declaration exactly.
-pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts, record_layout_document: str = "") -> FiirModule!:
+pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts, target_fact_document: str = "") -> FiirModule!:
     if header == "": error("Clang FIIR: source header cannot be empty")
     if target == "": error("Clang FIIR: target cannot be empty")
     let root = json.parse(document) catch malformed:
@@ -206,8 +214,11 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let record_identities = try reachable_record_identities(declarations, header, records, typedefs)
-    try apply_record_layouts(records, record_identities, record_layout_document)
-    let interner = FiirTypeInterner(typedefs, enumerations, records, facts)
+    let needs_float16 = try selected_declarations_use_float16(declarations, header, record_identities, records, typedefs)
+    let layout_values = try decode_layout_values(record_identities, needs_float16, target_fact_document)
+    try apply_record_layouts(records, record_identities, layout_values)
+    let float16_facts = try decode_float16_facts(needs_float16, layout_values)
+    let interner = FiirTypeInterner(typedefs, enumerations, records, facts, float16_facts)
     let constants = list[FiirConstant]()
     let functions = list[FiirFunction]()
     let cursor = SourceCursor(path = "", line = u32(0))
@@ -323,7 +334,7 @@ func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCata
         if c_spelling != none: catalog.identity_by_spelling[c_spelling] = identity
     return catalog
 
-# mark: Record declarations and layout probes =================================================
+# mark: Record declarations and target-fact probes =============================================
 
 func collect_records(declarations: list[json.Json]) -> ClangRecordCatalog!:
     let catalog = ClangRecordCatalog()
@@ -369,10 +380,10 @@ func decode_record_fields(children: list[json.Json], record_origin: FiirSourceOr
         ))
     return fields
 
-## Render a Clang-evaluated layout query for exactly the plain records reachable
-## from declarations owned by `header`. Luce never calculates C layout: the
-## resulting enum constants are decoded as target facts beside the source AST.
-pub func render_record_layout_probe(document: str, header: str) -> str!:
+## Render one Clang-evaluated query for the target facts required by declarations
+## owned by `header`: layout for reachable plain records and the format of a
+## reachable `_Float16`. Luce never calculates these facts itself.
+pub func render_layout_probe(document: str, header: str) -> str!:
     let root = json.parse(document) catch malformed:
         error("Clang FIIR: " + json.describe(malformed))
     let root_kind = try required_text_member(root, "kind", "translation unit")
@@ -383,8 +394,9 @@ pub func render_record_layout_probe(document: str, header: str) -> str!:
     let records = try collect_records(declarations)
     let typedefs = try collect_typedefs(declarations, enumerations, records)
     let identities = try reachable_record_identities(declarations, header, records, typedefs)
-    if len(identities) == 0: return ""
-    var output = "/* Clang-evaluated FIIR record layout probe. */\n"
+    let needs_float16 = try selected_declarations_use_float16(declarations, header, identities, records, typedefs)
+    if len(identities) == 0 and not needs_float16: return ""
+    var output = "/* Clang-evaluated FIIR target-fact probe. */\n"
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
         try validate_plain_record_shape(record)
@@ -392,6 +404,13 @@ pub func render_record_layout_probe(document: str, header: str) -> str!:
         output += "#undef " + record_probe_name(index, "alignment_bits") + "\n"
         for field_index in range(0, len(record.fields)):
             output += "#undef " + record_probe_name(index, "field_" + str(field_index)) + "\n"
+    if needs_float16:
+        output += "#ifndef __FLT16_MANT_DIG__\n#error Clang does not expose _Float16 format facts\n#endif\n"
+        output += "#ifndef __FLT16_MAX_EXP__\n#error Clang does not expose _Float16 format facts\n#endif\n"
+        output += "#undef __luce_fiir_float16_size_bits\n"
+        output += "#undef __luce_fiir_float16_radix\n"
+        output += "#undef __luce_fiir_float16_significand_bits\n"
+        output += "#undef __luce_fiir_float16_maximum_exponent\n"
     output += "enum {\n"
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
@@ -400,31 +419,43 @@ pub func render_record_layout_probe(document: str, header: str) -> str!:
         output += "    " + record_probe_name(index, "alignment_bits") + " = __alignof__(" + spelling + ") * __CHAR_BIT__,\n"
         for field_index in range(0, len(record.fields)):
             output += "    " + record_probe_name(index, "field_" + str(field_index)) + " = __builtin_offsetof(" + spelling + ", " + try record_field_name(record.fields[field_index]) + ") * __CHAR_BIT__,\n"
+    if needs_float16:
+        output += "    __luce_fiir_float16_size_bits = sizeof(_Float16) * __CHAR_BIT__,\n"
+        output += "    __luce_fiir_float16_radix = __FLT_RADIX__,\n"
+        output += "    __luce_fiir_float16_significand_bits = __FLT16_MANT_DIG__,\n"
+        output += "    __luce_fiir_float16_maximum_exponent = __FLT16_MAX_EXP__,\n"
     return output + "};\n"
 
-func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], document: str) -> !:
-    if len(identities) == 0: return
-    if document == "": error("Clang FIIR: reachable C records have no Clang-evaluated layout probe")
-    let root = json.parse(document) catch malformed:
-        error("Clang FIIR record layout: " + json.describe(malformed))
-    let root_kind = try required_text_member(root, "kind", "record-layout translation unit")
-    if root_kind != "TranslationUnitDecl":
-        error("Clang FIIR record layout: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
-    let declarations = try required_array_member(root, "inner", "record-layout translation unit")
+func decode_layout_values(record_identities: list[str], needs_float16: bool, document: str) -> map[str, u64]!:
     let values = map[str, u64]()
+    if len(record_identities) == 0 and not needs_float16: return values
+    if document == "":
+        if needs_float16 and len(record_identities) > 0:
+            error("Clang FIIR: reachable C records and _Float16 have no Clang-evaluated target-fact probe")
+        if needs_float16: error("Clang FIIR: reachable C _Float16 has no Clang-evaluated target-fact probe")
+        error("Clang FIIR: reachable C records have no Clang-evaluated target-fact probe")
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR target facts: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "target-fact translation unit")
+    if root_kind != "TranslationUnitDecl":
+        error("Clang FIIR target facts: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
+    let declarations = try required_array_member(root, "inner", "target-fact translation unit")
     for declaration in declarations:
-        let kind = try optional_text_member(declaration, "kind", "record-layout declaration") else ""
+        let kind = try optional_text_member(declaration, "kind", "target-fact declaration") else ""
         if kind != "EnumDecl": continue
-        let children = try optional_array_member(declaration, "inner", "record-layout enum") else list[json.Json]()
+        let children = try optional_array_member(declaration, "inner", "target-fact enum") else list[json.Json]()
         for child in children:
-            let child_kind = try optional_text_member(child, "kind", "record-layout enum child") else ""
+            let child_kind = try optional_text_member(child, "kind", "target-fact enum child") else ""
             if child_kind != "EnumConstantDecl": continue
-            let name = try required_text_member(child, "name", "record-layout constant")
-            if not strings.starts_with(name, "__luce_fiir_record_"): continue
-            let value = try explicit_enumeration_value(child, "record-layout constant `" + name + "`") else error("Clang FIIR record layout: `" + name + "` has no evaluated value")
+            let name = try required_text_member(child, "name", "target-fact constant")
+            if not strings.starts_with(name, "__luce_fiir_record_") and not strings.starts_with(name, "__luce_fiir_float16_"): continue
+            let value = try explicit_enumeration_value(child, "target-fact constant `" + name + "`") else error("Clang FIIR target facts: `" + name + "` has no evaluated value")
             match value:
-                Negative(magnitude): error("Clang FIIR record layout: `" + name + "` is negative")
+                Negative(magnitude): error("Clang FIIR target facts: `" + name + "` is negative")
                 Nonnegative(integer): values[name] = integer
+    return values
+
+func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], values: map[str, u64]) -> !:
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
         record.size_bits = try required_record_probe_value(values, record_probe_name(index, "size_bits"))
@@ -434,8 +465,23 @@ func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], do
             offsets.append(try required_record_probe_value(values, record_probe_name(index, "field_" + str(field_index))))
         record.field_offsets = offsets
 
+func decode_float16_facts(required: bool, values: map[str, u64]) -> ClangFloat16Facts?!:
+    if not required: return none
+    return ClangFloat16Facts(
+        size_bits = try required_float16_u16(values, "size_bits"),
+        radix = try required_float16_u16(values, "radix"),
+        significand_bits = try required_float16_u16(values, "significand_bits"),
+        maximum_exponent = i32(try required_float16_u16(values, "maximum_exponent")),
+    )
+
+func required_float16_u16(values: map[str, u64], suffix: str) -> u16!:
+    let value = try required_record_probe_value(values, "__luce_fiir_float16_" + suffix)
+    if value == u64(0) or value > u64(65535):
+        error("Clang FIIR target facts: `_Float16` " + suffix + " is outside the supported range")
+    return u16(value)
+
 func required_record_probe_value(values: map[str, u64], name: str) -> u64!:
-    if not values.has(name): error("Clang FIIR record layout: missing evaluated constant `" + name + "`")
+    if not values.has(name): error("Clang FIIR target facts: missing evaluated constant `" + name + "`")
     return values[name]
 
 func record_probe_name(index: i64, suffix: str) -> str:
@@ -483,6 +529,46 @@ func reachable_record_identities(declarations: list[json.Json], header: str, rec
                 if child_kind == "ParmVarDecl":
                     try append_record_spelling(try required_type_spelling(child, "C function parameter"), identities, records, typedefs)
     return identities
+
+## Decide whether the selected declaration graph needs `_Float16` target
+## facts. This follows only typedef and record edges already admitted by the
+## importer; included-header declarations do not trigger work on their own.
+func selected_declarations_use_float16(declarations: list[json.Json], header: str, record_identities: list[str], records: ClangRecordCatalog, typedefs: map[str, ClangTypedef]) -> bool!:
+    for identity in record_identities:
+        for field in records.by_identity[identity].fields:
+            if spelling_resolves_to_float16(field.type_spelling, typedefs, list[str]()): return true
+    let cursor = SourceCursor(path = "", line = u32(0))
+    for declaration in declarations:
+        let location = declaration.member("loc")
+        if location == none: continue
+        let origin = try update_origin(cursor, location)
+        if origin == none or cursor.path != header: continue
+        let kind = try optional_text_member(declaration, "kind", "declaration") else ""
+        if kind == "TypedefDecl":
+            let name = try required_text_member(declaration, "name", "typedef at " + origin_text(origin))
+            if spelling_resolves_to_float16(name, typedefs, list[str]()): return true
+        elif kind == "FunctionDecl":
+            let signature = try required_type_spelling(declaration, "C function at " + origin_text(origin))
+            let delimiter = strings.find(signature, " (")
+            if delimiter != none:
+                if spelling_resolves_to_float16(signature[:delimiter], typedefs, list[str]()): return true
+            let children = try optional_array_member(declaration, "inner", "C function at " + origin_text(origin)) else list[json.Json]()
+            for child in children:
+                let child_kind = try optional_text_member(child, "kind", "C function child") else ""
+                if child_kind == "ParmVarDecl":
+                    if spelling_resolves_to_float16(try required_type_spelling(child, "C function parameter"), typedefs, list[str]()): return true
+    return false
+
+func spelling_resolves_to_float16(spelling: str, typedefs: map[str, ClangTypedef], active: list[str]) -> bool:
+    let canonical = unqualified_scalar_spelling(strings.trim(spelling))
+    if canonical == "_Float16": return true
+    if not typedefs.has(canonical): return false
+    for name in active:
+        if name == canonical: return false
+    active.append(canonical)
+    let result = spelling_resolves_to_float16(typedefs[canonical].target_spelling, typedefs, active)
+    active.remove(len(active) - 1)
+    return result
 
 func append_record_spelling(spelling: str, identities: list[str], records: ClangRecordCatalog, typedefs: map[str, ClangTypedef]) -> !:
     let canonical = unqualified_scalar_spelling(strings.trim(spelling))
@@ -677,8 +763,9 @@ class FiirTypeInterner:
     let record_type_ids: map[str, FiirTypeId]
     let resolving_records: list[str]
     let facts: ClangScalarFacts
+    let float16_facts: ClangFloat16Facts?
 
-    init(typedefs: map[str, ClangTypedef], enumerations: ClangEnumerationCatalog, records: ClangRecordCatalog, facts: ClangScalarFacts):
+    init(typedefs: map[str, ClangTypedef], enumerations: ClangEnumerationCatalog, records: ClangRecordCatalog, facts: ClangScalarFacts, float16_facts: ClangFloat16Facts?):
         self.types = list[FiirType]()
         self.type_ids = map[str, FiirTypeId]()
         self.resolving = list[str]()
@@ -689,6 +776,7 @@ class FiirTypeInterner:
         self.record_type_ids = map[str, FiirTypeId]()
         self.resolving_records = list[str]()
         self.facts = facts
+        self.float16_facts = float16_facts
 
     func intern(spelling: str, context: str) -> FiirTypeId!:
         var canonical = strings.trim(spelling)
@@ -741,6 +829,9 @@ class FiirTypeInterner:
             value_type = integer_type(canonical, FiirCIntegerKind.signed_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, true)
         elif canonical == "unsigned long long" or canonical == "unsigned long long int":
             value_type = integer_type(canonical, FiirCIntegerKind.unsigned_long_long, self.facts.long_long_value_bits, self.facts.long_long_size_bits, false)
+        elif canonical == "_Float16":
+            let float16 = self.float16_facts else error("Clang FIIR: " + context + " uses `_Float16` without evaluated target facts")
+            value_type = floating_type(canonical, FiirCFloatingKind.float16, float16.size_bits, float16.radix, float16.significand_bits, float16.maximum_exponent)
         elif canonical == "float":
             value_type = floating_type(canonical, FiirCFloatingKind.single, self.facts.float_storage_bits, self.facts.float_radix, self.facts.float_significand_bits, self.facts.float_maximum_exponent)
         elif canonical == "double":

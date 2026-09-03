@@ -14,13 +14,13 @@ Last updated: 2026-09-02 (Stage-0 0.30).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. Explicit inbound C-memory copies are closed standard-source intrinsics behind ordinary public wrappers. **Not yet**: FIIR-generated rich adapters, including f16, and callback runtime enforcement. Each unsupported form fails with a span. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. Explicit inbound C-memory copies are closed standard-source intrinsics behind ordinary public wrappers. **Not yet**: the remaining FIIR-generated rich adapters and callback runtime enforcement. Each unsupported form fails with a span. |
 | HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Its process runner accepts explicit arguments as the ordinary `slice[str]` semantic shape. |
 | Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed mutable/frozen collections and slices, nominal interfaces/classes/weak handles, closures/cells, generated ownership helpers, structured task groups and typed transfer runs, with no physical layout or execution-domain policy. The verifier proves every rule, reachability removes unreachable closed-world resources while retaining only each transfer graph's semantic service closure, and the MIR interpreter executes every instruction under explicit test layout rules. |
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| Tests | 938 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 952 unit tests across 34 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Done, in order
@@ -454,8 +454,19 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   a binary32 midpoint double-round. Positive, ties-to-even, subnormal,
   signed-zero, structural-hash and display, finite-overflow, two-byte storage,
   native QBE, Wasmtime, and executable-example evidence agree. Direct f16 C
-  ABI crossings remain rejected until the rich-boundary adapter can preserve
-  `_Float16` without pretending it is f32.
+  ABI crossings remain rejected unless they pass through the FIIR-generated
+  adapter below; direct extern declarations never pretend f16 is f32.
+- [x] **Generated C `_Float16` bindings preserve semantic f16 without exposing
+  its ABI** (2026-09-02). The selected-header graph requests Clang-evaluated
+  binary16 size, radix, significand, and exponent facts only when reachable.
+  FIIR serializes the distinct fundamental identity; generated public typedefs,
+  function parameters/results, and record fields remain nominal over `f16`.
+  The raw adapter edge uses `f32` as an exact value transport and the generated
+  C product casts to/from `_Float16` while asserting the recorded format. Both
+  semantic oracles, Wasm generation, native QBE/C execution, CLI binding, and
+  the checked-in C-import example cover direct and nested crossings. A target
+  enum-layout variant is re-inspected before compilation, proving target facts
+  change FIIR/C products without changing generated Luce semantics.
 - [x] **Named IEEE special values establish the first ordinary `math` surface**
   (2026-09-01). `src/standard/math.luc` declares width-explicit NaN, positive
   infinity, and negative infinity constants for f16/f32/f64 using only the
@@ -1488,8 +1499,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   and dispose-after-copy ordering; a real linked QBE/C harness proves the byte
   contents and exactly one successful disposal. Typed-package identity/node
   round trips preserve standard provenance and both HIR forms. The complete
-  906-test, CLI, Wasmtime, and native-QBE gate is green. The generated f16
-  adapter remains correctly dependent on S21 FIIR, while automatic inclusion
+  906-test, CLI, Wasmtime, and native-QBE gate is green. Automatic inclusion
   of standard modules in compiler products remains S30.
 
 - [x] **The first Clang-to-QBE FIIR binding is an executable product path**
