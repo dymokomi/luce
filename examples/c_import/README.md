@@ -13,9 +13,10 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
   `c.float16`, `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
-  constant, two header-local fundamental-integer object constants, two
-  explicitly selected fundamental-integer macro constants, live mutable and
-  read-only external scalar and enumeration objects, and fieldwise
+  constant, two header-local fundamental-integer object constants, six
+  header-local Boolean/exact-IEEE object constants, two explicitly selected
+  fundamental-integer macro constants, live mutable and read-only external
+  scalar and enumeration objects, and fieldwise
   simple/nested record crossings. It exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
@@ -34,9 +35,13 @@ product. A constant-only anonymous enum contributes universal
 sign-and-magnitude constants
 instead of an unusable synthetic type or a target-selected integer carrier.
 Header-local `static const` fundamental-integer objects use that same carrier
-after Clang proves and evaluates their complete value. Declaration-only
-external scalar objects remain runtime storage: the raw module exposes readers
-and mutable writers, while the generated C product performs the actual access.
+after Clang proves and evaluates their complete value. Boolean and supported
+exact-IEEE floating constants have separate FIIR value kinds; floating bits
+are retained exactly through inspection and serialization, then reconstructed
+as semantic Luce values. Signed zero and infinities remain distinct while NaN
+payloads collapse to Luce's one observable NaN. Declaration-only external
+scalar objects remain runtime storage: the raw module exposes readers and
+mutable writers, while the generated C product performs the actual access.
 The example's offset is volatile, so every read and write remains observable;
 its `const` sensor capacity has no generated writer. Boolean and floating
 objects exercise the direct scalar writer path alongside the checked integer
@@ -49,11 +54,12 @@ Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or `f
 integer and typedef carriers retain one lossless portable shape; enum carriers
 retain one `bool` plus `u64` shape and expose the header's constants. The
 adapter alone asserts scalar representations, verifies integer target ranges,
-maps declared enum values to the target's exact C type, and verifies record
-size, alignment, offsets, and field types. Other extended floating formats,
-pointers, unions, bit-fields, non-integer macro or object constants, aggregate,
-atomic, or thread-local external objects, and recipes remain explicit
-generation errors until their complete contracts are implemented.
+maps declared enum values to the target's exact C type, reasserts constant
+semantic values, and verifies record size, alignment, offsets, and field
+types. Other extended floating formats, pointers, unions, bit-fields,
+enumeration object constants, non-integer macro constants, aggregate, atomic,
+or thread-local external objects, and recipes remain explicit generation
+errors until their complete contracts are implemented.
 
 Generate the binding products with explicit destinations:
 

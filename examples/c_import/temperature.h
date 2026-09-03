@@ -32,8 +32,20 @@ enum {
 
 static const long long LUCE_TEMPERATURE_SIGNED_MINIMUM = (-9223372036854775807LL - 1LL);
 static const unsigned long long LUCE_TEMPERATURE_UNSIGNED_MAXIMUM = 18446744073709551615ULL;
+static const bool LUCE_TEMPERATURE_DEFAULT_ENABLED = true;
+static const luce_half_value LUCE_TEMPERATURE_HALF_STEP = (_Float16)0.5;
+static const float LUCE_TEMPERATURE_NEGATIVE_ZERO = -0.0f;
+static const double LUCE_TEMPERATURE_REFERENCE_RATIO = 1.5;
+static const double LUCE_TEMPERATURE_POSITIVE_INFINITY = __builtin_inf();
+static const double LUCE_TEMPERATURE_UNDEFINED = __builtin_nan("");
 _Static_assert(LUCE_TEMPERATURE_SIGNED_MINIMUM < 0, "signed constant must remain negative");
 _Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM > 0, "unsigned constant must remain positive");
+_Static_assert(LUCE_TEMPERATURE_DEFAULT_ENABLED, "Boolean constant must remain true");
+_Static_assert(LUCE_TEMPERATURE_HALF_STEP == (_Float16)0.5, "binary16 constant must remain exact");
+_Static_assert(1.0f / LUCE_TEMPERATURE_NEGATIVE_ZERO < 0.0f, "binary32 constant must retain negative zero");
+_Static_assert(LUCE_TEMPERATURE_REFERENCE_RATIO == 1.5, "binary64 constant must remain exact");
+_Static_assert(__builtin_isinf(LUCE_TEMPERATURE_POSITIVE_INFINITY), "infinity constant must remain infinite");
+_Static_assert(__builtin_isnan(LUCE_TEMPERATURE_UNDEFINED), "NaN constant must remain NaN");
 
 #define LUCE_TEMPERATURE_ABSOLUTE_ZERO ((luce_degrees)-273)
 #define LUCE_TEMPERATURE_SENSOR_LIMIT 4095ULL

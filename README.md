@@ -76,9 +76,13 @@ use one nominal sign-magnitude carrier and typed constants; their target enum
 representation is mediated entirely by the generated C adapter, which also
 checks integer ranges and rejects undeclared enum values. Constant-only
 anonymous enums use one target-independent sign-and-magnitude constant carrier
-without fabricating a C enum type. Header-local `static const` fundamental
-integer objects join that same typed constant model after Clang proves and
-evaluates the value; volatile storage is not misrepresented as a constant.
+without fabricating a C enum type. Header-local `static const`
+fundamental-integer, Boolean, and supported exact-IEEE floating objects join
+that typed constant model after Clang proves and evaluates the value. FIIR
+retains floating encodings exactly; generated Luce reconstructs semantic
+values, preserving signed zero and infinities while canonicalizing unobservable
+NaN payloads. Volatile storage is not misrepresented as a constant, and the C
+product reasserts every imported constant's exact type and semantic value.
 Declaration-only external scalar and enumeration objects remain live behind
 generated readers and, when mutable, writers. Integer writes are range checked;
 enumerations reuse the checked sign-and-magnitude boundary; `const` and

@@ -935,13 +935,23 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   imported object. Both semantic oracles, Wasm/QBE emission, the example CLI,
   ordinary and `-fshort-enums` native execution, and a real corrupted-object
   trap cover the slice without adding HIR or MIR concepts.
+- [x] **Import header-local Boolean and exact-IEEE floating objects as
+  evaluated constants** (2026-09-03). Clang bit-casts each supported value in
+  the target-fact probe, FIIR retains its semantic kind and exact bits, and
+  generated Luce reconstructs ordinary `bool`, `f16`, `f32`, or `f64` values.
+  Finite values, infinities, and signed zero remain exact; NaN payloads collapse
+  only at the Luce semantic boundary where payload identity is unobservable.
+  The generated C product reasserts exact types and semantic values. Focused
+  validation, both semantic oracles, Wasm/QBE emission, CLI materialization,
+  and real linked C execution cover the slice without adding an HIR/MIR or
+  backend instruction.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, non-integer object constants, aggregate/atomic/thread-local objects,
-  arrays/pointers/function pointers/opaque types, ownership and nullability
-  recipes, typed variadic adapters, support tiers, deterministic regeneration
-  diagnostics.
+  unions, enumeration object constants, non-integer macro constants,
+  aggregate/atomic/thread-local objects, arrays/pointers/function
+  pointers/opaque types, ownership and nullability recipes, typed variadic
+  adapters, support tiers, deterministic regeneration diagnostics.
 - [ ] **Wasm engine in Luce**: decoder + validator + interpreter with fuel at back-edges and calls; differential-tested against `wasmtime`; then the compiler tests drop `wasmtime`.
 - [ ] **Host slices**: storage journal + acceptance rule → crypto → terminal headless shell → `WasmHost` running proving program 1 → realm/network → UI/Metal.
 - [x] **`luce build --time-report` for generics** (2026-08-31). Report source

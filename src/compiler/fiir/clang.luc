@@ -6,7 +6,7 @@
 #       Decodes Clang's JSON AST into target-neutral FIIR. JSON and Clang's
 #       spelling conventions stop here. The decoder accepts scalar typedefs,
 #       C enumerations, constant-only anonymous enumerations, header-local
-#       integral object constants, external scalar objects, plain records, and
+#       scalar object constants, external scalar objects, plain records, and
 #       functions; every other declaration or type is either outside the
 #       requested header or rejected with a stable support diagnostic.
 #
@@ -16,7 +16,7 @@
 #
 #==============================================================================================
 
-from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirObject, FiirObjectAccess, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, is_c_identifier, plain_value_boundary, validate_fiir
+from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirObject, FiirObjectAccess, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, exact_ieee_floating_width, is_c_identifier, plain_value_boundary, validate_fiir
 import std.json
 import std.strings
 
@@ -252,8 +252,16 @@ struct ClangTypedef:
     let target_record_id: str?
     let origin: FiirSourceOrigin
 
+enum ClangScalarConstantKind:
+    integer
+    boolean
+    float16
+    single
+    double
+    long_double
+
 union ClangObjectKind:
-    Constant
+    Constant(value_kind: ClangScalarConstantKind)
     External(access: FiirObjectAccess)
 
 struct ClangObject:
@@ -395,7 +403,7 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
                 error("Clang FIIR: object catalog is inconsistent at `" + name + "`")
             let object = object_declarations[object_index]
             match object.kind:
-                Constant:
+                Constant(value_kind):
                     try append_object_constant(object, object_constant_index, target_facts, interner, constants)
                     object_constant_index += 1
                 External(access): try append_external_object(object, access, interner, objects)
@@ -498,7 +506,7 @@ func collect_enumerations(declarations: list[json.Json]) -> ClangEnumerationCata
 # mark: Object declarations ===================================================================
 
 ## Classify every header-owned object before target-fact probing. Header-local
-## immutable integer definitions become values; declaration-only `extern`
+## immutable scalar definitions become values; declaration-only `extern`
 ## objects remain live storage and cross through generated accessors. Other
 ## definitions would bind the adapter's private copy or define storage merely
 ## by including the header, so they fail rather than changing C semantics.
@@ -523,9 +531,8 @@ func collect_objects(declarations: list[json.Json], header: str, typedefs: map[s
         if storage == "static" and has_initializer and is_const:
             if is_volatile:
                 error("Clang FIIR: C object `" + name + "` is volatile runtime storage and cannot become a generated constant")
-            if not spelling_resolves_to_integer(spelling, typedefs, list[str]()):
-                error("Clang FIIR: C object constant `" + name + "` has unsupported non-integer type `" + spelling + "`")
-            objects.append(ClangObject(name = name, type_spelling = spelling, kind = ClangObjectKind.Constant, is_volatile = is_volatile, origin = origin))
+            let value_kind = scalar_constant_kind(spelling, typedefs, list[str]()) else error("Clang FIIR: C object constant `" + name + "` has unsupported type `" + spelling + "`")
+            objects.append(ClangObject(name = name, type_spelling = spelling, kind = ClangObjectKind.Constant(value_kind = value_kind), is_volatile = is_volatile, origin = origin))
         elif storage == "extern" and not has_initializer:
             if try object_has_thread_storage(declaration):
                 error("Clang FIIR: external C object `" + name + "` uses thread-local storage, which has no generated accessor contract yet")
@@ -542,7 +549,7 @@ func count_object_constants(objects: list[ClangObject]) -> i64:
     var count = 0
     for object in objects:
         match object.kind:
-            Constant: count += 1
+            Constant(value_kind): count += 1
             External(access): pass
     return count
 
@@ -550,7 +557,7 @@ func constant_objects(objects: list[ClangObject]) -> list[ClangObject]:
     let constants = list[ClangObject]()
     for object in objects:
         match object.kind:
-            Constant: constants.append(object)
+            Constant(value_kind): constants.append(object)
             External(access): pass
     return constants
 
@@ -600,6 +607,25 @@ func spelling_resolves_to_integer(spelling: str, typedefs: map[str, ClangTypedef
         if name == canonical: return false
     active.append(canonical)
     let result = spelling_resolves_to_integer(typedefs[canonical].target_spelling, typedefs, active)
+    active.remove(len(active) - 1)
+    return result
+
+## Resolve only the scalar families whose complete value can be represented in
+## FIIR before target facts are available. Exact floating-model validation is
+## deliberately deferred until the same Clang invocation has supplied it.
+func scalar_constant_kind(spelling: str, typedefs: map[str, ClangTypedef], active: list[str]) -> ClangScalarConstantKind?:
+    let canonical = unqualified_scalar_spelling(strings.trim(spelling))
+    if fundamental_integer_kind(canonical) != none: return ClangScalarConstantKind.integer
+    if canonical == "_Bool" or canonical == "bool": return ClangScalarConstantKind.boolean
+    if canonical == "_Float16": return ClangScalarConstantKind.float16
+    if canonical == "float": return ClangScalarConstantKind.single
+    if canonical == "double": return ClangScalarConstantKind.double
+    if canonical == "long double": return ClangScalarConstantKind.long_double
+    if not typedefs.has(canonical): return none
+    for name in active:
+        if name == canonical: return none
+    active.append(canonical)
+    let result = scalar_constant_kind(typedefs[canonical].target_spelling, typedefs, active)
     active.remove(len(active) - 1)
     return result
 
@@ -687,6 +713,7 @@ pub func render_target_fact_probe(document: str, header: str) -> str!:
         output += "#undef " + object_constant_probe_name(index, "is_constant") + "\n"
         for word in range(0, 4):
             output += "#undef " + object_constant_probe_name(index, "word_" + str(word)) + "\n"
+        output += try render_floating_object_bits_probe(object_constants[index], index)
     output += "enum {\n"
     for index in range(0, len(identities)):
         let record = records.by_identity[identities[index]]
@@ -703,11 +730,57 @@ pub func render_target_fact_probe(document: str, header: str) -> str!:
     for index in range(0, len(object_constants)):
         let name = object_constants[index].name
         let constant_check = "__builtin_constant_p(" + name + ")"
+        let raw_bits = try object_constant_bits_expression(object_constants[index], index)
         output += "    " + object_constant_probe_name(index, "is_constant") + " = " + constant_check + ",\n"
         for word in range(0, 4):
             let shift = str(word * 16)
-            output += "    " + object_constant_probe_name(index, "word_" + str(word)) + " = __builtin_choose_expr(" + constant_check + ", (int)(((uint64_t)(" + name + ") >> " + shift + ") & UINT64_C(65535)), 0),\n"
-    return output + "};\n"
+            output += "    " + object_constant_probe_name(index, "word_" + str(word)) + " = __builtin_choose_expr(" + constant_check + ", (int)((" + raw_bits + " >> " + shift + ") & UINT64_C(65535)), 0),\n"
+    output += "};\n"
+    for index in range(0, len(object_constants)):
+        match object_constants[index].kind:
+            Constant(value_kind):
+                match value_kind:
+                    float16, single, double, long_double: output += "#undef " + object_constant_bits_probe_name(index) + "\n"
+                    integer, boolean: pass
+            External(access): trap("Clang FIIR constant catalog contains external storage")
+    return output
+
+## Keep bit reinterpretation inside Clang's target-fact query. Size guards let
+## unsupported target models reach FIIR's stable lossless-carrier diagnostic
+## instead of failing incidentally while Clang parses an unselected bit cast.
+func render_floating_object_bits_probe(object: ClangObject, index: i64) -> str!:
+    let bits_name = object_constant_bits_probe_name(index)
+    match object.kind:
+        Constant(value_kind):
+            var bit_type = ""
+            var size_condition = ""
+            match value_kind:
+                integer, boolean: return ""
+                float16: bit_type = "uint16_t"
+                single:
+                    bit_type = "uint32_t"
+                    size_condition = "__SIZEOF_FLOAT__ == 4"
+                double:
+                    bit_type = "uint64_t"
+                    size_condition = "__SIZEOF_DOUBLE__ == 8"
+                long_double:
+                    bit_type = "uint64_t"
+                    size_condition = "__SIZEOF_LONG_DOUBLE__ == 8"
+            var output = "#undef " + bits_name + "\n"
+            if size_condition != "": output += "#if " + size_condition + "\n"
+            output += "#define " + bits_name + " ((uint64_t)__builtin_bit_cast(" + bit_type + ", " + object.name + "))\n"
+            if size_condition != "":
+                output += "#else\n#define " + bits_name + " UINT64_C(0)\n#endif\n"
+            return output
+        External(access): error("Clang FIIR constant probe received external C object `" + object.name + "`")
+
+func object_constant_bits_expression(object: ClangObject, index: i64) -> str!:
+    match object.kind:
+        Constant(value_kind):
+            match value_kind:
+                integer, boolean: return "((uint64_t)(" + object.name + "))"
+                float16, single, double, long_double: return object_constant_bits_probe_name(index)
+        External(access): error("Clang FIIR constant probe received external C object `" + object.name + "`")
 
 ## Ask Clang for selected macro types inside one filtered function AST. Local
 ## `__auto_type` preserves typedef spelling without requiring the macro to be
@@ -879,6 +952,9 @@ func record_probe_name(index: i64, suffix: str) -> str:
 func object_constant_probe_name(index: i64, suffix: str) -> str:
     return "__luce_fiir_object_constant_" + str(index) + "_" + suffix
 
+func object_constant_bits_probe_name(index: i64) -> str:
+    return "__luce_fiir_object_constant_" + str(index) + "_bits"
+
 func macro_constant_type_probe_name(index: i64) -> str:
     return "__luce_fiir_macro_constant_type_" + str(index)
 
@@ -897,7 +973,29 @@ func append_object_constant(declaration: ClangObject, index: i64, values: map[st
                 value = FiirConstantValue.Integer(value = try decode_integer_probe_value("C object `" + declaration.name + "`", "C object `" + declaration.name + "`", "target facts", object_constant_probe_name(index, ""), is_signed, values)),
                 origin = declaration.origin,
             ))
-        else: error("Clang FIIR: C object constant `" + declaration.name + "` does not resolve to an integer type")
+        Boolean:
+            let raw = try decode_probe_bits("C object `" + declaration.name + "`", "C object `" + declaration.name + "`", "target facts", object_constant_probe_name(index, ""), values)
+            if raw > u64(1): error("Clang FIIR target facts: C object `" + declaration.name + "` has invalid Boolean value " + str(raw))
+            constants.append(FiirConstant(
+                name = declaration.name,
+                source = FiirConstantSource.object,
+                value_type = value_type,
+                value = FiirConstantValue.Boolean(value = raw == u64(1)),
+                origin = declaration.origin,
+            ))
+        Floating(kind, radix, significand_bits, maximum_exponent):
+            let width = exact_ieee_floating_width(resolved) else error("Clang FIIR: C object constant `" + declaration.name + "` has no lossless Luce carrier for type `" + resolved.spelling + "`")
+            let raw = try decode_probe_bits("C object `" + declaration.name + "`", "C object `" + declaration.name + "`", "target facts", object_constant_probe_name(index, ""), values)
+            if width < u16(64) and raw >> u64(width) != u64(0):
+                error("Clang FIIR target facts: C object `" + declaration.name + "` has bits outside its " + str(width) + "-bit representation")
+            constants.append(FiirConstant(
+                name = declaration.name,
+                source = FiirConstantSource.object,
+                value_type = value_type,
+                value = FiirConstantValue.Floating(bits = raw),
+                origin = declaration.origin,
+            ))
+        else: error("Clang FIIR: C object constant `" + declaration.name + "` does not resolve to a supported scalar type")
 
 func append_external_object(declaration: ClangObject, access: FiirObjectAccess, interner: FiirTypeInterner, objects: list[FiirObject]) -> !:
     let value_type = try interner.intern(declaration.type_spelling, "external C object `" + declaration.name + "`")
@@ -927,6 +1025,12 @@ func append_macro_constant(declaration: ClangMacroConstant, index: i64, values: 
         else: error("Clang FIIR: selected C macro `" + declaration.name + "` does not resolve to an integer type")
 
 func decode_integer_probe_value(context: str, fact_context: str, fact_product: str, prefix: str, is_signed: bool, values: map[str, u64]) -> FiirIntegerValue!:
+    let raw = try decode_probe_bits(context, fact_context, fact_product, prefix, values)
+    if is_signed and raw > u64(9223372036854775807):
+        return FiirIntegerValue.Negative(magnitude = u64(18446744073709551615) - raw + u64(1))
+    return FiirIntegerValue.Nonnegative(value = raw)
+
+func decode_probe_bits(context: str, fact_context: str, fact_product: str, prefix: str, values: map[str, u64]) -> u64!:
     let is_constant = try required_fact_value(values, prefix + "is_constant", fact_product)
     if is_constant != u64(1):
         error("Clang FIIR: " + context + " does not have a Clang-evaluable constant value")
@@ -936,9 +1040,7 @@ func decode_integer_probe_value(context: str, fact_context: str, fact_product: s
         if part > u64(65535):
             error("Clang FIIR " + fact_product + ": " + fact_context + " word " + str(word) + " exceeds 16 bits")
         raw = raw | (part << u64(word * 16))
-    if is_signed and raw > u64(9223372036854775807):
-        return FiirIntegerValue.Negative(magnitude = u64(18446744073709551615) - raw + u64(1))
-    return FiirIntegerValue.Nonnegative(value = raw)
+    return raw
 
 func record_c_reference(record: ClangRecord) -> str!:
     let spelling = record.c_spelling
