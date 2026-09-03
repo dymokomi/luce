@@ -2089,6 +2089,35 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   safe examples. The completed repository gate is 972/972 compiler tests
   across 37 files plus CLI, Wasm, and native QBE shell gates.
 
+- [x] **Compile-time indexes, linear QBE emission, and named native traps**
+  (2026-09-03). A whole-compiler audit found the design sound and the
+  implementation naive in one consistent way: every lookup was a linear scan
+  and the QBE IL was one growing string. Type interning is now a hash of a
+  structural key in HIR, lowering, and package import; `contains_type_parameter`
+  and the five structural type walkers are memoized (the walkers under a
+  generation that every republished nominal bumps); HIR name, method, function,
+  constant, local, helper, and shared-cell lookups are indexed; the verifier
+  keeps an undo log instead of copying the defined-register set per region,
+  and the capability verifiers run only for functions that hold a capability.
+  The QBE emitter collects IL fragments and joins once. Measured: emitting 800
+  synthetic functions fell from 33.5 s to 0.45 s, a 200-struct type-heavy
+  check from 150 s to 1.3 s, and the differential file from 10 min 22 s to
+  6 min 02 s after compiling the sealed runtime once per sweep.
+
+  The lowerer gained one counted-loop helper (twelve hand-written traversal
+  loops), one signature assembler (four copies), and one call-result placement
+  helper (six copies); `ir.luc` gained `node_children`, the one place that
+  knows every node form's operands, and the prologue, effects, initialization,
+  and deinitializer walkers now match only the forms they treat specially.
+  Native traps name their reason on stderr with the same text the MIR oracle
+  reports, and the trapping sweep asserts that agreement. Three bugs were
+  found and fixed with fixtures: `recover` of a managed value double-released
+  it (native and Wasm printed garbage), `INT64_MIN * -1` did not trap natively
+  on arm64, and a recursive frozen container used as a map key exhausted the
+  compiler's call depth. The repository gate stays at 972/972 compiler tests
+  across 37 files plus CLI, Wasm, and native QBE shell gates; `main` is now the
+  former `stage1-qbe` line.
+
 ## 3. Bugs the multi-backend harness found
 
 Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.
@@ -2127,6 +2156,15 @@ Kept as evidence that the testing strategy (`plan.md` §1) earns its cost.
 14. Binary16 is an `s` call value in QBE but a two-byte IEEE memory value. A
     shared representation module and an executable worker round-trip now pin
     that distinction for both ordinary emission and task codecs.
+15. Lowerer: `recover <managed value>` registered the recovered value as a
+   handler temporary and released it before the catch result took ownership,
+   so QBE and Wasm both printed freed memory while the HIR oracle was right.
+16. QBE: the checked 64-bit multiply verified `computed / right == left`,
+   which arm64 `sdiv` satisfies for `INT64_MIN * -1`; the oracle trapped and
+   the native binary printed the minimum.
+17. HIR: `is_hashable_type` had no visited set, so a struct holding a
+   `frozen_list` of itself as a map key recursed until the compiler hit its
+   call-depth guard.
 
 ## 4. Where this came from — the lineage and the evidence
 
