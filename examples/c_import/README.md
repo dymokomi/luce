@@ -13,9 +13,10 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
 - `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
   `c.float16`, `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
-  constant, two header-local fundamental-integer object constants, six
-  header-local Boolean/exact-IEEE object constants, two explicitly selected
-  fundamental-integer macro constants, live mutable and read-only external
+  constant, two header-local enumeration object constants, two header-local
+  fundamental-integer object constants, six header-local Boolean/exact-IEEE
+  object constants, two explicitly selected fundamental-integer macro
+  constants, live mutable and read-only external
   scalar and enumeration objects, and fieldwise
   simple/nested record crossings. It exposes safe Luce-facing functions.
 - `main.luc` selectively imports and calls the Luce-facing function.
@@ -39,7 +40,10 @@ after Clang proves and evaluates their complete value. Boolean and supported
 exact-IEEE floating constants have separate FIIR value kinds; floating bits
 are retained exactly through inspection and serialization, then reconstructed
 as semantic Luce values. Signed zero and infinities remain distinct while NaN
-payloads collapse to Luce's one observable NaN. Declaration-only external
+payloads collapse to Luce's one observable NaN. Named and typedef-backed
+enumeration object constants retain the enum's nominal carrier and complete
+open sign-and-magnitude value, so an unnamed but valid C value is not silently
+rejected or collapsed to an integer constant. Declaration-only external
 scalar objects remain runtime storage: the raw module exposes readers and
 mutable writers, while the generated C product performs the actual access.
 The example's offset is volatile, so every read and write remains observable;
@@ -57,7 +61,7 @@ adapter alone asserts scalar representations, verifies integer target ranges,
 maps declared enum values to the target's exact C type, reasserts constant
 semantic values, and verifies record size, alignment, offsets, and field
 types. Other extended floating formats, pointers, unions, bit-fields,
-enumeration object constants, non-integer macro constants, aggregate, atomic,
+non-integer macro constants, aggregate, atomic,
 or thread-local external objects, and recipes remain explicit generation
 errors until their complete contracts are implemented.
 

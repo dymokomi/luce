@@ -77,9 +77,11 @@ representation is mediated entirely by the generated C adapter, which also
 checks integer ranges and rejects undeclared enum values. Constant-only
 anonymous enums use one target-independent sign-and-magnitude constant carrier
 without fabricating a C enum type. Header-local `static const`
-fundamental-integer, Boolean, and supported exact-IEEE floating objects join
-that typed constant model after Clang proves and evaluates the value. FIIR
-retains floating encodings exactly; generated Luce reconstructs semantic
+fundamental-integer, Boolean, supported exact-IEEE floating, and named or
+typedef-backed enumeration objects join that typed constant model after Clang
+proves and evaluates the value. Enumeration constants retain their nominal
+open sign-and-magnitude domain, including values without a named enumerator.
+FIIR retains floating encodings exactly; generated Luce reconstructs semantic
 values, preserving signed zero and infinities while canonicalizing unobservable
 NaN payloads. Volatile storage is not misrepresented as a constant, and the C
 product reasserts every imported constant's exact type and semantic value.

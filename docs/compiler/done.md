@@ -1731,6 +1731,29 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   threshold. The completed repository gate is 964/964 compiler tests across
   35 files plus CLI, Wasm, and native QBE shell gates.
 
+- [x] **Header-local C enumeration objects retain open nominal constant
+  values** (2026-09-03). FIIR gives named, typedef-backed, and alias-backed
+  `static const` enumeration definitions a distinct validated constant case.
+  Clang supplies one semantic sign fact and four bounded words from C's
+  defined `uint64_t` conversion, preserving the complete supported
+  signed-`i64`/unsigned-`u64` union without inferring a target enum width.
+  Values without a corresponding enumerator remain valid C enum values rather
+  than being rejected, collapsed to a case identity, or reclassified as
+  integer constants.
+
+  Generated raw Luce constructs the existing nominal Boolean-plus-magnitude
+  carrier and retains the constant's declared typedef spelling. The
+  backend-owned C product independently asserts the exact declared type and
+  semantic value. HIR and canonical MIR therefore gain no foreign, target, or
+  platform concept. Pure invalid-sign and negative-zero coverage, real Clang
+  inspection, both semantic oracles, Wasm/QBE emission, warning-clean C11,
+  ordinary and `-fshort-enums` linked QBE execution, and the complete CLI
+  bind/build/run example cover both declared value `-2` and unnamed open value
+  `7`. Object-constant fixtures and regressions now have a dedicated 546-line
+  owner; the general Clang suite is 1,575 lines. The completed repository gate
+  is 965/965 compiler tests across 36 files plus CLI, Wasm, and native QBE
+  shell gates.
+
 - [x] **Plain C records cross FIIR through logical field carriers, never
   frontend layout** (2026-09-02). The Clang decoder catalogs complete structs,
   resolves anonymous typedefs and forward declarations, and recursively keeps

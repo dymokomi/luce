@@ -945,10 +945,21 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   validation, both semantic oracles, Wasm/QBE emission, CLI materialization,
   and real linked C execution cover the slice without adding an HIR/MIR or
   backend instruction.
+- [x] **Import header-local enumeration objects as open nominal constants**
+  (2026-09-03). Named, typedef-backed, and alias-backed `static const` enum
+  definitions retain their declared FIIR type and a canonical
+  sign-and-magnitude value across the complete signed-`i64`/unsigned-`u64`
+  union. The Clang target-fact probe supplies semantic sign plus the defined
+  `uint64_t` conversion, so values without a named enumerator remain valid.
+  Generated Luce reuses the existing nominal enum carrier; the backend-owned
+  C product independently asserts the declaration's exact type and value.
+  Pure malformed-state coverage, real Clang import, both semantic oracles,
+  Wasm/QBE emission, the example CLI, ordinary and `-fshort-enums` native
+  execution cover the slice without adding an HIR/MIR or backend instruction.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, enumeration object constants, non-integer macro constants,
+  unions, non-integer macro constants,
   aggregate/atomic/thread-local objects, arrays/pointers/function
   pointers/opaque types, ownership and nullability recipes, typed variadic
   adapters, support tiers, deterministic regeneration diagnostics.

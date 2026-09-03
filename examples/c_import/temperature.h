@@ -30,6 +30,8 @@ enum {
     LUCE_WATER_BOILING_CELSIUS = 100
 };
 
+static const luce_temperature_scale LUCE_TEMPERATURE_DEFAULT_SCALE = LUCE_SCALE_CELSIUS;
+static const luce_temperature_scale LUCE_TEMPERATURE_OPEN_SCALE = (luce_temperature_scale)7;
 static const long long LUCE_TEMPERATURE_SIGNED_MINIMUM = (-9223372036854775807LL - 1LL);
 static const unsigned long long LUCE_TEMPERATURE_UNSIGNED_MAXIMUM = 18446744073709551615ULL;
 static const bool LUCE_TEMPERATURE_DEFAULT_ENABLED = true;
@@ -38,6 +40,8 @@ static const float LUCE_TEMPERATURE_NEGATIVE_ZERO = -0.0f;
 static const double LUCE_TEMPERATURE_REFERENCE_RATIO = 1.5;
 static const double LUCE_TEMPERATURE_POSITIVE_INFINITY = __builtin_inf();
 static const double LUCE_TEMPERATURE_UNDEFINED = __builtin_nan("");
+_Static_assert(LUCE_TEMPERATURE_DEFAULT_SCALE == LUCE_SCALE_CELSIUS, "declared enum object constant must remain exact");
+_Static_assert(LUCE_TEMPERATURE_OPEN_SCALE == (luce_temperature_scale)7, "open enum object constant must remain exact");
 _Static_assert(LUCE_TEMPERATURE_SIGNED_MINIMUM < 0, "signed constant must remain negative");
 _Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM > 0, "unsigned constant must remain positive");
 _Static_assert(LUCE_TEMPERATURE_DEFAULT_ENABLED, "Boolean constant must remain true");
