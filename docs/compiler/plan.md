@@ -22,13 +22,13 @@ rejection. Do not merge the superseded native-backend work from `main`, and do
 not begin a Luce-owned machine backend before this checkpoint is complete and
 audited.
 
-The repository currently proves 968 compiler tests across 36 files, plus the
-CLI, Wasmtime, QBE differential, and host-native gates. The latest FIIR slice
-imports direct pointers to typedef-backed incomplete C records as nominal raw
-handles without introducing C layout or platform facts into HIR or MIR. The
-next implementation slice is **S21 binding recipes and safe wrapper
-ownership**, beginning at the unchecked row under “Complete C import (FIIR)”
-below.
+The repository currently proves 972 compiler tests across 37 files, plus the
+CLI, Wasmtime, QBE differential, and host-native gates. FIIR 2 keeps
+Clang-proven pointer facts separate from reviewed binding recipes and generates
+ordinary safe Luce owners, checked call borrows, returned-borrow anchors, and
+integer-status failures for direct opaque handles. The next implementation
+slice is **S21 complete opaque-handle spellings and directions**, beginning at
+the first row under §5.2 below.
 
 There are three deliberately non-overlapping sources of truth:
 
@@ -297,20 +297,17 @@ constant-only anonymous enums, plain nested records, header-local scalar/enum
 constants, selected scalar macros, live scalar/enum objects, fixed functions,
 and direct pointers to typedef-backed incomplete records all pass Clang facts
 through deterministic FIIR/raw/C products, both semantic oracles, Wasm, and
-linked QBE/C. The most recent handle rung retains nullability, pointee
-mutability, origin, and unspecified ownership/lifetime; typed pointers and
-layout terminate in the C adapter.
+linked QBE/C. A separate reviewed recipe section now classifies every direct
+opaque boundary needed by a safe module; generated owners, call borrows,
+returned-borrow anchors, disposers, and integer-status failures execute through
+the same ordinary HIR/MIR pipeline. Typed pointers and layout still terminate
+in the C adapter.
 
 Unsupported declarations must continue to fail before HIR rather than acquire
 an approximate carrier. Resume in this order; each row is one independently
 committable vertical slice and updates the spec, examples, conformance ledger,
 and diagnostics with its tests:
 
-- [ ] **Binding recipes and safe wrapper ownership.** Separate facts Clang
-  proves from facts a recipe supplies. Generate nullable, borrowed-for-call,
-  returned-borrow, owned-plus-disposer, and status/error wrappers. Missing safe
-  ownership facts are generation errors; only the audited raw layer may retain
-  explicit “unspecified” facts.
 - [ ] **Complete opaque-handle spellings and directions.** Add direct tagged
   struct pointers, pointer typedef chains, const/read-only results, and
   pointer-to-pointer/out-handle forms on the recipe model. Prove a SQLite-style

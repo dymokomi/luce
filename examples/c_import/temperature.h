@@ -80,7 +80,10 @@ typedef struct luce_temperature_sensor luce_temperature_sensor;
 luce_temperature_sensor * _Nonnull luce_temperature_sensor_open(luce_degrees value);
 luce_temperature_sensor * _Nullable luce_temperature_sensor_find(luce_degrees value);
 luce_degrees luce_temperature_sensor_value(const luce_temperature_sensor * _Nonnull sensor);
-luce_temperature_sensor * _Null_unspecified luce_temperature_sensor_echo(luce_temperature_sensor * _Null_unspecified sensor);
+luce_temperature_sensor * _Nullable luce_temperature_sensor_echo(luce_temperature_sensor * _Nonnull sensor);
+bool luce_temperature_sensor_present(const luce_temperature_sensor * _Nullable sensor);
+int luce_temperature_sensor_validate(const luce_temperature_sensor * _Nonnull sensor);
+void luce_temperature_sensor_close(luce_temperature_sensor * _Nonnull sensor);
 
 #ifdef __cplusplus
 }

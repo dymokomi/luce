@@ -3,13 +3,17 @@
 This example follows the native pipeline in the language design:
 
 ```text
-temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
+temperature.h + temperature.recipe.toml -> luce bind
+    -> FIIR + temperature.raw + temperature.safe + C adapter
+    -> handwritten Luce boundaries -> main.luc
 ```
 
 - `temperature.c` and `temperature.h` are the native library.
 - `../luce.toml` declares the `temperature` C binding target.
 - `temperature/raw.native.luc` and `temperature.adapter.c` are generated from
   the header and are not checked in.
+- `temperature.recipe.toml` is the reviewed ownership/lifetime/status input;
+  the generated `temperature/safe.luc` is also not checked in.
 - `temperature.luc` performs explicit `c.boolean`, `c.float`, `c.double`,
   `c.float16`, `c.int`, generated `luce_degrees`, and generated
   `luce_temperature_scale` crossings, plus a generated anonymous-enum integer
@@ -21,8 +25,9 @@ temperature.h -> luce bind -> temperature.raw -> temperature.luc -> main.luc
   simple/nested record crossings. It also passes direct nullable and non-null
   pointers to the typedef-backed incomplete `luce_temperature_sensor` record
   through the generated nominal raw handle. It exposes reviewed Luce-facing
-  functions; the sensor functions deliberately remain raw until binding
-  recipes can state ownership and lifetime.
+  functions. The raw sensor functions remain an audited low-level example;
+  `safe_temperature.luc` separately exercises generated ownership, checked
+  borrows, a returned borrow, absence, status failure, and idempotent close.
 - `main.luc` selectively imports and calls the Luce-facing function.
 
 The executable importer supports C `_Bool`, exact IEEE binary16 `_Float16`,
@@ -64,9 +69,11 @@ open named-enumeration values.
 Direct pointers to typedef-backed incomplete records become one layout-free
 nominal `extern type`. `_Nonnull` is bare, `_Nullable` is optional, and absent
 or `_Null_unspecified` nullability is conservatively optional. FIIR retains
-pointee mutability plus explicitly unspecified ownership/lifetime; only the C
-adapter contains the typed pointer spelling and casts. This raw rung does not
-claim safe ownership or mutation authority.
+pointee mutability; ownership and lifetime are absent from Clang-derived
+boundaries and live in the separately reviewed recipe. Only the C adapter
+contains the typed pointer spelling and casts. The safe generator turns the
+recipe into an owner class, checked borrow class, and status wrapper without
+changing HIR, MIR, or backend layout.
 Boolean retains one Luce `bool` shape; floating types retain `f16`, `f32`, or
 `f64`; integer and typedef carriers retain one lossless portable shape; enum
 carriers retain one `bool` plus `u64` shape and expose the header's constants.
@@ -74,9 +81,10 @@ The adapter alone asserts scalar representations, verifies integer target ranges
 maps declared enum values to the target's exact C type, reasserts constant
 semantic values, and verifies record size, alignment, offsets, and field
 types. Other extended floating formats, broader pointer forms, unions,
-bit-fields, pointer/array/string macro constants, aggregate, atomic,
-or thread-local external objects, and recipes remain explicit generation
-errors until their complete contracts are implemented.
+bit-fields, pointer/array/string macro constants, aggregate, atomic, or
+thread-local external objects, and the broader pointer/array/callback recipe
+vocabulary remain explicit generation errors until their complete contracts
+are implemented.
 
 Generate the binding products with explicit destinations:
 
@@ -86,6 +94,8 @@ mkdir -p build/temperature
   --fiir build/temperature.fiir.json \
   --raw build/temperature/raw.native.luc \
   --adapter build/temperature.adapter.c \
+  --recipe examples/c_import/temperature.recipe.toml \
+  --safe build/temperature/safe.luc \
   --clang-arg -std=c11 \
   --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
   --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
@@ -100,8 +110,9 @@ mkdir -p build/temperature
 ```
 
 The CLI regression suite then builds and runs this example through the real
-QBE product path with `src/standard/c.luc`, the generated raw module and
-adapter, and `temperature.c` supplied as distinct inputs. Keeping each input
-visible is intentional: package/manifest discovery is deferred past 1.0, and
-the compiler does not guess source roots, sidecar names, include paths, or
-libraries.
+QBE product path with `src/standard/c.luc`, the generated raw and safe modules
+and adapter, `safe_temperature.luc`, and `temperature.c` supplied as distinct
+inputs. The same generated safe module executes through both semantic oracles,
+Wasm encoding, and real linked QBE/C tests. Keeping each input visible is
+intentional: package/manifest discovery is deferred past 1.0, and the compiler
+does not guess source roots, sidecar names, include paths, or libraries.

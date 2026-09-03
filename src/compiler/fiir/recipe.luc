@@ -1,0 +1,395 @@
+#==============================================================================================
+#
+#   fiir.recipe - Reviewed ownership and failure facts for generated C bindings
+#
+#   DESCRIPTION:
+#       Parses the deliberately small TOML recipe vocabulary from language
+#       specification §21.4, validates every relationship against Clang's FIIR
+#       declaration graph, and attaches the recipe as a separate durable fact
+#       section. It never changes a foreign type, nullability, or mutability.
+#
+#       The closed first vocabulary covers borrowed-for-call opaque parameters,
+#       owned opaque results with one exact disposer, returned opaque borrows
+#       anchored to an input owner, and C-integer status results. Later pointer
+#       families extend these variants instead of accepting free-form policy.
+#
+#==============================================================================================
+
+from compiler.fiir.schema import FiirBindingRecipe, FiirBoundaryValue, FiirFunction, FiirFunctionRecipe, FiirIntegerValue, FiirModule, FiirNullability, FiirRecipeParameter, FiirRecipeParameterUse, FiirRecipeResult, FiirSourceOrigin, FiirTypeForm, is_c_identifier, parse_fiir_decimal_u64, resolve_fiir_type, validate_fiir
+import std.json
+import std.strings
+
+# mark: Recipe parsing =========================================================================
+
+class FunctionRecipeBuilder:
+    let origin: FiirSourceOrigin
+    var name: str?
+    var result_text: str?
+    var result_origin: FiirSourceOrigin?
+    var success: FiirIntegerValue?
+    var error_code: i64?
+    var message: str?
+    let parameters: list[FiirRecipeParameter]
+
+    init(origin: FiirSourceOrigin):
+        self.origin = origin
+        self.name = none
+        self.result_text = none
+        self.result_origin = none
+        self.success = none
+        self.error_code = none
+        self.message = none
+        self.parameters = list[FiirRecipeParameter]()
+
+## Parse the exact recipe subset used by `luce bind`. Basic strings use JSON's
+## escape vocabulary, which is also valid TOML basic-string syntax. Tables,
+## arrays, implicit coercions, and unknown keys are rejected rather than
+## silently becoming generator policy.
+pub func parse_binding_recipe(document: str, path: str, binding: str) -> FiirBindingRecipe!:
+    if path == "": error("FIIR recipe: source path cannot be empty")
+    if not is_c_identifier(binding):
+        error("FIIR recipe: binding name `" + binding + "` is not a portable identifier")
+    let expected_header = "[[native." + binding + ".function]]"
+    let functions = list[FiirFunctionRecipe]()
+    var builder: FunctionRecipeBuilder? = none
+    let lines = strings.split(document, "\n")
+    for index in range(0, len(lines)):
+        let line_number = u32(index + 1)
+        let source = strip_comment(lines[index])
+        let line = strings.trim(source)
+        if line == "": continue
+        let column = first_content_column(source)
+        let origin = FiirSourceOrigin(path = path, line = line_number, column = column)
+        if strings.starts_with(line, "[["):
+            if line != expected_header:
+                error(at(origin, "expected table `" + expected_header + "`, found `" + line + "`"))
+            if builder != none: functions.append(try finish_entry(builder))
+            builder = FunctionRecipeBuilder(origin)
+            continue
+        if builder == none:
+            error(at(origin, "property appears before `" + expected_header + "`"))
+        let assignment = split_assignment(line, origin) catch reason:
+            error(reason)
+        let key = assignment.key
+        let value = assignment.value
+        let current = builder
+        if key == "name":
+            if current.name != none: error(at(origin, "duplicate `name` property"))
+            current.name = try parse_basic_string(value, origin, "name")
+        elif key == "result":
+            if current.result_text != none: error(at(origin, "duplicate `result` property"))
+            current.result_text = try parse_basic_string(value, origin, "result")
+            current.result_origin = origin
+        elif strings.starts_with(key, "parameter."):
+            let parameter = parse_parameter_key(key, origin) catch reason:
+                error(reason)
+            for existing in current.parameters:
+                if existing.index == parameter:
+                    error(at(origin, "duplicate `parameter." + str(parameter) + "` property"))
+            let use = try parse_basic_string(value, origin, key)
+            if use != "borrowed for call":
+                error(at(origin, "`" + key + "` must be `\"borrowed for call\"`"))
+            current.parameters.append(FiirRecipeParameter(
+                index = parameter,
+                use = FiirRecipeParameterUse.borrowed_for_call,
+                origin = origin,
+            ))
+        elif key == "success":
+            if current.success != none: error(at(origin, "duplicate `success` property"))
+            current.success = try parse_integer_value(value, origin, "success")
+        elif key == "error-code":
+            if current.error_code != none: error(at(origin, "duplicate `error-code` property"))
+            current.error_code = try parse_integer(value, origin, "error-code")
+        elif key == "message":
+            if current.message != none: error(at(origin, "duplicate `message` property"))
+            current.message = try parse_basic_string(value, origin, "message")
+        else:
+            error(at(origin, "unknown property `" + key + "`"))
+    if builder != none: functions.append(try finish_entry(builder))
+    if len(functions) == 0:
+        error(path + ":1:1: FIIR recipe: expected at least one `" + expected_header + "` table")
+    return FiirBindingRecipe(binding = binding, path = path, functions = functions)
+
+struct Assignment:
+    let key: str
+    let value: str
+
+func split_assignment(line: str, origin: FiirSourceOrigin) -> Assignment!:
+    var delimiter = -1
+    for index in range(0, len(line)):
+        if line[index] == '=':
+            delimiter = index
+            break
+    if delimiter < 0: error(at(origin, "expected `key = value`"))
+    let key = strings.trim(line[:delimiter])
+    let value = strings.trim(line[delimiter + 1:])
+    if key == "" or value == "": error(at(origin, "expected nonempty `key = value`"))
+    return Assignment(key = key, value = value)
+
+func parse_basic_string(value: str, origin: FiirSourceOrigin, key: str) -> str!:
+    let decoded = json.parse(value) catch malformed:
+        error(at(origin, "`" + key + "` must be one TOML basic string: " + json.describe(malformed)))
+    let text = decoded.as_text() else error(at(origin, "`" + key + "` must be a string"))
+    if text == "": error(at(origin, "`" + key + "` cannot be empty"))
+    return text
+
+func parse_integer(value: str, origin: FiirSourceOrigin, key: str) -> i64!:
+    let parsed = parse_i64(value) else error(at(origin, "`" + key + "` must be a base-ten integer"))
+    return parsed
+
+func parse_integer_value(value: str, origin: FiirSourceOrigin, key: str) -> FiirIntegerValue!:
+    if len(value) > 0 and value[0] == '-':
+        let magnitude = parse_fiir_decimal_u64(value[1:]) catch reason:
+            error(at(origin, "`" + key + "` is outside the supported integer domain"))
+        if magnitude == u64(0) or magnitude > u64(9223372036854775808):
+            error(at(origin, "`" + key + "` is outside the supported integer domain"))
+        return FiirIntegerValue.Negative(magnitude = magnitude)
+    let integer = parse_fiir_decimal_u64(value) catch reason:
+        error(at(origin, "`" + key + "` is outside the supported integer domain"))
+    return FiirIntegerValue.Nonnegative(value = integer)
+
+func parse_parameter_key(key: str, origin: FiirSourceOrigin) -> u32!:
+    let suffix = key[len("parameter."):]
+    let parsed = parse_i64(suffix) else error(at(origin, "`" + key + "` needs a decimal parameter index"))
+    if parsed < 0 or parsed > 4294967295:
+        error(at(origin, "`" + key + "` parameter index is outside the supported range"))
+    return u32(parsed)
+
+func finish_entry(builder: FunctionRecipeBuilder) -> FiirFunctionRecipe!:
+    let name = builder.name else error(at(builder.origin, "function table omits `name`"))
+    var result: FiirRecipeResult? = none
+    let result_text = builder.result_text
+    if result_text != none:
+        let result_origin = builder.result_origin else builder.origin
+        if strings.starts_with(result_text, "owned via "):
+            let disposer = result_text[len("owned via "):]
+            if not is_c_identifier(disposer):
+                error(at(result_origin, "owned result disposer `" + disposer + "` is not a portable C identifier"))
+            try reject_status_properties(builder, result_origin)
+            result = FiirRecipeResult.Owned(disposer = disposer)
+        elif strings.starts_with(result_text, "borrowed from parameter."):
+            let suffix = result_text[len("borrowed from parameter."):]
+            let parsed = parse_i64(suffix) else error(at(result_origin, "borrowed result needs `borrowed from parameter.N`"))
+            if parsed < 0 or parsed > 4294967295:
+                error(at(result_origin, "borrowed-result parameter index is outside the supported range"))
+            try reject_status_properties(builder, result_origin)
+            result = FiirRecipeResult.Borrowed(source_parameter = u32(parsed))
+        elif result_text == "status":
+            let success = builder.success else error(at(result_origin, "status result requires `success`"))
+            let error_code = builder.error_code else error(at(result_origin, "status result requires `error-code`"))
+            let message = builder.message else error(at(result_origin, "status result requires `message`"))
+            if error_code <= 0 or error_code > 4294967295:
+                error(at(result_origin, "status `error-code` must be in 1...4294967295"))
+            result = FiirRecipeResult.Status(
+                success = success,
+                error_code = u32(error_code),
+                message = message,
+            )
+        else:
+            error(at(result_origin, "unsupported result recipe `" + result_text + "`"))
+    elif builder.success != none or builder.error_code != none or builder.message != none:
+        error(at(builder.origin, "status properties require `result = \"status\"`"))
+    if result == none and len(builder.parameters) == 0:
+        error(at(builder.origin, "function recipe has no ownership or status facts"))
+    return FiirFunctionRecipe(name = name, parameters = builder.parameters, result = result, origin = builder.origin)
+
+func reject_status_properties(builder: FunctionRecipeBuilder, origin: FiirSourceOrigin) -> !:
+    if builder.success != none or builder.error_code != none or builder.message != none:
+        error(at(origin, "`success`, `error-code`, and `message` apply only to a status result"))
+
+func strip_comment(line: str) -> str:
+    var quoted = false
+    var escaped = false
+    for index in range(0, len(line)):
+        let character = line[index]
+        if character == '"' and not escaped: quoted = not quoted
+        if character == '#' and not quoted: return line[:index]
+        if character == '\\' and quoted and not escaped: escaped = true
+        else: escaped = false
+    return line
+
+func first_content_column(line: str) -> u32:
+    var index = 0
+    while index < len(line) and (line[index] == ' ' or line[index] == '\t'): index += 1
+    return u32(index + 1)
+
+func at(origin: FiirSourceOrigin, message: str) -> str:
+    return origin.path + ":" + str(origin.line) + ":" + str(origin.column) + ": FIIR recipe: " + message
+
+# mark: Recipe validation ======================================================================
+
+struct OwnedHandle:
+    let name: str
+    let disposer: str
+
+## Attach a recipe only after every declaration, ownership edge, lifetime
+## anchor, disposer, and status mapping has been proved against Clang's facts.
+pub func attach_binding_recipe(module: FiirModule, recipe: FiirBindingRecipe) -> FiirModule!:
+    if module.recipe != none: error("FIIR recipe: module already has a binding recipe")
+    let attached = FiirModule(
+        format_version = module.format_version,
+        language = module.language,
+        generator_version = module.generator_version,
+        header = module.header,
+        target = module.target,
+        clang_arguments = module.clang_arguments,
+        types = module.types,
+        constants = module.constants,
+        objects = module.objects,
+        functions = module.functions,
+        recipe = recipe,
+    )
+    try validate_binding_recipe(attached)
+    return attached
+
+pub func validate_binding_recipe(module: FiirModule) -> !:
+    try validate_fiir(module)
+    let recipe = module.recipe else error("FIIR recipe: module has no binding recipe")
+    if not is_c_identifier(recipe.binding):
+        error("FIIR recipe: binding name `" + recipe.binding + "` is not a portable identifier")
+    if recipe.path == "": error("FIIR recipe: source path cannot be empty")
+    let owned_handles = list[OwnedHandle]()
+    let error_codes = map[u32, str]()
+
+    for index in range(0, len(recipe.functions)):
+        let entry = recipe.functions[index]
+        for earlier in range(0, index):
+            if recipe.functions[earlier].name == entry.name:
+                error(at(entry.origin, "duplicate function recipe `" + entry.name + "`"))
+        let function_index = find_function(module, entry.name)
+        if function_index < 0:
+            error(at(entry.origin, "function `" + entry.name + "` does not exist in the imported header"))
+        let function = module.functions[function_index]
+        for parameter in entry.parameters:
+            if i64(parameter.index) >= len(function.parameters):
+                error(at(parameter.origin, "function `" + entry.name + "` has no parameter " + str(parameter.index)))
+            if try opaque_handle_name(module, function.parameters[parameter.index].boundary) == none:
+                error(at(parameter.origin, "function `" + entry.name + "` parameter " + str(parameter.index) + " is not an opaque handle"))
+        let result = entry.result
+        if result != none:
+            match result:
+                Owned(disposer):
+                    let handle = try require_opaque_result(module, function, entry)
+                    try validate_disposer(module, handle, disposer, entry.origin)
+                    var found = false
+                    for owned in owned_handles:
+                        if owned.name == handle:
+                            found = true
+                            if owned.disposer != disposer:
+                                error(at(entry.origin, "opaque handle `" + handle + "` has conflicting disposers `" + owned.disposer + "` and `" + disposer + "`"))
+                    if not found: owned_handles.append(OwnedHandle(name = handle, disposer = disposer))
+                Borrowed(source_parameter):
+                    let handle = try require_opaque_result(module, function, entry)
+                    if i64(source_parameter) >= len(function.parameters):
+                        error(at(entry.origin, "borrowed result names missing parameter " + str(source_parameter)))
+                    let source = try opaque_handle_name(module, function.parameters[source_parameter].boundary)
+                    if source == none or source != handle:
+                        error(at(entry.origin, "borrowed result `" + handle + "` must be anchored to a parameter of the same opaque type"))
+                    if function.parameters[source_parameter].boundary.nullability != FiirNullability.nonnull:
+                        error(at(entry.origin, "borrowed-result anchor parameter must be non-null"))
+                    if not entry_has_parameter(entry, source_parameter):
+                        error(at(entry.origin, "borrowed-result anchor parameter " + str(source_parameter) + " must also be `borrowed for call`"))
+                Status(success, error_code, message):
+                    try validate_status_result(module, function, success, entry.origin)
+                    if error_codes.has(error_code):
+                        error(at(entry.origin, "status error code " + str(error_code) + " is also used by `" + error_codes[error_code] + "`"))
+                    error_codes[error_code] = entry.name
+                    if message == "": error(at(entry.origin, "status message cannot be empty"))
+
+    for function in module.functions:
+        let entry = recipe_for(recipe, function.name)
+        let is_disposer_function = owned_disposer_for(owned_handles, function.name)
+        if is_disposer_function and entry != none:
+            let disposer_entry = entry
+            error(at(disposer_entry.origin, "disposer `" + function.name + "` is implied by its owned result and cannot have a separate recipe"))
+        for parameter_index in range(0, len(function.parameters)):
+            let parameter_handle = try opaque_handle_name(module, function.parameters[parameter_index].boundary)
+            if parameter_handle == none: continue
+            if is_disposer_function and parameter_index == 0: continue
+            if entry == none or not entry_has_parameter(entry, u32(parameter_index)):
+                error("FIIR recipe: opaque parameter " + str(parameter_index) + " of `" + function.name + "` has no `borrowed for call` fact")
+            if not owns_handle(owned_handles, parameter_handle):
+                error("FIIR recipe: borrowed opaque handle `" + parameter_handle + "` has no owned acquisition")
+        if try opaque_handle_name(module, function.result) != none:
+            if entry == none or entry.result == none:
+                error("FIIR recipe: opaque result of `" + function.name + "` has no ownership fact")
+            let required_entry = entry
+            let recipe_result = required_entry.result else trap("validated opaque recipe result disappeared")
+            match recipe_result:
+                Owned(disposer): pass
+                Borrowed(source_parameter): pass
+                Status(success, error_code, message):
+                    error(at(required_entry.origin, "opaque result cannot be a status result"))
+
+func validate_disposer(module: FiirModule, handle: str, disposer_name: str, origin: FiirSourceOrigin) -> !:
+    let index = find_function(module, disposer_name)
+    if index < 0: error(at(origin, "disposer `" + disposer_name + "` does not exist in the imported header"))
+    let disposer = module.functions[index]
+    if len(disposer.parameters) != 1:
+        error(at(origin, "disposer `" + disposer_name + "` must take exactly one parameter"))
+    let parameter_handle = try opaque_handle_name(module, disposer.parameters[0].boundary)
+    if parameter_handle == none or parameter_handle != handle:
+        error(at(origin, "disposer `" + disposer_name + "` must take non-null opaque handle `" + handle + "`"))
+    if disposer.parameters[0].boundary.nullability != FiirNullability.nonnull:
+        error(at(origin, "disposer `" + disposer_name + "` parameter must be non-null"))
+    let result = try resolve_fiir_type(module, disposer.result.value_type)
+    match result.form:
+        Unit: pass
+        else: error(at(origin, "disposer `" + disposer_name + "` must return void"))
+
+func validate_status_result(module: FiirModule, function: FiirFunction, success: FiirIntegerValue, origin: FiirSourceOrigin) -> !:
+    let result = try resolve_fiir_type(module, function.result.value_type)
+    match result.form:
+        Integer(kind, bits, is_signed):
+            match success:
+                Negative(magnitude):
+                    if not is_signed: error(at(origin, "unsigned status result cannot use a negative success value"))
+                    if magnitude > signed_magnitude(bits): error(at(origin, "status success value is outside the C result range"))
+                Nonnegative(value):
+                    var maximum = unsigned_maximum(bits)
+                    if is_signed: maximum = signed_magnitude(bits) - u64(1)
+                    if value > maximum: error(at(origin, "status success value is outside the C result range"))
+        else: error(at(origin, "status result requires a C integer return type"))
+
+func require_opaque_result(module: FiirModule, function: FiirFunction, entry: FiirFunctionRecipe) -> str!:
+    let handle = try opaque_handle_name(module, function.result)
+    if handle == none: error(at(entry.origin, "function `" + entry.name + "` does not return an opaque handle"))
+    return handle
+
+pub func opaque_handle_name(module: FiirModule, boundary: FiirBoundaryValue) -> str?!:
+    let value_type = try resolve_fiir_type(module, boundary.value_type)
+    match value_type.form:
+        OpaqueHandle(name, c_spelling, origin): return name
+        else: return none
+
+pub func recipe_for(recipe: FiirBindingRecipe, function: str) -> FiirFunctionRecipe?:
+    for entry in recipe.functions:
+        if entry.name == function: return entry
+    return none
+
+pub func entry_has_parameter(entry: FiirFunctionRecipe, index: u32) -> bool:
+    for parameter in entry.parameters:
+        if parameter.index == index: return true
+    return false
+
+pub func find_function(module: FiirModule, name: str) -> i64:
+    for index in range(0, len(module.functions)):
+        if module.functions[index].name == name: return index
+    return -1
+
+func owned_disposer_for(handles: list[OwnedHandle], name: str) -> bool:
+    for handle in handles:
+        if handle.disposer == name: return true
+    return false
+
+func owns_handle(handles: list[OwnedHandle], name: str) -> bool:
+    for handle in handles:
+        if handle.name == name: return true
+    return false
+
+func signed_magnitude(bits: u16) -> u64:
+    return u64(1) << u64(bits - u16(1))
+
+func unsigned_maximum(bits: u16) -> u64:
+    if bits == u16(64): return u64(18446744073709551615)
+    return (u64(1) << u64(bits)) - u64(1)

@@ -20,8 +20,8 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 | Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
 | WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
-| FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. Linked QBE/C tests cover the generated products. **Not yet**: safe ownership recipes, broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
-| Tests | 968 unit tests across 36 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. A separate reviewed recipe section generates ordinary safe Luce owners, checked borrows, returned-borrow anchors, and status failures. Both layers have semantic-oracle and linked QBE/C proofs. **Not yet**: broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
+| Tests | 972 unit tests across 37 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Implemented milestones and evidence
@@ -2033,7 +2033,8 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   (2026-09-03). The Clang importer recognizes exactly one direct pointer to a
   typedef-backed incomplete record. FIIR interns one layout-free
   `OpaqueHandle` identity and retains each boundary's nullability, pointee
-  mutability, source origin, and explicitly unspecified ownership/lifetime.
+  mutability, and source origin. Ownership and lifetime are deliberately absent
+  from Clang-derived boundary facts and belong to the later recipe milestone.
   `_Nonnull` produces a bare handle, while `_Nullable`, `_Null_unspecified`,
   and unannotated pointers produce the ordinary tagged optional. Indirect
   result declarators, complete-record pointers, pointer typedefs, and multiple
@@ -2044,7 +2045,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   casts between its `void *` carrier and the exact typed C pointer. Pointee
   mutability remains an auditable raw-boundary fact rather than being promoted
   into a safe capability, and ownership/lifetime cannot be invented from C
-  syntax: the next FIIR slice is the explicit binding-recipe model.
+  syntax.
 
   Pure schema/declarator tests cover qualifier order, malformed state,
   unsupported pointer shapes, nullable/bare generation, stable JSON, and
@@ -2055,6 +2056,38 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   instruction, runtime operation, layout rule, or platform branch was added.
   The completed repository gate is 968/968 compiler tests across 36 files plus
   CLI, Wasm, and native QBE shell gates.
+
+- [x] **FIIR recipes generate checked safe ownership without changing HIR or
+  MIR** (2026-09-03). FIIR 2 removes ownership and lifetime from the
+  Clang-derived boundary value and stores a reviewed binding recipe as a
+  separate durable section with exact source origins. Its deliberately closed
+  TOML subset classifies opaque parameters as borrowed for one call, opaque
+  results as owned through one validated disposer or borrowed from one
+  same-type input owner, and C-integer results as status values with a stable
+  package error. Unknown properties, duplicate entries, missing opaque facts,
+  nonexistent functions/parameters/disposers, incompatible handle types,
+  nullable lifetime anchors, invalid disposer shapes, out-of-range success
+  values, and duplicate recipe error codes all fail before source generation.
+
+  `luce bind --recipe PATH --safe PATH` treats the reviewed input and safe
+  output as one explicit pair while preserving raw-only generation. All four
+  candidates are rendered before installation and the serialized FIIR remains
+  the completion marker. Generated safe source uses ordinary Luce classes,
+  optionals, and failure: an owner clears its raw handle before its idempotent
+  disposer call, automatic `deinit` closes it, a borrow retains the owner and
+  checks every call after explicit close, a returned borrow retains the same
+  owner, and a non-success integer becomes the recipe's `ErrorCode` and
+  message. No target, pointer layout, C type spelling, ABI rule, new HIR node,
+  MIR instruction, runtime service, or backend branch was added.
+
+  Deterministic recipe/schema/generator tests use an in-memory FIIR fixture;
+  the real temperature header supplies allocated nullable/non-null handles,
+  disposal, returned borrows, optional inputs, and status success/failure. The
+  generated safe module runs through the HIR and MIR oracles, encodes through
+  Wasm, and compiles/links/runs with the real C implementation through QBE.
+  CLI tests generate and inspect all four products and execute both the raw and
+  safe examples. The completed repository gate is 972/972 compiler tests
+  across 37 files plus CLI, Wasm, and native QBE shell gates.
 
 ## 3. Bugs the multi-backend harness found
 

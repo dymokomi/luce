@@ -65,7 +65,9 @@ versioned JSON record of the exact host target and QBE-owned sizes,
 alignments, field offsets, symbols, and calling conventions.
 
 The C-import path generates inspectable FIIR, raw Luce, and C-adapter products
-from one exact Clang invocation. It admits C `_Bool`, IEEE binary16 `_Float16`,
+from one exact Clang invocation. An optional reviewed recipe adds a fourth,
+ordinary safe Luce module while remaining a distinct durable FIIR section. It
+admits C `_Bool`, IEEE binary16 `_Float16`,
 IEEE binary32 `float`, IEEE binary64 `double` and `long double`, and every
 fundamental C integer through nominal target-independent carriers. `_Float16`
 stays `f16` in the public generated API while its private adapter call uses
@@ -97,8 +99,14 @@ enumerations reuse the checked sign-and-magnitude boundary; `const` and
 fixed-carrier calls.
 Plain C records use logical generated Luce records and private fixed field carriers;
 Clang-evaluated layout is asserted only by the backend-owned C adapter. Other
-extended floating representations and broader declarations fail explicitly
-until their complete adapter contracts land.
+Direct pointers to typedef-backed incomplete records become nominal raw
+handles. Clang supplies nullability and pointee mutability; the recipe supplies
+borrowed-for-call parameters, owned results and exact disposers, returned-borrow
+anchors, and integer-status failures. Generated owner/borrow wrappers execute
+through the ordinary HIR/MIR pipeline and linked QBE/C without introducing a
+pointer or platform shape before the backend. Other extended floating
+representations and broader declarations fail explicitly until their complete
+adapter contracts land.
 The end-to-end command and generated module layout are documented in
 [`examples/c_import/README.md`](examples/c_import/README.md).
 
@@ -114,8 +122,9 @@ A few terms recur in the source and in this README:
 - **MIR / canonical IR** — the flat, target-independent instruction stream the
   compiled backends consume (`src/compiler/mir/canonical.luc`).
 - **FIIR** — the Foreign Interface Intermediate Representation: validated
-  backend-independent facts decoded from a foreign frontend before raw Luce
-  and target adapter products are generated (`src/compiler/fiir/schema.luc`).
+  foreign-frontend facts plus separately reviewed binding relationships,
+  consumed before raw/safe Luce and target adapter products are generated
+  (`src/compiler/fiir/schema.luc`).
 - **Slice** — the part of the 1.0 language a stage implements today. The parser
   covers most of 1.0; HIR generation, the interpreter, and the compiled path
   each cover a smaller, growing slice.
@@ -207,9 +216,10 @@ examples and tests link back here rather than restating it.
   a supported native host it also builds and
   runs a smoke-test executable.
 
-The parser is ahead of HIR generation and backends. A
-program appearing in the language tour does not necessarily mean every stage
-can execute it yet.
+The parser covers the 1.0 grammar, while semantic and executable coverage still
+has explicit open rows. A program appearing in the language tour does not by
+itself prove that every stage can execute it; `examples/FEATURES.md` records the
+first incomplete stage for every language section.
 
 ## Running and adding tests
 
