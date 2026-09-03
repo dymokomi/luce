@@ -1595,9 +1595,23 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   full-`u64`, malformed-layout, and `-fshort-enums` fixtures cover the model.
   The real temperature binding executes a negative enumerator through both
   semantic oracles, Wasm/QBE encoding, CLI build/run, and linked QBE/C; a real
-  C result outside the declared set traps `native_enum_value`. Constant-only
-  anonymous enums and recipe-classified bitmasks remain with the constant and
-  recipe slices.
+  C result outside the declared set traps `native_enum_value`.
+
+- [x] **Constant-only anonymous C enums become constants, not phantom types**
+  (2026-09-02). The Clang decoder retains every enumerator's evaluated value,
+  selected integer type, and source origin in a first-class FIIR constant
+  declaration. FIIR validation checks the complete signed-`i64`/unsigned-`u64`
+  domain against that declared C type. The raw module emits one universal
+  `c.integer_constant` sign-and-magnitude value, while target sizes, selected
+  integer families, and range assertions remain in FIIR and the backend-owned
+  C product. That product asserts every constant's exact C type and value, so a
+  stale raw module cannot compile against a changed header silently; synthetic
+  width and family changes leave generated Luce byte-identical. Named and
+  typedef-backed enums remain on the separate
+  open-enum carrier path. Focused malformed/full-domain fixtures, both
+  semantic oracles, Wasm/QBE encoding, the real linked QBE/C gate, and the
+  `c_import` example exercise the constants. Macro/object constants and
+  recipe-classified bitmasks remain.
 
 - [x] **Borrowed C lists expose their one existing dense representation**
   (2026-09-01). `extern func` input parameters now admit `list[H]` exactly

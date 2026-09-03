@@ -10,6 +10,11 @@ typedef enum luce_temperature_scale {
     LUCE_SCALE_FAHRENHEIT = 42
 } luce_temperature_scale;
 
+enum {
+    LUCE_WATER_FREEZING_CELSIUS = 0,
+    LUCE_WATER_BOILING_CELSIUS = 100
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif

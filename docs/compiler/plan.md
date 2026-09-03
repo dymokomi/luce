@@ -864,11 +864,19 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   target facts change FIIR and C only while generated Luce is byte-identical.
   Unsupported scalars and declarations fail generation rather than guessing a
   target representation.
+- [x] **Import constant-only anonymous C enumerations without inventing a
+  type** (2026-09-02). Each enumerator retains its exact Clang-selected integer
+  type, canonical full-domain value, and source origin as a standalone FIIR
+  constant. Generated Luce exposes one universal `c.integer_constant`
+  sign-and-magnitude value; target widths and selected integer families affect
+  only serialized FIIR and backend-owned C assertions. That C product also
+  asserts each header constant's type and value so mismatched regeneration
+  cannot compile silently. Both semantic oracles, Wasm/QBE encoding, the real
+  linked QBE/C binding, and the example CLI path consume the constants.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  constant-only anonymous enumerations, records/unions, macro/object constants,
-  arrays/pointers/function pointers/opaque
+  records/unions, macro/object constants, arrays/pointers/function pointers/opaque
   types, ownership and nullability recipes, typed variadic adapters, support
   tiers, deterministic
   regeneration diagnostics, and the generated f16 shim.

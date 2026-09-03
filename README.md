@@ -72,9 +72,11 @@ including dependency-owned names such as `size_t`, retain their own nominal
 carriers without inheriting a target width. Named and typedef-backed C enums
 use one nominal sign-magnitude carrier and typed constants; their target enum
 representation is mediated entirely by the generated C adapter, which also
-checks integer ranges and rejects undeclared enum values. Extended floating
-representations and broader declarations fail explicitly until their complete
-adapter contracts land.
+checks integer ranges and rejects undeclared enum values. Constant-only
+anonymous enums use one target-independent sign-and-magnitude constant carrier
+without fabricating a C enum type. Extended floating representations and
+broader declarations fail explicitly until their complete adapter contracts
+land.
 The end-to-end command and generated module layout are documented in
 [`examples/c_import/README.md`](examples/c_import/README.md).
 
