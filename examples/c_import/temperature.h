@@ -35,6 +35,9 @@ static const unsigned long long LUCE_TEMPERATURE_UNSIGNED_MAXIMUM = 184467440737
 _Static_assert(LUCE_TEMPERATURE_SIGNED_MINIMUM < 0, "signed constant must remain negative");
 _Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM > 0, "unsigned constant must remain positive");
 
+#define LUCE_TEMPERATURE_ABSOLUTE_ZERO ((luce_degrees)-273)
+#define LUCE_TEMPERATURE_SENSOR_LIMIT 4095ULL
+
 #ifdef __cplusplus
 extern "C" {
 #endif

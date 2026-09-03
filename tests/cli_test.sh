@@ -59,6 +59,7 @@ expect 2 "build: --runtime expects a source path" "$cli" build --package org.luc
 expect 2 "build: --c-header may be supplied once" "$cli" build --package org.luce.tests --root "$test_dir" --c-header one.h --c-header two.h out "$test_dir/main.luc"
 expect 2 "bind: expected \`--name NAME --fiir PATH --raw PATH --adapter PATH\`" "$cli" bind
 expect 2 "bind: --name may be supplied once" "$cli" bind --name first --name second
+expect 2 "bind: --macro-constant expects a C macro name" "$cli" bind --macro-constant
 
 expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/main.luc"
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/shared.luc"
@@ -109,10 +110,14 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --clang-arg -Wall \
     --clang-arg -Wextra \
     --clang-arg -Werror \
+    --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
+    --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
     examples/c_import/temperature.h
 grep -q '"format": "luce-fiir-1"' "$test_dir/temperature.fiir.json"
 grep -q '"target":' "$test_dir/temperature.fiir.json"
 grep -q '"kind": "record"' "$test_dir/temperature.fiir.json"
+grep -q '"source": "macro"' "$test_dir/temperature.fiir.json"
+grep -q '## Selected C macro constants: LUCE_TEMPERATURE_ABSOLUTE_ZERO LUCE_TEMPERATURE_SENSOR_LIMIT' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub struct luce_half_value:' "$test_dir/temperature/raw.native.luc"
@@ -126,6 +131,8 @@ grep -q 'pub let LUCE_SCALE_CELSIUS: luce_temperature_scale' "$test_dir/temperat
 grep -q 'pub let LUCE_WATER_BOILING_CELSIUS: c.integer_constant = c.integer_constant(false, 100u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_SIGNED_MINIMUM: c.integer_constant = c.integer_constant(true, 9223372036854775808u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub let LUCE_TEMPERATURE_UNSIGNED_MAXIMUM: c.integer_constant = c.integer_constant(false, 18446744073709551615u64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_ABSOLUTE_ZERO: c.integer_constant = c.integer_constant(true, 273u64)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub let LUCE_TEMPERATURE_SENSOR_LIMIT: c.integer_constant = c.integer_constant(false, 4095u64)' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.native.luc"
 grep -q 'pub struct luce_temperature_range:' "$test_dir/temperature/raw.native.luc"
@@ -144,6 +151,9 @@ grep -q '_Static_assert(LUCE_WATER_BOILING_CELSIUS == UINT64_C(100)' "$test_dir/
 grep -q '_Generic((LUCE_TEMPERATURE_SIGNED_MINIMUM), long long: 1, default: 0)' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_SIGNED_MINIMUM == INT64_MIN' "$test_dir/temperature.adapter.c"
 grep -q '_Static_assert(LUCE_TEMPERATURE_UNSIGNED_MAXIMUM == UINT64_C(18446744073709551615)' "$test_dir/temperature.adapter.c"
+grep -q '_Generic((LUCE_TEMPERATURE_ABSOLUTE_ZERO), luce_degrees: 1, default: 0)' "$test_dir/temperature.adapter.c"
+grep -q '_Static_assert(LUCE_TEMPERATURE_ABSOLUTE_ZERO == -INT64_C(273)' "$test_dir/temperature.adapter.c"
+grep -q '_Static_assert(LUCE_TEMPERATURE_SENSOR_LIMIT == UINT64_C(4095)' "$test_dir/temperature.adapter.c"
 grep -q 'offsetof(struct luce_temperature_reading, scale)' "$test_dir/temperature.adapter.c"
 grep -q 'struct __luce_fiir_temperature_record_luce_temperature_reading' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
@@ -158,6 +168,8 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --clang-arg -Wextra \
     --clang-arg -Werror \
     --clang-arg -fshort-enums \
+    --macro-constant LUCE_TEMPERATURE_ABSOLUTE_ZERO \
+    --macro-constant LUCE_TEMPERATURE_SENSOR_LIMIT \
     examples/c_import/temperature.h
 cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/temperature-short.adapter.c"
 
@@ -178,7 +190,7 @@ grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$t
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
+printf 'from temperature import adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, half_celsius, is_freezing, macro_constants, scale_round_trips, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    return 0 if celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
     --root "$test_dir" \

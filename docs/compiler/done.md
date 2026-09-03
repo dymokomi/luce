@@ -7,7 +7,7 @@ and the work that is still ahead; read that one to resume work, read this
 one to check a claim. Every tick here has a commit and a green `./test.sh`
 behind it.
 
-Last updated: 2026-09-02 (Stage-0 0.30).
+Last updated: 2026-09-03 (Stage-0 0.30).
 
 ## 1. Where things stand
 
@@ -1620,8 +1620,7 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   typedef-backed enums remain on the separate
   open-enum carrier path. Focused malformed/full-domain fixtures, both
   semantic oracles, Wasm/QBE encoding, the real linked QBE/C gate, and the
-  `c_import` example exercise the constants. Macro constants and
-  recipe-classified bitmasks remain.
+  `c_import` example exercise the constants. Recipe-classified bitmasks remain.
 
 - [x] **Header-local fundamental-integer C objects become evaluated FIIR constants**
   (2026-09-02). The importer accepts only selected-header `static const`
@@ -1639,6 +1638,29 @@ Last updated: 2026-09-02 (Stage-0 0.30).
   CLI materialization, warning-clean C11, and the real linked temperature
   example cover the path. No new HIR, MIR, backend instruction, runtime type,
   or platform branch was introduced.
+
+- [x] **Explicitly selected fundamental-integer C macros become evaluated FIIR constants**
+  (2026-09-03). The repeatable `luce bind --macro-constant NAME` option is the
+  complete import set and preserves request order. Clang's normalized
+  preprocessing stream establishes each final active object-like definition
+  and source location; absent, function-like, invalid, and duplicate selections
+  fail explicitly. A filtered local-`__auto_type` AST preserves exact typedef
+  spelling without requiring a constant initializer, then a separate filtered
+  value AST proves constant evaluation and supplies four bounded 16-bit words.
+  This separation gives non-integer macros stable importer diagnostics while
+  leaving every C expression and preprocessing rule owned by Clang.
+
+  FIIR now identifies anonymous-enumeration, object, and macro provenance for
+  each standalone constant. Generated Luce retains the same universal
+  sign/magnitude carrier; the backend C product asserts the selected macro's
+  exact type and value. The filtered probe roots avoid reparsing entire included
+  header ASTs and keep selected imports near the existing inspection cost.
+  Pure preprocessing/type/value failures, full-domain values, source origins,
+  CLI materialization, HIR/MIR oracles, Wasm/QBE encoding, warning-clean C11,
+  and real linked execution cover the path. No macro replacement text is
+  interpreted by Luce, and no target fact enters HIR or MIR. The completed
+  repository gate is 957/957 compiler tests plus CLI, Wasm, and native QBE
+  shell gates.
 
 - [x] **Plain C records cross FIIR through logical field carriers, never
   frontend layout** (2026-09-02). The Clang decoder catalogs complete structs,

@@ -9,7 +9,7 @@ the machine representation in depth. Update this file when a decision
 changes; move items to `done.md` when they are ticked. Do not let either
 drift into a wish list.
 
-Last updated: 2026-09-02 (Stage-0 0.30).
+Last updated: 2026-09-03 (Stage-0 0.30).
 
 ## Recovery audit of the unpublished native branch
 
@@ -901,10 +901,20 @@ Each item is a vertical slice gated by §1. Gates (§6) are settled in the spec 
   header's type and value. Full signed/unsigned extrema, const-qualified
   typedefs, mutable/external rejection, both semantic oracles, Wasm/QBE, CLI,
   and real linked C execution cover the slice.
+- [x] **Import explicitly selected fundamental-integer macros through Clang**
+  (2026-09-03). Repeated `--macro-constant NAME` options define the complete
+  selection and output order. A preprocessor inventory proves the final active
+  object-like definition and source origin; filtered type and value AST probes
+  let Clang preserve typedef spelling, evaluate the full 64-bit integer union,
+  and reject non-integer or nonconstant selections without Luce interpreting
+  replacement text. FIIR records constant provenance, and the generated C
+  adapter reasserts exact type and value. Pure malformed-state coverage, both
+  semantic oracles, Wasm/QBE emission, CLI materialization, and real linked C
+  execution cover the slice.
 - [ ] **Complete C import (FIIR)** for the remaining 1.0 C declaration and
   recipe surface used by Cocoa/Metal, OpenSSL/Monocypher, and wasm3 during the
   transition: lossless carriers for extended floating formats,
-  unions, macro constants, non-integer object constants, external objects,
+  unions, non-integer object constants, external objects,
   arrays/pointers/function pointers/opaque types, ownership and nullability
   recipes, typed variadic adapters, support tiers, deterministic regeneration
   diagnostics.

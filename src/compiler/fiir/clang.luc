@@ -16,7 +16,7 @@
 #
 #==============================================================================================
 
-from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, plain_value_boundary, validate_fiir
+from compiler.fiir.schema import FiirBoundaryValue, FiirCFloatingKind, FiirCIntegerKind, FiirCallingConvention, FiirConstant, FiirConstantSource, FiirConstantValue, FiirEnumCase, FiirFunction, FiirIntegerValue, FiirLanguage, FiirModule, FiirParameter, FiirRecordField, FiirSourceOrigin, FiirType, FiirTypeForm, FiirTypeId, is_c_identifier, plain_value_boundary, validate_fiir
 import std.json
 import std.strings
 
@@ -118,6 +118,123 @@ func has_macro(macros: str, name: str) -> bool:
         if line == prefix or strings.starts_with(line, prefix + " "): return true
     return false
 
+# mark: Selected macro inventory ===============================================================
+
+## One explicitly selected object-like macro after preprocessing. Macro
+## replacement text is intentionally absent: Clang remains the sole evaluator
+## of C preprocessing, typing, and constant-expression semantics.
+pub struct ClangMacroDefinition:
+    pub let name: str
+    pub let origin: FiirSourceOrigin
+
+## The two filtered AST products needed to finish selected macro constants.
+## Keeping them together prevents positional document arguments from losing
+## their meaning at the pure decoder boundary.
+pub struct ClangMacroProducts:
+    pub let definitions: list[ClangMacroDefinition]
+    pub let type_document: str
+    pub let value_document: str
+
+struct ClangMacroState:
+    let origin: FiirSourceOrigin
+    let function_like: bool
+
+struct ClangLineMarker:
+    let path: str
+    let line: u32
+
+struct ClangMacroConstant:
+    let name: str
+    let value_type: FiirTypeId
+    let origin: FiirSourceOrigin
+
+## Decode Clang's normalized `-E -dD` stream and retain only explicitly
+## requested definitions. The final active definition wins exactly as it does
+## for the translation unit; function-like and absent macros fail before any
+## generated probe attempts to use them as values.
+pub func decode_clang_macro_definitions(document: str, header: str, selected: list[str]) -> list[ClangMacroDefinition]!:
+    let requested = map[str, bool]()
+    for name in selected:
+        if not is_c_identifier(name):
+            error("Clang FIIR: selected macro `" + name + "` is not a portable C identifier")
+        if requested.has(name): error("Clang FIIR: selected macro `" + name + "` was requested more than once")
+        requested[name] = true
+    let states = map[str, ClangMacroState]()
+    let active = map[str, bool]()
+    var path = ""
+    var line_number = u32(0)
+    for line in strings.split(document, "\n"):
+        let marker = try preprocessor_line_marker(line)
+        if marker != none:
+            path = marker.path
+            line_number = marker.line
+            continue
+        if line_number != u32(0):
+            let definition = macro_directive(line, "#define ")
+            if definition != none:
+                let name = definition.name
+                if requested.has(name):
+                    states[name] = ClangMacroState(
+                        origin = FiirSourceOrigin(path = path, line = line_number, column = u32(1)),
+                        function_like = definition.function_like,
+                    )
+                    active[name] = true
+            let undefined = macro_directive(line, "#undef ")
+            if undefined != none and requested.has(undefined.name): active[undefined.name] = false
+            if line_number < u32(4294967295): line_number += u32(1)
+    let definitions = list[ClangMacroDefinition]()
+    for name in selected:
+        if not states.has(name) or not active.has(name) or not active[name]:
+            error("Clang FIIR: selected macro `" + name + "` is not defined after preprocessing `" + header + "`")
+        let state = states[name]
+        if state.function_like:
+            error("Clang FIIR: selected macro `" + name + "` is function-like; only object-like constant macros can be imported")
+        definitions.append(ClangMacroDefinition(name = name, origin = state.origin))
+    return definitions
+
+struct ClangMacroDirective:
+    let name: str
+    let function_like: bool
+
+func macro_directive(line: str, prefix: str) -> ClangMacroDirective?:
+    if not strings.starts_with(line, prefix): return none
+    let start = len(prefix)
+    if start >= len(line): return none
+    var end = start
+    while end < len(line) and is_c_identifier_character(line[end], end == start): end += 1
+    if end == start: return none
+    return ClangMacroDirective(name = line[start:end], function_like = end < len(line) and line[end] == '(')
+
+func is_c_identifier_character(character: char, first: bool) -> bool:
+    if character == '_' or (character >= 'A' and character <= 'Z') or (character >= 'a' and character <= 'z'): return true
+    return not first and character >= '0' and character <= '9'
+
+func preprocessor_line_marker(line: str) -> ClangLineMarker?!:
+    if not strings.starts_with(line, "# "): return none
+    var position = 2
+    let line_start = position
+    while position < len(line) and line[position] >= '0' and line[position] <= '9': position += 1
+    if position == line_start or position >= len(line) or line[position] != ' ': return none
+    let parsed_line = parse_i64(line[line_start:position]) else error("Clang FIIR macro inventory: malformed line marker `" + line + "`")
+    if parsed_line <= 0 or parsed_line > 4294967295:
+        error("Clang FIIR macro inventory: line marker is outside the supported source range")
+    while position < len(line) and line[position] == ' ': position += 1
+    if position >= len(line) or line[position] != '"': return none
+    let path_start = position
+    position += 1
+    var escaped = false
+    while position < len(line):
+        let character = line[position]
+        if character == '"' and not escaped:
+            let encoded = json.parse(line[path_start:position + 1]) catch malformed:
+                error("Clang FIIR macro inventory: malformed line-marker path: " + json.describe(malformed))
+            let path = encoded.as_text() else error("Clang FIIR macro inventory: line-marker path is not text")
+            return ClangLineMarker(path = path, line = u32(parsed_line))
+        if character == '\\' and not escaped: escaped = true
+        else: escaped = false
+        position += 1
+    error("Clang FIIR macro inventory: unterminated line-marker path")
+
 # mark: AST document ===========================================================================
 
 class SourceCursor:
@@ -207,7 +324,7 @@ class ClangRecordCatalog:
 ## Decode the translation-unit JSON produced for `header`. Declarations owned
 ## by included headers remain foreign dependencies, except for typedef chains
 ## needed to express a selected header declaration exactly.
-pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts, target_fact_document: str = "") -> FiirModule!:
+pub func decode_clang_ast(document: str, header: str, target: str, clang_arguments: list[str], facts: ClangScalarFacts, target_fact_document: str = "", macro_products: ClangMacroProducts? = none) -> FiirModule!:
     if header == "": error("Clang FIIR: source header cannot be empty")
     if target == "": error("Clang FIIR: target cannot be empty")
     let root = json.parse(document) catch malformed:
@@ -274,6 +391,12 @@ pub func decode_clang_ast(document: str, header: str, target: str, clang_argumen
             error("Clang FIIR: declaration kind `" + kind + "` at " + origin_text(origin) + " is not supported")
     if object_constant_index != len(object_constants):
         error("Clang FIIR: object constant catalog was not consumed completely")
+    if macro_products != none:
+        let products = macro_products
+        let macro_constants = try decode_macro_constant_types(products.type_document, products.definitions, interner)
+        let macro_values = try decode_macro_fact_values(len(macro_constants), products.value_document)
+        for index in range(0, len(macro_constants)):
+            try append_macro_constant(macro_constants[index], index, macro_values, interner, constants)
 
     let module = FiirModule(
         format_version = u32(1),
@@ -503,6 +626,56 @@ pub func render_target_fact_probe(document: str, header: str) -> str!:
             output += "    " + object_constant_probe_name(index, "word_" + str(word)) + " = __builtin_choose_expr(" + constant_check + ", (int)(((uint64_t)(" + name + ") >> " + shift + ") & UINT64_C(65535)), 0),\n"
     return output + "};\n"
 
+## Ask Clang for selected macro types inside one filtered function AST. Local
+## `__auto_type` preserves typedef spelling without requiring the macro to be
+## a constant expression; the separate value probe establishes that property.
+pub func render_macro_type_probe(macro_definitions: list[ClangMacroDefinition]) -> str:
+    if len(macro_definitions) == 0: return ""
+    var output = "/* Clang-evaluated FIIR macro-type probe. */\n"
+    output += "#pragma clang diagnostic push\n"
+    output += "#pragma clang diagnostic ignored \"-Wgnu-auto-type\"\n"
+    output += "#pragma clang diagnostic ignored \"-Wunused-variable\"\n"
+    output += "#pragma clang diagnostic ignored \"-Wunused-function\"\n"
+    output += "static void __luce_fiir_macro_type_facts(void) {\n"
+    for index in range(0, len(macro_definitions)):
+        let probe_name = macro_constant_type_probe_name(index)
+        output += "#undef " + probe_name + "\n"
+        output += "    __auto_type " + probe_name + " = (" + macro_definitions[index].name + ");\n"
+    output += "}\n#pragma clang diagnostic pop\n"
+    return output
+
+## After the type-only probe has proved every selected macro is a supported
+## fundamental integer, render a second probe for its evaluated value. Keeping
+## the casts out of the first pass gives unsupported pointers, strings, and
+## aggregates stable FIIR diagnostics instead of incidental C diagnostics.
+pub func render_macro_value_probe(document: str, facts: ClangScalarFacts, macro_definitions: list[ClangMacroDefinition], target_fact_document: str) -> str!:
+    if len(macro_definitions) == 0: return ""
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "translation unit")
+    if root_kind != "TranslationUnitDecl":
+        error("Clang FIIR: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
+    let declarations = try required_array_member(root, "inner", "translation unit")
+    let enumerations = try collect_enumerations(declarations)
+    let records = try collect_records(declarations)
+    let typedefs = try collect_typedefs(declarations, enumerations, records)
+    let interner = FiirTypeInterner(typedefs, enumerations, records, facts, none)
+    discard(try decode_macro_constant_types(target_fact_document, macro_definitions, interner))
+    var output = "/* Clang-evaluated FIIR macro-value probe. */\n#include <stdint.h>\n"
+    for index in range(0, len(macro_definitions)):
+        output += "#undef " + macro_constant_probe_name(index, "is_constant") + "\n"
+        for word in range(0, 4):
+            output += "#undef " + macro_constant_probe_name(index, "word_" + str(word)) + "\n"
+    output += "enum __luce_fiir_macro_value_facts {\n"
+    for index in range(0, len(macro_definitions)):
+        let name = macro_definitions[index].name
+        let constant_check = "__builtin_constant_p(" + name + ")"
+        output += "    " + macro_constant_probe_name(index, "is_constant") + " = " + constant_check + ",\n"
+        for word in range(0, 4):
+            let shift = str(word * 16)
+            output += "    " + macro_constant_probe_name(index, "word_" + str(word)) + " = __builtin_choose_expr(" + constant_check + ", (int)(((uint64_t)(" + name + ") >> " + shift + ") & UINT64_C(65535)), 0),\n"
+    return output + "};\n"
+
 func decode_target_fact_values(record_identities: list[str], needs_float16: bool, object_constant_count: i64, document: str) -> map[str, u64]!:
     let values = map[str, u64]()
     if len(record_identities) == 0 and not needs_float16 and object_constant_count == 0: return values
@@ -515,26 +688,75 @@ func decode_target_fact_values(record_identities: list[str], needs_float16: bool
         if object_constant_count > 0:
             error("Clang FIIR: selected C declarations have no Clang-evaluated target-fact probe")
         error("Clang FIIR: reachable C records have no Clang-evaluated target-fact probe")
+    return try decode_fact_values(document, "target facts")
+
+func decode_macro_fact_values(count: i64, document: str) -> map[str, u64]!:
+    if count == 0: return map[str, u64]()
+    if document == "": error("Clang FIIR: selected C macros have no Clang-evaluated value probe")
+    return try decode_fact_values(document, "macro values")
+
+func decode_fact_values(document: str, product: str) -> map[str, u64]!:
+    let values = map[str, u64]()
     let root = json.parse(document) catch malformed:
-        error("Clang FIIR target facts: " + json.describe(malformed))
-    let root_kind = try required_text_member(root, "kind", "target-fact translation unit")
-    if root_kind != "TranslationUnitDecl":
-        error("Clang FIIR target facts: root kind is `" + root_kind + "`, expected `TranslationUnitDecl`")
-    let declarations = try required_array_member(root, "inner", "target-fact translation unit")
+        error("Clang FIIR " + product + ": " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", product + " translation unit")
+    let declarations = list[json.Json]()
+    if root_kind == "TranslationUnitDecl":
+        for declaration in try required_array_member(root, "inner", product + " translation unit"): declarations.append(declaration)
+    elif root_kind == "EnumDecl": declarations.append(root)
+    else:
+        error("Clang FIIR " + product + ": root kind is `" + root_kind + "`, expected `TranslationUnitDecl` or `EnumDecl`")
     for declaration in declarations:
-        let kind = try optional_text_member(declaration, "kind", "target-fact declaration") else ""
+        let kind = try optional_text_member(declaration, "kind", product + " declaration") else ""
         if kind != "EnumDecl": continue
-        let children = try optional_array_member(declaration, "inner", "target-fact enum") else list[json.Json]()
+        let children = try optional_array_member(declaration, "inner", product + " enum") else list[json.Json]()
         for child in children:
-            let child_kind = try optional_text_member(child, "kind", "target-fact enum child") else ""
+            let child_kind = try optional_text_member(child, "kind", product + " enum child") else ""
             if child_kind != "EnumConstantDecl": continue
-            let name = try required_text_member(child, "name", "target-fact constant")
-            if not strings.starts_with(name, "__luce_fiir_record_") and not strings.starts_with(name, "__luce_fiir_float16_") and not strings.starts_with(name, "__luce_fiir_object_constant_"): continue
-            let value = try explicit_enumeration_value(child, "target-fact constant `" + name + "`") else error("Clang FIIR target facts: `" + name + "` has no evaluated value")
+            let name = try required_text_member(child, "name", product + " constant")
+            if not strings.starts_with(name, "__luce_fiir_record_") and not strings.starts_with(name, "__luce_fiir_float16_") and not strings.starts_with(name, "__luce_fiir_object_constant_") and not strings.starts_with(name, "__luce_fiir_macro_constant_"): continue
+            let value = try explicit_enumeration_value(child, product + " constant `" + name + "`") else error("Clang FIIR " + product + ": `" + name + "` has no evaluated value")
             match value:
-                Negative(magnitude): error("Clang FIIR target facts: `" + name + "` is negative")
+                Negative(magnitude): error("Clang FIIR " + product + ": `" + name + "` is negative")
                 Nonnegative(integer): values[name] = integer
     return values
+
+func decode_macro_constant_types(document: str, definitions: list[ClangMacroDefinition], interner: FiirTypeInterner) -> list[ClangMacroConstant]!:
+    let constants = list[ClangMacroConstant]()
+    if len(definitions) == 0: return constants
+    if document == "": error("Clang FIIR: selected C macros have no Clang-evaluated type probe")
+    let root = json.parse(document) catch malformed:
+        error("Clang FIIR macro types: " + json.describe(malformed))
+    let root_kind = try required_text_member(root, "kind", "macro-type AST")
+    if root_kind != "TranslationUnitDecl" and root_kind != "FunctionDecl":
+        error("Clang FIIR macro types: root kind is `" + root_kind + "`, expected `TranslationUnitDecl` or `FunctionDecl`")
+    let spellings = map[str, str]()
+    try collect_macro_probe_spellings(root, spellings)
+    for index in range(0, len(definitions)):
+        let probe_name = macro_constant_type_probe_name(index)
+        if not spellings.has(probe_name): error("Clang FIIR macro types: missing probe variable `" + probe_name + "`")
+        let selected_spelling = spellings[probe_name]
+        if not spelling_resolves_to_integer(selected_spelling, interner.typedefs, list[str]()):
+            error("Clang FIIR: selected C macro `" + definitions[index].name + "` has unsupported non-integer type `" + selected_spelling + "`")
+        let value_type = try interner.intern(selected_spelling, "selected C macro `" + definitions[index].name + "`")
+        let resolved = try interner.resolve(value_type)
+        match resolved.form:
+            Integer(kind, bits, is_signed):
+                if bits > u16(64): error("Clang FIIR: selected C macro `" + definitions[index].name + "` exceeds the 64-bit portable integer domain")
+            else:
+                error("Clang FIIR: selected C macro `" + definitions[index].name + "` has unsupported non-integer type `" + selected_spelling + "`")
+        constants.append(ClangMacroConstant(name = definitions[index].name, value_type = value_type, origin = definitions[index].origin))
+    return constants
+
+func collect_macro_probe_spellings(value: json.Json, spellings: map[str, str]) -> !:
+    let kind = try optional_text_member(value, "kind", "macro-type AST node") else ""
+    if kind == "VarDecl":
+        let name = try optional_text_member(value, "name", "macro-type variable") else ""
+        if strings.starts_with(name, "__luce_fiir_macro_constant_type_"):
+            if spellings.has(name): error("Clang FIIR macro types: duplicate probe variable `" + name + "`")
+            spellings[name] = try required_type_spelling(value, "macro-type probe variable `" + name + "`")
+    let children = try optional_array_member(value, "inner", "macro-type AST node") else list[json.Json]()
+    for child in children: try collect_macro_probe_spellings(child, spellings)
 
 func apply_record_layouts(records: ClangRecordCatalog, identities: list[str], values: map[str, u64]) -> !:
     for index in range(0, len(identities)):
@@ -562,7 +784,10 @@ func required_float16_u16(values: map[str, u64], suffix: str) -> u16!:
     return u16(value)
 
 func required_target_fact_value(values: map[str, u64], name: str) -> u64!:
-    if not values.has(name): error("Clang FIIR target facts: missing evaluated constant `" + name + "`")
+    return try required_fact_value(values, name, "target facts")
+
+func required_fact_value(values: map[str, u64], name: str, product: str) -> u64!:
+    if not values.has(name): error("Clang FIIR " + product + ": missing evaluated constant `" + name + "`")
     return values[name]
 
 func record_probe_name(index: i64, suffix: str) -> str:
@@ -571,6 +796,12 @@ func record_probe_name(index: i64, suffix: str) -> str:
 func object_constant_probe_name(index: i64, suffix: str) -> str:
     return "__luce_fiir_object_constant_" + str(index) + "_" + suffix
 
+func macro_constant_type_probe_name(index: i64) -> str:
+    return "__luce_fiir_macro_constant_type_" + str(index)
+
+func macro_constant_probe_name(index: i64, suffix: str) -> str:
+    return "__luce_fiir_macro_constant_" + str(index) + "_" + suffix
+
 func append_object_constant(declaration: ClangObjectConstant, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
     let value_type = try interner.intern(declaration.type_spelling, "C object constant `" + declaration.name + "`")
     let resolved = try interner.resolve(value_type)
@@ -578,21 +809,35 @@ func append_object_constant(declaration: ClangObjectConstant, index: i64, values
         Integer(kind, bits, is_signed):
             constants.append(FiirConstant(
                 name = declaration.name,
+                source = FiirConstantSource.object,
                 value_type = value_type,
-                value = FiirConstantValue.Integer(value = try decode_object_constant_value(declaration.name, index, is_signed, values)),
+                value = FiirConstantValue.Integer(value = try decode_integer_probe_value("C object `" + declaration.name + "`", "C object `" + declaration.name + "`", "target facts", object_constant_probe_name(index, ""), is_signed, values)),
                 origin = declaration.origin,
             ))
         else: error("Clang FIIR: C object constant `" + declaration.name + "` does not resolve to an integer type")
 
-func decode_object_constant_value(name: str, index: i64, is_signed: bool, values: map[str, u64]) -> FiirIntegerValue!:
-    let is_constant = try required_target_fact_value(values, object_constant_probe_name(index, "is_constant"))
+func append_macro_constant(declaration: ClangMacroConstant, index: i64, values: map[str, u64], interner: FiirTypeInterner, constants: list[FiirConstant]) -> !:
+    let resolved = try interner.resolve(declaration.value_type)
+    match resolved.form:
+        Integer(kind, bits, is_signed):
+            constants.append(FiirConstant(
+                name = declaration.name,
+                source = FiirConstantSource.macro,
+                value_type = declaration.value_type,
+                value = FiirConstantValue.Integer(value = try decode_integer_probe_value("selected C macro `" + declaration.name + "`", "C macro `" + declaration.name + "`", "macro values", macro_constant_probe_name(index, ""), is_signed, values)),
+                origin = declaration.origin,
+            ))
+        else: error("Clang FIIR: selected C macro `" + declaration.name + "` does not resolve to an integer type")
+
+func decode_integer_probe_value(context: str, fact_context: str, fact_product: str, prefix: str, is_signed: bool, values: map[str, u64]) -> FiirIntegerValue!:
+    let is_constant = try required_fact_value(values, prefix + "is_constant", fact_product)
     if is_constant != u64(1):
-        error("Clang FIIR: C object `" + name + "` does not have a Clang-evaluable constant value")
+        error("Clang FIIR: " + context + " does not have a Clang-evaluable constant value")
     var raw = u64(0)
     for word in range(0, 4):
-        let part = try required_target_fact_value(values, object_constant_probe_name(index, "word_" + str(word)))
+        let part = try required_fact_value(values, prefix + "word_" + str(word), fact_product)
         if part > u64(65535):
-            error("Clang FIIR target facts: C object `" + name + "` word " + str(word) + " exceeds 16 bits")
+            error("Clang FIIR " + fact_product + ": " + fact_context + " word " + str(word) + " exceeds 16 bits")
         raw = raw | (part << u64(word * 16))
     if is_signed and raw > u64(9223372036854775807):
         return FiirIntegerValue.Negative(magnitude = u64(18446744073709551615) - raw + u64(1))
@@ -786,6 +1031,7 @@ func append_anonymous_enumeration_constants(enumeration: ClangEnumeration, inter
         let value_type = try interner.intern(constant.type_spelling, "C constant `" + enum_case.name + "`")
         constants.append(FiirConstant(
             name = enum_case.name,
+            source = FiirConstantSource.anonymous_enumeration,
             value_type = value_type,
             value = FiirConstantValue.Integer(value = enum_case.value),
             origin = enum_case.origin,
