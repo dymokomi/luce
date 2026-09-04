@@ -2485,6 +2485,34 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   whose alignment is not one, through any place that reaches it; a packed
   struct itself, and any field of one-byte scalars, stays addressable.
   Gate: 1067 compiler tests across 54 files.
+- [x] **Interface views (B4, first slice)** (2026-09-04). In a `.lucb`
+  module an interface used as a type is a two-word view, the conformer's
+  address and its witness table's (base.md §14.3): the checker forms one
+  from `T*`, or from `const T*` when no requirement mutates, and refuses a
+  bare value; a view fixes its mutability when formed, so a `let` view may
+  still call a `mutating` requirement. The lowerer lays the view out as
+  `{ptr, ptr}`, materialises each conformance's witness table on first use
+  as a global initialised with the addresses of the witness thunks the
+  full profile already lowers (`MirInitializer.FunctionAddress`, so no new
+  instruction), and dispatches with `ElementAddress`, a load, and a
+  `CallIndirect` whose erased receiver is the conformer's address. The
+  reference interpreter reads the conformer through the view's address and
+  writes it back after a mutating call; the escape rule treats a view of a
+  local like a pointer to it. `Writer?` on the data-word niche waits.
+  Gate: 1071 compiler tests across 54 files.
+- [x] **`volatile` accesses (B4, second slice)** (2026-09-04). A scalar
+  load or store through `volatile T*` (base.md §15.2), whether of the
+  pointee or of a field reached through it, lowers to the new canonical
+  `VolatileLoad`/`VolatileStore`; a compound `+=` through such a pointer
+  is a volatile load, the operation, and a volatile store. QBE legalizes
+  both through the relaxed `__atomic_load_N`/`__atomic_store_N` calls of
+  §19.3, since its load optimiser forwards stores and drops repeated
+  loads, extending sub-word results with its `sb`/`ub`/`sh`/`uh` classes
+  and carrying floats as their bits; the MIR oracle and Wasm perform the
+  plain access, which is what a single thread with no cache observes. An
+  array element indexed through a volatile pointer keeps the plain access
+  for now, and an aggregate copies member by member as before.
+  Gate: 1071 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

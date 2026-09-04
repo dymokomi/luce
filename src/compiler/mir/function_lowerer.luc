@@ -37,6 +37,7 @@ from compiler.mir.lowering_model import COutputSlot, DeferredAction
 from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, MatchExit, MirLoweringState, contains_symbol
 from compiler.mir.lowering_model import CellStorage, CountedLoop, EqualityHelper, FunctionLoweringHost, GeneratedHelper, OwnershipHelper, RecoverTarget, Region
 from compiler.profiles.full.mir.lowering import FullProfileLowerer
+from compiler.profile import Profile
 
 ## Storage owned solely by one in-flight C call. String results are decoded
 ## before these allocations are released because a C result may alias an
@@ -48,6 +49,11 @@ struct CInputTemporary:
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
 ## function state while program identities remain stable.
+# The two loads a view call needs: the conformer's address and the witness.
+struct ViewDispatch:
+    let data: RegisterId
+    let callee: RegisterId
+
 pub class FunctionLowerer: FunctionLoweringHost:
     let state: MirLoweringState
     ## The one dispatch point for full-Luce-only forms: collections, classes,
@@ -638,7 +644,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
             Assignment(symbol, operation, value):
                 let address = try self.address_of(module, function, span, symbol, body)
                 let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
-                try self.lower_store(module, function, span, value_type, address, operation, value, body)
+                try self.lower_store(module, function, span, value_type, address, operation, value, false, body)
             ExternStore(variable_index, operation, value):
                 let global = self.state.lowered_external_globals[variable_index]
                 let value_type = self.state.external_globals[global.value].value_type
@@ -654,12 +660,12 @@ pub class FunctionLowerer: FunctionLoweringHost:
             GlobalStore(global_index, operation, value):
                 let address = self.global_address(global_index, span, body)
                 let value_type = self.state.globals[global_index].value_type
-                try self.lower_store(module, function, span, value_type, address, operation, value, body)
+                try self.lower_store(module, function, span, value_type, address, operation, value, false, body)
             PointerStore(pointer, steps, operation, value):
                 # `*p = v`, `p.field = v`: the pointee is the place's root (base.md §7.7).
                 let address = try self.lower_expression(module, function, pointer, body)
                 let pointee = pointee_of(self.state.program.types, node_type(self.state.program, pointer))
-                try self.lower_place_store(module, function, span, address, false, pointee, steps, operation, value, body)
+                try self.lower_place_store(module, function, span, address, false, pointee, steps, operation, value, self.is_volatile_pointer(node_type(self.state.program, pointer)), body)
                 return
             PlaceAssignment(symbol, steps, operation, value):
                 let root_type = self.state.program.symbols[symbol.value].value_type
@@ -674,11 +680,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     root_is_reference_value = is_reference_type(self.state.types, lowered_root)
                 if root_is_reference_value:
                     let reference_parameter = parameter else trap("reference place lost its parameter register")
-                    try self.lower_place_store(module, function, span, reference_parameter, true, root_type, steps, operation, value, body)
+                    try self.lower_place_store(module, function, span, reference_parameter, true, root_type, steps, operation, value, false, body)
                 else:
-                    try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol, body), false, root_type, steps, operation, value, body)
+                    try self.lower_place_store(module, function, span, try self.address_of(module, function, span, symbol, body), false, root_type, steps, operation, value, false, body)
             GlobalPlaceAssignment(global, steps, operation, value):
-                try self.lower_place_store(module, function, span, self.global_address(global, span, body), false, self.state.program.globals[global].value_type, steps, operation, value, body)
+                try self.lower_place_store(module, function, span, self.global_address(global, span, body), false, self.state.program.globals[global].value_type, steps, operation, value, false, body)
             ExpressionStatement(value):
                 let discarded = try self.lower_expression(module, function, value, body)
             IfStatement(branches, has_fallback, fallback):
@@ -701,7 +707,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # Walk one resolved target-neutral field/element path from an addressable
     # root or a direct reference-parameter value, then perform the shared store
     # protocol.
-    func lower_place_store(module: HirModule, function: HirFunction, span: SourceSpan, root: RegisterId, root_is_value: bool, root_type: ir.TypeId, steps: Operands, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
+    func lower_place_store(module: HirModule, function: HirFunction, span: SourceSpan, root: RegisterId, root_is_value: bool, root_type: ir.TypeId, steps: Operands, operation: AssignmentOperation, value: NodeId, is_volatile: bool, body: list[MirInstruction]) -> !:
         var address = root
         var place_type = root_type
         var weak_storage: TypeId? = none
@@ -742,21 +748,52 @@ pub class FunctionLowerer: FunctionLoweringHost:
             try self.full.lower_weak_store(self, module, function, span, weak_storage, address, value, body)
             return
         let value_type = try self.state.mir_type_of(module, function, span, place_type)
-        try self.lower_store(module, function, span, value_type, address, operation, value, body)
+        try self.lower_store(module, function, span, value_type, address, operation, value, is_volatile, body)
 
     # mark: Weak references ====================================================================
 
     # Store a value, or combine it with what the place holds, at an address.
-    func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: NodeId, body: list[MirInstruction]) -> !:
+    func lower_store(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, address: RegisterId, operation: AssignmentOperation, value: NodeId, is_volatile: bool, body: list[MirInstruction]) -> !:
         let register = try self.lower_expression(module, function, value, body)
         var stored = register
         match operation:
             Replace: stored = register
             Combine(binary):
-                let current = self.state.new_register(value_type)
-                body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = address), span = span))
+                var current = RegisterId(value = no_register)
+                if is_volatile: current = self.load_volatile(value_type, address, span, body)
+                else:
+                    current = self.state.new_register(value_type)
+                    body.append(MirInstruction(form = InstructionForm.Load(result = current, value_type = value_type, address = address), span = span))
                 stored = try self.lower_binary_operation(module, function, span, binary, value_type, current, register, body)
+        if is_volatile and not self.is_aggregate(value_type):
+            body.append(MirInstruction(form = InstructionForm.VolatileStore(value_type = value_type, address = address, value = stored), span = span))
+            return
         self.replace_owned_value(value_type, address, stored, span, body)
+
+    # mark: Volatile accesses (Base) ============================================================
+    #
+    # An access through `volatile T*` is observable (base.md §15.2). The
+    # qualifier lives on the pointer type, so the lowerer asks the place's
+    # root: `*p`, `p.field`, and `p.field.inner` all read through `p`. A
+    # scalar becomes `VolatileLoad`/`VolatileStore`; an aggregate copies as
+    # it always did, member by member at the backend's discretion.
+
+    func is_volatile_pointer(pointer_type: ir.TypeId) -> bool:
+        match self.state.program.types.definitions[pointer_type.value].form:
+            Pointer(pointee, is_const, is_volatile): return is_volatile
+            else: return false
+
+    func volatile_place(node: NodeId) -> bool:
+        match node_form(self.state.program, node):
+            Deref(pointer): return self.is_volatile_pointer(node_type(self.state.program, pointer))
+            FieldAccess(record, field): return self.volatile_place(record)
+            else: return false
+
+    func load_volatile(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if self.is_aggregate(value_type): return address
+        let register = self.state.new_register(value_type)
+        body.append(MirInstruction(form = InstructionForm.VolatileLoad(result = register, value_type = value_type, address = address), span = span))
+        return register
 
     # The address a mutable binding lives at: a local's slot, or — for `self`
     # in a mutating method — the pointer the caller passed.
@@ -1334,6 +1371,14 @@ pub class FunctionLowerer: FunctionLoweringHost:
             Match(subject, arms, has_result):
                 if types_match(node_type(self.state.program, expression), resolve_builtin_type(BuiltinType.never_type)):
                     return try self.lower_match(module, function, expression, subject, arms, true, body)
+            InterfaceValue(value, conformance):
+                if self.state.profile == Profile.base: return try self.lower_view(module, function, expression, value, i64(conformance), body)
+                let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
+                if runtime_value != none: return runtime_value
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                if self.state.profile == Profile.base: return try self.lower_view_call(module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
+                let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
+                if runtime_value != none: return runtime_value
             else:
                 let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
                 if runtime_value != none: return runtime_value
@@ -1669,6 +1714,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
             QualifyPointer(value): return try self.lower_expression(module, function, value, body)
             Deref(pointer):
                 let address = try self.lower_expression(module, function, pointer, body)
+                if self.volatile_place(expression): return self.load_volatile(value_type, address, span, body)
                 return self.load_value(value_type, address, span, body)
             AddressOf(pointer, symbol, global, steps): return try self.lower_address_of(module, function, span, pointer, symbol, global, steps, body)
             PointerOffset(pointer, offset, negate):
@@ -1814,6 +1860,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 if class_field != none: return class_field
                 let struct_type = try self.state.mir_type_of(module, function, node_span(self.state.program, record), node_type(self.state.program, record))
                 let field = self.field_address(struct_type, base, field_index, span, body)
+                if self.volatile_place(record): return self.load_volatile(value_type, field, span, body)
                 return self.load_value(value_type, field, span, body)
             NoneLiteral:
                 # The nullable pointer niche is one word whose zero is `none`.
@@ -1989,6 +2036,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     self.emit_fallible_yield(fallback, span, body)
                 self.emit_end(span, body)
                 return FallibleResult(value = result_value, error_value = result_error)
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                if self.state.profile == Profile.base: return try self.lower_fallible_view_call(module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
+                let runtime_value = try self.full.lower_fallible_expression(self, module, function, expression, body)
+                if runtime_value != none: return runtime_value
+                error(self.state.unsupported(module, function, span, "fallible expression `" + str(node_form(self.state.program, expression)) + "`"))
             else:
                 let runtime_value = try self.full.lower_fallible_expression(self, module, function, expression, body)
                 if runtime_value != none: return runtime_value
@@ -3039,6 +3091,77 @@ pub class FunctionLowerer: FunctionLoweringHost:
         body.append(MirInstruction(form = InstructionForm.Trap(reason = "integer-backed enum conversion of a value that is not a declared case"), span = span))
         self.emit_end(span, body)
         return result
+
+    # mark: Interface views (Base) =============================================================
+    #
+    # A Base interface value is two words, the conformer's address and its
+    # witness table's (base.md §14.3). The table is a global of witness thunk
+    # addresses in requirement order, and a call loads the slot and calls it
+    # indirectly with the conformer's address as the erased receiver.
+
+    func lower_view(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, conformance: i64, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let data = try self.lower_expression(module, function, value, body)
+        let view_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let view = self.new_temp(view_type, span, body)
+        self.store_value(pointer, self.field_address(view_type, view, 0, span, body), data, span, body)
+        let table = self.state.new_register(pointer)
+        body.append(MirInstruction(form = InstructionForm.GlobalAddress(result = table, global = self.state.witness_table_global(conformance)), span = span))
+        self.store_value(pointer, self.field_address(view_type, view, 1, span, body), table, span, body)
+        return view
+
+    # The witness thunk address of one requirement, and the conformer's address.
+    func lower_view_dispatch(module: HirModule, function: HirFunction, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, span: SourceSpan, body: list[MirInstruction]) -> ViewDispatch!:
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let view = try self.lower_expression(module, function, receiver, body)
+        let view_type = try self.state.mir_type_of(module, function, span, interface_type)
+        let data = self.load_value(pointer, self.field_address(view_type, view, 0, span, body), span, body)
+        let table = self.load_value(pointer, self.field_address(view_type, view, 1, span, body), span, body)
+        let slot = self.element_address(pointer, table, self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), requirement, span, body), span, body)
+        let callee = self.load_value(pointer, slot, span, body)
+        return ViewDispatch(data = data, callee = callee)
+
+    func lower_view_arguments(module: HirModule, function: HirFunction, arguments: Operands, body: list[MirInstruction]) -> list[RegisterId]!:
+        let values = list[RegisterId]()
+        for pair in range(0, i64(arguments.count) // 2): values.append(RegisterId(value = no_register))
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.state.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.state.program, arguments, pair * 2 + 1)))
+            values[parameter_index] = try self.lower_expression(module, function, argument, body)
+        return values
+
+    func lower_view_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let signature = try self.state.view_call_signature(interface_type, requirement)
+        if signature.is_fallible: trap("fallible view call entered infallible lowering")
+        let dispatch = try self.lower_view_dispatch(module, function, receiver, interface_type, requirement, span, body)
+        let values = try self.lower_view_arguments(module, function, arguments, body)
+        let call_arguments = list[RegisterId]()
+        let results = list[RegisterId]()
+        let value = try self.place_call_result(module, function, span, node_type(self.state.program, expression), signature.returns_never, call_arguments, results, body)
+        call_arguments.append(dispatch.data)
+        for argument in values: call_arguments.append(argument)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
+        if signature.returns_never: body.append(MirInstruction(form = InstructionForm.Unreachable, span = span))
+        return value
+
+    func lower_fallible_view_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.state.program, expression)
+        let signature = try self.state.view_call_signature(interface_type, requirement)
+        let dispatch = try self.lower_view_dispatch(module, function, receiver, interface_type, requirement, span, body)
+        let values = try self.lower_view_arguments(module, function, arguments, body)
+        let successful = self.state.fallible_inner(node_type(self.state.program, expression)) else trap("fallible view call has an infallible result")
+        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let call_arguments = [self.new_temp(error_type, span, body)]
+        let results = list[RegisterId]()
+        let value = try self.place_call_result(module, function, span, successful, signature.returns_never, call_arguments, results, body)
+        call_arguments.append(dispatch.data)
+        for argument in values: call_arguments.append(argument)
+        let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        results.append(reported_error)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
+        return FallibleResult(value = value, error_value = reported_error)
 
     # A widening no target can narrow needs no guard; the backend that knows
     # the pointer width chooses between an extension and a copy.
