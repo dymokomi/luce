@@ -145,6 +145,12 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   both profiles share, in a `.lucb` file. It checks, runs through the
   reference interpreter, and lowers to a freestanding program; the Base
   process entry arrives with spans (plan.md §5.1, B2).
+- `base/pointer_width.lucb` uses `usize` and `isize`, the pointer-width
+  integers only a Base module names. The IR carries them without a width and
+  each backend folds the target's: 64 bits under QBE, 32 on WebAssembly and
+  in the oracle's 4-byte layout rules (base.md §5.1). Its `sizeof`, `alignof`,
+  and `offsetof` questions travel the same way and fold to the target's C
+  layout (base.md §5.11).
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the

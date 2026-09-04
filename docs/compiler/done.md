@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 993 compiler tests across 50 files.
+  Gate: 1009 compiler tests across 51 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,43 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 993 compiler tests across 50 files.
+  Gate: 1009 compiler tests across 51 files.
+- [x] **Pointer-width integers and layout questions without a width in the IR
+  (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
+  `.lucb` module (a `.luc` module naming them is told they belong to Luce
+  Base) as the HIR form `PointerInteger` and the canonical MIR type
+  `PointerInt`, which carries no width: `bits_of` and the bound helpers
+  answer 0, and `TypeLayout` supplies the target width (`integer_bits`,
+  `int_minimum`, `int_maximum`, `uint_maximum`) so the MIR interpreter
+  checks arithmetic at its layout's pointer width, QBE emits `l`, and Wasm
+  emits `i32`. The HIR model treats the type as 64 bits wide for literal
+  typing; a constant that fits only the wider target is refused by the
+  backend that knows the width (the oracle under 4-byte rules and wasm32,
+  each naming the constant and the width). The verifier skips the range
+  check for the widthless register and refuses any `Convert` touching it,
+  and the lowerer refuses numeric conversions and hashing of the type with a
+  diagnostic, until the Base cast family fixes their rules. Layout is
+  pointer size and alignment; the C boundary maps the type to
+  `size_t`/`ptrdiff_t` and the header now includes `<stddef.h>`.
+  `sizeof(T)`, `sizeof(value)`, `alignof(T)`, and `offsetof(T, field)` are
+  core names in a `.lucb` module (ordinary names in full Luce) that check as
+  `usize` and become the HIR node `LayoutConstant` and the canonical MIR
+  instruction of the same name, both carrying the question (`LayoutQuery` in
+  `layout_query.luc`, the one shared vocabulary) and the type, never a byte
+  count. `TypeLayout.answer` folds it in each backend from its own rules, so
+  `sizeof(usize)` is 4 in the MIR oracle's 4-byte rules and on wasm32 and 8
+  under QBE. The reference interpreter is a backend for these questions
+  (design §23.3): it lowers the type with the lowerer's own type mapping and
+  answers under its layout rules, host pointers by default, so `luce run`
+  matches the native build; a test may pass narrower rules. The checker
+  names a missing field, a non-struct `offsetof`, a value handed to
+  `alignof`, and the arity of each question; the verifier requires a
+  storable subject, a struct subject with an in-range field for `offset`,
+  and a `usize` result. Folding `usize` expressions into array lengths and
+  module-level `assert`s (base.md §5.1) waits for the Base constant
+  evaluator. `examples/base/pointer_width.lucb` asks all three questions and
+  answers 42 at either pointer width through check, run, and a Wasm build.
+  Gate: 1009 compiler tests across 51 files.
 
 ## 3. Bugs the multi-backend harness found
 
