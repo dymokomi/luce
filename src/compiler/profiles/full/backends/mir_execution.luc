@@ -1,0 +1,1475 @@
+#==============================================================================================
+#
+#   full_profile_mir_execution - Oracle execution of the instructions only full Luce has
+#
+#   DESCRIPTION:
+#       Executes the canonical MIR instructions whose semantics the Luce
+#       runtime supplies: typed lists, hash collections, snapshot slices,
+#       equality contexts, class identities with ARC and weak slots,
+#       existential boxes, closure cells, and structured workers. It owns the
+#       oracle's handle tables for those values; the shared interpreter owns
+#       memory, buffers, and calls and lends them through `MirExecutionHost`.
+#       `backends/mir_interpreter` is the one dispatch point that reaches
+#       this class.
+#
+#       Everything here uses the explicit test layout rules the interpreter
+#       was built with. No host ABI or target fact enters.
+#
+#==============================================================================================
+
+from compiler.backends.layout import TypeLayout
+from compiler.backends.mir_execution_model import Frame, MirExecutionHost, MirValue
+from compiler.backends.mir_execution_model import bool_of, bounded_position_of, float_of, function_address_base, host_count_of, normalize_mir_float, ptr_of, signed_int_of, unsigned_int_of
+from compiler.backends.mir_execution_model import buffer_owner_address_base, class_address_base, equality_context_address_base, hash_address_base, interface_address_base, list_address_base, slice_address_base, task_address_base, task_group_address_base, weak_class_address_base
+from compiler.backends.mir_task_runtime import MirTaskGroup, MirTaskOutcome, MirTaskStorage, MirTransferredForm, MirTransferredHashEntry, MirTransferredValue
+from compiler.mir.canonical import BuiltinMirType, FunctionId, MirField, MirFunction, MirInstruction, MirProgram, MirTaskResult, RegisterId, TypeId, builtin_mir_type, is_aggregate_type, is_ptr_type, mir_type, no_register, transfer_at
+from compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
+import std.strings
+
+# mark: Managed oracle storage ==================================================================
+
+## One backing buffer retained by a list or immutable slices.
+class MirListBuffer:
+    let elements: list[i64]
+    var references: i64
+
+    pub init():
+        self.elements = list[i64]()
+        self.references = 1
+
+## Semantic list identity for this oracle. Independent typed element cells are
+## sufficient here: contiguity and growth are compiled-runtime policy.
+class MirList:
+    let element_type: TypeId
+    var buffer: MirListBuffer
+    var references: i64
+    var active_iterations: i64
+    var is_alive: bool
+
+    pub init(element_type: TypeId):
+        self.element_type = element_type
+        self.buffer = MirListBuffer()
+        self.references = 1
+        self.active_iterations = 0
+        self.is_alive = true
+
+## Insertion-ordered semantic table storage. Keys and map values occupy
+## independent typed oracle cells; hashes only select candidates and never
+## decide language equality.
+class MirHash:
+    let key_type: TypeId
+    let value_type: TypeId?
+    let hashes: list[u64]
+    let keys: list[i64]
+    let values: list[i64]
+    var references: i64
+    var active_iterations: i64
+    var is_alive: bool
+
+    pub init(key_type: TypeId, value_type: TypeId?):
+        self.key_type = key_type
+        self.value_type = value_type
+        self.hashes = list[u64]()
+        self.keys = list[i64]()
+        self.values = list[i64]()
+        self.references = 1
+        self.active_iterations = 0
+        self.is_alive = true
+
+## One comparison-local set of ordered list identity pairs. The semantic
+## oracle uses host lists; canonical MIR and compiled runtimes retain only an
+## opaque context handle and the same seen-or-add behavior.
+class MirEqualityContext:
+    let left: list[i64]
+    let right: list[i64]
+    var is_alive: bool
+
+    pub init():
+        self.left = list[i64]()
+        self.right = list[i64]()
+        self.is_alive = true
+
+union MirSliceBacking:
+    List(buffer: MirListBuffer, start: i64)
+    Bytes(owner: i64, data: i64)
+
+class MirSlice:
+    let element_type: TypeId
+    let backing: MirSliceBacking
+    let length: i64
+    var references: i64
+    var is_alive: bool
+
+    pub init(element_type: TypeId, backing: MirSliceBacking, length: i64):
+        self.element_type = element_type
+        self.backing = backing
+        self.length = length
+        self.references = 1
+        self.is_alive = true
+
+## One semantic class identity. Payload fields use independent typed cells so
+## the oracle tests lifecycle and ownership without choosing a target layout.
+class MirClassObject:
+    let class_index: i64
+    let fields: list[i64]
+    let field_types: list[TypeId]
+    let destroyer: FunctionId
+    let allocation_id: i64
+    let allocation_site: ClassAllocationSite?
+    var references: i64
+    var is_initialized: bool
+    var is_alive: bool
+    var is_destroying: bool
+
+    pub init(class_index: i64, fields: list[i64], field_types: list[TypeId], destroyer: FunctionId, allocation_id: i64, allocation_site: ClassAllocationSite?):
+        self.class_index = class_index
+        self.fields = fields
+        self.field_types = field_types
+        self.destroyer = destroyer
+        self.allocation_id = allocation_id
+        self.allocation_site = allocation_site
+        self.references = 1
+        self.is_initialized = false
+        self.is_alive = true
+        self.is_destroying = false
+
+## One structural value awaiting inspection in the MIR oracle's private
+## memory. Runtime handles remain typed and are never reinterpreted as raw
+## target addresses by the census.
+struct MirGraphValue:
+    let value_type: TypeId
+    let address: i64
+
+## A separately owned weak slot. Its referent index remains stable after death
+## because oracle storage is append-only; promotion consults `is_alive`.
+class MirWeakClassSlot:
+    let referent: i64
+    var references: i64
+    var is_alive: bool
+
+    pub init(referent: i64):
+        self.referent = referent
+        self.references = 1
+        self.is_alive = true
+
+## One erased payload and its exact conformance. Storage is ordinary oracle
+## memory so normalized witness thunks exercise the same MIR as compiled code.
+class MirInterfaceBox:
+    let conformance: i64
+    let payload: i64
+    var references: i64
+    var is_alive: bool
+
+    pub init(conformance: i64, payload: i64):
+        self.conformance = conformance
+        self.payload = payload
+        self.references = 1
+        self.is_alive = true
+
+
+func contains_graph_id(values: list[i64], sought: i64) -> bool:
+    for value in values:
+        if value == sought: return true
+    return false
+
+func contains_graph_buffer(values: list[MirListBuffer], sought: MirListBuffer) -> bool:
+    for value in values:
+        if value is sought: return true
+    return false
+
+# Decode the integer tag carried by one transferred enum. Canonical enum tags
+# are integer types; signed tags remain accepted because the verifier owns the
+# exact structural declaration and the bounds check rejects negative cases.
+func transferred_index(value: MirTransferredValue) -> i64!:
+    match value.form:
+        Signed(item): return item
+        Unsigned(item):
+            if item > u64(9223372036854775807):
+                error("mir interpreter: transferred enum tag exceeds oracle capacity")
+            return i64(item)
+        else: error("mir interpreter: transferred enum tag is not an integer")
+
+# The two semantic oracles have different top-level diagnostic prefixes.
+# A caught worker trap is language data, so remove only this oracle's leading
+# `mir ` and preserve the same remote diagnostic text the HIR oracle caches.
+func normalized_task_trap(reason: str) -> str:
+    let encoded = strings.to_bytes(reason)
+    if len(encoded) < 4 or encoded[0] != u8(109) or encoded[1] != u8(105) or encoded[2] != u8(114) or encoded[3] != u8(32):
+        return reason
+    let payload = list[u8]()
+    for index in range(4, len(encoded)): payload.append(encoded[index])
+    return strings.from_bytes(payload) else reason
+
+# mark: The executor ============================================================================
+
+## The full-profile consumer of one MIR interpreter instance.
+pub class FullProfileMirExecution:
+    let program: MirProgram
+    let layout: TypeLayout
+    let lists: list[MirList]
+    let hashes: list[MirHash]
+    let equality_contexts: list[MirEqualityContext]
+    let slices: list[MirSlice]
+    let classes: list[MirClassObject]
+    let weak_classes: list[MirWeakClassSlot]
+    let interfaces: list[MirInterfaceBox]
+    let tasks: list[MirTaskStorage]
+    let task_groups: list[MirTaskGroup]
+    var next_class_allocation_id: i64
+
+    pub init(program: MirProgram, layout: TypeLayout):
+        self.program = program
+        self.layout = layout
+        self.lists = list[MirList]()
+        self.hashes = list[MirHash]()
+        self.equality_contexts = list[MirEqualityContext]()
+        self.slices = list[MirSlice]()
+        self.classes = list[MirClassObject]()
+        self.weak_classes = list[MirWeakClassSlot]()
+        self.interfaces = list[MirInterfaceBox]()
+        self.tasks = list[MirTaskStorage]()
+        self.task_groups = list[MirTaskGroup]()
+        self.next_class_allocation_id = 0
+
+    # mark: Instructions ========================================================================
+
+    ## One straight-line runtime instruction. False when the instruction is
+    ## shared and the interpreter executes it itself.
+    pub func execute(host: MirExecutionHost, frame: Frame, instruction: MirInstruction) -> bool!:
+        let types = self.program.types
+        match instruction.form:
+            EqualityContextCreate(result):
+                self.equality_contexts.append(MirEqualityContext())
+                frame.registers[result.value] = MirValue.Ptr(value = equality_context_address_base + len(self.equality_contexts) - 1)
+            EqualityContextRelease(value):
+                let context = try self.equality_context_at(frame.registers[value.value])
+                context.is_alive = false
+            EqualityContextVisit(result, context, left, right):
+                let state = try self.equality_context_at(frame.registers[context.value])
+                let left_identity = ptr_of(frame.registers[left.value])
+                let right_identity = ptr_of(frame.registers[right.value])
+                var visited = false
+                for index in range(0, len(state.left)):
+                    if state.left[index] == left_identity and state.right[index] == right_identity:
+                        visited = true
+                        break
+                if not visited:
+                    state.left.append(left_identity)
+                    state.right.append(right_identity)
+                frame.registers[result.value] = MirValue.Bool(value = visited)
+            HashCreate(result):
+                let shape = self.hash_types(frame.function, result)
+                var value_type: TypeId? = none
+                if len(shape) == 2: value_type = shape[1]
+                self.hashes.append(MirHash(shape[0], value_type))
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.hash_at(frame.registers[value.value])
+                    storage.references += 1
+            HashRelease(value, key_release, value_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.hash_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("hash reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        if storage.active_iterations != 0: trap("released a hash collection during active iteration")
+                        var position = len(storage.keys) - 1
+                        while position >= 0:
+                            discard(try host.call(i64(key_release.value), [MirValue.Ptr(value = storage.keys[position])]))
+                            var value_address = 0
+                            if storage.value_type != none: value_address = storage.values[position]
+                            discard(try host.call(i64(value_release.value), [MirValue.Ptr(value = value_address)]))
+                            position -= 1
+                        storage.is_alive = false
+            HashCopy(result, value, key_retain, value_retain):
+                let source = try self.hash_at(frame.registers[value.value])
+                let copied = try self.copy_hash(host, source, key_retain, value_retain)
+                self.hashes.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashSnapshot(result, value, key_retain, value_retain):
+                let copied = try self.copy_hash(host, try self.hash_at(frame.registers[value.value]), key_retain, value_retain)
+                self.hashes.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            HashLength(result, value):
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len((try self.hash_at(frame.registers[value.value])).keys)))
+            HashIterationBegin(result, value):
+                let storage = try self.hash_at(frame.registers[value.value])
+                storage.active_iterations += 1
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.keys)))
+            HashIterationEnd(value):
+                let storage = try self.hash_at(frame.registers[value.value])
+                if storage.active_iterations <= 0: error("mir interpreter: trap: hash iteration depth underflow")
+                storage.active_iterations -= 1
+            HashFindFirst(result, value, key_hash):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let wanted = unsigned_int_of(frame.registers[key_hash.value])
+                var candidate: u64 = u64(0)
+                for position in range(0, len(storage.hashes)):
+                    if storage.hashes[position] == wanted:
+                        candidate = u64(position + 1)
+                        break
+                frame.registers[result.value] = MirValue.UnsignedInt(value = candidate)
+            HashFindNext(result, value, current):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let encoded = try host_count_of(frame.registers[current.value], "hash candidate")
+                if encoded <= 0 or encoded > len(storage.hashes): error("mir interpreter: trap: invalid hash candidate")
+                let wanted = storage.hashes[encoded - 1]
+                var candidate: u64 = u64(0)
+                for position in range(encoded, len(storage.hashes)):
+                    if storage.hashes[position] == wanted:
+                        candidate = u64(position + 1)
+                        break
+                frame.registers[result.value] = MirValue.UnsignedInt(value = candidate)
+            HashKeyAddress(result, value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.keys), false, "hash index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.keys[position])
+            HashValueAddress(result, value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                if storage.value_type == none: trap("verified hash value address on a set")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.values), false, "hash index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.values[position])
+            HashInsertEntry(result, value, key_hash):
+                let storage = try self.hash_at(frame.registers[value.value])
+                try self.require_hash_shape_mutable(storage)
+                let key_address = host.allocate(self.layout.size_of(storage.key_type), self.layout.align_of(storage.key_type))
+                var value_address = 0
+                if storage.value_type != none:
+                    let item_type = storage.value_type else trap("map hash storage lost its value type")
+                    value_address = host.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                storage.hashes.append(unsigned_int_of(frame.registers[key_hash.value]))
+                storage.keys.append(key_address)
+                storage.values.append(value_address)
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.keys) - 1))
+            HashRemoveEntry(value, index):
+                let storage = try self.hash_at(frame.registers[value.value])
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.keys), false, "hash index out of bounds")
+                try self.require_hash_shape_mutable(storage)
+                storage.hashes.remove(position)
+                storage.keys.remove(position)
+                storage.values.remove(position)
+            HashClear(value, key_release, value_release):
+                let storage = try self.hash_at(frame.registers[value.value])
+                try self.require_hash_shape_mutable(storage)
+                var position = len(storage.keys) - 1
+                while position >= 0:
+                    discard(try host.call(i64(key_release.value), [MirValue.Ptr(value = storage.keys[position])]))
+                    var value_address = 0
+                    if storage.value_type != none: value_address = storage.values[position]
+                    discard(try host.call(i64(value_release.value), [MirValue.Ptr(value = value_address)]))
+                    position -= 1
+                storage.hashes.clear()
+                storage.keys.clear()
+                storage.values.clear()
+            HashReserve(value, minimum_capacity):
+                discard(try self.hash_at(frame.registers[value.value]))
+                discard(try host_count_of(frame.registers[minimum_capacity.value], "hash minimum capacity"))
+            ListCreate(result):
+                let element_type = self.list_element_type(frame.function, result)
+                self.lists.append(MirList(element_type))
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            ListRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.list_at(frame.registers[value.value])
+                    storage.references += 1
+            ListRelease(value, element_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.list_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("list reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        if storage.active_iterations != 0: trap("released a list during active iteration")
+                        try self.release_list_buffer(host, storage.buffer, element_release)
+                        storage.is_alive = false
+            ListCopy(result, value, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let source = try self.list_at(frame.registers[value.value])
+                if source.element_type.value != element_type.value: trap("verified list copy changed element type")
+                let copied = MirList(element_type)
+                let size = self.layout.size_of(element_type)
+                let alignment = self.layout.align_of(element_type)
+                try self.append_copied_list_elements(host, copied, source, size, alignment, element_retain)
+                self.lists.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            ListSnapshot(result, value, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let source = try self.list_at(frame.registers[value.value])
+                if source.element_type.value != element_type.value: trap("verified list snapshot changed element type")
+                let copied = MirList(element_type)
+                try self.append_copied_list_elements(host, copied, source, self.layout.size_of(element_type), self.layout.align_of(element_type), element_retain)
+                self.lists.append(copied)
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            TaskGroupCreate(result):
+                self.task_groups.append(MirTaskGroup())
+                frame.registers[result.value] = MirValue.Ptr(value = task_group_address_base + len(self.task_groups) - 1)
+            TaskGroupFinish(group):
+                let storage = try self.task_group_at(frame.registers[group.value])
+                if storage.is_finished: error("mir interpreter: trap: task group finished twice")
+                for child in storage.children:
+                    if child.outcome == none: child.outcome = MirTaskOutcome.Cancelled
+                storage.is_finished = true
+            TaskSpawn(result, group, function, arguments):
+                let owner = try self.task_group_at(frame.registers[group.value])
+                if owner.is_finished: error("mir interpreter: trap: spawned into a finished task group")
+                var task_result = MirTaskResult.Unit
+                var failure_type = TypeId(value = 0)
+                match mir_type(types, frame.function.registers[result.value]):
+                    Task(value, error_value):
+                        task_result = value
+                        failure_type = error_value
+                    else: trap("verified task spawn has a non-task result")
+                let copied = list[MirTransferredValue]()
+                let copied_types = list[TypeId]()
+                for index in range(0, i64(arguments.count)):
+                    let transfer = transfer_at(frame.function, arguments, index)
+                    copied.append(try self.encode_transfer(host, transfer.value_type, frame.registers[transfer.value.value]))
+                    copied_types.append(transfer.value_type)
+                let task = MirTaskStorage(function, copied, copied_types, task_result, failure_type)
+                self.tasks.append(task)
+                owner.children.append(task)
+                frame.registers[result.value] = MirValue.Ptr(value = task_address_base + len(self.tasks) - 1)
+            TaskWait(result, destination, failure, error_destination, task):
+                let storage = try self.task_at(frame.registers[task.value])
+                try self.start_task(host, storage)
+                let outcome = storage.outcome else trap("joined MIR task has no terminal outcome")
+                match outcome:
+                    Succeeded(value):
+                        match storage.result:
+                            Unit: pass
+                            Never: trap("never-returning MIR task completed successfully")
+                            Value(value_type):
+                                let transferred = value else trap("value-producing MIR task cached unit success")
+                                if destination.value != no_register:
+                                    try self.decode_transfer_into(host, value_type, ptr_of(frame.registers[destination.value]), transferred)
+                                else:
+                                    frame.registers[result.value] = try self.decode_transfer(host, value_type, transferred)
+                        frame.registers[failure.value] = MirValue.Ptr(value = 0)
+                    Failed(error_value):
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.decode_transfer_into(host, storage.failure_type, address, error_value)
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+                    Trapped(message):
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.store_task_runtime_error(host, storage.failure_type, address, 1, message)
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+                    Cancelled:
+                        let address = ptr_of(frame.registers[error_destination.value])
+                        try self.store_task_runtime_error(host, storage.failure_type, address, 2, "task cancelled")
+                        frame.registers[failure.value] = MirValue.Ptr(value = address)
+            TaskWaitAll(result, failure, error_destination, tasks):
+                try self.execute_task_wait_all(host, frame, result, failure, error_destination, tasks)
+            TaskCancel(task):
+                let storage = try self.task_at(frame.registers[task.value])
+                if storage.outcome == none: storage.outcome = MirTaskOutcome.Cancelled
+            ListConcat(result, left, right, element_retain):
+                let element_type = self.list_element_type(frame.function, left)
+                let left_list = try self.list_at(frame.registers[left.value])
+                let right_list = try self.list_at(frame.registers[right.value])
+                if left_list.element_type.value != element_type.value or right_list.element_type.value != element_type.value:
+                    trap("verified list concatenation changed element type")
+                let joined = MirList(element_type)
+                let size = self.layout.size_of(element_type)
+                let alignment = self.layout.align_of(element_type)
+                try self.append_copied_list_elements(host, joined, left_list, size, alignment, element_retain)
+                try self.append_copied_list_elements(host, joined, right_list, size, alignment, element_retain)
+                self.lists.append(joined)
+                frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+            ListLength(result, value):
+                let storage = try self.list_at(frame.registers[value.value])
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.buffer.elements)))
+            ListIterationBegin(result, value):
+                let storage = try self.list_at(frame.registers[value.value])
+                storage.active_iterations += 1
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.buffer.elements)))
+            ListIterationEnd(value):
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.active_iterations <= 0: error("mir interpreter: trap: list iteration depth underflow")
+                storage.active_iterations -= 1
+            ListMutableSliceBegin(result, value, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified mutable-slice begin changed element type")
+                try self.detach_list(host, storage, element_retain)
+                storage.active_iterations += 1
+                frame.registers[result.value] = frame.registers[value.value]
+            MutableSliceEnd(value):
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.active_iterations <= 0: error("mir interpreter: trap: mutable-slice depth underflow")
+                storage.active_iterations -= 1
+            MutableSliceLength(result, value):
+                let storage = try self.list_at(frame.registers[value.value])
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(len(storage.buffer.elements)))
+            MutableSliceElementAddress(result, value, index, element_retain):
+                let element_type = self.mutable_slice_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified mutable-slice index changed element type")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
+                try self.detach_list(host, storage, element_retain)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
+            ListAppendSlot(result, value, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified list append changed element type")
+                try self.require_list_shape_mutable(storage)
+                try self.detach_list(host, storage, element_retain)
+                let address = host.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+                storage.buffer.elements.append(address)
+                frame.registers[result.value] = MirValue.Ptr(value = address)
+            ListInsertSlot(result, value, index, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified list insert changed element type")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), true, "index out of bounds")
+                try self.require_list_shape_mutable(storage)
+                try self.detach_list(host, storage, element_retain)
+                let address = host.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+                storage.buffer.elements.append(address)
+                var current = len(storage.buffer.elements) - 1
+                while current > position:
+                    storage.buffer.elements[current] = storage.buffer.elements[current - 1]
+                    current -= 1
+                storage.buffer.elements[position] = address
+                frame.registers[result.value] = MirValue.Ptr(value = address)
+            ListRemoveAt(value, index, element_retain):
+                let storage = try self.list_at(frame.registers[value.value])
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
+                try self.require_list_shape_mutable(storage)
+                try self.detach_list(host, storage, element_retain)
+                for current in range(position, len(storage.buffer.elements) - 1):
+                    storage.buffer.elements[current] = storage.buffer.elements[current + 1]
+                storage.buffer.elements.remove(len(storage.buffer.elements) - 1)
+            ListClear(value, element_release):
+                let storage = try self.list_at(frame.registers[value.value])
+                try self.require_list_shape_mutable(storage)
+                if storage.buffer.references > 1:
+                    storage.buffer.references -= 1
+                    storage.buffer = MirListBuffer()
+                else:
+                    var position = len(storage.buffer.elements) - 1
+                    while position >= 0:
+                        discard(try host.call(i64(element_release.value), [MirValue.Ptr(value = storage.buffer.elements[position])]))
+                        position -= 1
+                    storage.buffer.elements.clear()
+            ListReserve(value, minimum_capacity, element_retain):
+                # Capacity is deliberately unobservable in canonical MIR.
+                let storage = try self.list_at(frame.registers[value.value])
+                discard(unsigned_int_of(frame.registers[minimum_capacity.value]))
+                try self.detach_list(host, storage, element_retain)
+            ListElementAddress(result, value, index):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified list index changed element type")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
+                frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
+            ListMutableElementAddress(result, value, index, element_retain):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified mutable list index changed element type")
+                let position = try bounded_position_of(frame.registers[index.value], len(storage.buffer.elements), false, "index out of bounds")
+                try self.detach_list(host, storage, element_retain)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.buffer.elements[position])
+            ListSlice(result, value, start, end):
+                let element_type = self.list_element_type(frame.function, value)
+                let storage = try self.list_at(frame.registers[value.value])
+                let lower_value = unsigned_int_of(frame.registers[start.value])
+                let upper_value = unsigned_int_of(frame.registers[end.value])
+                if lower_value > upper_value or upper_value > u64(len(storage.buffer.elements)): error("mir interpreter: trap: slice bounds out of range")
+                let lower = i64(lower_value)
+                let upper = i64(upper_value)
+                storage.buffer.references += 1
+                self.slices.append(MirSlice(element_type, MirSliceBacking.List(buffer = storage.buffer, start = lower), upper - lower))
+                frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+            BytesSlice(result, owner, data, length, start, end):
+                let owner_value = ptr_of(frame.registers[owner.value])
+                let source_length = try host_count_of(frame.registers[length.value], "byte length")
+                let lower_value = unsigned_int_of(frame.registers[start.value])
+                let upper_value = unsigned_int_of(frame.registers[end.value])
+                if lower_value > upper_value or upper_value > u64(source_length): error("mir interpreter: trap: slice bounds out of range")
+                let lower = i64(lower_value)
+                let upper = i64(upper_value)
+                if owner_value != 0: try host.retain_immutable_buffer(owner_value)
+                let byte_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+                self.slices.append(MirSlice(byte_type, MirSliceBacking.Bytes(owner = owner_value, data = ptr_of(frame.registers[data.value]) + lower), upper - lower))
+                frame.registers[result.value] = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+            SliceLength(result, value):
+                let storage = try self.slice_at(frame.registers[value.value])
+                frame.registers[result.value] = MirValue.UnsignedInt(value = u64(storage.length))
+            SliceRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.slice_at(frame.registers[value.value])
+                    storage.references += 1
+            SliceRelease(value, element_release):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.slice_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("slice reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        match storage.backing:
+                            List(buffer, start): try self.release_list_buffer(host, buffer, element_release)
+                            Bytes(owner, data): try host.release_immutable_buffer(owner)
+                        storage.is_alive = false
+            SliceElementAddress(result, value, index):
+                let element_type = self.slice_element_type(frame.function, value)
+                let storage = try self.slice_at(frame.registers[value.value])
+                if storage.element_type.value != element_type.value: trap("verified slice index changed element type")
+                let position = try bounded_position_of(frame.registers[index.value], storage.length, false, "index out of bounds")
+                match storage.backing:
+                    List(buffer, start): frame.registers[result.value] = MirValue.Ptr(value = buffer.elements[start + position])
+                    Bytes(owner, data): frame.registers[result.value] = MirValue.Ptr(value = data + position)
+            ClassCreate(result, identity):
+                let fields = list[i64]()
+                let field_types = list[TypeId]()
+                for field in self.program.classes[identity.value].fields:
+                    fields.append(host.allocate(self.layout.size_of(field.storage_type), self.layout.align_of(field.storage_type)))
+                    field_types.append(field.storage_type)
+                let metadata = self.program.classes[identity.value]
+                let allocation_id = self.next_class_allocation_id
+                self.next_class_allocation_id += 1
+                self.classes.append(MirClassObject(
+                    i64(identity.value),
+                    fields,
+                    field_types,
+                    metadata.destroyer,
+                    allocation_id,
+                    ClassAllocationSite(path = "", function = frame.function.name, span = instruction.span),
+                ))
+                frame.registers[result.value] = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
+            ClassMarkInitialized(value):
+                let storage = try self.class_at(frame.registers[value.value], false)
+                storage.is_initialized = true
+            ClassRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.class_at(frame.registers[value.value], false)
+                    storage.references += 1
+            ClassRelease(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.class_at(frame.registers[value.value], false)
+                    if storage.references <= 0: trap("class reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        # Weak promotion observes death before user deinit and
+                        # before payload ownership starts unwinding.
+                        storage.is_alive = false
+                        storage.is_destroying = true
+                        discard(try host.call(i64(storage.destroyer.value), [
+                            frame.registers[value.value],
+                            MirValue.Bool(value = storage.is_initialized),
+                        ]))
+                        storage.is_destroying = false
+            ClassFieldAddress(result, value, field):
+                let storage = try self.class_at(frame.registers[value.value], true)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.fields[field])
+            WeakClassCreate(result, value):
+                # A deinitializer may publish its borrowed dying receiver only
+                # into a weak slot. The runtime control block is still alive
+                # under its implicit weak reference while destruction runs;
+                # promotion will nevertheless observe `is_alive == false`.
+                let referent = try self.class_index_at(frame.registers[value.value], true)
+                self.weak_classes.append(MirWeakClassSlot(referent))
+                frame.registers[result.value] = MirValue.Ptr(value = weak_class_address_base + len(self.weak_classes) - 1)
+            WeakClassRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.weak_class_at(frame.registers[value.value])
+                    storage.references += 1
+            WeakClassRelease(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.weak_class_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("weak class reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0: storage.is_alive = false
+            WeakClassPromote(destination, value, optional_type):
+                let target = ptr_of(frame.registers[destination.value])
+                var referent = -1
+                let weak_address = ptr_of(frame.registers[value.value])
+                if weak_address != 0:
+                    let weak_storage = try self.weak_class_at(frame.registers[value.value])
+                    let class_storage = self.classes[weak_storage.referent]
+                    if class_storage.is_alive: referent = weak_storage.referent
+                let tag_type = builtin_mir_type(BuiltinMirType.unsigned_u8)
+                if referent < 0:
+                    host.store(tag_type, target, MirValue.UnsignedInt(value = u64(0)))
+                else:
+                    let class_storage = self.classes[referent]
+                    class_storage.references += 1
+                    host.store(tag_type, target, MirValue.UnsignedInt(value = u64(1)))
+                    var class_type = builtin_mir_type(BuiltinMirType.pointer)
+                    match mir_type(self.program.types, optional_type):
+                        Enum(tag, cases): class_type = cases[1]
+                        else: trap("verified weak promotion has a non-optional type")
+                    host.store(
+                        class_type,
+                        target + self.layout.enum_payload_offset(optional_type),
+                        MirValue.Ptr(value = class_address_base + referent),
+                    )
+            InterfaceCreate(result, source, conformance):
+                let metadata = self.program.conformances[conformance.value]
+                let payload = host.allocate(self.layout.size_of(metadata.value_type), self.layout.align_of(metadata.value_type))
+                host.copy_bytes(ptr_of(frame.registers[source.value]), payload, self.layout.size_of(metadata.value_type))
+                self.interfaces.append(MirInterfaceBox(i64(conformance.value), payload))
+                frame.registers[result.value] = MirValue.Ptr(value = interface_address_base + len(self.interfaces) - 1)
+            InterfaceRetain(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.interface_at(frame.registers[value.value])
+                    storage.references += 1
+            InterfaceRelease(value):
+                if ptr_of(frame.registers[value.value]) != 0:
+                    let storage = try self.interface_at(frame.registers[value.value])
+                    if storage.references <= 0: trap("interface reference count underflow")
+                    storage.references -= 1
+                    if storage.references == 0:
+                        let metadata = self.program.conformances[storage.conformance]
+                        discard(try host.call(i64(metadata.release.value), [MirValue.Ptr(value = storage.payload)]))
+                        storage.is_alive = false
+            InterfaceDetach(result, value):
+                let storage = try self.interface_at(frame.registers[value.value])
+                if storage.references == 1:
+                    frame.registers[result.value] = frame.registers[value.value]
+                else:
+                    let metadata = self.program.conformances[storage.conformance]
+                    let payload = host.allocate(self.layout.size_of(metadata.value_type), self.layout.align_of(metadata.value_type))
+                    host.copy_bytes(storage.payload, payload, self.layout.size_of(metadata.value_type))
+                    discard(try host.call(i64(metadata.retain.value), [MirValue.Ptr(value = payload)]))
+                    storage.references -= 1
+                    self.interfaces.append(MirInterfaceBox(storage.conformance, payload))
+                    frame.registers[result.value] = MirValue.Ptr(value = interface_address_base + len(self.interfaces) - 1)
+            InterfacePayload(result, value):
+                let storage = try self.interface_at(frame.registers[value.value])
+                frame.registers[result.value] = MirValue.Ptr(value = storage.payload)
+            CellCreate(result, element_type, destroyer):
+                let fields = [host.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))]
+                self.classes.append(MirClassObject(-1, fields, [element_type], destroyer, -1, none))
+                frame.registers[result.value] = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
+            CellMarkInitialized(value):
+                let storage = try self.class_at(frame.registers[value.value], false)
+                storage.is_initialized = true
+            CellRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                if address != 0:
+                    let storage = try self.class_at(frame.registers[value.value], false)
+                    storage.references += 1
+            CellRelease(value):
+                try self.release_managed(host, frame.registers[value.value])
+            CellValueAddress(result, value, element_type):
+                let storage = try self.class_at(frame.registers[value.value], true)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.fields[0])
+            ClosureCreate(environment, destination, function_type, closure):
+                let metadata = self.program.closures[closure.value]
+                let fields = list[i64]()
+                let field_types = list[TypeId]()
+                for capture in metadata.captures:
+                    fields.append(host.allocate(self.layout.size_of(capture.value_type), self.layout.align_of(capture.value_type)))
+                    field_types.append(capture.value_type)
+                self.classes.append(MirClassObject(-1, fields, field_types, metadata.destroyer, -1, none))
+                let handle = MirValue.Ptr(value = class_address_base + len(self.classes) - 1)
+                frame.registers[environment.value] = handle
+                let address = ptr_of(frame.registers[destination.value])
+                host.store(builtin_mir_type(BuiltinMirType.pointer), address, MirValue.Ptr(value = function_address_base + i64(metadata.function.value)))
+                host.store(builtin_mir_type(BuiltinMirType.pointer), address + self.layout.pointer_size(), handle)
+            ClosureMarkInitialized(environment):
+                let storage = try self.class_at(frame.registers[environment.value], false)
+                storage.is_initialized = true
+            ClosureCaptureAddress(result, environment, closure, capture):
+                let storage = try self.class_at(frame.registers[environment.value], true)
+                frame.registers[result.value] = MirValue.Ptr(value = storage.fields[capture])
+            FunctionRetain(value):
+                let address = ptr_of(frame.registers[value.value])
+                let environment = host.load(builtin_mir_type(BuiltinMirType.pointer), address + self.layout.pointer_size())
+                if ptr_of(environment) != 0:
+                    let storage = try self.class_at(environment, false)
+                    storage.references += 1
+            FunctionRelease(value):
+                let address = ptr_of(frame.registers[value.value])
+                let environment = host.load(builtin_mir_type(BuiltinMirType.pointer), address + self.layout.pointer_size())
+                if ptr_of(environment) != 0:
+                    try self.release_managed(host, environment)
+            CallInterface(results, interface_id, requirement, target, arguments):
+                let storage = try self.interface_at(frame.registers[target.value])
+                let conformance = self.program.conformances[storage.conformance]
+                if conformance.interface_id.value != interface_id.value:
+                    trap("verified interface call changed nominal identity")
+                let witness = conformance.implementations[requirement]
+                host.bind(frame, results, try host.call(i64(witness.value), host.collect(frame, arguments)))
+            else: return false
+        return true
+
+    # mark: Process entry and census ============================================================
+
+    ## Invoke the language process boundary with the same semantic slice the
+    ## HIR oracle sees. This is target-independent oracle construction: host
+    ## argc/argv and WASI memory remain backend concerns.
+    pub func run_process(host: MirExecutionHost, arguments: list[str]) -> MirValue!:
+        let entry = self.program.process_entry else error("mir interpreter: program has no process entry")
+        var element_type = entry.arguments_type
+        match mir_type(self.program.types, entry.arguments_type):
+            Slice(element): element_type = element
+            else: trap("verified process entry has no slice type")
+        var fields = list[MirField]()
+        match mir_type(self.program.types, element_type):
+            Struct(value): fields = value
+            else: trap("verified process entry has no string element type")
+
+        let buffer = MirListBuffer()
+        for argument in arguments:
+            let encoded = strings.to_bytes(argument)
+            let data = host.allocate(len(encoded), 1)
+            for offset in range(0, len(encoded)): host.write_byte(data + offset, encoded[offset])
+            let owner = host.create_immutable_buffer(data, len(encoded))
+            let slot = host.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+            host.store(fields[0].value_type, slot + self.layout.field_offset(element_type, 0), MirValue.Ptr(value = owner))
+            host.store(fields[1].value_type, slot + self.layout.field_offset(element_type, 1), MirValue.Ptr(value = data))
+            host.store(fields[2].value_type, slot + self.layout.field_offset(element_type, 2), MirValue.UnsignedInt(value = u64(len(encoded))))
+            buffer.elements.append(slot)
+
+        self.slices.append(MirSlice(element_type, MirSliceBacking.List(buffer = buffer, start = 0), len(arguments)))
+        let slice = self.slices[len(self.slices) - 1]
+        let slice_value = MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+        let error_address = host.allocate(self.layout.size_of(entry.failure_type), self.layout.align_of(entry.failure_type))
+        let results = try host.call(i64(entry.function.value), [MirValue.Ptr(value = error_address), slice_value])
+        try self.release_list_buffer(host, buffer, entry.element_release)
+        slice.references = 0
+        slice.is_alive = false
+        if ptr_of(results[1]) != 0:
+            discard(try host.call(i64(entry.failure_release.value), [results[1]]))
+            error("mir interpreter: unhandled process failure")
+        return results[0]
+
+    ## Observe live source classes after a run. The MIR oracle already owns
+    ## append-only semantic runtime state, so graph reconstruction is entirely
+    ## opt-in and execution pays only the allocation-site fields required for
+    ## a useful report.
+    pub func resource_census(host: MirExecutionHost) -> ResourceCensus:
+        let allocations = list[LiveClassAllocation]()
+        let edges = list[StrongReferenceEdge]()
+        for storage in self.classes:
+            if storage.class_index < 0 or not storage.is_alive: continue
+            let site = storage.allocation_site else trap("live source class has no MIR allocation site")
+            let metadata = self.program.classes[storage.class_index]
+            allocations.append(LiveClassAllocation(
+                allocation_id = storage.allocation_id,
+                class_name = metadata.name,
+                site = site,
+            ))
+            let references = self.collect_class_references(host, storage)
+            for target in references:
+                edges.append(StrongReferenceEdge(source = storage.allocation_id, target = target))
+        return resource_census(allocations, edges)
+
+    # Flatten structural and managed storage paths until the next source
+    # class. This mirrors the HIR oracle over canonical MIR types while using
+    # only this backend's private layout and handle tables.
+    func collect_class_references(host: MirExecutionHost, root: MirClassObject) -> list[i64]:
+        let pending = list[MirGraphValue]()
+        for index in range(0, len(root.fields)):
+            pending.append(MirGraphValue(value_type = root.field_types[index], address = root.fields[index]))
+        let references = list[i64]()
+        let visited_handles = list[i64]()
+        let visited_buffers = list[MirListBuffer]()
+
+        while len(pending) > 0:
+            let position = len(pending) - 1
+            let current = pending[position]
+            pending.remove(position)
+            match mir_type(self.program.types, current.value_type):
+                Struct(fields):
+                    for field_index in range(0, len(fields)):
+                        pending.append(MirGraphValue(
+                            value_type = fields[field_index].value_type,
+                            address = current.address + self.layout.field_offset(current.value_type, field_index),
+                        ))
+                Array(element, count):
+                    let stride = self.layout.size_of(element)
+                    for index in range(0, count):
+                        pending.append(MirGraphValue(value_type = element, address = current.address + index * stride))
+                Enum(tag, cases):
+                    let selected = i64(unsigned_int_of(host.load(tag, current.address)))
+                    if selected < 0 or selected >= len(cases): trap("MIR resource census observed an invalid enum tag")
+                    pending.append(MirGraphValue(
+                        value_type = cases[selected],
+                        address = current.address + self.layout.enum_payload_offset(current.value_type),
+                    ))
+                Class(identity):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0: continue
+                    let target = self.graph_class(handle)
+                    if target.class_index < 0: trap("MIR class value names hidden managed storage")
+                    if target.is_alive and not contains_graph_id(references, target.allocation_id):
+                        references.append(target.allocation_id)
+                WeakClass(identity): pass
+                Cell(element):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    self.append_managed_fields(pending, self.graph_class(handle))
+                Func(signature):
+                    let handle = ptr_of(host.load(builtin_mir_type(BuiltinMirType.pointer), current.address + self.layout.pointer_size()))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    self.append_managed_fields(pending, self.graph_class(handle))
+                List(element):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_list(handle)
+                    self.append_list_buffer(pending, visited_buffers, storage.buffer, element)
+                Map(key, value):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_hash(handle)
+                    for index in range(0, len(storage.keys)):
+                        pending.append(MirGraphValue(value_type = key, address = storage.keys[index]))
+                        pending.append(MirGraphValue(value_type = value, address = storage.values[index]))
+                Set(element):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_hash(handle)
+                    for address in storage.keys:
+                        pending.append(MirGraphValue(value_type = element, address = address))
+                Slice(element):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_slice(handle)
+                    match storage.backing:
+                        # A slice exposes one range but retains the complete
+                        # immutable snapshot buffer, so every buffered value
+                        # remains an ownership edge even when it is outside
+                        # the visible range.
+                        List(buffer, start): self.append_list_buffer(pending, visited_buffers, buffer, element)
+                        Bytes(owner, data): pass
+                Interface(identity):
+                    let handle = ptr_of(host.load(current.value_type, current.address))
+                    if handle == 0 or contains_graph_id(visited_handles, handle): continue
+                    visited_handles.append(handle)
+                    let storage = self.graph_interface(handle)
+                    let concrete = self.program.conformances[storage.conformance].value_type
+                    pending.append(MirGraphValue(value_type = concrete, address = storage.payload))
+                # Scalars, raw pointers, immutable buffers, and builders own
+                # no source class edge.
+                else: pass
+        return references
+
+    func append_managed_fields(pending: list[MirGraphValue], storage: MirClassObject):
+        for index in range(0, len(storage.fields)):
+            pending.append(MirGraphValue(value_type = storage.field_types[index], address = storage.fields[index]))
+
+    func append_list_buffer(pending: list[MirGraphValue], visited: list[MirListBuffer], buffer: MirListBuffer, element: TypeId):
+        if contains_graph_buffer(visited, buffer): return
+        visited.append(buffer)
+        for address in buffer.elements:
+            pending.append(MirGraphValue(value_type = element, address = address))
+
+    func graph_class(handle: i64) -> MirClassObject:
+        let index = handle - class_address_base
+        if index < 0 or index >= len(self.classes): trap("MIR resource census observed an invalid managed handle")
+        return self.classes[index]
+
+    func graph_list(handle: i64) -> MirList:
+        let index = handle - list_address_base
+        if index < 0 or index >= len(self.lists) or not self.lists[index].is_alive:
+            trap("MIR resource census observed an invalid list handle")
+        return self.lists[index]
+
+    func graph_hash(handle: i64) -> MirHash:
+        let index = handle - hash_address_base
+        if index < 0 or index >= len(self.hashes) or not self.hashes[index].is_alive:
+            trap("MIR resource census observed an invalid hash handle")
+        return self.hashes[index]
+
+    func graph_slice(handle: i64) -> MirSlice:
+        let index = handle - slice_address_base
+        if index < 0 or index >= len(self.slices) or not self.slices[index].is_alive:
+            trap("MIR resource census observed an invalid slice handle")
+        return self.slices[index]
+
+    func graph_interface(handle: i64) -> MirInterfaceBox:
+        let index = handle - interface_address_base
+        if index < 0 or index >= len(self.interfaces) or not self.interfaces[index].is_alive:
+            trap("MIR resource census observed an invalid interface handle")
+        return self.interfaces[index]
+
+    ## Execute a pending child once in a fresh interpreter. Program metadata and
+
+    # mark: Structured task lifetimes ===========================================================
+
+    ## explicit foreign hosts are shared immutable inputs; memory, globals,
+    ## managed handles, task groups, and allocation identities begin empty.
+    func start_task(host: MirExecutionHost, storage: MirTaskStorage) -> !:
+        if storage.outcome != none: return
+        let worker = host.fresh_domain()
+
+        let target = self.program.functions[storage.function.value]
+        let arguments = list[MirValue]()
+        var result_address = 0
+        if target.signature.is_fallible:
+            let error_address = worker.allocate(self.layout.size_of(storage.failure_type), self.layout.align_of(storage.failure_type))
+            arguments.append(MirValue.Ptr(value = error_address))
+        match storage.result:
+            Value(value_type):
+                if is_aggregate_type(self.program.types, value_type):
+                    result_address = worker.allocate(self.layout.size_of(value_type), self.layout.align_of(value_type))
+                    arguments.append(MirValue.Ptr(value = result_address))
+            else: pass
+        for index in range(0, len(storage.arguments)):
+            arguments.append(try worker.decode_transfer(storage.argument_types[index], storage.arguments[index]))
+
+        let returned = worker.call(i64(storage.function.value), arguments) catch reason:
+            storage.outcome = MirTaskOutcome.Trapped(message = normalized_task_trap(reason))
+            return
+        if target.signature.is_fallible:
+            let failure = ptr_of(returned[len(returned) - 1])
+            if failure != 0:
+                let copied_error = worker.encode_transfer_from_storage(storage.failure_type, failure) catch reason:
+                    storage.outcome = MirTaskOutcome.Trapped(message = reason)
+                    return
+                storage.outcome = MirTaskOutcome.Failed(error_value = copied_error)
+                return
+
+        match storage.result:
+            Unit: storage.outcome = MirTaskOutcome.Succeeded(value = none)
+            Never: storage.outcome = MirTaskOutcome.Trapped(message = "mir interpreter: trap: never-returning worker returned")
+            Value(value_type):
+                var copied: MirTransferredValue
+                if is_aggregate_type(self.program.types, value_type):
+                    copied = try worker.encode_transfer_from_storage(value_type, result_address)
+                else:
+                    copied = try worker.encode_transfer(value_type, returned[0])
+                storage.outcome = MirTaskOutcome.Succeeded(value = copied)
+
+    ## `wait_all` observes every distinct child even after the first failure.
+    ## Successful values are materialized only if the complete join succeeds,
+    ## preserving source order and avoiding a partially visible result list.
+    func execute_task_wait_all(host: MirExecutionHost, frame: Frame, result: RegisterId, failure: RegisterId, error_destination: RegisterId, tasks_register: RegisterId) -> !:
+        let task_list = try self.list_at(frame.registers[tasks_register.value])
+        var task_result = MirTaskResult.Unit
+        var failure_type = TypeId(value = 0)
+        match mir_type(self.program.types, task_list.element_type):
+            Task(value, error_value):
+                task_result = value
+                failure_type = error_value
+            else: trap("verified wait_all list contains non-task elements")
+
+        let successes = list[MirTransferredValue]()
+        var failed = false
+        let error_address = ptr_of(frame.registers[error_destination.value])
+        for task_address in task_list.buffer.elements:
+            let child = try self.task_at(host.load(task_list.element_type, task_address))
+            try self.start_task(host, child)
+            let outcome = child.outcome else trap("joined MIR task has no terminal outcome")
+            match outcome:
+                Succeeded(value):
+                    match task_result:
+                        Unit: successes.append(MirTransferredValue(form = MirTransferredForm.Aggregate(fields = list[MirTransferredValue]())))
+                        Never: trap("never-returning MIR task completed successfully")
+                        Value(value_type):
+                            let transferred = value else trap("value-producing MIR task cached unit success")
+                            successes.append(transferred)
+                Failed(error_value):
+                    if not failed:
+                        try self.decode_transfer_into(host, failure_type, error_address, error_value)
+                        failed = true
+                Trapped(message):
+                    if not failed:
+                        try self.store_task_runtime_error(host, failure_type, error_address, 1, message)
+                        failed = true
+                Cancelled:
+                    if not failed:
+                        try self.store_task_runtime_error(host, failure_type, error_address, 2, "task cancelled")
+                        failed = true
+
+        if failed:
+            frame.registers[failure.value] = MirValue.Ptr(value = error_address)
+            return
+        frame.registers[failure.value] = MirValue.Ptr(value = 0)
+        if result.value == no_register: return
+        var element_type = TypeId(value = 0)
+        match mir_type(self.program.types, frame.function.registers[result.value]):
+            List(element): element_type = element
+            else: trap("verified wait_all result is not a list")
+        let values = MirList(element_type)
+        for transferred in successes:
+            let address = host.allocate(self.layout.size_of(element_type), self.layout.align_of(element_type))
+            try self.decode_transfer_into(host, element_type, address, transferred)
+            values.buffer.elements.append(address)
+        self.lists.append(values)
+        frame.registers[result.value] = MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+
+    ## Encode one canonical value without retaining an address or handle from
+    ## this interpreter domain. Aggregate registers already contain storage
+    ## addresses by canonical MIR convention.
+    pub func encode_transfer(host: MirExecutionHost, value_type: TypeId, value: MirValue) -> MirTransferredValue!:
+        if is_aggregate_type(self.program.types, value_type):
+            return try self.encode_transfer_from_storage(host, value_type, ptr_of(value))
+        match mir_type(self.program.types, value_type):
+            Int(bits, is_signed):
+                if is_signed: return MirTransferredValue(form = MirTransferredForm.Signed(value = signed_int_of(value)))
+                return MirTransferredValue(form = MirTransferredForm.Unsigned(value = unsigned_int_of(value)))
+            Float(bits): return MirTransferredValue(form = MirTransferredForm.Floating(value = float_of(value)))
+            Bool: return MirTransferredValue(form = MirTransferredForm.Boolean(value = bool_of(value)))
+            FrozenList(element):
+                let source = try self.list_at(value)
+                let elements = list[MirTransferredValue]()
+                for address in source.buffer.elements:
+                    elements.append(try self.encode_transfer_from_storage(host, element, address))
+                return MirTransferredValue(form = MirTransferredForm.Sequence(elements = elements))
+            FrozenMap(key, item): return try self.encode_hash_transfer(host, value, key, item)
+            FrozenSet(element): return try self.encode_hash_transfer(host, value, element, none)
+            Slice(element):
+                let source = try self.slice_at(value)
+                let elements = list[MirTransferredValue]()
+                for index in range(0, source.length):
+                    match source.backing:
+                        List(buffer, start): elements.append(try self.encode_transfer_from_storage(host, element, buffer.elements[start + index]))
+                        Bytes(owner, data): elements.append(try self.encode_transfer_from_storage(host, element, data + index))
+                return MirTransferredValue(form = MirTransferredForm.Sequence(elements = elements))
+            else: error("mir interpreter: task transfer reached a non-sendable canonical type")
+
+    pub func encode_transfer_from_storage(host: MirExecutionHost, value_type: TypeId, address: i64) -> MirTransferredValue!:
+        match mir_type(self.program.types, value_type):
+            Struct(fields):
+                if self.is_buffer_value_shape(fields):
+                    let data = ptr_of(host.load(fields[1].value_type, address + self.layout.field_offset(value_type, 1)))
+                    let length = try host_count_of(host.load(fields[2].value_type, address + self.layout.field_offset(value_type, 2)), "task buffer length")
+                    let payload = list[u8]()
+                    for offset in range(0, length): payload.append(host.read_byte(data + offset))
+                    return MirTransferredValue(form = MirTransferredForm.Buffer(bytes = payload))
+                let copied = list[MirTransferredValue]()
+                for index in range(0, len(fields)):
+                    copied.append(try self.encode_transfer_from_storage(host, fields[index].value_type, address + self.layout.field_offset(value_type, index)))
+                return MirTransferredValue(form = MirTransferredForm.Aggregate(fields = copied))
+            Array(element, count):
+                let copied = list[MirTransferredValue]()
+                let stride = self.layout.size_of(element)
+                for index in range(0, count): copied.append(try self.encode_transfer_from_storage(host, element, address + index * stride))
+                return MirTransferredValue(form = MirTransferredForm.Aggregate(fields = copied))
+            Enum(tag, cases):
+                let copied_tag = try self.encode_transfer_from_storage(host, tag, address)
+                let selected = try transferred_index(copied_tag)
+                if selected < 0 or selected >= len(cases): error("mir interpreter: task transfer observed an invalid enum tag")
+                let payload = try self.encode_transfer_from_storage(host, cases[selected], address + self.layout.enum_payload_offset(value_type))
+                return MirTransferredValue(form = MirTransferredForm.Variant(tag = copied_tag, payload = payload))
+            else: return try self.encode_transfer(host, value_type, host.load(value_type, address))
+
+    func encode_hash_transfer(host: MirExecutionHost, value: MirValue, key_type: TypeId, value_type: TypeId?) -> MirTransferredValue!:
+        let source = try self.hash_at(value)
+        let entries = list[MirTransferredHashEntry]()
+        for index in range(0, len(source.keys)):
+            var copied_value: MirTransferredValue? = none
+            if value_type != none:
+                let item_type = value_type
+                copied_value = try self.encode_transfer_from_storage(host, item_type, source.values[index])
+            entries.append(MirTransferredHashEntry(
+                hash = source.hashes[index],
+                key = try self.encode_transfer_from_storage(host, key_type, source.keys[index]),
+                value = copied_value,
+            ))
+        return MirTransferredValue(form = MirTransferredForm.Hash(entries = entries))
+
+    ## Decode a pointer-free transfer into this interpreter's fresh memory and
+    ## semantic handle tables. No source-domain identity can survive.
+    pub func decode_transfer(host: MirExecutionHost, value_type: TypeId, transferred: MirTransferredValue) -> MirValue!:
+        if is_aggregate_type(self.program.types, value_type):
+            let address = host.allocate(self.layout.size_of(value_type), self.layout.align_of(value_type))
+            try self.decode_transfer_into(host, value_type, address, transferred)
+            return MirValue.Ptr(value = address)
+        match mir_type(self.program.types, value_type):
+            Int(bits, is_signed):
+                match transferred.form:
+                    Signed(value): return MirValue.SignedInt(value = value)
+                    Unsigned(value): return MirValue.UnsignedInt(value = value)
+                    else: error("mir interpreter: transferred integer has the wrong shape")
+            Float(bits):
+                match transferred.form:
+                    Floating(value): return MirValue.Float(value = normalize_mir_float(value, value_type, self.program.types))
+                    else: error("mir interpreter: transferred float has the wrong shape")
+            Bool:
+                match transferred.form:
+                    Boolean(value): return MirValue.Bool(value = value)
+                    else: error("mir interpreter: transferred bool has the wrong shape")
+            FrozenList(element):
+                match transferred.form:
+                    Sequence(elements):
+                        let storage = MirList(element)
+                        for item in elements:
+                            let address = host.allocate(self.layout.size_of(element), self.layout.align_of(element))
+                            try self.decode_transfer_into(host, element, address, item)
+                            storage.buffer.elements.append(address)
+                        self.lists.append(storage)
+                        return MirValue.Ptr(value = list_address_base + len(self.lists) - 1)
+                    else: error("mir interpreter: transferred frozen list has the wrong shape")
+            FrozenMap(key, item): return try self.decode_hash_transfer(host, transferred, key, item)
+            FrozenSet(element): return try self.decode_hash_transfer(host, transferred, element, none)
+            Slice(element):
+                match transferred.form:
+                    Sequence(elements):
+                        let buffer = MirListBuffer()
+                        for item in elements:
+                            let address = host.allocate(self.layout.size_of(element), self.layout.align_of(element))
+                            try self.decode_transfer_into(host, element, address, item)
+                            buffer.elements.append(address)
+                        self.slices.append(MirSlice(element, MirSliceBacking.List(buffer = buffer, start = 0), len(elements)))
+                        return MirValue.Ptr(value = slice_address_base + len(self.slices) - 1)
+                    else: error("mir interpreter: transferred slice has the wrong shape")
+            else: error("mir interpreter: task transfer decoded a non-sendable canonical type")
+
+    func decode_transfer_into(host: MirExecutionHost, value_type: TypeId, address: i64, transferred: MirTransferredValue) -> !:
+        match mir_type(self.program.types, value_type):
+            Struct(fields):
+                if self.is_buffer_value_shape(fields):
+                    match transferred.form:
+                        Buffer(payload):
+                            let data = host.allocate(len(payload), 1)
+                            for offset in range(0, len(payload)): host.write_byte(data + offset, payload[offset])
+                            let owner = host.create_immutable_buffer(data, len(payload))
+                            host.store(fields[0].value_type, address + self.layout.field_offset(value_type, 0), MirValue.Ptr(value = owner))
+                            host.store(fields[1].value_type, address + self.layout.field_offset(value_type, 1), MirValue.Ptr(value = data))
+                            host.store(fields[2].value_type, address + self.layout.field_offset(value_type, 2), MirValue.UnsignedInt(value = u64(len(payload))))
+                            return
+                        else: error("mir interpreter: transferred buffer has the wrong shape")
+                match transferred.form:
+                    Aggregate(values):
+                        if len(values) != len(fields): error("mir interpreter: transferred struct field count changed")
+                        for index in range(0, len(fields)):
+                            try self.decode_transfer_into(host, fields[index].value_type, address + self.layout.field_offset(value_type, index), values[index])
+                    else: error("mir interpreter: transferred struct has the wrong shape")
+            Array(element, count):
+                match transferred.form:
+                    Aggregate(values):
+                        if len(values) != count: error("mir interpreter: transferred array length changed")
+                        let stride = self.layout.size_of(element)
+                        for index in range(0, count): try self.decode_transfer_into(host, element, address + index * stride, values[index])
+                    else: error("mir interpreter: transferred array has the wrong shape")
+            Enum(tag, cases):
+                match transferred.form:
+                    Variant(copied_tag, payload):
+                        try self.decode_transfer_into(host, tag, address, copied_tag)
+                        let selected = try transferred_index(copied_tag)
+                        if selected < 0 or selected >= len(cases): error("mir interpreter: transferred enum tag is invalid")
+                        try self.decode_transfer_into(host, cases[selected], address + self.layout.enum_payload_offset(value_type), payload)
+                    else: error("mir interpreter: transferred enum has the wrong shape")
+            else: host.store(value_type, address, try self.decode_transfer(host, value_type, transferred))
+
+    func decode_hash_transfer(host: MirExecutionHost, transferred: MirTransferredValue, key_type: TypeId, value_type: TypeId?) -> MirValue!:
+        match transferred.form:
+            Hash(entries):
+                let storage = MirHash(key_type, value_type)
+                for entry in entries:
+                    let key_address = host.allocate(self.layout.size_of(key_type), self.layout.align_of(key_type))
+                    try self.decode_transfer_into(host, key_type, key_address, entry.key)
+                    var value_address = 0
+                    if value_type != none:
+                        let item_type = value_type
+                        let item = entry.value else error("mir interpreter: transferred frozen map entry has no value")
+                        value_address = host.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                        try self.decode_transfer_into(host, item_type, value_address, item)
+                    elif entry.value != none:
+                        error("mir interpreter: transferred frozen set entry unexpectedly has a value")
+                    storage.hashes.append(entry.hash)
+                    storage.keys.append(key_address)
+                    storage.values.append(value_address)
+                self.hashes.append(storage)
+                return MirValue.Ptr(value = hash_address_base + len(self.hashes) - 1)
+            else: error("mir interpreter: transferred frozen hash has the wrong shape")
+
+    func is_buffer_value_shape(fields: list[MirField]) -> bool:
+        if len(fields) != 3: return false
+        match mir_type(self.program.types, fields[0].value_type):
+            BufferOwner: pass
+            else: return false
+        return is_ptr_type(self.program.types, fields[1].value_type) and fields[2].value_type.value == builtin_mir_type(BuiltinMirType.unsigned_u64).value
+
+    func store_task_runtime_error(host: MirExecutionHost, error_type: TypeId, address: i64, code: u64, message: str) -> !:
+        match mir_type(self.program.types, error_type):
+            Struct(fields):
+                if len(fields) != 2: error("mir interpreter: task Error has the wrong field count")
+                let code_address = address + self.layout.field_offset(error_type, 0)
+                match mir_type(self.program.types, fields[0].value_type):
+                    Struct(code_fields):
+                        if len(code_fields) != 2: error("mir interpreter: task ErrorCode has the wrong field count")
+                        try self.store_transferred_text(host, code_fields[0].value_type, code_address + self.layout.field_offset(fields[0].value_type, 0), "luce.task")
+                        host.store(code_fields[1].value_type, code_address + self.layout.field_offset(fields[0].value_type, 1), MirValue.UnsignedInt(value = code))
+                    else: error("mir interpreter: task Error code is not structural")
+                try self.store_transferred_text(host, fields[1].value_type, address + self.layout.field_offset(error_type, 1), message)
+            else: error("mir interpreter: task failure type is not Error")
+
+    func store_transferred_text(host: MirExecutionHost, value_type: TypeId, address: i64, value: str) -> !:
+        let payload = strings.to_bytes(value)
+        try self.decode_transfer_into(host, value_type, address, MirTransferredValue(form = MirTransferredForm.Buffer(bytes = payload)))
+
+    ## The element addresses of the live list whose storage begins at
+    ## `start`, for a C boundary that borrowed it. The interpreter loads the
+    ## values; only the identity search needs the list table.
+    pub func borrowed_list_elements(start: i64, element_type: TypeId, count: u64) -> list[i64]!:
+        for storage in self.lists:
+            if not storage.is_alive or storage.element_type.value != element_type.value: continue
+            if len(storage.buffer.elements) == 0 or storage.buffer.elements[0] != start: continue
+            if count > u64(len(storage.buffer.elements)):
+                error("mir interpreter: extern read beyond a borrowed list")
+            let addresses = list[i64]()
+            for index in range(0, i64(count)): addresses.append(storage.buffer.elements[index])
+            return addresses
+        error("mir interpreter: extern read a pointer that is not borrowed list storage")
+
+    # mark: Handle tables =======================================================================
+
+    func task_at(value: MirValue) -> MirTaskStorage!:
+        let index = ptr_of(value) - task_address_base
+        if index < 0 or index >= len(self.tasks): error("mir interpreter: trap: invalid task handle")
+        return self.tasks[index]
+
+    func task_group_at(value: MirValue) -> MirTaskGroup!:
+        let index = ptr_of(value) - task_group_address_base
+        if index < 0 or index >= len(self.task_groups): error("mir interpreter: trap: invalid task group handle")
+        return self.task_groups[index]
+
+    func list_at(value: MirValue) -> MirList!:
+        let index = ptr_of(value) - list_address_base
+        if index < 0 or index >= len(self.lists): error("mir interpreter: trap: invalid list handle")
+        let storage = self.lists[index]
+        if not storage.is_alive: error("mir interpreter: trap: released list handle")
+        return storage
+
+    func hash_at(value: MirValue) -> MirHash!:
+        let index = ptr_of(value) - hash_address_base
+        if index < 0 or index >= len(self.hashes): error("mir interpreter: trap: invalid hash collection handle")
+        let storage = self.hashes[index]
+        if not storage.is_alive: error("mir interpreter: trap: released hash collection handle")
+        return storage
+
+    func require_hash_shape_mutable(storage: MirHash) -> !:
+        if storage.active_iterations > 0:
+            error("mir interpreter: trap: hash collection structurally modified during active iteration")
+
+    func equality_context_at(value: MirValue) -> MirEqualityContext!:
+        let index = ptr_of(value) - equality_context_address_base
+        if index < 0 or index >= len(self.equality_contexts): error("mir interpreter: trap: invalid equality context")
+        let context = self.equality_contexts[index]
+        if not context.is_alive: error("mir interpreter: trap: released equality context")
+        return context
+
+    func require_list_shape_mutable(storage: MirList) -> !:
+        if storage.active_iterations > 0:
+            error("mir interpreter: trap: list structurally modified during active iteration")
+
+    func slice_at(value: MirValue) -> MirSlice!:
+        let index = ptr_of(value) - slice_address_base
+        if index < 0 or index >= len(self.slices): error("mir interpreter: trap: invalid slice handle")
+        let storage = self.slices[index]
+        if not storage.is_alive: error("mir interpreter: trap: released slice handle")
+        return storage
+
+    func class_index_at(value: MirValue, allow_destroying: bool) -> i64!:
+        let index = ptr_of(value) - class_address_base
+        if index < 0 or index >= len(self.classes): error("mir interpreter: trap: invalid class handle")
+        let storage = self.classes[index]
+        if not storage.is_alive and not (allow_destroying and storage.is_destroying):
+            error("mir interpreter: trap: released class handle " + str(index) + " (class " + str(storage.class_index) + ")")
+        return index
+
+    func class_at(value: MirValue, allow_destroying: bool) -> MirClassObject!:
+        return self.classes[try self.class_index_at(value, allow_destroying)]
+
+    func release_managed(host: MirExecutionHost, value: MirValue) -> !:
+        if ptr_of(value) == 0: return
+        let storage = try self.class_at(value, false)
+        if storage.references <= 0: trap("managed reference count underflow")
+        storage.references -= 1
+        if storage.references > 0: return
+        storage.is_alive = false
+        storage.is_destroying = true
+        discard(try host.call(i64(storage.destroyer.value), [value, MirValue.Bool(value = storage.is_initialized)]))
+        storage.is_destroying = false
+
+    func weak_class_at(value: MirValue) -> MirWeakClassSlot!:
+        let index = ptr_of(value) - weak_class_address_base
+        if index < 0 or index >= len(self.weak_classes): error("mir interpreter: trap: invalid weak class handle")
+        let storage = self.weak_classes[index]
+        if not storage.is_alive: error("mir interpreter: trap: released weak class handle")
+        return storage
+
+    func interface_at(value: MirValue) -> MirInterfaceBox!:
+        let index = ptr_of(value) - interface_address_base
+        if index < 0 or index >= len(self.interfaces): error("mir interpreter: trap: invalid interface handle")
+        let storage = self.interfaces[index]
+        if not storage.is_alive: error("mir interpreter: trap: released interface handle")
+        return storage
+
+    func list_element_type(function: MirFunction, value: RegisterId) -> TypeId:
+        match mir_type(self.program.types, function.registers[value.value]):
+            List(element): return element
+            FrozenList(element): return element
+            else: trap("verified list instruction has a non-list handle")
+
+    func hash_types(function: MirFunction, value: RegisterId) -> list[TypeId]:
+        match mir_type(self.program.types, function.registers[value.value]):
+            Map(key, item): return [key, item]
+            Set(element): return [element]
+            FrozenMap(key, item): return [key, item]
+            FrozenSet(element): return [element]
+            else: trap("verified hash instruction has a non-map/set handle")
+
+    func copy_hash(host: MirExecutionHost, source: MirHash, key_retain: FunctionId, value_retain: FunctionId) -> MirHash!:
+        let copied = MirHash(source.key_type, source.value_type)
+        for position in range(0, len(source.keys)):
+            copied.hashes.append(source.hashes[position])
+            let key_address = host.allocate(self.layout.size_of(source.key_type), self.layout.align_of(source.key_type))
+            host.copy_bytes(source.keys[position], key_address, self.layout.size_of(source.key_type))
+            discard(try host.call(i64(key_retain.value), [MirValue.Ptr(value = key_address)]))
+            copied.keys.append(key_address)
+            var value_address = 0
+            if source.value_type != none:
+                let item_type = source.value_type else trap("map hash storage lost its value type")
+                value_address = host.allocate(self.layout.size_of(item_type), self.layout.align_of(item_type))
+                host.copy_bytes(source.values[position], value_address, self.layout.size_of(item_type))
+            discard(try host.call(i64(value_retain.value), [MirValue.Ptr(value = value_address)]))
+            copied.values.append(value_address)
+        return copied
+
+    func slice_element_type(function: MirFunction, value: RegisterId) -> TypeId:
+        match mir_type(self.program.types, function.registers[value.value]):
+            Slice(element): return element
+            else: trap("verified slice instruction has a non-slice handle")
+
+    func mutable_slice_element_type(function: MirFunction, value: RegisterId) -> TypeId:
+        match mir_type(self.program.types, function.registers[value.value]):
+            MutableSlice(element): return element
+            else: trap("verified mutable-slice instruction has a non-view handle")
+
+    # Append independent value slots while preserving any references encoded
+    # inside those values. List copy and both concatenation halves share this
+    # shallow-copy rule.
+    func append_copied_list_elements(host: MirExecutionHost, destination: MirList, source: MirList, size: i64, alignment: i64, element_retain: FunctionId) -> !:
+        for source_address in source.buffer.elements:
+            let destination_address = host.allocate(size, alignment)
+            host.copy_bytes(source_address, destination_address, size)
+            discard(try host.call(i64(element_retain.value), [MirValue.Ptr(value = destination_address)]))
+            destination.buffer.elements.append(destination_address)
+
+    func detach_list(host: MirExecutionHost, storage: MirList, element_retain: FunctionId) -> !:
+        if storage.buffer.references == 1: return
+        let copied = MirListBuffer()
+        let size = self.layout.size_of(storage.element_type)
+        let alignment = self.layout.align_of(storage.element_type)
+        for source in storage.buffer.elements:
+            let destination = host.allocate(size, alignment)
+            host.copy_bytes(source, destination, size)
+            discard(try host.call(i64(element_retain.value), [MirValue.Ptr(value = destination)]))
+            copied.elements.append(destination)
+        storage.buffer.references -= 1
+        storage.buffer = copied
+
+    func release_list_buffer(host: MirExecutionHost, buffer: MirListBuffer, element_release: FunctionId) -> !:
+        if buffer.references <= 0: trap("list buffer reference count underflow")
+        buffer.references -= 1
+        if buffer.references != 0: return
+        var position = len(buffer.elements) - 1
+        while position >= 0:
+            discard(try host.call(i64(element_release.value), [MirValue.Ptr(value = buffer.elements[position])]))
+            position -= 1
+

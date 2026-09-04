@@ -1,0 +1,267 @@
+#==============================================================================================
+#
+#   mir_execution_model - The value and frame vocabulary of the MIR oracle
+#
+#   DESCRIPTION:
+#       What the MIR interpreter computes with: one register's contents, the
+#       call frame, the oracle-only handle address ranges, the pure helpers
+#       over those values, and the narrow services the interpreter lends to
+#       its full-profile executor. `backends/mir_interpreter` and
+#       `profiles/full/backends/mir_execution` share this vocabulary while the
+#       dependency runs one way, exactly as `mir/lowering_model` does for
+#       lowering. Nothing here is a target fact: the address ranges are
+#       oracle tokens, never machine addresses.
+#
+#==============================================================================================
+
+from compiler.backends.mir_task_runtime import MirTransferredValue
+from compiler.mir.canonical import BinaryOp, MirFunction, MirTypeTable, RegisterRun, TypeId, bits_of, is_signed_int_type
+from compiler.formatting.ieee import normalize_ieee_float
+
+# mark: Values ================================================================================
+
+let i64_maximum: i64 = 9223372036854775807
+let i64_minimum: i64 = -9223372036854775807 - 1
+
+## One register's contents. Integer variants preserve the MIR type's signed
+## domain; width remains a property of that type. `Ptr` is a byte offset into
+## the interpreter's memory.
+pub union MirValue:
+    SignedInt(value: i64)
+    UnsignedInt(value: u64)
+    Float(value: f64)
+    Bool(value: bool)
+    Ptr(value: i64)
+
+## `FunctionAddress` yields `function_address_base + index`.
+pub let function_address_base: i64 = 0x1000000
+## `ExternAddress` uses a disjoint range so an indirect C call can route to
+## the explicit host without confusing an extern identity with artifact code.
+pub let extern_address_base: i64 = 0x2000000
+## Opaque list handles occupy a third disjoint address range.
+pub let list_address_base: i64 = 0x3000000
+## Immutable slice handles occupy a fourth disjoint address range.
+pub let slice_address_base: i64 = 0x4000000
+## Opaque immutable buffer owners occupy a fifth disjoint address range.
+pub let buffer_owner_address_base: i64 = 0x5000000
+## Class and weak-slot handles occupy disjoint semantic ranges. These are
+## oracle tokens only; compiled backends choose their own representation.
+pub let class_address_base: i64 = 0x6000000
+pub let weak_class_address_base: i64 = 0x7000000
+## Existential handles use a separate oracle-only identity range.
+pub let interface_address_base: i64 = 0x8000000
+## Recursive equality contexts occupy an oracle-only opaque range.
+pub let equality_context_address_base: i64 = 0x9000000
+## Hash-collection identities are disjoint from every other oracle handle.
+pub let hash_address_base: i64 = 0xA000000
+## Linear buffer builders occupy their own oracle-only opaque range.
+pub let buffer_builder_address_base: i64 = 0xB000000
+## Structured task identities and group capabilities use oracle-only ranges.
+pub let task_address_base: i64 = 0xC000000
+pub let task_group_address_base: i64 = 0xD000000
+
+# One call: its registers and the addresses of its slots.
+pub class Frame:
+    pub let function: MirFunction
+    pub let registers: list[MirValue]
+    pub let slots: list[i64]
+
+    pub init(function: MirFunction, registers: list[MirValue], slots: list[i64]):
+        self.function = function
+        self.registers = registers
+        self.slots = slots
+
+# mark: Execution services ====================================================================
+
+## The services `MirInterpreter` lends to the profile executor: its private
+## memory, calls, immutable buffers, and worker domains. A profile consumer
+## never imports the interpreter, so the dependency runs one way.
+pub interface MirExecutionHost:
+    func allocate(size: i64, alignment: i64) -> i64
+    func load(value_type: TypeId, address: i64) -> MirValue
+    func store(value_type: TypeId, address: i64, value: MirValue)
+    func copy_bytes(source: i64, destination: i64, size: i64)
+    func write_byte(address: i64, value: u8)
+    func read_byte(address: i64) -> u8
+    func call(index: i64, arguments: list[MirValue]) -> list[MirValue]!
+    func collect(frame: Frame, registers: RegisterRun) -> list[MirValue]
+    func bind(frame: Frame, results: RegisterRun, values: list[MirValue])
+    ## Immutable string/byte owners are shared oracle storage; the profile
+    ## only retains and releases them.
+    func create_immutable_buffer(data: i64, length: i64) -> i64
+    func retain_immutable_buffer(owner: i64) -> !
+    func release_immutable_buffer(owner: i64) -> !
+    ## A fresh loaded domain over the same program and host capabilities:
+    ## worker execution starts here.
+    func fresh_domain() -> MirExecutionHost
+    func encode_transfer(value_type: TypeId, value: MirValue) -> MirTransferredValue!
+    func encode_transfer_from_storage(value_type: TypeId, address: i64) -> MirTransferredValue!
+    func decode_transfer(value_type: TypeId, value: MirTransferredValue) -> MirValue!
+
+# mark: Value helpers ==========================================================================
+
+pub func signed_int_of(value: MirValue) -> i64:
+    match value:
+        SignedInt(item): return item
+        else: trap("verified MIR register holds a non-signed-integer where a signed integer was expected")
+
+pub func unsigned_int_of(value: MirValue) -> u64:
+    match value:
+        UnsignedInt(item): return item
+        else: trap("verified MIR register holds a non-unsigned-integer where an unsigned integer was expected")
+
+pub func float_of(value: MirValue) -> f64:
+    match value:
+        Float(item): return item
+        else: trap("verified MIR register holds a non-float where a float was expected")
+
+pub func bool_of(value: MirValue) -> bool:
+    match value:
+        Bool(item): return item
+        else: trap("verified MIR register holds a non-bool where a bool was expected")
+
+pub func ptr_of(value: MirValue) -> i64:
+    match value:
+        Ptr(item): return item
+        else: trap("verified MIR register holds a non-pointer where a pointer was expected")
+
+pub func trap_overflow() -> !:
+    error("mir interpreter: trap: integer overflow")
+
+# Convert one target-independent unsigned semantic quantity into the oracle's
+# host indexing domain only after proving it fits. This capacity is an oracle
+# implementation limit, never a canonical-MIR or target limit.
+pub func host_count_of(value: MirValue, what: str) -> i64!:
+    let item = unsigned_int_of(value)
+    if item > u64(9223372036854775807):
+        error("mir interpreter: trap: " + what + " exceeds semantic-oracle capacity")
+    return i64(item)
+
+# Check a source-visible position in the unsigned semantic domain before
+# narrowing it to the oracle's host-list index. An enormous index is out of
+# bounds; it is not evidence that canonical MIR inherited an i64 limit.
+pub func bounded_position_of(value: MirValue, length: i64, allows_end: bool, reason: str) -> i64!:
+    let item = unsigned_int_of(value)
+    var outside = item >= u64(length)
+    if allows_end: outside = item > u64(length)
+    if outside: error("mir interpreter: trap: " + reason)
+    return i64(item)
+
+pub func host_integer_of(value: MirValue, what: str) -> i64!:
+    match value:
+        SignedInt(item): return item
+        UnsignedInt(item):
+            if item > u64(9223372036854775807):
+                error("mir interpreter: trap: " + what + " exceeds semantic-oracle capacity")
+            return i64(item)
+        else: trap("verified MIR register holds a non-integer where an integer was expected")
+
+# Reinterpret the low destination-width bits, choosing the semantic variant
+# from the destination type. `extend`, `wrap`, and equal-width reinterpret
+# differ in verifier constraints; their bit materialization is shared.
+pub func integer_from_low_bits(value: MirValue, result_type: TypeId, types: MirTypeTable) -> MirValue:
+    let bits = bits_of(types, result_type)
+    let low = low_integer_bits(value, bits)
+    if not is_signed_int_type(types, result_type): return MirValue.UnsignedInt(value = low)
+    if bits == 64:
+        if low <= u64(9223372036854775807): return MirValue.SignedInt(value = i64(low))
+        return MirValue.SignedInt(value = (-9223372036854775807 - 1) + i64(low - u64(9223372036854775808)))
+    let sign = u64(1) << u64(bits - 1)
+    if low < sign: return MirValue.SignedInt(value = i64(low))
+    return MirValue.SignedInt(value = i64(low) - i64(u64(1) << u64(bits)))
+
+pub func low_integer_bits(value: MirValue, bits: i64) -> u64:
+    var mask = u64(18446744073709551615)
+    if bits < 64: mask = (u64(1) << u64(bits)) - u64(1)
+    match value:
+        UnsignedInt(item): return item & mask
+        SignedInt(item):
+            if item >= 0: return u64(item) & mask
+            if bits == 64: return u64(9223372036854775808) + u64(item - (-9223372036854775807 - 1))
+            return u64(item & i64(mask))
+        else: trap("verified MIR conversion received a non-integer")
+
+# Shift one bit at a time after dropping the outgoing high bit. The remaining
+# value can always be doubled in host `u64`, including for a 64-bit operand,
+# so Stage-0 never decides Luce's fixed-width shift behavior through overflow.
+pub func shift_left_unsigned(value: u64, count: i64, bits: i64) -> u64:
+    let high_bit = u64(1) << u64(bits - 1)
+    var result = value
+    for step in range(0, count):
+        if result >= high_bit: result -= high_bit
+        result += result
+    return result
+
+# Multiply two `i64` values, reporting overflow instead of letting Stage-0
+# trap. Magnitudes are compared against `maximum // |b|`; the one product
+# that exceeds `maximum` yet fits is exactly `minimum`.
+# Keep the low `bits` of a value, sign-extending for signed types. 64-bit
+# values are already canonical.
+pub func wrap_to_width(value: i64, bits: i64, is_signed: bool) -> i64:
+    if bits >= 64: return value
+    let mask = (1 << bits) - 1
+    let low = value & mask
+    if is_signed and low >= (1 << (bits - 1)): return low - (mask + 1)
+    return low
+
+# Shift left within `bits`, dropping bits shifted past the width, without
+# ever forming a host `i64` that overflows (Stage-0 traps on `1 << 63`).
+# The surviving low `bits - count` bits of `value` are split into their top
+# bit and the rest; the rest shifts safely below bit 63, and the top bit is
+# added back as 2^(bits-1) — which for 64 bits is the i64 minimum.
+pub func shift_left_within(value: i64, count: i64, bits: i64, is_signed: bool) -> i64:
+    if count == 0: return wrap_to_width(value, bits, is_signed)
+    let keep = bits - count
+    var mask = 9223372036854775807
+    if keep < 63: mask = (1 << keep) - 1
+    let low = value & mask
+    let top = (low >> (keep - 1)) & 1
+    let rest = low & (mask >> 1)
+    var shifted = rest << count
+    if top == 1:
+        if bits == 64: shifted = shifted + (-9223372036854775807 - 1)
+        else: shifted = shifted + (1 << (bits - 1))
+    return wrap_to_width(shifted, bits, is_signed)
+
+pub func checked_multiply(left: i64, right: i64) -> i64!:
+    if left == 0 or right == 0: return 0
+    if left == 1: return right
+    if right == 1: return left
+    if left == i64_minimum or right == i64_minimum: try trap_overflow()
+    let negative = (left < 0) != (right < 0)
+    var left_magnitude = left
+    if left_magnitude < 0: left_magnitude = 0 - left_magnitude
+    var right_magnitude = right
+    if right_magnitude < 0: right_magnitude = 0 - right_magnitude
+    let limit = i64_maximum // right_magnitude
+    if left_magnitude > limit:
+        # The product is at least 2^63; only minimum itself is representable.
+        let divides_exactly = i64_maximum % right_magnitude == right_magnitude - 1
+        if negative and divides_exactly and left_magnitude == limit + 1: return i64_minimum
+        try trap_overflow()
+    return left * right
+
+pub func evaluate_float_binary(operation: BinaryOp, operand_type: TypeId, left: f64, right: f64, types: MirTypeTable) -> MirValue!:
+    if operation == BinaryOp.add: return MirValue.Float(value = normalize_mir_float(left + right, operand_type, types))
+    if operation == BinaryOp.sub: return MirValue.Float(value = normalize_mir_float(left - right, operand_type, types))
+    if operation == BinaryOp.mul: return MirValue.Float(value = normalize_mir_float(left * right, operand_type, types))
+    if operation == BinaryOp.div: return MirValue.Float(value = normalize_mir_float(left / right, operand_type, types))
+    if operation == BinaryOp.eq: return MirValue.Bool(value = left == right)
+    if operation == BinaryOp.ne: return MirValue.Bool(value = left != right)
+    if operation == BinaryOp.lt: return MirValue.Bool(value = left < right)
+    if operation == BinaryOp.le: return MirValue.Bool(value = left <= right)
+    if operation == BinaryOp.gt: return MirValue.Bool(value = left > right)
+    if operation == BinaryOp.ge: return MirValue.Bool(value = left >= right)
+    trap("verified float operands reached an integer-only operation")
+
+pub func normalize_mir_float(value: f64, value_type: TypeId, types: MirTypeTable) -> f64:
+    return normalize_ieee_float(value, bits_of(types, value_type))
+
+# Oracle-only address tokens are non-negative. Mix them into a process-local
+# code without exposing an integer conversion operation to canonical MIR.
+pub func semantic_pointer_hash(value: i64) -> u64:
+    var result = u64(value) ^ u64(0x9E3779B97F4A7C15)
+    result = result ^ shift_left_unsigned(result, 13, 64)
+    result = result ^ (result >> u64(7))
+    result = result ^ shift_left_unsigned(result, 17, 64)
+    return result

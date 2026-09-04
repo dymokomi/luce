@@ -270,6 +270,12 @@ Read in this order; each stop hands off to the next.
   target-independent optimization.
 - `src/compiler/backends/` contains the Wasm emitter, QBE emitter and host
   materializer, backend-owned layout, and the two semantic execution engines.
+- `src/compiler/profile.luc` names the two language profiles, full Luce and
+  Luce Base, and what each admits. Code that only one profile executes lives
+  in `src/compiler/profiles/full/` or `src/compiler/profiles/base/`, laid out
+  by stage (`hir/`, `mir/`, `backends/`); each shared stage reaches it through
+  one dispatch point, and `test.sh` checks that the two folders never import
+  each other.
 - `src/runtime/` is the separately compiled freestanding Luce runtime; it owns
   checked allocation, typed reclamation and block reuse, plus the ownership
   and collection policy being built above the backend arena.

@@ -14,14 +14,14 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 | Layer | State |
 |---|---|
 | Tokenizer, parser, syntax tree | Complete for the 1.0 surface (`docs/language/1.0.md`); every syntax form has parser coverage. Throughput is linear (~450 KB/s); expression nesting is capped at 256 with a diagnostic. |
-| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. Explicit inbound C-memory copies are closed standard-source intrinsics behind ordinary public wrappers. **Not yet**: the remaining FIIR-generated rich adapters and callback runtime enforcement. Each unsupported form fails with a span. |
-| HIR interpreter (`backends/interpreter.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Its process runner accepts explicit arguments as the ordinary `slice[str]` semantic shape. |
-| Canonical MIR (`mir/canonical.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed mutable/frozen collections and slices, nominal interfaces/classes/weak handles, closures/cells, generated ownership helpers, structured task groups and typed transfer runs, with no physical layout or execution-domain policy. The verifier proves every rule, reachability removes unreachable closed-world resources while retaining only each transfer graph's semantic service closure, and the MIR interpreter executes every instruction under explicit test layout rules. |
-| Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
-| WebAssembly backend (`backends/wasm.luc`, `wasm_float16.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
-| QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`, `qbe_toolchain.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
+| HIR generation (`hir/generator.luc`, `declarations.luc`, `imports.luc`, `public_api.luc`, `body_checker.luc`, `generation_model.luc`, `generics/`, `interfaces/`; `profiles/full/hir/`) | Functions, generics, nominal values/classes, interfaces and protocols, closures, collections and slices, failure/control, exact function/C-function values, native authority, the exact process-entry contract, and the complete executable surface described below. Structured tasks admit only named Luce workers, prove both transfer directions recursively, keep handles inside their creating invocation, and expose frozen collection snapshots as immutable sendable graphs. Documentation and defaults are retained. Fixed-representation C enums and exported C structs remain ordinary semantic values with separate closed boundary metadata. Explicit inbound C-memory copies are closed standard-source intrinsics behind ordinary public wrappers. **Not yet**: the remaining FIIR-generated rich adapters and callback runtime enforcement. Each unsupported form fails with a span. |
+| HIR interpreter (`backends/interpreter.luc`, `hir_values.luc`, `hir_execution_model.luc`; `profiles/full/backends/hir_execution.luc`) | The semantic oracle. Executes safe HIR generation, including exact scalar rounding, protocols, structural hashing/equality, closures, managed classes, sealed-runtime collections, frozen snapshots, and deterministic isolated tasks with copied arguments/results, cached waits, failures, traps, cancellation, and ordered `wait_all`. Its process runner accepts explicit arguments as the ordinary `slice[str]` semantic shape. |
+| Canonical MIR (`mir/canonical.luc`; oracle in `backends/mir_interpreter.luc`, `mir_execution_model.luc`, `profiles/full/backends/mir_execution.luc`) | Target-neutral and designed for the whole language (`mir.md`), including typed mutable/frozen collections and slices, nominal interfaces/classes/weak handles, closures/cells, generated ownership helpers, structured task groups and typed transfer runs, with no physical layout or execution-domain policy. The verifier proves every rule, reachability removes unreachable closed-world resources while retaining only each transfer graph's semantic service closure, and the MIR interpreter executes every instruction under explicit test layout rules. |
+| Lowerer (`mir/lowerer.luc`, `lowering_model.luc`, `function_lowerer.luc`; `profiles/full/mir/lowering.luc`) | Everything HIR generates, including protocols, structural hashing and cycle-aware equality, interfaces, scalars/aggregates, managed collections/classes/closures, failure/cleanup, C boundaries, immutable snapshots, and structured tasks with a finish on every ordinary exit. Generic declarations and marker proofs are fully erased before this boundary. |
+| WebAssembly backend (`backends/wasm.luc`, `wasm_plan.luc`, `wasm_encoding.luc`, `wasm_float16.luc`; `profiles/full/backends/wasm_emission.luc`, `wasm_planning.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
+| QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_toolchain.luc`; `profiles/full/backends/qbe_emission.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
 | FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. A separate reviewed recipe section generates ordinary safe Luce owners, checked borrows, returned-borrow anchors, and status failures. Both layers have semantic-oracle and linked QBE/C proofs. **Not yet**: broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
-| Tests | 972 unit tests across 37 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 976 unit tests across 47 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Implemented milestones and evidence
@@ -793,7 +793,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   found no target fact before `backends/`. The 2K-line ownership review also
   found no honest class-only split in the mutually recursive function walk.
   The following closure slice did establish an independent capture-context
-  owner in `hir/closure_context.luc`. Remaining §11 work is tracked separately
+  owner in `profiles/full/hir/closure_context.luc`. Remaining §11 work is tracked separately
   rather than hidden behind this core milestone.
 - [x] **First-class weak handles reuse the nominal class lifetime protocol**
   (2026-08-31). `Weak[T]` remains one compiler-known type family rather than
@@ -2117,6 +2117,41 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   compiler's call depth. The repository gate stays at 972/972 compiler tests
   across 37 files plus CLI, Wasm, and native QBE shell gates; `main` is now the
   former `stage1-qbe` line.
+- [x] **One folder per language profile, one dispatch point per stage (B0)**
+  (2026-09-03). `profile.luc` names the two profiles, the suffix that selects
+  each, the three reserved words only full Luce spells, and type admission
+  over the existing structural keys. Everything only full Luce executes moved
+  out of the six shared stage files into `profiles/full/{hir,mir,backends}/`
+  as classes over the shared state: the HIR checks for closures, collections,
+  classes, and workers (`hir/checker.luc`, with `closure_context.luc` and
+  `sendability.luc` beside it); their lowering (`mir/lowering.luc`, 1.8k
+  lines out of `function_lowerer`); reference execution and the run state it
+  owns (`backends/hir_execution.luc`); the MIR oracle's handle tables and
+  runtime instructions (`mir_execution.luc`); QBE legalization, worker
+  codecs, and the process entry (`qbe_emission.luc`, `qbe_tasks.luc`,
+  `qbe_task_support.luc`); and Wasm encoding plus the module plan's runtime
+  queries (`wasm_emission.luc`, `wasm_planning.luc`). Each shared stage keeps
+  one `full` field and asks it at the arms it no longer owns; the profile
+  answers through a host interface declared beside the shared state
+  (`HirSemanticChecker` grew five services; `FunctionLoweringHost`,
+  `HirExecutionHost`, `MirExecutionHost`, and `QbeEmissionHost` are new),
+  so no import cycle exists and stage 1 can still reject module cycles.
+  Vocabulary both sides need moved to shared model files rather than being
+  duplicated: `hir_values.luc` (the value operations of the HIR oracle),
+  `hir_execution_model.luc`, `mir_execution_model.luc` (now the home of
+  `MirValue`), `qbe_emission_model.luc`, and `wasm_encoding.luc` (the byte
+  vocabulary and shared emitters). `test.sh` enforces both folder rules and
+  extends the target-neutrality grep to `profiles/*/hir` and `profiles/*/mir`;
+  `tests/compiler/profiles/` mirrors the layout with the closure, class,
+  worker, collection, slice, and hash sections of the generator, lowerer, and
+  interpreter tests, which now share fixtures through `*_support.luc`
+  modules. No behavior changed: the QBE IL of all 34 compilable examples is
+  byte-identical to the pre-split tree, and the full gate is green at
+  976 compiler tests across 47 files. `body_checker` is 3.0k lines and
+  `function_lowerer` 3.7k, down from 3.8k and 5.3k. One Stage-0 observation
+  was recorded in `stage0-0.30.md`: a test module named exactly after the
+  source module it tests (`compiler.profile_test`) fails three assertions
+  under 0.30, so the profile test is `language_profile_test.luc`.
 
 ## 3. Bugs the multi-backend harness found
 

@@ -1,0 +1,940 @@
+#==============================================================================================
+#
+#   full_profile_checker - Function-local semantics that only full Luce has
+#
+#   DESCRIPTION:
+#       Checks the expression and statement forms whose meaning is supplied by
+#       the Luce runtime: closures with captures, the built-in collections and
+#       their snapshot slices, nominal classes with weak references, and
+#       structured workers. `hir/body_checker` is the one dispatch point that
+#       reaches this class; it hands over syntax it does not own and receives
+#       ordinary typed HIR nodes back. Existential interface values keep their
+#       shared checker in `hir/interfaces/values`, because Base also types
+#       interface-typed values and differs only in representation.
+#
+#       Like `hir/generics`, this is a consumer of the shared
+#       `HirGenerationState`: it writes nodes into the same transaction and
+#       reaches the ordinary expression checker only through the narrow
+#       `HirSemanticChecker` services, never by importing it.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan, format_diagnostic
+from compiler.frontend.syntax import ArgumentSyntax, CaptureSyntax, ExpressionForm, ExpressionSyntax, MapEntrySyntax, ParameterSyntax, PathSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generation_model import CheckedPlace, HirGenerationState, HirSemanticChecker, IndexPlaceStep, LocalBinding, LocalStorage
+from compiler.hir.generics.functions import GenericFunctionChecker
+from compiler.hir.ir import BuiltinType, HirCaptureKind, HirFunction, HirFunctionImplementation, HirGenericCallKind, HirNode, HirNodeForm, HirParameter, HirReceiver, HirReceiverKind
+from compiler.hir.ir import ModuleId, NodeId, Operands, SymbolId, SymbolKind, TypeId, Value, no_node
+from compiler.hir.ir import describe_type, resolve_builtin_type, types_match, values_equal
+from compiler.hir.ir import place_class_field_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step, place_weak_field_step
+from compiler.profiles.full.hir.closure_context import ClosureContext
+from compiler.profiles.full.hir.sendability import SendabilityChecker
+
+## The full-profile consumer of the shared HIR generation transaction.
+pub class FullProfileChecker:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+    let generics: GenericFunctionChecker
+    ## Capture discovery is shared with the body checker, which consults it
+    ## on every local-name lookup; the context itself belongs to this profile.
+    let closures: ClosureContext
+    let sendability: SendabilityChecker
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector, generics: GenericFunctionChecker, closures: ClosureContext):
+        self.state = state
+        self.declarations = declarations
+        self.generics = generics
+        self.closures = closures
+        self.sendability = SendabilityChecker(state)
+
+    # mark: Dispatch ============================================================================
+
+    ## Compiler-known call heads that construct or observe runtime values:
+    ## `list[T]()`, `map[K, V]()`, `set[T](...)`, `Weak(value)`, and
+    ## `wait_all(tasks)`. Absent when `name` is none of them.
+    pub func check_named_call(semantics: HirSemanticChecker, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if name == "wait_all": return try self.check_wait_all(semantics, type_arguments, arguments, span, expected)
+        if name == "list": return try self.check_list_constructor(semantics, type_arguments, arguments, span, expected)
+        if name == "map": return try self.check_map_constructor(semantics, type_arguments, arguments, span, expected)
+        if name == "set": return try self.check_set_constructor(semantics, type_arguments, arguments, span, expected)
+        if name == "Weak": return try self.check_weak_constructor(semantics, type_arguments, arguments, span, expected)
+        return none
+
+    ## Method calls whose receiver is a runtime-owned value. Absent when the
+    ## receiver type is shared with Base and ordinary method lookup applies.
+    pub func check_member_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        match self.state.types.definitions[owner_type.value].form:
+            List(element_type):
+                return try self.check_list_call(semantics, receiver, owner_type, element_type, name, arguments, callee_span, span, expected)
+            Map(key_type, value_type):
+                return try self.check_map_call(semantics, receiver, owner_type, key_type, value_type, name, arguments, callee_span, span, expected)
+            Set(element_type):
+                return try self.check_set_call(semantics, receiver, owner_type, element_type, name, arguments, callee_span, span, expected)
+            FrozenSet(element_type):
+                if name != "contains":
+                    try self.fail(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`")
+                if len(arguments) != 1 or arguments[0].label != none:
+                    try self.fail(span, "`frozen_set.contains` takes one positional element")
+                let element = try semantics.check_expression_for_feature(arguments[0].value, element_type)
+                let contains = self.state.push_node(HirNodeForm.SetContains(value = receiver, element = element), resolve_builtin_type(BuiltinType.boolean), span)
+                return try semantics.require_type_for_feature(contains, expected)
+            Weak(referent):
+                return try self.check_weak_call(semantics, receiver, owner_type, referent, name, arguments, callee_span, span, expected)
+            Task(result):
+                return try self.check_task_call(semantics, receiver, owner_type, result, name, arguments, callee_span, span, expected)
+            else: return none
+
+    ## `[...]` outside a fixed-array context: a contextual `list[T]` or
+    ## `slice[T]`, or an inferred list from the first element.
+    pub func check_list_literal_value(semantics: HirSemanticChecker, elements: list[ExpressionSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if expected != none:
+            match self.state.types.definitions[expected.value].form:
+                List(element_type): return try self.check_list_literal(semantics, elements, element_type, expected, span)
+                Slice(element_type):
+                    let list_type = self.state.intern_list(element_type)
+                    let list_value = try self.check_list_literal(semantics, elements, element_type, list_type, span)
+                    return self.state.push_node(
+                        HirNodeForm.SequenceSlice(value = list_value, start = NodeId(value = no_node), end = NodeId(value = no_node)),
+                        expected,
+                        span,
+                    )
+                else: pass
+        if len(elements) == 0:
+            error(self.diagnostic(span, "an empty list literal needs a `list[T]` context"))
+        let first = try semantics.check_expression_for_feature(elements[0], none)
+        let element_type = self.state.type_of(first)
+        try self.state.validate_stored_type(self.state.current_module, element_type, span, "a list element")
+        let checked = [first]
+        for index in range(1, len(elements)):
+            checked.append(try semantics.check_expression_for_feature(elements[index], element_type))
+        let list_type = self.state.intern_list(element_type)
+        return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(checked)), list_type, span), expected)
+
+    ## Indexing a collection: checked element access on sequences and
+    ## optional-valued lookup on maps. Absent for every shared type.
+    pub func check_index(semantics: HirSemanticChecker, value: NodeId, value_type: TypeId, subscript: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match self.state.types.definitions[value_type.value].form:
+            List(element): element_type = element
+            FrozenList(element): element_type = element
+            Slice(element): element_type = element
+            MutableSlice(element): element_type = element
+            Map(key, element):
+                return try self.check_map_lookup(semantics, value, key, element, subscript, span, expected)
+            FrozenMap(key, element):
+                return try self.check_map_lookup(semantics, value, key, element, subscript, span, expected)
+            else: return none
+        let index = try semantics.check_expression_for_feature(subscript, resolve_builtin_type(BuiltinType.unsigned_u64))
+        let result = self.state.push_node(HirNodeForm.SequenceIndex(value = value, index = index), element_type, span)
+        return try semantics.require_type_for_feature(result, expected)
+
+    func check_map_lookup(semantics: HirSemanticChecker, value: NodeId, key: TypeId, element: TypeId, subscript: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let checked_key = try semantics.check_expression_for_feature(subscript, key)
+        let result_type = self.state.intern_optional(element)
+        let result = self.state.push_node(HirNodeForm.MapLookup(value = value, key = checked_key), result_type, span)
+        return try semantics.require_type_for_feature(result, expected)
+
+    ## `.length` on a runtime collection or snapshot. Absent otherwise.
+    pub func check_length_access(semantics: HirSemanticChecker, checked: NodeId, checked_type: TypeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if name != "length": return none
+        var has_length = false
+        match self.state.types.definitions[checked_type.value].form:
+            List(element): has_length = true
+            Map(key, value): has_length = true
+            Set(element): has_length = true
+            FrozenList(element): has_length = true
+            FrozenMap(key, value): has_length = true
+            FrozenSet(element): has_length = true
+            Slice(element): has_length = true
+            MutableSlice(element): has_length = true
+            else: pass
+        if not has_length: return none
+        let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+        return try semantics.require_type_for_feature(length, expected)
+
+    ## Reading a field through a class identity. Absent for value types.
+    pub func check_class_field_access(semantics: HirSemanticChecker, checked: NodeId, checked_type: TypeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        let class_index = self.declarations.class_of(checked_type)
+        if class_index < 0: return none
+        let field_index = self.declarations.find_class_field(class_index, name)
+        if field_index < 0:
+            if self.declarations.find_method(self.state.classes[class_index].type_id, name) >= 0 or self.declarations.find_generic_method(checked_type, name) >= 0:
+                try self.fail(span, "`" + name + "` is a method of `" + self.state.classes[class_index].name + "`; call it with `(...)`")
+            try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
+        let field = self.declarations.class_field(checked_type, field_index)
+        if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
+            try self.fail(span, "field `" + name + "` is private to module `" + self.state.modules[self.state.classes[class_index].module_index].name + "`")
+        let typed = self.state.push_node(HirNodeForm.FieldAccess(value = checked, field = field_index), field.value_type, span)
+        return try semantics.require_type_for_feature(typed, expected)
+
+    ## One assignment step through a class field. `place` was resolved
+    ## without requiring a mutable root, because a class identity stays
+    ## mutable through an immutable binding. Absent for value types.
+    pub func resolve_class_field_place(place: CheckedPlace, name: str, span: SourceSpan, mutate_value: bool) -> CheckedPlace?!:
+        let class_index = self.declarations.class_of(place.value_type)
+        if class_index < 0: return none
+        let field_index = self.declarations.find_class_field(class_index, name)
+        if field_index < 0: try self.fail(span, "class `" + self.state.classes[class_index].name + "` has no field `" + name + "`")
+        let field = self.declarations.class_field(place.value_type, field_index)
+        if not field.is_public and self.state.classes[class_index].module_index != self.state.current_module:
+            try self.fail(span, "field `" + name + "` is private to module `" + self.state.modules[self.state.classes[class_index].module_index].name + "`")
+        let initializing_this_field = place.initializer_field and len(place.steps) == 0
+        if mutate_value and not field.is_mutable and not initializing_this_field:
+            try self.fail(span, "cannot assign to `let` field `" + name + "`; only its class initializer may set it")
+        var step = place_class_field_step
+        if field.is_weak: step = place_weak_field_step
+        place.steps.append(step)
+        place.steps.append(u32(field_index))
+        return CheckedPlace(symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = initializing_this_field)
+
+    ## The assignment step and index/element types for indexing a runtime
+    ## collection. Absent when the indexed type is shared with Base.
+    pub func index_place_step(value_type: TypeId) -> IndexPlaceStep?:
+        let index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        match self.state.types.definitions[value_type.value].form:
+            List(element): return IndexPlaceStep(step = place_list_element_step, element_type = element, index_type = index_type)
+            MutableSlice(element): return IndexPlaceStep(step = place_mutable_slice_element_step, element_type = element, index_type = index_type)
+            Map(key, element): return IndexPlaceStep(step = place_map_element_step, element_type = element, index_type = key)
+            else: return none
+
+    ## Map lookup yields an optional, so only a complete final `=` may target
+    ## a map element.
+    pub func validate_place_steps(place: CheckedPlace, operator: str, span: SourceSpan) -> !:
+        for position in range(0, len(place.steps) // 2):
+            if place.steps[position * 2] == place_map_element_step:
+                if position != len(place.steps) // 2 - 1:
+                    try self.fail(span, "map lookup returns an optional value; assign the complete indexed value")
+                if operator != "=":
+                    try self.fail(span, "map indexed assignment supports only `=`; lookup returns an optional value")
+
+    ## A mutating receiver reached through a class field: the identity is
+    ## shared storage, so the walk stops here. False for value fields.
+    pub func require_mutable_class_field(inner: NodeId, field: i64, span: SourceSpan, mutate_value: bool) -> bool!:
+        let class_index = self.declarations.class_of(self.state.type_of(inner))
+        if class_index < 0: return false
+        let stored = self.declarations.class_field(self.state.type_of(inner), field)
+        if mutate_value and not stored.is_mutable:
+            try self.fail(span, "mutating method needs a `var` receiver; field `" + stored.name + "` is `let`")
+        return true
+
+    ## A list element is a shared slot: reaching it needs no mutable root.
+    ## Absent when the indexed value is not a runtime collection.
+    pub func is_shared_element_root(inner_type: TypeId) -> bool:
+        match self.state.types.definitions[inner_type.value].form:
+            List(element): return true
+            else: return false
+
+    ## Operands of `is` / `is not`: values with shared reference identity.
+    pub func has_reference_identity(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            List(element): return true
+            Map(key, value): return true
+            Set(element): return true
+            Class(index, arguments): return true
+            else: return false
+
+    ## `+` concatenates lists into a fresh shallow copy.
+    pub func is_concatenable(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            List(element): return true
+            else: return false
+
+    ## `defer task.cancel()` is the one worker operation that may be deferred.
+    ## Absent when the deferred expression is not a worker operation.
+    pub func deferred_worker_action(checked: NodeId, span: SourceSpan) -> NodeId?:
+        match self.state.node_form(checked):
+            TaskCancel(task_value): return self.state.push_statement(HirNodeForm.ExpressionStatement(value = checked), span)
+            else: return none
+
+    ## Capture the task handle of a deferred cancellation at registration.
+    pub func capture_deferred_worker_action(semantics: HirSemanticChecker, value: NodeId, statements: list[NodeId], span: SourceSpan) -> NodeId?!:
+        match self.state.node_form(value):
+            TaskCancel(task_value):
+                let captured = try semantics.capture_defer_value_for_feature(task_value, statements)
+                let cancellation = self.state.push_node(HirNodeForm.TaskCancel(value = captured), resolve_builtin_type(BuiltinType.unit), span)
+                return self.state.push_statement(HirNodeForm.ExpressionStatement(value = cancellation), span)
+            else: return none
+
+    # mark: Closures ============================================================================
+
+    # An expression lambda receives its complete signature from context. Its
+    # body is represented as an ordinary hidden HIR function whose sole
+    # statement yields the checked expression.
+    pub func check_lambda(semantics: HirSemanticChecker, parameters: list[ParameterSyntax], body: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let context = try self.callable_context(semantics, expected, span, "an expression lambda requires an expected function type")
+        let parameter_types = list[TypeId]()
+        var result = resolve_builtin_type(BuiltinType.unit)
+        var c_callable = false
+        match self.state.types.definitions[context.value].form:
+            Function(items, function_result):
+                for item in items: parameter_types.append(item)
+                result = function_result
+            CFunction(items, function_result):
+                for item in items: parameter_types.append(item)
+                result = function_result
+                c_callable = true
+            else: trap("callable context did not contain a callable")
+        if len(parameters) != len(parameter_types):
+            try self.fail(span, "lambda declares " + str(len(parameters)) + " parameter(s), expected " + str(len(parameter_types)))
+        return try self.check_anonymous_function(semantics, list[CaptureSyntax](), parameters, parameter_types, result, body, none, span, expected, c_callable)
+
+    # A block closure can stand alone when every parameter is annotated; an
+    # omitted result is `unit`. Context supplies only missing parameter types
+    # and otherwise acts as the exact final signature check.
+    pub func check_block_closure(semantics: HirSemanticChecker, captures: list[CaptureSyntax], parameters: list[ParameterSyntax], result_syntax: TypeSyntax?, body: SuiteSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let parameter_types = list[TypeId]()
+        var contextual_result: TypeId? = none
+        var c_callable = false
+        if expected != none:
+            let resolved_context = try self.callable_context(semantics, expected, span, "closure context must be a function type")
+            match self.state.types.definitions[resolved_context.value].form:
+                Function(items, function_result):
+                    for item in items: parameter_types.append(item)
+                    contextual_result = function_result
+                CFunction(items, function_result):
+                    for item in items: parameter_types.append(item)
+                    contextual_result = function_result
+                    c_callable = true
+                else: trap("callable context did not contain a callable")
+            if len(parameters) != len(parameter_types):
+                try self.fail(span, "closure declares " + str(len(parameters)) + " parameter(s), expected " + str(len(parameter_types)))
+        else:
+            for parameter in parameters:
+                let annotation = parameter.annotation else error(self.diagnostic(parameter.span, "parameter `" + parameter.name + "` requires a type when the closure has no expected function type"))
+                parameter_types.append(try self.declarations.resolve_type(self.state.current_module, annotation))
+
+        var result = resolve_builtin_type(BuiltinType.unit)
+        if result_syntax != none:
+            result = try self.declarations.resolve_type(self.state.current_module, result_syntax)
+        elif contextual_result != none:
+            result = contextual_result
+        return try self.check_anonymous_function(semantics, captures, parameters, parameter_types, result, none, body, span, expected, c_callable)
+
+    # Shared implementation for both surface forms. Capture initializers are
+    # checked before the frame exists, then aliases and parameters establish
+    # the hidden function's independent local namespace.
+    pub func check_anonymous_function(semantics: HirSemanticChecker, captures: list[CaptureSyntax], parameters: list[ParameterSyntax], parameter_types: list[TypeId], result: TypeId, expression_body: ExpressionSyntax?, suite_body: SuiteSyntax?, span: SourceSpan, expected: TypeId?, c_callable: bool) -> NodeId!:
+        try self.state.validate_function_result(self.state.current_module, result, span)
+        let capture_names = list[str]()
+        let capture_types = list[TypeId]()
+        let capture_kinds = list[HirCaptureKind]()
+        let capture_initializers = list[NodeId]()
+        let capture_sources = list[SymbolId?]()
+        let capture_spans = list[SourceSpan]()
+        for capture in captures:
+            for previous in capture_names:
+                if previous == capture.name: try self.fail(capture.span, "duplicate capture `" + capture.name + "`")
+            capture_names.append(capture.name)
+            capture_spans.append(capture.span)
+            if capture.is_weak:
+                let source_index = self.state.find_local(capture.name)
+                if source_index < 0: try self.fail(capture.span, "weak capture `" + capture.name + "` requires an outer class binding")
+                let source = self.state.locals[source_index]
+                if self.declarations.class_of(source.value_type) < 0:
+                    try self.fail(capture.span, "weak capture `" + capture.name + "` requires a class value, found `" + self.describe_type(source.value_type) + "`")
+                capture_types.append(self.state.intern_optional(source.value_type))
+                capture_kinds.append(HirCaptureKind.weak_capture)
+                capture_initializers.append(self.state.push_node(HirNodeForm.Reference(symbol = source.symbol), source.value_type, capture.span))
+                capture_sources.append(source.symbol)
+            else:
+                let initializer_syntax = capture.value else trap("copy capture lost its initializer")
+                let initializer = try semantics.check_expression_for_feature(initializer_syntax, none)
+                let initializer_type = self.state.type_of(initializer)
+                if self.state.contains_fallible(initializer_type):
+                    try self.fail(capture.span, "a fallible value cannot be copied into a closure capture")
+                try self.state.validate_persistent_type(self.state.current_module, initializer_type, capture.span, "closure capture `" + capture.name + "`")
+                capture_types.append(initializer_type)
+                capture_kinds.append(HirCaptureKind.value)
+                capture_initializers.append(initializer)
+                capture_sources.append(none)
+
+        let function_type = self.state.intern_function_type(parameter_types, result)
+        let hidden_name = "$closure_" + str(self.state.next_symbol)
+        let function_symbol = self.state.make_symbol(hidden_name, SymbolKind.function, result)
+        let closure = self.closures.begin(function_symbol, span)
+        let outer_count = len(self.state.locals)
+        for index in range(0, len(capture_names)):
+            self.closures.add_explicit(capture_names[index], capture_types[index], capture_kinds[index], capture_initializers[index], capture_sources[index], capture_spans[index]) catch reason:
+                self.closures.abandon()
+                error(reason)
+
+        let checked_parameters = list[HirParameter]()
+        for index in range(0, len(parameters)):
+            let parameter = parameters[index]
+            if parameter.default_value != none:
+                self.restore_closure_scope(semantics, outer_count)
+                self.closures.abandon()
+                try self.fail(parameter.span, "anonymous-function parameters cannot have defaults because function values have no argument labels")
+            let annotation = parameter.annotation
+            if annotation != none:
+                let declared = try self.declarations.resolve_type(self.state.current_module, annotation)
+                if not types_match(declared, parameter_types[index]):
+                    self.restore_closure_scope(semantics, outer_count)
+                    self.closures.abandon()
+                    try self.fail(parameter.span, "parameter `" + parameter.name + "` has type `" + self.describe_type(declared) + "`, expected `" + self.describe_type(parameter_types[index]) + "`")
+            if self.state.contains_fallible(parameter_types[index]):
+                self.restore_closure_scope(semantics, outer_count)
+                self.closures.abandon()
+                try self.fail(parameter.span, "parameter `" + parameter.name + "` cannot store a fallible type")
+            self.state.validate_parameter_type(self.state.current_module, parameter_types[index], parameter.span, "parameter `" + parameter.name + "`") catch reason:
+                self.restore_closure_scope(semantics, outer_count)
+                self.closures.abandon()
+                error(reason)
+            if self.state.contains_task_value(parameter_types[index]):
+                self.restore_closure_scope(semantics, outer_count)
+                self.closures.abandon()
+                try self.fail(parameter.span, "an anonymous function cannot receive a structured `task`; use a direct Luce call")
+            self.closures.require_free_name(parameter.name, parameter.span) catch reason:
+                self.restore_closure_scope(semantics, outer_count)
+                self.closures.abandon()
+                error(reason)
+            let symbol = self.state.make_symbol(parameter.name, SymbolKind.parameter, parameter_types[index])
+            checked_parameters.append(HirParameter(symbol = symbol, name = parameter.name, value_type = parameter_types[index], default_value = NodeId(value = no_node)))
+            self.state.locals.append(LocalBinding(symbol = symbol, name = parameter.name, value_type = parameter_types[index], is_mutable = false, storage = LocalStorage.value))
+
+        let saved_result = self.state.current_result
+        let saved_receiver = self.state.current_receiver
+        let saved_loop_depth = self.state.loop_depth
+        let saved_recovery_types = self.state.recovery_types
+        self.state.current_result = result
+        self.state.current_receiver = none
+        self.state.loop_depth = 0
+        self.state.recovery_types = list[TypeId]()
+
+        let statements = list[NodeId]()
+        if expression_body != none:
+            var successful_result = result
+            let inner_result = self.state.fallible_inner(result)
+            if inner_result != none: successful_result = inner_result
+            let yielded = semantics.check_expression_for_feature(expression_body, successful_result) catch reason:
+                self.restore_anonymous_context(semantics, outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                error(reason)
+            statements.append(self.state.push_statement(HirNodeForm.ReturnStatement(value = yielded), span))
+        else:
+            let syntax = suite_body else trap("anonymous function has no body")
+            let checked_body = semantics.check_suite_for_feature(syntax.statements) catch reason:
+                self.restore_anonymous_context(semantics, outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                error(reason)
+            for statement in checked_body: statements.append(statement)
+            var successful_result = result
+            let inner_result = self.state.fallible_inner(result)
+            if inner_result != none: successful_result = inner_result
+            if not types_match(successful_result, resolve_builtin_type(BuiltinType.unit)) and not semantics.statements_return_for_feature(statements):
+                self.restore_anonymous_context(semantics, outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+                self.closures.abandon()
+                try self.fail(span, "closure may finish without returning `" + self.describe_type(result) + "`")
+
+        let initializers = self.closures.finish(function_symbol, span)
+        self.restore_anonymous_context(semantics, outer_count, saved_result, saved_receiver, saved_loop_depth, saved_recovery_types)
+        var environment: u32? = none
+        if len(initializers) > 0: environment = closure
+        self.state.generated_functions.append(HirFunction(
+            symbol = function_symbol,
+            module = ModuleId(value = u32(self.state.current_module)),
+            name = hidden_name,
+            is_public = false,
+            documentation = list[str](),
+            receiver = none,
+            closure = environment,
+            parameters = checked_parameters,
+            result = result,
+            implementation = HirFunctionImplementation.Defined(body = self.state.push_nodes(statements)),
+            span = span,
+        ))
+
+        var value_type = function_type
+        if c_callable:
+            if len(initializers) > 0: try self.fail(span, "a capturing closure cannot become a `cfunc` value")
+            value_type = self.state.intern_c_function_type(parameter_types, result)
+        var value = self.state.push_node(HirNodeForm.FunctionAddress(function = function_symbol), value_type, span)
+        if len(initializers) > 0:
+            value = self.state.push_node(HirNodeForm.ClosureValue(closure = closure, initializers = self.state.push_nodes(initializers)), function_type, span)
+        return try semantics.require_type_for_feature(value, expected)
+
+    pub func callable_context(semantics: HirSemanticChecker, expected: TypeId?, span: SourceSpan, message: str) -> TypeId!:
+        let supplied = expected else error(self.diagnostic(span, message))
+        var context = supplied
+        let optional = self.state.optional_inner(supplied)
+        if optional != none: context = optional
+        match self.state.types.definitions[context.value].form:
+            Function(parameters, result): return context
+            CFunction(parameters, result): return context
+            else: error(self.diagnostic(span, message + ", found `" + self.describe_type(supplied) + "`"))
+
+    pub func restore_closure_scope(semantics: HirSemanticChecker, outer_count: i64):
+        while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+
+    pub func restore_anonymous_context(semantics: HirSemanticChecker, outer_count: i64, result: TypeId, receiver: HirReceiver?, loop_depth: i64, recovery_types: list[TypeId]):
+        self.restore_closure_scope(semantics, outer_count)
+        self.state.current_result = result
+        self.state.current_receiver = receiver
+        self.state.loop_depth = loop_depth
+        self.state.recovery_types = recovery_types
+
+    # `new Document("Notes")`: classes have one explicit initializer and
+
+    # mark: Classes and weak references =========================================================
+
+    # construction is the only operation that creates a fresh identity.
+    pub func check_class_new(semantics: HirSemanticChecker, value_syntax: TypeSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let class_index = try self.declarations.class_constructor_declaration(self.state.current_module, value_syntax)
+        if class_index < 0:
+            let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
+            try self.fail(value_syntax.span, "`new` requires a class type, found `" + self.describe_type(value_type) + "`")
+        let item = self.state.classes[class_index]
+        if item.module_index != self.state.current_module and not item.is_public:
+            try self.fail(value_syntax.span, "class `" + item.name + "` is private to module `" + self.state.modules[item.module_index].name + "`")
+        let initializer = item.initializer else trap("class has no initializer after declaration collection")
+        if len(item.type_parameters) > 0:
+            let type_arguments = list[TypeArgumentSyntax]()
+            match value_syntax.form:
+                Applied(path, applied_arguments):
+                    for argument in applied_arguments: type_arguments.append(argument)
+                else: pass
+            match initializer:
+                Generic(index):
+                    return try self.generics.check_nominal_initializer(
+                        semantics,
+                        item.name,
+                        item.type_id,
+                        index,
+                        type_arguments,
+                        arguments,
+                        span,
+                        expected,
+                    )
+                Concrete(index): trap("generic class initializer has a concrete callable identity")
+        let value_type = try self.declarations.resolve_type(self.state.current_module, value_syntax)
+        match initializer:
+            Concrete(index):
+                return try semantics.check_initializer_call_for_feature(
+                    item.name,
+                    item.type_id,
+                    item.module_index,
+                    index,
+                    arguments,
+                    span,
+                    expected,
+                )
+            Generic(index): trap("non-generic class initializer has a generic callable identity")
+
+    # `Weak(value)` infers its nominal referent. It is a closed core
+    # constructor rather than generic call syntax, and never creates a strong
+    # edge to the supplied class identity.
+    pub func check_weak_constructor(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) > 0: try self.fail(span, "`Weak` infers its class type and takes no type arguments")
+        if len(arguments) != 1 or arguments[0].label != none:
+            try self.fail(span, "`Weak` takes exactly one positional class value")
+        let value = try semantics.check_expression_for_feature(arguments[0].value, none)
+        let referent = self.state.type_of(value)
+        if self.declarations.class_of(referent) < 0:
+            try self.fail(arguments[0].span, "`Weak` requires a class value, found `" + self.describe_type(referent) + "`")
+        let weak_type = self.state.intern_weak(referent)
+        let created = self.state.push_node(HirNodeForm.WeakCreate(value = value), weak_type, span)
+        return try semantics.require_type_for_feature(created, expected)
+
+    # Promotion is the sole operation on a first-class weak handle. It returns
+    # an owned optional whose presence is decided atomically by the runtime.
+    pub func check_weak_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, referent: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "get":
+            try self.fail(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`")
+        if len(arguments) != 0: try self.fail(span, "`Weak.get` takes no arguments")
+        let promoted = self.state.push_node(HirNodeForm.WeakGet(value = receiver), self.state.intern_optional(referent), span)
+        return try semantics.require_type_for_feature(promoted, expected)
+
+    # mark: Collections =========================================================================
+
+    pub func check_list_literal(semantics: HirSemanticChecker, elements: list[ExpressionSyntax], element_type: TypeId, list_type: TypeId, span: SourceSpan) -> NodeId!:
+        let checked = list[NodeId]()
+        for element in elements: checked.append(try semantics.check_expression_for_feature(element, element_type))
+        return self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(checked)), list_type, span)
+
+    pub func check_list_constructor(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 1: try self.fail(span, "`list[T]()` needs exactly one element type")
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(element): element_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`list[T]()` needs exactly one element type")
+        if self.state.contains_fallible(element_type):
+            try self.fail(span, "a list cannot store a fallible type; `T!` is a function-result effect")
+        try self.state.validate_stored_type(self.state.current_module, element_type, span, "a list element")
+        if len(arguments) != 0: try self.fail(span, "`list[T]()` takes no arguments")
+        let list_type = self.state.intern_list(element_type)
+        let value = self.state.push_node(HirNodeForm.List(elements = self.state.push_nodes(list[NodeId]())), list_type, span)
+        return try semantics.require_type_for_feature(value, expected)
+
+    pub func check_list_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, element_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "snapshot" and name != "append" and name != "insert" and name != "remove_at" and name != "clear" and name != "reserve" and name != "with_mutable_slice":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`list." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        let index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`list.copy` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListCopy(value = receiver), owner_type, span), expected)
+        if name == "snapshot":
+            if len(arguments) != 0: try self.fail(span, "`list.snapshot` takes no arguments")
+            try self.sendability.require(element_type, span, "snapshot element")
+            let frozen_type = self.state.intern_frozen_list(element_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.CollectionSnapshot(value = receiver), frozen_type, span), expected)
+        if name == "with_mutable_slice":
+            if len(arguments) != 1: try self.fail(span, "`list.with_mutable_slice` takes one callback")
+            let view_type = self.state.intern_mutable_slice(element_type)
+            let callback_type = self.state.intern_function_type([view_type], unit_type)
+            let callback = try semantics.check_expression_for_feature(arguments[0].value, callback_type)
+            let scoped = self.state.push_node(HirNodeForm.ListWithMutableSlice(value = receiver, callback = callback), unit_type, span)
+            return try semantics.require_type_for_feature(scoped, expected)
+        if name == "append":
+            if len(arguments) != 1: try self.fail(span, "`list.append` takes one element")
+            let element = try semantics.check_expression_for_feature(arguments[0].value, element_type)
+            try self.closures.reject_direct_collection_cycle(receiver, element, span)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListAppend(value = receiver, element = element), unit_type, span), expected)
+        if name == "insert":
+            if len(arguments) != 2: try self.fail(span, "`list.insert` takes an index and one element")
+            let index = try semantics.check_expression_for_feature(arguments[0].value, index_type)
+            let element = try semantics.check_expression_for_feature(arguments[1].value, element_type)
+            try self.closures.reject_direct_collection_cycle(receiver, element, span)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListInsert(value = receiver, index = index, element = element), unit_type, span), expected)
+        if name == "remove_at":
+            if len(arguments) != 1: try self.fail(span, "`list.remove_at` takes one index")
+            let index = try semantics.check_expression_for_feature(arguments[0].value, index_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListRemoveAt(value = receiver, index = index), element_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`list.clear` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListClear(value = receiver), unit_type, span), expected)
+        if name == "reserve":
+            if len(arguments) != 1: try self.fail(span, "`list.reserve` takes one minimum capacity")
+            let minimum = try semantics.check_expression_for_feature(arguments[0].value, index_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.ListReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+        trap("recognized list method did not return a checked HIR node")
+
+    pub func check_map_literal(semantics: HirSemanticChecker, entries: list[MapEntrySyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var key_type = resolve_builtin_type(BuiltinType.unit)
+        var value_type = resolve_builtin_type(BuiltinType.unit)
+        if expected != none:
+            match self.state.types.definitions[expected.value].form:
+                Map(expected_key, expected_value):
+                    key_type = expected_key
+                    value_type = expected_value
+                else: pass
+
+        let checked = list[NodeId]()
+        for entry in entries:
+            var expected_key: TypeId? = key_type
+            if key_type.value == resolve_builtin_type(BuiltinType.unit).value: expected_key = none
+            let key = try semantics.check_expression_for_feature(entry.key, expected_key)
+            if len(checked) == 0 and key_type.value == resolve_builtin_type(BuiltinType.unit).value: key_type = self.state.type_of(key)
+            if not self.declarations.is_hash_key_type(key_type):
+                try self.fail(entry.key.span, "map key type `" + self.describe_type(key_type) + "` must satisfy `Equatable & Hashable`")
+            var expected_value: TypeId? = value_type
+            if value_type.value == resolve_builtin_type(BuiltinType.unit).value: expected_value = none
+            let element = try semantics.check_expression_for_feature(entry.value, expected_value)
+            if len(checked) == 0 and value_type.value == resolve_builtin_type(BuiltinType.unit).value: value_type = self.state.type_of(element)
+            for index in range(0, len(checked) // 2):
+                if statically_equal_nodes(self.state, checked[index * 2], key):
+                    try self.fail(entry.key.span, "duplicate statically equal map key")
+            checked.append(key)
+            checked.append(element)
+        let map_type = self.state.intern_map(key_type, value_type)
+        try self.state.validate_stored_type(self.state.current_module, key_type, span, "a map key")
+        try self.state.validate_stored_type(self.state.current_module, value_type, span, "a map value")
+        return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.Map(entries = self.state.push_nodes(checked)), map_type, span), expected)
+
+    pub func check_map_constructor(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 2: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        if len(arguments) != 0: try self.fail(span, "`map[K, V]()` takes no arguments")
+        var key_type = resolve_builtin_type(BuiltinType.unit)
+        var value_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(key): key_type = try self.declarations.resolve_type(self.state.current_module, key)
+            else: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        match type_arguments[1]:
+            TypeArgument(element): value_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`map[K, V]()` needs exactly two type arguments")
+        if self.state.contains_fallible(key_type) or self.state.contains_fallible(value_type):
+            try self.fail(span, "a map cannot store a fallible type; `T!` is a function-result effect")
+        try self.state.validate_stored_type(self.state.current_module, key_type, span, "a map key")
+        try self.state.validate_stored_type(self.state.current_module, value_type, span, "a map value")
+        if not self.declarations.is_hash_key_type(key_type):
+            try self.fail(span, "map key type `" + self.describe_type(key_type) + "` must satisfy `Equatable & Hashable`")
+        let map_type = self.state.intern_map(key_type, value_type)
+        let value = self.state.push_node(HirNodeForm.Map(entries = self.state.push_nodes(list[NodeId]())), map_type, span)
+        return try semantics.require_type_for_feature(value, expected)
+
+    pub func check_map_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, key_type: TypeId, value_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "snapshot" and name != "remove" and name != "clear" and name != "reserve":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`map." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`map.copy` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.MapCopy(value = receiver), owner_type, span), expected)
+        if name == "snapshot":
+            if len(arguments) != 0: try self.fail(span, "`map.snapshot` takes no arguments")
+            try self.sendability.require(key_type, span, "snapshot key")
+            try self.sendability.require(value_type, span, "snapshot value")
+            let frozen_type = self.state.intern_frozen_map(key_type, value_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.CollectionSnapshot(value = receiver), frozen_type, span), expected)
+        if name == "remove":
+            if len(arguments) != 1: try self.fail(span, "`map.remove` takes one key")
+            let key = try semantics.check_expression_for_feature(arguments[0].value, key_type)
+            let result_type = self.state.intern_optional(value_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.MapRemove(value = receiver, key = key), result_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`map.clear` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.MapClear(value = receiver), unit_type, span), expected)
+        if len(arguments) != 1: try self.fail(span, "`map.reserve` takes one minimum capacity")
+        let minimum = try semantics.check_expression_for_feature(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+        return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.MapReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+
+    pub func check_set_constructor(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 1: try self.fail(span, "`set[T](...)` needs exactly one element type")
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        match type_arguments[0]:
+            TypeArgument(element): element_type = try self.declarations.resolve_type(self.state.current_module, element)
+            else: try self.fail(span, "`set[T](...)` needs exactly one element type")
+        if self.state.contains_fallible(element_type):
+            try self.fail(span, "a set cannot store a fallible type; `T!` is a function-result effect")
+        try self.state.validate_stored_type(self.state.current_module, element_type, span, "a set element")
+        if not self.declarations.is_hash_key_type(element_type):
+            try self.fail(span, "set element type `" + self.describe_type(element_type) + "` must satisfy `Equatable & Hashable`")
+        let checked = list[NodeId]()
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`set[T](...)` uses positional elements")
+            checked.append(try semantics.check_expression_for_feature(argument.value, element_type))
+        let set_type = self.state.intern_set(element_type)
+        let value = self.state.push_node(HirNodeForm.Set(elements = self.state.push_nodes(checked)), set_type, span)
+        return try semantics.require_type_for_feature(value, expected)
+
+    pub func check_set_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, element_type: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if name != "copy" and name != "snapshot" and name != "contains" and name != "insert" and name != "remove" and name != "clear" and name != "reserve":
+            error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`set." + name + "` uses positional arguments")
+        let unit_type = resolve_builtin_type(BuiltinType.unit)
+        let boolean_type = resolve_builtin_type(BuiltinType.boolean)
+        if name == "copy":
+            if len(arguments) != 0: try self.fail(span, "`set.copy` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetCopy(value = receiver), owner_type, span), expected)
+        if name == "snapshot":
+            if len(arguments) != 0: try self.fail(span, "`set.snapshot` takes no arguments")
+            try self.sendability.require(element_type, span, "snapshot element")
+            let frozen_type = self.state.intern_frozen_set(element_type)
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.CollectionSnapshot(value = receiver), frozen_type, span), expected)
+        if name == "clear":
+            if len(arguments) != 0: try self.fail(span, "`set.clear` takes no arguments")
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetClear(value = receiver), unit_type, span), expected)
+        if name == "reserve":
+            if len(arguments) != 1: try self.fail(span, "`set.reserve` takes one minimum capacity")
+            let minimum = try semantics.check_expression_for_feature(arguments[0].value, resolve_builtin_type(BuiltinType.unsigned_u64))
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetReserve(value = receiver, minimum_capacity = minimum), unit_type, span), expected)
+        if len(arguments) != 1: try self.fail(span, "`set." + name + "` takes one element")
+        let element = try semantics.check_expression_for_feature(arguments[0].value, element_type)
+        if name == "contains":
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetContains(value = receiver, element = element), boolean_type, span), expected)
+        if name == "insert":
+            return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetInsert(value = receiver, element = element), boolean_type, span), expected)
+        return try semantics.require_type_for_feature(self.state.push_node(HirNodeForm.SetRemove(value = receiver, element = element), boolean_type, span), expected)
+
+    # Safe contiguous sequences capture one immutable half-open snapshot.
+    # Missing bounds remain explicit so the receiver is evaluated exactly once
+    # before any source bound and length is read only when needed.
+    pub func check_slice(semantics: HirSemanticChecker, sliced: ExpressionSyntax, start: ExpressionSyntax?, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let value = try semantics.check_expression_for_feature(sliced, none)
+        var element_type = resolve_builtin_type(BuiltinType.unit)
+        let value_type = self.state.type_of(value)
+        match self.state.types.definitions[value_type.value].form:
+            Array(element, count): element_type = element
+            List(element): element_type = element
+            Bytes: element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
+            else: try self.fail(span, "`" + self.describe_type(value_type) + "` does not support slicing yet")
+        let index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
+        var lower = NodeId(value = no_node)
+        let start_value = start
+        if start_value != none: lower = try semantics.check_expression_for_feature(start_value, index_type)
+        var upper = NodeId(value = no_node)
+        let end_value = end
+        if end_value != none: upper = try semantics.check_expression_for_feature(end_value, index_type)
+        let result_type = self.state.intern_slice(element_type)
+        let result = self.state.push_node(HirNodeForm.SequenceSlice(value = value, start = lower, end = upper), result_type, span)
+        return try semantics.require_type_for_feature(result, expected)
+
+    # `spawn path(arguments)` deliberately reuses the complete direct-call
+
+    # mark: Workers =============================================================================
+
+    # resolution transaction: labels, defaults, generic inference, visibility,
+    # conversions, and evaluation order must not acquire a worker-specific
+    # duplicate. The freshly produced call node has not escaped this checker,
+    # so it is reclassified in place after proving the exact callable and both
+    # transfer directions.
+    pub func check_spawn(semantics: HirSemanticChecker, path: PathSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let callee = self.expression_for_path(semantics, path)
+        let checked = try semantics.check_call_for_feature(callee, list[TypeArgumentSyntax](), arguments, span, none)
+        var successful = self.state.type_of(checked)
+        let fallible = self.state.fallible_inner(successful)
+        if fallible != none: successful = fallible
+
+        match self.state.node_form(checked):
+            Call(function, placed):
+                let function_index = self.function_index(semantics, function)
+                if function_index < 0: trap("resolved spawn function has no declaration")
+                let target = self.state.functions[function_index]
+                match target.source:
+                    ExternalC(contract): try self.fail(path.span, "`spawn` requires a Luce function body, not extern C function `" + target.name + "`")
+                    else: pass
+                if target.receiver != none:
+                    let receiver = target.receiver else trap("worker receiver disappeared")
+                    if receiver.kind != HirReceiverKind.type_function:
+                        try self.fail(path.span, "`spawn` cannot invoke an instance method; extract a named worker function")
+                try self.require_spawn_arguments(semantics, placed, target.parameters)
+                try self.sendability.require(successful, span, "worker result of `" + target.name + "`")
+                self.state.arena.nodes[checked.value] = HirNode(form = HirNodeForm.Spawn(function = function, arguments = placed))
+            GenericCall(generic, type_arguments, placed, kind):
+                if kind != HirGenericCallKind.function:
+                    try self.fail(path.span, "`spawn` requires a named function, not a constructor")
+                let target = self.state.generic_functions[generic]
+                if target.signature.receiver != none:
+                    let receiver = target.signature.receiver else trap("generic worker receiver disappeared")
+                    if receiver.kind != HirReceiverKind.type_function:
+                        try self.fail(path.span, "`spawn` cannot invoke an instance method; extract a named worker function")
+                try self.require_spawn_arguments(semantics, placed, target.signature.parameters)
+                try self.sendability.require(successful, span, "worker result of `" + target.name + "`")
+                self.state.arena.nodes[checked.value] = HirNode(form = HirNodeForm.GenericSpawn(generic = generic, type_arguments = type_arguments, arguments = placed))
+            else:
+                try self.fail(path.span, "`spawn` requires a statically named Luce function")
+
+        let task_type = self.state.intern_task(successful)
+        self.state.arena.node_types[checked.value] = task_type
+        return try semantics.require_type_for_feature(checked, expected)
+
+    pub func expression_for_path(semantics: HirSemanticChecker, path: PathSyntax) -> ExpressionSyntax:
+        var expression = ExpressionSyntax(form = ExpressionForm.Name(value = path.parts[0]), span = path.span)
+        for index in range(1, len(path.parts)):
+            expression = ExpressionSyntax(form = ExpressionForm.Member(value = expression, name = path.parts[index]), span = path.span)
+        return expression
+
+    pub func function_index(semantics: HirSemanticChecker, symbol: SymbolId) -> i64:
+        for index in range(0, len(self.state.functions)):
+            if self.state.functions[index].symbol.value == symbol.value: return index
+        return -1
+
+    pub func require_spawn_arguments(semantics: HirSemanticChecker, arguments: Operands, parameters: list[HirParameter]) -> !:
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = i64(self.state.arena.extra[i64(arguments.start) + pair * 2])
+            let argument = NodeId(value = self.state.arena.extra[i64(arguments.start) + pair * 2 + 1])
+            try self.sendability.require(
+                self.state.type_of(argument),
+                self.state.span_of(argument),
+                "spawn argument `" + parameters[parameter_index].name + "`",
+            )
+
+    # Task handles expose exactly the two structured operations in §19. The
+    # handle remains locally storable; neither operation reveals its backend
+    # identity or the worker's scheduling mechanism.
+    pub func check_task_call(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, result: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(arguments) != 0:
+            try self.fail(span, "`task." + name + "` takes no arguments")
+        if name == "wait":
+            let waited = self.state.push_node(HirNodeForm.TaskWait(value = receiver), self.state.intern_fallible(result), span)
+            return try semantics.require_type_for_feature(waited, expected)
+        if name == "cancel":
+            let cancelled = self.state.push_node(HirNodeForm.TaskCancel(value = receiver), resolve_builtin_type(BuiltinType.unit), span)
+            return try semantics.require_type_for_feature(cancelled, expected)
+        error(self.diagnostic(callee_span, "`" + self.describe_type(owner_type) + "` has no method `" + name + "`"))
+
+    # `wait_all` is compiler-known because it is the only operation allowed to
+    # consume a local container of task handles without creating an unknown
+    # escape. Result ordering and failure selection remain HIR semantics.
+    pub func check_wait_all(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) != 0: try self.fail(span, "`wait_all` takes no explicit type arguments")
+        if len(arguments) != 1 or arguments[0].label != none:
+            try self.fail(span, "`wait_all` takes one positional `list[task[T]]`")
+        let tasks = try semantics.check_expression_for_feature(arguments[0].value, none)
+        var result = resolve_builtin_type(BuiltinType.unit)
+        match self.state.types.definitions[self.state.type_of(tasks).value].form:
+            List(element):
+                match self.state.types.definitions[element.value].form:
+                    Task(task_result): result = task_result
+                    else: try self.fail(arguments[0].span, "`wait_all` needs `list[task[T]]`, found `" + self.describe_type(self.state.type_of(tasks)) + "`")
+            else: try self.fail(arguments[0].span, "`wait_all` needs `list[task[T]]`, found `" + self.describe_type(self.state.type_of(tasks)) + "`")
+        let values = self.state.intern_list(result)
+        let waited = self.state.push_node(HirNodeForm.TaskWaitAll(tasks = tasks), self.state.intern_fallible(values), span)
+        return try semantics.require_type_for_feature(waited, expected)
+
+    # mark: Diagnostics =========================================================================
+
+    func describe_type(value: TypeId) -> str:
+        return describe_type(self.state.types, value)
+
+    func diagnostic(span: SourceSpan, message: str) -> str:
+        return format_diagnostic(self.state.modules[self.state.current_module].path, span, message)
+
+    func fail(span: SourceSpan, message: str) -> !:
+        error(self.diagnostic(span, message))
+
+# mark: Static literal equality =================================================================
+
+# A map literal rejects keys only when checked HIR proves their equality
+# without execution. Decoded constants, one source-level numeric sign, and
+# recursively literal optional/tuple/array values form the closed proof; calls
+# and other computed keys intentionally follow ordinary replacement at run
+# time.
+func statically_equal_nodes(state: HirGenerationState, left: NodeId, right: NodeId) -> bool:
+    let left_literal = statically_literal_value(state, left)
+    let right_literal = statically_literal_value(state, right)
+    if left_literal != none:
+        if right_literal == none: return false
+        return values_equal(left_literal, right_literal)
+    if right_literal != none: return false
+    match state.node_form(left):
+        NoneLiteral:
+            match state.node_form(right):
+                NoneLiteral: return true
+                else: return false
+        Some(left_value):
+            match state.node_form(right):
+                Some(right_value): return statically_equal_nodes(state, left_value, right_value)
+                else: return false
+        Tuple(left_values):
+            match state.node_form(right):
+                Tuple(right_values): return statically_equal_runs(state, left_values, right_values)
+                else: return false
+        Array(left_values):
+            match state.node_form(right):
+                Array(right_values): return statically_equal_runs(state, left_values, right_values)
+                else: return false
+        else: return false
+
+# Return the semantic value of a source literal without evaluating arbitrary
+# HIR. The grammar represents a negative number as one unary node over its
+# positive literal (§4.2), so that single resolved layer belongs to the proof.
+func statically_literal_value(state: HirGenerationState, node: NodeId) -> Value?:
+    match state.node_form(node):
+        Constant(value): return state.arena.values[value]
+        Unary(operation, operand):
+            match state.node_form(operand):
+                Constant(value):
+                    let literal = state.arena.values[value]
+                    match operation:
+                        NumericIdentity(operand_type): return literal
+                        NumericNegate(operand_type):
+                            match literal:
+                                Floating(item): return Value.Floating(value = item * -1.0)
+                                else: return none
+                        else: return none
+                else: return none
+        else: return none
+
+func statically_equal_runs(state: HirGenerationState, left: Operands, right: Operands) -> bool:
+    if left.count != right.count: return false
+    for index in range(0, i64(left.count)):
+        let left_value = NodeId(value = state.arena.extra[i64(left.start) + index])
+        let right_value = NodeId(value = state.arena.extra[i64(right.start) + index])
+        if not statically_equal_nodes(state, left_value, right_value): return false
+    return true

@@ -49,3 +49,25 @@ The complete `./test.sh` gate passed under the checksum-installed 0.30 seed:
 No source workaround was added and no Stage-0 defect was found during
 adoption. Module format 73 and host ABI 32 are unchanged from 0.28, so the
 repository simply rebuilds its local compiler artifacts with the new seed.
+
+## Open observation: a test module named after its source module
+
+Found 2026-09-03 while adding `src/compiler/profile.luc`. A test file at
+`tests/compiler/profile_test.luc` (test module `compiler.profile_test` in
+package `luce_tests`, importing source module `compiler.profile` from
+package `luce` plus `frontend.tokenizer`, `hir.ir`, and `mir.canonical`)
+fails three of its four assertions: functions of `compiler.profile` that
+return list literals appear to answer wrongly. The identical file under any
+other name (`profiles_test`, `xprofile_test`, `hir/profile_test`) passes
+all four, and so does the same file once the source module is renamed.
+Inserting a `print` before a failing assertion also makes it pass. Dropping
+either the tokenizer import or the IR imports makes it pass, and a
+five-line reproduction with the same package and module names passes, so
+the trigger is layout-sensitive and not yet minimized.
+
+Reproduce in this tree by copying `tests/compiler/language_profile_test.luc`
+to `tests/compiler/profile_test.luc` and running
+`./stage0/bin/luce-0 test tests/compiler/profile_test.luc` with `LUCE_LIB`
+unset. The repository avoids the pair by naming the test
+`language_profile_test.luc`; no compiler source was changed to work around
+it.

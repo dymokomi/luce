@@ -1,0 +1,1206 @@
+#==============================================================================================
+#
+#   full_profile_execution - Reference execution of the forms only full Luce has
+#
+#   DESCRIPTION:
+#       Executes the HIR forms whose meaning the Luce runtime supplies: the
+#       built-in collections and their snapshot slices, nominal classes with
+#       ARC finalization and weak references, closures with shared cells,
+#       existential interface calls, and structured workers. It is the
+#       semantic oracle for those features: it defines their behavior and
+#       never consults MIR. `backends/interpreter` is the one dispatch point
+#       that reaches this class; it hands over the nodes, values, and place
+#       steps it does not own and receives ordinary evaluations back through
+#       the `HirExecutionHost` services.
+#
+#       The class also owns the run state those features need: the structured
+#       task groups of the active invocations, the class observations of an
+#       opt-in resource census, and the shared-cell facts of captured locals.
+#
+#==============================================================================================
+
+from compiler.backends.hir_execution_model import AssignmentPlaceStep, Binding, ClosureTarget, Evaluation, Execution, HirExecutionHost, Place, PlaceEvaluation, PlaceStepResolution
+from compiler.backends.hir_resources import collect_hir_class_references
+from compiler.backends.hir_values import detach_list, find_binding, find_frozen_hash_entry, find_hash_entry, require_hash_shape_mutable, require_list_shape_mutable, trim_bindings, value_at_assignment_place, value_with_assignment_place, weak_class_value
+from compiler.hir.ir import BoxedValue, BuiltinType, CapturedCellStorage, ClassStorage, ClosureStorage, FrozenHashEntry, FrozenHashStorage, FrozenListStorage, HashEntry, HashStorage, HirCaptureKind, HirFunction, HirProgram, HirTaskOutcome, HirTaskStorage, InterfaceStorage, ListBuffer, ListStorage, MutableSliceStorage, NodeId, Operands, SliceBacking, SliceStorage, SymbolId, TypeId, Value, WeakClassStorage
+from compiler.hir.ir import class_application, describe_type, entry_at, no_node, node_at, node_form, node_module, node_span, node_type, nominal_fields, resolve_builtin_type, types_match
+from compiler.hir.ir import place_class_field_step, place_list_element_step, place_map_element_step, place_mutable_slice_element_step, place_weak_field_step
+from compiler.reporting.resources import ClassAllocationSite, LiveClassAllocation, ResourceCensus, StrongReferenceEdge, resource_census
+import std.strings
+
+# mark: Run state ===============================================================================
+
+union ListEvaluation:
+    EvaluatedList(storage: ListStorage)
+    TransferredList(execution: Execution)
+
+union HashEvaluation:
+    EvaluatedHash(storage: HashStorage)
+    TransferredHash(execution: Execution)
+
+## One invocation-owned set of children. Handles may be copied freely inside
+## the invocation, but only this group decides exit-time cancellation/join.
+class HirTaskGroup:
+    pub let children: list[HirTaskStorage]
+
+    pub init():
+        self.children = list[HirTaskStorage]()
+
+## One weak observation of an allocated source class. The observation cannot
+## keep its target alive and therefore does not perturb the ARC result it
+## later reports.
+class HirClassObservation:
+    let allocation_id: i64
+    let class_type: TypeId
+    let site: ClassAllocationSite
+    let reference: WeakClassStorage
+
+    pub init(allocation_id: i64, class_type: TypeId, site: ClassAllocationSite, target: ClassStorage):
+        self.allocation_id = allocation_id
+        self.class_type = class_type
+        self.site = site
+        self.reference = WeakClassStorage(target = target)
+
+## The full-profile consumer of one interpreter run.
+pub class FullProfileExecution:
+    let program: HirProgram
+    let class_observations: list[HirClassObservation]?
+    ## Active synchronous call groups, outermost first. A worker itself gets
+    ## a fresh domain and therefore an isolated group stack.
+    let task_groups: list[HirTaskGroup]
+    var next_allocation_id: i64
+    var next_task_identity: u64
+    # Symbol-indexed lookup of the locals promoted to shared closure cells.
+    let shared_cell_flags: list[bool]
+
+    pub init(program: HirProgram, collects_resources: bool):
+        self.program = program
+        var observations: list[HirClassObservation]? = none
+        if collects_resources: observations = list[HirClassObservation]()
+        self.class_observations = observations
+        self.task_groups = list[HirTaskGroup]()
+        self.next_allocation_id = 0
+        self.next_task_identity = u64(0)
+        self.shared_cell_flags = list[bool]()
+        for symbol in program.symbols: self.shared_cell_flags.append(false)
+        for shared in program.shared_cells: self.shared_cell_flags[shared.value] = true
+
+    # mark: Invocations =========================================================================
+
+    ## The process entry receives its arguments as one semantic `slice[str]`.
+    pub func takes_process_arguments(function: HirFunction) -> bool:
+        return len(function.parameters) == 1 and types_match(function.parameters[0].value_type, resolve_builtin_type(BuiltinType.string_slice))
+
+    pub func process_arguments(arguments: list[str]) -> Value:
+        return process_argument_slice(arguments)
+
+    ## A closure body sees its captured environment as ordinary bindings.
+    pub func bind_captures(function: HirFunction, captures: list[Value], bindings: list[Binding]):
+        let closure_index = function.closure
+        if closure_index != none:
+            let capture_table = self.program.closures[closure_index].captures
+            if len(captures) != len(capture_table): trap("closure environment does not match its HIR capture table")
+            for capture_index in range(0, len(capture_table)):
+                bindings.append(Binding(symbol = capture_table[capture_index].symbol, value = captures[capture_index]))
+        elif len(captures) > 0:
+            trap("capture-free function received a closure environment")
+
+    ## Every invocation owns one structured task group for the workers it
+    ## spawns directly.
+    pub func begin_invocation():
+        self.task_groups.append(HirTaskGroup())
+
+    pub func end_invocation():
+        self.task_groups.remove(len(self.task_groups) - 1)
+
+    ## Function exit cancels and joins the invocation's children before the
+    ## function-scope deferred suffix runs.
+    pub func finish_invocation_group():
+        self.finish_task_group(self.task_groups[len(self.task_groups) - 1])
+
+    ## The code and environment behind a stateful callable value. Absent for
+    ## plain functions and C callables.
+    pub func closure_target(callable: Value) -> ClosureTarget?:
+        match callable:
+            Closure(storage):
+                let captures = list[Value]()
+                for capture in storage.captures: captures.append(capture.value)
+                return ClosureTarget(function = self.program.closures[storage.closure].function, captures = captures)
+            else: return none
+
+    ## Host ARC reaches the interpreter exactly when an interpreted class
+    ## loses its final strong reference; the interpreter forwards here.
+    pub func finalize(host: HirExecutionHost, class_type: TypeId, fields: list[BoxedValue], run_deinitializer: bool):
+        self.finalize_class(host, class_type, fields, run_deinitializer) catch reason:
+            trap(reason)
+
+    # mark: Dispatch ============================================================================
+
+    ## Expression forms whose value is a runtime handle or whose evaluation
+    ## needs the runtime. Absent when the form is shared.
+    pub func evaluate(host: HirExecutionHost, expression: NodeId, bindings: list[Binding]) -> Evaluation?!:
+        match node_form(self.program, expression):
+            Spawn(function, arguments): return try self.evaluate_spawn(host, function, arguments, bindings)
+            InterfaceValue(value, conformance):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item): return Evaluation.Evaluated(value = Value.Interface(storage = InterfaceStorage(conformance, item)))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            InterfaceCall(receiver, interface_type, requirement, arguments):
+                return try self.evaluate_interface_call(host, receiver, interface_type, requirement, arguments, bindings)
+            ClosureValue(closure, initializers):
+                let capture_table = self.program.closures[closure].captures
+                if initializers.count != u32(len(capture_table)): trap("closure initializer run does not match its capture table")
+                let captures = list[BoxedValue]()
+                for position in range(0, len(capture_table)):
+                    let capture = capture_table[position]
+                    if capture.kind == HirCaptureKind.shared_cell:
+                        let source = capture.source else trap("shared-cell capture has no source binding")
+                        let binding_index = find_binding(bindings, source)
+                        if binding_index < 0: trap("shared-cell capture refers outside its call frame")
+                        match bindings[binding_index].value:
+                            CapturedCell(storage): captures.append(BoxedValue(value = Value.CapturedCell(storage = storage)))
+                            else: trap("shared-cell capture source was not promoted")
+                        continue
+                    let initializer = node_at(self.program, initializers, position)
+                    match try host.evaluate(initializer, bindings):
+                        Evaluated(item):
+                            if capture.kind == HirCaptureKind.weak_capture:
+                                match item:
+                                    Class(storage): captures.append(BoxedValue(value = Value.WeakClass(storage = WeakClassStorage(target = storage))))
+                                    else: trap("weak closure capture initializer is not a class value")
+                            else:
+                                captures.append(BoxedValue(value = item))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Closure(storage = ClosureStorage(closure = closure, captures = captures)))
+            WeakCaptureReference(symbol):
+                let index = find_binding(bindings, symbol)
+                if index < 0: trap("weak capture reference points outside its call frame")
+                match bindings[index].value:
+                    WeakClass(storage): return Evaluation.Evaluated(value = weak_class_value(storage))
+                    else: trap("weak capture reference names owning storage")
+            TaskWait(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Task(storage): return Evaluation.Evaluated(value = try self.wait_task(host, storage))
+                            else: trap("typed task wait has a non-task value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TaskCancel(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Task(storage):
+                                self.cancel_task(storage)
+                                return Evaluation.Evaluated(value = Value.Unit)
+                            else: trap("typed task cancellation has a non-task value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TaskWaitAll(tasks): return try self.evaluate_wait_all(host, tasks, bindings)
+            List(elements):
+                # Allocate the identity before evaluating its elements, then
+                # append each one immediately. This matches canonical MIR and
+                # fixes allocation/trap order without weakening left-to-right
+                # element evaluation.
+                let storage = ListStorage(list[BoxedValue]())
+                for position in range(0, i64(elements.count)):
+                    match try host.evaluate(node_at(self.program, elements, position), bindings):
+                        Evaluated(item): storage.buffer.elements.append(BoxedValue(value = item))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.List(storage = storage))
+            Map(entries):
+                let storage = HashStorage(list[HashEntry]())
+                for position in range(0, i64(entries.count) // 2):
+                    var key = Value.Unit
+                    match try host.evaluate(node_at(self.program, entries, position * 2), bindings):
+                        Evaluated(item): key = item
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    match try host.evaluate(node_at(self.program, entries, position * 2 + 1), bindings):
+                        Evaluated(item):
+                            let selected = try find_hash_entry(storage, key)
+                            if selected >= 0:
+                                storage.entries[selected].value = BoxedValue(value = item)
+                            else:
+                                storage.entries.append(HashEntry(key = BoxedValue(value = key), value = BoxedValue(value = item)))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Map(storage = storage))
+            Set(elements):
+                let storage = HashStorage(list[HashEntry]())
+                for position in range(0, i64(elements.count)):
+                    match try host.evaluate(node_at(self.program, elements, position), bindings):
+                        Evaluated(item):
+                            if try find_hash_entry(storage, item) < 0:
+                                storage.entries.append(HashEntry(key = BoxedValue(value = item), value = BoxedValue(value = Value.Unit)))
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Set(storage = storage))
+            ListCopy(value):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage):
+                        let elements = list[BoxedValue]()
+                        for element in storage.buffer.elements: elements.append(element)
+                        return Evaluation.Evaluated(value = Value.List(storage = ListStorage(elements)))
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            CollectionSnapshot(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item): return Evaluation.Evaluated(value = try snapshot_collection(item))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            ListWithMutableSlice(value, callback):
+                let selected_list = try self.evaluate_list(host, value, bindings)
+                var storage: ListStorage? = none
+                match selected_list:
+                    EvaluatedList(item): storage = item
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+                let selected_callback = try host.evaluate(callback, bindings)
+                var callback_value = Value.Unit
+                match selected_callback:
+                    Evaluated(item): callback_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                let list_storage = storage else trap("typed mutable-slice operation has no list storage")
+                # Detach before exposing the first mutable element so every
+                # pre-existing immutable slice keeps its captured snapshot.
+                detach_list(list_storage)
+                list_storage.active_iterations += 1
+                let callback_result = host.call_function_value(
+                    callback_value,
+                    node_type(self.program, callback),
+                    [Value.MutableSlice(storage = MutableSliceStorage(list_storage))],
+                ) catch reason:
+                    list_storage.active_iterations -= 1
+                    error(reason)
+                list_storage.active_iterations -= 1
+                match callback_result:
+                    Unit: return Evaluation.Evaluated(value = Value.Unit)
+                    else: trap("typed mutable-slice callback returned a value")
+            WeakCreate(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Class(storage): return Evaluation.Evaluated(value = Value.WeakClass(storage = WeakClassStorage(storage)))
+                            else: trap("typed `Weak` construction received a non-class HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            WeakGet(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            WeakClass(storage): return Evaluation.Evaluated(value = weak_class_value(storage))
+                            else: trap("typed `Weak.get` received a non-weak HIR value")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            SequenceSlice(value, start, end): return try self.evaluate_sequence_slice(host, value, start, end, bindings)
+            ListAppend(value, element):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage):
+                        match try host.evaluate(element, bindings):
+                            Evaluated(item):
+                                try require_list_shape_mutable(storage)
+                                detach_list(storage)
+                                storage.buffer.elements.append(BoxedValue(value = item))
+                                return Evaluation.Evaluated(value = Value.Unit)
+                            Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            ListInsert(value, index, element):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage):
+                        match try host.evaluate(index, bindings):
+                            Evaluated(index_value):
+                                match index_value:
+                                    UnsignedInteger(position):
+                                        match try host.evaluate(element, bindings):
+                                            Evaluated(item):
+                                                if position > u64(len(storage.buffer.elements)): error("interpreter: index out of bounds")
+                                                let position_index = i64(position)
+                                                try require_list_shape_mutable(storage)
+                                                detach_list(storage)
+                                                let rebuilt = list[BoxedValue]()
+                                                for current in range(0, len(storage.buffer.elements) + 1):
+                                                    if current == position_index: rebuilt.append(BoxedValue(value = item))
+                                                    else:
+                                                        var old = current
+                                                        if current > position_index: old -= 1
+                                                        rebuilt.append(storage.buffer.elements[old])
+                                                storage.buffer.elements = rebuilt
+                                                return Evaluation.Evaluated(value = Value.Unit)
+                                            Transferred(execution): return Evaluation.Transferred(execution = execution)
+                                    else: trap("typed list insert index is not an integer")
+                            Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            ListRemoveAt(value, index):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage):
+                        match try host.evaluate(index, bindings):
+                            Evaluated(index_value):
+                                match index_value:
+                                    UnsignedInteger(position):
+                                        if position >= u64(len(storage.buffer.elements)): error("interpreter: index out of bounds")
+                                        let position_index = i64(position)
+                                        try require_list_shape_mutable(storage)
+                                        let removed = storage.buffer.elements[position_index].value
+                                        detach_list(storage)
+                                        let rebuilt = list[BoxedValue]()
+                                        for current in range(0, len(storage.buffer.elements)):
+                                            if current != position_index: rebuilt.append(storage.buffer.elements[current])
+                                        storage.buffer.elements = rebuilt
+                                        return Evaluation.Evaluated(value = removed)
+                                    else: trap("typed list removal index is not an integer")
+                            Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            ListClear(value):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage):
+                        try require_list_shape_mutable(storage)
+                        storage.buffer = ListBuffer(list[BoxedValue]())
+                        storage.has_snapshot = false
+                        return Evaluation.Evaluated(value = Value.Unit)
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+            ListReserve(value, minimum_capacity):
+                match try self.evaluate_list(host, value, bindings):
+                    EvaluatedList(storage): pass
+                    TransferredList(execution): return Evaluation.Transferred(execution = execution)
+                match try host.evaluate(minimum_capacity, bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(minimum): return Evaluation.Evaluated(value = Value.Unit)
+                            else: trap("typed list reserve capacity is not an integer")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapLookup(value, key):
+                let receiver = try host.evaluate(value, bindings)
+                var mutable_storage: HashStorage? = none
+                var frozen_storage: FrozenHashStorage? = none
+                match receiver:
+                    Evaluated(item):
+                        match item:
+                            Map(found): mutable_storage = found
+                            FrozenMap(found): frozen_storage = found
+                            else: trap("typed map lookup has a non-map receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                match try host.evaluate(key, bindings):
+                    Evaluated(item):
+                        if mutable_storage != none:
+                            let found = mutable_storage
+                            let selected = try find_hash_entry(found, item)
+                            if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                            return Evaluation.Evaluated(value = Value.Present(value = found.entries[selected].value))
+                        let found = frozen_storage else trap("map lookup lost its storage")
+                        let selected = try find_frozen_hash_entry(found, item)
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                        return Evaluation.Evaluated(value = Value.Present(value = found.entries[selected].value))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapCopy(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Map(storage):
+                                let entries = list[HashEntry]()
+                                for entry in storage.entries: entries.append(HashEntry(key = entry.key, value = entry.value))
+                                return Evaluation.Evaluated(value = Value.Map(storage = HashStorage(entries)))
+                            else: trap("typed map copy has a non-map receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            MapRemove(value, key): return try self.evaluate_map_remove(host, value, key, bindings)
+            MapClear(value): return try self.evaluate_hash_clear(host, value, true, bindings)
+            MapReserve(value, minimum_capacity): return try self.evaluate_hash_reserve(host, value, true, minimum_capacity, bindings)
+            SetContains(value, element): return try self.evaluate_set_contains(host, value, element, bindings)
+            SetInsert(value, element): return try self.evaluate_set_membership(host, value, element, 1, bindings)
+            SetRemove(value, element): return try self.evaluate_set_membership(host, value, element, 2, bindings)
+            SetClear(value): return try self.evaluate_hash_clear(host, value, false, bindings)
+            SetReserve(value, minimum_capacity): return try self.evaluate_hash_reserve(host, value, false, minimum_capacity, bindings)
+            SetCopy(value):
+                match try host.evaluate(value, bindings):
+                    Evaluated(item):
+                        match item:
+                            Set(storage):
+                                let entries = list[HashEntry]()
+                                for entry in storage.entries: entries.append(HashEntry(key = entry.key, value = entry.value))
+                                return Evaluation.Evaluated(value = Value.Set(storage = HashStorage(entries)))
+                            else: trap("typed set copy has a non-set receiver")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            else: return none
+
+    ## The element count of a runtime collection or snapshot. Absent for the
+    ## shared sequence values.
+    pub func collection_length(item: Value) -> u64?:
+        match item:
+            List(storage): return u64(len(storage.buffer.elements))
+            Map(storage): return u64(len(storage.entries))
+            Set(storage): return u64(len(storage.entries))
+            FrozenList(storage): return u64(len(storage.elements))
+            FrozenMap(storage): return u64(len(storage.entries))
+            FrozenSet(storage): return u64(len(storage.entries))
+            Slice(storage): return u64(storage.length)
+            MutableSlice(storage): return u64(len(storage.list.buffer.elements))
+            else: return none
+
+    ## Checked element read from a runtime sequence. Absent for the shared
+    ## sequence values.
+    pub func index_collection(sequence_value: Value, position: u64) -> Value?!:
+        match sequence_value:
+            List(storage):
+                if position >= u64(len(storage.buffer.elements)): error("interpreter: index out of bounds")
+                return storage.buffer.elements[position].value
+            FrozenList(storage):
+                if position >= u64(len(storage.elements)): error("interpreter: index out of bounds")
+                return storage.elements[position].value
+            Slice(storage):
+                if position >= u64(storage.length): error("interpreter: index out of bounds")
+                match storage.backing:
+                    List(buffer): return buffer.elements[storage.start + i64(position)].value
+                    Bytes(payload): return Value.UnsignedInteger(value = u64(payload[storage.start + i64(position)]))
+            MutableSlice(storage):
+                if position >= u64(len(storage.list.buffer.elements)): error("interpreter: index out of bounds")
+                return storage.list.buffer.elements[position].value
+            else: return none
+
+    ## Reading a field through a class identity, promoting a weak field.
+    ## Absent for value records.
+    pub func read_class_field(item: Value, field: i64) -> Value?:
+        match item:
+            Class(storage):
+                let stored = storage.fields[field].value
+                if nominal_fields(self.program, storage.class_type)[field].is_weak:
+                    match stored:
+                        WeakClass(slot): return weak_class_value(slot)
+                        else: trap("weak class field has owning storage")
+                return stored
+            else: return none
+
+    ## A mutating receiver reached through a class field.
+    pub func class_field_place(place: Place, base: Value, field: i64) -> PlaceEvaluation?:
+        match base:
+            Class(storage):
+                if nominal_fields(self.program, storage.class_type)[field].is_weak:
+                    trap("weak optional field cannot be a mutating value receiver")
+                place.steps.append(AssignmentPlaceStep.ClassField(index = field))
+                return PlaceEvaluation.EvaluatedPlace(place = place, value = storage.fields[field].value)
+            else: return none
+
+    ## One assignment step through a class field, weak field, list element,
+    ## mutable slice element, or map key.
+    pub func resolve_place_step(host: HirExecutionHost, kind: u32, payload: i64, current: Value, bindings: list[Binding]) -> PlaceStepResolution!:
+        if kind == place_class_field_step:
+            match current:
+                Class(storage): return PlaceStepResolution.Resolved(step = AssignmentPlaceStep.ClassField(index = payload), current = storage.fields[payload].value)
+                else: trap("class-field step applied to a non-class HIR value")
+        if kind == place_weak_field_step:
+            match current:
+                Class(storage):
+                    match storage.fields[payload].value:
+                        WeakClass(slot): return PlaceStepResolution.Resolved(step = AssignmentPlaceStep.WeakField(index = payload), current = weak_class_value(slot))
+                        else: trap("weak class field has owning storage")
+                else: trap("weak-field step applied to a non-class HIR value")
+        if kind == place_list_element_step:
+            match try host.evaluate(NodeId(value = u32(payload)), bindings):
+                Evaluated(item):
+                    match item:
+                        UnsignedInteger(element_index):
+                            match current:
+                                List(storage):
+                                    if element_index >= u64(len(storage.buffer.elements)): error("interpreter: index out of bounds")
+                                    return PlaceStepResolution.Resolved(step = AssignmentPlaceStep.ListElement(index = i64(element_index)), current = storage.buffer.elements[element_index].value)
+                                else: trap("list element step applied to a non-list HIR value")
+                        else: trap("typed place index is not an integer")
+                Transferred(execution): return PlaceStepResolution.Transferred(execution = execution)
+        if kind == place_mutable_slice_element_step:
+            match try host.evaluate(NodeId(value = u32(payload)), bindings):
+                Evaluated(item):
+                    match item:
+                        UnsignedInteger(element_index):
+                            match current:
+                                MutableSlice(storage):
+                                    if element_index >= u64(len(storage.list.buffer.elements)): error("interpreter: index out of bounds")
+                                    return PlaceStepResolution.Resolved(step = AssignmentPlaceStep.MutableSliceElement(index = i64(element_index)), current = storage.list.buffer.elements[element_index].value)
+                                else: trap("mutable-slice element step applied to a non-view HIR value")
+                        else: trap("typed place index is not an integer")
+                Transferred(execution): return PlaceStepResolution.Transferred(execution = execution)
+        if kind == place_map_element_step:
+            match try host.evaluate(NodeId(value = u32(payload)), bindings):
+                Evaluated(key):
+                    match current:
+                        Map(storage):
+                            let entry = try find_hash_entry(storage, key)
+                            var selected = Value.Unit
+                            if entry >= 0: selected = storage.entries[entry].value.value
+                            return PlaceStepResolution.Resolved(step = AssignmentPlaceStep.MapElement(key = BoxedValue(value = key)), current = selected)
+                        else: trap("map element step applied to a non-map HIR value")
+                Transferred(execution): return PlaceStepResolution.Transferred(execution = execution)
+        trap("typed place assignment has an unknown step")
+
+    ## Built-in `for` over a runtime collection or snapshot. Absent when the
+    ## iterable is a shared type.
+    pub func execute_collection_for(host: HirExecutionHost, symbol: SymbolId, value: Value, iterable_type: TypeId, body: Operands, bindings: list[Binding]) -> Execution?!:
+        match self.program.types.definitions[iterable_type.value].form:
+            List(element): return try self.execute_list_for(host, symbol, value, body, bindings)
+            Map(key, element): return try self.execute_hash_for(host, symbol, value, true, body, bindings)
+            Set(element): return try self.execute_hash_for(host, symbol, value, false, body, bindings)
+            FrozenList(element):
+                match value:
+                    FrozenList(storage): return try self.execute_immutable_for(host, symbol, storage.elements, body, bindings)
+                    else: trap("typed frozen-list iteration received the wrong value")
+            FrozenMap(key, element): return try self.execute_frozen_hash_for(host, symbol, value, true, body, bindings)
+            FrozenSet(element): return try self.execute_frozen_hash_for(host, symbol, value, false, body, bindings)
+            else: return none
+
+    ## Fresh class storage for an initializer, recorded for the census when
+    ## one is active. Absent when the receiver is a value.
+    pub func initialize_class_receiver(host: HirExecutionHost, site_node: NodeId, owner: TypeId) -> Value?:
+        match self.program.types.definitions[owner.value].form:
+            Class(class_index, type_arguments):
+                let fields = list[BoxedValue]()
+                for field in nominal_fields(self.program, owner):
+                    if field.is_weak:
+                        fields.append(BoxedValue(value = Value.WeakClass(storage = WeakClassStorage(none))))
+                    else:
+                        fields.append(BoxedValue(value = Value.Unit))
+                var allocation_id = -1
+                if self.class_observations != none:
+                    allocation_id = self.next_allocation_id
+                    self.next_allocation_id += 1
+                let storage = ClassStorage(owner, fields, allocation_id, host.class_finalizer(), true, true, false)
+                if self.class_observations != none:
+                    let observations = self.class_observations else trap("resource census observations disappeared")
+                    let module = node_module(self.program, site_node)
+                    observations.append(HirClassObservation(
+                        allocation_id,
+                        owner,
+                        ClassAllocationSite(
+                            path = self.program.modules[module.value].path,
+                            function = "",
+                            span = node_span(self.program, site_node),
+                        ),
+                        storage,
+                    ))
+                return Value.Class(storage = storage)
+            else: return none
+
+    ## Construction arms source `deinit` only after an initializer reaches
+    ## its successful return. Struct receivers pass through unchanged.
+    pub func mark_initialized(value: Value):
+        mark_class_initialized(value)
+
+    # mark: Classes and the resource census =====================================================
+
+    pub func finalize_class(host: HirExecutionHost, class_type: TypeId, fields: list[BoxedValue], run_deinitializer: bool) -> !:
+        let deinitializer = class_application(self.program, class_type).deinitializer
+        if run_deinitializer and deinitializer != none:
+            let target = host.find_function(deinitializer)
+            # Stage-0 rightly forbids passing a dying `self` as a new strong
+            # callback argument. A non-finalizing proxy over the same payload
+            # supplies the borrowed source receiver without resurrecting the
+            # original identity or recursively invoking finalization.
+            let proxy = ClassStorage(class_type, fields, -1, host.class_finalizer(), false, false, true)
+            let invocation = try host.call(target, [Value.Class(storage = proxy)])
+            match invocation.value:
+                Unit: pass
+                else: trap("checked class deinitializer returned a value")
+
+        # Box destruction, and therefore nested class finalization, follows
+        # source declaration order in reverse rather than host list policy.
+        var remaining = len(fields)
+        while remaining > 0:
+            remaining -= 1
+            fields.remove(remaining)
+
+    ## Observe the post-run ownership graph without retaining it. Every edge
+    ## is collapsed to source class identities; weak slots are absent.
+    pub func resource_census() -> ResourceCensus:
+        let observations = self.class_observations else trap("resource census was not enabled for this HIR execution")
+        let allocations = list[LiveClassAllocation]()
+        let edges = list[StrongReferenceEdge]()
+        for observation in observations:
+            let target = observation.reference.target
+            if target == none: continue
+            allocations.append(LiveClassAllocation(
+                allocation_id = observation.allocation_id,
+                class_name = describe_type(self.program.types, observation.class_type),
+                site = observation.site,
+            ))
+            let references = collect_hir_class_references(target.fields)
+            for referenced in references:
+                edges.append(StrongReferenceEdge(source = observation.allocation_id, target = referenced))
+        return resource_census(allocations, edges)
+
+    # A census executes in the same isolated, unit-returning domain promised
+    # by the future test harness. Tear down intentional cycles after their
+    # metadata has been copied out so the compiler host does not inherit the
+    # program-under-test's leak.
+    pub func discard_resource_domain():
+        let observations = self.class_observations else trap("resource census was not enabled for this HIR execution")
+        for observation in observations:
+            let target = observation.reference.target
+            if target != none: target.suppress_finalization()
+        for observation in observations:
+            let target = observation.reference.target
+            if target != none: target.discard_owned_fields()
+
+    # Centralize the trusted typed-list assertion while preserving a receiver
+
+    # mark: Collections =========================================================================
+
+    # expression's control transfer for every list operation.
+    func evaluate_list(host: HirExecutionHost, value: NodeId, bindings: list[Binding]) -> ListEvaluation!:
+        match try host.evaluate(value, bindings):
+            Evaluated(item):
+                match item:
+                    List(storage): return ListEvaluation.EvaluatedList(storage = storage)
+                    else: trap("typed list operation has a non-list receiver")
+            Transferred(execution): return ListEvaluation.TransferredList(execution = execution)
+
+    func evaluate_hash(host: HirExecutionHost, value: NodeId, is_map: bool, bindings: list[Binding]) -> HashEvaluation!:
+        match try host.evaluate(value, bindings):
+            Evaluated(item):
+                match item:
+                    Map(storage):
+                        if is_map: return HashEvaluation.EvaluatedHash(storage = storage)
+                    Set(storage):
+                        if not is_map: return HashEvaluation.EvaluatedHash(storage = storage)
+                    else: pass
+                trap("typed hash-collection operation has the wrong receiver")
+            Transferred(execution): return HashEvaluation.TransferredHash(execution = execution)
+
+    pub func evaluate_map_remove(host: HirExecutionHost, value: NodeId, key: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(host, value, true, bindings):
+            EvaluatedHash(storage):
+                match try host.evaluate(key, bindings):
+                    Evaluated(item):
+                        let selected = try find_hash_entry(storage, item)
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Absent)
+                        try require_hash_shape_mutable(storage, "map")
+                        let removed = storage.entries[selected].value
+                        let rebuilt = list[HashEntry]()
+                        for index in range(0, len(storage.entries)):
+                            if index != selected: rebuilt.append(storage.entries[index])
+                        while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                        for entry in rebuilt: storage.entries.append(entry)
+                        return Evaluation.Evaluated(value = Value.Present(value = removed))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+
+    pub func evaluate_hash_clear(host: HirExecutionHost, value: NodeId, is_map: bool, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(host, value, is_map, bindings):
+            EvaluatedHash(storage):
+                var kind = "set"
+                if is_map: kind = "map"
+                try require_hash_shape_mutable(storage, kind)
+                while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                return Evaluation.Evaluated(value = Value.Unit)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+
+    pub func evaluate_hash_reserve(host: HirExecutionHost, value: NodeId, is_map: bool, minimum_capacity: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(host, value, is_map, bindings):
+            EvaluatedHash(storage): pass
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+        match try host.evaluate(minimum_capacity, bindings):
+            Evaluated(item):
+                match item:
+                    UnsignedInteger(minimum): return Evaluation.Evaluated(value = Value.Unit)
+                    else: trap("typed hash-collection reserve capacity is not an integer")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    # Operation 0 is contains, 1 insert, and 2 remove. The compact internal
+    # tag keeps the shared semantic transaction in one place without leaking
+    # a source-level enum or duplicating receiver/operand evaluation.
+    pub func evaluate_set_membership(host: HirExecutionHost, value: NodeId, element: NodeId, operation: i64, bindings: list[Binding]) -> Evaluation!:
+        match try self.evaluate_hash(host, value, false, bindings):
+            EvaluatedHash(storage):
+                match try host.evaluate(element, bindings):
+                    Evaluated(item):
+                        let selected = try find_hash_entry(storage, item)
+                        if operation == 0: return Evaluation.Evaluated(value = Value.Boolean(value = selected >= 0))
+                        if operation == 1:
+                            if selected >= 0: return Evaluation.Evaluated(value = Value.Boolean(value = false))
+                            try require_hash_shape_mutable(storage, "set")
+                            storage.entries.append(HashEntry(key = BoxedValue(value = item), value = BoxedValue(value = Value.Unit)))
+                            return Evaluation.Evaluated(value = Value.Boolean(value = true))
+                        if selected < 0: return Evaluation.Evaluated(value = Value.Boolean(value = false))
+                        try require_hash_shape_mutable(storage, "set")
+                        let rebuilt = list[HashEntry]()
+                        for index in range(0, len(storage.entries)):
+                            if index != selected: rebuilt.append(storage.entries[index])
+                        while len(storage.entries) > 0: storage.entries.remove(len(storage.entries) - 1)
+                        for entry in rebuilt: storage.entries.append(entry)
+                        return Evaluation.Evaluated(value = Value.Boolean(value = true))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            TransferredHash(execution): return Evaluation.Transferred(execution = execution)
+
+    # `contains` is the one hash-set operation shared by mutable and frozen
+    # values. Mutation keeps using evaluate_set_membership, whose receiver
+    # assertion deliberately admits only mutable Set storage.
+    pub func evaluate_set_contains(host: HirExecutionHost, value: NodeId, element: NodeId, bindings: list[Binding]) -> Evaluation!:
+        let receiver = try host.evaluate(value, bindings)
+        var selected = Value.Unit
+        match receiver:
+            Evaluated(item): selected = item
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+        match try host.evaluate(element, bindings):
+            Evaluated(item):
+                match selected:
+                    Set(storage): return Evaluation.Evaluated(value = Value.Boolean(value = try find_hash_entry(storage, item) >= 0))
+                    FrozenSet(storage): return Evaluation.Evaluated(value = Value.Boolean(value = try find_frozen_hash_entry(storage, item) >= 0))
+                    else: trap("typed set membership has a non-set receiver")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    pub func evaluate_sequence_slice(host: HirExecutionHost, value: NodeId, start: NodeId, end: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try host.evaluate(value, bindings):
+            Evaluated(sequence):
+                var length = 0
+                match sequence:
+                    Array(elements): length = len(elements)
+                    List(storage): length = len(storage.buffer.elements)
+                    Bytes(payload): length = len(payload)
+                    else: trap("typed slice operation has a non-contiguous receiver")
+                var lower = 0
+                if start.value != no_node:
+                    match try host.evaluate(start, bindings):
+                        Evaluated(item):
+                            match item:
+                                UnsignedInteger(bound):
+                                    if bound > u64(length): error("interpreter: slice bounds out of range")
+                                    lower = i64(bound)
+                                else: trap("typed slice start is not an integer")
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                var upper = length
+                if end.value != no_node:
+                    match try host.evaluate(end, bindings):
+                        Evaluated(item):
+                            match item:
+                                UnsignedInteger(bound):
+                                    if bound > u64(length): error("interpreter: slice bounds out of range")
+                                    upper = i64(bound)
+                                else: trap("typed slice end is not an integer")
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                if lower > upper or upper > length:
+                    error("interpreter: slice bounds out of range")
+                var offset = lower
+                var backing = SliceBacking.Bytes(value = list[u8]())
+                match sequence:
+                    Array(elements):
+                        let snapshot = list[BoxedValue]()
+                        for position in range(lower, upper): snapshot.append(elements[position])
+                        backing = SliceBacking.List(buffer = ListBuffer(snapshot))
+                        offset = 0
+                    List(storage):
+                        storage.has_snapshot = true
+                        backing = SliceBacking.List(buffer = storage.buffer)
+                    Bytes(payload): backing = SliceBacking.Bytes(value = payload)
+                    else: trap("typed slice operation has a non-contiguous receiver")
+                return Evaluation.Evaluated(value = Value.Slice(storage = SliceStorage(backing, offset, upper - lower)))
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    # Evaluate the existing declaration-placed argument run, copy the values
+
+    # mark: Structured task lifetimes ===========================================================
+
+    # into a fresh worker domain, and register exactly one group-owned child.
+    # Scheduling is deliberately deterministic in the semantic oracle: a
+    # pending child starts when first joined. Queuing it here still makes the
+    # task immediately live and lets cancellation win before that safe point.
+    pub func evaluate_spawn(host: HirExecutionHost, function: SymbolId, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
+        let target = host.find_function(function)
+        let values = list[Value]()
+        for parameter in target.parameters: values.append(Value.Unit)
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            match try host.evaluate(argument, bindings):
+                Evaluated(item): values[parameter_index] = try copy_sendable_value(item)
+                Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+        if len(self.task_groups) == 0: trap("spawn executed outside a function task group")
+        let copied = list[BoxedValue]()
+        for value in values: copied.append(BoxedValue(value = value))
+        let storage = HirTaskStorage(self.next_task_identity, function, copied)
+        self.next_task_identity += u64(1)
+        self.task_groups[len(self.task_groups) - 1].children.append(storage)
+        return Evaluation.Evaluated(value = Value.Task(storage = storage))
+
+    # Execute a pending child once in an isolated interpreter domain. Program
+    # metadata and explicit host capabilities are immutable inputs; globals,
+    # call frames, class storage, task groups, and allocation identities are
+    # fresh. The completed remote value stays cached until each wait copies it.
+    pub func start_task(host: HirExecutionHost, storage: HirTaskStorage):
+        if storage.outcome != none: return
+        let worker = host.fresh_domain()
+        let arguments = list[Value]()
+        for argument in storage.arguments: arguments.append(argument.value)
+        let result = worker.invoke(worker.find_function(storage.function), arguments) catch reason:
+            storage.outcome = HirTaskOutcome.Trapped(message = reason)
+            return
+        match result:
+            FallibleSuccess(value): storage.outcome = HirTaskOutcome.Succeeded(value = BoxedValue(value = value.value))
+            FallibleFailure(error_value): storage.outcome = HirTaskOutcome.Failed(error_value = BoxedValue(value = error_value.value))
+            else: storage.outcome = HirTaskOutcome.Succeeded(value = BoxedValue(value = result))
+
+    # Return one fresh local-domain copy of the cached result. The compiler
+    # has already proven both successful results and Error are sendable.
+    pub func wait_task(host: HirExecutionHost, storage: HirTaskStorage) -> Value!:
+        self.start_task(host, storage)
+        let outcome = storage.outcome else trap("joined task has no terminal outcome")
+        match outcome:
+            Succeeded(value):
+                return Value.FallibleSuccess(value = BoxedValue(value = try copy_sendable_value(value.value)))
+            Failed(error_value):
+                return Value.FallibleFailure(error_value = BoxedValue(value = try copy_sendable_value(error_value.value)))
+            Trapped(message):
+                return Value.FallibleFailure(error_value = BoxedValue(value = task_runtime_error(1, message)))
+            Cancelled:
+                return Value.FallibleFailure(error_value = BoxedValue(value = task_runtime_error(2, "task cancelled")))
+
+    # Cancellation is idempotent. A deterministic pending child has not yet
+    # crossed its first join safe point; completed outcomes remain unchanged.
+    pub func cancel_task(storage: HirTaskStorage):
+        if storage.outcome == none: storage.outcome = HirTaskOutcome.Cancelled
+
+    # Function exit requests cancellation for every unfinished child and
+    # joins the group before function-scope deferred cleanup begins. Waiting
+    # on an already completed child is unnecessary: its cached storage is
+    # retained by the group until this method returns.
+    func finish_task_group(group: HirTaskGroup):
+        for child in group.children:
+            if child.outcome == none: child.outcome = HirTaskOutcome.Cancelled
+
+    # Observe every child even after a failure, preserving source list order.
+    # Calling wait_task again for a repeated handle only copies its cache and
+    # therefore never starts a second worker execution.
+    pub func evaluate_wait_all(host: HirExecutionHost, tasks: NodeId, bindings: list[Binding]) -> Evaluation!:
+        match try host.evaluate(tasks, bindings):
+            Evaluated(item):
+                match item:
+                    List(storage):
+                        let values = list[BoxedValue]()
+                        var first_failure: BoxedValue? = none
+                        for element in storage.buffer.elements:
+                            let task = element.value
+                            match task:
+                                Task(child):
+                                    match try self.wait_task(host, child):
+                                        FallibleSuccess(value): values.append(BoxedValue(value = value.value))
+                                        FallibleFailure(error_value):
+                                            if first_failure == none:
+                                                first_failure = BoxedValue(value = error_value.value)
+                                        else: trap("task wait produced a non-fallible result")
+                                else: trap("typed wait_all list contains a non-task value")
+                        if first_failure != none:
+                            return Evaluation.Evaluated(value = Value.FallibleFailure(error_value = first_failure))
+                        return Evaluation.Evaluated(value = Value.FallibleSuccess(value = BoxedValue(value = Value.List(storage = ListStorage(values)))))
+                    else: trap("typed wait_all has a non-list value")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+    # Dynamic interface dispatch preserves the ordinary method-call ordering:
+
+    # mark: Existential interface calls =========================================================
+
+    # select the receiver place first, evaluate later arguments left-to-right,
+    # then read and (for mutation) detach the current existential payload.
+    pub func evaluate_interface_call(host: HirExecutionHost, receiver: NodeId, interface_type: TypeId, requirement_index: u32, arguments: Operands, bindings: list[Binding]) -> Evaluation!:
+        var interface_index = -1
+        match self.program.types.definitions[interface_type.value].form:
+            Interface(index, values): interface_index = index
+            else: trap("interface call has a non-interface owner type")
+        let requirement = self.program.interfaces[interface_index].requirements[requirement_index]
+        var mutable_place: Place? = none
+        var selected = Value.Unit
+        if requirement.is_mutating:
+            match try host.evaluate_mutable_place(receiver, bindings):
+                EvaluatedPlace(place, value):
+                    mutable_place = place
+                    selected = value
+                TransferredPlace(execution): return Evaluation.Transferred(execution = execution)
+        else:
+            match try host.evaluate(receiver, bindings):
+                Evaluated(value): selected = value
+                Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+        let explicit = list[Value]()
+        for pair in range(0, i64(arguments.count) // 2): explicit.append(Value.Unit)
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.program, arguments, pair * 2 + 1)))
+            match try host.evaluate(argument, bindings):
+                Evaluated(value): explicit[parameter_index] = value
+                Transferred(execution): return Evaluation.Transferred(execution = execution)
+
+        if requirement.is_mutating:
+            let place = mutable_place else trap("mutating interface call has no receiver place")
+            let binding_index = find_binding(bindings, place.symbol)
+            if binding_index < 0: trap("mutating interface call refers to an unknown binding")
+            selected = try value_at_assignment_place(self.binding_value(bindings[binding_index].value), place.steps, 0)
+        var selected_storage: InterfaceStorage? = none
+        match selected:
+            Interface(value): selected_storage = value
+            else: trap("interface call receiver is not an existential value")
+        let storage = selected_storage else trap("interface call has no existential storage")
+        if i64(storage.conformance) >= len(self.program.conformances): trap("interface value has an unknown conformance")
+        let conformance = self.program.conformances[storage.conformance]
+        if not types_match(conformance.interface_type, interface_type): trap("interface value has the wrong conformance identity")
+        if i64(requirement_index) >= len(conformance.implementations): trap("interface requirement is outside its conformance table")
+
+        let values = list[Value]()
+        values.append(storage.value.value)
+        for value in explicit: values.append(value)
+        let invocation = try host.call(host.find_function(conformance.implementations[requirement_index]), values)
+        if requirement.is_mutating:
+            # Always detaching the semantic wrapper is conservative COW. A
+            # value conformer's aliases keep their old payload; a class
+            # conformer's detached wrappers still name the same class identity.
+            let place = mutable_place else trap("mutating interface call has no receiver place")
+            let binding_index = find_binding(bindings, place.symbol)
+            if binding_index < 0: trap("mutating interface call refers to an unknown binding")
+            let updated_interface = Value.Interface(storage = InterfaceStorage(storage.conformance, invocation.receiver))
+            let updated = try value_with_assignment_place(self.binding_value(bindings[binding_index].value), place.steps, 0, updated_interface)
+            self.assign_binding(bindings, binding_index, updated)
+        return Evaluation.Evaluated(value = invocation.value)
+
+    # mark: Collection iteration ================================================================
+
+    pub func execute_list_for(host: HirExecutionHost, symbol: SymbolId, iterated: Value, body: Operands, bindings: list[Binding]) -> Execution!:
+        let storage = require_list_storage(iterated)
+        storage.active_iterations += 1
+        let outer_count = len(bindings)
+        let length = len(storage.buffer.elements)
+        var index = 0
+        while index < length:
+            bindings.append(Binding(symbol = symbol, value = storage.buffer.elements[index].value))
+            let outcome = host.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                storage.active_iterations -= 1
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return self.finish_list_iteration(storage, Execution.Next)
+                Returned(value): return self.finish_list_iteration(storage, Execution.Returned(value = value))
+                Raised(error_value): return self.finish_list_iteration(storage, Execution.Raised(error_value = error_value))
+                Recovered(value): return self.finish_list_iteration(storage, Execution.Recovered(value = value))
+                else: pass
+            index += 1
+        return self.finish_list_iteration(storage, Execution.Next)
+
+    pub func finish_list_iteration(storage: ListStorage, outcome: Execution) -> Execution:
+        storage.active_iterations -= 1
+        return outcome
+
+    pub func execute_hash_for(host: HirExecutionHost, symbol: SymbolId, iterated: Value, is_map: bool, body: Operands, bindings: list[Binding]) -> Execution!:
+        var storage: HashStorage? = none
+        match iterated:
+            Map(value):
+                if is_map: storage = value
+            Set(value):
+                if not is_map: storage = value
+            else: pass
+        let collection = storage else trap("typed hash-collection iteration received the wrong value")
+        collection.active_iterations += 1
+        let outer_count = len(bindings)
+        let length = len(collection.entries)
+        for index in range(0, length):
+            bindings.append(Binding(symbol = symbol, value = collection.entries[index].key.value))
+            let outcome = host.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                collection.active_iterations -= 1
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return self.finish_hash_iteration(collection, Execution.Next)
+                Returned(value): return self.finish_hash_iteration(collection, Execution.Returned(value = value))
+                Raised(error_value): return self.finish_hash_iteration(collection, Execution.Raised(error_value = error_value))
+                Recovered(value): return self.finish_hash_iteration(collection, Execution.Recovered(value = value))
+                else: pass
+        return self.finish_hash_iteration(collection, Execution.Next)
+
+    pub func finish_hash_iteration(storage: HashStorage, outcome: Execution) -> Execution:
+        storage.active_iterations -= 1
+        return outcome
+
+    # Frozen collections expose no identity-wide mutation barrier. Iteration
+    # therefore needs only the ordinary lexical binding/control transaction;
+    # the immutable storage may be shared safely inside this worker domain.
+    pub func execute_immutable_for(host: HirExecutionHost, symbol: SymbolId, elements: list[BoxedValue], body: Operands, bindings: list[Binding]) -> Execution!:
+        let outer_count = len(bindings)
+        for element in elements:
+            bindings.append(Binding(symbol = symbol, value = element.value))
+            let outcome = host.execute_scope(body, bindings) catch reason:
+                trim_bindings(bindings, outer_count)
+                error(reason)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return Execution.Next
+                Returned(value): return Execution.Returned(value = value)
+                Raised(error_value): return Execution.Raised(error_value = error_value)
+                Recovered(value): return Execution.Recovered(value = value)
+                else: pass
+        return Execution.Next
+
+    pub func execute_frozen_hash_for(host: HirExecutionHost, symbol: SymbolId, iterated: Value, is_map: bool, body: Operands, bindings: list[Binding]) -> Execution!:
+        var storage: FrozenHashStorage? = none
+        match iterated:
+            FrozenMap(value):
+                if is_map: storage = value
+            FrozenSet(value):
+                if not is_map: storage = value
+            else: pass
+        let collection = storage else trap("typed frozen hash-collection iteration received the wrong value")
+        let keys = list[BoxedValue]()
+        for entry in collection.entries: keys.append(entry.key)
+        return try self.execute_immutable_for(host, symbol, keys, body, bindings)
+
+    # Promotion is a property of the semantic symbol, not of the point where
+
+    # mark: Captured local storage ==============================================================
+
+    # its declaration executes. Parameters and local bindings therefore pass
+    # through the same initializer and converge on one cell identity.
+    pub func initial_binding(symbol: SymbolId, value: Value) -> Value:
+        if not self.is_shared_cell(symbol): return value
+        match value:
+            CapturedCell(storage): return value
+            else: return Value.CapturedCell(storage = CapturedCellStorage(value = value))
+
+    pub func is_shared_cell(symbol: SymbolId) -> bool:
+        return self.shared_cell_flags[symbol.value]
+
+    # Source reads see the cell payload; closure construction alone reads the
+    # raw binding so it can share the cell rather than snapshot its value.
+    pub func binding_value(value: Value) -> Value:
+        match value:
+            CapturedCell(storage): return storage.value.value
+            else: return value
+
+    pub func assign_binding(bindings: list[Binding], index: i64, value: Value):
+        match bindings[index].value:
+            CapturedCell(storage): storage.value = BoxedValue(value = value)
+            else: bindings[index] = Binding(symbol = bindings[index].symbol, value = value)
+
+# mark: Worker-domain transfer and value helpers ================================================
+
+func process_argument_slice(arguments: list[str]) -> Value:
+    let elements = list[BoxedValue]()
+    for argument in arguments:
+        elements.append(BoxedValue(value = Value.Text(value = argument)))
+    let buffer = ListBuffer(elements)
+    return Value.Slice(storage = SliceStorage(
+        backing = SliceBacking.List(buffer = buffer),
+        start = 0,
+        length = len(elements),
+    ))
+
+# Snapshot is an explicit graph-copy boundary even before a value crosses a
+# worker. Mutable identities never become the backing of frozen values, so a
+# later source mutation cannot affect the snapshot. The sendability checker
+# has already proved every recursively copied member belongs to the closed
+# value vocabulary accepted by copy_sendable_value.
+func snapshot_collection(value: Value) -> Value!:
+    match value:
+        List(storage):
+            let copied = list[BoxedValue]()
+            for element in storage.buffer.elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.FrozenList(storage = FrozenListStorage(copied))
+        Map(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = try copy_sendable_value(entry.value.value)),
+                ))
+            return Value.FrozenMap(storage = FrozenHashStorage(copied))
+        Set(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = Value.Unit),
+                ))
+            return Value.FrozenSet(storage = FrozenHashStorage(copied))
+        else: trap("typed collection snapshot has a non-collection value")
+
+# Copy precisely the closed sendable runtime vocabulary. HIR type checking
+# has already derived this property structurally; keeping the oracle copier
+# exhaustive makes a checker/runtime disagreement fail loudly instead of
+# sharing mutable host storage across supposedly isolated domains.
+func copy_sendable_value(value: Value) -> Value!:
+    match value:
+        Unit: return Value.Unit
+        Boolean(item): return Value.Boolean(value = item)
+        SignedInteger(item): return Value.SignedInteger(value = item)
+        UnsignedInteger(item): return Value.UnsignedInteger(value = item)
+        Floating(item): return Value.Floating(value = item)
+        Character(item): return Value.Character(value = item)
+        Text(item): return Value.Text(value = item)
+        Bytes(item):
+            let copied = list[u8]()
+            for byte in item: copied.append(byte)
+            return Value.Bytes(value = copied)
+        Tuple(elements):
+            let copied = list[BoxedValue]()
+            for element in elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.Tuple(elements = copied)
+        Array(elements):
+            let copied = list[BoxedValue]()
+            for element in elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.Array(elements = copied)
+        FrozenList(storage):
+            let copied = list[BoxedValue]()
+            for element in storage.elements:
+                copied.append(BoxedValue(value = try copy_sendable_value(element.value)))
+            return Value.FrozenList(storage = FrozenListStorage(copied))
+        FrozenMap(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = try copy_sendable_value(entry.value.value)),
+                ))
+            return Value.FrozenMap(storage = FrozenHashStorage(copied))
+        FrozenSet(storage):
+            let copied = list[FrozenHashEntry]()
+            for entry in storage.entries:
+                copied.append(FrozenHashEntry(
+                    key = BoxedValue(value = try copy_sendable_value(entry.key.value)),
+                    value = BoxedValue(value = Value.Unit),
+                ))
+            return Value.FrozenSet(storage = FrozenHashStorage(copied))
+        Slice(storage):
+            let copied = list[BoxedValue]()
+            match storage.backing:
+                List(buffer):
+                    for offset in range(0, storage.length):
+                        copied.append(BoxedValue(value = try copy_sendable_value(buffer.elements[storage.start + offset].value)))
+                    return Value.Slice(storage = SliceStorage(SliceBacking.List(buffer = ListBuffer(copied)), 0, storage.length))
+                Bytes(source_bytes):
+                    let payload = list[u8]()
+                    for offset in range(0, storage.length): payload.append(source_bytes[storage.start + offset])
+                    return Value.Slice(storage = SliceStorage(SliceBacking.Bytes(value = payload), 0, storage.length))
+        Record(fields):
+            let copied = list[BoxedValue]()
+            for field in fields:
+                copied.append(BoxedValue(value = try copy_sendable_value(field.value)))
+            return Value.Record(fields = copied)
+        Variant(case_index, payload):
+            let copied = list[BoxedValue]()
+            for field in payload:
+                copied.append(BoxedValue(value = try copy_sendable_value(field.value)))
+            return Value.Variant(case_index = case_index, payload = copied)
+        Absent: return Value.Absent
+        Present(item): return Value.Present(value = BoxedValue(value = try copy_sendable_value(item.value)))
+        else: trap("HIR sendability proof admitted a mutable or domain-bound runtime value")
+
+# The compiler-owned task error domain is independent of the application
+# package identity. Values 1 and 2 are `task.trapped` and `task.cancelled`;
+# value 3 is reserved for `task.resource_exhausted` once resource failures
+# carry a typed internal reason rather than an interpreter diagnostic string.
+func task_runtime_error(code: u64, message: str) -> Value:
+    let error_code = Value.Record(fields = [
+        BoxedValue(value = Value.Text(value = "luce.task")),
+        BoxedValue(value = Value.UnsignedInteger(value = code)),
+    ])
+    return Value.Record(fields = [
+        BoxedValue(value = error_code),
+        BoxedValue(value = Value.Text(value = message)),
+    ])
+
+func require_list_storage(value: Value) -> ListStorage:
+    match value:
+        List(storage): return storage
+        else: trap("typed list iteration received a non-list value")
+
+# Construction arms source `deinit` only after an initializer reaches its
+# successful return. Struct receivers pass through unchanged.
+func mark_class_initialized(value: Value):
+    match value:
+        Class(storage): storage.is_initialized = true
+        else: pass

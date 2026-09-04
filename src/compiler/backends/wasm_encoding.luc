@@ -1,13 +1,215 @@
 #==============================================================================================
 #
-#   wasm_encoding - Shared WebAssembly integer encodings
+#   wasm_encoding - The WebAssembly byte vocabulary and shared byte emitters
 #
 #   DESCRIPTION:
-#       Small byte-level primitives shared by the module encoder and its
-#       backend-local legalization modules. They know only WebAssembly's
-#       integer representation, never canonical MIR or target policy.
+#       The binary format's section, type, and opcode names, the LEB128
+#       integer encodings, and the small byte emitters every encoder shares:
+#       locals, constants, memory operations, guards, runtime calls, and
+#       function descriptors. `backends/wasm` and the profile encoder in
+#       `profiles/full/backends/wasm_emission` both build on this module, so
+#       it imports neither of them.
 #
 #==============================================================================================
+
+from compiler.backends.wasm_plan import ModulePlan, defined_function_index
+from compiler.mir.canonical import FunctionId, MirProgram, RegisterId, TypeId, find_runtime_binding
+from compiler.runtime_contract import RuntimeService
+
+# mark: WebAssembly binary format names =======================================================
+
+pub let type_section: u8 = 0x01
+pub let import_section: u8 = 0x02
+pub let function_section: u8 = 0x03
+pub let table_section: u8 = 0x04
+pub let memory_section: u8 = 0x05
+pub let global_section: u8 = 0x06
+pub let export_section: u8 = 0x07
+pub let element_section: u8 = 0x09
+pub let code_section: u8 = 0x0A
+pub let data_section: u8 = 0x0B
+
+pub let function_type_tag: u8 = 0x60
+pub let i64_value_type: u8 = 0x7E
+pub let f32_value_type: u8 = 0x7D
+pub let f64_value_type: u8 = 0x7C
+pub let function_reference_type: u8 = 0x70
+pub let function_import_kind: u8 = 0x00
+pub let global_import_kind: u8 = 0x03
+pub let function_export_kind: u8 = 0x00
+pub let memory_export_kind: u8 = 0x02
+pub let global_mutable: u8 = 0x01
+pub let empty_block_type: u8 = 0x40
+
+# WASI preview 1: the module name, the two services used, and the scratch
+# area at the start of memory that `fd_write` reads its iovec from.
+pub let wasi_module: str = "wasi_snapshot_preview1"
+pub let wasi_fd_write: str = "fd_write"
+pub let wasi_proc_exit: str = "proc_exit"
+# Only WebAssembly interprets a host namespace. The same canonical C symbol
+# is linked directly by QBE/native backends.
+pub let c_import_module: str = "env"
+pub let wasi_stdout: i64 = 1
+pub let wasi_stderr: i64 = 2
+pub let scratch_iovec_buffer: i64 = 0     # iovec.buf: i32 offset of the bytes
+pub let scratch_iovec_length: i64 = 4     # iovec.buf_len: i32 byte count
+pub let scratch_written: i64 = 8          # where fd_write stores the count written
+pub let scratch_trap_newline: i64 = 12    # one backend-owned diagnostic newline
+
+# The shadow stack pointer follows imported external globals in Wasm's global
+# index space, starts at the top of a sixteen-page memory, and grows down
+# toward the data. Frames are
+# 16-byte aligned. A memory without a stack stays one page.
+pub let page_size: i64 = 65536
+pub let stack_pages: i64 = 16
+
+# Control
+pub let opcode_unreachable: u8 = 0x00
+pub let opcode_block: u8 = 0x02
+pub let opcode_loop: u8 = 0x03
+pub let opcode_if: u8 = 0x04
+pub let opcode_else: u8 = 0x05
+pub let opcode_end: u8 = 0x0B
+pub let opcode_br: u8 = 0x0C
+pub let opcode_br_if: u8 = 0x0D
+pub let opcode_return: u8 = 0x0F
+pub let opcode_call: u8 = 0x10
+pub let opcode_call_indirect: u8 = 0x11
+pub let opcode_drop: u8 = 0x1A
+# Variables
+pub let opcode_local_get: u8 = 0x20
+pub let opcode_local_set: u8 = 0x21
+pub let opcode_local_tee: u8 = 0x22
+pub let opcode_global_get: u8 = 0x23
+pub let opcode_global_set: u8 = 0x24
+# Memory
+pub let opcode_i32_load: u8 = 0x28
+pub let opcode_i64_load: u8 = 0x29
+pub let opcode_f32_load: u8 = 0x2A
+pub let opcode_f64_load: u8 = 0x2B
+pub let opcode_i32_load8_s: u8 = 0x2C
+pub let opcode_i32_load8_u: u8 = 0x2D
+pub let opcode_i32_load16_s: u8 = 0x2E
+pub let opcode_i32_load16_u: u8 = 0x2F
+pub let opcode_i32_store: u8 = 0x36
+pub let opcode_i64_store: u8 = 0x37
+pub let opcode_f32_store: u8 = 0x38
+pub let opcode_f64_store: u8 = 0x39
+pub let opcode_i32_store8: u8 = 0x3A
+pub let opcode_i32_store16: u8 = 0x3B
+pub let opcode_memory_size: u8 = 0x3F
+pub let opcode_memory_grow: u8 = 0x40
+# Constants
+pub let opcode_i32_const: u8 = 0x41
+pub let opcode_i64_const: u8 = 0x42
+pub let opcode_f32_const: u8 = 0x43
+pub let opcode_f64_const: u8 = 0x44
+# i32 comparison
+pub let opcode_i32_eqz: u8 = 0x45
+pub let opcode_i32_eq: u8 = 0x46
+pub let opcode_i32_ne: u8 = 0x47
+pub let opcode_i32_lt_s: u8 = 0x48
+pub let opcode_i32_lt_u: u8 = 0x49
+pub let opcode_i32_gt_s: u8 = 0x4A
+pub let opcode_i32_gt_u: u8 = 0x4B
+pub let opcode_i32_le_s: u8 = 0x4C
+pub let opcode_i32_le_u: u8 = 0x4D
+pub let opcode_i32_ge_s: u8 = 0x4E
+pub let opcode_i32_ge_u: u8 = 0x4F
+# i64 comparison
+pub let opcode_i64_eqz: u8 = 0x50
+pub let opcode_i64_eq: u8 = 0x51
+pub let opcode_i64_ne: u8 = 0x52
+pub let opcode_i64_lt_s: u8 = 0x53
+pub let opcode_i64_lt_u: u8 = 0x54
+pub let opcode_i64_gt_s: u8 = 0x55
+pub let opcode_i64_gt_u: u8 = 0x56
+pub let opcode_i64_le_s: u8 = 0x57
+pub let opcode_i64_le_u: u8 = 0x58
+pub let opcode_i64_ge_s: u8 = 0x59
+pub let opcode_i64_ge_u: u8 = 0x5A
+# f32 and f64 comparison
+pub let opcode_f32_eq: u8 = 0x5B
+pub let opcode_f32_ne: u8 = 0x5C
+pub let opcode_f32_lt: u8 = 0x5D
+pub let opcode_f32_gt: u8 = 0x5E
+pub let opcode_f32_le: u8 = 0x5F
+pub let opcode_f32_ge: u8 = 0x60
+pub let opcode_f64_eq: u8 = 0x61
+pub let opcode_f64_ne: u8 = 0x62
+pub let opcode_f64_lt: u8 = 0x63
+pub let opcode_f64_gt: u8 = 0x64
+pub let opcode_f64_le: u8 = 0x65
+pub let opcode_f64_ge: u8 = 0x66
+# i32 arithmetic
+pub let opcode_i32_add: u8 = 0x6A
+pub let opcode_i32_sub: u8 = 0x6B
+pub let opcode_i32_mul: u8 = 0x6C
+pub let opcode_i32_div_s: u8 = 0x6D
+pub let opcode_i32_div_u: u8 = 0x6E
+pub let opcode_i32_rem_s: u8 = 0x6F
+pub let opcode_i32_rem_u: u8 = 0x70
+pub let opcode_i32_and: u8 = 0x71
+pub let opcode_i32_or: u8 = 0x72
+pub let opcode_i32_xor: u8 = 0x73
+pub let opcode_i32_shl: u8 = 0x74
+pub let opcode_i32_shr_s: u8 = 0x75
+pub let opcode_i32_shr_u: u8 = 0x76
+# i64 arithmetic
+pub let opcode_i64_add: u8 = 0x7C
+pub let opcode_i64_sub: u8 = 0x7D
+pub let opcode_i64_mul: u8 = 0x7E
+pub let opcode_i64_div_s: u8 = 0x7F
+pub let opcode_i64_div_u: u8 = 0x80
+pub let opcode_i64_rem_s: u8 = 0x81
+pub let opcode_i64_rem_u: u8 = 0x82
+pub let opcode_i64_and: u8 = 0x83
+pub let opcode_i64_or: u8 = 0x84
+pub let opcode_i64_xor: u8 = 0x85
+pub let opcode_i64_shl: u8 = 0x86
+pub let opcode_i64_shr_s: u8 = 0x87
+pub let opcode_i64_shr_u: u8 = 0x88
+# float arithmetic
+pub let opcode_f32_neg: u8 = 0x8C
+pub let opcode_f32_add: u8 = 0x92
+pub let opcode_f32_sub: u8 = 0x93
+pub let opcode_f32_mul: u8 = 0x94
+pub let opcode_f32_div: u8 = 0x95
+pub let opcode_f64_neg: u8 = 0x9A
+pub let opcode_f64_add: u8 = 0xA0
+pub let opcode_f64_sub: u8 = 0xA1
+pub let opcode_f64_mul: u8 = 0xA2
+pub let opcode_f64_div: u8 = 0xA3
+# Conversions
+pub let opcode_i32_wrap_i64: u8 = 0xA7
+# Bulk memory: `memory.copy` is the prefixed opcode `0xFC 0x0A` followed by
+# the destination and source memory indices (both 0, the single memory).
+pub let opcode_prefix_fc: u8 = 0xFC
+pub let subopcode_memory_copy: u8 = 0x0A
+pub let opcode_i32_trunc_f32_s: u8 = 0xA8
+pub let opcode_i32_trunc_f32_u: u8 = 0xA9
+pub let opcode_i32_trunc_f64_s: u8 = 0xAA
+pub let opcode_i32_trunc_f64_u: u8 = 0xAB
+pub let opcode_i64_extend_i32_s: u8 = 0xAC
+pub let opcode_i64_extend_i32_u: u8 = 0xAD
+pub let opcode_i64_trunc_f32_s: u8 = 0xAE
+pub let opcode_i64_trunc_f32_u: u8 = 0xAF
+pub let opcode_i64_trunc_f64_s: u8 = 0xB0
+pub let opcode_i64_trunc_f64_u: u8 = 0xB1
+pub let opcode_f32_convert_i32_s: u8 = 0xB2
+pub let opcode_f32_convert_i32_u: u8 = 0xB3
+pub let opcode_f32_convert_i64_s: u8 = 0xB4
+pub let opcode_f32_convert_i64_u: u8 = 0xB5
+pub let opcode_f32_demote_f64: u8 = 0xB6
+pub let opcode_i32_reinterpret_f32: u8 = 0xBC
+pub let opcode_i64_reinterpret_f64: u8 = 0xBD
+pub let opcode_f64_convert_i32_s: u8 = 0xB7
+pub let opcode_f64_convert_i32_u: u8 = 0xB8
+pub let opcode_f64_convert_i64_s: u8 = 0xB9
+pub let opcode_f64_convert_i64_u: u8 = 0xBA
+pub let opcode_f64_promote_f32: u8 = 0xBB
+pub let opcode_i32_extend8_s: u8 = 0xC0
+pub let opcode_i32_extend16_s: u8 = 0xC1
 
 # mark: LEB128 =================================================================================
 
@@ -29,3 +231,83 @@ pub func append_signed(output: list[u8], number: i64):
         if not finished: byte = byte | 0x80
         output.append(u8(byte))
         if finished: return
+
+# mark: Shared byte emitters ===================================================================
+
+pub func append_constant(body: list[u8], value: i64, is_wide: bool):
+    body.append(pick(is_wide, opcode_i64_const, opcode_i32_const))
+    append_signed(body, value)
+
+pub func append_function_descriptor(plan: ModulePlan, body: list[u8], function: FunctionId):
+    let offset = plan.function_descriptor_offsets[function.value]
+    if offset < 0: trap("module plan omitted a function callback descriptor")
+    append_constant(body, offset, false)
+
+pub func append_memory_op(body: list[u8], opcode: u8, alignment: i64):
+    body.append(opcode)
+    append_unsigned(body, alignment)
+    append_unsigned(body, 0)
+
+# `if <condition> unreachable end`: trap when the i32 on the stack is true.
+pub func append_trap_if_true(body: list[u8]):
+    body.append(opcode_if)
+    body.append(empty_block_type)
+    body.append(opcode_unreachable)
+    body.append(opcode_end)
+
+pub func encode_function_value(body: list[u8], destination: RegisterId, function: FunctionId?, environment: RegisterId?):
+    local_get(body, destination)
+    var table_slot: i64 = 0
+    if function != none: table_slot = i64(function.value)
+    append_constant(body, table_slot, false)
+    append_memory_op(body, opcode_i32_store, 2)
+    local_get(body, destination)
+    append_constant(body, 4, false)
+    body.append(opcode_i32_add)
+    if environment == none: append_constant(body, 0, false)
+    else: local_get(body, environment)
+    append_memory_op(body, opcode_i32_store, 2)
+
+pub func encode_index_guard(plan: ModulePlan, body: list[u8], value: RegisterId, index: RegisterId, allow_end: bool, length_service: FunctionId):
+    local_get(body, index)
+    local_get(body, value)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(length_service.value)))
+    if allow_end: body.append(opcode_i64_gt_u)
+    else: body.append(opcode_i64_ge_u)
+    append_trap_if_true(body)
+
+pub func encode_pointer_runtime_call(program: MirProgram, plan: ModulePlan, body: list[u8], service: RuntimeService, value: RegisterId, instruction: str) -> !:
+    let target = find_runtime_binding(program, service) else error("wasm backend: verified `" + instruction + "` has no runtime binding")
+    local_get(body, value)
+    body.append(opcode_call)
+    append_unsigned(body, defined_function_index(plan, i64(target.value)))
+
+pub func local_get(body: list[u8], register: RegisterId):
+    body.append(opcode_local_get)
+    append_unsigned(body, i64(register.value))
+
+pub func local_get_index(body: list[u8], index: i64):
+    body.append(opcode_local_get)
+    append_unsigned(body, index)
+
+pub func local_set(body: list[u8], register: RegisterId):
+    body.append(opcode_local_set)
+    append_unsigned(body, i64(register.value))
+
+pub func local_set_index(body: list[u8], index: i64):
+    body.append(opcode_local_set)
+    append_unsigned(body, index)
+
+pub func pick(is_wide: bool, wide: u8, narrow: u8) -> u8:
+    if is_wide: return wide
+    return narrow
+
+pub func recycling_alignment(plan: ModulePlan, alignment: i64) -> i64:
+    let pointer_alignment = plan.layout.pointer_align()
+    if alignment < pointer_alignment: return pointer_alignment
+    return alignment
+
+pub func storage_alignment(plan: ModulePlan, element_type: TypeId) -> i64:
+    return recycling_alignment(plan, plan.layout.align_of(element_type))
+

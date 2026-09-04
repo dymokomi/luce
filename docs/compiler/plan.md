@@ -10,7 +10,7 @@ changes. Checked items stay here only when their condensed decision or
 dependency context is needed to understand the remaining sequence;
 `done.md` owns the full evidence. Do not let either drift into a wish list.
 
-Last updated: 2026-09-03 (Stage-0 0.30); Base sequenced into stage 1.
+Last updated: 2026-09-03 (Stage-0 0.30); Base sequenced into stage 1; B0 landed.
 
 ## Current resumption snapshot
 
@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 972 compiler tests across 37 files, plus the
+The repository currently proves 976 compiler tests across 47 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -304,6 +304,22 @@ examples/base/                          Base examples
   `node_children`/`type_form_key`/`mir_type_key` entry, whichever profile
   owns it; `profile.luc` says which profile admits it.
 
+B0 landed on 2026-09-03 (`done.md` §2): the layout above exists with
+`profiles/full/{hir,mir,backends}/`, the six dispatch points hand over
+through host interfaces declared beside the shared state
+(`HirSemanticChecker`, `FunctionLoweringHost`, `HirExecutionHost`,
+`MirExecutionHost`, `QbeEmissionHost`; the Wasm encoder dispatches through
+free functions over the shared byte vocabulary in `backends/wasm_encoding`),
+and the QBE IL of every example is byte-identical to the pre-split tree. Two
+placements were decided during the move: the HIR checker for interface-typed
+values stays shared in `hir/interfaces/values.luc`, because Base also types
+interface values and differs only in representation (its boxing, retain/
+release, and dispatch legalization are in the profile); and the pure value
+helpers of both oracles (`backends/hir_values.luc`, the `*_execution_model`
+files) stay shared, because equality, hashing, and place walkers over the
+one `Value` vocabulary are not profile code. Base gets `profiles/base/` with
+B1.
+
 ### 5.1 Base, runtime, standard library, self-hosting
 
 Each row is one independently committable vertical slice with the same six
@@ -315,14 +331,6 @@ focused example. `base.md` §8.9 records the one exception: the reference
 interpreter rejects `asm`, so those programs are proved by the compiled
 backends only.
 
-- [ ] **B0 — the profile layout.** Create `profile.luc` and the two profile
-  folders; move the full-Luce-only code (classes, collections, closures,
-  workers, existential interface values) out of `body_checker`,
-  `function_lowerer`, the interpreters, and the backends into
-  `profiles/full/` as classes over the shared state, leaving one dispatch
-  point per stage; add the folder rules to `test.sh`. Purely mechanical,
-  gate green, no behavior change; it also splits the two largest files at a
-  real seam.
 - [ ] **B1 — the Base profile.** Select the profile by the `.lucb` suffix
   (and rename the audited tier to `.lucn`, `base.md` §16.2); admit the Base
   reserved words and the `@`, `---`, `...`, and wrapping/saturating/checked

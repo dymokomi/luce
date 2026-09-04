@@ -1,0 +1,139 @@
+#==============================================================================================
+#
+#   workers_test - Structured workers resolve into typed HIR
+#
+#   DESCRIPTION:
+#       `spawn`, task handles, `wait_all`, and worker-boundary sendability
+#       (profiles/full/hir/checker.luc and sendability.luc).
+#
+#==============================================================================================
+
+from luce.compiler.hir.ir import describe_type
+from compiler.hir.generator_support import checked, expect_failure, form, source_module
+
+
+pub func test_task_types_are_locally_storable_and_visible_to_direct_luce_calls():
+    let program = checked([source_module("main",
+        "func inspect[T](work: task[T], batch: list[task[T]]):\n"
+        + "    let alias = work\n"
+        + "    let local: list[task[T]] = [work, alias]\n"
+        + "    discard(local)\n"
+        + "    discard(batch)\n"
+        + "func use(work: task[i64]):\n"
+        + "    inspect(work, [work])\n"
+    )])
+    assert(describe_type(program.types, program.functions[len(program.functions) - 1].parameters[0].value_type) == "task[i64]")
+
+pub func test_spawn_wait_cancel_and_wait_all_are_resolved_worker_operations():
+    let program = checked([source_module("main",
+        "func double(value: i64) -> i64: return value * 2\n"
+        + "func fallible(value: i64) -> i64!: return value\n"
+        + "func identity[T](value: T) -> T: return value\n"
+        + "func run() -> i64!:\n"
+        + "    let first: task[i64] = spawn double(2)\n"
+        + "    let second = spawn fallible(value = 3)\n"
+        + "    let third = spawn identity(4)\n"
+        + "    defer third.cancel()\n"
+        + "    let values = try wait_all([first, second, third])\n"
+        + "    discard(try first.wait())\n"
+        + "    return values[0]\n"
+    )])
+    var spawns = 0
+    var waits = 0
+    var cancellations = 0
+    var wait_all = 0
+    for index in range(0, len(program.nodes)):
+        match program.nodes[index].form:
+            Spawn(function, arguments):
+                spawns += 1
+                assert(describe_type(program.types, program.node_types[index]) == "task[i64]")
+            TaskWait(value): waits += 1
+            TaskCancel(value): cancellations += 1
+            TaskWaitAll(tasks): wait_all += 1
+            else: pass
+    assert(spawns == 3)
+    assert(waits == 1)
+    # Defer retains the checked source operation and one captured cleanup
+    # operation; only the latter is reachable from the function body.
+    assert(cancellations == 2)
+    assert(wait_all == 1)
+
+pub func test_frozen_collection_snapshots_are_typed_sendable_values():
+    let program = checked([source_module("main",
+        "func inspect(values: frozen_list[i64], table: frozen_map[str, i64], tags: frozen_set[str]) -> i64:\n"
+        + "    return values[0u64] + (table[\"answer\"] else 0) if tags.contains(\"ready\") else 0\n"
+        + "func run() -> i64!:\n"
+        + "    let values = [1, 2].snapshot()\n"
+        + "    let table = {\"answer\": 41}.snapshot()\n"
+        + "    let tags = set[str](\"ready\").snapshot()\n"
+        + "    let work = spawn inspect(values, table, tags)\n"
+        + "    return try work.wait()\n"
+    )])
+    var snapshots = 0
+    var frozen_types = 0
+    for definition in program.types.definitions:
+        match definition.form:
+            FrozenList(element): frozen_types += 1
+            FrozenMap(key, element): frozen_types += 1
+            FrozenSet(element): frozen_types += 1
+            else: pass
+    for index in range(0, len(program.nodes)):
+        match program.nodes[index].form:
+            CollectionSnapshot(value):
+                snapshots += 1
+                let rendered = describe_type(program.types, program.node_types[index])
+                assert(rendered == "frozen_list[i64]" or rendered == "frozen_map[str, i64]" or rendered == "frozen_set[str]")
+            else: pass
+    assert(snapshots == 3)
+    assert(frozen_types == 3)
+
+    expect_failure([source_module("main",
+        "class Box:\n"
+        + "    func init(self): return\n"
+        + "func bad(values: list[Box]):\n"
+        + "    let frozen = values.snapshot()\n"
+    )], "main.luc:4:18: snapshot element has non-sendable type `Box`: class identity is shared mutable state")
+
+pub func test_spawn_sendability_reports_the_exact_rejected_type_path():
+    expect_failure([source_module("main",
+        "struct Envelope:\n"
+        + "    let values: list[i64]\n"
+        + "func worker(value: Envelope) -> i64: return 0\n"
+        + "func bad(value: Envelope):\n"
+        + "    let work = spawn worker(value)\n"
+    )], "main.luc:5:29: spawn argument `value`.values has non-sendable type `list[i64]`: mutable list identity is not sendable; transfer an immutable snapshot")
+    expect_failure([source_module("main",
+        "class Box:\n"
+        + "    func init(self): return\n"
+        + "func worker() -> Box: return new Box()\n"
+        + "func bad():\n"
+        + "    let work = spawn worker()\n"
+    )], "main.luc:5:16: worker result of `worker` has non-sendable type `Box`: class identity is shared mutable state")
+    expect_failure([source_module("main",
+        "func worker(value: task[i64]) -> i64: return 0\n"
+        + "func bad(existing: task[i64]):\n"
+        + "    let work = spawn worker(existing)\n"
+    )], "main.luc:3:29: spawn argument `value` has non-sendable type `task[i64]`: task handles belong to their creating function's structured group")
+    expect_failure([source_module("main",
+        "func worker[T](value: T) -> T: return value\n"
+        + "func launch[T](value: T):\n"
+        + "    let work = spawn worker(value)\n"
+    )], "main.luc:3:29: spawn argument `value` has non-sendable type `T`: sendability cannot be proven for an abstract type parameter")
+
+pub func test_spawn_accepts_only_statically_named_luce_functions():
+    expect_failure([source_module("main", "extern func external(value: i64) -> i64\nfunc bad(): let work = spawn external(1)\n")], "main.luc:2:30: `spawn` requires a Luce function body, not extern C function `external`")
+    expect_failure([source_module("main", "func worker(value: i64) -> i64: return value\nfunc bad():\n    let selected = worker\n    let work = spawn selected(1)\n")], "main.luc:4:22: `spawn` requires a statically named Luce function")
+    expect_failure([source_module("main", "struct Pair:\n    let value: i64\nfunc bad(): let work = spawn Pair(1)\n")], "main.luc:3:30: `spawn` requires a statically named Luce function")
+
+pub func test_task_lifetimes_reject_every_persistent_or_dynamic_escape():
+    expect_failure([source_module("main", "func bad(work: task[i64]) -> task[i64]: return work\n")], "main.luc:1:1: a function cannot return a structured `task` or a value containing one")
+    expect_failure([source_module("main", "struct Bad:\n    let work: task[i64]\n")], "main.luc:2:5: field `work` cannot outlive its structured `task` group")
+    expect_failure([source_module("main", "enum Bad:\n    value(work: task[i64])\n")], "main.luc:2:5: case payload `work` cannot outlive its structured `task` group")
+    expect_failure([source_module("main", "func bad(work: task[i64]):\n    let callback = func ():\n        discard(work)\n")], "main.luc:3:17: a structured `task` cannot be captured by a closure")
+    expect_failure([source_module("main", "func bad(work: task[i64]):\n    let callback = func [copy saved = work] ():\n        return\n")], "main.luc:2:26: closure capture `saved` cannot outlive its structured `task` group")
+    expect_failure([source_module("main", "func bad(callback: func(task[i64]) -> unit): return\n")], "main.luc:1:25: a function value cannot receive a structured `task`; use a direct Luce call")
+    expect_failure([source_module("main", "func receive(work: task[i64]): return\nfunc bad():\n    let callback = receive\n")], "main.luc:3:20: function `receive` receives a structured `task` and may be called only by direct name")
+    expect_failure([source_module("main", "func hide[T](value: T): return\nfunc bad(work: task[i64]): hide(work)\n")], "main.luc:2:28: parameter `value` cannot hide a structured `task` inside an unconstrained generic parameter")
+    expect_failure([source_module("main", "func mixed[T, U](visible: task[T], hidden: U): return\nfunc bad(first: task[i64], second: task[i64]): mixed(first, second)\n")], "main.luc:2:48: parameter `hidden` cannot hide a structured `task` inside an unconstrained generic parameter")
+    expect_failure([source_module("main", "interface Dynamic:\n    func accept(self, work: task[i64])\n")], "main.luc:2:23: an interface requirement cannot receive a structured `task`; use a direct Luce call")
+    expect_failure([source_module("main", "func bad(work: task[i64!]): return\n")], "main.luc:1:21: `task` names the successful worker result; write `task[T]`, not `task[T!]`")

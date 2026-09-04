@@ -1,0 +1,991 @@
+#==============================================================================================
+#
+#   hir_values - Operations on semantic values
+#
+#   DESCRIPTION:
+#       The value model the HIR interpreter computes with: binding lookup,
+#       assignment-place reads and rebuilds, the checked operators and host
+#       arithmetic, cycle-aware structural equality, structural hashing,
+#       display, and numeric construction. Every function here is pure over
+#       `Value` and the program's type table; none walks HIR nodes. The
+#       interpreter and its profile executor both consume this module, so it
+#       imports neither.
+#
+#==============================================================================================
+
+from compiler.backends.hir_execution_model import AssignmentPlaceStep, Binding
+from compiler.hir.ir import SymbolId
+from compiler.hir.ir import BinaryOperation, BoxedValue, FrozenHashEntry, FrozenHashStorage, HashEntry, HashStorage, ListBuffer, ListStorage, TypeId, TypeTable, UnaryOperation, Value, WeakClassStorage
+from compiler.hir.ir import floating_bit_width, integer_bit_width, integer_maximum, integer_minimum, unsigned_integer_maximum
+from compiler.hir.ir import is_floating_type, is_unsigned_integer_type
+from compiler.formatting.float_display import display_float32, display_float64
+from compiler.formatting.ieee import normalize_ieee_float
+import std.strings
+
+# mark: Bindings ==============================================================================
+
+# Weak slots never expose their storage carrier to source semantics. Reading
+# one atomically promotes a live host weak edge to the ordinary optional class
+# value used for the remainder of the expression.
+pub func weak_class_value(storage: WeakClassStorage) -> Value:
+    let target = storage.target
+    if target == none: return Value.Absent
+    if not target.is_alive: return Value.Absent
+    return Value.Present(value = BoxedValue(value = Value.Class(storage = target)))
+
+# Store one source optional class value without retaining its referent.
+pub func weak_class_storage_value(value: Value) -> Value:
+    match value:
+        Absent: return Value.WeakClass(storage = WeakClassStorage(none))
+        Present(boxed):
+            match boxed.value:
+                Class(storage): return Value.WeakClass(storage = WeakClassStorage(storage))
+                else: trap("weak field received a non-class optional payload")
+        else: trap("weak field received a non-optional HIR value")
+
+# The place an expression names: a reference, or fields reached from one.
+# Read the value selected by a fully evaluated mixed field/array place.
+pub func value_at_assignment_place(value: Value, steps: list[AssignmentPlaceStep], start: i64) -> Value!:
+    if start >= len(steps): return value
+    match steps[start]:
+        Field(index):
+            match value:
+                Record(fields): return try value_at_assignment_place(fields[index].value, steps, start + 1)
+                else: trap("field step applied to a non-struct HIR value")
+        ClassField(index):
+            match value:
+                Class(storage): return try value_at_assignment_place(storage.fields[index].value, steps, start + 1)
+                else: trap("class-field step applied to a non-class HIR value")
+        WeakField(index):
+            match value:
+                Class(storage):
+                    match storage.fields[index].value:
+                        WeakClass(slot): return try value_at_assignment_place(weak_class_value(slot), steps, start + 1)
+                        else: trap("weak class field has owning storage")
+                else: trap("weak-field step applied to a non-class HIR value")
+        Element(index):
+            match value:
+                Array(elements):
+                    if index < 0 or index >= len(elements): error("interpreter: index out of bounds")
+                    return try value_at_assignment_place(elements[index].value, steps, start + 1)
+                else: trap("element step applied to a non-array HIR value")
+        ListElement(index):
+            match value:
+                List(storage):
+                    if index < 0 or index >= len(storage.buffer.elements): error("interpreter: index out of bounds")
+                    return try value_at_assignment_place(storage.buffer.elements[index].value, steps, start + 1)
+                else: trap("list element step applied to a non-list HIR value")
+        MutableSliceElement(index):
+            match value:
+                MutableSlice(storage):
+                    if index < 0 or index >= len(storage.list.buffer.elements): error("interpreter: index out of bounds")
+                    return try value_at_assignment_place(storage.list.buffer.elements[index].value, steps, start + 1)
+                else: trap("mutable-slice element step applied to a non-view HIR value")
+        MapElement(key):
+            match value:
+                Map(storage):
+                    let selected = try find_hash_entry(storage, key.value)
+                    if selected < 0: trap("absent map value was read as an assignment place")
+                    return try value_at_assignment_place(storage.entries[selected].value.value, steps, start + 1)
+                else: trap("map element step applied to a non-map HIR value")
+
+# Preserve every immutable snapshot by moving a list identity to a new buffer
+# immediately before its first subsequent write. Aliases share ListStorage and
+# therefore observe the same detachment and mutation.
+pub func detach_list(storage: ListStorage):
+    if not storage.has_snapshot: return
+    let elements = list[BoxedValue]()
+    for element in storage.buffer.elements: elements.append(element)
+    storage.buffer = ListBuffer(elements)
+    storage.has_snapshot = false
+
+# Rebuild each enclosing value aggregate with the selected place replaced.
+pub func value_with_assignment_place(value: Value, steps: list[AssignmentPlaceStep], start: i64, replacement: Value) -> Value!:
+    if start >= len(steps): return replacement
+    match steps[start]:
+        Field(selected):
+            match value:
+                Record(fields):
+                    let rebuilt = list[BoxedValue]()
+                    for index in range(0, len(fields)):
+                        if index == selected:
+                            rebuilt.append(BoxedValue(value = try value_with_assignment_place(fields[index].value, steps, start + 1, replacement)))
+                        else: rebuilt.append(fields[index])
+                    return Value.Record(fields = rebuilt)
+                else: trap("field step applied to a non-struct HIR value")
+        ClassField(selected):
+            match value:
+                Class(storage):
+                    storage.fields[selected] = BoxedValue(value = try value_with_assignment_place(storage.fields[selected].value, steps, start + 1, replacement))
+                    return value
+                else: trap("class-field step applied to a non-class HIR value")
+        WeakField(selected):
+            if start + 1 != len(steps): trap("weak-field step cannot contain a nested assignment")
+            match value:
+                Class(storage):
+                    storage.fields[selected] = BoxedValue(value = weak_class_storage_value(replacement))
+                    return value
+                else: trap("weak-field step applied to a non-class HIR value")
+        Element(selected):
+            match value:
+                Array(elements):
+                    if selected < 0 or selected >= len(elements): error("interpreter: index out of bounds")
+                    let rebuilt = list[BoxedValue]()
+                    for index in range(0, len(elements)):
+                        if index == selected:
+                            rebuilt.append(BoxedValue(value = try value_with_assignment_place(elements[index].value, steps, start + 1, replacement)))
+                        else: rebuilt.append(elements[index])
+                    return Value.Array(elements = rebuilt)
+                else: trap("element step applied to a non-array HIR value")
+        ListElement(selected):
+            match value:
+                List(storage):
+                    if selected < 0 or selected >= len(storage.buffer.elements): error("interpreter: index out of bounds")
+                    detach_list(storage)
+                    storage.buffer.elements[selected] = BoxedValue(value = try value_with_assignment_place(storage.buffer.elements[selected].value, steps, start + 1, replacement))
+                    return value
+                else: trap("list element step applied to a non-list HIR value")
+        MutableSliceElement(selected):
+            match value:
+                MutableSlice(storage):
+                    if selected < 0 or selected >= len(storage.list.buffer.elements): error("interpreter: index out of bounds")
+                    detach_list(storage.list)
+                    storage.list.buffer.elements[selected] = BoxedValue(value = try value_with_assignment_place(storage.list.buffer.elements[selected].value, steps, start + 1, replacement))
+                    return value
+                else: trap("mutable-slice element step applied to a non-view HIR value")
+        MapElement(key):
+            if start + 1 != len(steps): trap("map element step cannot contain a nested assignment")
+            match value:
+                Map(storage):
+                    let selected = try find_hash_entry(storage, key.value)
+                    if selected >= 0:
+                        storage.entries[selected].value = BoxedValue(value = replacement)
+                    else:
+                        try require_hash_shape_mutable(storage, "map")
+                        storage.entries.append(HashEntry(key = key, value = BoxedValue(value = replacement)))
+                    return value
+                else: trap("map element step applied to a non-map HIR value")
+
+# Remove locals introduced after a lexical scope began.
+pub func trim_bindings(bindings: list[Binding], count: i64):
+    while len(bindings) > count: bindings.remove(len(bindings) - 1)
+
+# Innermost binding first, so a suite's binding wins over an outer one.
+pub func find_binding(bindings: list[Binding], symbol: SymbolId) -> i64:
+    var index = len(bindings) - 1
+    while index >= 0:
+        if bindings[index].symbol.value == symbol.value: return index
+        index -= 1
+    return -1
+
+# mark: Worker-domain transfer =================================================================
+
+# mark: Operators =============================================================================
+
+# Extract the bool proven by HIR typing, trapping only on a compiler defect.
+pub func as_boolean(value: Value) -> bool:
+    match value:
+        Boolean(item): return item
+        else: trap("typed Boolean expression contains another value")
+
+# mark: Display ================================================================================
+
+## Canonical user-facing spellings for the closed builtin Display family.
+## Numeric width lives in the checked HIR type, but decimal spelling depends
+## only on the mathematical value retained by the semantic oracle.
+pub func display_builtin(value: Value, value_type: TypeId, types: TypeTable) -> str:
+    match value:
+        Boolean(item):
+            if item: return "true"
+            return "false"
+        SignedInteger(item): return str(item)
+        UnsignedInteger(item): return str(item)
+        Floating(item):
+            if floating_bit_width(types, value_type) <= 32: return display_float32(f32(item))
+            return display_float64(item)
+        Character(item): return str(item)
+        else: trap("BuiltinDisplay received a non-displayable HIR value")
+
+# mark: Primitive operations ==================================================================
+
+# Apply one resolved unary operation. For example, `NumericNegate(i64)` maps
+# integer 3 to -3 without consulting source `-` spelling.
+pub func evaluate_unary(operation: UnaryOperation, value: Value, types: TypeTable) -> Value!:
+    match operation:
+        LogicalNot:
+            match value:
+                Boolean(item): return Value.Boolean(value = not item)
+                else: trap("LogicalNot received a non-boolean HIR value")
+        NumericIdentity(operand_type):
+            match value:
+                SignedInteger(item): return value
+                UnsignedInteger(item): return value
+                Floating(item): return value
+                else: trap("NumericIdentity received a non-numeric HIR value")
+        NumericNegate(operand_type):
+            match value:
+                SignedInteger(item): return try checked_integer_result(try checked_subtract(0, item), operand_type, types)
+                Floating(item): return Value.Floating(value = normalize_float(-item, operand_type, types))
+                else: trap("NumericNegate received a non-numeric HIR value")
+        IntegerBitwiseNot(operand_type):
+            match value:
+                SignedInteger(item): return Value.SignedInteger(value = ~item)
+                UnsignedInteger(item):
+                    # Fixed width: `~0u8` is 255, never host-width u64.max.
+                    return Value.UnsignedInteger(value = unsigned_integer_maximum(types, operand_type) - item)
+                else: trap("IntegerBitwiseNot received a non-integer HIR value")
+
+# Dispatch on the value family; HirGenerator already guaranteed both sides
+# share it, so a mismatch here is a compiler bug, not a user error.
+pub func evaluate_binary(left: Value, operation: BinaryOperation, right: Value, types: TypeTable) -> Value!:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = try values_equal(left, right, EqualityContext()))
+        NotEqual(operand_type): return Value.Boolean(value = not (try values_equal(left, right, EqualityContext())))
+        else: pass
+    match left:
+        Unit:
+            match right:
+                Unit: return evaluate_unit_binary(operation)
+                else: trap("typed binary expression has unequal value types")
+        Boolean(left_value):
+            match right:
+                Boolean(right_value): return evaluate_boolean_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        SignedInteger(left_value):
+            match right:
+                SignedInteger(right_value): return try evaluate_integer_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        UnsignedInteger(left_value):
+            match right:
+                UnsignedInteger(right_value): return try evaluate_unsigned_integer_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Foreign(left_token):
+            match right:
+                Foreign(right_token): return evaluate_optional_equality(left_token == right_token, operation)
+                else: trap("typed binary expression has unequal value types")
+        Floating(left_value):
+            match right:
+                Floating(right_value): return evaluate_float_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Character(left_value):
+            match right:
+                Character(right_value): return evaluate_comparable_equality(str(left_value) == str(right_value), u32(left_value) < u32(right_value), operation)
+                else: trap("typed binary expression has unequal value types")
+        Text(left_value):
+            match right:
+                Text(right_value): return evaluate_text_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        Bytes(left_value):
+            match right:
+                Bytes(right_value): return evaluate_bytes_binary(left_value, operation, right_value)
+                else: trap("typed binary expression has unequal value types")
+        Tuple(left_value):
+            match right:
+                Tuple(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Array(left_value):
+            match right:
+                Array(right_value): return try evaluate_tuple_binary(left_value, operation, right_value, types)
+                else: trap("typed binary expression has unequal value types")
+        Function(symbol): trap("function values have no binary operations")
+        Closure(storage): trap("closure values have no binary operations")
+        Interface(storage): trap("interface values have no binary operations")
+        CFunction(identity): trap("cfunc values have no binary operations")
+        Task(storage): trap("task handles have no binary operations")
+        FrozenList(storage): trap("frozen lists have no non-structural binary operations")
+        FrozenMap(storage): trap("frozen maps have no non-structural binary operations")
+        FrozenSet(storage): trap("frozen sets have no non-structural binary operations")
+        Record(left_fields):
+            match right:
+                Record(right_fields): return try evaluate_tuple_binary(left_fields, operation, right_fields, types)
+                else: trap("typed binary expression has unequal value types")
+        Class(left_storage):
+            match right:
+                Class(right_storage):
+                    match operation:
+                        Identity(operand_type): return Value.Boolean(value = left_storage is right_storage)
+                        NotIdentity(operand_type): return Value.Boolean(value = not (left_storage is right_storage))
+                        else: trap("classes support identity operations only")
+                else: trap("typed binary expression has unequal value types")
+        WeakClass(storage): trap("hidden weak storage escaped field access")
+        CapturedCell(storage): trap("hidden captured-cell storage escaped source reads")
+        Variant(left_case, left_payload):
+            match right:
+                Variant(right_case, right_payload):
+                    if left_case != right_case: return evaluate_optional_equality(false, operation)
+                    return try evaluate_tuple_binary(left_payload, operation, right_payload, types)
+                else: trap("typed binary expression has unequal value types")
+        Absent:
+            match right:
+                Absent: return evaluate_optional_equality(true, operation)
+                Present(item): return evaluate_optional_equality(false, operation)
+                else: trap("typed binary expression has unequal value types")
+        Present(left_value):
+            match right:
+                Absent: return evaluate_optional_equality(false, operation)
+                Present(right_value): return try evaluate_binary(left_value.value, operation, right_value.value, types)
+                else: trap("typed binary expression has unequal value types")
+        FallibleSuccess(value): trap("fallible call outcome escaped `try` or `catch`")
+        FallibleFailure(error_value): trap("fallible call outcome escaped `try` or `catch`")
+        Slice(storage): trap("slices have no binary operations in the current slice")
+        MutableSlice(storage): trap("mutable slices have no binary operations")
+        List(left_storage):
+            match right:
+                List(right_storage): return evaluate_list_binary(left_storage, operation, right_storage)
+                else: trap("typed binary expression has unequal value types")
+        Map(left_storage):
+            match right:
+                Map(right_storage): return evaluate_hash_identity(left_storage, operation, right_storage, "maps")
+                else: trap("typed binary expression has unequal value types")
+        Set(left_storage):
+            match right:
+                Set(right_storage): return evaluate_hash_identity(left_storage, operation, right_storage, "sets")
+                else: trap("typed binary expression has unequal value types")
+
+# Render the source-visible Error shape only at the host execution boundary.
+# Internal propagation retains the structured value and never parses text.
+pub func render_error(value: Value) -> str:
+    match value:
+        Record(error_fields):
+            if len(error_fields) != 2: return "malformed Error"
+            var message = "<non-string message>"
+            match error_fields[1].value:
+                Text(text): message = text
+                else: pass
+            match error_fields[0].value:
+                Record(code_fields):
+                    if len(code_fields) == 2:
+                        var domain = "<invalid package>"
+                        var code = -1
+                        match code_fields[0].value:
+                            Text(text): domain = text
+                            else: pass
+                        match code_fields[1].value:
+                            UnsignedInteger(number): code = i64(number)
+                            else: pass
+                        return domain + ":" + str(code) + ": " + message
+                else: pass
+            return "malformed Error: " + message
+        else: return "malformed Error"
+
+# Unit supports equality only; `unit == unit` is true.
+pub func evaluate_unit_binary(operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = true)
+        NotEqual(operand_type): return Value.Boolean(value = false)
+        else: trap("unit HIR value received a non-equality operation")
+
+# Apply resolved equality to two bool values.
+pub func evaluate_boolean_binary(left: bool, operation: BinaryOperation, right: bool) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        else: trap("boolean HIR values received a non-equality operation")
+
+# Apply resolved arithmetic, bitwise, equality, or ordering to integer values.
+pub func evaluate_integer_binary(left: i64, operation: BinaryOperation, right: i64, types: TypeTable) -> Value!:
+    match operation:
+        Add(operand_type): return try checked_integer_result(try checked_add(left, right), operand_type, types)
+        Subtract(operand_type): return try checked_integer_result(try checked_subtract(left, right), operand_type, types)
+        Multiply(operand_type): return try checked_integer_result(try checked_multiply(left, right), operand_type, types)
+        FloorDivide(operand_type): return try checked_integer_result(try checked_floor_divide(left, right), operand_type, types)
+        Remainder(operand_type): return try checked_integer_result(try checked_remainder(left, right), operand_type, types)
+        BitwiseAnd(operand_type): return Value.SignedInteger(value = left & right)
+        BitwiseOr(operand_type): return Value.SignedInteger(value = left | right)
+        BitwiseXor(operand_type): return Value.SignedInteger(value = left ^ right)
+        ShiftLeft(operand_type):
+            try require_valid_shift(right, operand_type, types)
+            return Value.SignedInteger(value = normalize_shift_left(left, right, operand_type, types))
+        ShiftRight(operand_type):
+            try require_valid_shift(right, operand_type, types)
+            return Value.SignedInteger(value = left >> right)
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        Less(operand_type): return Value.Boolean(value = left < right)
+        LessEqual(operand_type): return Value.Boolean(value = left <= right)
+        Greater(operand_type): return Value.Boolean(value = left > right)
+        GreaterEqual(operand_type): return Value.Boolean(value = left >= right)
+        else: trap("typed integer expression contains an invalid operator")
+
+# Unsigned arithmetic uses u64 all the way through, then applies the resolved
+# source width. Guards run before host arithmetic so Stage-0 never decides a
+# Luce overflow on our behalf.
+pub func evaluate_unsigned_integer_binary(left: u64, operation: BinaryOperation, right: u64, types: TypeTable) -> Value!:
+    match operation:
+        Add(operand_type):
+            if left > u64(18446744073709551615) - right: try overflow()
+            return try checked_unsigned_integer_result(left + right, operand_type, types)
+        Subtract(operand_type):
+            if left < right: try overflow()
+            return try checked_unsigned_integer_result(left - right, operand_type, types)
+        Multiply(operand_type):
+            if right != u64(0) and left > u64(18446744073709551615) // right: try overflow()
+            return try checked_unsigned_integer_result(left * right, operand_type, types)
+        FloorDivide(operand_type):
+            if right == u64(0): error("interpreter: division by zero")
+            return Value.UnsignedInteger(value = left // right)
+        Remainder(operand_type):
+            if right == u64(0): error("interpreter: division by zero")
+            return Value.UnsignedInteger(value = left % right)
+        BitwiseAnd(operand_type): return Value.UnsignedInteger(value = left & right)
+        BitwiseOr(operand_type): return Value.UnsignedInteger(value = left | right)
+        BitwiseXor(operand_type): return Value.UnsignedInteger(value = left ^ right)
+        ShiftLeft(operand_type):
+            try require_valid_unsigned_shift(right, operand_type, types)
+            return Value.UnsignedInteger(value = shift_left_unsigned(left, i64(right), integer_bit_width(types, operand_type)))
+        ShiftRight(operand_type):
+            try require_valid_unsigned_shift(right, operand_type, types)
+            return Value.UnsignedInteger(value = left >> right)
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        Less(operand_type): return Value.Boolean(value = left < right)
+        LessEqual(operand_type): return Value.Boolean(value = left <= right)
+        Greater(operand_type): return Value.Boolean(value = left > right)
+        GreaterEqual(operand_type): return Value.Boolean(value = left >= right)
+        else: trap("typed unsigned integer expression contains an invalid operator")
+
+# mark: Checked host arithmetic ================================================================
+#
+# Signed values travel as host `i64`s, and Stage-0 itself traps when one of
+# those overflows. Every signed operation therefore proves the 64-bit result
+# exists before computing it; unsigned operations use the separate `u64`
+# path above. The final checked helper narrows to the resolved HIR width.
+
+let i64_minimum: i64 = -9223372036854775807 - 1
+let i64_maximum: i64 = 9223372036854775807
+
+pub func overflow() -> !:
+    error("interpreter: integer arithmetic overflow")
+
+pub func checked_add(left: i64, right: i64) -> i64!:
+    if right > 0 and left > i64_maximum - right: try overflow()
+    if right < 0 and left < i64_minimum - right: try overflow()
+    return left + right
+
+pub func checked_subtract(left: i64, right: i64) -> i64!:
+    if right < 0 and left > i64_maximum + right: try overflow()
+    if right > 0 and left < i64_minimum + right: try overflow()
+    return left - right
+
+# Compare magnitudes against `maximum // |right|` so the only 2^63 product,
+# `minimum` itself, is recognised without ever forming an overflowing value.
+pub func checked_multiply(left: i64, right: i64) -> i64!:
+    if left == 0 or right == 0: return 0
+    if left == 1: return right
+    if right == 1: return left
+    if left == i64_minimum or right == i64_minimum: try overflow()
+    let negative = (left < 0) != (right < 0)
+    var left_magnitude = left
+    if left_magnitude < 0: left_magnitude = 0 - left_magnitude
+    var right_magnitude = right
+    if right_magnitude < 0: right_magnitude = 0 - right_magnitude
+    let limit = i64_maximum // right_magnitude
+    if left_magnitude > limit:
+        let divides_exactly = i64_maximum % right_magnitude == right_magnitude - 1
+        if negative and divides_exactly and left_magnitude == limit + 1: return i64_minimum
+        try overflow()
+    return left * right
+
+pub func checked_floor_divide(left: i64, right: i64) -> i64!:
+    if right == 0: error("interpreter: division by zero")
+    if left == i64_minimum and right == -1: try overflow()
+    return left // right
+
+pub func checked_remainder(left: i64, right: i64) -> i64!:
+    if right == 0: error("interpreter: division by zero")
+    if right == -1: return 0
+    return left % right
+
+# Enforce the fixed width carried by HIR after a checked arithmetic operation.
+# For example, `2147483647i32 + 1i32` reports overflow.
+pub func checked_integer_result(value: i64, operand_type: TypeId, types: TypeTable) -> Value!:
+    if value < integer_minimum(types, operand_type) or value > integer_maximum(types, operand_type):
+        error("interpreter: integer arithmetic overflow")
+    return Value.SignedInteger(value = value)
+
+pub func checked_unsigned_integer_result(value: u64, operand_type: TypeId, types: TypeTable) -> Value!:
+    if value > unsigned_integer_maximum(types, operand_type):
+        error("interpreter: integer arithmetic overflow")
+    return Value.UnsignedInteger(value = value)
+
+# Reject a shift count outside the resolved operand width before Stage-0 can
+# apply its host-width behavior. For example, i32 counts must be in 0..<32.
+pub func require_valid_shift(count: i64, operand_type: TypeId, types: TypeTable) -> !:
+    let width = integer_bit_width(types, operand_type)
+    if width == 0: trap("shift applied to a non-integer HIR type")
+    if count < 0 or count >= width:
+        error("interpreter: shift count is outside integer width")
+
+pub func require_valid_unsigned_shift(count: u64, operand_type: TypeId, types: TypeTable) -> !:
+    let width = integer_bit_width(types, operand_type)
+    if width == 0: trap("shift applied to a non-integer HIR type")
+    if count >= u64(width): error("interpreter: shift count is outside integer width")
+
+# Shift one bit at a time after discarding the outgoing high bit. The value
+# that remains can always be doubled in host `u64`, including at width 64.
+pub func shift_left_unsigned(value: u64, count: i64, bits: i64) -> u64:
+    let high_bit = u64(1) << u64(bits - 1)
+    var result = value
+    for step in range(0, count):
+        if result >= high_bit: result -= high_bit
+        result += result
+    return result
+
+# Model fixed-width left shift while values are physically stored as i64.
+# `1i32 << 31i32`, for example, has the signed i32 value -2147483648.
+pub func normalize_shift_left(value: i64, count: i64, operand_type: TypeId, types: TypeTable) -> i64:
+    let width = integer_bit_width(types, operand_type)
+    if width == 0: trap("shift applied to a non-integer HIR type")
+    return shift_left_within(value, count, width, not is_unsigned_integer_type(types, operand_type))
+
+# Keep the low `bits` of a value, sign-extending for signed types.
+pub func wrap_to_width(value: i64, bits: i64, is_signed: bool) -> i64:
+    if bits >= 64: return value
+    let mask = (1 << bits) - 1
+    let low = value & mask
+    if is_signed and low >= (1 << (bits - 1)): return low - (mask + 1)
+    return low
+
+# Shift left within `bits`, dropping bits shifted past the width, without
+# ever forming a host `i64` that overflows (Stage-0 traps on `1 << 63`).
+# The surviving low `bits - count` bits of `value` are split into their top
+# bit and the rest; the rest shifts safely below bit 63, and the top bit is
+# added back as 2^(bits-1) — which for 64 bits is the i64 minimum.
+pub func shift_left_within(value: i64, count: i64, bits: i64, is_signed: bool) -> i64:
+    if count == 0: return wrap_to_width(value, bits, is_signed)
+    let keep = bits - count
+    var mask = 9223372036854775807
+    if keep < 63: mask = (1 << keep) - 1
+    let low = value & mask
+    let top = (low >> (keep - 1)) & 1
+    let rest = low & (mask >> 1)
+    var shifted = rest << count
+    if top == 1:
+        if bits == 64: shifted = shifted + (-9223372036854775807 - 1)
+        else: shifted = shifted + (1 << (bits - 1))
+    return wrap_to_width(shifted, bits, is_signed)
+
+# Derive every comparison from `equal` and `less`. Characters use this:
+# they order by Unicode code point, never by locale.
+pub func evaluate_comparable_equality(equal: bool, less: bool, operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = equal)
+        NotEqual(operand_type): return Value.Boolean(value = not equal)
+        Less(operand_type): return Value.Boolean(value = less)
+        LessEqual(operand_type): return Value.Boolean(value = less or equal)
+        Greater(operand_type): return Value.Boolean(value = not less and not equal)
+        GreaterEqual(operand_type): return Value.Boolean(value = not less)
+        else: trap("ordered HIR values received a non-comparison operation")
+
+# Valid UTF-8 preserves Unicode scalar order under unsigned byte comparison,
+# while the semantic oracle can compare its decoded strings directly.
+pub func evaluate_text_binary(left: str, operation: BinaryOperation, right: str) -> Value:
+    match operation:
+        Add(operand_type): return Value.Text(value = left + right)
+        else: return evaluate_comparable_equality(left == right, left < right, operation)
+
+# Byte strings concatenate and compare lexicographically by unsigned byte.
+pub func evaluate_bytes_binary(left: list[u8], operation: BinaryOperation, right: list[u8]) -> Value:
+    match operation:
+        Add(operand_type):
+            let joined = list[u8]()
+            for value in left: joined.append(value)
+            for value in right: joined.append(value)
+            return Value.Bytes(value = joined)
+        else: pass
+    var equal = len(left) == len(right)
+    var index = 0
+    while equal and index < len(left):
+        if left[index] != right[index]: equal = false
+        index += 1
+    var less = false
+    index = 0
+    while index < len(left) and index < len(right):
+        if left[index] < right[index]:
+            less = true
+            break
+        if left[index] > right[index]: break
+        index += 1
+    if index == len(left) and index < len(right): less = true
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = equal)
+        NotEqual(operand_type): return Value.Boolean(value = not equal)
+        Less(operand_type): return Value.Boolean(value = less)
+        LessEqual(operand_type): return Value.Boolean(value = less or equal)
+        Greater(operand_type): return Value.Boolean(value = not less and not equal)
+        GreaterEqual(operand_type): return Value.Boolean(value = not less)
+        else: trap("bytes HIR values received an unsupported operation")
+
+# Lists retain identity under assignment, but `+` constructs a fresh shallow
+# collection whose slots contain the left elements followed by the right.
+pub func evaluate_list_binary(left: ListStorage, operation: BinaryOperation, right: ListStorage) -> Value:
+    match operation:
+        Identity(operand_type): return Value.Boolean(value = left is right)
+        NotIdentity(operand_type): return Value.Boolean(value = not (left is right))
+        Add(operand_type):
+            let elements = list[BoxedValue]()
+            for element in left.buffer.elements: elements.append(element)
+            for element in right.buffer.elements: elements.append(element)
+            return Value.List(storage = ListStorage(elements))
+        else: trap("lists have no other binary operations in the current slice")
+
+pub func evaluate_hash_identity(left: HashStorage, operation: BinaryOperation, right: HashStorage, kind: str) -> Value:
+    match operation:
+        Identity(operand_type): return Value.Boolean(value = left is right)
+        NotIdentity(operand_type): return Value.Boolean(value = not (left is right))
+        else: trap(kind + " have no non-structural binary operation")
+
+# mark: Cycle-aware equality ==================================================================
+
+# A comparison is one coinductive transaction. Revisiting the same ordered
+# pair of list identities proves the recursive edge already being compared;
+# later scalar/shape differences in that transaction still make the root
+# unequal. Keeping pairs in the oracle, rather than on ListStorage, makes
+# equality reentrant and leaves collection identity unmodified.
+pub class EqualityContext:
+    let left_lists: list[ListStorage]
+    let right_lists: list[ListStorage]
+    let left_maps: list[HashStorage]
+    let right_maps: list[HashStorage]
+
+    pub init():
+        self.left_lists = list[ListStorage]()
+        self.right_lists = list[ListStorage]()
+        self.left_maps = list[HashStorage]()
+        self.right_maps = list[HashStorage]()
+
+    func seen_or_add(left: ListStorage, right: ListStorage) -> bool:
+        for index in range(0, len(self.left_lists)):
+            if self.left_lists[index] is left and self.right_lists[index] is right: return true
+        self.left_lists.append(left)
+        self.right_lists.append(right)
+        return false
+
+    func seen_map_or_add(left: HashStorage, right: HashStorage) -> bool:
+        for index in range(0, len(self.left_maps)):
+            if self.left_maps[index] is left and self.right_maps[index] is right: return true
+        self.left_maps.append(left)
+        self.right_maps.append(right)
+        return false
+
+pub func boxed_values_equal(left: list[BoxedValue], right: list[BoxedValue], context: EqualityContext) -> bool!:
+    if len(left) != len(right): return false
+    for index in range(0, len(left)):
+        if not (try values_equal(left[index].value, right[index].value, context)): return false
+    return true
+
+pub func byte_values_equal(left: list[u8], right: list[u8]) -> bool:
+    if len(left) != len(right): return false
+    for index in range(0, len(left)):
+        if left[index] != right[index]: return false
+    return true
+
+pub func find_hash_entry(storage: HashStorage, key: Value) -> i64!:
+    for index in range(0, len(storage.entries)):
+        if try values_equal(storage.entries[index].key.value, key, EqualityContext()): return index
+    return -1
+
+pub func find_frozen_hash_entry(storage: FrozenHashStorage, key: Value) -> i64!:
+    for index in range(0, len(storage.entries)):
+        if try values_equal(storage.entries[index].key.value, key, EqualityContext()): return index
+    return -1
+
+pub func values_equal(left: Value, right: Value, context: EqualityContext) -> bool!:
+    match left:
+        Unit:
+            match right:
+                Unit: return true
+                else: return false
+        Boolean(value):
+            match right:
+                Boolean(other): return value == other
+                else: return false
+        SignedInteger(value):
+            match right:
+                SignedInteger(other): return value == other
+                else: return false
+        UnsignedInteger(value):
+            match right:
+                UnsignedInteger(other): return value == other
+                else: return false
+        Foreign(value):
+            match right:
+                Foreign(other): return value == other
+                else: return false
+        Floating(value):
+            match right:
+                Floating(other): return value == other
+                else: return false
+        Character(value):
+            match right:
+                Character(other): return value == other
+                else: return false
+        Text(value):
+            match right:
+                Text(other): return value == other
+                else: return false
+        Bytes(value):
+            match right:
+                Bytes(other): return byte_values_equal(value, other)
+                else: return false
+        Tuple(values):
+            match right:
+                Tuple(other): return try boxed_values_equal(values, other, context)
+                else: return false
+        Array(values):
+            match right:
+                Array(other): return try boxed_values_equal(values, other, context)
+                else: return false
+        Record(values):
+            match right:
+                Record(other): return try boxed_values_equal(values, other, context)
+                else: return false
+        Variant(case_index, payload):
+            match right:
+                Variant(other_case, other_payload):
+                    return case_index == other_case and try boxed_values_equal(payload, other_payload, context)
+                else: return false
+        Absent:
+            match right:
+                Absent: return true
+                else: return false
+        Present(value):
+            match right:
+                Present(other): return try values_equal(value.value, other.value, context)
+                else: return false
+        List(storage):
+            match right:
+                List(other):
+                    if storage is other: return true
+                    if len(storage.buffer.elements) != len(other.buffer.elements): return false
+                    if context.seen_or_add(storage, other): return true
+                    return try boxed_values_equal(storage.buffer.elements, other.buffer.elements, context)
+                else: return false
+        Map(storage):
+            match right:
+                Map(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    if context.seen_map_or_add(storage, other): return true
+                    for entry in storage.entries:
+                        let found = try find_hash_entry(other, entry.key.value)
+                        if found < 0: return false
+                        if not (try values_equal(entry.value.value, other.entries[found].value.value, context)): return false
+                    return true
+                else: return false
+        Set(storage):
+            match right:
+                Set(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        if try find_hash_entry(other, entry.key.value) < 0: return false
+                    return true
+                else: return false
+        FrozenList(storage):
+            match right:
+                FrozenList(other): return try boxed_values_equal(storage.elements, other.elements, context)
+                else: return false
+        FrozenMap(storage):
+            match right:
+                FrozenMap(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        let found = try find_frozen_hash_entry(other, entry.key.value)
+                        if found < 0: return false
+                        if not (try values_equal(entry.value.value, other.entries[found].value.value, context)): return false
+                    return true
+                else: return false
+        FrozenSet(storage):
+            match right:
+                FrozenSet(other):
+                    if storage is other: return true
+                    if len(storage.entries) != len(other.entries): return false
+                    for entry in storage.entries:
+                        if try find_frozen_hash_entry(other, entry.key.value) < 0: return false
+                    return true
+                else: return false
+        else: trap("non-equatable HIR value reached structural equality")
+
+pub func require_list_shape_mutable(storage: ListStorage) -> !:
+    if storage.active_iterations > 0:
+        error("interpreter: list structurally modified during active iteration")
+
+pub func require_hash_shape_mutable(storage: HashStorage, kind: str) -> !:
+    if storage.active_iterations > 0:
+        error("interpreter: " + kind + " structurally modified during active iteration")
+
+# mark: Structural hashing ====================================================================
+
+# One deliberately private xorshift combiner. Hash values are execution-local
+# and have no persistent representation; this oracle needs only the language
+# invariant that equal values in one run produce equal codes.
+pub func mix_structural_hash(state: u64, value: u64) -> u64:
+    var mixed = state ^ value
+    # Reuse the oracle's explicit fixed-width shift because Stage-0 traps when
+    # a host expression itself discards a high bit.
+    mixed = mixed ^ shift_left_unsigned(mixed, 13, 64)
+    mixed = mixed ^ (mixed >> u64(7))
+    mixed = mixed ^ shift_left_unsigned(mixed, 17, 64)
+    return mixed
+
+pub func hash_bytes(state: u64, value: list[u8]) -> u64:
+    var result = mix_structural_hash(state, u64(len(value)))
+    for byte in value: result = mix_structural_hash(result, u64(byte))
+    return result
+
+pub func hash_values(state: u64, values: list[BoxedValue]) -> u64:
+    var result = mix_structural_hash(state, u64(len(values)))
+    for value in values: result = mix_structural_hash(result, structural_hash(value.value))
+    return result
+
+# Map and set equality ignores insertion order, so their structural hash must
+# combine entries commutatively. Each individual map entry still distinguishes
+# key from value and the outer type-specific state distinguishes map from set.
+pub func hash_frozen_entries(state: u64, entries: list[FrozenHashEntry], include_values: bool) -> u64:
+    var combined = u64(0)
+    for entry in entries:
+        var item = mix_structural_hash(u64(29), structural_hash(entry.key.value))
+        if include_values: item = mix_structural_hash(item, structural_hash(entry.value.value))
+        combined = combined ^ item
+    return mix_structural_hash(mix_structural_hash(state, u64(len(entries))), combined)
+
+pub func structural_hash(value: Value) -> u64:
+    let seed = u64(1469598103934665603)
+    match value:
+        Unit: return mix_structural_hash(seed, u64(1))
+        Boolean(item):
+            if item: return mix_structural_hash(seed, u64(2))
+            return mix_structural_hash(seed, u64(3))
+        SignedInteger(item):
+            var magnitude = u64(0)
+            if item < 0: magnitude = u64(0 - (item + 1))
+            else: magnitude = u64(item)
+            let signed = mix_structural_hash(seed, magnitude)
+            if item < 0: return mix_structural_hash(signed, u64(5))
+            return mix_structural_hash(signed, u64(4))
+        UnsignedInteger(item): return mix_structural_hash(seed, mix_structural_hash(u64(6), item))
+        Floating(item):
+            if item == 0.0: return mix_structural_hash(seed, u64(7))
+            return hash_bytes(mix_structural_hash(seed, u64(8)), strings.to_bytes(str(item)))
+        Character(item): return mix_structural_hash(seed, mix_structural_hash(u64(9), u64(u32(item))))
+        Text(item): return hash_bytes(mix_structural_hash(seed, u64(10)), strings.to_bytes(item))
+        Bytes(item): return hash_bytes(mix_structural_hash(seed, u64(11)), item)
+        Tuple(items): return hash_values(mix_structural_hash(seed, u64(12)), items)
+        Array(items): return hash_values(mix_structural_hash(seed, u64(13)), items)
+        Record(fields): return hash_values(mix_structural_hash(seed, u64(14)), fields)
+        Variant(case_index, payload):
+            let tagged = mix_structural_hash(mix_structural_hash(seed, u64(15)), u64(case_index))
+            return hash_values(tagged, payload)
+        Absent: return mix_structural_hash(seed, u64(16))
+        Present(item): return mix_structural_hash(mix_structural_hash(seed, u64(17)), structural_hash(item.value))
+        FrozenList(storage): return hash_values(mix_structural_hash(seed, u64(18)), storage.elements)
+        FrozenMap(storage): return hash_frozen_entries(mix_structural_hash(seed, u64(19)), storage.entries, true)
+        FrozenSet(storage): return hash_frozen_entries(mix_structural_hash(seed, u64(20)), storage.entries, false)
+        Foreign(token): trap("foreign handles are not structurally hashable")
+        List(storage): trap("mutable lists are not structurally hashable")
+        Map(storage): trap("mutable maps are not structurally hashable")
+        Set(storage): trap("mutable sets are not structurally hashable")
+        Slice(storage): trap("slices are not structurally hashable")
+        MutableSlice(storage): trap("mutable slices are not structurally hashable")
+        Function(symbol): trap("functions are not structurally hashable")
+        Closure(storage): trap("closures are not structurally hashable")
+        Interface(storage): trap("interface values are not structurally hashable")
+        CFunction(identity): trap("C functions are not structurally hashable")
+        Task(storage): trap("task handles are not structurally hashable")
+        Class(storage): trap("classes are not structurally hashable")
+        WeakClass(storage): trap("weak handles are not structurally hashable")
+        CapturedCell(storage): trap("captured cells are not structurally hashable")
+        FallibleSuccess(item): trap("fallible outcomes are not structurally hashable")
+        FallibleFailure(item): trap("fallible outcomes are not structurally hashable")
+
+# Tuples compare elementwise through `evaluate_binary`, so each element uses
+# its own family's equality; HirGenerator already made both sides one type.
+pub func evaluate_tuple_binary(left: list[BoxedValue], operation: BinaryOperation, right: list[BoxedValue], types: TypeTable) -> Value!:
+    if len(left) != len(right): trap("typed tuples have unequal length")
+    var index = 0
+    while index < len(left):
+        # Equality does not read `operand_type`; the values already share a type.
+        let compared = try evaluate_binary(left[index].value, BinaryOperation.Equal(operand_type = TypeId(value = 0)), right[index].value, types)
+        match compared:
+            Boolean(equal):
+                if not equal:
+                    match operation:
+                        Equal(operand_type): return Value.Boolean(value = false)
+                        NotEqual(operand_type): return Value.Boolean(value = true)
+                        else: trap("tuple HIR values received a non-equality operation")
+            else: trap("tuple equality produced a non-boolean HIR value")
+        index += 1
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = true)
+        NotEqual(operand_type): return Value.Boolean(value = false)
+        else: trap("tuple HIR values received a non-equality operation")
+
+# Two optionals are equal when both are absent, or both are present with
+# equal payloads; `evaluate_binary` has already settled which case applies.
+pub func evaluate_optional_equality(both_absent_or_equal: bool, operation: BinaryOperation) -> Value:
+    match operation:
+        Equal(operand_type): return Value.Boolean(value = both_absent_or_equal)
+        NotEqual(operand_type): return Value.Boolean(value = not both_absent_or_equal)
+        else: trap("optional HIR values received a non-equality operation")
+
+# Apply resolved arithmetic, equality, or ordering to floating-point values.
+pub func evaluate_float_binary(left: f64, operation: BinaryOperation, right: f64, types: TypeTable) -> Value:
+    match operation:
+        Add(operand_type): return Value.Floating(value = normalize_float(left + right, operand_type, types))
+        Subtract(operand_type): return Value.Floating(value = normalize_float(left - right, operand_type, types))
+        Multiply(operand_type): return Value.Floating(value = normalize_float(left * right, operand_type, types))
+        Divide(operand_type): return Value.Floating(value = normalize_float(left / right, operand_type, types))
+        Equal(operand_type): return Value.Boolean(value = left == right)
+        NotEqual(operand_type): return Value.Boolean(value = left != right)
+        Less(operand_type): return Value.Boolean(value = left < right)
+        LessEqual(operand_type): return Value.Boolean(value = left <= right)
+        Greater(operand_type): return Value.Boolean(value = left > right)
+        GreaterEqual(operand_type): return Value.Boolean(value = left >= right)
+        else: trap("typed floating-point expression contains an invalid operator")
+
+# mark: Numeric construction ==================================================================
+
+pub func normalize_float(value: f64, value_type: TypeId, types: TypeTable) -> f64:
+    return normalize_ieee_float(value, floating_bit_width(types, value_type))
+
+pub func checked_float_conversion(value: f64, destination: TypeId, types: TypeTable) -> f64!:
+    let rounded = normalize_float(value, destination, types)
+    if (value - value) == 0.0 and (rounded - rounded) != 0.0:
+        error("interpreter: trap: floating-point conversion out of range")
+    return rounded
+
+pub func convert_numeric_value(value: Value, destination: TypeId, types: TypeTable) -> Value!:
+    match value:
+        SignedInteger(integer):
+            if is_floating_type(types, destination):
+                return Value.Floating(value = try checked_float_conversion(f64(integer), destination, types))
+            if is_unsigned_integer_type(types, destination):
+                if integer < 0 or u64(integer) > unsigned_integer_maximum(types, destination):
+                    error("interpreter: trap: integer conversion out of range")
+                return Value.UnsignedInteger(value = u64(integer))
+            if integer < integer_minimum(types, destination) or integer > integer_maximum(types, destination):
+                error("interpreter: trap: integer conversion out of range")
+            return Value.SignedInteger(value = integer)
+        UnsignedInteger(integer):
+            if is_floating_type(types, destination):
+                return Value.Floating(value = try checked_float_conversion(f64(integer), destination, types))
+            if is_unsigned_integer_type(types, destination):
+                if integer > unsigned_integer_maximum(types, destination): error("interpreter: trap: integer conversion out of range")
+                return Value.UnsignedInteger(value = integer)
+            if integer > u64(integer_maximum(types, destination)):
+                error("interpreter: trap: integer conversion out of range")
+            return Value.SignedInteger(value = i64(integer))
+        Floating(item):
+            if is_floating_type(types, destination):
+                return Value.Floating(value = try checked_float_conversion(item, destination, types))
+            if item != item: error("interpreter: trap: float to integer conversion of NaN")
+            if is_unsigned_integer_type(types, destination):
+                let upper = f64(unsigned_integer_maximum(types, destination)) + 1.0
+                if item < 0.0 or item >= upper: error("interpreter: trap: float to integer conversion is outside the integer range")
+                return Value.UnsignedInteger(value = u64(item))
+            if item < f64(integer_minimum(types, destination)) or item >= f64(integer_maximum(types, destination)) + 1.0:
+                error("interpreter: trap: float to integer conversion is outside the integer range")
+            return Value.SignedInteger(value = i64(item))
+        else: trap("typed numeric conversion has a non-numeric value")
