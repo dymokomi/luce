@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1087 compiler tests across 58 files, plus the
+The repository currently proves 1088 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -388,8 +388,8 @@ backends only.
   (2026-09-04, `done.md` §2): interface views, whose witness table is a
   global of thunk addresses rather than a new instruction; `volatile`
   loads and stores; atomics, with `max`/`min` as a compare-exchange loop
-  under QBE and without `wait`/`wake` or fences; `Writer?` on the
-  null-data niche; declaration attributes (§9.8), carried as one
+  under QBE, `atomic.fence` through the standard `atomic` module, and
+  without `wait`/`wake`; `Writer?` on the null-data niche; declaration attributes (§9.8), carried as one
   `SymbolAttributes` value from syntax to MIR, with `used` a pruning
   root, `section` QBE linkage, and `weak`/`used` assembler directives
   the toolchain appends; `naked` waits for `asm`. Spec question: §5.9 says `&x` on an `@u32` is `@u32*` while

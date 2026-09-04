@@ -2586,6 +2586,19 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   representations, so `sizeof` agrees with the backends. The thread-local
   `memory.allocator` is the first such optional.
   Gate: 1087 compiler tests across 58 files.
+- [x] **Fences (B4, sixth slice)** (2026-09-04). The standard `atomic`
+  module (`src/standard/atomic.lucb`, base.md §15.1, §16.6) declares
+  `Ordering` and `fence`; a call `atomic.fence(.order)` on the imported
+  module is checked to the HIR `AtomicFence` node and lowered to the
+  canonical `Fence(order, is_signal)` instruction rather than a call, so
+  `fence` is one vocabulary from source to backend. QBE calls
+  `luce_atomic_thread_fence` or, for `.signal`, `luce_atomic_signal_fence`,
+  two one-line C shims over the compiler builtins that the toolchain
+  links whenever a program fences (§19.3), since the builtins have no
+  linkable symbol; the oracles and Wasm, which run one thread, perform
+  nothing.
+  A non-case order, an unknown order, and a missing order are diagnosed.
+  Gate: 1088 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 
