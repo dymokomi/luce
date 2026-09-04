@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1016 compiler tests across 52 files.
+  Gate: 1023 compiler tests across 53 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1016 compiler tests across 52 files.
+  Gate: 1023 compiler tests across 53 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1016 compiler tests across 52 files.
+  Gate: 1023 compiler tests across 53 files.
 - [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
   In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
   `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
@@ -2240,7 +2240,31 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
   of signedness, and `u64` into `usize` stay spelled and are refused by
   name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
-  Gate: 1016 compiler tests across 52 files.
+  Gate: 1023 compiler tests across 53 files.
+- [x] **The overflow operator family (B1, fifth slice)** (2026-09-03). `+%`,
+  `-%`, `*%`, and unary `-%` wrap in two's complement, `+|`, `-|`, `*|`
+  saturate at the type's bounds, and `+?`, `-?`, `*?` answer `T?` with
+  `none` on overflow (base.md §7.2); the augmented `+%=`-family assigns. The
+  parser places them at their checked spelling's precedence, the checker
+  requires integer operands, and HIR carries one operation per spelling
+  (`WrapAdd` … `CheckedMultiply`, `WrapNegate`). Canonical MIR gains
+  `add_wrap`/`sub_wrap`/`mul_wrap`, `add_sat`/`sub_sat`/`mul_sat`, the
+  overflow tests `add_overflows`/`sub_overflows`/`mul_overflows` that answer
+  `bool`, and `neg_wrap`; a checked form lowers to the overflow test, the
+  wrapped value, and an `If` that stores the optional's tag. Both oracles
+  compute wrapping through `backends/wrapping.luc`, which forms every result
+  modulo 2^64 without a host overflow Stage-0 would trap on. QBE's checked
+  arithmetic now computes its overflow condition into one flag and traps on
+  it, so saturation selects a bound with the same flag (`maximum + sign`
+  wraps to the minimum) and the overflow test copies it; Wasm leaves the
+  flag on the stack for a `select`, dividing for the multiply test only when
+  the divisor is neither zero nor `-1`. `examples/base/c_arithmetic.lucb`
+  spells all three behaviours, and the shared Base fixtures
+  (`tests/compiler/profiles/base/fixtures.luc`: C division, widening,
+  wrapping, saturating, checked, layout) answer one number each through the
+  reference interpreter, the MIR oracle at both pointer widths, both
+  encoders, and a native QBE build linked to a C driver.
+  Gate: 1023 compiler tests across 53 files.
 
 ## 3. Bugs the multi-backend harness found
 

@@ -41,6 +41,11 @@ from compiler.mir.canonical import describe_mir_type, find_runtime_binding, is_a
 from compiler.mir.canonical import is_signed_int_type, mir_type, register_at
 
 ## Pure canonical-MIR to QBE-IL translation.
+# The wrapped machine value of an arithmetic operation and its overflow flag.
+struct OverflowEmission:
+    let value: str
+    let flag: str
+
 pub class QbeBackend:
     let clock: (func() -> i64)?
 
@@ -744,6 +749,15 @@ class QbeEmitter: QbeEmissionHost:
             rem: try self.emit_integer_division(function, result, left, right, true, false)
             trunc_div: try self.emit_integer_division(function, result, left, right, false, true)
             trunc_rem: try self.emit_integer_division(function, result, left, right, true, true)
+            add_wrap: self.emit_integer_result(function, result, "add", left, right)
+            sub_wrap: self.emit_integer_result(function, result, "sub", left, right)
+            mul_wrap: self.emit_integer_result(function, result, "mul", left, right)
+            add_overflows: try self.emit_overflow_test(function, result, BinaryOp.add, left, right)
+            sub_overflows: try self.emit_overflow_test(function, result, BinaryOp.sub, left, right)
+            mul_overflows: try self.emit_overflow_test(function, result, BinaryOp.mul, left, right)
+            add_sat: try self.emit_saturating_arithmetic(function, result, BinaryOp.add, left, right)
+            sub_sat: try self.emit_saturating_arithmetic(function, result, BinaryOp.sub, left, right)
+            mul_sat: try self.emit_saturating_arithmetic(function, result, BinaryOp.mul, left, right)
             bit_and: self.emit_integer_result(function, result, "and", left, right)
             bit_or: self.emit_integer_result(function, result, "or", left, right)
             bit_xor: self.emit_integer_result(function, result, "xor", left, right)
@@ -774,6 +788,73 @@ class QbeEmitter: QbeEmissionHost:
         let computed = self.reg(result)
         self.out.line(computed + " =l " + name + " " + self.reg(left) + ", " + self.reg(right))
         let bad = self.out.temp()
+        try self.emit_wide_overflow_flag(bad, operation, signed, computed, left, right)
+        self.emit_guard(bad, "integer overflow")
+
+    # The wrapped result of `left op right` at the type's width and a `w` flag
+    # that is non-zero exactly when the exact result does not fit; both forms
+    # of base.md §7.2 that observe overflow without trapping build on this.
+    func emit_overflow_flag(function: MirFunction, value_type: TypeId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> OverflowEmission!:
+        let bits = self.bits(value_type)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        var name = "add"
+        if operation == BinaryOp.sub: name = "sub"
+        elif operation == BinaryOp.mul: name = "mul"
+        let flag = self.out.temp()
+        if bits < 64:
+            let wide_left = try self.widen_integer(value_type, left)
+            let wide_right = try self.widen_integer(value_type, right)
+            let wide_result = self.out.temp()
+            self.out.line(wide_result + " =l " + name + " " + wide_left + ", " + wide_right)
+            self.emit_range_flag(flag, value_type, wide_result)
+            return OverflowEmission(value = wide_result, flag = flag)
+        let computed = self.out.temp()
+        self.out.line(computed + " =l " + name + " " + self.reg(left) + ", " + self.reg(right))
+        try self.emit_wide_overflow_flag(flag, operation, signed, computed, left, right)
+        return OverflowEmission(value = computed, flag = flag)
+
+    func emit_overflow_test(function: MirFunction, result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, left)
+        let emission = try self.emit_overflow_flag(function, value_type, operation, left, right)
+        self.out.line(self.reg(result) + " =w copy " + emission.flag)
+
+    # Saturation lands on the bound the exact result passed: for a signed type
+    # `maximum + 1` wraps to the minimum, so one add of a 0/1 sign selects it.
+    func emit_saturating_arithmetic(function: MirFunction, result: RegisterId, operation: BinaryOp, left: RegisterId, right: RegisterId) -> !:
+        let value_type = self.register_type(function, result)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        let emission = try self.emit_overflow_flag(function, value_type, operation, left, right)
+        let bound = self.out.temp()
+        if signed:
+            let toward_minimum = self.out.temp()
+            if operation == BinaryOp.add: self.out.line(toward_minimum + " =l shr " + try self.arithmetic_value(value_type, right) + ", 63")
+            elif operation == BinaryOp.sub:
+                let positive = self.out.temp()
+                self.out.line(positive + " =w csgtl " + try self.arithmetic_value(value_type, right) + ", 0")
+                self.out.line(toward_minimum + " =l extuw " + positive)
+            else:
+                let signs = self.out.temp()
+                self.out.line(signs + " =l xor " + try self.arithmetic_value(value_type, left) + ", " + try self.arithmetic_value(value_type, right))
+                self.out.line(toward_minimum + " =l shr " + signs + ", 63")
+            self.out.line(bound + " =l add " + str(self.layout.int_maximum(value_type)) + ", " + toward_minimum)
+        elif operation == BinaryOp.sub: self.out.line(bound + " =l copy 0")
+        else: self.out.line(bound + " =l copy " + str(self.layout.uint_maximum(value_type)))
+        let saturated = self.out.new_label("saturate")
+        let exact = self.out.new_label("exact")
+        let join = self.out.new_label("saturate_end")
+        let chosen = self.out.temp()
+        self.terminate("\tjnz " + emission.flag + ", @" + saturated + ", @" + exact + "\n")
+        self.label(saturated)
+        self.out.line(chosen + " =l copy " + bound)
+        self.terminate("\tjmp @" + join + "\n")
+        self.label(exact)
+        self.out.line(chosen + " =l copy " + emission.value)
+        self.terminate("\tjmp @" + join + "\n")
+        self.label(join)
+        self.canonicalize_integer(value_type, result, chosen)
+
+    # The 64-bit overflow conditions, into `flag` (`w`, non-zero on overflow).
+    func emit_wide_overflow_flag(bad: str, operation: BinaryOp, signed: bool, computed: str, left: RegisterId, right: RegisterId) -> !:
         if operation == BinaryOp.add:
             if signed:
                 let a = self.out.temp()
@@ -809,10 +890,27 @@ class QbeEmitter: QbeEmissionHost:
                 self.out.line(is_minimum + " =w ceql " + self.reg(left) + ", -9223372036854775808")
                 self.out.line(is_negative_one + " =w ceql " + self.reg(right) + ", -1")
                 self.out.line(overflows + " =w and " + is_minimum + ", " + is_negative_one)
-                self.emit_guard(overflows, "integer overflow")
+                # `minimum / -1` would fault on amd64, so that pair answers here
+                # and never reaches the division below.
+                let plain = self.out.new_label("mul_plain")
+                let done = self.out.new_label("mul_done")
+                self.out.line(bad + " =w copy 1")
+                self.terminate("\tjnz " + overflows + ", @" + done + ", @" + plain + "\n")
+                self.label(plain)
+                try self.emit_multiplication_flag(bad, signed, computed, left, right)
+                self.terminate("\tjmp @" + done + "\n")
+                self.label(done)
+                return
+            try self.emit_multiplication_flag(bad, signed, computed, left, right)
+
+    # `computed / right != left` detects a wrapped product once `right` is
+    # known to be neither zero nor the one divisor that faults.
+    func emit_multiplication_flag(bad: str, signed: bool, computed: str, left: RegisterId, right: RegisterId) -> !:
+        if true:
             let zero = self.out.temp()
             let check = self.out.new_label("mul_check")
             let okay = self.out.new_label("mul_ok")
+            self.out.line(bad + " =w copy 0")
             self.out.line(zero + " =w ceql " + self.reg(right) + ", 0")
             self.terminate("\tjnz " + zero + ", @" + okay + ", @" + check + "\n")
             self.label(check)
@@ -821,11 +919,8 @@ class QbeEmitter: QbeEmissionHost:
             if not signed: divide = "udiv"
             self.out.line(quotient + " =l " + divide + " " + computed + ", " + self.reg(right))
             self.out.line(bad + " =w cnel " + quotient + ", " + self.reg(left))
-            self.emit_guard(bad, "integer overflow")
             self.terminate("\tjmp @" + okay + "\n")
             self.label(okay)
-            return
-        self.emit_guard(bad, "integer overflow")
 
     # QBE's `div`/`rem` truncate as C does; the floor forms adjust the
     # quotient afterwards when the remainder is non-zero and the signs differ.
@@ -935,6 +1030,10 @@ class QbeEmitter: QbeEmissionHost:
     func emit_unary(function: MirFunction, result: RegisterId, operation: UnaryOp, operand: RegisterId) -> !:
         let value_type = self.register_type(function, result)
         match operation:
+            neg_wrap:
+                let negated = self.out.temp()
+                self.out.line(negated + " =" + self.integer_base(value_type) + " sub 0, " + self.reg(operand))
+                self.canonicalize_integer(value_type, result, negated)
             neg:
                 if self.is_float16(value_type):
                     let raw = self.out.temp()
@@ -1256,6 +1355,19 @@ class QbeEmitter: QbeEmissionHost:
         return self.reg(register)
 
     func guard_range(value_type: TypeId, value: str) -> !:
+        let below = self.out.temp()
+        let above = self.out.temp()
+        let bad = self.out.temp()
+        self.emit_range_test(below, above, bad, value_type, value)
+        self.emit_guard(bad, "integer overflow")
+
+    # `flag` (`w`) is non-zero when the wide `value` lies outside the narrow type.
+    func emit_range_flag(flag: str, value_type: TypeId, value: str):
+        let below = self.out.temp()
+        let above = self.out.temp()
+        self.emit_range_test(below, above, flag, value_type, value)
+
+    func emit_range_test(below: str, above: str, flag: str, value_type: TypeId, value: str):
         let bits = self.bits(value_type)
         let signed = is_signed_int_type(self.program.types, value_type)
         var minimum = 0
@@ -1274,13 +1386,9 @@ class QbeEmitter: QbeEmissionHost:
             if bits == 8: maximum = 255
             elif bits == 16: maximum = 65535
             else: maximum = 4294967295
-        let below = self.out.temp()
-        let above = self.out.temp()
-        let bad = self.out.temp()
         self.out.line(below + " =w csltl " + value + ", " + str(minimum))
         self.out.line(above + " =w csgtl " + value + ", " + str(maximum))
-        self.out.line(bad + " =w or " + below + ", " + above)
-        self.emit_guard(bad, "integer overflow")
+        self.out.line(flag + " =w or " + below + ", " + above)
 
     pub func emit_guard(bad: str, reason: str):
         let trap_label = self.out.new_label("trap")

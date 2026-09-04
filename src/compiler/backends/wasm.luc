@@ -63,6 +63,7 @@
 #       `wasm_planning.luc` what those instructions need.
 #==============================================================================================
 
+from compiler.backends.wasm_encoding import opcode_select
 from compiler.backends.wasm_encoding import append_constant, append_memory_op, append_signed, append_trap_if_true, append_unsigned, code_section, data_section, element_section, empty_block_type, encode_function_value, export_section, function_export_kind
 from compiler.backends.wasm_encoding import function_import_kind, function_reference_type, function_section, function_type_tag, global_import_kind, global_mutable, global_section, i64_value_type, import_section, local_get, local_get_index, local_set
 from compiler.backends.wasm_encoding import memory_export_kind, memory_section, opcode_block, opcode_br, opcode_br_if, opcode_call, opcode_call_indirect, opcode_drop, opcode_else, opcode_end, opcode_f32_add, opcode_f32_const
@@ -1200,6 +1201,13 @@ func encode_binary(body: list[u8], operation: BinaryOp, kind: Kind, frame: Frame
         encode_rem(body, kind, result, left, right)
     elif operation == BinaryOp.trunc_div or operation == BinaryOp.trunc_rem:
         encode_trunc_division(body, operation, kind, result, left, right)
+    elif operation == BinaryOp.add_wrap or operation == BinaryOp.sub_wrap or operation == BinaryOp.mul_wrap:
+        encode_wrapping_arithmetic(body, operation, kind, result, left, right)
+    elif operation == BinaryOp.add_overflows or operation == BinaryOp.sub_overflows or operation == BinaryOp.mul_overflows:
+        append_overflow_flag(body, overflow_operation(operation), kind, left, right)
+        local_set(body, result)
+    elif operation == BinaryOp.add_sat or operation == BinaryOp.sub_sat or operation == BinaryOp.mul_sat:
+        encode_saturating_arithmetic(body, overflow_operation(operation), kind, result, left, right)
     elif operation == BinaryOp.shift_left or operation == BinaryOp.shift_right:
         encode_shift(body, operation, kind, result, left, right)
     elif operation == BinaryOp.bit_and or operation == BinaryOp.bit_or or operation == BinaryOp.bit_xor:
@@ -1284,6 +1292,186 @@ func encode_checked_arithmetic(body: list[u8], operation: BinaryOp, kind: Kind, 
     if operation == BinaryOp.add: encode_checked_add(body, result, left, right, kind.is_wide)
     elif operation == BinaryOp.sub: encode_checked_sub(body, result, left, right, kind.is_wide)
     else: encode_checked_mul(body, result, left, right, kind.is_wide)
+
+# mark: Overflow without trapping =============================================================
+#
+# Base's `+%`, `+|`, and `+?` (base.md §7.2) observe overflow instead of
+# trapping on it. The wrapped value is the machine's own result; the overflow
+# flag is the same condition the checked forms trap on, left as an i32 on the
+# stack without any local, so it can feed a `select` or a result register.
+
+func overflow_operation(operation: BinaryOp) -> BinaryOp:
+    if operation == BinaryOp.add_overflows or operation == BinaryOp.add_sat: return BinaryOp.add
+    if operation == BinaryOp.sub_overflows or operation == BinaryOp.sub_sat: return BinaryOp.sub
+    return BinaryOp.mul
+
+func wrapping_opcode(operation: BinaryOp, wide: bool) -> u8:
+    if operation == BinaryOp.add_wrap or operation == BinaryOp.add: return pick(wide, opcode_i64_add, opcode_i32_add)
+    if operation == BinaryOp.sub_wrap or operation == BinaryOp.sub: return pick(wide, opcode_i64_sub, opcode_i32_sub)
+    return pick(wide, opcode_i64_mul, opcode_i32_mul)
+
+func encode_wrapping_arithmetic(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    local_get(body, left)
+    local_get(body, right)
+    body.append(wrapping_opcode(operation, kind.is_wide))
+    append_canonicalise(body, kind)
+    local_set(body, result)
+
+# Leaves the wrapped `left op right` on the stack in the type's value type.
+func append_wrapped(body: list[u8], operation: BinaryOp, kind: Kind, left: RegisterId, right: RegisterId):
+    local_get(body, left)
+    local_get(body, right)
+    body.append(wrapping_opcode(operation, kind.is_wide))
+    append_canonicalise(body, kind)
+
+# Leaves the i32 overflow flag of `left op right` on the stack.
+func append_overflow_flag(body: list[u8], operation: BinaryOp, kind: Kind, left: RegisterId, right: RegisterId):
+    if is_narrow(kind):
+        # The i32 result is exact; it overflowed when outside the narrow range.
+        local_get(body, left)
+        local_get(body, right)
+        body.append(wrapping_opcode(operation, false))
+        append_constant(body, narrow_minimum(kind), false)
+        body.append(opcode_i32_lt_s)
+        local_get(body, left)
+        local_get(body, right)
+        body.append(wrapping_opcode(operation, false))
+        append_constant(body, narrow_maximum(kind), false)
+        body.append(opcode_i32_gt_s)
+        body.append(opcode_i32_or)
+        return
+    if kind.bits == 32 and not kind.is_signed:
+        # The exact i64 result overflowed u32 when it has bits above 32.
+        local_get(body, left)
+        body.append(opcode_i64_extend_i32_u)
+        local_get(body, right)
+        body.append(opcode_i64_extend_i32_u)
+        body.append(wrapping_opcode(operation, true))
+        append_constant(body, 0xFFFFFFFF, true)
+        body.append(opcode_i64_gt_u)
+        return
+    if kind.is_wide and not kind.is_signed:
+        if operation == BinaryOp.add:
+            # Carry: the sum is below either input.
+            local_get(body, left)
+            local_get(body, right)
+            body.append(opcode_i64_add)
+            local_get(body, left)
+            body.append(opcode_i64_lt_u)
+            return
+        if operation == BinaryOp.sub:
+            local_get(body, left)
+            local_get(body, right)
+            body.append(opcode_i64_lt_u)
+            return
+        # `b != 0 and (a * b) / b != a`, dividing only when `b` is non-zero.
+        local_get(body, right)
+        body.append(opcode_i64_eqz)
+        body.append(opcode_if)
+        body.append(i32_value_type)
+        append_constant(body, 0, false)
+        body.append(opcode_else)
+        local_get(body, left)
+        local_get(body, right)
+        body.append(opcode_i64_mul)
+        local_get(body, right)
+        body.append(opcode_i64_div_u)
+        local_get(body, left)
+        body.append(opcode_i64_ne)
+        body.append(opcode_end)
+        return
+    let wide = kind.is_wide
+    if operation == BinaryOp.add or operation == BinaryOp.sub:
+        # Signed add: `((a ^ r) & (b ^ r)) < 0`; sub: `((a ^ b) & (a ^ r)) < 0`.
+        local_get(body, left)
+        if operation == BinaryOp.add: append_wrapped(body, operation, kind, left, right)
+        else: local_get(body, right)
+        body.append(pick(wide, opcode_i64_xor, opcode_i32_xor))
+        if operation == BinaryOp.add: local_get(body, right)
+        else: local_get(body, left)
+        append_wrapped(body, operation, kind, left, right)
+        body.append(pick(wide, opcode_i64_xor, opcode_i32_xor))
+        body.append(pick(wide, opcode_i64_and, opcode_i32_and))
+        append_zero(body, wide)
+        body.append(pick(wide, opcode_i64_lt_s, opcode_i32_lt_s))
+        return
+    # Signed multiply: `b == 0` never overflows; `b == -1` overflows exactly
+    # for `a == minimum` (and its division would trap); otherwise the wrapped
+    # product divided by `b` differs from `a`.
+    local_get(body, right)
+    body.append(pick(wide, opcode_i64_eqz, opcode_i32_eqz))
+    body.append(opcode_if)
+    body.append(i32_value_type)
+    append_constant(body, 0, false)
+    body.append(opcode_else)
+    local_get(body, right)
+    append_constant(body, -1, wide)
+    body.append(pick(wide, opcode_i64_eq, opcode_i32_eq))
+    body.append(opcode_if)
+    body.append(i32_value_type)
+    local_get(body, left)
+    if wide: append_constant(body, -9223372036854775807 - 1, true)
+    else: append_constant(body, -2147483647 - 1, false)
+    body.append(pick(wide, opcode_i64_eq, opcode_i32_eq))
+    body.append(opcode_else)
+    append_wrapped(body, operation, kind, left, right)
+    local_get(body, right)
+    body.append(pick(wide, opcode_i64_div_s, opcode_i32_div_s))
+    local_get(body, left)
+    body.append(pick(wide, opcode_i64_ne, opcode_i32_ne))
+    body.append(opcode_end)
+    body.append(opcode_end)
+
+# `select(bound, wrapped, flag)`: the bound the exact result passed, else the
+# exact result. A signed bound is `maximum + (toward_minimum ? 1 : 0)`, which
+# wraps to the minimum; unsigned saturates at the type's maximum or at zero.
+func encode_saturating_arithmetic(body: list[u8], operation: BinaryOp, kind: Kind, result: RegisterId, left: RegisterId, right: RegisterId):
+    let wide = kind.is_wide
+    if kind.is_signed:
+        append_constant(body, saturation_maximum(kind), wide)
+        if operation == BinaryOp.add:
+            # The sign bit of `right`, as 0/1: overflow toward the minimum
+            # happens exactly when `right` is negative.
+            local_get(body, right)
+            append_constant(body, sign_shift(kind), wide)
+            body.append(pick(wide, opcode_i64_shr_u, opcode_i32_shr_u))
+        elif operation == BinaryOp.sub:
+            # `0 < right` as 0/1: subtracting a positive overflows downward.
+            append_zero(body, wide)
+            local_get(body, right)
+            body.append(pick(wide, opcode_i64_lt_s, opcode_i32_lt_s))
+            if wide: body.append(opcode_i64_extend_i32_u)
+        else:
+            # Differing signs make a negative product.
+            local_get(body, left)
+            local_get(body, right)
+            body.append(pick(wide, opcode_i64_xor, opcode_i32_xor))
+            append_constant(body, sign_shift(kind), wide)
+            body.append(pick(wide, opcode_i64_shr_u, opcode_i32_shr_u))
+        body.append(pick(wide, opcode_i64_add, opcode_i32_add))
+    elif operation == BinaryOp.sub: append_zero(body, wide)
+    else: append_constant(body, saturation_maximum(kind), wide)
+    append_wrapped(body, operation, kind, left, right)
+    append_overflow_flag(body, operation, kind, left, right)
+    body.append(opcode_select)
+    append_canonicalise(body, kind)
+    local_set(body, result)
+
+# A canonical value's sign bit is the top bit of its machine word.
+func sign_shift(kind: Kind) -> i64:
+    if kind.is_wide: return 63
+    return 31
+
+func saturation_maximum(kind: Kind) -> i64:
+    if kind.is_signed:
+        if kind.bits == 8: return 127
+        if kind.bits == 16: return 32767
+        if kind.bits == 32: return 2147483647
+        return 9223372036854775807
+    if kind.bits == 8: return 255
+    if kind.bits == 16: return 65535
+    if kind.bits == 32: return -1
+    return -1
 
 func narrow_arithmetic_opcode(operation: BinaryOp) -> u8:
     if operation == BinaryOp.add: return opcode_i32_add
@@ -1558,6 +1746,12 @@ func encode_unary(body: list[u8], operation: UnaryOp, kind: Kind, frame: FramePl
             if is_narrow(kind) and not kind.is_signed: append_constant(body, narrow_mask(kind), false)
             else: append_constant(body, -1, kind.is_wide)
             body.append(pick(kind.is_wide, opcode_i64_xor, opcode_i32_xor))
+            local_set(body, result)
+        neg_wrap:
+            append_zero(body, kind.is_wide)
+            local_get(body, operand)
+            body.append(pick(kind.is_wide, opcode_i64_sub, opcode_i32_sub))
+            append_canonicalise(body, kind)
             local_set(body, result)
         neg:
             if kind.is_float:

@@ -153,7 +153,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   layout (base.md §5.11).
 - `base/c_arithmetic.lucb` divides as C does: `//` and `%` truncate toward
   zero with the dividend's sign, where full Luce floors (base.md §7.2), and a
-  `u8` added to a `u32` widens without a spelling (base.md §7.5).
+  `u8` added to a `u32` widens without a spelling (base.md §7.5). Its `+%`,
+  `+|`, and `+?` wrap, saturate, and answer `none` on overflow instead of
+  trapping (base.md §7.2).
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
