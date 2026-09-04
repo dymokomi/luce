@@ -107,7 +107,8 @@ profiles differ (base.md §23).
 
 | ID | Spec | Closure unit | Current state / dependency |
 | --- | --- | --- | --- |
-| B1 | base.md §§1–4, 5.1–5.2, 7.2–7.5, 16.2, 19.1 | The Base profile: suffix selection, `.lucn` rename, Base tokens and reserved words, tier rejections, freestanding reachability, `usize`/`isize`, implicit widening, C division, the cast family | Not started. |
+| B0 | plan.md §5.0 | Profile layout: `profile.luc`, `profiles/full/` and `profiles/base/`, full-only code moved out of the shared stages, folder rules in `test.sh` | Not started; no behavior change. |
+| B1 | base.md §§1–4, 5.1–5.2, 7.2–7.5, 16.2, 19.1 | The Base profile: suffix selection, `.lucn` rename, Base tokens and reserved words, tier rejections, freestanding reachability, `usize`/`isize`, implicit widening, C division, the cast family | Depends on B0. |
 | B2 | base.md §§5.3–5.5, 6.6, 7.7, 8.3 | Pointers, qualifiers, the null niche, spans, `str` views, `cstr`, address-of and the escape rule, pointer arithmetic and ordering, `for x in &items` | Depends on B1. |
 | B3 | base.md §§6.1–6.5, 8.4–8.8, 10.3–10.4, 11.7, 12 | Zero values, `---`, globals, unions, integer-backed enums, `packed`/`align`, `new`/`alloc`/`free`/`with`/`in`, `Allocator`, `errdefer`, labels, guards | Depends on B2. |
 | B4 | base.md §§8.9, 9.1–9.8, 14.3, 15, 17 | Interface views, atomics, `volatile`, `asm`, attributes, `extern`, variadic C calls, `fmt`, `location()`, `export` | Depends on B3. |

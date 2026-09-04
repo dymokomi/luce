@@ -56,7 +56,7 @@ At this snapshot the work is ordered as:
 
 | Order | Ledger IDs | Work |
 | --- | --- | --- |
-| 1 | B1–B4 | Base frontend and HIR profile: suffix selection, pointers, spans, globals, unions, the §19.2 MIR additions, and QBE legalization for each. |
+| 1 | B0–B4 | Profile layout (§5.0), then the Base frontend and HIR profile: suffix selection, pointers, spans, globals, unions, the §19.2 MIR additions, and QBE legalization for each. |
 | 2 | B5 | Port the sealed runtime to Base; prove it with the existing differential corpus. |
 | 3 | B6, S12, S30 | The standard library in Base behind the §18 crossing rules: memory, io, files, c, process, strings, json; automatic standard-module loading. |
 | 4 | S29 | Self-host: compile the compiler with stage 1 over that library, compare with the Stage-0 build, keep one prior compiler. |
@@ -263,6 +263,47 @@ and proof belong in [done.md](done.md); the conformance ledger identifies the
 normative gap. Architecture decisions that constrain future work remain in
 §§2–3 and §6 rather than masquerading as unfinished tasks.
 
+### 5.0 Source layout for two profiles
+
+Working on either profile must not mean reading the other. The rule is:
+code both profiles execute stays where it is; code only one profile
+executes lives in that profile's folder; the shared stages reach it through
+one dispatch point per stage.
+
+```
+src/compiler/
+    frontend/  hir/  mir/  backends/   shared, profile-neutral, as today
+    profile.luc                         the Profile enum and what each admits:
+                                        suffix, reserved words, tokens, node,
+                                        type, and instruction forms
+    profiles/full/                      classes, collections, closures, workers,
+                                        existential interface values: their HIR
+                                        checks, lowering, interpreter support,
+                                        and runtime-service vocabulary
+    profiles/base/                      pointers, spans, unions, zero values,
+                                        allocation, atomics, volatile, asm,
+                                        extern/export: the same layers
+src/standard/base/                      the standard library, `.lucb`
+src/standard/safe/                      its `.luc`/`.lucn` wrappers (base.md §18)
+src/runtime/                            the sealed runtime, a Base package after B5
+tests/compiler/profiles/{full,base}/    tests mirror the source folders
+examples/base/                          Base examples
+```
+
+- A profile folder never imports the other profile folder. The shared
+  folders never name a profile except through `profile.luc` and the dispatch
+  points (`body_checker` for HIR forms, `function_lowerer` for lowering, the
+  interpreters for execution, each backend for legalization). `test.sh`
+  greps for both rules beside the existing no-platform-before-backend check.
+- The pattern already exists: `hir/generics/` and `hir/interfaces/` are
+  consumers of the shared `HirGenerationState`, and `FunctionLowerer`
+  consumes `MirLoweringState`. Profile code is written the same way, as
+  classes over the shared state, not as branches inside shared functions.
+- Shared vocabulary stays single: a node, type, or instruction form is
+  declared once in `hir/ir.luc` or `mir/canonical.luc` with its
+  `node_children`/`type_form_key`/`mir_type_key` entry, whichever profile
+  owns it; `profile.luc` says which profile admits it.
+
 ### 5.1 Base, runtime, standard library, self-hosting
 
 Each row is one independently committable vertical slice with the same six
@@ -274,6 +315,14 @@ focused example. `base.md` §8.9 records the one exception: the reference
 interpreter rejects `asm`, so those programs are proved by the compiled
 backends only.
 
+- [ ] **B0 — the profile layout.** Create `profile.luc` and the two profile
+  folders; move the full-Luce-only code (classes, collections, closures,
+  workers, existential interface values) out of `body_checker`,
+  `function_lowerer`, the interpreters, and the backends into
+  `profiles/full/` as classes over the shared state, leaving one dispatch
+  point per stage; add the folder rules to `test.sh`. Purely mechanical,
+  gate green, no behavior change; it also splits the two largest files at a
+  real seam.
 - [ ] **B1 — the Base profile.** Select the profile by the `.lucb` suffix
   (and rename the audited tier to `.lucn`, `base.md` §16.2); admit the Base
   reserved words and the `@`, `---`, `...`, and wrapping/saturating/checked
@@ -390,6 +439,8 @@ otherwise they retire with it.
   platform policy. Base's pointer-width integer and layout constants are
   symbolic in MIR and folded only by a backend. QBE, Wasm, and the later
   Base-written native backend begin from the same MIR.
+- Profile-only code lives in its profile folder (§5.0); the shared folders
+  gain dispatch points, never profile branches.
 - One vocabulary per concept: a new node form, type form, or instruction is
   added in its one definition plus `node_children`/`type_form_key`/
   `mir_type_key`; walkers match only the forms they treat specially. Do not
