@@ -2707,6 +2707,29 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   already expects and applies the one null check. A type function has no
   `self` and is refused with a pointer to the module-level form.
   Gate: 1101 compiler tests across 58 files.
+- [x] **Spans, function pointers, and the status form at the C boundary
+  (B4)** (2026-09-04). A span in parameter position crosses an export or
+  an `extern` call as `T *name, size_t name_count`; the wrapper builds
+  the span, reads `(NULL, 0)` as the empty span, and traps `null_foreign`
+  on a null pointer with a count (base.md §17.6). A Base `func` type is a
+  C function pointer in both directions, rendered as a C declarator in
+  the header. A fallible export takes the status form: the C function
+  returns `int`, 0 on success and 1 on failure, and writes the value
+  through a final `out` pointer; full Luce still refuses fallible
+  exports. The ABI report lowers the new type forms and matches the
+  wrapper's expanded parameter list. A native test calls all three from
+  a C `main`.
+  `extern union Name:` declares C layout whose members overlap at one
+  address (base.md §17.1), the same overlapping record a Base `union`
+  is, under the external C kind. A Base `func(A) -> R` type now resolves
+  to the C function pointer type (base.md §5.7) through
+  `ProfileDeclarations`, so it is one pointer word, calls through the C
+  convention, and crosses exports and `extern` calls as a function
+  pointer; full Luce keeps its two-word function value and its closed C
+  surface. Base diagnostics still spell that type `cfunc`, a wording to
+  revisit. A `bool` in a variadic position is promoted to `int` as 1 or
+  0 (§17.2).
+  Gate: 1104 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

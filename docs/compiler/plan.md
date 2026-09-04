@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1101 compiler tests across 58 files, plus the
+The repository currently proves 1104 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -412,8 +412,8 @@ backends only.
   under QBE, `atomic.fence` through the standard `atomic` module, and
   without `wait`/`wake`; `Writer?` on the null-data niche; `export func`
   with Base pointers, structs by value, and integer-backed enums in the
-  header, and exported methods as `Type_method`, without spans, function
-  pointers, or the status form yet; `extern func` with those types, `cstr` (`const u8*` for now),
+  header, exported methods as `Type_method`, spans as pointer-and-count
+  parameters, function pointers, and the fallible status form; `extern func` with those types, `cstr` (`const u8*` for now),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
   natively; the Base entry point `main(arguments: str[]) -> i32` with
   QBE's startup shim; declaration attributes (§9.8), carried as one

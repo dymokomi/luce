@@ -284,6 +284,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 for case_type in cases:
                     if self.type_needs_ownership(case_type): return true
                 return false
+            Func(signature): return self.state.representation().function_values_need_ownership()
             else: return self.full.type_needs_ownership(value_type)
 
     pub func emit_ownership_call(value_type: TypeId, address: RegisterId, retaining: bool, span: SourceSpan, body: list[MirInstruction]):
@@ -467,6 +468,68 @@ pub class FunctionLowerer: FunctionLoweringHost:
         self.emit_end(span, body)
         self.emit_end(span, body)
 
+    # `(T *data, size_t count)` from C becomes the span; `(NULL, 0)` is the
+    # empty span, whose data is a non-null dangling address (base.md §5.4,
+    # §17.6). A null pointer with a count is the caller's error and traps.
+    func span_from_c_parts(module: HirModule, function: HirFunction, span: SourceSpan, span_type: ir.TypeId, data: RegisterId, count: RegisterId, body: list[MirInstruction]) -> RegisterId!:
+        let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+        let count_type = pointer_int_type(self.state.types, false)
+        let mir_span = try self.state.mir_type_of(module, function, span, span_type)
+        let temp = self.new_temp(mir_span, span, body)
+        let is_null = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = is_null, operation = BinaryOp.eq, left = data, right = self.null_constant(span, body)), span = span))
+        let chosen = self.state.new_register(pointer_type)
+        self.open_if(is_null, [chosen], span, body)
+        let is_empty = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = is_empty, operation = BinaryOp.eq, left = count, right = self.integer_constant(count_type, 0, span, body)), span = span))
+        self.open_if(is_empty, list[RegisterId](), span, body)
+        self.emit_else(span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "null_foreign"), span = span))
+        self.emit_end(span, body)
+        self.emit_yield(temp, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(data, span, body)
+        self.emit_end(span, body)
+        self.store_value(pointer_type, self.field_address(mir_span, temp, 0, span, body), chosen, span, body)
+        self.store_value(count_type, self.field_address(mir_span, temp, 1, span, body), count, span, body)
+        return temp
+
+    # The status form of a fallible export (base.md §17.6): the C function
+    # returns `int`, 0 on success and 1 on failure, and writes the success
+    # value through a final out-pointer when there is one.
+    func lower_c_export_status(module: HirModule, function: HirFunction, internal: FunctionId, success: ir.TypeId, internal_arguments: list[RegisterId], parameter_types: list[TypeId], results: list[TypeId], body: list[MirInstruction]) -> !:
+        let span = function.span
+        let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+        let status_type = builtin_mir_type(BuiltinMirType.signed_i32)
+        let has_value = not types_match(success, resolve_builtin_type(BuiltinType.unit))
+        var out = RegisterId(value = no_register)
+        if has_value:
+            parameter_types.append(pointer_type)
+            out = self.state.new_register(pointer_type)
+        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let error_temp = self.new_temp(error_type, span, body)
+        let call_arguments = [error_temp]
+        let call_results = list[RegisterId]()
+        let value = try self.place_call_result(module, function, span, success, false, call_arguments, call_results, body)
+        for argument in internal_arguments: call_arguments.append(argument)
+        let reported = self.state.new_register(pointer_type)
+        call_results.append(reported)
+        body.append(MirInstruction(form = InstructionForm.Call(results = self.state.operands.run(call_results), function = internal, arguments = self.state.operands.run(call_arguments)), span = span))
+        let failed = self.error_is_present(reported, span, body)
+        let status = self.state.new_register(status_type)
+        self.open_if(failed, [status], span, body)
+        self.emit_yield(self.integer_constant(status_type, 1, span, body), span, body)
+        self.emit_else(span, body)
+        if has_value:
+            self.emit_nonnull_c_guard(out, span, body)
+            let encoded = try self.encode_c_boundary_value(module, function, span, success, value, body)
+            let raw_type = try self.state.c_boundary_type_of(module, function, span, success)
+            self.store_value(raw_type, out, encoded, span, body)
+        self.emit_yield(self.integer_constant(status_type, 0, span, body), span, body)
+        self.emit_end(span, body)
+        results.append(status_type)
+        body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run([status])), span = span))
+
     # One target-neutral C adapter. The source body remains an ordinary
     # Luce-convention function so source calls never acquire boundary traps or
     # null encoding. Explicit exports and named cfunc conversions share it;
@@ -482,8 +545,20 @@ pub class FunctionLowerer: FunctionLoweringHost:
         # the body already takes its receiver by address.
         let receives_self = function.receiver != none
         let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+        let count_type = pointer_int_type(self.state.types, false)
+        # A span parameter is two C parameters, its data and its count
+        # (base.md §17.6); `span_counts` holds the count register of each.
+        let span_counts = list[RegisterId]()
         for index in range(0, len(function.parameters)):
-            var raw_type = try self.state.c_boundary_type_of(module, function, function.span, function.parameters[index].value_type)
+            let value_type = function.parameters[index].value_type
+            span_counts.append(RegisterId(value = no_register))
+            if self.state.is_span(value_type):
+                parameter_types.append(pointer_type)
+                raw_values.append(self.state.new_register(pointer_type))
+                parameter_types.append(count_type)
+                span_counts[index] = self.state.new_register(count_type)
+                continue
+            var raw_type = try self.state.c_boundary_type_of(module, function, function.span, value_type)
             if index == 0 and receives_self: raw_type = pointer_type
             parameter_types.append(raw_type)
             raw_values.append(self.state.new_register(signature_register_type(self.state.types, CallingConvention.c, raw_type)))
@@ -492,6 +567,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
             if index == 0 and receives_self:
                 self.emit_nonnull_c_guard(raw_values[index], function.span, body)
                 internal_arguments.append(raw_values[index])
+            elif span_counts[index].value != no_register:
+                internal_arguments.append(try self.span_from_c_parts(module, function, function.span, function.parameters[index].value_type, raw_values[index], span_counts[index], body))
             else:
                 internal_arguments.append(try self.decode_c_boundary_value(module, function, function.span, function.parameters[index].value_type, raw_values[index], body))
 
@@ -502,7 +579,10 @@ pub class FunctionLowerer: FunctionLoweringHost:
             Defined(function_id): internal = function_id
             External(external): trap("C export mapped to an external identity")
         let results = list[TypeId]()
-        if types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
+        let fallible_success = self.state.fallible_inner(function.result)
+        if fallible_success != none:
+            try self.lower_c_export_status(module, function, internal, fallible_success, internal_arguments, parameter_types, results, body)
+        elif types_match(function.result, resolve_builtin_type(BuiltinType.unit)):
             body.append(MirInstruction(form = InstructionForm.Call(results = no_registers(), function = internal, arguments = self.state.operands.run(internal_arguments)), span = function.span))
             body.append(MirInstruction(form = InstructionForm.Return(values = no_registers()), span = function.span))
         else:
@@ -2467,7 +2547,13 @@ pub class FunctionLowerer: FunctionLoweringHost:
             match slot:
                 Input(parameter):
                     let value_type = called.parameters[parameter].value_type
-                    encoded.append(try self.encode_c_import_value(module, function, span, value_type, placed[parameter], temporaries, body))
+                    if self.state.is_span(value_type):
+                        # A span crosses as its data and count (base.md §17.6).
+                        let span_type = try self.state.mir_type_of(module, function, span, value_type)
+                        encoded.append(try self.load_field(span_type, placed[parameter], 0, span, body))
+                        encoded.append(try self.load_field(span_type, placed[parameter], 1, span, body))
+                    else:
+                        encoded.append(try self.encode_c_import_value(module, function, span, value_type, placed[parameter], temporaries, body))
                 Output(name, value_type):
                     var raw_type = try self.state.c_boundary_type_of(module, function, span, value_type)
                     # The call operand is still one pointer, but C writes the
