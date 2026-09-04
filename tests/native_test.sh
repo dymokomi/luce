@@ -13,7 +13,7 @@ trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 "$luce" build src/luce.luc -o "$test_dir/luce"
 runtime_source=src/runtime/allocator.lucn
 runtime_root=src/runtime
-"$test_dir/luce" build --package org.luce.tests --root examples --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello" examples/hello.luc
+"$test_dir/luce" build --package org.luce.tests --root examples/full --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello" examples/full/hello.luc
 
 description=$(file "$test_dir/hello")
 case "$(uname -s)-$(uname -m)" in

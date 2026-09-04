@@ -657,7 +657,7 @@ Two consequences for the design record:
   toolchain. Luce-native backends begin only after the language and runtime
   baseline is complete, and must prove the same canonical MIR against QBE.
 - The order of work: new `mir/canonical.luc` and verifier → MIR interpreter
-  and the three-way harness (both done: `tests/compiler/differential_test.luc`)
+  and the three-way harness (both done: `tests/common/differential_test.luc`)
   → the lowerer in vertical slices (scalars and locals, control flow, calls and constants — done;
   enums and `match`, structs and classes/ARC, closures and interfaces, failure and
   `defer`, collections, the C boundary, workers) → wasm encoder tracking

@@ -78,7 +78,7 @@ if grep -R -n -E 'Profile\.(base|full)|ModuleAuthority\.base' src/compiler/front
     exit 1
 fi
 
-# 2. Unit tests: every tests/compiler/**/*_test.luc file.
+# 2. Unit tests: every tests/common/**/*_test.luc file.
 "$luce" test
 
 # 3. Command-line contract: exit statuses, usage, and that every failure

@@ -60,38 +60,38 @@ expect 2 "build: --c-header may be supplied once" "$cli" build --package org.luc
 expect 2 "bind: expected \`--name NAME --fiir PATH --raw PATH --adapter PATH\`" "$cli" bind
 expect 2 "bind: --name may be supplied once" "$cli" bind --name first --name second
 expect 2 "bind: --macro-constant expects a C macro name" "$cli" bind --macro-constant
-expect 2 "bind: --safe requires --recipe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --safe s.luc examples/c_import/temperature.h
-expect 2 "bind: --recipe requires --safe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --recipe examples/c_import/temperature.recipe.toml examples/c_import/temperature.h
+expect 2 "bind: --safe requires --recipe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --safe s.luc examples/full/c_import/temperature.h
+expect 2 "bind: --recipe requires --safe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --recipe examples/full/c_import/temperature.recipe.toml examples/full/c_import/temperature.h
 
 expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/main.luc"
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/shared.luc"
 expect 1 "cannot read" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/missing.luc"
 expect 1 "expected \`i64\`, found \`bool\`" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/wrong.luc"
-expect 1 "generic specialization budget of 2 was exceeded" "$cli" check --package org.luce.tests --root examples --generic-specializations 2 examples/generic_functions.luc
-expect 0 "generic specializations for \`org.luce.tests\`: 5/5" "$cli" explain --package org.luce.tests --root examples --generic-specializations 5 examples/generic_functions.luc
-expect 0 "expansion path:" "$cli" explain --package org.luce.tests --root examples examples/generic_functions.luc
-expect 0 "interface costs for \`org.luce.tests\`: 5 box(es), 5 dynamic call(s)" "$cli" explain --package org.luce.tests --root examples examples/interfaces.luc
+expect 1 "generic specialization budget of 2 was exceeded" "$cli" check --package org.luce.tests --root examples/full --generic-specializations 2 examples/full/generic_functions.luc
+expect 0 "generic specializations for \`org.luce.tests\`: 5/5" "$cli" explain --package org.luce.tests --root examples/full --generic-specializations 5 examples/full/generic_functions.luc
+expect 0 "expansion path:" "$cli" explain --package org.luce.tests --root examples/full examples/full/generic_functions.luc
+expect 0 "interface costs for \`org.luce.tests\`: 5 box(es), 5 dynamic call(s)" "$cli" explain --package org.luce.tests --root examples/full examples/full/interfaces.luc
 
 expect 0 "5" "$cli" run --package org.luce.tests --root "$test_dir" main.answer "$test_dir/main.luc"
 expect 0 "help: use \`copy count = count\`" "$cli" run --package org.luce.tests --root "$test_dir" shared.main "$test_dir/shared.luc"
 expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luce.tests --root "$test_dir" main.nope "$test_dir/main.luc"
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests --root "$test_dir" other.main "$test_dir/main.luc"
 
-expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests --root examples/compiled_core "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic.wasm" examples/generic_functions.luc
-expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --root examples --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/strings.wasm" examples/strings.luc
+expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests --root examples/full/compiled_core "$test_dir/out.wasm" examples/full/compiled_core/main.luc
+expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --root examples/full --generic-specializations 5 --time-report --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic.wasm" examples/full/generic_functions.luc
+expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --root examples/full --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/strings.wasm" examples/full/strings.luc
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/shared.wasm" "$test_dir/shared.luc"
-expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --root examples/compiled_core --target native "$test_dir/out" examples/compiled_core/main.luc
+expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --root examples/full/compiled_core --target native "$test_dir/out" examples/full/compiled_core/main.luc
 
-expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/native" examples/hello.luc
+expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples/full --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/native" examples/full/hello.luc
 native_output=$("$test_dir/native")
 if [ "$native_output" != "Hello, world!" ]; then
     echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
     exit 1
 fi
-expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic-native" examples/generic_functions.luc
+expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples/full --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic-native" examples/full/generic_functions.luc
 expect 1 "C header and ABI report outputs require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-header "$test_dir/api.h" "$test_dir/api.wasm" "$test_dir/c_api.luc"
-expect 1 "C sources and arguments require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-source examples/c_import/temperature.c "$test_dir/api.wasm" "$test_dir/c_api.luc"
+expect 1 "C sources and arguments require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-source examples/full/c_import/temperature.c "$test_dir/api.wasm" "$test_dir/c_api.luc"
 expect 1 "C header output must differ from the primary artifact" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/collision" "$test_dir/collision" "$test_dir/c_api.luc"
 expect 1 "C source must differ from the C header output" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/source.c" --c-source "$test_dir/source.c" "$test_dir/collision" "$test_dir/c_api.luc"
 expect 0 "built $test_dir/c-api-native" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/api.h" --abi-report "$test_dir/api.abi.json" --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/c-api-native" "$test_dir/c_api.luc"
@@ -103,12 +103,12 @@ grep -q '"target":' "$test_dir/api.abi.json"
 grep -q '"offset": 4' "$test_dir/api.abi.json"
 
 mkdir "$test_dir/temperature"
-expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
+expect 0 "bound examples/full/c_import/temperature.h" "$cli" bind \
     --name temperature \
     --fiir "$test_dir/temperature.fiir.json" \
     --raw "$test_dir/temperature/raw.lucn" \
     --adapter "$test_dir/temperature.adapter.c" \
-    --recipe examples/c_import/temperature.recipe.toml \
+    --recipe examples/full/c_import/temperature.recipe.toml \
     --safe "$test_dir/temperature/safe.luc" \
     --clang-arg -std=c11 \
     --clang-arg -Wall \
@@ -123,7 +123,7 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --macro-constant LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY \
     --macro-constant LUCE_TEMPERATURE_MACRO_UNDEFINED \
     --macro-constant LUCE_TEMPERATURE_MACRO_OPEN_SCALE \
-    examples/c_import/temperature.h
+    examples/full/c_import/temperature.h
 grep -q '"format": "luce-fiir-2"' "$test_dir/temperature.fiir.json"
 grep -q '"target":' "$test_dir/temperature.fiir.json"
 grep -q '"kind": "record"' "$test_dir/temperature.fiir.json"
@@ -237,7 +237,7 @@ grep -q '(void \*)(luce_temperature_sensor_open((luce_degrees)value))' "$test_di
 grep -q 'luce_temperature_sensor_value((luce_temperature_sensor \*)sensor)' "$test_dir/temperature.adapter.c"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/temperature.adapter.c"
 mkdir "$test_dir/temperature-short"
-expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
+expect 0 "bound examples/full/c_import/temperature.h" "$cli" bind \
     --name temperature \
     --fiir "$test_dir/temperature-short.fiir.json" \
     --raw "$test_dir/temperature-short/raw.lucn" \
@@ -256,7 +256,7 @@ expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --macro-constant LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY \
     --macro-constant LUCE_TEMPERATURE_MACRO_UNDEFINED \
     --macro-constant LUCE_TEMPERATURE_MACRO_OPEN_SCALE \
-    examples/c_import/temperature.h
+    examples/full/c_import/temperature.h
 cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/temperature-short.adapter.c"
 
 expect 0 "bound tests/fixtures/fiir/scalars.h" "$cli" bind \
@@ -275,8 +275,8 @@ grep -q 'pub func luce_echo_int(value: c.int) -> c.int' "$test_dir/scalars.raw.l
 grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$test_dir/scalars.raw.lucn"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
-cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
-cp examples/c_import/safe_temperature.luc "$test_dir/safe_temperature.luc"
+cp examples/full/c_import/temperature.luc "$test_dir/temperature.luc"
+cp examples/full/c_import/safe_temperature.luc "$test_dir/safe_temperature.luc"
 printf 'from safe_temperature import safe_sensor_lifecycle\nfrom temperature import absent_sensor_round_trips, adjust_celsius, adjusted_half, boiling_celsius, celsius_to_fahrenheit, echo_degrees, enumeration_constants, external_objects, half_celsius, is_freezing, macro_constants, optional_sensor_value, scalar_constants, scalar_macro_constants, scale_round_trips, sensor_value, shifted_range, shifted_reading\npub func main(arguments: slice[str]) -> i32!:\n    let safe_value = try safe_sensor_lifecycle(42)\n    let (minimum, maximum) = shifted_range(-10.0, 10.0, 5.0)\n    let (reading_minimum, reading_maximum, current, is_celsius, fraction) = shifted_reading(5)\n    let (default_negative, default_magnitude, open_negative, open_magnitude) = enumeration_constants()\n    let (zero_negative, zero_magnitude, limit_negative, limit_magnitude) = macro_constants()\n    let (constant_enabled, constant_half, constant_zero, constant_ratio, constant_infinity, constant_nan) = scalar_constants()\n    let (macro_enabled, macro_half, macro_zero, macro_ratio, macro_infinity, macro_nan, macro_scale_negative, macro_scale_magnitude) = scalar_macro_constants()\n    let (offset, sensor_capacity, enabled, ratio, uses_fahrenheit) = external_objects(42)\n    return 0 if safe_value == 42 and celsius_to_fahrenheit(0.0) == 32.0 and half_celsius(84.0f32) == 42.0f32 and adjusted_half(1.0f16, 0.5f16) == 1.5f16 and adjust_celsius(40, 2) == 42 and echo_degrees(42) == 42 and boiling_celsius() == 100 and default_negative and default_magnitude == 2u64 and not open_negative and open_magnitude == 7u64 and zero_negative and zero_magnitude == 273u64 and not limit_negative and limit_magnitude == 4095u64 and constant_enabled and constant_half == 0.5f16 and 1.0f32 / constant_zero < 0.0f32 and constant_ratio == 1.5 and constant_infinity and constant_nan and macro_enabled and macro_half == 0.25f16 and 1.0f32 / macro_zero < 0.0f32 and macro_ratio == 1.25 and macro_infinity and macro_nan and not macro_scale_negative and macro_scale_magnitude == 7u64 and offset == 42 and sensor_capacity == 4095u64 and enabled and ratio == 1.5 and uses_fahrenheit and scale_round_trips() and is_freezing(0.0) and minimum == -5.0 and maximum == 15.0 and reading_minimum == -5.0 and reading_maximum == 15.0 and current == 5 and is_celsius and fraction == 1.0f16 and sensor_value(42) == 42 and optional_sensor_value(-1) == none and optional_sensor_value(7) == 7 and absent_sensor_round_trips() else 1\n' > "$test_dir/temperature_main.luc"
 expect 0 "built $test_dir/temperature-native" "$cli" build \
     --package org.luce.c-import-test \
@@ -288,7 +288,7 @@ expect 0 "built $test_dir/temperature-native" "$cli" build \
     --runtime-root src/runtime \
     --runtime src/runtime/allocator.lucn \
     --c-source "$test_dir/temperature.adapter.c" \
-    --c-source examples/c_import/temperature.c \
+    --c-source examples/full/c_import/temperature.c \
     --c-arg -std=c11 \
     --c-arg -Wall \
     --c-arg -Wextra \
@@ -296,7 +296,7 @@ expect 0 "built $test_dir/temperature-native" "$cli" build \
     --c-arg -I \
     --c-arg . \
     --c-arg -I \
-    --c-arg examples/c_import \
+    --c-arg examples/full/c_import \
     "$test_dir/temperature-native" \
     "$test_dir/temperature/raw.lucn" \
     "$test_dir/temperature/safe.luc" \
@@ -314,7 +314,7 @@ expect 1 "Clang FIIR toolchain: target query exited with status" "$cli" bind \
     --fiir "$test_dir/preserved.fiir.json" \
     --raw "$test_dir/preserved.raw.lucn" \
     --adapter "$test_dir/preserved.adapter.c" \
-    examples/c_import/temperature.h
+    examples/full/c_import/temperature.h
 [ "$(cat "$test_dir/preserved.fiir.json")" = "previous fiir" ]
 [ "$(cat "$test_dir/preserved.raw.lucn")" = "previous raw" ]
 [ "$(cat "$test_dir/preserved.adapter.c")" = "previous adapter" ]
@@ -324,7 +324,7 @@ expect 1 "Clang FIIR toolchain: target query exited with status" "$cli" bind \
 # host's installed tools.
 mkdir "$test_dir/empty-path"
 printf 'previous artifact' > "$test_dir/preserved"
-expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/preserved" examples/hello.luc
+expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples/full --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/preserved" examples/full/hello.luc
 preserved=$(cat "$test_dir/preserved")
 if [ "$preserved" != "previous artifact" ]; then
     echo "cli: failed native build replaced the previous artifact" >&2

@@ -1,0 +1,355 @@
+#==============================================================================================
+#
+#   pipeline_test - Caller-provided HIR execution backends plug in
+#
+#   DESCRIPTION:
+#       A toy backend proves anything implementing HirExecutionBackend can ride
+#       the same analyzed-HIR path as the built-in interpreter. Artifact
+#       backends instead share verified canonical MIR; their output forms are
+#       intentionally different and are selected explicitly by the pipeline.
+#
+#==============================================================================================
+
+from luce.compiler.backend import HirExecutionBackend
+from luce.compiler.pipeline import BuildTarget, CompilationOptions, PackageInput, RuntimePackageInput, StandardSourceInput, build_with_runtime, check, compile_runtime, compile_with_runtime, explain, run, run_with_backend
+from luce.compiler.runtime_package import sealed_runtime_package
+from luce.compiler.hir.analyzer import AnalyzedProgram
+from luce.compiler.hir.ir import ModuleAuthority, Value
+from luce.compiler.mir.canonical import CallingConvention, find_mir_extern, find_runtime_binding, mir_type
+from luce.compiler.backends.layout import LayoutRules
+from luce.compiler.backends.mir_interpreter import MirInterpreter
+from luce.compiler.backends.mir_execution_model import MirValue
+from luce.compiler.runtime_contract import RuntimeService
+import std.files
+import std.paths
+import std.strings
+
+# mark: Inputs ==============================================================================
+
+func package(source_paths: list[str]) -> PackageInput:
+    return PackageInput(identity = "org.luce.pipeline-tests", source_root = paths.dir(source_paths[0]), source_paths = source_paths)
+
+func runtime_package() -> RuntimePackageInput:
+    return sealed_runtime_package("src/runtime", ["src/runtime/allocator.lucn"])
+
+# mark: Pipeline composition ================================================================
+
+pub func test_package_identity_is_an_explicit_pipeline_input():
+    let analyzed = check(package(["examples/full/compiled_core/main.luc"])) catch reason:
+        trap(reason)
+    assert(analyzed.hir.packages[analyzed.hir.root_package.value].identity == "org.luce.pipeline-tests")
+
+    let invalid = PackageInput(identity = "", source_root = "examples/full/compiled_core", source_paths = ["examples/full/compiled_core/main.luc"])
+    discard(check(invalid)) catch reason:
+        assert(reason == "package identity cannot be empty")
+        return
+    trap("expected an empty package identity to fail")
+
+pub func test_pipeline_configures_and_reports_generic_specialization_budgets():
+    let input = package(["examples/full/generic_functions.luc"])
+    let options = CompilationOptions(generic_specialization_budget = 5)
+    let explained = explain(input, options) catch reason:
+        trap(reason)
+    let report = explained.generic_report
+    assert(len(explained.diagnostics) == 0)
+    assert(report.package_identity == "org.luce.pipeline-tests")
+    assert(report.budget == 5)
+    assert(len(report.specializations) == 5)
+    assert(report.checked_nodes > 0)
+    assert(strings.contains(report.render(), "examples/full/generic_functions.luc:19:36: identity[i64]"))
+    assert(len(explained.interface_report.boxing_sites) == 0)
+    assert(len(explained.interface_report.dispatch_sites) == 0)
+
+    let scratch = files.make_temporary_directory(".", ".luce-generic-report-") catch reason:
+        trap(reason)
+    let output = paths.join(scratch, "program.wasm")
+    let built = build_with_runtime(BuildTarget.wasm, output, input, runtime_package(), options) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    assert(len(built.generic_reports) == 2)
+    let compiled = built.generic_reports[0]
+    assert(compiled.has_compilation)
+    assert(compiled.mir_instructions > 0 and compiled.backend_code_bytes > 0)
+    assert(len(compiled.specializations) == 5)
+    var emitted = 0
+    var eliminated = 0
+    for item in compiled.specializations:
+        if item.mir_function == none:
+            eliminated += 1
+            assert(item.mir_instructions == none and item.backend_code_bytes == none)
+        else:
+            emitted += 1
+            assert(item.mir_instructions != none)
+            assert((item.backend_code_bytes else 0) > 0)
+    assert(emitted == 4 and eliminated == 1)
+    assert(strings.contains(compiled.render(), "artifact: eliminated before backend emission"))
+    files.remove_all(scratch) catch reason:
+        trap(reason)
+
+    let limited = CompilationOptions(generic_specialization_budget = 2)
+    discard(check(input, limited)) catch reason:
+        assert(strings.contains(reason, "generic specialization budget of 2 was exceeded while creating `choose[i64]`"))
+        assert(strings.contains(reason, "expansion path:"))
+        return
+    trap("expected the configured generic specialization budget to fail")
+
+pub func test_native_suffix_is_package_reader_authority_not_a_module_name():
+    let scratch = files.make_temporary_directory(".", ".luce-native-authority-") catch reason:
+        trap(reason)
+    let source = paths.join(scratch, "raw.lucn")
+    files.write(source, "func keep(value: native_ptr[u8]) -> native_ptr[u8]: return value\n") catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let analyzed = check(package([source])) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    files.remove_all(scratch) catch reason:
+        trap(reason)
+    assert(analyzed.hir.modules[0].name == "raw")
+    assert(analyzed.hir.modules[0].authority == ModuleAuthority.native)
+
+pub func test_standard_authority_comes_only_from_explicit_pipeline_provenance():
+    let path = "src/standard/c.luc"
+    let input = PackageInput(
+        identity = "org.luce.standard-test",
+        source_root = "examples/full/compiled_core",
+        source_paths = list[str](),
+        standard_sources = StandardSourceInput(source_root = "src/standard", source_paths = [path]),
+    )
+    let analyzed = check(input) catch reason:
+        trap(reason)
+    assert(analyzed.hir.modules[0].name == "c")
+    assert(analyzed.hir.modules[0].authority == ModuleAuthority.standard)
+
+    let untrusted = PackageInput(identity = "org.luce.project-test", source_root = ".", source_paths = [path])
+    discard(check(untrusted)) catch reason:
+        assert(strings.contains(reason, "unknown name `Builtin`"))
+        return
+    trap("expected project source to lack standard-library authority")
+
+pub func test_nonfatal_diagnostics_survive_check_run_compile_and_build():
+    let scratch = files.make_temporary_directory(".", ".luce-pipeline-diagnostics-") catch reason:
+        trap(reason)
+    let source = paths.join(scratch, "main.luc")
+    let output = paths.join(scratch, "program.wasm")
+    files.write(source, "pub func answer() -> i64:\n    var count = 42\n    let read: func() -> i64 = () => count\n    return read()\n") catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let input = package([source])
+    let analyzed = check(input) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let executed = run(input, "main", "answer") catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let explained = explain(input) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let compiled = compile_with_runtime(input, runtime_package()) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    let built = build_with_runtime(BuildTarget.wasm, output, input, runtime_package()) catch reason:
+        files.remove_all(scratch) catch cleanup_reason:
+            trap(reason + "; cleanup failed: " + cleanup_reason)
+        trap(reason)
+    assert(len(analyzed.diagnostics) == 1)
+    assert(len(executed.diagnostics) == 1)
+    assert(len(explained.diagnostics) == 1)
+    assert(len(compiled.diagnostics) == 1)
+    assert(len(built.diagnostics) == 1)
+    assert(executed.diagnostics[0].code == analyzed.diagnostics[0].code)
+    assert(explained.diagnostics[0].code == analyzed.diagnostics[0].code)
+    assert(compiled.diagnostics[0].primary.path == source)
+    assert(built.diagnostics[0].primary.path == source)
+    match executed.value:
+        SignedInteger(value): assert(value == 42)
+        else: assert(false)
+    let artifact = files.read_bytes(output) catch reason:
+        trap(reason)
+    assert(len(artifact) > 8)
+    files.remove_all(scratch) catch reason:
+        trap(reason)
+
+pub func test_pipeline_compiles_and_composes_the_explicit_sealed_runtime_package():
+    let descriptor = runtime_package()
+    let runtime = compile_runtime(descriptor) catch reason:
+        trap(reason)
+    let runtime_program = runtime.program
+    assert(len(runtime_program.runtime_bindings) == len(descriptor.bindings))
+    for index in range(0, len(descriptor.bindings)):
+        assert(runtime_program.runtime_bindings[index].service == descriptor.bindings[index].service)
+    assert(runtime_program.runtime_bindings[0].service == RuntimeService.storage_allocator)
+    let allocator = runtime_program.runtime_bindings[0].function
+    assert(runtime_program.functions[allocator.value].name == "allocator.allocate_storage")
+    assert(runtime_program.runtime_bindings[1].service == RuntimeService.storage_deallocator)
+    assert(runtime_program.functions[runtime_program.runtime_bindings[1].function.value].name == "allocator.deallocate_storage")
+    assert(runtime_program.runtime_bindings[len(runtime_program.runtime_bindings) - 2].service == RuntimeService.interface_witness)
+    let witness = runtime_program.runtime_bindings[len(runtime_program.runtime_bindings) - 2].function
+    assert(runtime_program.functions[witness.value].name == "allocator.interface_witness")
+    assert(runtime_program.runtime_bindings[len(runtime_program.runtime_bindings) - 1].service == RuntimeService.hash_entry_hash)
+    let entry_hash = runtime_program.runtime_bindings[len(runtime_program.runtime_bindings) - 1].function
+    assert(runtime_program.functions[entry_hash.value].name == "allocator.hash_entry_hash")
+    assert(runtime_program.globals[0].name == "allocator.next_offset")
+    let arena = find_mir_extern(runtime_program, "luce_rt_arena")
+    assert(arena >= 0)
+    assert(runtime_program.externs[arena].convention == CallingConvention.runtime)
+
+    let combined = compile_with_runtime(package(["examples/full/compiled_core/main.luc"]), runtime_package()) catch reason:
+        trap(reason)
+    # No application operation allocates yet, so closed-world reachability
+    # removes the runtime implementation and its provider as one dead unit.
+    assert(len(combined.program.runtime_bindings) == 0)
+    assert(find_mir_extern(combined.program, "luce_rt_arena") < 0)
+
+pub func test_pipeline_composes_every_list_service_before_backend_selection():
+    let combined = compile_with_runtime(package(["examples/full/lists.luc"]), runtime_package()) catch reason:
+        trap(reason)
+    let program = combined.program
+    # Pin the semantic services the example needs, not an incidental total:
+    # managed runtime callback fields can make ownership services reachable
+    # without changing the list contract under test.
+    let required_services = [
+        RuntimeService.storage_allocator,
+        RuntimeService.storage_deallocator,
+        RuntimeService.equality_context_create,
+        RuntimeService.equality_context_release,
+        RuntimeService.equality_context_visit,
+        RuntimeService.list_create,
+        RuntimeService.list_retain,
+        RuntimeService.list_release,
+        RuntimeService.list_copy,
+        RuntimeService.list_concat,
+        RuntimeService.list_length,
+        RuntimeService.list_iteration_begin,
+        RuntimeService.list_iteration_end,
+        RuntimeService.list_iteration_active,
+        RuntimeService.list_append_slot,
+        RuntimeService.list_insert_slot,
+        RuntimeService.list_remove_at,
+        RuntimeService.list_clear,
+        RuntimeService.list_reserve,
+        RuntimeService.list_element_address,
+        RuntimeService.list_mutable_element_address,
+        RuntimeService.list_slice,
+        RuntimeService.slice_retain,
+        RuntimeService.slice_release,
+        RuntimeService.slice_length,
+        RuntimeService.slice_element_address,
+    ]
+    for service in required_services:
+        assert(find_runtime_binding(program, service) != none)
+    assert(find_mir_extern(program, "luce_rt_arena") >= 0)
+    var creates = 0
+    var copies = 0
+    var concatenations = 0
+    var appends = 0
+    var inserts = 0
+    var removals = 0
+    var clears = 0
+    var reserves = 0
+    var indexes = 0
+    var mutable_indexes = 0
+    var slices = 0
+    var slice_indexes = 0
+    var iteration_begins = 0
+    var iteration_ends = 0
+    var aggregate_remove_copied_first = false
+    for function in program.functions:
+        var previous_was_copy = false
+        for instruction in function.body:
+            match instruction.form:
+                ListCreate(result):
+                    match mir_type(program.types, function.registers[result.value]):
+                        List(element): creates += 1
+                        else: trap("list creation lost its canonical element type")
+                ListCopy(result, value, element_retain): copies += 1
+                ListConcat(result, left, right, element_retain): concatenations += 1
+                ListIterationBegin(result, value): iteration_begins += 1
+                ListIterationEnd(value): iteration_ends += 1
+                ListAppendSlot(result, value, element_retain): appends += 1
+                ListInsertSlot(result, value, index, element_retain): inserts += 1
+                ListRemoveAt(value, index, element_retain):
+                    removals += 1
+                    if function.name == "lists.aggregate_removal" and previous_was_copy:
+                        aggregate_remove_copied_first = true
+                ListClear(value, element_release): clears += 1
+                ListReserve(value, minimum_capacity, element_retain): reserves += 1
+                ListElementAddress(result, value, index): indexes += 1
+                ListMutableElementAddress(result, value, index, element_retain): mutable_indexes += 1
+                ListSlice(result, value, start, end): slices += 1
+                SliceElementAddress(result, value, index): slice_indexes += 1
+                else: pass
+            match instruction.form:
+                Memcpy(destination, source, value_type): previous_was_copy = true
+                else: previous_was_copy = false
+    assert(creates >= 2 and appends >= 7 and indexes >= 5)
+    assert(copies == 3 and concatenations == 5 and inserts == 4 and removals == 2 and clears == 4 and reserves == 2)
+    assert(mutable_indexes == 8 and slices == 6 and slice_indexes == 8)
+    # `first` and the always-failing traversal each retain a transfer cleanup
+    # plus their mutually exclusive common exit; all other loops have one.
+    assert(iteration_begins == 8 and iteration_ends == 10)
+    assert(aggregate_remove_copied_first)
+    let value = MirInterpreter(program, LayoutRules(pointer_size = 8, pointer_align = 8)).run_process(list[str]()) catch reason:
+        trap(reason)
+    match value:
+        SignedInt(status): assert(status == 0)
+        else: assert(false)
+
+pub func test_pipeline_composes_the_mutable_slice_scope_service():
+    let combined = compile_with_runtime(package(["examples/full/mutable_slices.luc"]), runtime_package()) catch reason:
+        trap(reason)
+    let program = combined.program
+    assert(find_runtime_binding(program, RuntimeService.list_mutable_slice_begin) != none)
+    assert(find_runtime_binding(program, RuntimeService.list_iteration_end) != none)
+    let value = MirInterpreter(program, LayoutRules(pointer_size = 8, pointer_align = 8)).run_process(list[str]()) catch reason:
+        trap(reason)
+    match value:
+        SignedInt(status): assert(status == 0)
+        else: assert(false)
+
+# mark: Execution interface ================================================================
+
+# Counts modules.
+pub class ModuleCountBackend: HirExecutionBackend:
+    pub init():
+        return
+
+    pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
+        return Value.SignedInteger(value = len(program.hir.modules))
+
+pub func test_pipeline_accepts_an_execution_backend():
+    let value = run_with_backend(
+        ModuleCountBackend(),
+        package(["examples/full/semantic_core/math.luc", "examples/full/semantic_core/main.luc"]),
+        "main",
+        "answer",
+    ) catch reason:
+        trap(reason)
+    match value.value:
+        SignedInteger(module_count): assert(module_count == 2)
+        else: assert(false)
+
+# Always fails behind the execution interface.
+pub class RefusingBackend: HirExecutionBackend:
+    pub init():
+        return
+
+    pub func run(program: AnalyzedProgram, module_name: str, function_name: str) -> Value!:
+        error("refusing backend: cannot run `" + module_name + "." + function_name + "`")
+
+# An error raised behind the backend interfaces must reach the caller as a
+# diagnostic. Stage-0 0.20 turned this into a silent trap; 0.22 fixed it.
+pub func test_backend_errors_cross_the_interface_boundary():
+    let paths = ["examples/full/semantic_core/math.luc", "examples/full/semantic_core/main.luc"]
+    var reported = ""
+    discard(run_with_backend(RefusingBackend(), package(paths), "main", "answer")) catch reason:
+        reported = reason
+    assert(reported == "refusing backend: cannot run `main.answer`")

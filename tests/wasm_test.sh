@@ -39,7 +39,7 @@ expect() {
 }
 
 # A process entry: output through WASI fd_write, exit status through proc_exit.
-"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello.wasm" examples/hello.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples/full --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello.wasm" examples/full/hello.luc >/dev/null
 expect 0 "Hello, world!" wasmtime run "$test_dir/hello.wasm"
 
 printf 'pub func main(arguments: slice[str]) -> i32!:\n    print("one")\n    print("two")\n    return 3 * 2\n' > "$test_dir/status.luc"
@@ -56,7 +56,7 @@ printf 'let invalid: ErrorCode = ErrorCode.package(1)\npub func main(arguments: 
 expect 1 "" wasmtime run "$test_dir/entry_failure.wasm"
 
 # Exported functions: wasmtime invokes them by name and prints the result.
-"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/core.wasm" examples/compiled_core/main.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples/full --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/core.wasm" examples/full/compiled_core/main.luc >/dev/null
 expect 0 "42" wasmtime run --invoke compiled_core.main.answer "$test_dir/core.wasm"
 
 printf 'pub func answer() -> i64: return (2 + 3) * 4 - 6\npub func narrow() -> i32: return 2147483646i32 + 1i32\n' > "$test_dir/math.luc"
@@ -65,7 +65,7 @@ expect 0 "14" wasmtime run --invoke math.answer "$test_dir/math.wasm"
 expect 0 "2147483647" wasmtime run --invoke math.narrow "$test_dir/math.wasm"
 
 # Slice 3a: locals, every operator family, narrow widths, conditionals. The
-# same programs are oracle-checked in tests/compiler/differential_test.luc;
+# same programs are oracle-checked in tests/common/differential_test.luc;
 # here the wasm bytes actually run. (wasmtime prints i32 results signed, so
 # wide unsigned values stay in the unit tests.)
 cat > "$test_dir/scalars.luc" <<'LUCE'
@@ -282,7 +282,7 @@ expect 0 "45" wasmtime run --invoke main.answer "$test_dir/modules.wasm"
 
 # The complete function-value example also exercises recoverable failure, so
 # it names the same explicit sealed runtime as every installed product build.
-"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/function_values.wasm" examples/function_values.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples/full --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/function_values.wasm" examples/full/function_values.luc >/dev/null
 expect 0 "42" wasmtime run --invoke function_values.answer "$test_dir/function_values.wasm"
 expect 0 "" wasmtime run "$test_dir/function_values.wasm"
 
@@ -395,7 +395,7 @@ expect 0 "luce" wasmtime run "$test_dir/struct_print.wasm"
 
 # Milestone 4: tuples, optionals, owned strings, and print of a value.
 # Owner-backed strings and bytes require the explicitly composed sealed runtime
-# and execute through Wasmtime in tests/compiler/examples_test.luc.
+# and execute through Wasmtime in tests/common/examples_test.luc.
 cat > "$test_dir/composites.luc" <<'LUCE'
 func pair() -> (i64, i64): return (3, 4)
 pub func destructure() -> i64:
@@ -506,7 +506,7 @@ yes
 done" wasmtime run "$test_dir/print_value.wasm"
 
 # Enums and `match`: the same programs as the enum fixtures in
-# tests/compiler/differential_test.luc, executed.
+# tests/common/differential_test.luc, executed.
 cat > "$test_dir/enum_directions.luc" <<'LUCE'
 enum Direction:
     north
@@ -956,7 +956,7 @@ done
 
 # Maps and sets retain one semantic shape through the maintained example; the
 # composed runtime owns storage while Wasm supplies only layout and calls.
-"$cli" build --package org.luce.tests --root examples --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hash_collections.wasm" examples/maps_and_sets.luc >/dev/null
+"$cli" build --package org.luce.tests --root examples/full --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hash_collections.wasm" examples/full/maps_and_sets.luc >/dev/null
 expect 0 "42" wasmtime run --invoke maps_and_sets.answer "$test_dir/hash_collections.wasm"
 set +e
 wasmtime run --invoke maps_and_sets.mutation_trap "$test_dir/hash_collections.wasm" >/dev/null 2>&1; status=$?

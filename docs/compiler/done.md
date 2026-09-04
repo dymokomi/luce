@@ -21,7 +21,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 | WebAssembly backend (`backends/wasm.luc`, `wasm_plan.luc`, `wasm_encoding.luc`, `wasm_float16.luc`; `profiles/full/backends/wasm_emission.luc`, `wasm_planning.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_toolchain.luc`; `profiles/full/backends/qbe_emission.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
 | FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. A separate reviewed recipe section generates ordinary safe Luce owners, checked borrows, returned-borrow anchors, and status failures. Both layers have semantic-oracle and linked QBE/C proofs. **Not yet**: broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
-| Tests | 986 unit tests across 49 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 986 unit tests across 49 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/common/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Implemented milestones and evidence
@@ -2142,7 +2142,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   `MirValue`), `qbe_emission_model.luc`, and `wasm_encoding.luc` (the byte
   vocabulary and shared emitters). `test.sh` enforces both folder rules and
   extends the target-neutrality grep to `profiles/*/hir` and `profiles/*/mir`;
-  `tests/compiler/profiles/` mirrors the layout with the closure, class,
+  `tests/common/profiles/` mirrors the layout with the closure, class,
   worker, collection, slice, and hash sections of the generator, lowerer, and
   interpreter tests, which now share fixtures through `*_support.luc`
   modules. No behavior changed: the QBE IL of all 34 compilable examples is
@@ -2260,7 +2260,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   flag on the stack for a `select`, dividing for the multiply test only when
   the divisor is neither zero nor `-1`. `examples/base/c_arithmetic.lucb`
   spells all three behaviours, and the shared Base fixtures
-  (`tests/compiler/profiles/base/fixtures.luc`: C division, widening,
+  (`tests/base/fixtures.luc`: C division, widening,
   wrapping, saturating, checked, layout) answer one number each through the
   reference interpreter, the MIR oracle at both pointer widths, both
   encoders, and a native QBE build linked to a C driver.
@@ -2685,6 +2685,28 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   the interpreters, the backends). `test.sh` rule 1c refuses the old
   spellings in the shared folders.
   Gate: 1099 compiler tests across 58 files.
+- [x] **Tests and examples in three folders** (2026-09-04). `tests/` and
+  `examples/` now split the way the compiler does (plan.md §5.0):
+  `common` for what both dialects share, `base` for Luce Base, and `full`,
+  the working name, for the rest of the language. `tests/base` and
+  `tests/full` came out of `tests/compiler/profiles`, the remaining
+  compiler tests moved under `tests/common` with their helper imports
+  renamed, and every full-Luce example moved under `examples/full`, with
+  the package roots, module names, shell scripts, `FEATURES.md` rows, and
+  READMEs following. `examples/common` waits for the first program that
+  runs unchanged as `.luc` and `.lucb`. `tests/common` still holds many
+  tests of full-Luce features; sorting those into `tests/full` is a
+  follow-up, not a blocker.
+  Gate: 1101 compiler tests across 58 files.
+- [x] **Exported methods (B4)** (2026-09-04). `export func` and `export
+  mutating func` on a Base struct method give it C linkage as
+  `Type_method` with `self` first, a `const Type *` for a plain method
+  and a `Type *` for a mutating one (base.md §9.5, §17.6). The C API model
+  and header, the export namespace check, and the C wrapper share one
+  `exported_c_name`; the wrapper takes `self` as the pointer the body
+  already expects and applies the one null check. A type function has no
+  `self` and is refused with a pointer to the module-level form.
+  Gate: 1101 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

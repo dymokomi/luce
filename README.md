@@ -33,9 +33,9 @@ The compiler is now available at `build/luce`. It can check source files, run a
 function through the HIR interpreter, or build an artifact:
 
 ```sh
-./build/luce check --package org.luce.examples --root examples/semantic_core examples/semantic_core/math.luc examples/semantic_core/main.luc
-./build/luce run --package org.luce.examples --root examples/semantic_core main.answer examples/semantic_core/math.luc examples/semantic_core/main.luc
-./build/luce build --package org.luce.examples --root examples/compiled_core build/answer.wasm examples/compiled_core/main.luc
+./build/luce check --package org.luce.examples --root examples/full/semantic_core examples/full/semantic_core/math.luc examples/full/semantic_core/main.luc
+./build/luce run --package org.luce.examples --root examples/full/semantic_core main.answer examples/full/semantic_core/math.luc examples/full/semantic_core/main.luc
+./build/luce build --package org.luce.examples --root examples/full/compiled_core build/answer.wasm examples/full/compiled_core/main.luc
 ```
 
 The package identity is explicit because it is embedded in stable `ErrorCode`
@@ -45,15 +45,15 @@ Features backed by the reviewed Luce runtime pass its source explicitly; the
 compiler owns the sealed service manifest, so callers provide locations only:
 
 ```sh
-./build/luce build --package org.luce.examples --root examples --runtime-root src/runtime --runtime src/runtime/allocator.lucn build/strings.wasm examples/strings.luc
+./build/luce build --package org.luce.examples --root examples/full --runtime-root src/runtime --runtime src/runtime/allocator.lucn build/strings.wasm examples/full/strings.luc
 ```
 
 Native output uses the pinned QBE toolchain for the current host:
 
 ```sh
-./build/luce build --package org.luce.examples --root examples --target native \
+./build/luce build --package org.luce.examples --root examples/full --target native \
   --runtime-root src/runtime --runtime src/runtime/allocator.lucn \
-  build/hello examples/hello.luc
+  build/hello examples/full/hello.luc
 ./build/hello
 ```
 
@@ -108,7 +108,7 @@ pointer or platform shape before the backend. Other extended floating
 representations and broader declarations fail explicitly until their complete
 adapter contracts land.
 The end-to-end command and generated module layout are documented in
-[`examples/c_import/README.md`](examples/c_import/README.md).
+[`examples/full/c_import/README.md`](examples/full/c_import/README.md).
 
 ## Vocabulary
 
@@ -227,7 +227,7 @@ first incomplete stage for every language section.
 native smoke test on a supported host. To run one file:
 
 ```sh
-./stage0/bin/luce-0 test tests/compiler/frontend/parser_test.luc
+./stage0/bin/luce-0 test tests/common/frontend/parser_test.luc
 ```
 
 A test is a zero-argument `pub func test_*` function; Stage-0 discovers them
@@ -251,7 +251,7 @@ Read in this order; each stop hands off to the next.
 3. [pipeline.luc](src/compiler/pipeline.luc) is the shortest useful tour of
    the compiler. Its `build`, `check`, and `run` functions show how the stages
    fit together, and every stage file's header says where it sits.
-4. [tests/compiler](tests/compiler) holds precise examples of what each stage
+4. [tests/common](tests/compiler) holds precise examples of what each stage
    currently accepts, rejects, and produces; each file's sections read as that
    stage's specification.
 

@@ -53,7 +53,7 @@ repository simply rebuilds its local compiler artifacts with the new seed.
 ## Open observation: a test module named after its source module
 
 Found 2026-09-03 while adding `src/compiler/profile.luc`. A test file at
-`tests/compiler/profile_test.luc` (test module `compiler.profile_test` in
+`tests/common/profile_test.luc` (test module `compiler.profile_test` in
 package `luce_tests`, importing source module `compiler.profile` from
 package `luce` plus `frontend.tokenizer`, `hir.ir`, and `mir.canonical`)
 fails three of its four assertions: functions of `compiler.profile` that
@@ -65,9 +65,9 @@ either the tokenizer import or the IR imports makes it pass, and a
 five-line reproduction with the same package and module names passes, so
 the trigger is layout-sensitive and not yet minimized.
 
-Reproduce in this tree by copying `tests/compiler/language_profile_test.luc`
-to `tests/compiler/profile_test.luc` and running
-`./stage0/bin/luce-0 test tests/compiler/profile_test.luc` with `LUCE_LIB`
+Reproduce in this tree by copying `tests/common/language_profile_test.luc`
+to `tests/common/profile_test.luc` and running
+`./stage0/bin/luce-0 test tests/common/profile_test.luc` with `LUCE_LIB`
 unset. The repository avoids the pair by naming the test
 `language_profile_test.luc`; no compiler source was changed to work around
 it.
