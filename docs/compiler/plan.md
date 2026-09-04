@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1052 compiler tests across 54 files, plus the
+The repository currently proves 1062 compiler tests across 54 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -315,7 +315,7 @@ placements were decided during the move: the HIR checker for interface-typed
 values stays shared in `hir/interfaces/values.luc`, because Base also types
 interface values and differs only in representation (its boxing, retain/
 release, and dispatch legalization are in the profile); and the pure value
-helpers of both oracles (`backends/hir_values.luc`, the `*_execution_model`
+helpers of both oracles (`hir/evaluation.luc`, `backends/hir_values.luc`, the `*_execution_model`
 files) stay shared, because equality, hashing, and place walkers over the
 one `Value` vocabulary are not profile code. Base gets `profiles/base/` with
 B1.
@@ -368,7 +368,11 @@ backends only.
 - [ ] **B3 — bindings, globals, unions, allocation.** *Landed so far
   (2026-09-04, `done.md` §2): zero values and `---`; integer-backed enums,
   whose C header form waits for B4 (§17.6); unions, with the canonical
-  `Union` type and byte-image oracles.* Zero values and `---`,
+  `Union` type and byte-image oracles; module globals with constant
+  initialisers folded into the canonical `MirInitializer` value tree;
+  labeled loops, match guards, and `errdefer` (the last exercised end to
+  end once a Base module can raise, §11.3).*
+  Zero values and `---`,
   module `var` and `thread_local var` with constant initializers, `union`,
   integer-backed enums with `as` and bit operators, the `packed`/`align`
   layout words, `new`/`alloc`/`free`/`with`/`in` over the `Allocator`

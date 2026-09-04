@@ -123,7 +123,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         # to return on every path (an `if` chain whose arms all return, say);
         # the trailing `Unreachable` records that proof for the verifier.
         if not terminates(body):
-            try self.emit_function_exit_cleanup(module, function, function.span, body)
+            try self.emit_function_exit_cleanup(module, function, function.span, false, body)
             if returns_unit:
                 if is_fallible:
                     let no_error = self.null_constant(function.span, body)
@@ -530,7 +530,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 try self.lower_prologue_node(module, function, value, body)
                 try self.reserve_slot(module, function, failure, span, body)
                 try self.lower_prologue(module, function, catch_body, body)
-            MatchArm(patterns, statements, value):
+            MatchArm(patterns, statements, value, guard):
                 for pattern_position in range(0, i64(patterns.count)):
                     match node_form(self.state.program, node_at(self.state.program, patterns, pattern_position)):
                         PatternCase(case_index, bindings):
@@ -573,7 +573,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 try self.lower_print_value(module, function, value, span, body)
             ReturnStatement(value):
                 if value.value == no_node:
-                    try self.emit_function_exit_cleanup(module, function, span, body)
+                    try self.emit_function_exit_cleanup(module, function, span, false, body)
                     if self.state.error_slot >= 0:
                         let no_error = self.null_constant(span, body)
                         body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run([no_error])), span = span))
@@ -596,7 +596,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                         if self.type_needs_ownership(value_type) and not self.take_owned_value(register):
                             self.emit_value_ownership(value_type, register, true, span, body)
                         returned.append(register)
-                try self.emit_function_exit_cleanup(module, function, span, body)
+                try self.emit_function_exit_cleanup(module, function, span, false, body)
                 if self.state.error_slot >= 0: returned.append(self.null_constant(span, body))
                 body.append(MirInstruction(form = InstructionForm.Return(values = self.state.operands.run(returned)), span = span))
             RecoverStatement(value):
@@ -617,6 +617,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 body.append(MirInstruction(form = InstructionForm.Br(depth = depth, values = self.state.operands.run(values)), span = span))
             DeferStatement(action):
                 self.state.defers.append(DeferredAction.Source(statement = action))
+            ErrorDeferStatement(action):
+                self.state.defers.append(DeferredAction.ErrorSource(statement = action))
             Binding(symbol, is_mutable, value):
                 let local = try self.state.local_of(module, function, span, symbol)
                 match node_form(self.state.program, value):
@@ -687,12 +689,12 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 try self.lower_for(module, function, span, symbol, iteration, loop_body, body)
             Match(subject, arms, has_result):
                 let discarded = try self.lower_match(module, function, statement, subject, arms, false, body)
-            BreakStatement:
-                try self.emit_loop_deferred(module, function, span, body)
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.break_depth(module, function, span), values = no_registers()), span = span))
-            ContinueStatement:
-                try self.emit_loop_deferred(module, function, span, body)
-                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.continue_depth(module, function, span), values = no_registers()), span = span))
+            BreakStatement(levels):
+                try self.emit_loop_deferred(module, function, span, levels, body)
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.break_depth(module, function, span, levels), values = no_registers()), span = span))
+            ContinueStatement(levels):
+                try self.emit_loop_deferred(module, function, span, levels, body)
+                body.append(MirInstruction(form = InstructionForm.Br(depth = try self.continue_depth(module, function, span, levels), values = no_registers()), span = span))
             else: try self.state.fail_unsupported(module, function, span, "an expression node where a statement was expected")
         try self.emit_temporaries_from(temporary_start, body)
 
@@ -1064,13 +1066,17 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # Emit actions in reverse registration order without removing the
     # compile-time list: another control-flow path may need the same copies.
     pub func emit_deferred_from(module: HirModule, function: HirFunction, start: i64, body: list[MirInstruction]) -> !:
-        try self.emit_deferred_range(module, function, start, len(self.state.defers), body)
+        try self.emit_deferred_range(module, function, start, len(self.state.defers), false, body)
 
-    func emit_deferred_range(module: HirModule, function: HirFunction, start: i64, end: i64, body: list[MirInstruction]) -> !:
+    # `on_error` is the error exit: it also runs `errdefer` actions, in the
+    # same LIFO order as the ordinary ones (base.md §8.8).
+    func emit_deferred_range(module: HirModule, function: HirFunction, start: i64, end: i64, on_error: bool, body: list[MirInstruction]) -> !:
         var index = end - 1
         while index >= start:
             match self.state.defers[index]:
                 Source(statement): try self.lower_statement(module, function, statement, body)
+                ErrorSource(statement):
+                    if on_error: try self.lower_statement(module, function, statement, body)
                 DestroyAddress(address, value_type, span): self.emit_ownership_call(value_type, address, false, span, body)
                 OwnedValue(value, value_type, span): self.emit_value_ownership(value_type, value, false, span, body)
                 else: self.full.emit_deferred_action(self.state.defers[index], body)
@@ -1079,12 +1085,12 @@ pub class FunctionLowerer: FunctionLoweringHost:
     ## Preserve lexical LIFO while placing structured-worker completion at
     ## the invocation boundary: nested scopes unwind first, then children are
     ## cancelled/joined, then root resources and source defers are released.
-    func emit_function_exit_cleanup(module: HirModule, function: HirFunction, span: SourceSpan, body: list[MirInstruction]) -> !:
+    func emit_function_exit_cleanup(module: HirModule, function: HirFunction, span: SourceSpan, on_error: bool, body: list[MirInstruction]) -> !:
         var root_end = len(self.state.defers)
         if len(self.state.scope_defer_starts) > 1: root_end = self.state.scope_defer_starts[1]
-        try self.emit_deferred_range(module, function, root_end, len(self.state.defers), body)
+        try self.emit_deferred_range(module, function, root_end, len(self.state.defers), on_error, body)
         self.full.emit_task_group_finish(span, body)
-        try self.emit_deferred_range(module, function, 0, root_end, body)
+        try self.emit_deferred_range(module, function, 0, root_end, on_error, body)
 
     # End a full expression without disturbing lexical source/compiler
     # cleanups registered by the statement itself.
@@ -1111,30 +1117,38 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 else: pass
             index -= 1
 
-    func emit_loop_deferred(module: HirModule, function: HirFunction, span: SourceSpan, body: list[MirInstruction]) -> !:
-        if len(self.state.loop_defer_starts) == 0:
+    # `defer` runs for every scope a `break`/`continue` leaves, innermost
+    # first (base.md §8.5); `levels` counts the loops beyond the innermost.
+    func emit_loop_deferred(module: HirModule, function: HirFunction, span: SourceSpan, levels: i64, body: list[MirInstruction]) -> !:
+        if len(self.state.loop_defer_starts) <= levels:
             try self.state.fail_unsupported(module, function, span, "`break`/`continue` outside a loop")
-        try self.emit_deferred_from(module, function, self.state.loop_defer_starts[len(self.state.loop_defer_starts) - 1], body)
+        try self.emit_deferred_from(module, function, self.state.loop_defer_starts[len(self.state.loop_defer_starts) - 1 - levels], body)
 
     # `continue` targets a range loop's increment block or a while loop's
-    # loop label, whichever belongs to the innermost source loop.
-    func continue_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
+    # loop label, whichever belongs to the selected source loop.
+    func continue_depth(module: HirModule, function: HirFunction, span: SourceSpan, levels: i64) -> i64!:
         var depth = 0
+        var remaining = levels
         var index = len(self.state.regions) - 1
         while index >= 0:
-            if self.state.regions[index] == Region.for_continue: return depth
-            if self.state.regions[index] == Region.loop_body: return depth
+            if self.state.regions[index] == Region.for_continue and remaining == 0: return depth
+            if self.state.regions[index] == Region.loop_body:
+                if remaining == 0: return depth
+                remaining -= 1
             depth += 1
             index -= 1
         error(self.state.unsupported(module, function, span, "`break`/`continue` outside a loop"))
 
     # `break` crosses the loop itself and reaches its surrounding block. A
     # range loop's continue block is counted naturally on the walk.
-    func break_depth(module: HirModule, function: HirFunction, span: SourceSpan) -> i64!:
+    func break_depth(module: HirModule, function: HirFunction, span: SourceSpan, levels: i64) -> i64!:
         var depth = 0
+        var remaining = levels
         var index = len(self.state.regions) - 1
         while index >= 0:
-            if self.state.regions[index] == Region.loop_body: return depth + 1
+            if self.state.regions[index] == Region.loop_body:
+                if remaining == 0: return depth + 1
+                remaining -= 1
             depth += 1
             index -= 1
         error(self.state.unsupported(module, function, span, "`break`/`continue` outside a loop"))
@@ -1455,7 +1469,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         self.store_value(code_type, self.field_address(error_type, destination, 0, span, body), code_value, span, body)
         let message_value = try self.lower_expression(module, function, message, body)
         self.store_value(message_type, self.field_address(error_type, destination, 1, span, body), message_value, span, body)
-        try self.emit_function_exit_cleanup(module, function, span, body)
+        try self.emit_function_exit_cleanup(module, function, span, true, body)
         body.append(MirInstruction(form = InstructionForm.Raise(failure = destination), span = span))
         return RegisterId(value = no_register)
 
@@ -1500,7 +1514,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         self.open_if(failed, list[RegisterId](), span, body)
         let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
         body.append(MirInstruction(form = InstructionForm.Memcpy(destination = RegisterId(value = u32(self.state.error_slot)), source = attempted.error_value, value_type = error_type), span = span))
-        try self.emit_function_exit_cleanup(module, function, span, body)
+        try self.emit_function_exit_cleanup(module, function, span, true, body)
         body.append(MirInstruction(form = InstructionForm.Raise(failure = RegisterId(value = u32(self.state.error_slot))), span = span))
         self.emit_end(span, body)
         if types_match(node_type(self.state.program, expression), resolve_builtin_type(BuiltinType.never_type)):
@@ -3177,21 +3191,24 @@ pub class FunctionLowerer: FunctionLoweringHost:
             if closed: break
             let arm = node_at(self.state.program, arms, position)
             match node_form(self.state.program, arm):
-                MatchArm(patterns, statements, value):
+                MatchArm(patterns, statements, value, guard):
                     if self.arm_binds(patterns):
                         # Payload bindings point into a case-specific layout,
                         # so every alternative needs its own copy of the arm.
                         for alternative in range(0, i64(patterns.count)):
                             let pattern = node_at(self.state.program, patterns, alternative)
-                            let test = try self.lower_pattern_test(module, function, pattern, selected, subject_type, body)
+                            var test = try self.lower_pattern_test(module, function, pattern, selected, subject_type, body)
+                            if guard.value != no_node:
+                                # Bind first, then ask the guard (base.md §8.4).
+                                test = try self.lower_guarded_test(module, function, test, pattern, guard, selected, subject_type, span, body)
                             self.open_if(test, list[RegisterId](), span, body)
                             self.state.regions.append(Region.if_arm)
                             let defer_start = len(self.state.defers)
-                            try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
+                            if guard.value == no_node: try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
                             try self.lower_selected_match_arm(module, function, statements, value, arm_exit, defer_start, span, body)
                             self.emit_else(span, body)
                             open_arms += 1
-                    elif self.arm_is_wildcard(patterns):
+                    elif self.arm_is_wildcard(patterns) and guard.value == no_node:
                         try self.lower_selected_match_arm(module, function, statements, value, arm_exit, len(self.state.defers), span, body)
                         closed = true
                     else:
@@ -3199,6 +3216,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                         for alternative in range(1, i64(patterns.count)):
                             let next = try self.lower_pattern_test(module, function, node_at(self.state.program, patterns, alternative), selected, subject_type, body)
                             test = self.lower_or(test, next, span, body)
+                        if guard.value != no_node:
+                            test = try self.lower_guarded_test(module, function, test, NodeId(value = no_node), guard, selected, subject_type, span, body)
                         self.open_if(test, list[RegisterId](), span, body)
                         self.state.regions.append(Region.if_arm)
                         try self.lower_selected_match_arm(module, function, statements, value, arm_exit, len(self.state.defers), span, body)
@@ -3209,6 +3228,21 @@ pub class FunctionLowerer: FunctionLoweringHost:
         for arm in range(0, open_arms):
             self.state.regions.remove(len(self.state.regions) - 1)
             self.emit_end(span, body)
+
+    # `test and guard`, where the guard sees the pattern's bindings: a
+    # value-producing `If` that binds and asks, or yields false.
+    func lower_guarded_test(module: HirModule, function: HirFunction, test: RegisterId, pattern: NodeId, guard: NodeId, selected: RegisterId, subject_type: ir.TypeId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
+        let matched = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        self.open_if(test, [matched], span, body)
+        self.state.regions.append(Region.if_arm)
+        if pattern.value != no_node: try self.lower_pattern_bindings(module, function, pattern, selected, subject_type, body)
+        let passes = try self.lower_expression(module, function, guard, body)
+        self.emit_yield(passes, span, body)
+        self.emit_else(span, body)
+        self.emit_yield(self.bool_constant(false, span, body), span, body)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        return matched
 
     func lower_selected_match_arm(module: HirModule, function: HirFunction, statements: Operands, value: NodeId, arm_exit: MatchExit, defer_start: i64, span: SourceSpan, body: list[MirInstruction]) -> !:
         match arm_exit:

@@ -1,0 +1,173 @@
+#==============================================================================================
+#   constant_folder.luc: the value a Base module global starts with
+#
+#   Purpose: fold a checked constant expression (base.md §6.4) into the
+#            `MirInitializer` a global's static storage begins with, so the
+#            program has no initialisation order to run (base.md §6.3).
+#
+#   Design: folding reuses the language's value arithmetic (`hir/evaluation`)
+#           on HIR values, then converts the value by its type. A layout
+#           question is never answered here: it becomes a `Layout` leaf that
+#           the backend fills in, so MIR stays target-neutral, and a layout
+#           answer inside an expression is refused with a diagnostic.
+#==============================================================================================
+
+from compiler.hir.evaluation import cast_numeric_value, evaluate_binary, evaluate_unary
+from compiler.hir.ir import BoxedValue, HirProgram, NodeId, Operands, SymbolId, TypeId, Value
+from compiler.hir.ir import entry_at, integer_enum_representation, integer_enum_shape, is_union_type, no_node, node_at, node_form, node_type, nominal_fields
+from compiler.hir.ir import place_element_step, place_field_step
+from compiler.mir.canonical import DataId, FunctionId, GlobalId, MirConstant, MirInitializer, mir_type
+from compiler.mir.lowering_model import MirLoweringState
+import compiler.mir.canonical
+
+## Folds constant initialisers for one lowering transaction.
+pub class ConstantFolder:
+    let state: MirLoweringState
+
+    pub init(state: MirLoweringState):
+        self.state = state
+
+    ## The initial value of a global whose initialiser is `node`.
+    pub func initializer_of(node: NodeId) -> MirInitializer!:
+        let value_type = node_type(self.state.program, node)
+        match node_form(self.state.program, node):
+            ZeroValue: return MirInitializer.Zero(value_type = try self.lowered(value_type))
+            LayoutConstant(query, subject, field):
+                # Only a backend knows the answer; it lays the leaf out.
+                return MirInitializer.Layout(query = query, subject = try self.lowered(subject), field = field, value_type = try self.lowered(value_type))
+            else: pass
+        return try self.initializer(try self.fold(node), value_type)
+
+    func lowered(value_type: TypeId) -> canonical.TypeId!:
+        let result = self.state.lower_mir_type(value_type) catch feature:
+            error("its type needs " + feature + ", which the lowerer does not support yet")
+        return result
+
+    # mark: Folding =============================================================================
+
+    ## The value of a constant expression node.
+    pub func fold(node: NodeId) -> Value!:
+        let program = self.state.program
+        match node_form(program, node):
+            Constant(index): return program.values[index]
+            NoneLiteral: return Value.Absent
+            Some(inner): return Value.Present(value = BoxedValue(value = try self.fold(inner)))
+            Tuple(elements): return Value.Tuple(elements = try self.fold_run(elements))
+            Array(elements): return Value.Array(elements = try self.fold_run(elements))
+            StructValue(struct_index, fields):
+                let items = list[BoxedValue]()
+                for field in nominal_fields(program, node_type(program, node)): items.append(BoxedValue(value = Value.Unit))
+                for pair in range(0, i64(fields.count) // 2):
+                    let field_index = entry_at(program, fields, pair * 2)
+                    items[field_index] = BoxedValue(value = try self.fold(NodeId(value = u32(entry_at(program, fields, pair * 2 + 1)))))
+                return Value.Record(fields = items)
+            EnumValue(enum_index, case_index, payload):
+                let shape = integer_enum_shape(program, node_type(program, node))
+                if shape != none: return shape.values[case_index]
+                if payload.count == 0: return Value.Variant(case_index = case_index, payload = list[BoxedValue]())
+                error("an enum case with a payload is not a constant initialiser yet")
+            Unary(operation, operand): return try evaluate_unary(operation, try self.fold(operand), program.types)
+            Binary(left, operation, right): return try evaluate_binary(try self.fold(left), operation, try self.fold(right), program.types)
+            Cast(value):
+                let inner = try self.fold(value)
+                match inner:
+                    Address(frame, symbol, global, path): error("a pointer cast is not a constant initialiser yet")
+                    Absent: error("a pointer cast is not a constant initialiser yet")
+                    else: pass
+                let destination = integer_enum_representation(program, node_type(program, node)) else node_type(program, node)
+                return cast_numeric_value(inner, destination, program.types)
+            Conditional(chosen, condition, alternative):
+                match try self.fold(condition):
+                    Boolean(item):
+                        if item: return try self.fold(chosen)
+                        return try self.fold(alternative)
+                    else: error("a conditional initialiser has a non-boolean condition")
+            Reference(symbol):
+                for constant in program.constants:
+                    if constant.symbol.value == symbol.value: return try self.fold(constant.value)
+                error("`" + program.symbols[symbol.value].name + "` is not a constant")
+            LayoutConstant(query, subject, field):
+                error("a layout answer inside an expression is not a constant initialiser yet; a global may hold `sizeof`, `alignof`, or `offsetof` alone")
+            AddressOf(pointer, symbol, global, steps):
+                if pointer.value != no_node or global < 0: error("only the address of a global or a function is a constant initialiser")
+                let path = list[i64]()
+                for position in range(0, i64(steps.count) // 2):
+                    let kind = u32(entry_at(program, steps, position * 2))
+                    let payload = entry_at(program, steps, position * 2 + 1)
+                    if kind == place_field_step: path.append(payload)
+                    elif kind == place_element_step:
+                        match try self.fold(NodeId(value = u32(payload))):
+                            UnsignedInteger(item): path.append(i64(item))
+                            SignedInteger(item): path.append(item)
+                            else: error("a constant address indexes with a non-integer")
+                    else: error("only a field or an element of a global has a constant address")
+                return Value.Address(frame = 0, symbol = SymbolId(value = no_node), global = global, path = path)
+            FunctionAddress(function): return Value.Function(symbol = function)
+            else: error("this expression is not a constant initialiser")
+
+    func fold_run(run: Operands) -> list[BoxedValue]!:
+        let items = list[BoxedValue]()
+        for position in range(0, i64(run.count)):
+            items.append(BoxedValue(value = try self.fold(node_at(self.state.program, run, position))))
+        return items
+
+    # mark: Values to initialisers ==============================================================
+
+    ## The initialiser tree of one folded value, by its HIR type.
+    func initializer(value: Value, value_type: TypeId) -> MirInitializer!:
+        let program = self.state.program
+        let lowered = try self.lowered(value_type)
+        match value:
+            Boolean(item): return MirInitializer.Constant(value = MirConstant.Bool(value = item), value_type = lowered)
+            SignedInteger(item): return MirInitializer.Constant(value = MirConstant.SignedInt(value = item), value_type = lowered)
+            UnsignedInteger(item): return MirInitializer.Constant(value = MirConstant.UnsignedInt(value = item), value_type = lowered)
+            Floating(item): return MirInitializer.Constant(value = MirConstant.Float(value = item), value_type = lowered)
+            Character(item): return MirInitializer.Constant(value = MirConstant.UnsignedInt(value = u64(u32(item))), value_type = lowered)
+            Absent:
+                match mir_type(self.state.types, lowered):
+                    NullablePtr: return MirInitializer.Constant(value = MirConstant.Null, value_type = lowered)
+                    else: error("an absent optional that is not a pointer is not a constant initialiser yet")
+            Present(inner):
+                match program.types.definitions[value_type.value].form:
+                    Optional(payload):
+                        match mir_type(self.state.types, lowered):
+                            NullablePtr: return try self.initializer(inner.value, payload)
+                            else: error("a present optional that is not a pointer is not a constant initialiser yet")
+                    else: error("a present value has a non-optional type")
+            Record(items):
+                let fields = nominal_fields(program, value_type)
+                if is_union_type(program, value_type):
+                    for index in range(0, len(items)):
+                        match items[index].value:
+                            Unit: pass
+                            else: return MirInitializer.Member(value_type = lowered, member = index, parts = [try self.initializer(items[index].value, fields[index].value_type)])
+                    return MirInitializer.Zero(value_type = lowered)
+                let parts = list[MirInitializer]()
+                for index in range(0, len(items)): parts.append(try self.initializer(items[index].value, fields[index].value_type))
+                return MirInitializer.Aggregate(value_type = lowered, parts = parts)
+            Array(elements):
+                match program.types.definitions[value_type.value].form:
+                    Array(element, count):
+                        let parts = list[MirInitializer]()
+                        for item in elements: parts.append(try self.initializer(item.value, element))
+                        return MirInitializer.Aggregate(value_type = lowered, parts = parts)
+                    else: error("an array value has a non-array type")
+            Tuple(elements):
+                match program.types.definitions[value_type.value].form:
+                    Tuple(element_types):
+                        let parts = list[MirInitializer]()
+                        for index in range(0, len(elements)): parts.append(try self.initializer(elements[index].value, element_types[index]))
+                        return MirInitializer.Aggregate(value_type = lowered, parts = parts)
+                    else: error("a tuple value has a non-tuple type")
+            Address(frame, symbol, global, path):
+                if len(path) > 0: error("the address of a part of a global is not a constant initialiser yet")
+                # Each thread has its own cell, so the address is not static.
+                if program.globals[global].is_thread_local: error("the address of a `thread_local` global is not a constant")
+                return MirInitializer.GlobalAddress(global = GlobalId(value = u32(global)))
+            Function(symbol):
+                let index = self.state.function_index_of(symbol)
+                if index < 0: error("the function's address is not available to the lowerer")
+                return MirInitializer.FunctionAddress(function = FunctionId(value = u32(index)))
+            Variant(case_index, payload): error("a tagged enum is not a constant initialiser yet")
+            Unit: error("a value without a byte image is not a constant initialiser")
+            else: error("`" + value.render() + "` is not a constant initialiser yet")

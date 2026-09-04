@@ -34,6 +34,9 @@ from compiler.backends.qbe_representation import IlWriter, qbe_abi_type, qbe_agg
 from compiler.backends.qbe_emission_model import QbeEmissionHost
 from compiler.profiles.full.backends.qbe_emission import FullProfileQbeEmission
 from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
+from compiler.formatting.ieee import ieee_float_bits
+from compiler.mir.canonical import MirInitializer
+from compiler.wrapping import bits_of_signed
 from compiler.mir.canonical import MirFunction, MirProgram, MirSignature, RegisterId, RegisterRun, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
 import std.strings
@@ -45,6 +48,18 @@ from compiler.mir.canonical import is_ptr_type, is_signed_int_type, mir_type, re
 struct OverflowEmission:
     let value: str
     let flag: str
+
+# The member types and byte offsets of one aggregate initialiser's parts.
+struct AggregatePlacements:
+    let member_types: list[TypeId]
+    let offsets: list[i64]
+
+# The QBE data item letter for a scalar of `size` bytes.
+func qbe_data_kind(size: i64) -> str:
+    if size == 1: return "b"
+    if size == 2: return "h"
+    if size == 4: return "w"
+    return "l"
 
 pub class QbeBackend:
     let clock: (func() -> i64)?
@@ -246,22 +261,100 @@ class QbeEmitter: QbeEmissionHost:
             if external.convention == CallingConvention.runtime and external.name == "luce_rt_trap": return true
         return false
 
+    # Static storage: zero, or the initialiser laid out under this backend's
+    # rules with `z` padding between items. `thread` asks the linker for one
+    # cell per thread (base.md §6.3).
+    # Stage-0 0.30 leaks a retain when a struct holding an optional union with
+    # a list payload is read by index, so this walks the globals directly.
     func emit_globals() -> !:
-        for index in range(0, len(self.program.globals)):
-            let global = self.program.globals[index]
+        var index = -1
+        for global in self.program.globals:
+            index += 1
             let size = self.layout.size_of(global.value_type)
             let align = self.layout.align_of(global.value_type)
-            self.out.write("data $g" + str(index) + " = align " + str(align) + " { ")
+            var head = "data $g" + str(index)
+            if global.is_thread_local: head = "thread " + head
+            self.out.write(head + " = align " + str(align) + " { ")
             let initial = global.initial
             if initial == none:
                 self.out.write("z " + str(size))
             else:
-                let payload = self.program.data[initial.value].bytes
-                if len(payload) < size: error("qbe backend: initializer for global `" + global.name + "` is shorter than its type")
-                self.out.write("b")
-                for offset in range(0, size): self.out.write(" " + str(payload[offset]))
+                let items = list[str]()
+                let cursor = self.initializer_items(initial, global.value_type, 0, 0, items)
+                if cursor < size: items.append("z " + str(size - cursor))
+                self.out.write(strings.join(items, ", "))
             self.out.write(" }\n")
         if len(self.program.globals) > 0: self.out.write("\n")
+
+    # Append the data items of one initialiser placed at `offset`; `cursor` is
+    # the byte the previous item ended at, and the answer is the new cursor.
+    func initializer_items(initial: MirInitializer, value_type: TypeId, offset: i64, cursor: i64, items: list[str]) -> i64:
+        var position = cursor
+        if offset > position:
+            items.append("z " + str(offset - position))
+            position = offset
+        match initial:
+            Constant(value, constant_type):
+                let size = self.layout.size_of(constant_type)
+                var bits = u64(0)
+                match value:
+                    SignedInt(item): bits = bits_of_signed(item)
+                    UnsignedInt(item): bits = item
+                    Float(item): bits = ieee_float_bits(item, size * 8)
+                    Bool(item):
+                        if item: bits = u64(1)
+                    Null: bits = u64(0)
+                if size < 8: bits = bits & ((u64(1) << u64(size * 8)) - u64(1))
+                items.append(qbe_data_kind(size) + " " + str(bits))
+                position += size
+            Aggregate(aggregate_type, parts):
+                let placements = self.aggregate_placements(aggregate_type, len(parts))
+                for index in range(0, len(parts)):
+                    position = self.initializer_items(parts[index], placements.member_types[index], offset + placements.offsets[index], position, items)
+            Member(union_type, member, parts):
+                let member_type = self.union_member_type(union_type, member)
+                position = self.initializer_items(parts[0], member_type, offset, position, items)
+            Zero(zero_type):
+                let size = self.layout.size_of(zero_type)
+                items.append("z " + str(size))
+                position += size
+            Layout(query, subject, field, answer_type):
+                let size = self.layout.size_of(answer_type)
+                items.append(qbe_data_kind(size) + " " + str(self.layout.answer(query, subject, field)))
+                position += size
+            GlobalAddress(global):
+                items.append("l $g" + str(global.value))
+                position += 8
+            FunctionAddress(function):
+                items.append("l $" + self.function_name(function))
+                position += 8
+            DataAddress(data):
+                items.append("l $d" + str(data.value))
+                position += 8
+        return position
+
+    # Where each part of a struct or array initialiser lands.
+    # Verified MIR never places an aggregate initialiser on a scalar.
+    func aggregate_placements(aggregate_type: TypeId, count: i64) -> AggregatePlacements:
+        let member_types = list[TypeId]()
+        let offsets = list[i64]()
+        match mir_type(self.program.types, aggregate_type):
+            Struct(fields):
+                for index in range(0, count):
+                    member_types.append(fields[index].value_type)
+                    offsets.append(self.layout.field_offset(aggregate_type, index))
+            Array(element, elements):
+                let stride = self.layout.size_of(element)
+                for index in range(0, count):
+                    member_types.append(element)
+                    offsets.append(index * stride)
+            else: trap("verified aggregate initialiser on a non-aggregate type")
+        return AggregatePlacements(member_types = member_types, offsets = offsets)
+
+    func union_member_type(union_type: TypeId, member: i64) -> TypeId:
+        match mir_type(self.program.types, union_type):
+            Union(members): return members[member].value_type
+            else: trap("verified member initialiser on a non-union type")
 
     # mark: Functions --------------------------------------------------------------------------
 
@@ -428,7 +521,12 @@ class QbeEmitter: QbeEmissionHost:
             DataAddress(result, data):
                 self.out.line(self.reg(result) + " =l copy $d" + str(data.value))
             GlobalAddress(result, global):
-                self.out.line(self.reg(result) + " =l copy $g" + str(global.value))
+                # A thread-local cell is reached through the target's TLS
+                # sequence, which QBE emits for a `thread` symbol reference.
+                if self.program.globals[global.value].is_thread_local:
+                    self.out.line(self.reg(result) + " =l copy thread $g" + str(global.value))
+                else:
+                    self.out.line(self.reg(result) + " =l copy $g" + str(global.value))
             LoadExternalGlobal(result, global):
                 let declaration = self.program.external_globals[global.value]
                 try self.emit_load(self.reg(result), declaration.value_type, "extern $" + declaration.name)

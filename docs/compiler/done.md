@@ -2424,6 +2424,42 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   writes through pointers and into nested array elements, and refuses to
   read a member after one with no byte image (a pointer, a span) was written.
   Gate: 1052 compiler tests across 54 files.
+- [x] **Module globals (B3, fourth slice)** (2026-09-04). A `.lucb` module
+  declares `var name: T`, `var name: T = constant`, and `thread_local var`
+  at top level (base.md §6.3): the global is zero before `main` or holds
+  the constant its initialiser names, so there is nothing to order. The
+  checker admits the §6.4 constant vocabulary (layout questions, casts,
+  enum cases, struct and array construction, the address of a global) and
+  refuses a type with no zero value unless it is initialised. The lowerer's
+  new `ConstantFolder` folds the initialiser with the reference
+  interpreter's value arithmetic into `MirInitializer`, a target-neutral
+  value tree that replaces the byte-image `DataId` initial of `MirGlobal`;
+  QBE, Wasm, and the MIR oracle lay it out under their own rules, QBE
+  spells `thread_local` as `thread data`, and the optimizer and composer
+  follow its address leaves. A `sizeof`/`alignof`/`offsetof` initialiser
+  is a `Layout` leaf the backend answers, so MIR never learns a width; a
+  layout answer inside an expression is refused with a diagnostic. The
+  slice also moved the language's value arithmetic out of the backends
+  into `hir/evaluation.luc` (the folder and the reference interpreter share
+  it) and `wrapping.luc` beside it, which the gate's boundary rule
+  demanded. Also records a Stage-0 0.30 retain leak (an indexed read of a
+  struct holding an optional list-carrying union) in `stage0-0.30.md`.
+  Gate: 1062 compiler tests across 54 files.
+- [x] **Labels, match guards, and `errdefer` (B3, fifth slice)**
+  (2026-09-04). In a `.lucb` module a label `rows:` before `while` or
+  `for` lets `break rows`/`continue rows` leave nested loops (base.md
+  §8.5): the checker resolves the label to a loop count that
+  `BreakStatement`/`ContinueStatement` now carry, the lowerer walks that
+  many loop regions and runs the deferred actions of every scope left, and
+  the reference interpreter's `Broke`/`Continued` transfers count down.
+  A match arm may carry `pattern if condition:` (§8.4): the guard is checked
+  and lowered after the pattern binds, and a guarded arm sees a copy of the
+  coverage so it never counts toward exhaustiveness. `errdefer call` (§8.8)
+  is checked (Base only, fallible functions only), lowered as an
+  `ErrorSource` deferred action that only the error exit runs, and modelled
+  in the reference interpreter; a Base module cannot raise until the Base
+  failure model lands, so its end-to-end fixture waits for that slice.
+  Gate: 1062 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

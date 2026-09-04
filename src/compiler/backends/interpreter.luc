@@ -23,8 +23,8 @@
 
 from compiler.backend import HirExecutionBackend
 from compiler.backends.hir_execution_model import AssignmentPlaceStep, Binding, Evaluation, Execution, HirExecutionHost, Invocation, Place, PlaceEvaluation, PlaceUpdate, RunEvaluation
-from compiler.backends.hir_values import cast_numeric_value
-from compiler.backends.hir_values import as_boolean, checked_add, checked_integer_result, convert_numeric_value, display_builtin, evaluate_binary, evaluate_unary, find_binding, normalize_float, render_error, structural_hash, trim_bindings, value_at_assignment_place, value_with_assignment_place
+from compiler.hir.evaluation import as_boolean, cast_numeric_value, checked_add, checked_integer_result, convert_numeric_value, display_builtin, evaluate_binary, evaluate_unary, normalize_float, render_error, structural_hash
+from compiler.backends.hir_values import find_binding, trim_bindings, value_at_assignment_place, value_with_assignment_place
 from compiler.profiles.full.backends.hir_execution import FullProfileExecution
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, ClassFinalizer, NodeId
 from compiler.hir.ir import HirCEnum, HirCFunction, HirCFunctionIdentity, HirCStructKind, HirExternVariable, HirFunction, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, Value, no_node
@@ -32,7 +32,7 @@ from compiler.hir.ir import entry_at, node_at, node_form, node_type, nominal_cas
 from compiler.hir.ir import integer_enum_representation, integer_enum_shape
 from compiler.hir.ir import HirRecordLayout, is_union_type
 from compiler.formatting.ieee import ieee_float_bits, ieee_float_value
-from compiler.backends.wrapping import wrap_signed
+from compiler.wrapping import wrap_signed
 from compiler.hir.ir import integer_maximum, integer_minimum, is_pointer_integer_type, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, integer_values_match, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_element_step, place_field_step
@@ -338,7 +338,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             if self.function_by_symbol[symbol] < 0: self.function_by_symbol[symbol] = index
         self.globals = list[Value]()
         for global in program.globals:
-            self.globals.append(zero_hir_value(program, global.value_type))
+            # An initialised global takes its value when a run begins.
+            if global.initializer.value != no_node: self.globals.append(Value.Unit)
+            else: self.globals.append(zero_hir_value(program, global.value_type))
         self.full = FullProfileExecution(program, collects_resources)
         self.depth = 0
         self.rules = rules
@@ -796,6 +798,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     ## supplies an empty semantic slice to the exact process entry; callers
     ## that model process arguments use `run_process` explicitly.
     pub func run(module_name: str, function_name: str) -> Value!:
+        try self.initialize_globals()
         let function = try self.find_entry(module_name, function_name)
         if not function.is_public:
             error("interpreter: `" + module_name + "." + function_name + "` is private")
@@ -814,6 +817,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     ## Invoke the HIR-selected process entry directly. Backends separately
     ## prove that their host adapters construct this same semantic value.
     pub func run_process(arguments: list[str]) -> Value!:
+        try self.initialize_globals()
         let symbol = self.program.process_entry else error("interpreter: program has no process entry")
         let function = self.find_function(symbol)
         let result = try self.invoke(function, [self.full.process_arguments(arguments)])
@@ -822,6 +826,16 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             FallibleFailure(failure):
                 error("interpreter: unhandled process failure: " + render_error(failure.value))
             else: trap("typed process entry returned a non-fallible value")
+
+    # A Base global starts at the constant its initialiser names (base.md
+    # §6.3); every other global stays at its structural zero.
+    func initialize_globals() -> !:
+        for index in range(0, len(self.program.globals)):
+            let node = self.program.globals[index].initializer
+            if node.value == no_node: continue
+            match try self.evaluate(node, list[Binding]()):
+                Evaluated(item): self.globals[index] = item
+                Transferred(execution): error("interpreter: the initialiser of global `" + self.program.globals[index].name + "` did not produce a value")
 
     func call_c_export(function_name: str, arguments: list[Value]) -> Value!:
         var selected: HirFunction? = none
@@ -1338,11 +1352,17 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     func execute_function_scope(statements: Operands, bindings: list[Binding], is_function_scope: bool) -> Execution!:
         let outer_count = len(bindings)
         let deferred = list[NodeId]()
+        let on_error_only = list[bool]()
         for position in range(0, i64(statements.count)):
             let statement = node_at(self.program, statements, position)
             match node_form(self.program, statement):
                 DeferStatement(action):
                     deferred.append(action)
+                    on_error_only.append(false)
+                    continue
+                ErrorDeferStatement(action):
+                    deferred.append(action)
+                    on_error_only.append(true)
                     continue
                 else: pass
             let result = try self.execute(statement, bindings)
@@ -1350,13 +1370,25 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 Next: continue
                 else:
                     if is_function_scope: self.full.finish_invocation_group()
-                    try self.execute_deferred(deferred, bindings)
+                    var leaving_by_error = false
+                    match result:
+                        Raised(error_value): leaving_by_error = true
+                        else: pass
+                    try self.execute_deferred(self.actions_to_run(deferred, on_error_only, leaving_by_error), bindings)
                     trim_bindings(bindings, outer_count)
                     return result
         if is_function_scope: self.full.finish_invocation_group()
-        try self.execute_deferred(deferred, bindings)
+        try self.execute_deferred(self.actions_to_run(deferred, on_error_only, false), bindings)
         trim_bindings(bindings, outer_count)
         return Execution.Next
+
+    # `errdefer` actions run only when an error leaves the scope, in order
+    # with the scope's ordinary deferred actions (base.md §8.8).
+    func actions_to_run(deferred: list[NodeId], on_error_only: list[bool], leaving_by_error: bool) -> list[NodeId]:
+        let selected = list[NodeId]()
+        for index in range(0, len(deferred)):
+            if leaving_by_error or not on_error_only[index]: selected.append(deferred[index])
+        return selected
 
     # Cleanup is LIFO. HirGenerator admits only unit-producing actions, so
     # any control transfer here means malformed HIR rather than source input.
@@ -1371,8 +1403,8 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     # Execute one statement and report how it left.
     func execute(statement: NodeId, bindings: list[Binding]) -> Execution!:
         match node_form(self.program, statement):
-            BreakStatement: return Execution.Broke
-            ContinueStatement: return Execution.Continued
+            BreakStatement(levels): return Execution.Broke(levels = levels)
+            ContinueStatement(levels): return Execution.Continued(levels = levels)
             Binding(symbol, is_mutable, value):
                 match try self.evaluate(value, bindings):
                     Evaluated(item): bindings.append(Binding(symbol = symbol, value = self.full.initial_binding(symbol, item)))
@@ -1475,6 +1507,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Evaluated(item): return Execution.Recovered(value = item)
                     Transferred(execution): return execution
             DeferStatement(action): trap("defer marker executed outside its lexical scope")
+            ErrorDeferStatement(action): trap("errdefer marker executed outside its lexical scope")
             ExpressionStatement(value):
                 match try self.evaluate(value, bindings):
                     Evaluated(item): return Execution.Next
@@ -1501,8 +1534,12 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     if not keep_going: return Execution.Next
                     match try self.execute_scope(body, bindings):
                         Next: continue
-                        Continued: continue
-                        Broke: return Execution.Next
+                        Continued(levels):
+                            if levels == 0: continue
+                            return Execution.Continued(levels = levels - 1)
+                        Broke(levels):
+                            if levels == 0: return Execution.Next
+                            return Execution.Broke(levels = levels - 1)
                         Returned(value): return Execution.Returned(value = value)
                         Raised(error_value): return Execution.Raised(error_value = error_value)
                         Recovered(value): return Execution.Recovered(value = value)
@@ -1632,9 +1669,14 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 error(reason)
             trim_bindings(bindings, iteration_count)
             match outcome:
-                Broke:
+                Broke(levels):
                     trim_bindings(bindings, outer_count)
-                    return Execution.Next
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0:
+                        trim_bindings(bindings, outer_count)
+                        return Execution.Continued(levels = levels - 1)
                 Returned(value):
                     trim_bindings(bindings, outer_count)
                     return Execution.Returned(value = value)
@@ -1657,7 +1699,11 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
-                Broke: return Execution.Next
+                Broke(levels):
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0: return Execution.Continued(levels = levels - 1)
                 Returned(value): return Execution.Returned(value = value)
                 Raised(error_value): return Execution.Raised(error_value = error_value)
                 Recovered(value): return Execution.Recovered(value = value)
@@ -1683,7 +1729,11 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
-                Broke: return Execution.Next
+                Broke(levels):
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0: return Execution.Continued(levels = levels - 1)
                 Returned(value): return Execution.Returned(value = value)
                 Raised(error_value): return Execution.Raised(error_value = error_value)
                 Recovered(value): return Execution.Recovered(value = value)
@@ -1715,7 +1765,11 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
-                Broke: return Execution.Next
+                Broke(levels):
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0: return Execution.Continued(levels = levels - 1)
                 Returned(value): return Execution.Returned(value = value)
                 Raised(error_value): return Execution.Raised(error_value = error_value)
                 Recovered(value): return Execution.Recovered(value = value)
@@ -1748,7 +1802,11 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
-                Broke: return Execution.Next
+                Broke(levels):
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0: return Execution.Continued(levels = levels - 1)
                 Returned(value): return Execution.Returned(value = value)
                 Raised(error_value): return Execution.Raised(error_value = error_value)
                 Recovered(value): return Execution.Recovered(value = value)
@@ -1785,7 +1843,11 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
-                Broke: return Execution.Next
+                Broke(levels):
+                    if levels == 0: return Execution.Next
+                    return Execution.Broke(levels = levels - 1)
+                Continued(levels):
+                    if levels > 0: return Execution.Continued(levels = levels - 1)
                 Returned(value): return Execution.Returned(value = value)
                 Raised(error_value): return Execution.Raised(error_value = error_value)
                 Recovered(value): return Execution.Recovered(value = value)
@@ -1805,8 +1867,17 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         for position in range(0, i64(arms.count)):
             let arm = node_at(self.program, arms, position)
             match node_form(self.program, arm):
-                MatchArm(patterns, statements, value):
+                MatchArm(patterns, statements, value, guard):
                     if try self.arm_matches(patterns, selected, bindings):
+                        # A guard runs after the pattern binds (base.md §8.4).
+                        if guard.value != no_node:
+                            var passes = false
+                            match try self.evaluate(guard, bindings):
+                                Evaluated(item): passes = as_boolean(item)
+                                Transferred(execution): return execution
+                            if not passes:
+                                trim_bindings(bindings, outer_count)
+                                continue
                         let outcome = try self.execute_scope(statements, bindings)
                         trim_bindings(bindings, outer_count)
                         return outcome
@@ -1961,6 +2032,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 return Evaluation.Evaluated(value = try self.read_address(target.frame, target.symbol, target.global, target.path))
             AddressOf(pointer, symbol, global, steps):
                 var frame = len(self.frames) - 1
+                # A global's place belongs to no frame; a global initialiser
+                # runs before any, and frame -1 names literal data.
+                if global >= 0: frame = 0
                 var root_symbol = symbol
                 var root_global = global
                 var path = list[i64]()
@@ -2466,8 +2540,16 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         for position in range(0, i64(arms.count)):
             let arm = node_at(self.program, arms, position)
             match node_form(self.program, arm):
-                MatchArm(patterns, statements, value):
+                MatchArm(patterns, statements, value, guard):
                     if try self.arm_matches(patterns, selected, bindings):
+                        if guard.value != no_node:
+                            var passes = false
+                            match try self.evaluate(guard, bindings):
+                                Evaluated(item): passes = as_boolean(item)
+                                Transferred(execution): return Evaluation.Transferred(execution = execution)
+                            if not passes:
+                                trim_bindings(bindings, outer_count)
+                                continue
                         let result = try self.evaluate(value, bindings)
                         trim_bindings(bindings, outer_count)
                         return result

@@ -83,6 +83,7 @@ from compiler.backends.wasm_encoding import opcode_unreachable, page_size, pick,
 from compiler.backends.wasm_encoding import wasi_stderr, wasi_stdout
 from compiler.profiles.full.backends.wasm_emission import encode_runtime_instruction, encode_start_body
 from compiler.mir.canonical import BinaryOp, CallingConvention, ConvertOp, FunctionId, MirFunction, MirInstruction
+from compiler.mir.canonical import MirInitializer
 from compiler.mir.canonical import MirProgram, MirTypeTable, RegisterId, RegisterRun, no_registers, register_at, TypeId, UnaryOp
 from compiler.runtime_contract import RuntimeService
 from compiler.mir.canonical import bits_of, find_runtime_binding, is_pointer_int_type, mir_type
@@ -91,6 +92,7 @@ from compiler.backends.emission import BinaryEmission, FunctionEmission
 from compiler.backends.wasm_float16 import append_float16_bits, append_float16_round, append_float16_value, append_float64_to_float16_bits
 from compiler.backends.wasm_float16 import float16_i32_scratch_count, float16_i64_scratch_count
 from compiler.formatting.ieee import ieee_float_bits
+from compiler.wrapping import bits_of_signed
 from compiler.backends.wasm_plan import ModulePlan, defined_function_index, frame_alignment, has_start, i32_value_type
 from compiler.backends.wasm_plan import plan_module, signature_index, stack_top, start_function_index, wasm_signature, wasm_value_type
 import std.strings
@@ -333,14 +335,15 @@ func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
         entries.append(opcode_end)
         append_unsigned(entries, len(item.bytes))
         append_all(entries, item.bytes)
-    for index in range(0, len(program.globals)):
-        let global = program.globals[index]
+    # Walked directly, not by index: Stage-0 0.30 leaks a retain when a struct
+    # holding an optional union with a list payload is read by index.
+    var index = -1
+    for global in program.globals:
+        index += 1
         let initial = global.initial
         if initial == none: continue
         let size = plan.layout.size_of(global.value_type)
-        let payload = program.data[initial.value].bytes
-        if len(payload) < size:
-            error("wasm backend: initializer for global `" + global.name + "` is shorter than its type")
+        let payload = try initializer_bytes(program, plan, initial, global.value_type)
         entries.append(0x00)
         entries.append(opcode_i32_const)
         append_signed(entries, plan.global_offsets[index])
@@ -348,6 +351,53 @@ func encode_data_entries(program: MirProgram, plan: ModulePlan) -> list[u8]!:
         append_unsigned(entries, size)
         for offset in range(0, size): entries.append(payload[offset])
     return entries
+
+# The bytes a global starts with under WebAssembly's layout: little-endian
+# scalars at their offsets, addresses as linear-memory offsets, and functions
+# as their table slots.
+func initializer_bytes(program: MirProgram, plan: ModulePlan, initial: MirInitializer, value_type: TypeId) -> list[u8]!:
+    let image = list[u8]()
+    for index in range(0, plan.layout.size_of(value_type)): image.append(u8(0))
+    try write_initializer(program, plan, initial, value_type, 0, image)
+    return image
+
+func write_initializer(program: MirProgram, plan: ModulePlan, initial: MirInitializer, value_type: TypeId, offset: i64, image: list[u8]) -> !:
+    match initial:
+        Constant(value, constant_type):
+            let size = plan.layout.size_of(constant_type)
+            var bits = u64(0)
+            match value:
+                SignedInt(item): bits = bits_of_signed(item)
+                UnsignedInt(item): bits = item
+                Float(item): bits = ieee_float_bits(item, size * 8)
+                Bool(item):
+                    if item: bits = u64(1)
+                Null: bits = u64(0)
+            write_little_endian(image, offset, bits, size)
+        Aggregate(aggregate_type, parts):
+            match mir_type(program.types, aggregate_type):
+                Struct(fields):
+                    for index in range(0, len(parts)):
+                        try write_initializer(program, plan, parts[index], fields[index].value_type, offset + plan.layout.field_offset(aggregate_type, index), image)
+                Array(element, count):
+                    let stride = plan.layout.size_of(element)
+                    for index in range(0, len(parts)):
+                        try write_initializer(program, plan, parts[index], element, offset + index * stride, image)
+                else: error("wasm backend: aggregate initialiser for a non-aggregate type")
+        Member(union_type, member, parts):
+            match mir_type(program.types, union_type):
+                Union(members): try write_initializer(program, plan, parts[0], members[member].value_type, offset, image)
+                else: error("wasm backend: member initialiser for a non-union type")
+        Zero(zero_type): pass
+        Layout(query, subject, field, answer_type): write_little_endian(image, offset, u64(plan.layout.answer(query, subject, field)), plan.layout.size_of(answer_type))
+        GlobalAddress(global): write_little_endian(image, offset, u64(plan.global_offsets[global.value]), 4)
+        FunctionAddress(function): write_little_endian(image, offset, u64(function.value), 4)
+        DataAddress(data): write_little_endian(image, offset, u64(plan.data_offsets[data.value]), 4)
+
+func write_little_endian(image: list[u8], offset: i64, bits: u64, count: i64):
+    for index in range(0, count):
+        if index >= 8: image[offset + index] = u8(0)
+        else: image[offset + index] = u8((bits >> u64(index * 8)) & u64(255))
 
 func data_segment_count(program: MirProgram, plan: ModulePlan) -> i64:
     var count = len(program.data)

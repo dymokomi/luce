@@ -71,3 +71,48 @@ to `tests/compiler/profile_test.luc` and running
 unset. The repository avoids the pair by naming the test
 `language_profile_test.luc`; no compiler source was changed to work around
 it.
+
+## Open observation: an indexed struct read leaks a retain
+
+Observed on 2026-09-04 while emitting global initialisers. Reading a struct
+by index from a list, when the struct holds an optional union whose case
+carries a `list` payload, and then narrowing that optional, leaks one object
+per read; the test runner reports `1 object leaked`. Walking the same list
+with `for item in items` does not leak, nor does reading the field through
+the index without binding the struct first.
+
+Minimal reproduction (a standalone test file, `LUCE_LIB` unset):
+
+```luce
+union Tree:
+    Leaf(value: i64)
+    Branch(parts: list[Tree])
+
+struct Global:
+    let name: str
+    let initial: Tree?
+
+struct Program:
+    let globals: list[Global]
+
+func walk(tree: Tree) -> i64:
+    var total = 0
+    match tree:
+        Leaf(value): total += value
+        Branch(parts):
+            for index in range(0, len(parts)): total = total + walk(parts[index])
+    return total
+
+pub func test_indexed_read_leaks():
+    let program = Program(globals = [Global(name = "g", initial = Tree.Branch(parts = [Tree.Leaf(value = 1), Tree.Leaf(value = 2)]))])
+    for index in range(0, len(program.globals)):
+        let global = program.globals[index]
+        let initial = global.initial
+        if initial == none: continue
+        assert(walk(initial) == 3)
+```
+
+Replacing the indexed loop with `for global in program.globals:` passes. The
+compiler avoids the pair in `backends/qbe.luc`, `backends/wasm.luc`, and
+`backends/mir_interpreter.luc`, where globals are walked directly with a
+counter beside them; a comment at each site names this note.
