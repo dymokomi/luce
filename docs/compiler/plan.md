@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1096 compiler tests across 58 files, plus the
+The repository currently proves 1099 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -286,15 +286,31 @@ src/compiler/
 src/standard/base/                      the standard library, `.lucb`
 src/standard/safe/                      its `.luc`/`.lucn` wrappers (base.md §18)
 src/runtime/                            the sealed runtime, a Base package after B5
-tests/compiler/profiles/{full,base}/    tests mirror the source folders
-examples/base/                          Base examples
+tests/{common,base,full}/               tests split the same three ways: what
+                                        both dialects accept, Base only, and
+                                        the rest of the language
+examples/{common,base,full}/            example programs, the same split
 ```
+
+The three-way split of tests and examples is a decision of 2026-09-04;
+`full` is the working name for the non-Base tier until a better one is
+chosen, and the move happens with the Base profile split below.
 
 - A profile folder never imports the other profile folder. The shared
   folders never name a profile except through `profile.luc` and the dispatch
-  points (`body_checker` for HIR forms, `function_lowerer` for lowering, the
-  interpreters for execution, each backend for legalization). `test.sh`
-  greps for both rules beside the existing no-platform-before-backend check.
+  points (`body_checker` for HIR forms, `entry_points` for the process entry
+  contract, `function_lowerer` for lowering, the interpreters for execution,
+  each backend for legalization). `test.sh` greps for both rules beside the
+  existing no-platform-before-backend check.
+- Shared functions do not branch on the profile. A behaviour that differs
+  by profile is a method on the profile's class, reached through the host
+  interface from the dispatch point, and a component that differs in kind
+  is duplicated per profile rather than parameterised (decision of
+  2026-09-04). The Base slices of B1–B4 landed as `in_base_module()` and
+  `Profile.base` branches inside the shared checker, parser, declarations,
+  and lowering; the **Base profile split** slice moves them into
+  `profiles/base`, after which `test.sh` also greps the shared folders for
+  those spellings.
 - The pattern already exists: `hir/generics/` and `hir/interfaces/` are
   consumers of the shared `HirGenerationState`, and `FunctionLowerer`
   consumes `MirLoweringState`. Profile code is written the same way, as
@@ -394,7 +410,8 @@ backends only.
   header, without methods, spans, function pointers, or the status form
   yet; `extern func` with those types, `cstr` (`const u8*` for now),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
-  natively; declaration attributes (§9.8), carried as one
+  natively; the Base entry point `main(arguments: str[]) -> i32` with
+  QBE's startup shim; declaration attributes (§9.8), carried as one
   `SymbolAttributes` value from syntax to MIR, with `used` a pruning
   root, `section` QBE linkage, and `weak`/`used` assembler directives
   the toolchain appends; `naked` waits for `asm`. Spec question: §5.9 says `&x` on an `@u32` is `@u32*` while

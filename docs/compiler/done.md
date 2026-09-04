@@ -2645,6 +2645,23 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   `errno`/`stdio` accessors wait. A native test calls `snprintf`, `atoi`,
   and `abs` from Base.
   Gate: 1096 compiler tests across 58 files.
+- [x] **The Base entry point (B4)** (2026-09-04). `pub func
+  main(arguments: str[])` or `cstr[]`, returning `i32` or `i32!`, is the
+  Base process entry (base.md §9.7). The canonical process entry now
+  records its element type, and Base's own startup shim
+  (`profiles/base/backends/base_qbe_emission.luc`) is emitted through
+  the QBE host: `main(argc, argv)` builds the span over one stack array,
+  a text view per argument with its `strlen`, or a `cstr`, calls the
+  entry, and turns an unhandled failure into exit status 1. The entry
+  contract of each profile lives in its own module
+  (`profiles/{base,full}/hir/*entry.luc`), selected once by the shared
+  entry pass, and the reference interpreter builds a Base `main`'s span
+  in `profiles/base/backends/base_execution.luc` over a heap cell the
+  host allocates; Wasm reports that a Base entry waits.
+  `examples/base/main.lucb` is the first Base program that builds and
+  runs natively on its own, printing through `printf`. This slice is the
+  first written under the no-dialect-branches rule (`plan.md` §5.0).
+  Gate: 1099 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

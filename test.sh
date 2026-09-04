@@ -46,6 +46,7 @@ if grep -R -n 'compiler\.profiles\.full' src/compiler/profiles/base; then
     exit 1
 fi
 dispatch_points='src/compiler/hir/body_checker.luc
+src/compiler/hir/entry_points.luc
 src/compiler/mir/function_lowerer.luc
 src/compiler/backends/interpreter.luc
 src/compiler/backends/mir_interpreter.luc
