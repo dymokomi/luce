@@ -30,6 +30,9 @@ from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, Bu
 from compiler.hir.ir import HirCEnum, HirCFunction, HirCFunctionIdentity, HirCStructKind, HirExternVariable, HirFunction, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type, nominal_cases, nominal_fields
 from compiler.hir.ir import integer_enum_representation, integer_enum_shape
+from compiler.hir.ir import HirRecordLayout, is_union_type
+from compiler.formatting.ieee import ieee_float_bits, ieee_float_value
+from compiler.backends.wrapping import wrap_signed
 from compiler.hir.ir import integer_maximum, integer_minimum, is_pointer_integer_type, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, integer_values_match, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_element_step, place_field_step
@@ -183,6 +186,71 @@ let frame_limit: i64 = 2000
 # Mirror canonical MIR's zero-filled global storage as semantic values.
 # HirGenerator has already rejected types for which zero would forge an
 # address, callable, foreign handle, failure effect, or `never` value.
+# mark: Byte images ============================================================================
+
+func zero_image(size: i64) -> list[u8]:
+    let octets = list[u8]()
+    for index in range(0, size): octets.append(u8(0))
+    return octets
+
+func overlay_at(image: list[u8], octets: list[u8], offset: i64) -> list[u8]:
+    let copied = list[u8]()
+    for index in range(0, len(image)):
+        if index >= offset and index - offset < len(octets): copied.append(octets[index - offset])
+        else: copied.append(image[index])
+    return copied
+
+func little_endian(bits: u64, count: i64) -> list[u8]:
+    let octets = list[u8]()
+    for index in range(0, count):
+        if index >= 8: octets.append(u8(0))
+        else: octets.append(u8((bits >> u64(index * 8)) & u64(255)))
+    return octets
+
+func from_little_endian(image: list[u8], offset: i64, count: i64) -> u64:
+    var bits = u64(0)
+    for index in range(0, count):
+        if index >= 8: break
+        bits = bits | (u64(image[offset + index]) << u64(index * 8))
+    return bits
+
+func integer_image(value: Value, size: i64) -> list[u8]?:
+    match value:
+        SignedInteger(item): return little_endian(signed_bits(item), size)
+        UnsignedInteger(item): return little_endian(item, size)
+        else: return none
+
+# Two's complement bits of a signed value in a u64.
+func signed_bits(value: i64) -> u64:
+    if value >= 0: return u64(value)
+    return u64(value + 9223372036854775807 + 1) + u64(9223372036854775807) + u64(1)
+
+# The signed value whose low `bits` bits are `raw`.
+func signed_from_bits(raw: u64, bits: i64) -> i64:
+    if bits < 64: return wrap_signed(i64(raw & ((u64(1) << u64(bits)) - u64(1))), bits)
+    if raw < u64(9223372036854775807) + u64(1): return i64(raw)
+    return i64(raw - u64(9223372036854775807) - u64(1)) + (-9223372036854775807 - 1)
+
+# Does a type have a zero value the reference interpreter can hold? A bare
+# pointer or function has none; a union member of such a type starts unreadable.
+func has_structural_zero(program: HirProgram, value_type: TypeId) -> bool:
+    match program.types.definitions[value_type.value].form:
+        Pointer(pointee, is_const, is_volatile): return false
+        Function(parameters, result): return false
+        CFunction(parameters, result): return false
+        Interface(index, arguments): return false
+        Array(element, count): return has_structural_zero(program, element)
+        Tuple(elements):
+            for element in elements:
+                if not has_structural_zero(program, element): return false
+            return true
+        Struct(index, arguments):
+            if program.structs[index].layout == HirRecordLayout.overlapping: return true
+            for field in nominal_fields(program, value_type):
+                if not has_structural_zero(program, field.value_type): return false
+            return true
+        else: return true
+
 func zero_hir_value(program: HirProgram, value_type: TypeId) -> Value:
     match program.types.definitions[value_type.value].form:
         Boolean: return Value.Boolean(value = false)
@@ -216,7 +284,12 @@ func zero_hir_value(program: HirProgram, value_type: TypeId) -> Value:
         StringView: return Value.Span(base = BoxedValue(value = Value.Address(frame = -1, symbol = SymbolId(value = no_node), global = -1, path = list[i64]())), length = 0)
         Struct(index, arguments):
             let fields = list[BoxedValue]()
-            for field in nominal_fields(program, value_type): fields.append(BoxedValue(value = zero_hir_value(program, field.value_type)))
+            let is_union = program.structs[index].layout == HirRecordLayout.overlapping
+            for field in nominal_fields(program, value_type):
+                # A union is zeroed as bytes; a member with no zero of its own
+                # starts unreadable (base.md §10.4).
+                if is_union and not has_structural_zero(program, field.value_type): fields.append(BoxedValue(value = Value.Unit))
+                else: fields.append(BoxedValue(value = zero_hir_value(program, field.value_type)))
             return Value.Record(fields = fields)
         Enum(index, arguments):
             let representation = integer_enum_representation(program, value_type) else trap("checked runtime global has no structural zero")
@@ -427,7 +500,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
 
     func write_address(frame: i64, symbol: SymbolId, global: i64, path: list[i64], stored: Value) -> !:
         let root = try self.root_of(frame, symbol, global)
-        let updated = try self.replaced_at(root, path, 0, stored)
+        var updated = try self.replaced_at(root, path, 0, stored)
+        let owner_type = self.root_type(frame, symbol, global)
+        if owner_type != none: updated = try self.refresh_unions(owner_type, path, 0, updated)
         if global >= 0:
             self.globals[global] = updated
             return
@@ -462,6 +537,234 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         let lowered = lowering.lower_mir_type(subject) catch feature:
             error("interpreter: layout of a type the lowerer does not support yet: " + feature)
         return TypeLayout(lowering.types, self.rules).answer(query, lowered, field)
+
+
+    # mark: Union images ========================================================================
+    #
+    # A union's members overlap one storage (base.md §10.4). The reference
+    # interpreter keeps every member of a union value consistent with one
+    # little-endian byte image: after any write below a union, the written
+    # member's bytes overlay the image and the other members are decoded from
+    # it. A member with no byte image (a pointer, a span, text) leaves the
+    # others unreadable until the next write.
+
+    func root_type(frame: i64, symbol: SymbolId, global: i64) -> TypeId?:
+        if frame < 0: return none
+        if global >= 0: return self.program.globals[global].value_type
+        return self.program.symbols[symbol.value].value_type
+
+    # The field and element indices of an assignment place, up to the first
+    # step that leaves value records (a class field, a list element).
+    func steps_path(steps: list[AssignmentPlaceStep]) -> list[i64]:
+        let path = list[i64]()
+        for step in steps:
+            match step:
+                Field(index): path.append(index)
+                Element(index): path.append(index)
+                else: return path
+        return path
+
+    # Rebuild every union on `path` after a write at its end.
+    func refresh_unions(value_type: TypeId, path: list[i64], position: i64, value: Value) -> Value!:
+        if position >= len(path): return value
+        let step = path[position]
+        match self.program.types.definitions[value_type.value].form:
+            Struct(index, arguments):
+                let fields = nominal_fields(self.program, value_type)
+                match value:
+                    Record(items):
+                        if step < 0 or step >= len(items): return value
+                        let copied = list[BoxedValue]()
+                        for member in range(0, len(items)):
+                            if member == step: copied.append(BoxedValue(value = try self.refresh_unions(fields[step].value_type, path, position + 1, items[step].value)))
+                            else: copied.append(items[member])
+                        if is_union_type(self.program, value_type): return try self.union_after_write(value_type, step, copied)
+                        return Value.Record(fields = copied)
+                    else: return value
+            Array(element, count):
+                match value:
+                    Array(elements):
+                        if step < 0 or step >= len(elements): return value
+                        let copied = list[BoxedValue]()
+                        for member in range(0, len(elements)):
+                            if member == step: copied.append(BoxedValue(value = try self.refresh_unions(element, path, position + 1, elements[step].value)))
+                            else: copied.append(elements[member])
+                        return Value.Array(elements = copied)
+                    else: return value
+            Tuple(elements):
+                match value:
+                    Tuple(items):
+                        if step < 0 or step >= len(items): return value
+                        let copied = list[BoxedValue]()
+                        for member in range(0, len(items)):
+                            if member == step: copied.append(BoxedValue(value = try self.refresh_unions(elements[step], path, position + 1, items[step].value)))
+                            else: copied.append(items[member])
+                        return Value.Tuple(elements = copied)
+                    else: return value
+            else: return value
+
+    # The union's members after member `written` changed: the previous image
+    # (from any other member that still has one) under the new member's bytes.
+    func union_after_write(union_type: TypeId, written: i64, members: list[BoxedValue]) -> Value!:
+        let member_types = nominal_fields(self.program, union_type)
+        let size = try self.layout_answer(LayoutQuery.size, union_type, 0)
+        var image = zero_image(size)
+        var widest = 0
+        for index in range(0, len(members)):
+            if index == written: continue
+            let previous = try self.byte_image(members[index].value, member_types[index].value_type)
+            if previous != none and len(previous) > widest:
+                widest = len(previous)
+                image = overlay_at(zero_image(size), previous, 0)
+        let rebuilt = list[BoxedValue]()
+        let written_image = try self.byte_image(members[written].value, member_types[written].value_type)
+        if written_image == none:
+            for index in range(0, len(members)):
+                if index == written: rebuilt.append(members[written])
+                else: rebuilt.append(BoxedValue(value = Value.Unit))
+            return Value.Record(fields = rebuilt)
+        image = overlay_at(image, written_image, 0)
+        for index in range(0, len(members)):
+            if index == written: rebuilt.append(members[written])
+            else:
+                let decoded = try self.decode_image(image, 0, member_types[index].value_type)
+                rebuilt.append(BoxedValue(value = decoded else Value.Unit))
+        return Value.Record(fields = rebuilt)
+
+    # The little-endian bytes of a value, or none when it has no byte image.
+    func byte_image(value: Value, value_type: TypeId) -> list[u8]?!:
+        let size = try self.layout_answer(LayoutQuery.size, value_type, 0)
+        match self.program.types.definitions[value_type.value].form:
+            Boolean:
+                match value:
+                    Boolean(item):
+                        if item: return little_endian(u64(1), size)
+                        return little_endian(u64(0), size)
+                    else: return none
+            Integer(bits, is_signed): return integer_image(value, size)
+            PointerInteger(is_signed): return integer_image(value, size)
+            Character:
+                match value:
+                    Character(item): return little_endian(u64(u32(item)), size)
+                    else: return none
+            Floating(bits):
+                match value:
+                    Floating(item): return little_endian(ieee_float_bits(item, bits), size)
+                    else: return none
+            Enum(index, arguments):
+                if integer_enum_representation(self.program, value_type) == none: return none
+                return integer_image(value, size)
+            Array(element, count):
+                match value:
+                    Array(elements):
+                        let stride = try self.layout_answer(LayoutQuery.size, element, 0)
+                        var image = zero_image(size)
+                        for index in range(0, len(elements)):
+                            let part = try self.byte_image(elements[index].value, element)
+                            if part == none: return none
+                            image = overlay_at(image, part, index * stride)
+                        return image
+                    else: return none
+            Tuple(elements):
+                match value:
+                    Tuple(items):
+                        var image = zero_image(size)
+                        for index in range(0, len(items)):
+                            let part = try self.byte_image(items[index].value, elements[index])
+                            if part == none: return none
+                            image = overlay_at(image, part, try self.layout_answer(LayoutQuery.offset, value_type, index))
+                        return image
+                    else: return none
+            Struct(index, arguments):
+                match value:
+                    Record(items):
+                        let fields = nominal_fields(self.program, value_type)
+                        if is_union_type(self.program, value_type):
+                            # Members agree, so the widest member with an image is the union's.
+                            var best: list[u8]? = none
+                            for member in range(0, len(items)):
+                                let part = try self.byte_image(items[member].value, fields[member].value_type)
+                                if part == none: continue
+                                var take = true
+                                if best != none: take = len(part) > len(best)
+                                if take: best = overlay_at(zero_image(size), part, 0)
+                            return best
+                        var image = zero_image(size)
+                        for member in range(0, len(items)):
+                            let part = try self.byte_image(items[member].value, fields[member].value_type)
+                            if part == none: return none
+                            image = overlay_at(image, part, try self.layout_answer(LayoutQuery.offset, value_type, member))
+                        return image
+                    else: return none
+            Optional(inner):
+                # Only the null niche has an image: absent is address zero.
+                if not self.state_optional_pointer(value_type): return none
+                match value:
+                    Absent: return zero_image(size)
+                    else: return none
+            else: return none
+
+    # The value of `value_type` read from `image` at `offset`, or none when
+    # the type has no byte image or the bytes are not one of its values.
+    func decode_image(image: list[u8], offset: i64, value_type: TypeId) -> Value?!:
+        let size = try self.layout_answer(LayoutQuery.size, value_type, 0)
+        if offset < 0 or offset + size > len(image): return none
+        match self.program.types.definitions[value_type.value].form:
+            Boolean: return Value.Boolean(value = image[offset] != u8(0))
+            Integer(bits, is_signed):
+                let raw = from_little_endian(image, offset, size)
+                if is_signed: return Value.SignedInteger(value = signed_from_bits(raw, bits))
+                return Value.UnsignedInteger(value = raw)
+            PointerInteger(is_signed):
+                let raw = from_little_endian(image, offset, size)
+                if is_signed: return Value.SignedInteger(value = signed_from_bits(raw, size * 8))
+                return Value.UnsignedInteger(value = raw)
+            Character:
+                let raw = from_little_endian(image, offset, size)
+                if raw > u64(1114111) or (raw >= u64(55296) and raw <= u64(57343)): return none
+                return Value.Character(value = char(u32(raw)))
+            Floating(bits):
+                let raw = from_little_endian(image, offset, size)
+                let item = ieee_float_value(raw, bits) catch reason:
+                    return none
+                return Value.Floating(value = item)
+            Enum(index, arguments):
+                let representation = integer_enum_representation(self.program, value_type)
+                if representation == none: return none
+                return try self.decode_image(image, offset, representation)
+            Array(element, count):
+                let stride = try self.layout_answer(LayoutQuery.size, element, 0)
+                let elements = list[BoxedValue]()
+                for index in range(0, count):
+                    let item = try self.decode_image(image, offset + index * stride, element)
+                    if item == none: return none
+                    elements.append(BoxedValue(value = item))
+                return Value.Array(elements = elements)
+            Tuple(elements):
+                let items = list[BoxedValue]()
+                for index in range(0, len(elements)):
+                    let item = try self.decode_image(image, offset + (try self.layout_answer(LayoutQuery.offset, value_type, index)), elements[index])
+                    if item == none: return none
+                    items.append(BoxedValue(value = item))
+                return Value.Tuple(elements = items)
+            Struct(index, arguments):
+                let fields = nominal_fields(self.program, value_type)
+                let items = list[BoxedValue]()
+                if is_union_type(self.program, value_type):
+                    for member in range(0, len(fields)):
+                        let item = try self.decode_image(image, offset, fields[member].value_type)
+                        items.append(BoxedValue(value = item else Value.Unit))
+                    return Value.Record(fields = items)
+                for member in range(0, len(fields)):
+                    let item = try self.decode_image(image, offset + (try self.layout_answer(LayoutQuery.offset, value_type, member)), fields[member].value_type)
+                    if item == none: return none
+                    items.append(BoxedValue(value = item))
+                return Value.Record(fields = items)
+            Optional(inner):
+                if not self.state_optional_pointer(value_type): return none
+                if from_little_endian(image, offset, size) == u64(0): return Value.Absent
+                return none
+            else: return none
 
     # mark: Execution services ==================================================================
     #
@@ -1261,7 +1564,10 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             # The right-hand side may itself mutate the root; read the selected
             # value afterward while retaining the already-resolved indices.
             Combine(binary): assigned = try evaluate_binary(try value_at_assignment_place(latest_root, steps, 0), binary, right, self.program.types)
-        return PlaceUpdate.Updated(value = try value_with_assignment_place(latest_root, steps, 0, assigned))
+        let updated = try value_with_assignment_place(latest_root, steps, 0, assigned)
+        var root_type = self.program.symbols[root_symbol.value].value_type
+        if global_index >= 0: root_type = self.program.globals[global_index].value_type
+        return PlaceUpdate.Updated(value = try self.refresh_unions(root_type, self.steps_path(steps), 0, updated))
 
     # Execute either a compiler-known sequence or the resolved standard
     # protocol. Protocol setup runs once; its private mutable iterator remains
@@ -1876,15 +2182,27 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Catch(value, failure, body): return try self.evaluate_catch(value, failure, body, bindings)
             StructValue(struct_index, fields):
-                let field_count = len(nominal_fields(self.program, node_type(self.program, expression)))
+                let record_type = node_type(self.program, expression)
+                let field_count = len(nominal_fields(self.program, record_type))
                 match try self.evaluate_placed_run(fields, field_count, bindings):
-                    EvaluatedRun(items): return Evaluation.Evaluated(value = Value.Record(fields = items))
+                    EvaluatedRun(items):
+                        # A union's construction writes its one named member.
+                        if is_union_type(self.program, record_type) and fields.count >= 2:
+                            return Evaluation.Evaluated(value = try self.union_after_write(record_type, entry_at(self.program, fields, 0), items))
+                        return Evaluation.Evaluated(value = Value.Record(fields = items))
                     TransferredRun(execution): return Evaluation.Transferred(execution = execution)
             FieldAccess(record, field):
                 match try self.evaluate(record, bindings):
                     Evaluated(item):
                         match item:
-                            Record(fields): return Evaluation.Evaluated(value = fields[field].value)
+                            Record(fields):
+                                let stored = fields[field].value
+                                let record_type = node_type(self.program, record)
+                                if is_union_type(self.program, record_type):
+                                    match stored:
+                                        Unit: error("interpreter: union member `" + nominal_fields(self.program, record_type)[field].name + "` cannot be read in the reference interpreter: the member last written has no byte image (base.md §10.4)")
+                                        else: pass
+                                return Evaluation.Evaluated(value = stored)
                             else:
                                 let stored = self.full.read_class_field(item, field) else trap("field access applied to a non-record HIR value")
                                 return Evaluation.Evaluated(value = stored)
@@ -1997,7 +2315,8 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             let index = find_binding(bindings, place.symbol)
             if index < 0: trap("mutating call refers to an unknown binding")
             let updated = try value_with_assignment_place(self.full.binding_value(bindings[index].value), place.steps, 0, invocation.receiver)
-            self.full.assign_binding(bindings, index, updated)
+            let root_type = self.program.symbols[place.symbol.value].value_type
+            self.full.assign_binding(bindings, index, try self.refresh_unions(root_type, self.steps_path(place.steps), 0, updated))
         return Evaluation.Evaluated(value = invocation.value)
 
     # A function-value call evaluates its pointer first and positional

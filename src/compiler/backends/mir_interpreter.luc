@@ -27,9 +27,9 @@
 #       an out-of-range shift count trap here exactly as the language says
 #       (section 7) and never reach Stage-0's own trap. An `f32` is carried in
 #       an `f64` host slot only after every producing operation has rounded it
-#       with Stage-0's real binary32 arithmetic. Floats in memory live in a
-#       side table keyed by address because Stage-0 offers no float-to-bits
-#       conversion; a `Load` of a float address never written reads 0.0.
+#       with Stage-0's real binary32 arithmetic. Floats in memory are their
+#       IEEE bytes, encoded and decoded by `compiler.formatting.ieee`, so a
+#       union that writes a float and reads an integer sees the bits C sees.
 #
 #       The walk is: `run` -> `call` (one frame) -> `execute_body` -> one
 #       instruction. Control flow returns a `Flow` value that regions consume.
@@ -50,7 +50,7 @@ from compiler.backends.mir_task_runtime import MirTransferredValue
 from compiler.profiles.full.backends.mir_execution import FullProfileMirExecution
 from compiler.backends.layout import LayoutRules, TypeLayout, align_up
 from compiler.formatting.float_display import display_float32, display_float64
-from compiler.formatting.ieee import ieee_float_bits
+from compiler.formatting.ieee import ieee_float_bits, ieee_float_value
 from compiler.reporting.resources import ResourceCensus, resource_census
 import std.strings
 
@@ -109,11 +109,6 @@ struct RunRegion:
     let end: i64
     let results: RegisterRun
 
-# A float stored in memory; see the header for why these are not bytes.
-struct FloatCell:
-    let address: i64
-    let value: f64
-
 struct FreedStorage:
     let address: i64
     let size: i64
@@ -168,7 +163,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
     let layout: TypeLayout
     var depth: i64
     let memory: list[u8]
-    let float_cells: list[FloatCell]
     let freed_storage: list[FreedStorage]
     let data_addresses: list[i64]
     let global_addresses: list[i64]
@@ -194,7 +188,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
         self.layout = TypeLayout(program.types, rules)
         self.depth = 0
         self.memory = list[u8]()
-        self.float_cells = list[FloatCell]()
         self.freed_storage = list[FreedStorage]()
         self.data_addresses = list[i64]()
         self.global_addresses = list[i64]()
@@ -559,7 +552,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
                     if alignment < self.layout.pointer_align(): alignment = self.layout.pointer_align()
                     let size = storage_class_size(byte_count, alignment)
                     let address_value = ptr_of(frame.registers[address.value])
-                    self.clear_float_cells(address_value, size)
                     self.freed_storage.append(FreedStorage(address = address_value, size = size))
             Load(result, value_type, address):
                 frame.registers[result.value] = self.load(value_type, ptr_of(frame.registers[address.value]))
@@ -569,6 +561,8 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
                 match mir_type(types, struct_type):
                     Struct(fields):
                         frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + self.layout.field_offset(struct_type, field))
+                    Union(members):
+                        frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]))
                     else: trap("verified FieldAddress on a non-struct type")
             EnumPayloadAddress(result, enum_type, base):
                 frame.registers[result.value] = MirValue.Ptr(value = ptr_of(frame.registers[base.value]) + self.layout.enum_payload_offset(enum_type))
@@ -581,7 +575,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
                 let start = ptr_of(frame.registers[address.value])
                 let zeroed = self.layout.size_of(value_type)
                 for offset in range(0, zeroed): self.memory[start + offset] = u8(0)
-                self.clear_float_cells(start, zeroed)
             Memcpy(destination, source, value_type):
                 let size = self.layout.size_of(value_type)
                 let to = ptr_of(frame.registers[destination.value])
@@ -593,14 +586,8 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
                 let to = ptr_of(frame.registers[destination.value])
                 let from = ptr_of(frame.registers[source.value])
                 let moved = list[u8]()
-                let moved_float_cells = list[FloatCell]()
                 for offset in range(0, byte_count): moved.append(self.memory[from + offset])
-                for cell in self.float_cells:
-                    if cell.address >= from and cell.address < from + byte_count:
-                        moved_float_cells.append(FloatCell(address = cell.address - from, value = cell.value))
                 for offset in range(0, byte_count): self.memory[to + offset] = moved[offset]
-                self.clear_float_cells(to, byte_count)
-                for cell in moved_float_cells: self.set_float_cell(to + cell.address, cell.value)
             BufferRetain(value):
                 let owner = ptr_of(frame.registers[value.value])
                 if owner != 0:
@@ -817,7 +804,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
     pub func copy_bytes(source: i64, destination: i64, size: i64):
         for offset in range(0, size):
             self.memory[destination + offset] = self.memory[source + offset]
-            self.copy_float_cell(source + offset, destination + offset)
 
     # mark: Arithmetic ==========================================================================
     #
@@ -1075,9 +1061,10 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
     pub func load(value_type: TypeId, address: i64) -> MirValue:
         let types = self.program.types
         if is_float_type(types, value_type):
-            for cell in self.float_cells:
-                if cell.address == address: return MirValue.Float(value = cell.value)
-            return MirValue.Float(value = 0.0)
+            let size = self.layout.size_of(value_type)
+            let value = ieee_float_value(self.read_unsigned_int(address, size), size * 8) catch reason:
+                trap(reason)
+            return MirValue.Float(value = value)
         if is_bool_type(types, value_type): return MirValue.Bool(value = self.memory[address] != 0)
         if is_reference_type(types, value_type): return MirValue.Ptr(value = self.read_int(address, self.layout.pointer_size(), false))
         if is_signed_int_type(types, value_type):
@@ -1087,7 +1074,8 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
     pub func store(value_type: TypeId, address: i64, value: MirValue):
         let types = self.program.types
         if is_float_type(types, value_type):
-            self.set_float_cell(address, normalize_mir_float(float_of(value), value_type, types))
+            let size = self.layout.size_of(value_type)
+            self.write_unsigned_int(address, size, ieee_float_bits(normalize_mir_float(float_of(value), value_type, types), size * 8))
             return
         if is_bool_type(types, value_type):
             if bool_of(value): self.memory[address] = u8(1)
@@ -1136,27 +1124,6 @@ pub class MirInterpreter: MirExternMemory, MirExecutionHost:
             value = value * u64(256) + u64(self.memory[address + position])
             position -= 1
         return value
-
-    func set_float_cell(address: i64, value: f64):
-        for index in range(0, len(self.float_cells)):
-            if self.float_cells[index].address == address:
-                self.float_cells[index] = FloatCell(address = address, value = value)
-                return
-        self.float_cells.append(FloatCell(address = address, value = value))
-
-    func copy_float_cell(from: i64, to: i64):
-        for cell in self.float_cells:
-            if cell.address == from:
-                self.set_float_cell(to, cell.value)
-                return
-
-    func clear_float_cells(address: i64, size: i64):
-        var index = len(self.float_cells) - 1
-        while index >= 0:
-            let cell_address = self.float_cells[index].address
-            if cell_address >= address and cell_address < address + size:
-                self.float_cells.remove(index)
-            index -= 1
 
     # mark: The runtime =========================================================================
     #

@@ -703,6 +703,7 @@ symbol).
 | `Class(identity)` | owning nominal identity handle; payload layout remains a backend fact |
 | `WeakClass(identity)` | non-owning handle for the same nominal identity |
 | `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
+| `Union(members)` | members overlapping at one address (base.md §10.4); size is the largest member's rounded to the strictest alignment |
 | `Array(element, count)` | fixed arrays |
 | `Enum(tag, cases)` | tag is an `Int`; each case is a `Struct` payload |
 | `Func(signature)` | what a function pointer points at |

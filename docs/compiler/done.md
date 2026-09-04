@@ -2409,6 +2409,21 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   the integer, so hashing, equality, and the zero value follow the scalar
   paths.
   Gate: 1049 compiler tests across 54 files.
+- [x] **Unions (B3, third slice)** (2026-09-04). In a `.lucb` module
+  `union Name:` declares a record whose `name: type` members overlap at one
+  address (base.md §10.4): the parser reuses the struct body with the bare
+  member spelling, `HirStruct` carries `HirRecordLayout` (sequential or
+  overlapping), and canonical MIR gains `Union(members)`, laid out as the
+  largest member rounded to the strictest alignment with every member at
+  offset zero. Construction writes exactly one member, the type has no
+  equality, hash, or interfaces, and it is zeroed as bytes. The MIR oracle
+  now stores floats as their IEEE bytes instead of a side table, so writing
+  a float member and reading its integer or byte members sees the bits C
+  sees; the reference interpreter keeps every member of a union value
+  consistent with one little-endian byte image after each write, including
+  writes through pointers and into nested array elements, and refuses to
+  read a member after one with no byte image (a pointer, a span) was written.
+  Gate: 1052 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 
