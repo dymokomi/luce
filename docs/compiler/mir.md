@@ -705,6 +705,10 @@ symbol).
 | `Struct(fields)` | fields in declaration order; byte placement is a backend fact |
 | `Union(members)` | members overlapping at one address (base.md §10.4); size is the largest member's rounded to the strictest alignment |
 
+A `MirField` may carry `alignment` (raise the field to at least that many
+bytes) or `is_packed` (pin it to one byte); the backend's layout still owns
+the natural alignment of the type (base.md §5.11).
+
 A global's `initial` is a `MirInitializer`, a value tree (scalar constants,
 aggregates, one union member, zero, and global/function/data addresses) rather
 than bytes, so a pointer-width scalar or an address stays target-neutral until

@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1062 compiler tests across 54 files, plus the
+The repository currently proves 1067 compiler tests across 54 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -370,8 +370,9 @@ backends only.
   whose C header form waits for B4 (§17.6); unions, with the canonical
   `Union` type and byte-image oracles; module globals with constant
   initialisers folded into the canonical `MirInitializer` value tree;
-  labeled loops, match guards, and `errdefer` (the last exercised end to
-  end once a Base module can raise, §11.3).*
+  labeled loops, match guards, and `errdefer`; the Base failure model
+  (§11.2–11.4) with `Error` text as a view; `packed`/`align` layout words.
+  Only allocation (§12) remains, after B4's interface views.*
   Zero values and `---`,
   module `var` and `thread_local var` with constant initializers, `union`,
   integer-backed enums with `as` and bit operators, the `packed`/`align`

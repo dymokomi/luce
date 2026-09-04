@@ -2457,9 +2457,34 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   coverage so it never counts toward exhaustiveness. `errdefer call` (§8.8)
   is checked (Base only, fallible functions only), lowered as an
   `ErrorSource` deferred action that only the error exit runs, and modelled
-  in the reference interpreter; a Base module cannot raise until the Base
-  failure model lands, so its end-to-end fixture waits for that slice.
+  in the reference interpreter.
   Gate: 1062 compiler tests across 54 files.
+- [x] **The Base failure model (B3, sixth slice)** (2026-09-04). In a
+  `.lucb` module `Error` is `{ code: ErrorCode, message: str }` with the
+  text a view (base.md §11.3), and `ErrorCode`'s package identity is a view
+  too: the checker types `error(code, message)` and `failure.message` with
+  the view, and the lowerer, told the module's profile by `enter_module`,
+  lays both records out with `{ptr, usize}` texts, spells a package
+  identity as program data, and compares codes field by field through the
+  byte loop text views already use. Nothing else changes: the caller-owned
+  error slot, `Raise`, `try`, `catch`, and `recover` lower as before, so a
+  freestanding Base program raises and recovers without the runtime in both
+  oracles, Wasm, and native QBE, and `errdefer` now has its end-to-end
+  fixture. The reference interpreter reads a view message back as text when
+  a failure escapes.
+  Gate: 1067 compiler tests across 54 files.
+- [x] **`packed` and `align(N)` (B3, seventh slice)** (2026-09-04). In a
+  `.lucb` module `packed struct` removes padding, `align(N) struct` raises
+  the record's alignment, and `align(N)` before a field raises that field's
+  (base.md §5.11). The parser reads the contextual words, `HirStruct` and
+  `HirField` carry them, and the lowerer folds them into `MirField`'s
+  `alignment` (raise to at least) and `is_packed` (pin to one byte), which
+  the shared `TypeLayout.field_align` honours for every backend and both
+  oracles, so `sizeof`, `alignof`, `offsetof`, field addresses, and union
+  byte images all agree. The checker refuses the address of a packed field
+  whose alignment is not one, through any place that reaches it; a packed
+  struct itself, and any field of one-byte scalars, stays addressable.
+  Gate: 1067 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

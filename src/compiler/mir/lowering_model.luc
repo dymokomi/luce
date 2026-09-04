@@ -25,6 +25,7 @@ from compiler.hir.ir import HirModule, HirProgram, NodeId, SymbolId, describe_ty
 from compiler.hir.ir import nominal_cases, nominal_fields, resolve_builtin_type, types_match
 import compiler.hir.ir
 from compiler.frontend.source import SourceSpan, format_diagnostic
+from compiler.profile import Profile, profile_of
 import std.strings
 
 # mark: Shared lowering model ==================================================================
@@ -259,6 +260,10 @@ pub class MirLoweringState:
     # Hidden caller-owned Error and aggregate-result pointers (`-1` when the
     # function does not use that protocol), and the newline data item.
     pub var error_slot: i64
+    ## The profile of the module being lowered: a Base module's `Error` and
+    ## `ErrorCode` carry text as views (base.md §11.3), full Luce's as owned
+    ## strings. Set by `enter_module` before each function or global.
+    pub var profile: Profile
     pub var result_slot: i64
     ## The compiler-internal task-group register, or `-1` when this function
     ## contains no direct spawn.
@@ -342,6 +347,7 @@ pub class MirLoweringState:
         self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
         self.error_slot = -1
+        self.profile = Profile.full
         self.result_slot = -1
         self.task_group = -1
         self.newline_data = -1
@@ -584,11 +590,11 @@ pub class MirLoweringState:
             String: return self.string_type()
             Bytes: return self.bytes_type()
             ErrorCode:
-                let fields = [self.string_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
+                let fields = [self.error_text_type(), builtin_mir_type(BuiltinMirType.unsigned_u32)]
                 return self.intern_lowered_type(make_struct_type(fields))
             Error:
                 let code = try self.lower_mir_type(resolve_builtin_type(BuiltinType.error_code))
-                let fields = [code, self.string_type()]
+                let fields = [code, self.error_text_type()]
                 return self.intern_lowered_type(make_struct_type(fields))
             Tuple(elements):
                 let field_types = list[TypeId]()
@@ -615,7 +621,7 @@ pub class MirLoweringState:
                 if ir.is_union_type(self.program, value):
                     self.complete_nominal_type(result, make_union_type(field_types))
                 else:
-                    self.complete_nominal_type(result, make_struct_type(field_types))
+                    self.complete_nominal_type(result, self.laid_out_struct_type(index, value, field_types))
                 let completed = self.active_nominal_types.pop()
                 if completed != result.value: trap("nominal MIR type reservations are not nested")
                 return result
@@ -693,7 +699,7 @@ pub class MirLoweringState:
             # A span is two words: the element pointer and a `usize` length (base.md §5.4).
             Span(element, is_const): return self.intern_lowered_type(make_struct_type([builtin_mir_type(BuiltinMirType.pointer), pointer_int_type(self.types, false)]))
             # A text view has a span's two words (base.md §5.5).
-            StringView: return self.intern_lowered_type(make_struct_type([builtin_mir_type(BuiltinMirType.pointer), pointer_int_type(self.types, false)]))
+            StringView: return self.text_view_type()
             List(element):
                 let element_type = try self.lower_mir_type(element)
                 return self.intern_lowered_type(MirType.List(element = element_type))
@@ -860,7 +866,7 @@ pub class MirLoweringState:
                     match mir_type(self.types, referent):
                         Class(identity): storage_type = self.intern_lowered_type(MirType.WeakClass(identity = identity))
                         else: trap("weak HIR closure capture is not an optional class")
-                fields.append(MirField(value_type = storage_type))
+                fields.append(MirField(value_type = storage_type, alignment = 0, is_packed = false))
             let function_index = self.function_index_of(source.function)
             if function_index < 0: trap("HIR closure body has no function identity")
             var target = FunctionId(value = 0)
@@ -1045,8 +1051,43 @@ pub class MirLoweringState:
     # Immutable strings and bytes share one owned-buffer value protocol.
     # Literals keep an inert null owner; dynamic construction retains one
     # opaque runtime owner without exposing its layout.
+    # A record's fields with its Base layout words (base.md §5.11): `packed`
+    # pins every field to one byte, `align(N)` on the record raises its
+    # first field (and so the record), `align(N)` on a field raises that one.
+    func laid_out_struct_type(index: i64, value: ir.TypeId, field_types: list[TypeId]) -> MirType:
+        let declaration = self.program.structs[index]
+        let laid_out = list[MirField]()
+        for position in range(0, len(field_types)):
+            var alignment = 0
+            if position < len(declaration.fields): alignment = declaration.fields[position].alignment
+            if position == 0 and declaration.alignment > alignment: alignment = declaration.alignment
+            laid_out.append(MirField(value_type = field_types[position], alignment = alignment, is_packed = declaration.is_packed))
+        return MirType.Struct(fields = laid_out)
+
     pub func string_type() -> TypeId:
         return self.buffer_value_type()
+
+    ## A Base text view: a pointer and a `usize` length (base.md §5.5).
+    pub func text_view_type() -> TypeId:
+        return self.intern_lowered_type(make_struct_type([builtin_mir_type(BuiltinMirType.pointer), pointer_int_type(self.types, false)]))
+
+    ## How `Error` and `ErrorCode` carry their text in the module being
+    ## lowered: a view in Base, an owned string in full Luce.
+    pub func error_text_type() -> TypeId:
+        if self.profile == Profile.base: return self.text_view_type()
+        return self.string_type()
+
+    ## The HIR type of that text, for field-wise equality and hashing.
+    pub func error_text_hir_type() -> ir.TypeId!:
+        if self.profile != Profile.base: return resolve_builtin_type(BuiltinType.string)
+        for index in range(0, len(self.program.types.definitions)):
+            match self.program.types.definitions[index].form:
+                StringView: return ir.TypeId(value = u32(index))
+                else: pass
+        error("Base error text needs the `str` view type, which this program never spelled")
+
+    pub func enter_module(module: HirModule):
+        self.profile = profile_of(module.authority)
 
     pub func bytes_type() -> TypeId:
         return self.buffer_value_type()
