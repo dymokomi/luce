@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
 - [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
   In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
   `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
@@ -2240,7 +2240,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
   of signedness, and `u64` into `usize` stay spelled and are refused by
   name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
 - [x] **The overflow operator family (B1, fifth slice)** (2026-09-03). `+%`,
   `-%`, `*%`, and unary `-%` wrap in two's complement, `+|`, `-|`, `*|`
   saturate at the type's bounds, and `+?`, `-?`, `*?` answer `T?` with
@@ -2264,7 +2264,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   wrapping, saturating, checked, layout) answer one number each through the
   reference interpreter, the MIR oracle at both pointer widths, both
   encoders, and a native QBE build linked to a C driver.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
 - [x] **C's cast between numbers (B1, sixth slice)** (2026-09-03). `(T)x`
   parses when the parenthesised text is a scalar type name followed by an
   operand, so `(value)` stays a group and `(Point)(x)` a call (base.md §7.5);
@@ -2278,7 +2278,30 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   narrow clamp; QBE compares against the bounds first). Pointer, enum, and
   text casts arrive with their types (B2, B3). The shared fixtures gain a
   cast fixture and `examples/base/c_arithmetic.lucb` casts twice.
-  Gate: 1025 compiler tests across 53 files.
+  Gate: 1029 compiler tests across 53 files.
+- [x] **Pointers: `T*`, `&`, `*`, and `.` through them (B2, first slice)**
+  (2026-09-03). A `.lucb` module names `T*`, `const T*`, and `volatile T*`
+  (the qualifier prefixes the pointee and attaches to the `*` that follows;
+  `*?` is a nullable pointer in the type grammar, whose niche representation
+  is the next slice), takes `&place` with the qualifier of the path's root
+  (a `var` binding or a `T*` pointee gives `T*`, anything else `const T*`),
+  loads with `*p`, stores with `*p = v` and `p.field = v` through a `T*`
+  only, reads `p.field` without `->`, converts `T*` to `const T*`
+  implicitly, and compares addresses with `==`/`!=` across qualifiers
+  (base.md §5.3, §6.6, §7.7). HIR carries `Pointer` types and the nodes
+  `AddressOf` (a local, global, or pointee root plus `PlaceAssignment`
+  steps), `Deref`, `PointerStore`, and `QualifyPointer`; the lowerer maps a
+  pointer to the canonical `Ptr`, an address to the local's frame slot or
+  the field and element addresses of its path, and a store to the existing
+  place-store path with the pointee as root. The reference interpreter
+  models a pointer as a place in a call frame (`Value.Address`: frame,
+  root, path) over a frame stack it now keeps, so a callee can read and
+  write a caller's local through the pointer it was handed. A `.luc` module
+  is told pointers belong to Luce Base. The shared fixtures gain a pointer
+  fixture and `examples/base/pointers.lucb` checks, runs, and builds. Open
+  in B2: the `T*?` niche, `void*`, pointer arithmetic and ordering, arrays
+  and spans, `str` views, and the escape rule.
+  Gate: 1029 compiler tests across 53 files.
 
 ## 3. Bugs the multi-backend harness found
 

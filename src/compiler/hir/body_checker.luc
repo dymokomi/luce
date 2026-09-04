@@ -558,6 +558,9 @@ pub class HirBodyChecker: HirSemanticChecker:
                     else: pass
                 return try self.check_place_assignment(target, operator, value, span)
             Index(indexed, subscript): return try self.check_place_assignment(target, operator, value, span)
+            Unary(unary_operator, operand):
+                if unary_operator == "*": return try self.check_place_assignment(target, operator, value, span)
+                error(self.diagnostic(span, "assignment needs a named mutable place"))
             Group(grouped): return try self.check_assignment(grouped, operator, value, span)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
         var local_index = self.state.find_local(name)
@@ -616,7 +619,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     func check_place_assignment(target: ExpressionSyntax, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         let place = try self.resolve_assignment_place(target, span, true)
         try self.full.validate_place_steps(place, operator, span)
-        if len(place.steps) == 0: trap("place assignment has no path steps")
+        if len(place.steps) == 0 and place.pointer.value == no_node: trap("place assignment has no path steps")
         let checked = try self.check_expression(value, place.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
@@ -625,6 +628,9 @@ pub class HirBodyChecker: HirSemanticChecker:
             if not types_match(resolved.result, place.value_type):
                 try self.fail(span, "assignment changes the place from `" + self.describe_type(place.value_type) + "` to `" + self.describe_type(resolved.result) + "`")
             operation = AssignmentOperation.Combine(operation = resolved.operation)
+        if place.pointer.value != no_node:
+            let pointer_steps = self.state.push_run(place.steps)
+            return self.state.push_statement(HirNodeForm.PointerStore(pointer = place.pointer, steps = pointer_steps, operation = operation, value = checked), span)
         if place.global < 0: try self.closures.reject_direct_class_cycle(place.symbol, place.steps, checked, span)
         let steps = self.state.push_run(place.steps)
         if place.global >= 0:
@@ -637,6 +643,10 @@ pub class HirBodyChecker: HirSemanticChecker:
     func resolve_assignment_place(target: ExpressionSyntax, span: SourceSpan, mutate_value: bool) -> CheckedPlace!:
         match target.form:
             Group(grouped): return try self.resolve_assignment_place(grouped, span, mutate_value)
+            Unary(operator, operand):
+                if operator != "*": error(self.diagnostic(span, "assignment needs a named mutable place"))
+                if not self.in_base_module(): try self.fail(span, "`*` on a value belongs to Luce Base; a `.luc` module has no raw pointers (base.md §5.3)")
+                return try self.pointer_place(try self.check_expression(operand, none), span, mutate_value)
             Name(root_name):
                 var local_index = self.state.find_local(root_name)
                 if local_index < 0:
@@ -644,6 +654,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                     if global_index < 0: try self.fail(span, "unknown local binding `" + root_name + "`")
                     let global = self.state.globals[global_index]
                     return CheckedPlace(
+                        pointer = NodeId(value = no_node),
                         symbol = SymbolId(value = no_node),
                         global = global_index,
                         value_type = global.value_type,
@@ -659,17 +670,27 @@ pub class HirBodyChecker: HirSemanticChecker:
                 if mutate_value and not local.is_mutable and not initializer_field:
                     if root_name == "self": try self.fail(span, "cannot assign to a field of `self` in a non-mutating method; declare the method `mutating`")
                     try self.fail(span, "cannot assign through immutable binding `" + root_name + "`; declare it with `var`")
-                return CheckedPlace(symbol = local.symbol, global = -1, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
+                return CheckedPlace(pointer = NodeId(value = no_node), symbol = local.symbol, global = -1, value_type = local.value_type, steps = list[u32](), initializer_field = initializer_field)
             Member(base, name):
                 # First inspect without requiring a mutable root: a class
                 # identity remains mutable through an immutable binding.
                 var place = try self.resolve_assignment_place(base, span, false)
-                let class_place = try self.full.resolve_class_field_place(place, name, span, mutate_value)
-                if class_place != none: return class_place
+                var through_pointer = false
+                match self.state.types.definitions[place.value_type.value].form:
+                    Pointer(pointee, is_const, is_volatile):
+                        # `p.field = v` stores through the pointer, whatever the
+                        # binding holding `p` is (base.md §6.6).
+                        let loaded = try self.place_value(place, span)
+                        place = try self.pointer_place(loaded, span, mutate_value)
+                        through_pointer = true
+                    else: pass
+                if not through_pointer:
+                    let class_place = try self.full.resolve_class_field_place(place, name, span, mutate_value)
+                    if class_place != none: return class_place
 
-                # Value fields propagate the caller's mutation requirement
-                # all the way to a mutable root.
-                place = try self.resolve_assignment_place(base, span, mutate_value)
+                    # Value fields propagate the caller's mutation requirement
+                    # all the way to a mutable root.
+                    place = try self.resolve_assignment_place(base, span, mutate_value)
                 let struct_index = self.declarations.struct_of(place.value_type)
                 if struct_index < 0: try self.fail(span, "`" + self.describe_type(place.value_type) + "` has no field `" + name + "`")
                 let field_index = self.declarations.find_field(struct_index, name)
@@ -681,7 +702,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                     try self.fail(span, "cannot assign to `let` field `" + name + "`; declare it with `var`")
                 place.steps.append(place_field_step)
                 place.steps.append(u32(field_index))
-                return CheckedPlace(symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
+                return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
             Index(base, subscript):
                 let inspected = try self.resolve_assignment_place(base, span, false)
                 var element_type = resolve_builtin_type(BuiltinType.unit)
@@ -700,8 +721,61 @@ pub class HirBodyChecker: HirSemanticChecker:
                 let index = try self.check_expression(subscript, index_type)
                 place.steps.append(step)
                 place.steps.append(index.value)
-                return CheckedPlace(symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
+                return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
+
+    # A place rooted at the pointee of a Base pointer. A store needs `T*`;
+    # `const T*` reads only (base.md §6.6).
+    func pointer_place(pointer: NodeId, span: SourceSpan, mutate_value: bool) -> CheckedPlace!:
+        match self.state.types.definitions[self.state.type_of(pointer).value].form:
+            Pointer(pointee, is_const, is_volatile):
+                if mutate_value and is_const:
+                    try self.fail(span, "cannot store through `" + self.describe_type(self.state.type_of(pointer)) + "`; a store needs `" + self.describe_type(pointee) + "*`")
+                return CheckedPlace(pointer = pointer, symbol = SymbolId(value = no_node), global = -1, value_type = pointee, steps = list[u32](), initializer_field = false)
+            else: error(self.diagnostic(span, "`*` dereferences a pointer, found `" + self.describe_type(self.state.type_of(pointer)) + "`"))
+
+    # Read the value a resolved place holds, as an expression node.
+    func place_value(place: CheckedPlace, span: SourceSpan) -> NodeId!:
+        var current = NodeId(value = no_node)
+        if place.pointer.value != no_node:
+            match self.state.types.definitions[self.state.type_of(place.pointer).value].form:
+                Pointer(pointee, is_const, is_volatile): current = self.state.push_node(HirNodeForm.Deref(pointer = place.pointer), pointee, span)
+                else: trap("pointer place has a non-pointer root")
+        elif place.global >= 0:
+            current = self.state.push_node(HirNodeForm.GlobalLoad(global = u32(place.global)), self.state.globals[place.global].value_type, span)
+        else:
+            current = self.state.push_node(HirNodeForm.Reference(symbol = place.symbol), self.state.symbols[place.symbol.value].value_type, span)
+        for position in range(0, len(place.steps) // 2):
+            let kind = place.steps[position * 2]
+            let payload = place.steps[position * 2 + 1]
+            let current_type = self.state.type_of(current)
+            if kind == place_field_step:
+                let field = self.declarations.struct_field(current_type, i64(payload))
+                current = self.state.push_node(HirNodeForm.FieldAccess(value = current, field = i64(payload)), field.value_type, span)
+            elif kind == place_element_step:
+                match self.state.types.definitions[current_type.value].form:
+                    Array(element, count): current = self.state.push_node(HirNodeForm.SequenceIndex(value = current, index = NodeId(value = payload)), element, span)
+                    else: trap("element step applied to a non-array place")
+            else: try self.fail(span, "a pointer path crosses a runtime collection; Luce Base has none")
+        return current
+
+    # `&place` (base.md §6.6): the qualifier comes from the path's root, a
+    # `var` binding or a `T*` pointee giving `T*`, anything else `const T*`.
+    func check_address_of(operand: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let place = try self.resolve_assignment_place(operand, span, false)
+        var is_const = true
+        if place.pointer.value != no_node:
+            match self.state.types.definitions[self.state.type_of(place.pointer).value].form:
+                Pointer(pointee, pointer_const, is_volatile): is_const = pointer_const
+                else: pass
+        elif place.global >= 0: is_const = false
+        else:
+            for local in self.state.locals:
+                if local.symbol.value == place.symbol.value: is_const = not local.is_mutable
+        let steps = self.state.push_run(place.steps)
+        let address_type = self.state.intern_pointer(place.value_type, is_const, false)
+        let node = self.state.push_node(HirNodeForm.AddressOf(pointer = place.pointer, symbol = place.symbol, global = place.global, steps = steps), address_type, span)
+        return try self.require_type(node, expected)
 
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
@@ -1054,6 +1128,18 @@ pub class HirBodyChecker: HirSemanticChecker:
             let typed = self.state.push_node(HirNodeForm.Try(value = checked), successful, span)
             return try self.require_type(typed, expected)
 
+        if operator == "&" or operator == "*":
+            if not self.in_base_module(): try self.fail(span, "`" + operator + "` on a value belongs to Luce Base; a `.luc` module has no raw pointers (base.md §5.3)")
+        if operator == "&": return try self.check_address_of(operand, span, expected)
+        if operator == "*":
+            # The pointer operand takes no type from context; its pointee does.
+            let pointer = try self.check_expression(operand, none)
+            match self.state.types.definitions[self.state.type_of(pointer).value].form:
+                Pointer(pointee, is_const, is_volatile):
+                    let loaded = self.state.push_node(HirNodeForm.Deref(pointer = pointer), pointee, span)
+                    return try self.require_type(loaded, expected)
+                else: error(self.diagnostic(span, "`*` dereferences a pointer, found `" + self.describe_type(self.state.type_of(pointer)) + "`"))
+
         # Numeric unary operators produce a non-optional value even when the
         # surrounding context will promote that result to `T?`.
         let operand_context = self.optional_value_context(expected)
@@ -1120,6 +1206,12 @@ pub class HirBodyChecker: HirSemanticChecker:
         if widens_implicitly(self.state.types, left, right):
             return CheckedBinaryOperands(left = try self.require_type(operands.left, right), right = operands.right)
         if widens_implicitly(self.state.types, right, left):
+            return CheckedBinaryOperands(left = operands.left, right = try self.require_type(operands.right, left))
+        # Pointers compare across qualifiers (base.md §5.3): the less qualified
+        # side takes the other's type.
+        if qualifies_implicitly(self.state.types, left, right):
+            return CheckedBinaryOperands(left = try self.require_type(operands.left, right), right = operands.right)
+        if qualifies_implicitly(self.state.types, right, left):
             return CheckedBinaryOperands(left = operands.left, right = try self.require_type(operands.right, left))
         return operands
 
@@ -2145,7 +2237,12 @@ pub class HirBodyChecker: HirSemanticChecker:
     # Complete value-member selection from an already evaluated receiver. This
     # is shared with function-valued field calls so computed receivers retain
     # source-order, single-evaluation semantics.
-    func check_field_access_node(checked: NodeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
+    func check_field_access_node(first: NodeId, name: str, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        var checked = first
+        # `p.field` reads through a Base pointer; `->` is not needed (base.md §7.7).
+        match self.state.types.definitions[self.state.type_of(first).value].form:
+            Pointer(pointee, is_const, is_volatile): checked = self.state.push_node(HirNodeForm.Deref(pointer = first), pointee, span)
+            else: pass
         let checked_type = self.state.type_of(checked)
         if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
             let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
@@ -2771,6 +2868,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         # a spelling; no value can change (base.md §7.5).
         if self.in_base_module() and widens_implicitly(self.state.types, found, expected):
             return self.state.push_node(HirNodeForm.NumericConvert(value = value), expected, self.state.span_of(value))
+        if self.in_base_module() and qualifies_implicitly(self.state.types, found, expected):
+            return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, self.state.span_of(value))
         let existential = try self.interfaces.convert(self, value, expected)
         if existential != none: return existential
         if self.is_function_fallibility_lift(found, expected):
@@ -2943,6 +3042,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             Unary(operation, operand): return self.is_constant_expression(operand, allow_function)
             NumericConvert(value): return self.is_constant_expression(value, allow_function)
             Cast(value): return self.is_constant_expression(value, allow_function)
+            QualifyPointer(value): return self.is_constant_expression(value, allow_function)
             Binary(left, operation, right): return self.is_constant_expression(left, allow_function) and self.is_constant_expression(right, allow_function)
             Range(lower, upper, inclusive): return self.is_constant_expression(lower, allow_function) and self.is_constant_expression(upper, allow_function)
             Conditional(chosen, condition, alternative):
@@ -3212,3 +3312,17 @@ func base_overflow_operation(operator: str, operand_type: TypeId) -> BinaryOpera
 func base_overflow_result(state: HirGenerationState, operator: str, operand_type: TypeId) -> TypeId:
     if operator == "+?" or operator == "-?" or operator == "*?": return state.intern_optional(operand_type)
     return operand_type
+
+# `T*` converts implicitly to `const T*`, `volatile T*`, and `const volatile T*`;
+# a qualifier is never removed without a cast (base.md §5.3).
+func qualifies_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> bool:
+    match types.definitions[found.value].form:
+        Pointer(pointee, is_const, is_volatile):
+            match types.definitions[expected.value].form:
+                Pointer(other_pointee, other_const, other_volatile):
+                    if pointee.value != other_pointee.value: return false
+                    if is_const and not other_const: return false
+                    if is_volatile and not other_volatile: return false
+                    return true
+                else: return false
+        else: return false

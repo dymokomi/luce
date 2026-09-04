@@ -767,6 +767,9 @@ pub union HirNodeForm:
     Binding(symbol: SymbolId, is_mutable: bool, value: NodeId)
     Assignment(symbol: SymbolId, operation: AssignmentOperation, value: NodeId)
     ExternStore(variable: u32, operation: AssignmentOperation, value: NodeId)
+    ## `*p = v` and `p.field = v` (base.md §7.7): a store through a Base
+    ## pointer, then `steps` as `PlaceAssignment` spells them.
+    PointerStore(pointer: NodeId, steps: Operands, operation: AssignmentOperation, value: NodeId)
     GlobalStore(global: u32, operation: AssignmentOperation, value: NodeId)
     PlaceAssignment(symbol: SymbolId, steps: Operands, operation: AssignmentOperation, value: NodeId)
     ## A resolved field/element path rooted in sealed runtime state. Ordinary
@@ -822,6 +825,14 @@ pub union HirNodeForm:
     ## range checks and floating-width rounding are semantic, never backend
     ## defaults.
     NumericConvert(value: NodeId)
+    ## `&place` (base.md §6.6): the address of a local (`symbol`), a global
+    ## (`global`), or the pointee of `pointer`, followed by `steps` as
+    ## `PlaceAssignment` spells them. Exactly one root is present.
+    AddressOf(pointer: NodeId, symbol: SymbolId, global: i64, steps: Operands)
+    ## `*p`: the value a Base pointer addresses (base.md §7.7).
+    Deref(pointer: NodeId)
+    ## `T*` read as `const T*`: the same address under a stricter type.
+    QualifyPointer(value: NodeId)
     ## A layout question about `subject` (`sizeof`, `alignof`, or `offsetof` of
     ## its field `field`; -1 otherwise), typed `usize`. HIR carries the
     ## question, never the answer: only a backend knows the target's layout
@@ -1047,6 +1058,15 @@ pub func node_children(program: HirProgram, node: NodeId, into: list[NodeId]):
         NativeFloatBits(value): into.append(value)
         NativeArena(end): into.append(end)
         NumericConvert(value): into.append(value)
+        AddressOf(pointer, symbol, global, steps):
+            if pointer.value != no_node: into.append(pointer)
+            place_step_nodes(program, steps, into)
+        Deref(pointer): into.append(pointer)
+        QualifyPointer(value): into.append(value)
+        PointerStore(pointer, steps, operation, value):
+            into.append(pointer)
+            place_step_nodes(program, steps, into)
+            into.append(value)
         LayoutConstant(query, subject, field): pass
         Cast(value): into.append(value)
         Discard(value): into.append(value)
@@ -1345,6 +1365,10 @@ pub union TypeForm:
     ## A typed native address token. The pointee identity survives until a
     ## backend chooses layout; no pointer width or byte arithmetic exists here.
     NativePointer(pointee: TypeId, is_mutable: bool)
+    ## A Luce Base pointer (base.md §5.3): never null, one word, C's layout.
+    ## `is_const` forbids stores through it; `is_volatile` makes its loads and
+    ## stores observable effects. Nullability is the ordinary optional.
+    Pointer(pointee: TypeId, is_const: bool, is_volatile: bool)
     ## Abstract identity used only while a generic declaration is checked.
     ## Monomorphization removes it before canonical MIR construction.
     TypeParameter(generic: u32, position: u32)
@@ -1543,6 +1567,11 @@ pub func type_form_key(form: TypeForm) -> str:
         NativePointer(pointee, is_mutable):
             if is_mutable: return "native_mut_ptr:" + str(pointee.value)
             return "native_ptr:" + str(pointee.value)
+        Pointer(pointee, is_const, is_volatile):
+            var key = "pointer:" + str(pointee.value)
+            if is_const: key = key + ":const"
+            if is_volatile: key = key + ":volatile"
+            return key
         TypeParameter(generic, position): return "parameter:" + str(generic) + "," + str(position)
         Interface(index, arguments): return "interface:" + str(index) + "[" + type_id_list_key(arguments) + "]"
         Struct(index, arguments): return "struct:" + str(index) + "[" + type_id_list_key(arguments) + "]"
@@ -1680,6 +1709,11 @@ pub func type_forms_match(left: TypeForm, right: TypeForm) -> bool:
                 NativePointer(other_pointee, other_mutable):
                     return pointee.value == other_pointee.value and is_mutable == other_mutable
                 else: return false
+        Pointer(pointee, is_const, is_volatile):
+            match right:
+                Pointer(other_pointee, other_const, other_volatile):
+                    return pointee.value == other_pointee.value and is_const == other_const and is_volatile == other_volatile
+                else: return false
         TypeParameter(generic, position):
             match right:
                 TypeParameter(other_generic, other_position): return generic == other_generic and position == other_position
@@ -1744,6 +1778,7 @@ func type_contains_parameter_once(types: TypeTable, value: TypeId, visited: list
         Fallible(element): return type_contains_parameter_once(types, element, visited)
         Array(element, count): return type_contains_parameter_once(types, element, visited)
         NativePointer(element, is_mutable): return type_contains_parameter_once(types, element, visited)
+        Pointer(element, is_const, is_volatile): return type_contains_parameter_once(types, element, visited)
         Tuple(elements):
             for element in elements:
                 if type_contains_parameter_once(types, element, visited): return true
@@ -2192,6 +2227,11 @@ pub union Value:
     Variant(case_index: i64, payload: list[BoxedValue])
     Absent
     Present(value: BoxedValue)
+    ## The reference interpreter's Base pointer: a place in one call frame
+    ## (`frame` indexes the run's frame stack), rooted at a local `symbol` or
+    ## a `global`, followed by field and element indices. Addresses compare
+    ## equal when they name one place (base.md §5.3).
+    Address(frame: i64, symbol: SymbolId, global: i64, path: list[i64])
     ## Internal carrier for the two outcomes of a `T!` call. HirGenerator
     ## ensures these are consumed only by Try/Catch nodes, so they never
     ## become ordinary source values.
@@ -2206,6 +2246,7 @@ pub union Value:
             SignedInteger(item): return str(item)
             UnsignedInteger(item): return str(item)
             Foreign(token): return "<foreign>"
+            Address(frame, symbol, global, path): return "<address>"
             Floating(item): return str(item)
             Character(item): return str(item)
             Text(item): return item
@@ -2310,6 +2351,11 @@ pub func values_equal(left: Value, right: Value) -> bool:
             match right:
                 Unit: return true
                 else: return false
+        Address(frame, symbol, global, path):
+            match right:
+                Address(other_frame, other_symbol, other_global, other_path):
+                    return frame == other_frame and symbol.value == other_symbol.value and global == other_global and integer_lists_equal(path, other_path)
+                else: return false
         SignedInteger(a):
             match right:
                 SignedInteger(b): return a == b
@@ -2343,3 +2389,9 @@ pub func values_equal(left: Value, right: Value) -> bool:
                     return true
                 else: return false
         else: return false
+
+func integer_lists_equal(left: list[i64], right: list[i64]) -> bool:
+    if len(left) != len(right): return false
+    for index in range(0, len(left)):
+        if left[index] != right[index]: return false
+    return true

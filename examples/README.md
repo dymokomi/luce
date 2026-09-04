@@ -157,6 +157,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   `+|`, and `+?` wrap, saturate, and answer `none` on overflow instead of
   trapping (base.md §7.2), and `(u8)298` is C's cast: the low byte, never a
   trap (base.md §7.5).
+- `base/pointers.lucb` takes `&point` and `&count`, stores through `*counter`
+  and `point.x`, and reads through a `const Point*`: Base's never-null
+  pointers with the qualifier taken from the path's root (base.md §5.3, §6.6).
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the

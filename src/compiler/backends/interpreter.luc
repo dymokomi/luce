@@ -78,6 +78,13 @@ pub interface HirExternVariableHost:
     func load(variable: HirExternVariable) -> Value!
     func store(variable: HirExternVariable, value: Value) -> !
 
+# One resolved Base pointer: the place it names.
+struct AddressTarget:
+    let frame: i64
+    let symbol: SymbolId
+    let global: i64
+    let path: list[i64]
+
 ## The reusable interpreter backend. Each execution gets private program state.
 pub class HirInterpreter: HirExecutionBackend:
     ## The layout rules this interpreter answers `sizeof`-family questions
@@ -215,6 +222,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     var depth: i64
     # Symbol-indexed lookup over the program's functions.
     let function_by_symbol: list[i64]
+    # The bindings of every live call, innermost last, so a Base pointer to a
+    # caller's local (`Value.Address`) can be read and written from a callee.
+    let frames: list[list[Binding]]
     # Layout questions are answered with the compiled backends' own type
     # lowering and layout algorithm under `rules`; both are created on the
     # first question, since most programs ask none.
@@ -241,6 +251,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         self.depth = 0
         self.rules = rules
         self.lowering = none
+        self.frames = list[list[Binding]]()
 
     ## Host ARC reaches this callback exactly when an interpreted class loses
     ## its final strong reference. Source `deinit` runs before payload fields;
@@ -248,6 +259,83 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     ## order independently of the host list implementation.
     pub func finalize(class_type: TypeId, fields: list[BoxedValue], run_deinitializer: bool):
         self.full.finalize(self, class_type, fields, run_deinitializer)
+
+    # mark: Base pointers =======================================================================
+    #
+    # A Base pointer is a place: the frame that owns the root binding (or a
+    # global), then field and element indices. Reads and writes rebuild the
+    # value along that path, as `PlaceAssignment` does for a local.
+
+    func evaluate_address(pointer: NodeId, bindings: list[Binding]) -> AddressTarget!:
+        match try self.evaluate(pointer, bindings):
+            Evaluated(item):
+                match item:
+                    Address(frame, symbol, global, path): return AddressTarget(frame = frame, symbol = symbol, global = global, path = path)
+                    else: trap("typed pointer operation received a non-address HIR value")
+            Transferred(execution): error("interpreter: a pointer operand diverged")
+
+    # Append a `PlaceAssignment`-shaped step run as indices: fields directly,
+    # element steps by evaluating their index expression.
+    func append_path_steps(path: list[i64], steps: Operands, bindings: list[Binding]) -> !:
+        for position in range(0, i64(steps.count) // 2):
+            let kind = u32(entry_at(self.program, steps, position * 2))
+            let payload = entry_at(self.program, steps, position * 2 + 1)
+            if kind == place_field_step: path.append(payload)
+            elif kind == place_element_step:
+                match try self.evaluate(NodeId(value = u32(payload)), bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(index): path.append(i64(index))
+                            SignedInteger(index): path.append(index)
+                            else: trap("element step index is not an integer")
+                    Transferred(execution): error("interpreter: an index expression diverged")
+            else: error("interpreter: a pointer path crosses a runtime collection")
+
+    func root_of(frame: i64, symbol: SymbolId, global: i64) -> Value!:
+        if global >= 0: return self.globals[global]
+        if frame < 0 or frame >= len(self.frames): error("interpreter: trap: a pointer outlived the frame that owned its place")
+        let index = find_binding(self.frames[frame], symbol)
+        if index < 0: error("interpreter: trap: a pointer outlived the binding that owned its place")
+        return self.full.binding_value(self.frames[frame][index].value)
+
+    func read_address(frame: i64, symbol: SymbolId, global: i64, path: list[i64]) -> Value!:
+        var current = try self.root_of(frame, symbol, global)
+        for step in path:
+            match current:
+                Record(fields): current = fields[step].value
+                Array(elements):
+                    if step < 0 or step >= len(elements): error("interpreter: trap: index out of range")
+                    current = elements[step].value
+                else: trap("pointer path step applied to a non-aggregate HIR value")
+        return current
+
+    func write_address(frame: i64, symbol: SymbolId, global: i64, path: list[i64], stored: Value) -> !:
+        let root = try self.root_of(frame, symbol, global)
+        let updated = try self.replaced_at(root, path, 0, stored)
+        if global >= 0:
+            self.globals[global] = updated
+            return
+        let bindings = self.frames[frame]
+        self.full.assign_binding(bindings, find_binding(bindings, symbol), updated)
+
+    func replaced_at(current: Value, path: list[i64], position: i64, stored: Value) -> Value!:
+        if position == len(path): return stored
+        let step = path[position]
+        match current:
+            Record(fields):
+                let copied = list[BoxedValue]()
+                for index in range(0, len(fields)):
+                    if index == step: copied.append(BoxedValue(value = try self.replaced_at(fields[index].value, path, position + 1, stored)))
+                    else: copied.append(fields[index])
+                return Value.Record(fields = copied)
+            Array(elements):
+                if step < 0 or step >= len(elements): error("interpreter: trap: index out of range")
+                let copied = list[BoxedValue]()
+                for index in range(0, len(elements)):
+                    if index == step: copied.append(BoxedValue(value = try self.replaced_at(elements[index].value, path, position + 1, stored)))
+                    else: copied.append(elements[index])
+                return Value.Array(elements = copied)
+            else: trap("pointer path step applied to a non-aggregate HIR value")
 
     # The reference interpreter is a backend for layout questions (design
     # §23.3): it lowers the type as the compiled backends do and answers under
@@ -364,10 +452,13 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
 
         self.full.begin_invocation()
         self.depth += 1
+        self.frames.append(bindings)
         let outcome = self.execute_function_scope(function_body(function), bindings, true) catch reason:
+            self.frames.remove(len(self.frames) - 1)
             self.depth -= 1
             self.full.end_invocation()
             error(reason)
+        self.frames.remove(len(self.frames) - 1)
         self.depth -= 1
         self.full.end_invocation()
         var receiver = Value.Unit
@@ -910,6 +1001,24 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Combine(binary): assigned = try evaluate_binary(self.globals[global_index], binary, right, self.program.types)
                 self.globals[global_index] = assigned
                 return Execution.Next
+            PointerStore(pointer, step_run, operation, value):
+                let target = try self.evaluate_address(pointer, bindings)
+                var path = list[i64]()
+                for step in target.path: path.append(step)
+                try self.append_path_steps(path, step_run, bindings)
+                let current = try self.read_address(target.frame, target.symbol, target.global, path)
+                var stored = Value.Unit
+                match operation:
+                    Replace:
+                        match try self.evaluate(value, bindings):
+                            Evaluated(item): stored = item
+                            Transferred(execution): return execution
+                    Combine(binary):
+                        match try self.evaluate(value, bindings):
+                            Evaluated(item): stored = try evaluate_binary(current, binary, item, self.program.types)
+                            Transferred(execution): return execution
+                try self.write_address(target.frame, target.symbol, target.global, path, stored)
+                return Execution.Next
             PlaceAssignment(symbol, step_run, operation, value):
                 let index = find_binding(bindings, symbol)
                 if index < 0: trap("typed place assignment refers to an unknown binding")
@@ -1252,6 +1361,23 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 match try self.evaluate(value, bindings):
                     Evaluated(item): return Evaluation.Evaluated(value = cast_numeric_value(item, node_type(self.program, expression), self.program.types))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
+            QualifyPointer(value): return try self.evaluate(value, bindings)
+            Deref(pointer):
+                let target = try self.evaluate_address(pointer, bindings)
+                return Evaluation.Evaluated(value = try self.read_address(target.frame, target.symbol, target.global, target.path))
+            AddressOf(pointer, symbol, global, steps):
+                var frame = len(self.frames) - 1
+                var root_symbol = symbol
+                var root_global = global
+                var path = list[i64]()
+                if pointer.value != no_node:
+                    let inner = try self.evaluate_address(pointer, bindings)
+                    frame = inner.frame
+                    root_symbol = inner.symbol
+                    root_global = inner.global
+                    for step in inner.path: path.append(step)
+                try self.append_path_steps(path, steps, bindings)
+                return Evaluation.Evaluated(value = Value.Address(frame = frame, symbol = root_symbol, global = root_global, path = path))
             NumericConvert(value):
                 match try self.evaluate(value, bindings):
                     Evaluated(item):
