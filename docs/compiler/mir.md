@@ -771,10 +771,11 @@ MirFunction
     is_public     bool                  source-package API visibility
     is_exported   bool                  explicit artifact symbol, independent of `pub`
     span          SourceSpan
+    attributes    SymbolAttributes      base.md §9.8 words; `used` is a pruning root
 
 MirExtern     name, convention (c | runtime), params, results, fallible
 MirExternalGlobal name, value type
-MirGlobal     type, initial: DataId?, is_mutable
+MirGlobal     type, initial: DataId?, is_mutable, attributes
 MirData       bytes, minimum alignment
 ```
 

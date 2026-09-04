@@ -2552,6 +2552,23 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   instruction was needed. `PageAllocator`, `CAllocator`, `Arena`, and the
   §12.5 linter wait for the runtime port.
   Gate: 1077 compiler tests across 54 files.
+- [x] **Declaration attributes (B4, fourth slice)** (2026-09-04). The
+  closed word set of base.md §9.8 (`inline`, `noinline`, `cold`, `naked`,
+  `weak`, `used`, `section("name")`) parses between `pub` and `func`,
+  `var`, `thread_local var`, or `export c func` in a Base module, each
+  word once, `inline` and `noinline` excluding each other and the
+  function-only words refused before a global. One `SymbolAttributes`
+  value (`compiler/symbol_attributes.luc`) rides on the syntax tree,
+  `HirFunction`/`HirGlobal`, the package codec, and `MirFunction`/
+  `MirGlobal`, where an exported function's C wrapper carries the words
+  as well. `used` is a root for the optimizer's pruning; `section`
+  becomes QBE `section` linkage on the data or function; `weak` and
+  `used` become the assembler directives QBE cannot express, appended to
+  its output by the toolchain as `.weak_definition`/`.no_dead_strip` for
+  Mach-O and `.weak` for ELF. The inlining and coldness hints are carried
+  and ignored, as the spec allows. `naked` is refused until `asm` lands,
+  and `weak` on anything but an exported function until globals export.
+  Gate: 1085 compiler tests across 57 files.
 
 ## 3. Bugs the multi-backend harness found
 
