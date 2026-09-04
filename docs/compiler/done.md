@@ -2569,6 +2569,23 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   and ignored, as the spec allows. `naked` is refused until `asm` lands,
   and `weak` on anything but an exported function until globals export.
   Gate: 1085 compiler tests across 57 files.
+- [x] **Atomic `max`/`min` and volatile indexing (B4, fifth slice)**
+  (2026-09-04). `max(v, order)` and `min(v, order)` on an atomic integer
+  are two more `AtomicUpdate` operations, compared in the type's own
+  signedness: the oracles and Wasm pick the extreme and store it, while
+  QBE, which has no `__atomic_fetch_max`, emits a load and a
+  compare-exchange loop that retries until the location still holds what
+  it read. `wait`/`wake` now say they wait for the runtime's futex. An
+  array element indexed through a `volatile` pointer, `regs.slots[i]`,
+  reads and writes as a volatile access like the field it sits in.
+  An optional interface view, `Writer?`, is now the view itself on the
+  null-data niche (base.md §5.6): `none` is two zero words, presence is a
+  null test on the data word, `x == none` needs no equality on the
+  payload, an absent constant initialiser folds to zero storage, and the
+  reference interpreter answers layout questions under Base's
+  representations, so `sizeof` agrees with the backends. The thread-local
+  `memory.allocator` is the first such optional.
+  Gate: 1087 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

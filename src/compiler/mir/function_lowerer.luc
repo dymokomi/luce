@@ -66,6 +66,8 @@ func atomic_op_of(operation: AtomicOperation) -> AtomicOp:
         and_bits: return AtomicOp.bit_and
         xor_bits: return AtomicOp.bit_xor
         swap: return AtomicOp.swap
+        maximum: return AtomicOp.maximum
+        minimum: return AtomicOp.minimum
 
 # The two loads a view call needs: the conformer's address and the witness.
 struct ViewDispatch:
@@ -825,6 +827,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         match node_form(self.state.program, node):
             Deref(pointer): return self.is_volatile_pointer(node_type(self.state.program, pointer))
             FieldAccess(record, field): return self.volatile_place(record)
+            SequenceIndex(value, index): return self.volatile_place(value)
             else: return false
 
     func load_volatile(value_type: TypeId, address: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
@@ -1936,9 +1939,18 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 # The nullable pointer niche is one word whose zero is `none`.
                 if is_nullable_ptr_type(self.state.types, value_type): return self.typed_null_constant(value_type, span, body)
                 let temp = self.new_temp(value_type, span, body)
+                if self.state.is_view_optional_type(value_type):
+                    # An absent view is two zero words.
+                    body.append(MirInstruction(form = InstructionForm.Zero(address = temp, value_type = value_type), span = span))
+                    return temp
                 self.store_optional_tag(temp, 0, span, body)
                 return temp
             Some(inner):
+                if self.state.is_view_optional_type(value_type):
+                    let view = try self.lower_expression(module, function, inner, body)
+                    let copy = self.new_temp(value_type, span, body)
+                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = copy, source = view, value_type = value_type), span = span))
+                    return copy
                 if is_nullable_ptr_type(self.state.types, value_type):
                     let pointer = try self.lower_expression(module, function, inner, body)
                     let wrapped = self.state.new_register(value_type)
@@ -3254,8 +3266,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
         let saved = self.new_temp(global_type, span, body)
         body.append(MirInstruction(form = InstructionForm.Memcpy(destination = saved, source = address, value_type = global_type), span = span))
         let view = try self.lower_expression(module, function, allocator, body)
-        self.store_optional_tag(address, 1, span, body)
-        body.append(MirInstruction(form = InstructionForm.Memcpy(destination = self.payload_address(global_type, address, span, body), source = view, value_type = view_type), span = span))
+        if self.state.is_view_optional_type(global_type):
+            body.append(MirInstruction(form = InstructionForm.Memcpy(destination = address, source = view, value_type = view_type), span = span))
+        else:
+            self.store_optional_tag(address, 1, span, body)
+            body.append(MirInstruction(form = InstructionForm.Memcpy(destination = self.payload_address(global_type, address, span, body), source = view, value_type = view_type), span = span))
         let defer_start = len(self.state.defers)
         self.state.defers.append(DeferredAction.RestoreValue(address = address, saved = saved, value_type = global_type, span = span))
         try self.lower_scope_from(module, function, statements, defer_start, body)
@@ -3633,7 +3648,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     let same = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
                     body.append(MirInstruction(form = InstructionForm.Binary(result = same, operation = BinaryOp.eq, left = selected, right = wanted), span = span))
                     return same
-                if is_nullable_ptr_type(self.state.types, enum_type):
+                if is_nullable_ptr_type(self.state.types, enum_type) or self.state.is_view_optional_type(enum_type):
                     # `.none` is case 0 and `.some` case 1 of the optional; the
                     # niche answers both with one null test.
                     let present = self.optional_present(enum_type, selected, span, body)
@@ -3890,6 +3905,13 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # niche, the tag otherwise. `optional` is the register-sized word or the
     # tagged enum's address, as the type decides.
     pub func optional_present(optional_type: TypeId, optional: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if self.state.is_view_optional_type(optional_type):
+            # A view is present when its data word is not null.
+            let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+            let data = self.load_value(pointer_type, self.field_address(optional_type, optional, 0, span, body), span, body)
+            let present = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = present, operation = BinaryOp.ne, left = data, right = self.null_constant(span, body)), span = span))
+            return present
         if not is_nullable_ptr_type(self.state.types, optional_type): return self.load_present(optional, span, body)
         let null_value = self.typed_null_constant(optional_type, span, body)
         let present = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
@@ -3899,6 +3921,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # The payload of an optional proved present: the word read as an address
     # for the niche, the enum payload otherwise.
     pub func optional_payload(optional_type: TypeId, inner_type: TypeId, optional: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        # A present view is the value itself, reached by the same address.
+        if self.state.is_view_optional_type(optional_type): return optional
         if not is_nullable_ptr_type(self.state.types, optional_type):
             return self.load_value(inner_type, self.payload_address(optional_type, optional, span, body), span, body)
         let pointer = self.state.new_register(inner_type)
@@ -3945,6 +3969,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
             Array(element, count):
                 let element_type = try self.state.mir_type_of(module, function, span, element)
                 let address = self.checked_element_address(element_type, sequence, position, count, span, body)
+                if self.volatile_place(value): return self.load_volatile(element_type, address, span, body)
                 return self.load_value(element_type, address, span, body)
             else:
                 let collection = try self.full.lower_collection_index(self, module, function, span, hir_sequence_type, sequence, position, body)
@@ -4363,6 +4388,25 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     # Two nullable pointers are equal when their words are.
                     let same = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
                     body.append(MirInstruction(form = InstructionForm.Binary(result = same, operation = BinaryOp.eq, left = left, right = right), span = span))
+                    return same
+                if self.state.is_view_optional_type(mir_value_type):
+                    # Two optional views are equal when both words are; an
+                    # absent view is all zero, so `none` compares like a value.
+                    let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+                    let left_data = try self.load_field(mir_value_type, left, 0, span, body)
+                    let right_data = try self.load_field(mir_value_type, right, 0, span, body)
+                    let left_table = try self.load_field(mir_value_type, left, 1, span, body)
+                    let right_table = try self.load_field(mir_value_type, right, 1, span, body)
+                    let same_data = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                    body.append(MirInstruction(form = InstructionForm.Binary(result = same_data, operation = BinaryOp.eq, left = left_data, right = right_data), span = span))
+                    let same = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                    self.open_if(same_data, [same], span, body)
+                    let same_table = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                    body.append(MirInstruction(form = InstructionForm.Binary(result = same_table, operation = BinaryOp.eq, left = left_table, right = right_table), span = span))
+                    self.emit_yield(same_table, span, body)
+                    self.emit_else(span, body)
+                    self.emit_yield(self.bool_constant(false, span, body), span, body)
+                    self.emit_end(span, body)
                     return same
                 let left_present = self.load_present(left, span, body)
                 let right_present = self.load_present(right, span, body)

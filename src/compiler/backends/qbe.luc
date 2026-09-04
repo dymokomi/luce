@@ -33,7 +33,7 @@ from compiler.backends.qbe_float16 import qbe_float16_helpers
 from compiler.backends.qbe_representation import IlWriter, qbe_abi_type, qbe_aggregate_type_name, qbe_base_type, qbe_function_name, qbe_layout_rules, qbe_load_instruction, qbe_section_linkage, qbe_store_instruction
 from compiler.backends.qbe_emission_model import QbeEmissionHost
 from compiler.profiles.full.backends.qbe_emission import FullProfileQbeEmission
-from compiler.mir.canonical import AtomicOrder, BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
+from compiler.mir.canonical import AtomicOp, AtomicOrder, BinaryOp, CallingConvention, ConvertOp, FunctionId, InstructionForm, MirConstant
 from compiler.formatting.ieee import ieee_float_bits
 from compiler.mir.canonical import MirInitializer
 from compiler.wrapping import bits_of_signed
@@ -531,6 +531,7 @@ class QbeEmitter: QbeEmissionHost:
             AtomicUpdate(result, operation, value_type, address, value, order):
                 let width = self.layout.size_of(value_type)
                 var name = "__atomic_exchange_"
+                var is_extreme = false
                 match operation:
                     add: name = "__atomic_fetch_add_"
                     sub: name = "__atomic_fetch_sub_"
@@ -538,7 +539,12 @@ class QbeEmitter: QbeEmissionHost:
                     bit_and: name = "__atomic_fetch_and_"
                     bit_xor: name = "__atomic_fetch_xor_"
                     swap: name = "__atomic_exchange_"
-                self.out.line(self.reg(result) + " =" + volatile_word_class(width, is_signed_int_type(self.program.types, value_type)) + " call $" + name + str(width) + "(l " + self.reg(address) + ", " + volatile_register_class(width) + " " + self.reg(value) + ", w " + str(c_memory_order(order)) + ")")
+                    maximum: is_extreme = true
+                    minimum: is_extreme = true
+                if is_extreme:
+                    try self.emit_atomic_extreme(result, operation == AtomicOp.maximum, value_type, address, value, order)
+                else:
+                    self.out.line(self.reg(result) + " =" + volatile_word_class(width, is_signed_int_type(self.program.types, value_type)) + " call $" + name + str(width) + "(l " + self.reg(address) + ", " + volatile_register_class(width) + " " + self.reg(value) + ", w " + str(c_memory_order(order)) + ")")
             AtomicCompareExchange(exchanged, observed, value_type, address, expected, desired, success, failure, is_weak):
                 # The library reads the expectation from memory and leaves the
                 # value it observed there.
@@ -1512,6 +1518,50 @@ class QbeEmitter: QbeEmissionHost:
         let bits = self.out.temp()
         self.out.line(bits + " =w call $luce.f16.double_to_bits(d " + value + ")")
         self.out.line(destination + " =s call $luce.f16.from_bits(w " + bits + ")")
+
+    # `max`/`min` have no `__atomic_fetch_*` form: read the value, pick the
+    # extreme in the type's own signedness, and compare-exchange until the
+    # location still held what was read. The loop's temporaries are
+    # assigned in more than one block, which QBE's SSA construction admits.
+    func emit_atomic_extreme(result: RegisterId, is_max: bool, value_type: TypeId, address: RegisterId, value: RegisterId, order: AtomicOrder) -> !:
+        let width = self.layout.size_of(value_type)
+        let signed = is_signed_int_type(self.program.types, value_type)
+        let value_class = volatile_word_class(width, signed)
+        let argument_class = volatile_register_class(width)
+        var compare = "cugt"
+        if is_max and signed: compare = "csgt"
+        elif not is_max and signed: compare = "cslt"
+        elif not is_max: compare = "cult"
+        var compare_class = "w"
+        if width == 8: compare_class = "l"
+        let slot = self.out.temp()
+        let old = self.out.temp()
+        let keep = self.out.temp()
+        let replacement = self.out.temp()
+        let exchanged = self.out.temp()
+        let loop = self.out.new_label("atomic_loop")
+        let keep_old = self.out.new_label("atomic_keep")
+        let take_new = self.out.new_label("atomic_take")
+        let attempt = self.out.new_label("atomic_attempt")
+        let done = self.out.new_label("atomic_done")
+        self.out.line(slot + " =l alloc8 8")
+        self.out.line("jmp @" + loop)
+        self.label(loop)
+        self.out.line(old + " =" + value_class + " call $__atomic_load_" + str(width) + "(l " + self.reg(address) + ", w 0)")
+        self.out.line(keep + " =w " + compare + compare_class + " " + old + ", " + self.reg(value))
+        self.out.line("jnz " + keep + ", @" + keep_old + ", @" + take_new)
+        self.label(keep_old)
+        self.out.line(replacement + " =" + value_class + " copy " + old)
+        self.out.line("jmp @" + attempt)
+        self.label(take_new)
+        self.out.line(replacement + " =" + value_class + " copy " + self.reg(value))
+        self.out.line("jmp @" + attempt)
+        self.label(attempt)
+        try self.emit_store(value_type, slot, old)
+        self.out.line(exchanged + " =w call $__atomic_compare_exchange_" + str(width) + "(l " + self.reg(address) + ", l " + slot + ", " + argument_class + " " + replacement + ", w 0, w " + str(c_memory_order(order)) + ", w 0)")
+        self.out.line("jnz " + exchanged + ", @" + done + ", @" + loop)
+        self.label(done)
+        self.out.line(self.reg(result) + " =" + value_class + " copy " + old)
 
     pub func emit_load(destination: str, value_type: TypeId, address: str) -> !:
         if self.is_float16(value_type):
