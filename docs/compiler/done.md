@@ -2530,6 +2530,28 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   a global at run time. `max`/`min`, `wait`/`wake`, and `atomic.fence`
   are diagnosed as not implemented yet; fences wait for `asm`.
   Gate: 1074 compiler tests across 54 files.
+- [x] **Allocation (B3, last slice)** (2026-09-04). The standard `memory`
+  module (`src/standard/memory.lucb`, base.md §12) is Base source the
+  loader supplies beside the package: the `Allocator` interface, the
+  `exhausted` code, the thread-local `allocator` view, and `FixedBuffer`.
+  `new T(...)`, `new T`, `new T[n]`, `alloc T[n]`, and `alloc(size, align)`
+  check to one HIR `Allocate` node whose request is the interface call
+  `allocate(size, align)` on the chosen allocator, the current view or the
+  one `in` names, with the count and raw size hoisted into a prelude so
+  they are evaluated once; the lowerer branches on the answered optional,
+  stores the constructed value or zeroes the elements, and yields the
+  pointer or span, or an `Error` carrying `memory.exhausted` (§11.4) that
+  `try`/`catch` handle like any other failure. `free(x)` is the `release`
+  call on a `u8[]` view of the block; `with a:` is `WithAllocator`, which
+  saves the thread-local, stores the view, and restores it through a
+  `RestoreValue` deferred action on every exit. A `.lucb` module without
+  the `memory` module in its package, a value that is not an allocator,
+  a `new T` whose `T` has no zero value, and a `free` of a non-pointer
+  are diagnosed. The reference interpreter keeps allocated cells in a
+  heap that `Address` values reach through a heap frame; no new canonical
+  instruction was needed. `PageAllocator`, `CAllocator`, `Arena`, and the
+  §12.5 linter wait for the runtime port.
+  Gate: 1077 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

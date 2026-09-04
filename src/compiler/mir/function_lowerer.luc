@@ -563,6 +563,17 @@ pub class FunctionLowerer: FunctionLoweringHost:
                         else: pass
                 try self.lower_prologue(module, function, statements, body)
                 if value.value != no_node: try self.lower_prologue_node(module, function, value, body)
+            Allocate(prelude, request, initializer, count, zeroed, code, message):
+                # The prelude is a suite of captures, so its `let`s need slots.
+                try self.lower_prologue(module, function, prelude, body)
+                try self.lower_prologue_node(module, function, request, body)
+                if initializer.value != no_node: try self.lower_prologue_node(module, function, initializer, body)
+                if count.value != no_node: try self.lower_prologue_node(module, function, count, body)
+                try self.lower_prologue_node(module, function, code, body)
+                try self.lower_prologue_node(module, function, message, body)
+            WithAllocator(global, allocator, with_body):
+                try self.lower_prologue_node(module, function, allocator, body)
+                try self.lower_prologue(module, function, with_body, body)
             else:
                 let children = list[NodeId]()
                 node_children(self.state.program, node, children)
@@ -648,6 +659,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 let stored = try self.lower_expression(module, function, value, body)
                 let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
                 body.append(MirInstruction(form = InstructionForm.AtomicStore(value_type = value_type, address = location, value = stored, order = atomic_order_of(order)), span = span))
+            WithAllocator(global, allocator, body_statements):
+                try self.lower_with_allocator(module, function, span, global, allocator, body_statements, body)
             Binding(symbol, is_mutable, value):
                 let local = try self.state.local_of(module, function, span, symbol)
                 match node_form(self.state.program, value):
@@ -1137,6 +1150,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 Source(statement): try self.lower_statement(module, function, statement, body)
                 ErrorSource(statement):
                     if on_error: try self.lower_statement(module, function, statement, body)
+                RestoreValue(address, saved, value_type, restore_span):
+                    body.append(MirInstruction(form = InstructionForm.Memcpy(destination = address, source = saved, value_type = value_type), span = restore_span))
                 DestroyAddress(address, value_type, span): self.emit_ownership_call(value_type, address, false, span, body)
                 OwnedValue(value, value_type, span): self.emit_value_ownership(value_type, value, false, span, body)
                 else: self.full.emit_deferred_action(self.state.defers[index], body)
@@ -2089,6 +2104,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     self.emit_fallible_yield(fallback, span, body)
                 self.emit_end(span, body)
                 return FallibleResult(value = result_value, error_value = result_error)
+            Allocate(prelude, request, initializer, count, zeroed, code, message):
+                return try self.lower_allocation(module, function, expression, prelude, request, initializer, count, zeroed, code, message, body)
             InterfaceCall(receiver, interface_type, requirement, arguments):
                 if self.state.profile == Profile.base: return try self.lower_fallible_view_call(module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
                 let runtime_value = try self.full.lower_fallible_expression(self, module, function, expression, body)
@@ -3145,6 +3162,101 @@ pub class FunctionLowerer: FunctionLoweringHost:
         body.append(MirInstruction(form = InstructionForm.Trap(reason = "integer-backed enum conversion of a value that is not a declared case"), span = span))
         self.emit_end(span, body)
         return result
+
+    # mark: Allocation (Base) ===================================================================
+    #
+    # `new`/`alloc` (base.md §12.2) is a fallible expression: the request is
+    # the allocator's `allocate` call, `none` becomes the error the checker
+    # named, and the block is initialised as the node says. `with` saves the
+    # current allocator, sets it, and restores it on every exit.
+
+    func lower_allocation(module: HirModule, function: HirFunction, expression: NodeId, prelude: Operands, request: NodeId, initializer: NodeId, count: NodeId, zeroed: bool, code: NodeId, message: NodeId, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.state.program, expression)
+        for position in range(0, i64(prelude.count)):
+            try self.lower_statement(module, function, node_at(self.state.program, prelude, position), body)
+        let result_hir_type = self.state.fallible_inner(node_type(self.state.program, expression)) else trap("allocation has an infallible type")
+        let result_type = try self.state.mir_type_of(module, function, span, result_hir_type)
+        let pointer_type = builtin_mir_type(BuiltinMirType.pointer)
+        let optional_hir_type = node_type(self.state.program, request)
+        let optional_type = try self.state.mir_type_of(module, function, span, optional_hir_type)
+        var block_hir_type = optional_hir_type
+        match self.state.program.types.definitions[optional_hir_type.value].form:
+            Optional(inner): block_hir_type = inner
+            else: trap("allocation request is not optional")
+        let block_type = try self.state.mir_type_of(module, function, span, block_hir_type)
+        var element_hir_type = result_hir_type
+        match self.state.program.types.definitions[result_hir_type.value].form:
+            Pointer(pointee, is_const, is_volatile): element_hir_type = pointee
+            Span(element, is_const): element_hir_type = element
+            else: trap("allocation yields neither a pointer nor a span")
+        let element_type = try self.state.mir_type_of(module, function, span, element_hir_type)
+        let optional = try self.lower_expression(module, function, request, body)
+        let present = self.optional_present(optional_type, optional, span, body)
+        let value = self.state.new_register(self.register_type_for(result_type))
+        let error_value = self.state.new_register(pointer_type)
+        self.open_if(present, [value, error_value], span, body)
+        self.state.regions.append(Region.if_arm)
+        let block = self.optional_payload(optional_type, block_type, optional, span, body)
+        let data = self.load_value(pointer_type, self.field_address(block_type, block, 0, span, body), span, body)
+        if initializer.value != no_node:
+            let constructed = try self.lower_expression(module, function, initializer, body)
+            self.store_value(element_type, data, constructed, span, body)
+        elif zeroed:
+            if count.value == no_node:
+                body.append(MirInstruction(form = InstructionForm.Zero(address = data, value_type = element_type), span = span))
+            else:
+                # The counted loop runs in `u64`; the count is pointer-sized.
+                let index_type = builtin_mir_type(BuiltinMirType.unsigned_u64)
+                let counted = try self.lower_expression(module, function, count, body)
+                let limit = self.state.new_register(index_type)
+                body.append(MirInstruction(form = InstructionForm.Convert(result = limit, operation = ConvertOp.cast_int, operand = counted), span = span))
+                let loop = self.begin_counted_loop(self.integer_constant(index_type, 0, span, body), limit, list[RegisterId](), span, body)
+                self.exit_counted_loop_when_done(loop, list[RegisterId](), span, body)
+                body.append(MirInstruction(form = InstructionForm.Zero(address = self.element_address(element_type, data, loop.index, span, body), value_type = element_type), span = span))
+                self.end_counted_loop(loop, span, body)
+        var produced = data
+        if count.value != no_node:
+            let made = self.new_temp(result_type, span, body)
+            self.store_value(pointer_type, self.field_address(result_type, made, 0, span, body), data, span, body)
+            let length = try self.lower_expression(module, function, count, body)
+            self.store_value(pointer_int_type(self.state.types, false), self.field_address(result_type, made, 1, span, body), length, span, body)
+            produced = made
+        self.emit_fallible_yield(FallibleResult(value = produced, error_value = self.null_constant(span, body)), span, body)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_else(span, body)
+        self.state.regions.append(Region.if_arm)
+        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let code_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_code))
+        let message_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, message))
+        let failure = self.new_temp(error_type, span, body)
+        let code_value = try self.lower_expression(module, function, code, body)
+        self.store_value(code_type, self.field_address(error_type, failure, 0, span, body), code_value, span, body)
+        let message_value = try self.lower_expression(module, function, message, body)
+        self.store_value(message_type, self.field_address(error_type, failure, 1, span, body), message_value, span, body)
+        var absent = self.null_constant(span, body)
+        if count.value != no_node: absent = self.new_temp(result_type, span, body)
+        self.emit_fallible_yield(FallibleResult(value = absent, error_value = failure), span, body)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        return FallibleResult(value = value, error_value = error_value)
+
+    func lower_with_allocator(module: HirModule, function: HirFunction, span: SourceSpan, global: u32, allocator: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+        let global_hir_type = self.state.program.globals[global].value_type
+        let global_type = try self.state.mir_type_of(module, function, span, global_hir_type)
+        var view_hir_type = global_hir_type
+        match self.state.program.types.definitions[global_hir_type.value].form:
+            Optional(inner): view_hir_type = inner
+            else: trap("the current allocator is not optional")
+        let view_type = try self.state.mir_type_of(module, function, span, view_hir_type)
+        let address = self.global_address(global, span, body)
+        let saved = self.new_temp(global_type, span, body)
+        body.append(MirInstruction(form = InstructionForm.Memcpy(destination = saved, source = address, value_type = global_type), span = span))
+        let view = try self.lower_expression(module, function, allocator, body)
+        self.store_optional_tag(address, 1, span, body)
+        body.append(MirInstruction(form = InstructionForm.Memcpy(destination = self.payload_address(global_type, address, span, body), source = view, value_type = view_type), span = span))
+        let defer_start = len(self.state.defers)
+        self.state.defers.append(DeferredAction.RestoreValue(address = address, saved = saved, value_type = global_type, span = span))
+        try self.lower_scope_from(module, function, statements, defer_start, body)
 
     # mark: Interface views (Base) =============================================================
     #

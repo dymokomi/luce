@@ -17,7 +17,7 @@
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan, format_diagnostic
-from compiler.frontend.syntax import ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax, FormatPartSyntax, FunctionSyntax, IfBranchSyntax, StatementSyntax
+from compiler.frontend.syntax import AllocationShape, ExpressionForm, ArgumentSyntax, BindingPatternSyntax, ExpressionSyntax, FormatPartSyntax, FunctionSyntax, IfBranchSyntax, StatementSyntax
 from compiler.frontend.syntax import MatchStatementArmSyntax, MatchValueArmSyntax, PatternLiteralSyntax, PatternSyntax, SuiteSyntax, TypeArgumentSyntax, TypeSyntax
 from compiler.frontend.syntax import PathSyntax, TypeForm
 from compiler.layout_query import LayoutQuery
@@ -347,6 +347,10 @@ pub class HirBodyChecker: HirSemanticChecker:
     # Check one statement. Each statement family owns its detailed rules below.
     func check_statement(statement: StatementSyntax) -> list[NodeId]!:
         match statement.form:
+            FreeStatement(value, allocator):
+                return [try self.check_free(value, allocator, statement.span)]
+            WithStatement(allocator, body):
+                return [try self.check_with(allocator, body, statement.span)]
             BreakStatement(label):
                 if self.state.loop_depth == 0: try self.fail(statement.span, "`break` is only valid inside a loop")
                 return [self.state.push_statement(HirNodeForm.BreakStatement(levels = try self.loop_levels(label, "break", statement.span)), statement.span)]
@@ -956,6 +960,189 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return true
             else: return false
 
+    # mark: Allocation (Base) ===================================================================
+    #
+    # Only `new` and `alloc` allocate (base.md §12.1). Each asks the chosen
+    # allocator, the `in` expression or the current one in the standard
+    # `memory` module, for a block through the `Allocator` view, fails with
+    # `memory.exhausted` when it answers `none`, and otherwise initialises the
+    # block; `free` is the `release` call on the same allocator.
+
+    # The standard `memory` module, which every allocation needs.
+    func memory_module(span: SourceSpan) -> i64!:
+        for index in range(0, len(self.state.modules)):
+            if self.state.modules[index].name == "memory": return index
+        error(self.diagnostic(span, "`new`, `alloc`, `free`, and `with` need the standard `memory` module in the package (base.md §12)"))
+
+    func allocator_interface(memory: i64, span: SourceSpan) -> TypeId!:
+        let index = self.declarations.find_interface_in_module(memory, "Allocator")
+        if index < 0: try self.fail(span, "the `memory` module has no `Allocator` interface (base.md §12.4)")
+        return self.state.intern_interface(index, list[TypeId]())
+
+    func current_allocator_global(memory: i64, span: SourceSpan) -> i64!:
+        let index = self.state.find_global_in_module(memory, "allocator")
+        if index < 0: try self.fail(span, "the `memory` module has no `allocator` global (base.md §12.3)")
+        return index
+
+    # The `Allocator` view an `in` or `with` names: a view, a pointer to a
+    # conformer, or a `var` conformer whose address is taken here.
+    func allocator_view(expression: ExpressionSyntax, view_type: TypeId) -> NodeId!:
+        let checked = try self.check_expression(expression, none)
+        let found = self.state.type_of(checked)
+        if types_match(found, view_type): return checked
+        var source = checked
+        match self.state.types.definitions[found.value].form:
+            Pointer(pointee, is_const, is_volatile): pass
+            Interface(index, arguments): pass
+            else:
+                let parts = self.address_of_node(checked, expression.span) catch reason:
+                    error(self.not_an_allocator(found, expression.span))
+                let steps = self.state.push_run(parts.steps)
+                source = self.state.push_node(HirNodeForm.AddressOf(pointer = parts.pointer, symbol = parts.symbol, global = parts.global, steps = steps), self.state.intern_pointer(found, false, false), expression.span)
+        let converted = try self.interfaces.convert(self, source, view_type)
+        return converted else error(self.not_an_allocator(found, expression.span))
+
+    func not_an_allocator(found: TypeId, span: SourceSpan) -> str:
+        return self.diagnostic(span, "`" + self.describe_type(found) + "` is not an allocator; name a `var` that implements `Allocator`, a pointer to one, or an `Allocator` view (base.md §12.2)")
+
+    # The current allocator, or a trap when none has been set (base.md §12.3).
+    func current_allocator(memory: i64, view_type: TypeId, span: SourceSpan) -> NodeId!:
+        let global = try self.current_allocator_global(memory, span)
+        let load = self.state.push_node(HirNodeForm.GlobalLoad(global = u32(global)), self.state.globals[global].value_type, span)
+        let message = self.push_constant(Value.Text(value = "memory.unset: no allocator is current; set `memory.allocator` or use `with`"), resolve_builtin_type(BuiltinType.string), span)
+        let unset = self.state.push_node(HirNodeForm.Trap(message = message), self.never_type(), span)
+        return self.state.push_node(HirNodeForm.ElseFallback(value = load, arm = unset), view_type, span)
+
+    func chosen_allocator(memory: i64, allocator: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
+        let view_type = try self.allocator_interface(memory, span)
+        if allocator != none: return try self.allocator_view(allocator, view_type)
+        return try self.current_allocator(memory, view_type, span)
+
+    func check_allocation(shape: AllocationShape, value_type: TypeSyntax?, count: ExpressionSyntax?, arguments: list[ArgumentSyntax], size: ExpressionSyntax?, alignment: ExpressionSyntax?, allocator: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let memory = try self.memory_module(span)
+        let view = try self.chosen_allocator(memory, allocator, span)
+        let usize_type = resolve_builtin_type(BuiltinType.unsigned_usize)
+        var element = resolve_builtin_type(BuiltinType.unsigned_u8)
+        if value_type != none: element = try self.declarations.resolve_type(self.state.current_module, value_type)
+        var size_node = NodeId(value = no_node)
+        var alignment_node = NodeId(value = no_node)
+        var count_node = NodeId(value = no_node)
+        var initializer = NodeId(value = no_node)
+        var zeroed = false
+        var result = self.state.intern_pointer(element, false, false)
+        # A span's count is evaluated once, into a hidden binding, because
+        # both the request's size and the resulting span read it.
+        let prelude = list[NodeId]()
+        match shape:
+            raw:
+                let raw_size = size else trap("raw allocation has no size")
+                let raw_alignment = alignment else trap("raw allocation has no alignment")
+                size_node = try self.capture_defer_value(try self.check_expression(raw_size, usize_type), prelude)
+                alignment_node = try self.check_expression(raw_alignment, usize_type)
+                count_node = size_node
+                result = self.state.intern_span(element, false)
+            zeroed_span:
+                count_node = try self.capture_defer_value(try self.check_expression(count else trap("span allocation has no count"), usize_type), prelude)
+                size_node = try self.element_bytes(element, count_node, span)
+                alignment_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.align, subject = element, field = -1), usize_type, span)
+                zeroed = true
+                result = self.state.intern_span(element, false)
+            uninitialised_span:
+                count_node = try self.capture_defer_value(try self.check_expression(count else trap("span allocation has no count"), usize_type), prelude)
+                size_node = try self.element_bytes(element, count_node, span)
+                alignment_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.align, subject = element, field = -1), usize_type, span)
+                result = self.state.intern_span(element, false)
+            zeroed_value:
+                let blocker = self.zero_blocker(element)
+                if blocker != none:
+                    try self.fail(span, "`new " + self.describe_type(element) + "` needs a zero value, and `" + self.describe_type(element) + "` holds `" + self.describe_type(blocker) + "`; construct it instead (base.md §6.1, §12.2)")
+                size_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.size, subject = element, field = -1), usize_type, span)
+                alignment_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.align, subject = element, field = -1), usize_type, span)
+                zeroed = true
+            constructed:
+                let syntax = value_type else trap("constructed allocation has no type")
+                initializer = try self.check_allocation_construction(syntax, arguments, element, span)
+                size_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.size, subject = element, field = -1), usize_type, span)
+                alignment_node = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.align, subject = element, field = -1), usize_type, span)
+        let block_type = self.state.intern_optional(self.state.intern_span(resolve_builtin_type(BuiltinType.unsigned_u8), false))
+        let request = self.state.push_node(HirNodeForm.InterfaceCall(
+            receiver = view,
+            interface_type = try self.allocator_interface(memory, span),
+            requirement = 0,
+            arguments = self.state.push_run([0, size_node.value, 1, alignment_node.value]),
+        ), block_type, span)
+        let code = try self.exhausted_code(memory, span)
+        let message = self.push_constant(Value.Text(value = "memory exhausted"), self.error_text_type(), span)
+        let node = self.state.push_node(HirNodeForm.Allocate(prelude = self.state.push_nodes(prelude), request = request, initializer = initializer, count = count_node, zeroed = zeroed, code = code, message = message), self.state.intern_fallible(result), span)
+        return try self.require_type(node, expected)
+
+    # `count * sizeof(T)` as a `usize`.
+    func element_bytes(element: TypeId, count: NodeId, span: SourceSpan) -> NodeId!:
+        let usize_type = resolve_builtin_type(BuiltinType.unsigned_usize)
+        let each = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.size, subject = element, field = -1), usize_type, span)
+        return self.state.push_node(HirNodeForm.Binary(left = count, operation = BinaryOperation.Multiply(operand_type = usize_type), right = each), usize_type, span)
+
+    # `new Node(...)` and `new Expr.number(...)`: the construction the type's
+    # spelling names, checked as the call it is.
+    func check_allocation_construction(syntax: TypeSyntax, arguments: list[ArgumentSyntax], element: TypeId, span: SourceSpan) -> NodeId!:
+        match syntax.form:
+            Named(path):
+                var callee = ExpressionSyntax(form = ExpressionForm.Name(value = path.parts[0]), span = syntax.span)
+                if len(path.parts) == 2:
+                    callee = ExpressionSyntax(form = ExpressionForm.Member(value = callee, name = path.parts[1]), span = syntax.span)
+                elif len(path.parts) != 1: try self.fail(span, "`new` constructs a struct or an enum case (base.md §12.2)")
+                return try self.check_call(callee, list[TypeArgumentSyntax](), arguments, span, element)
+            else: error(self.diagnostic(span, "`new` constructs a struct or an enum case; `new T[count]` allocates a span (base.md §12.2)"))
+
+    func exhausted_code(memory: i64, span: SourceSpan) -> NodeId!:
+        let index = self.state.find_constant_in_module(memory, "exhausted")
+        if index < 0: try self.fail(span, "the `memory` module has no `exhausted` error code (base.md §12.2)")
+        return self.state.push_node(HirNodeForm.Reference(symbol = self.state.constants[index].symbol), resolve_builtin_type(BuiltinType.error_code), span)
+
+    # `free(x)`: `release` of the block `x` names, on the chosen allocator.
+    func check_free(value: ExpressionSyntax, allocator: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
+        if not self.in_base_module(): try self.fail(span, "`free` belongs to Luce Base; a `.luc` module has no allocators (base.md §12.2)")
+        let memory = try self.memory_module(span)
+        let view = try self.chosen_allocator(memory, allocator, span)
+        let checked = try self.check_expression(value, none)
+        let found = self.state.type_of(checked)
+        let usize_type = resolve_builtin_type(BuiltinType.unsigned_usize)
+        let byte_pointer = self.state.intern_pointer(resolve_builtin_type(BuiltinType.unsigned_u8), false, false)
+        var block = checked
+        match self.state.types.definitions[found.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                let raw_pointer = self.state.push_node(HirNodeForm.Cast(value = checked), byte_pointer, span)
+                let length = self.state.push_node(HirNodeForm.LayoutConstant(query = LayoutQuery.size, subject = pointee, field = -1), usize_type, span)
+                block = self.state.push_node(HirNodeForm.SpanFromParts(pointer = raw_pointer, length = length), self.state.intern_span(resolve_builtin_type(BuiltinType.unsigned_u8), false), span)
+            Span(element, is_const):
+                if not types_match(element, resolve_builtin_type(BuiltinType.unsigned_u8)):
+                    let data = self.state.push_node(HirNodeForm.SpanData(span = checked), self.state.intern_pointer(element, false, false), span)
+                    let raw_pointer = self.state.push_node(HirNodeForm.Cast(value = data), byte_pointer, span)
+                    let count = self.state.push_node(HirNodeForm.SpanLength(span = checked), usize_type, span)
+                    let length = try self.element_bytes(element, count, span)
+                    block = self.state.push_node(HirNodeForm.SpanFromParts(pointer = raw_pointer, length = length), self.state.intern_span(resolve_builtin_type(BuiltinType.unsigned_u8), false), span)
+            else: try self.fail(span, "`free` takes a `T*`, a `T[]`, or a `u8[]`, found `" + self.describe_type(found) + "` (base.md §12.2)")
+        let release = self.state.push_node(HirNodeForm.InterfaceCall(
+            receiver = view,
+            interface_type = try self.allocator_interface(memory, span),
+            requirement = 2,
+            arguments = self.state.push_run([0, block.value]),
+        ), resolve_builtin_type(BuiltinType.unit), span)
+        return self.state.push_statement(HirNodeForm.ExpressionStatement(value = release), span)
+
+    # `with allocator:` makes the view current for the suite (base.md §12.3).
+    func check_with(allocator: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
+        if not self.in_base_module(): try self.fail(span, "`with` belongs to Luce Base; a `.luc` module has no allocators (base.md §12.3)")
+        let memory = try self.memory_module(span)
+        let view = try self.allocator_view(allocator, try self.allocator_interface(memory, span))
+        let global = try self.current_allocator_global(memory, span)
+        let outer_count = len(self.state.locals)
+        let statements = self.check_suite(body.statements) catch reason:
+            while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+            error(reason)
+        while len(self.state.locals) > outer_count: self.state.locals.remove(len(self.state.locals) - 1)
+        return self.state.push_statement(HirNodeForm.WithAllocator(global = u32(global), allocator = view, body = self.state.push_nodes(statements)), span)
+
     # mark: Atomics (Base) ======================================================================
     #
     # An `@T` is a location whose every access is one atomic instruction
@@ -1341,8 +1528,10 @@ pub class HirBodyChecker: HirSemanticChecker:
             MatchValue(subject, arms):
                 return try self.check_match_value(subject, arms, value.span, expected)
             NewValue(value_type, arguments):
-                try self.reject_in_base(value.span, "`new` of a class", "has no classes; Base `new` allocates from an allocator and lands with B3")
+                try self.reject_in_base(value.span, "`new` of a class", "has no classes; Base `new` allocates from an allocator (base.md §12.2)")
                 return try self.full.check_class_new(self, value_type, arguments, value.span, expected)
+            Allocate(shape, value_type, count, arguments, size, alignment, allocator):
+                return try self.check_allocation(shape, value_type, count, arguments, size, alignment, allocator, value.span, expected)
             SpawnValue(function, arguments):
                 try self.reject_in_base(value.span, "`spawn`", "has no workers; threads are the `thread` module (base.md §15.3)")
                 return try self.full.check_spawn(self, function, arguments, value.span, expected)

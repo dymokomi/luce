@@ -186,6 +186,9 @@ let frame_limit: i64 = 2000
 # Mirror canonical MIR's zero-filled global storage as semantic values.
 # HirGenerator has already rejected types for which zero would forge an
 # address, callable, foreign handle, failure effect, or `never` value.
+## The frame number of the reference interpreter's allocation cells.
+let heap_frame: i64 = -2
+
 # mark: Byte images ============================================================================
 
 func zero_image(size: i64) -> list[u8]:
@@ -318,6 +321,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     # Program data the Base text views point into: one byte array per
     # literal, addressed as frame -1 (base.md §5.5).
     let literal_data: list[Value]
+    ## Storage `new` and `alloc` hand out (base.md §12.2): each cell is one
+    ## value or one array, addressed as frame `heap_frame`.
+    let heap: list[Value]
     # Layout questions are answered with the compiled backends' own type
     # lowering and layout algorithm under `rules`; both are created on the
     # first question, since most programs ask none.
@@ -348,6 +354,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         self.lowering = none
         self.frames = list[list[Binding]]()
         self.literal_data = list[Value]()
+        self.heap = list[Value]()
 
     ## Host ARC reaches this callback exactly when an interpreted class loses
     ## its final strong reference. Source `deinit` runs before payload fields;
@@ -483,6 +490,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             else: trap("span base is not an address")
 
     func root_of(frame: i64, symbol: SymbolId, global: i64) -> Value!:
+        if frame == heap_frame: return self.heap[global]
         if frame < 0: return self.literal_data[global]
         if global >= 0: return self.globals[global]
         if frame < 0 or frame >= len(self.frames): error("interpreter: trap: a pointer outlived the frame that owned its place")
@@ -506,6 +514,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         var updated = try self.replaced_at(root, path, 0, stored)
         let owner_type = self.root_type(frame, symbol, global)
         if owner_type != none: updated = try self.refresh_unions(owner_type, path, 0, updated)
+        if frame == heap_frame:
+            self.heap[global] = updated
+            return
         if global >= 0:
             self.globals[global] = updated
             return
@@ -848,6 +859,69 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 let text = strings.from_bytes(try self.view_bytes(SpanView(base = base, length = length))) else error("interpreter: trap: a text view holds invalid UTF-8")
                 return Value.Text(value = text)
             else: return value
+
+    # `new`/`alloc` (base.md §12.2): the allocator is asked, so its state and
+    # its refusal are real, but the block it answers is not where the value
+    # lives: the reference interpreter keeps each allocation in its own cell,
+    # since its memory is values, not bytes.
+    func evaluate_allocation(expression: NodeId, prelude: Operands, request: NodeId, initializer: NodeId, count: NodeId, zeroed: bool, code: NodeId, message: NodeId, bindings: list[Binding]) -> Evaluation!:
+        let element = self.allocated_element_type(node_type(self.program, expression))
+        for position in range(0, i64(prelude.count)):
+            match try self.execute(node_at(self.program, prelude, position), bindings):
+                Next: pass
+                else: trap("an allocation prelude transferred control")
+        var answered = Value.Unit
+        match try self.evaluate(request, bindings):
+            Evaluated(item): answered = item
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+        match answered:
+            Absent:
+                var code_value = Value.Unit
+                match try self.evaluate(code, bindings):
+                    Evaluated(item): code_value = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                match try self.evaluate(message, bindings):
+                    Evaluated(item):
+                        let failure = Value.Record(fields = [BoxedValue(value = code_value), BoxedValue(value = item)])
+                        return Evaluation.Evaluated(value = Value.FallibleFailure(error_value = BoxedValue(value = failure)))
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            else: pass
+        let cell = len(self.heap)
+        let place = Value.Address(frame = heap_frame, symbol = SymbolId(value = no_node), global = cell, path = list[i64]())
+        if count.value == no_node:
+            var stored = Value.Unit
+            if initializer.value != no_node:
+                match try self.evaluate(initializer, bindings):
+                    Evaluated(item): stored = item
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+            else: stored = zero_hir_value(self.program, element)
+            self.heap.append(stored)
+            return Evaluation.Evaluated(value = Value.FallibleSuccess(value = BoxedValue(value = place)))
+        var length = 0
+        match try self.evaluate(count, bindings):
+            Evaluated(item):
+                match item:
+                    UnsignedInteger(value): length = i64(value)
+                    SignedInteger(value): length = value
+                    else: trap("allocation count is not an integer")
+            Transferred(execution): return Evaluation.Transferred(execution = execution)
+        let elements = list[BoxedValue]()
+        for index in range(0, length): elements.append(BoxedValue(value = zero_hir_value(self.program, element)))
+        self.heap.append(Value.Array(elements = elements))
+        # A span's base names an element, as one formed from an array does.
+        let first = Value.Address(frame = heap_frame, symbol = SymbolId(value = no_node), global = cell, path = [0])
+        return Evaluation.Evaluated(value = Value.FallibleSuccess(value = BoxedValue(value = Value.Span(base = BoxedValue(value = first), length = length))))
+
+    # The element an allocation's `T*!` or `T[]!` result holds.
+    func allocated_element_type(fallible_type: TypeId) -> TypeId:
+        var result = fallible_type
+        match self.program.types.definitions[fallible_type.value].form:
+            Fallible(inner): result = inner
+            else: pass
+        match self.program.types.definitions[result.value].form:
+            Pointer(pointee, is_const, is_volatile): return pointee
+            Span(element, is_const): return element
+            else: trap("allocation yields neither a pointer nor a span")
 
     # A Base global starts at the constant its initialiser names (base.md
     # §6.3); every other global stays at its structural zero.
@@ -1530,6 +1604,20 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Transferred(execution): return execution
             DeferStatement(action): trap("defer marker executed outside its lexical scope")
             ErrorDeferStatement(action): trap("errdefer marker executed outside its lexical scope")
+            WithAllocator(global, allocator, body):
+                # The view is current for the suite and the previous value
+                # returns on every exit (base.md §12.3).
+                var view = Value.Unit
+                match try self.evaluate(allocator, bindings):
+                    Evaluated(item): view = item
+                    Transferred(execution): return execution
+                let saved = self.globals[global]
+                self.globals[global] = Value.Present(value = BoxedValue(value = view))
+                let outcome = self.execute_scope(body, bindings) catch reason:
+                    self.globals[global] = saved
+                    error(reason)
+                self.globals[global] = saved
+                return outcome
             AtomicStore(address, value, order):
                 let target = try self.evaluate_address(address, bindings)
                 match try self.evaluate(value, bindings):
@@ -1978,6 +2066,8 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                         let destination = integer_enum_representation(self.program, node_type(self.program, expression)) else node_type(self.program, expression)
                         return Evaluation.Evaluated(value = cast_numeric_value(item, destination, self.program.types))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
+            Allocate(prelude, request, initializer, count, zeroed, code, message):
+                return try self.evaluate_allocation(expression, prelude, request, initializer, count, zeroed, code, message, bindings)
             AtomicLoad(address, order):
                 let target = try self.evaluate_address(address, bindings)
                 return Evaluation.Evaluated(value = try self.read_address(target.frame, target.symbol, target.global, target.path))
