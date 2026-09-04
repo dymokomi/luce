@@ -11,7 +11,7 @@ test_dir=$(mktemp -d "${TMPDIR:-/tmp}/luce-native.XXXXXX")
 trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 
 "$luce" build src/luce.luc -o "$test_dir/luce"
-runtime_source=src/runtime/allocator.native.luc
+runtime_source=src/runtime/allocator.lucn
 runtime_root=src/runtime
 "$test_dir/luce" build --package org.luce.tests --root examples --target native --runtime-root "$runtime_root" --runtime "$runtime_source" "$test_dir/hello" examples/hello.luc
 

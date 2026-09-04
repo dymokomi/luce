@@ -45,14 +45,14 @@ Features backed by the reviewed Luce runtime pass its source explicitly; the
 compiler owns the sealed service manifest, so callers provide locations only:
 
 ```sh
-./build/luce build --package org.luce.examples --root examples --runtime-root src/runtime --runtime src/runtime/allocator.native.luc build/strings.wasm examples/strings.luc
+./build/luce build --package org.luce.examples --root examples --runtime-root src/runtime --runtime src/runtime/allocator.lucn build/strings.wasm examples/strings.luc
 ```
 
 Native output uses the pinned QBE toolchain for the current host:
 
 ```sh
 ./build/luce build --package org.luce.examples --root examples --target native \
-  --runtime-root src/runtime --runtime src/runtime/allocator.native.luc \
+  --runtime-root src/runtime --runtime src/runtime/allocator.lucn \
   build/hello examples/hello.luc
 ./build/hello
 ```

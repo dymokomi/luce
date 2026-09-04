@@ -18,7 +18,7 @@ trap 'rm -rf -- "$test_dir"' EXIT HUP INT TERM
 
 "$luce" build src/luce.luc -o "$test_dir/luce"
 cli=$test_dir/luce
-runtime_source=src/runtime/allocator.native.luc
+runtime_source=src/runtime/allocator.lucn
 runtime_root=src/runtime
 
 # expect STATUS EXPECTED_OUTPUT COMMAND...

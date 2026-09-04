@@ -141,6 +141,10 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
   in collections and class fields, and named/`self` weak captures through both
   semantic oracles, Wasm, and native QBE. Default mutable capture also emits
   the non-fatal structured shared-cell advisory through check, run, and build.
+- `base/hello.lucb` is the first Luce Base module: the scalar and struct subset
+  both profiles share, in a `.lucb` file. It checks, runs through the
+  reference interpreter, and lowers to a freestanding program; the Base
+  process entry arrives with spans (plan.md §5.1, B2).
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the
@@ -188,7 +192,7 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `assertions.luc` proves effect-free conditions, the optional default and
   eager dynamic assertion messages, unit-valued successful continuation,
   captured QBE/Wasm failure diagnostics, and skipped deferred cleanup.
-- `native_interop.native.luc` checks and executes raw `extern` types,
+- `native_interop.lucn` checks and executes raw `extern` types,
   anonymous `foreign` data pointers, borrowed dense lists, functions, output
   parameters, variables, and ordinary value-shaped extern structs. Its
   `clock_gettime`, zero-length `writev`, and list-backed `memcmp` calls cross

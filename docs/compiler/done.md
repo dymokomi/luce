@@ -21,7 +21,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
 | WebAssembly backend (`backends/wasm.luc`, `wasm_plan.luc`, `wasm_encoding.luc`, `wasm_float16.luc`; `profiles/full/backends/wasm_emission.luc`, `wasm_planning.luc`) | Supporting regression backend for the current lowerer surface, with spec arithmetic, backend-local binary16/legalized layout, calls/interfaces, WASI preview 1, C imports/globals, managed values, and immutable snapshots. It explicitly rejects isolated tasks at the backend boundary because WASI preview 1 has no worker-domain primitive. It is not the stage-1 portability boundary. |
 | QBE backend (`backends/qbe.luc`, `qbe_representation.luc`, `qbe_toolchain.luc`; `profiles/full/backends/qbe_emission.luc`, `qbe_tasks.luc`, `qbe_task_support.luc`) | The required stage-1 portability and artifact oracle: direct canonical-MIR → QBE 1.3 IL with one shared native representation module, backend-owned layout/ABI, the compiled Luce runtime, C symbols, and process-isolated workers. Typed codecs copy only verified sendable graphs through framed pipes; cached waits, nested workers, cancellation, traps, failures, group cleanup, and ordered `wait_all` execute through real native artifacts. The product path atomically installs only the linked executable. |
 | FIIR/C import (`fiir/`, `backends/clang_fiir.luc`, `backends/c_fiir.luc`) | Clang-derived, versioned facts generate target-neutral raw Luce plus checked C adapters for fundamental scalars, scalar typedefs, open enums, scalar constants/macros, live scalar/enum objects, logical nested records, and direct typedef-backed opaque-record handles. A separate reviewed recipe section generates ordinary safe Luce owners, checked borrows, returned-borrow anchors, and status failures. Both layers have semantic-oracle and linked QBE/C proofs. **Not yet**: broader pointer/array/string/callback forms, unions/bit-fields, aggregate/atomic/thread-local storage, typed variadics, extended floating carriers, and support/regeneration policy. |
-| Tests | 976 unit tests across 47 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
+| Tests | 986 unit tests across 49 files, plus CLI, `wasmtime`, QBE differential, and host-native smoke gates. `tests/compiler/differential_test.luc` runs the complete non-trapping and trapping corpus through HIR, optimized MIR, and the QBE product toolchain and checks values, output, and traps. |
 | Toolchain | Stage-0 0.30 and official QBE 1.3 source are checksum-pinned in `bootstrap.sh`. Remaining constraints are in `plan.md` §8. |
 
 ## 2. Implemented milestones and evidence
@@ -2152,6 +2152,24 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   was recorded in `stage0-0.30.md`: a test module named exactly after the
   source module it tests (`compiler.profile_test`) fails three assertions
   under 0.30, so the profile test is `language_profile_test.luc`.
+
+- [x] **The Base module kind: `.lucb` selects the profile, `.lucn` is the
+  audited tier (B1, first slice)** (2026-09-03). `ModuleAuthority` gained
+  `base`; the suffix table is `.luc`, `.lucn`, `.lucb`, derived in one place
+  (`source_modules.authority_for_path`) and encoded in typed packages. The
+  runtime allocator and the native interop example carry the `.lucn` name.
+  A Base module imports only Base modules (base.md §16.2), and every
+  runtime-backed spelling it could make is refused at its dispatch point with
+  a diagnostic naming the construct and the tier: `class` declarations, the
+  collection type names and literals, `list`/`map`/`set`/`Weak`/`wait_all`
+  heads, `new`, `spawn`, block closures, and lambdas that capture; the shared
+  scalar, struct, enum, and capture-free lambda subset checks unchanged in
+  both profiles. After lowering, a package whose modules are all `.lucb` is
+  checked freestanding: no function may hold a value whose canonical type
+  only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
+  over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
+  HIR oracle, and builds a freestanding Wasm library through the pipeline.
+  Gate: 986 compiler tests across 49 files.
 
 ## 3. Bugs the multi-backend harness found
 

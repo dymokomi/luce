@@ -60,8 +60,8 @@ expect 2 "build: --c-header may be supplied once" "$cli" build --package org.luc
 expect 2 "bind: expected \`--name NAME --fiir PATH --raw PATH --adapter PATH\`" "$cli" bind
 expect 2 "bind: --name may be supplied once" "$cli" bind --name first --name second
 expect 2 "bind: --macro-constant expects a C macro name" "$cli" bind --macro-constant
-expect 2 "bind: --safe requires --recipe PATH" "$cli" bind --name temperature --fiir f.json --raw r.native.luc --adapter a.c --safe s.luc examples/c_import/temperature.h
-expect 2 "bind: --recipe requires --safe PATH" "$cli" bind --name temperature --fiir f.json --raw r.native.luc --adapter a.c --recipe examples/c_import/temperature.recipe.toml examples/c_import/temperature.h
+expect 2 "bind: --safe requires --recipe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --safe s.luc examples/c_import/temperature.h
+expect 2 "bind: --recipe requires --safe PATH" "$cli" bind --name temperature --fiir f.json --raw r.lucn --adapter a.c --recipe examples/c_import/temperature.recipe.toml examples/c_import/temperature.h
 
 expect 0 "checked 1 file(s)" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/main.luc"
 expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" check --package org.luce.tests --root "$test_dir" "$test_dir/shared.luc"
@@ -78,23 +78,23 @@ expect 1 "module \`main\` has no function \`nope\`" "$cli" run --package org.luc
 expect 1 "unknown module \`other\`" "$cli" run --package org.luce.tests --root "$test_dir" other.main "$test_dir/main.luc"
 
 expect 0 "built $test_dir/out.wasm" "$cli" build --package org.luce.tests --root examples/compiled_core "$test_dir/out.wasm" examples/compiled_core/main.luc
-expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/generic.wasm" examples/generic_functions.luc
-expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --root examples --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/strings.wasm" examples/strings.luc
-expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/shared.wasm" "$test_dir/shared.luc"
+expect 0 "artifact: eliminated before backend emission" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic.wasm" examples/generic_functions.luc
+expect 0 "built $test_dir/strings.wasm" "$cli" build --package org.luce.tests --root examples --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/strings.wasm" examples/strings.luc
+expect 0 "warning[L1401]: mutable binding \`count\` is shared with this closure" "$cli" build --package org.luce.tests --root "$test_dir" --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/shared.wasm" "$test_dir/shared.luc"
 expect 1 "executable: needs one public \`main\`" "$cli" build --package org.luce.tests --root examples/compiled_core --target native "$test_dir/out" examples/compiled_core/main.luc
 
-expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/native" examples/hello.luc
+expect 0 "built $test_dir/native" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/native" examples/hello.luc
 native_output=$("$test_dir/native")
 if [ "$native_output" != "Hello, world!" ]; then
     echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
     exit 1
 fi
-expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/generic-native" examples/generic_functions.luc
+expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic-native" examples/generic_functions.luc
 expect 1 "C header and ABI report outputs require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-header "$test_dir/api.h" "$test_dir/api.wasm" "$test_dir/c_api.luc"
 expect 1 "C sources and arguments require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-source examples/c_import/temperature.c "$test_dir/api.wasm" "$test_dir/c_api.luc"
 expect 1 "C header output must differ from the primary artifact" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/collision" "$test_dir/collision" "$test_dir/c_api.luc"
 expect 1 "C source must differ from the C header output" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/source.c" --c-source "$test_dir/source.c" "$test_dir/collision" "$test_dir/c_api.luc"
-expect 0 "built $test_dir/c-api-native" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/api.h" --abi-report "$test_dir/api.abi.json" --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/c-api-native" "$test_dir/c_api.luc"
+expect 0 "built $test_dir/c-api-native" "$cli" build --package org.luce.tests --root "$test_dir" --target native --c-header "$test_dir/api.h" --abi-report "$test_dir/api.abi.json" --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/c-api-native" "$test_dir/c_api.luc"
 grep -q 'typedef struct Pair Pair;' "$test_dir/api.h"
 grep -q '#define Status_done ((Status)(INT64_C(42)))' "$test_dir/api.h"
 grep -q 'Status luce_pair(Pair value);' "$test_dir/api.h"
@@ -106,7 +106,7 @@ mkdir "$test_dir/temperature"
 expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --name temperature \
     --fiir "$test_dir/temperature.fiir.json" \
-    --raw "$test_dir/temperature/raw.native.luc" \
+    --raw "$test_dir/temperature/raw.lucn" \
     --adapter "$test_dir/temperature.adapter.c" \
     --recipe examples/c_import/temperature.recipe.toml \
     --safe "$test_dir/temperature/safe.luc" \
@@ -132,64 +132,64 @@ grep -q '"kind": "owned"' "$test_dir/temperature.fiir.json"
 grep -q '"kind": "borrowed"' "$test_dir/temperature.fiir.json"
 grep -q '"kind": "status"' "$test_dir/temperature.fiir.json"
 grep -q '"source": "macro"' "$test_dir/temperature.fiir.json"
-grep -q '## Selected C macro constants: LUCE_TEMPERATURE_ABSOLUTE_ZERO LUCE_TEMPERATURE_SENSOR_LIMIT LUCE_TEMPERATURE_MACRO_ENABLED LUCE_TEMPERATURE_MACRO_HALF_STEP LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY LUCE_TEMPERATURE_MACRO_UNDEFINED LUCE_TEMPERATURE_MACRO_OPEN_SCALE' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub struct luce_half_value:' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_adjust_half(value: luce_half_value, delta: luce_half_value) -> luce_half_value' "$test_dir/temperature/raw.native.luc"
-grep -q 'extern func luce_fiir_temperature_luce_adjust_half(value: f32, delta: f32) -> f32' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_adjust_celsius(celsius: c.int, delta: c.int) -> c.int' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub struct luce_degrees:' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_echo_degrees(celsius: luce_degrees) -> luce_degrees' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub struct luce_temperature_scale:' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_SCALE_CELSIUS: luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_WATER_BOILING_CELSIUS: c.integer_constant = c.integer_constant(false, 100u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_DEFAULT_SCALE: luce_temperature_scale = luce_temperature_scale(true, 2u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_OPEN_SCALE: luce_temperature_scale = luce_temperature_scale(false, 7u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_SIGNED_MINIMUM: c.integer_constant = c.integer_constant(true, 9223372036854775808u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_UNSIGNED_MAXIMUM: c.integer_constant = c.integer_constant(false, 18446744073709551615u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_DEFAULT_ENABLED: c.boolean = c.boolean(true)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_HALF_STEP: c.float16 = c.float16(0.5f16)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_NEGATIVE_ZERO: c.float = c.float(-0.0f32)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_REFERENCE_RATIO: c.double = c.double(1.5f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_POSITIVE_INFINITY: c.double = c.double(math.positive_infinity_f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_ABSOLUTE_ZERO: c.integer_constant = c.integer_constant(true, 273u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_SENSOR_LIMIT: c.integer_constant = c.integer_constant(false, 4095u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_ENABLED: c.boolean = c.boolean(true)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_HALF_STEP: c.float16 = c.float16(0.25f16)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO: c.float = c.float(-0.0f32)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO: c.double = c.double(1.25f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY: c.double = c.double(math.positive_infinity_f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub let LUCE_TEMPERATURE_MACRO_OPEN_SCALE: luce_temperature_scale = luce_temperature_scale(false, 7u64)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func read_luce_temperature_offset() -> luce_degrees' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func write_luce_temperature_offset(value: luce_degrees)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func read_luce_temperature_sensor_capacity() -> c.unsigned_long_long' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func write_luce_temperature_enabled(value: c.boolean)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func write_luce_temperature_ratio(value: c.double)' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func read_luce_temperature_unit() -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func write_luce_temperature_unit(value: luce_temperature_scale)' "$test_dir/temperature/raw.native.luc"
+grep -q '## Selected C macro constants: LUCE_TEMPERATURE_ABSOLUTE_ZERO LUCE_TEMPERATURE_SENSOR_LIMIT LUCE_TEMPERATURE_MACRO_ENABLED LUCE_TEMPERATURE_MACRO_HALF_STEP LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY LUCE_TEMPERATURE_MACRO_UNDEFINED LUCE_TEMPERATURE_MACRO_OPEN_SCALE' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_celsius_to_fahrenheit(celsius: c.double) -> c.double' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_half_celsius(celsius: c.float) -> c.float' "$test_dir/temperature/raw.lucn"
+grep -q 'pub struct luce_half_value:' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_adjust_half(value: luce_half_value, delta: luce_half_value) -> luce_half_value' "$test_dir/temperature/raw.lucn"
+grep -q 'extern func luce_fiir_temperature_luce_adjust_half(value: f32, delta: f32) -> f32' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_adjust_celsius(celsius: c.int, delta: c.int) -> c.int' "$test_dir/temperature/raw.lucn"
+grep -q 'pub struct luce_degrees:' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_echo_degrees(celsius: luce_degrees) -> luce_degrees' "$test_dir/temperature/raw.lucn"
+grep -q 'pub struct luce_temperature_scale:' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_SCALE_CELSIUS: luce_temperature_scale' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_WATER_BOILING_CELSIUS: c.integer_constant = c.integer_constant(false, 100u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_DEFAULT_SCALE: luce_temperature_scale = luce_temperature_scale(true, 2u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_OPEN_SCALE: luce_temperature_scale = luce_temperature_scale(false, 7u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_SIGNED_MINIMUM: c.integer_constant = c.integer_constant(true, 9223372036854775808u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_UNSIGNED_MAXIMUM: c.integer_constant = c.integer_constant(false, 18446744073709551615u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_DEFAULT_ENABLED: c.boolean = c.boolean(true)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_HALF_STEP: c.float16 = c.float16(0.5f16)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_NEGATIVE_ZERO: c.float = c.float(-0.0f32)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_REFERENCE_RATIO: c.double = c.double(1.5f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_POSITIVE_INFINITY: c.double = c.double(math.positive_infinity_f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_ABSOLUTE_ZERO: c.integer_constant = c.integer_constant(true, 273u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_SENSOR_LIMIT: c.integer_constant = c.integer_constant(false, 4095u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_ENABLED: c.boolean = c.boolean(true)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_HALF_STEP: c.float16 = c.float16(0.25f16)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_NEGATIVE_ZERO: c.float = c.float(-0.0f32)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_REFERENCE_RATIO: c.double = c.double(1.25f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_POSITIVE_INFINITY: c.double = c.double(math.positive_infinity_f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_UNDEFINED: c.double = c.double(math.nan_f64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub let LUCE_TEMPERATURE_MACRO_OPEN_SCALE: luce_temperature_scale = luce_temperature_scale(false, 7u64)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func read_luce_temperature_offset() -> luce_degrees' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func write_luce_temperature_offset(value: luce_degrees)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func read_luce_temperature_sensor_capacity() -> c.unsigned_long_long' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func write_luce_temperature_enabled(value: c.boolean)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func write_luce_temperature_ratio(value: c.double)' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func read_luce_temperature_unit() -> luce_temperature_scale' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func write_luce_temperature_unit(value: luce_temperature_scale)' "$test_dir/temperature/raw.lucn"
 grep -q '"objects": \[' "$test_dir/temperature.fiir.json"
 grep -q '"name": "luce_temperature_offset"' "$test_dir/temperature.fiir.json"
 grep -q '"access": "read_only"' "$test_dir/temperature.fiir.json"
 grep -q '"volatile": true' "$test_dir/temperature.fiir.json"
-if grep -q 'write_luce_temperature_sensor_capacity' "$test_dir/temperature/raw.native.luc"; then
+if grep -q 'write_luce_temperature_sensor_capacity' "$test_dir/temperature/raw.lucn"; then
     echo "read-only external C object unexpectedly has a writer" >&2
     exit 1
 fi
-grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub struct luce_temperature_range:' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub struct luce_temperature_reading:' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_shift_range(value: luce_temperature_range, delta: c.double) -> luce_temperature_range' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_shift_reading(value: luce_temperature_reading, delta: luce_degrees) -> luce_temperature_reading' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub extern type luce_temperature_sensor' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_temperature_sensor_open(value: luce_degrees) -> luce_temperature_sensor' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_temperature_sensor_find(value: luce_degrees) -> luce_temperature_sensor?' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_temperature_sensor_value(sensor: luce_temperature_sensor) -> luce_degrees' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_temperature_sensor_echo(sensor: luce_temperature_sensor) -> luce_temperature_sensor?' "$test_dir/temperature/raw.native.luc"
-grep -q 'pub func luce_temperature_sensor_close(sensor: luce_temperature_sensor)' "$test_dir/temperature/raw.native.luc"
+grep -q 'pub func luce_echo_scale(scale: luce_temperature_scale) -> luce_temperature_scale' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_is_freezing(enabled: c.boolean, celsius: c.double) -> c.boolean' "$test_dir/temperature/raw.lucn"
+grep -q 'pub struct luce_temperature_range:' "$test_dir/temperature/raw.lucn"
+grep -q 'pub struct luce_temperature_reading:' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_shift_range(value: luce_temperature_range, delta: c.double) -> luce_temperature_range' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_shift_reading(value: luce_temperature_reading, delta: luce_degrees) -> luce_temperature_reading' "$test_dir/temperature/raw.lucn"
+grep -q 'pub extern type luce_temperature_sensor' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_temperature_sensor_open(value: luce_degrees) -> luce_temperature_sensor' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_temperature_sensor_find(value: luce_degrees) -> luce_temperature_sensor?' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_temperature_sensor_value(sensor: luce_temperature_sensor) -> luce_degrees' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_temperature_sensor_echo(sensor: luce_temperature_sensor) -> luce_temperature_sensor?' "$test_dir/temperature/raw.lucn"
+grep -q 'pub func luce_temperature_sensor_close(sensor: luce_temperature_sensor)' "$test_dir/temperature/raw.lucn"
 grep -q 'pub class luce_temperature_sensor:' "$test_dir/temperature/safe.luc"
 grep -q 'pub class luce_temperature_sensor_borrow:' "$test_dir/temperature/safe.luc"
 grep -q 'func deinit(self): self.close()' "$test_dir/temperature/safe.luc"
@@ -240,7 +240,7 @@ mkdir "$test_dir/temperature-short"
 expect 0 "bound examples/c_import/temperature.h" "$cli" bind \
     --name temperature \
     --fiir "$test_dir/temperature-short.fiir.json" \
-    --raw "$test_dir/temperature-short/raw.native.luc" \
+    --raw "$test_dir/temperature-short/raw.lucn" \
     --adapter "$test_dir/temperature-short.adapter.c" \
     --clang-arg -std=c11 \
     --clang-arg -Wall \
@@ -262,17 +262,17 @@ cc -std=c11 -Wall -Wextra -Werror -fshort-enums -I . -fsyntax-only "$test_dir/te
 expect 0 "bound tests/fixtures/fiir/scalars.h" "$cli" bind \
     --name scalars \
     --fiir "$test_dir/scalars.fiir.json" \
-    --raw "$test_dir/scalars.raw.native.luc" \
+    --raw "$test_dir/scalars.raw.lucn" \
     --adapter "$test_dir/scalars.adapter.c" \
     --clang-arg -std=c11 \
     tests/fixtures/fiir/scalars.h
-grep -q 'pub func luce_echo_boolean(value: c.boolean) -> c.boolean' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub func luce_echo_float(value: c.float) -> c.float' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub struct size_t:' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub struct luce_scalar_status:' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub func luce_echo_size(value: size_t) -> size_t' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub func luce_echo_int(value: c.int) -> c.int' "$test_dir/scalars.raw.native.luc"
-grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$test_dir/scalars.raw.native.luc"
+grep -q 'pub func luce_echo_boolean(value: c.boolean) -> c.boolean' "$test_dir/scalars.raw.lucn"
+grep -q 'pub func luce_echo_float(value: c.float) -> c.float' "$test_dir/scalars.raw.lucn"
+grep -q 'pub struct size_t:' "$test_dir/scalars.raw.lucn"
+grep -q 'pub struct luce_scalar_status:' "$test_dir/scalars.raw.lucn"
+grep -q 'pub func luce_echo_size(value: size_t) -> size_t' "$test_dir/scalars.raw.lucn"
+grep -q 'pub func luce_echo_int(value: c.int) -> c.int' "$test_dir/scalars.raw.lucn"
+grep -q 'pub func luce_echo_unsigned_long_long(value: c.unsigned_long_long)' "$test_dir/scalars.raw.lucn"
 cc -std=c11 -Wall -Wextra -Werror -I . -fsyntax-only "$test_dir/scalars.adapter.c"
 
 cp examples/c_import/temperature.luc "$test_dir/temperature.luc"
@@ -286,7 +286,7 @@ expect 0 "built $test_dir/temperature-native" "$cli" build \
     --standard src/standard/math.luc \
     --target native \
     --runtime-root src/runtime \
-    --runtime src/runtime/allocator.native.luc \
+    --runtime src/runtime/allocator.lucn \
     --c-source "$test_dir/temperature.adapter.c" \
     --c-source examples/c_import/temperature.c \
     --c-arg -std=c11 \
@@ -298,7 +298,7 @@ expect 0 "built $test_dir/temperature-native" "$cli" build \
     --c-arg -I \
     --c-arg examples/c_import \
     "$test_dir/temperature-native" \
-    "$test_dir/temperature/raw.native.luc" \
+    "$test_dir/temperature/raw.lucn" \
     "$test_dir/temperature/safe.luc" \
     "$test_dir/temperature.luc" \
     "$test_dir/safe_temperature.luc" \
@@ -306,17 +306,17 @@ expect 0 "built $test_dir/temperature-native" "$cli" build \
 "$test_dir/temperature-native"
 
 printf 'previous fiir' > "$test_dir/preserved.fiir.json"
-printf 'previous raw' > "$test_dir/preserved.raw.native.luc"
+printf 'previous raw' > "$test_dir/preserved.raw.lucn"
 printf 'previous adapter' > "$test_dir/preserved.adapter.c"
 expect 1 "Clang FIIR toolchain: target query exited with status" "$cli" bind \
     --name temperature \
     --clang /luce-test/missing-clang \
     --fiir "$test_dir/preserved.fiir.json" \
-    --raw "$test_dir/preserved.raw.native.luc" \
+    --raw "$test_dir/preserved.raw.lucn" \
     --adapter "$test_dir/preserved.adapter.c" \
     examples/c_import/temperature.h
 [ "$(cat "$test_dir/preserved.fiir.json")" = "previous fiir" ]
-[ "$(cat "$test_dir/preserved.raw.native.luc")" = "previous raw" ]
+[ "$(cat "$test_dir/preserved.raw.lucn")" = "previous raw" ]
 [ "$(cat "$test_dir/preserved.adapter.c")" = "previous adapter" ]
 
 # A host-tool failure must preserve an existing destination and report the
@@ -324,7 +324,7 @@ expect 1 "Clang FIIR toolchain: target query exited with status" "$cli" bind \
 # host's installed tools.
 mkdir "$test_dir/empty-path"
 printf 'previous artifact' > "$test_dir/preserved"
-expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.native.luc "$test_dir/preserved" examples/hello.luc
+expect 1 "qbe toolchain: qbe exited with status 127" /usr/bin/env PATH="$test_dir/empty-path" "$cli" build --package org.luce.tests --root examples --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/preserved" examples/hello.luc
 preserved=$(cat "$test_dir/preserved")
 if [ "$preserved" != "previous artifact" ]; then
     echo "cli: failed native build replaced the previous artifact" >&2

@@ -10,7 +10,7 @@ temperature.h + temperature.recipe.toml -> luce bind
 
 - `temperature.c` and `temperature.h` are the native library.
 - `../luce.toml` declares the `temperature` C binding target.
-- `temperature/raw.native.luc` and `temperature.adapter.c` are generated from
+- `temperature/raw.lucn` and `temperature.adapter.c` are generated from
   the header and are not checked in.
 - `temperature.recipe.toml` is the reviewed ownership/lifetime/status input;
   the generated `temperature/safe.luc` is also not checked in.
@@ -92,7 +92,7 @@ Generate the binding products with explicit destinations:
 mkdir -p build/temperature
 ./build/luce bind --name temperature \
   --fiir build/temperature.fiir.json \
-  --raw build/temperature/raw.native.luc \
+  --raw build/temperature/raw.lucn \
   --adapter build/temperature.adapter.c \
   --recipe examples/c_import/temperature.recipe.toml \
   --safe build/temperature/safe.luc \
