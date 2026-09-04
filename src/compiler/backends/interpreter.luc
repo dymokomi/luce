@@ -230,6 +230,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     # The bindings of every live call, innermost last, so a Base pointer to a
     # caller's local (`Value.Address`) can be read and written from a callee.
     let frames: list[list[Binding]]
+    # Program data the Base text views point into: one byte array per
+    # literal, addressed as frame -1 (base.md §5.5).
+    let literal_data: list[Value]
     # Layout questions are answered with the compiled backends' own type
     # lowering and layout algorithm under `rules`; both are created on the
     # first question, since most programs ask none.
@@ -257,6 +260,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         self.rules = rules
         self.lowering = none
         self.frames = list[list[Binding]]()
+        self.literal_data = list[Value]()
 
     ## Host ARC reaches this callback exactly when an interpreted class loses
     ## its final strong reference. Source `deinit` runs before payload fields;
@@ -329,6 +333,52 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     else: return false
             else: return false
 
+    # mark: Text views =========================================================================
+
+    func is_text_view(value_type: TypeId) -> bool:
+        match self.program.types.definitions[value_type.value].form:
+            StringView: return true
+            else: return false
+
+    # A literal's bytes become one program-data place; the view spans it.
+    func literal_view(text: str) -> Value:
+        let payload = list[BoxedValue]()
+        for byte in strings.to_bytes(text): payload.append(BoxedValue(value = Value.UnsignedInteger(value = u64(byte))))
+        self.literal_data.append(Value.Array(elements = payload))
+        let base = Value.Address(frame = -1, symbol = SymbolId(value = no_node), global = len(self.literal_data) - 1, path = [0])
+        return Value.Span(base = BoxedValue(value = base), length = len(payload))
+
+    # The bytes a view covers, read through its places.
+    func view_bytes(seen: SpanView) -> list[u8]!:
+        let payload = list[u8]()
+        for position in range(0, seen.length):
+            match try self.span_element_address(seen, position):
+                Address(frame, symbol, global, path):
+                    match try self.read_address(frame, symbol, global, path):
+                        UnsignedInteger(byte): payload.append(u8(byte))
+                        else: trap("a text view covers a non-byte")
+                else: trap("span element address is not an address")
+        return payload
+
+    # Text views compare by bytes (base.md §5.5): -1, 0, or 1.
+    func compare_views(left: Value, right: Value) -> i64!:
+        var first = SpanView(base = BoxedValue(value = Value.Unit), length = 0)
+        var second = SpanView(base = BoxedValue(value = Value.Unit), length = 0)
+        match left:
+            Span(base, length): first = SpanView(base = base, length = length)
+            else: trap("text comparison received a non-view")
+        match right:
+            Span(base, length): second = SpanView(base = base, length = length)
+            else: trap("text comparison received a non-view")
+        let left_bytes = try self.view_bytes(first)
+        let right_bytes = try self.view_bytes(second)
+        for index in range(0, len(left_bytes)):
+            if index >= len(right_bytes): return 1
+            if left_bytes[index] < right_bytes[index]: return -1
+            if left_bytes[index] > right_bytes[index]: return 1
+        if len(right_bytes) > len(left_bytes): return -1
+        return 0
+
     func evaluate_span(viewed: NodeId, bindings: list[Binding]) -> SpanView!:
         match try self.evaluate(viewed, bindings):
             Evaluated(item):
@@ -346,6 +396,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             else: trap("span base is not an address")
 
     func root_of(frame: i64, symbol: SymbolId, global: i64) -> Value!:
+        if frame < 0: return self.literal_data[global]
         if global >= 0: return self.globals[global]
         if frame < 0 or frame >= len(self.frames): error("interpreter: trap: a pointer outlived the frame that owned its place")
         let index = find_binding(self.frames[frame], symbol)
@@ -1223,6 +1274,14 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
             Span(element, is_const): return try self.execute_sequence_for(symbol, value, body, bindings)
             Pointer(pointee, is_const, is_volatile): return try self.execute_address_for(symbol, value, body, bindings)
             String: return try self.execute_string_for(symbol, value, body, bindings)
+            StringView:
+                # A view's bytes are valid UTF-8; iterate them as text.
+                var seen = SpanView(base = BoxedValue(value = Value.Unit), length = 0)
+                match value:
+                    Span(base, length): seen = SpanView(base = base, length = length)
+                    else: trap("typed text iteration received a non-view")
+                let text = strings.from_bytes(try self.view_bytes(seen)) else error("interpreter: trap: a text view holds invalid UTF-8")
+                return try self.execute_string_for(symbol, Value.Text(value = text), body, bindings)
             else: trap("typed `for` received a non-iterable value")
 
     func execute_protocol_for(symbol: SymbolId, iterator_symbol: SymbolId, iterator: NodeId, next: NodeId, body: Operands, bindings: list[Binding]) -> Execution!:
@@ -1440,7 +1499,13 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
     # Evaluate one expression to its value.
     pub func evaluate(expression: NodeId, bindings: list[Binding]) -> Evaluation!:
         match node_form(self.program, expression):
-            Constant(value): return Evaluation.Evaluated(value = self.program.values[value])
+            Constant(value):
+                # A Base text literal is a view over program data.
+                if self.is_text_view(node_type(self.program, expression)):
+                    match self.program.values[value]:
+                        Text(text): return Evaluation.Evaluated(value = self.literal_view(text))
+                        else: trap("text view constant is not text")
+                return Evaluation.Evaluated(value = self.program.values[value])
             Reference(symbol):
                 let index = find_binding(bindings, symbol)
                 if index >= 0: return Evaluation.Evaluated(value = self.full.binding_value(bindings[index].value))
@@ -1476,6 +1541,7 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 match try self.evaluate(value, bindings):
                     Evaluated(item):
                         match item:
+                            Span(base, length): return Evaluation.Evaluated(value = item)
                             Address(frame, symbol, global, path):
                                 # A pointer-to-pointer cast keeps the place; the
                                 # reference interpreter has no numeric addresses.
@@ -1696,7 +1762,19 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Evaluated(item):
                         match operation:
                             LogicalAnd, LogicalOr: return Evaluation.Evaluated(value = Value.Boolean(value = as_boolean(item)))
-                            else: return Evaluation.Evaluated(value = try evaluate_binary(left_value, operation, item, self.program.types))
+                            else:
+                                # Base text views compare by bytes through their places.
+                                if self.is_text_view(node_type(self.program, left)):
+                                    let order = try self.compare_views(left_value, item)
+                                    match operation:
+                                        Equal(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order == 0))
+                                        NotEqual(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order != 0))
+                                        Less(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order < 0))
+                                        LessEqual(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order <= 0))
+                                        Greater(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order > 0))
+                                        GreaterEqual(operand_type): return Evaluation.Evaluated(value = Value.Boolean(value = order >= 0))
+                                        else: trap("text views support only comparison operators")
+                                return Evaluation.Evaluated(value = try evaluate_binary(left_value, operation, item, self.program.types))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
             Conditional(value, condition, alternative):
                 match try self.evaluate(condition, bindings):
