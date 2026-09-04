@@ -20,12 +20,12 @@
 #
 #==============================================================================================
 
-from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, DataId, FunctionId, GlobalId
+from compiler.mir.canonical import AtomicOp, AtomicOrder, BinaryOp, BuiltinMirType, CallingConvention, DataId, FunctionId, GlobalId
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
 from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_nullable_ptr_type, pointer_int_type, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, mir_type, no_register, no_registers, signature_register_type, uint_maximum
-from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirFunction, HirReceiverKind, Value
+from compiler.hir.ir import AssignmentOperation, AtomicOperation, AtomicOrdering, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirFunction, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, describe_type, no_node, node_children
 from compiler.hir.ir import entry_at, function_body, node_at, node_diverges, node_form, node_span, node_type, resolve_builtin_type, types_match
 from compiler.hir.ir import executable_function_name, place_element_step, place_field_step
@@ -49,6 +49,24 @@ struct CInputTemporary:
 ## Function-local consumer of the shared lowering transaction. A single
 ## instance is reused in source order; begin_function resets only active
 ## function state while program identities remain stable.
+# HIR's memory orders and read-modify-writes in canonical MIR's vocabulary.
+func atomic_order_of(order: AtomicOrdering) -> AtomicOrder:
+    match order:
+        relaxed: return AtomicOrder.relaxed
+        acquire: return AtomicOrder.acquire
+        release: return AtomicOrder.release
+        acq_rel: return AtomicOrder.acq_rel
+        seq_cst: return AtomicOrder.seq_cst
+
+func atomic_op_of(operation: AtomicOperation) -> AtomicOp:
+    match operation:
+        add: return AtomicOp.add
+        sub: return AtomicOp.sub
+        or_bits: return AtomicOp.bit_or
+        and_bits: return AtomicOp.bit_and
+        xor_bits: return AtomicOp.bit_xor
+        swap: return AtomicOp.swap
+
 # The two loads a view call needs: the conformer's address and the witness.
 struct ViewDispatch:
     let data: RegisterId
@@ -625,6 +643,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 self.state.defers.append(DeferredAction.Source(statement = action))
             ErrorDeferStatement(action):
                 self.state.defers.append(DeferredAction.ErrorSource(statement = action))
+            AtomicStore(address, value, order):
+                let location = try self.lower_expression(module, function, address, body)
+                let stored = try self.lower_expression(module, function, value, body)
+                let value_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                body.append(MirInstruction(form = InstructionForm.AtomicStore(value_type = value_type, address = location, value = stored, order = atomic_order_of(order)), span = span))
             Binding(symbol, is_mutable, value):
                 let local = try self.state.local_of(module, function, span, symbol)
                 match node_form(self.state.program, value):
@@ -1711,6 +1734,36 @@ pub class FunctionLowerer: FunctionLoweringHost:
             NumericConvert(value): return try self.lower_numeric_conversion(module, function, expression, value, body)
             Cast(value): return try self.lower_cast(module, function, expression, value, body)
             EnumFromInteger(value): return try self.lower_enum_from_integer(module, function, expression, value, body)
+            AtomicLoad(address, order):
+                let location = try self.lower_expression(module, function, address, body)
+                let result = self.state.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.AtomicLoad(result = result, value_type = value_type, address = location, order = atomic_order_of(order)), span = span))
+                return result
+            AtomicStore(address, value, order):
+                let location = try self.lower_expression(module, function, address, body)
+                let stored = try self.lower_expression(module, function, value, body)
+                let stored_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+                body.append(MirInstruction(form = InstructionForm.AtomicStore(value_type = stored_type, address = location, value = stored, order = atomic_order_of(order)), span = span))
+                return RegisterId(value = no_register)
+            AtomicUpdate(operation, address, value, order):
+                let location = try self.lower_expression(module, function, address, body)
+                let operand = try self.lower_expression(module, function, value, body)
+                let result = self.state.new_register(value_type)
+                body.append(MirInstruction(form = InstructionForm.AtomicUpdate(result = result, operation = atomic_op_of(operation), value_type = value_type, address = location, value = operand, order = atomic_order_of(order)), span = span))
+                return result
+            AtomicCompareExchange(address, expected, desired, success, failure, is_weak):
+                # `(bool, T)`: whether it exchanged and the value observed.
+                let location = try self.lower_expression(module, function, address, body)
+                let expected_value = try self.lower_expression(module, function, expected, body)
+                let desired_value = try self.lower_expression(module, function, desired, body)
+                let element_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expected))
+                let exchanged = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                let observed = self.state.new_register(element_type)
+                body.append(MirInstruction(form = InstructionForm.AtomicCompareExchange(exchanged = exchanged, observed = observed, value_type = element_type, address = location, expected = expected_value, desired = desired_value, success = atomic_order_of(success), failure = atomic_order_of(failure), is_weak = is_weak), span = span))
+                let temp = self.new_temp(value_type, span, body)
+                self.store_value(builtin_mir_type(BuiltinMirType.boolean), self.field_address(value_type, temp, 0, span, body), exchanged, span, body)
+                self.store_value(element_type, self.field_address(value_type, temp, 1, span, body), observed, span, body)
+                return temp
             QualifyPointer(value): return try self.lower_expression(module, function, value, body)
             Deref(pointer):
                 let address = try self.lower_expression(module, function, pointer, body)
@@ -3028,7 +3081,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
             address = try self.lower_expression(module, function, pointer, body)
             place_type = pointee_of(self.state.program.types, node_type(self.state.program, pointer))
         elif global >= 0:
-            try self.state.fail_unsupported(module, function, span, "the address of a global")
+            address = self.global_address(u32(global), span, body)
+            place_type = self.state.program.globals[global].value_type
         else:
             address = try self.address_of(module, function, span, symbol, body)
             place_type = self.state.program.symbols[symbol.value].value_type

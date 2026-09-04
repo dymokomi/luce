@@ -2513,6 +2513,23 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   array element indexed through a volatile pointer keeps the plain access
   for now, and an aggregate copies member by member as before.
   Gate: 1071 compiler tests across 54 files.
+- [x] **Atomics (B4, third slice)** (2026-09-04). `@T` (base.md §5.9,
+  §15.1) is a HIR type that stores as `T` and admits integers, `bool`,
+  `usize`/`isize`, and pointers. The checker reads an atomic place as a
+  sequentially consistent `AtomicLoad` wherever a value is wanted, turns
+  `=` into `AtomicStore` and `+=`/`-=`/`|=`/`&=`/`^=` into wrapping
+  `AtomicUpdate`s, and resolves the methods `load`, `store`, `add`, `sub`,
+  `set`, `clear` (an `and` with the complement), `flip`, `swap`, and `cas`
+  with their `.relaxed`…`.seq_cst` orders, `cas` answering `(bool, T)`.
+  Canonical MIR gains the four atomic instructions with C11 orders; QBE
+  bridges them through `__atomic_load_N`, `__atomic_store_N`,
+  `__atomic_fetch_*_N`, `__atomic_exchange_N`, and
+  `__atomic_compare_exchange_N` (base.md §19.3), while the MIR oracle,
+  the reference interpreter, and Wasm perform the plain wrapping
+  operations of a single thread. The lowerer also learned the address of
+  a global at run time. `max`/`min`, `wait`/`wake`, and `atomic.fence`
+  are diagnosed as not implemented yet; fences wait for `asm`.
+  Gate: 1074 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

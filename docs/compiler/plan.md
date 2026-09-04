@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1071 compiler tests across 54 files, plus the
+The repository currently proves 1074 compiler tests across 54 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -383,7 +383,13 @@ backends only.
 - [ ] **B4 — interface views, atomics, `asm`, calling C.** *Landed so far
   (2026-09-04, `done.md` §2): interface views, whose witness table is a
   global of thunk addresses rather than a new instruction; `volatile`
-  loads and stores.* Two-word
+  loads and stores; atomics, without `max`/`min`, `wait`/`wake`, or
+  fences. Spec question: §5.9 says `&x` on an `@u32` is `@u32*` while
+  §15.1's `@Node*?` reads as an atomic pointer; the parser follows §21's
+  grammar and lets `@` head the whole type. Open decision: Base's `c` module of §5.2 (aliases plus
+  the distinct `c.char`/`c.long`/`c.wchar`) shares its name with the
+  standard `c.luc` that full Luce's C import uses (§21); `cstr` and Base
+  `extern` wait on how the two are told apart.* Two-word
   unmanaged interface views with a witness-table-address instruction, `@T`
   atomics and fences with the C11 orderings, `volatile` loads and stores,
   per-architecture `asm` blocks and `naked` functions, the declaration

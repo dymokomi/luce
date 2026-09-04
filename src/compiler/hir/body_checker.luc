@@ -29,7 +29,7 @@ from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import integer_bit_width, is_pointer_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match, values_equal
 from compiler.hir.ir import place_element_step, place_field_step
-from compiler.hir.ir import HirRecordLayout
+from compiler.hir.ir import AtomicOperation, AtomicOrdering, HirRecordLayout, atomic_inner
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant
 from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, HirGenerationState, HirSemanticChecker, ImportedBinding, ImportedModule
@@ -509,8 +509,10 @@ pub class HirBodyChecker: HirSemanticChecker:
                     Uninitialized:
                         if not is_mutable: try self.fail(span, "`---` leaves storage unwritten, which only a `var` may then fill (base.md §6.2)")
                     else: pass
-                let checked = try self.check_expression(value, expected)
-                let checked_type = self.state.type_of(checked)
+                let checked = try self.value_of(try self.check_expression(value, expected), expected)
+                var checked_type = self.state.type_of(checked)
+                # `var hits: @u64 = 1`: the location is atomic, its first value plain.
+                if expected != none and atomic_inner(self.state.types, expected) != none: checked_type = expected
                 if self.state.contains_fallible(checked_type):
                     try self.fail(span, "a fallible value cannot be stored in a binding; handle it with `try` or `catch`")
                 try self.state.validate_stored_type(self.state.current_module, checked_type, span, "binding `" + name + "`")
@@ -589,6 +591,9 @@ pub class HirBodyChecker: HirSemanticChecker:
         if not local.is_mutable:
             if name == "self": try self.fail(span, "cannot assign to `self` in a non-mutating method; declare the method `mutating`")
             try self.fail(span, "cannot assign to immutable binding `" + name + "`; declare it with `var`")
+        if atomic_inner(self.state.types, local.value_type) != none:
+            let reference = self.state.push_node(HirNodeForm.Reference(symbol = local.symbol), local.value_type, span)
+            return try self.check_atomic_assignment(reference, operator, value, span)
         let checked = try self.check_expression(value, local.value_type)
         # `value += delta` must leave `value` its own type, so the compound
         # operator is checked as the binary operation it abbreviates.
@@ -621,6 +626,9 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     func check_global_assignment(global_index: i64, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
         let global = self.state.globals[global_index]
+        if atomic_inner(self.state.types, global.value_type) != none:
+            let load = self.state.push_node(HirNodeForm.GlobalLoad(global = u32(global_index)), global.value_type, span)
+            return try self.check_atomic_assignment(load, operator, value, span)
         let checked = try self.check_expression(value, global.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
@@ -639,6 +647,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         let place = try self.resolve_assignment_place(target, span, true)
         try self.full.validate_place_steps(place, operator, span)
         if len(place.steps) == 0 and place.pointer.value == no_node: trap("place assignment has no path steps")
+        if atomic_inner(self.state.types, place.value_type) != none:
+            return try self.check_atomic_assignment(try self.place_value(place, span), operator, value, span)
         let checked = try self.check_expression(value, place.value_type)
         var operation: AssignmentOperation = AssignmentOperation.Replace
         if operator != "=":
@@ -946,6 +956,129 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return true
             else: return false
 
+    # mark: Atomics (Base) ======================================================================
+    #
+    # An `@T` is a location whose every access is one atomic instruction
+    # (base.md §15.1): a plain read is a sequentially consistent load, `=` a
+    # store, the compound operators the read-modify-write instructions, and
+    # the methods name their order. The marker is on the type, so no plain
+    # access to the location can be spelled.
+
+    # An atomic place used as a value: the load of it, unless the context
+    # asks for the atomic type itself (its address, or a same-typed slot).
+    func value_of(value: NodeId, expected: TypeId?) -> NodeId!:
+        let found = self.state.type_of(value)
+        let inner = atomic_inner(self.state.types, found)
+        if inner == none: return value
+        if expected != none and types_match(found, expected): return value
+        return try self.atomic_load(value, AtomicOrdering.seq_cst, self.state.span_of(value))
+
+    func atomic_address(place: NodeId, span: SourceSpan) -> NodeId!:
+        let parts = try self.address_of_node(place, span)
+        let steps = self.state.push_run(parts.steps)
+        let address_type = self.state.intern_pointer(self.state.type_of(place), false, false)
+        return self.state.push_node(HirNodeForm.AddressOf(pointer = parts.pointer, symbol = parts.symbol, global = parts.global, steps = steps), address_type, span)
+
+    func atomic_load(place: NodeId, order: AtomicOrdering, span: SourceSpan) -> NodeId!:
+        let inner = atomic_inner(self.state.types, self.state.type_of(place)) else trap("atomic load of a non-atomic place")
+        let address = try self.atomic_address(place, span)
+        return self.state.push_node(HirNodeForm.AtomicLoad(address = address, order = order), inner, span)
+
+    # `=`, `+=`, `-=`, `|=`, `&=`, and `^=` on an atomic place, sequentially
+    # consistent; the arithmetic wraps as C11's does, so no checked form.
+    func check_atomic_assignment(place: NodeId, operator: str, value: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let inner = atomic_inner(self.state.types, self.state.type_of(place)) else trap("atomic assignment to a non-atomic place")
+        let address = try self.atomic_address(place, span)
+        if operator != "=" and not is_integer_type(self.state.types, inner):
+            try self.fail(span, "`" + operator + "` needs an atomic integer, found `@" + self.describe_type(inner) + "` (base.md §15.1)")
+        let checked = try self.check_expression(value, inner)
+        if operator == "=":
+            return self.state.push_statement(HirNodeForm.AtomicStore(address = address, value = checked, order = AtomicOrdering.seq_cst), span)
+        var operation = AtomicOperation.add
+        if operator == "+=": operation = AtomicOperation.add
+        elif operator == "-=": operation = AtomicOperation.sub
+        elif operator == "|=": operation = AtomicOperation.or_bits
+        elif operator == "&=": operation = AtomicOperation.and_bits
+        elif operator == "^=": operation = AtomicOperation.xor_bits
+        else: try self.fail(span, "`" + operator + "` is not an atomic instruction; an `@" + self.describe_type(inner) + "` takes `=`, `+=`, `-=`, `|=`, `&=`, `^=`, or a method (base.md §15.1)")
+        if not is_integer_type(self.state.types, inner):
+            try self.fail(span, "`" + operator + "` needs an atomic integer, found `@" + self.describe_type(inner) + "` (base.md §15.1)")
+        let update = self.state.push_node(HirNodeForm.AtomicUpdate(operation = operation, address = address, value = checked, order = AtomicOrdering.seq_cst), inner, span)
+        return self.state.push_statement(HirNodeForm.ExpressionStatement(value = update), span)
+
+    # The methods of base.md §15.1, each naming its memory order.
+    func check_atomic_call(receiver: NodeId, inner: TypeId, name: str, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let address = try self.atomic_address(receiver, callee_span)
+        if name == "load":
+            if len(arguments) > 1: try self.fail(span, "`load` takes at most an order")
+            let order = try self.atomic_order(arguments, 0)
+            return try self.require_type(self.state.push_node(HirNodeForm.AtomicLoad(address = address, order = order), inner, span), expected)
+        if name == "store":
+            if len(arguments) < 1 or len(arguments) > 2: try self.fail(span, "`store` takes a value and an order")
+            let value = try self.check_expression(arguments[0].value, inner)
+            let order = try self.atomic_order(arguments, 1)
+            let stored = self.state.push_node(HirNodeForm.AtomicStore(address = address, value = value, order = order), resolve_builtin_type(BuiltinType.unit), span)
+            return try self.require_type(stored, expected)
+        if name == "cas":
+            if len(arguments) < 2 or len(arguments) > 5: try self.fail(span, "`cas` takes `expected`, `desired`, and up to a success order, a failure order, and `weak`")
+            let expected_value = try self.check_expression(arguments[0].value, inner)
+            let desired = try self.check_expression(arguments[1].value, inner)
+            let success = try self.atomic_order(arguments, 2)
+            var failure = success
+            if len(arguments) > 3: failure = try self.atomic_order(arguments, 3)
+            if failure == AtomicOrdering.release or failure == AtomicOrdering.acq_rel:
+                try self.fail(span, "a `cas` failure order may not be `release` or `acq_rel` (base.md §15.1)")
+            var is_weak = false
+            if len(arguments) == 5:
+                let weak_argument = arguments[4]
+                let label = weak_argument.label
+                if label != none:
+                    if label != "weak": try self.fail(span, "the fifth argument of `cas` is `weak`")
+                let literal = find_literal_token(weak_argument.value) else error(self.diagnostic(span, "`weak` takes `true` or `false`"))
+                if literal.text != "true" and literal.text != "false": try self.fail(span, "`weak` takes `true` or `false`")
+                is_weak = literal.text == "true"
+            let result_type = self.state.intern_tuple([resolve_builtin_type(BuiltinType.boolean), inner])
+            let exchange = self.state.push_node(HirNodeForm.AtomicCompareExchange(address = address, expected = expected_value, desired = desired, success = success, failure = failure, is_weak = is_weak), result_type, span)
+            return try self.require_type(exchange, expected)
+        var operation = AtomicOperation.swap
+        var complements = false
+        if name == "add": operation = AtomicOperation.add
+        elif name == "sub": operation = AtomicOperation.sub
+        elif name == "set": operation = AtomicOperation.or_bits
+        elif name == "clear":
+            operation = AtomicOperation.and_bits
+            complements = true
+        elif name == "flip": operation = AtomicOperation.xor_bits
+        elif name == "swap": operation = AtomicOperation.swap
+        elif name == "max" or name == "min" or name == "wait" or name == "wake":
+            try self.fail(callee_span, "`" + name + "` on an atomic is not implemented yet (base.md §15.1)")
+        else: try self.fail(callee_span, "`@" + self.describe_type(inner) + "` has no method `" + name + "`; the atomic methods are load, store, add, sub, set, clear, flip, max, min, swap, cas, wait, and wake (base.md §15.1)")
+        if operation != AtomicOperation.swap and not is_integer_type(self.state.types, inner):
+            try self.fail(span, "`" + name + "` needs an atomic integer, found `@" + self.describe_type(inner) + "` (base.md §15.1)")
+        if len(arguments) < 1 or len(arguments) > 2: try self.fail(span, "`" + name + "` takes a value and an order")
+        var value = try self.check_expression(arguments[0].value, inner)
+        if complements: value = self.state.push_node(HirNodeForm.Unary(operation = UnaryOperation.IntegerBitwiseNot(operand_type = inner), operand = value), inner, span)
+        let order = try self.atomic_order(arguments, 1)
+        let update = self.state.push_node(HirNodeForm.AtomicUpdate(operation = operation, address = address, value = value, order = order), inner, span)
+        return try self.require_type(update, expected)
+
+    # `.relaxed`, `.acquire`, `.release`, `.acq_rel`, or `.seq_cst`; an
+    # omitted order is `seq_cst`.
+    func atomic_order(arguments: list[ArgumentSyntax], position: i64) -> AtomicOrdering!:
+        if position >= len(arguments): return AtomicOrdering.seq_cst
+        let argument = arguments[position]
+        match argument.value.form:
+            CaseValue(name, case_arguments):
+                if len(case_arguments) > 0: try self.fail(argument.span, "a memory order takes no arguments")
+                if name == "relaxed": return AtomicOrdering.relaxed
+                if name == "acquire": return AtomicOrdering.acquire
+                if name == "release": return AtomicOrdering.release
+                if name == "acq_rel": return AtomicOrdering.acq_rel
+                if name == "seq_cst": return AtomicOrdering.seq_cst
+                try self.fail(argument.span, "`." + name + "` is not a memory order; the orders are `.relaxed`, `.acquire`, `.release`, `.acq_rel`, and `.seq_cst` (base.md §15.1)")
+            else: try self.fail(argument.span, "a memory order is spelled `.relaxed`, `.acquire`, `.release`, `.acq_rel`, or `.seq_cst` (base.md §15.1)")
+        return AtomicOrdering.seq_cst
+
     # A return must match the enclosing function's contract: a value
     # for a value-returning function, nothing for a unit function.
     func check_return(value: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
@@ -1104,7 +1237,15 @@ pub class HirBodyChecker: HirSemanticChecker:
     # Check one expression. `expected` is the type the surrounding context
     # requires, or none where any type is welcome; every produced expression
     # passes `require_type` on its way out.
+    # An `@T` context takes a plain `T`: the location is atomic, the value
+    # that fills it is not (base.md §15.1).
     func check_expression(value: ExpressionSyntax, expected: TypeId?) -> NodeId!:
+        if expected != none:
+            let inner = atomic_inner(self.state.types, expected)
+            if inner != none: return try self.check_expression_form(value, inner)
+        return try self.check_expression_form(value, expected)
+
+    func check_expression_form(value: ExpressionSyntax, expected: TypeId?) -> NodeId!:
         match value.form:
             Literal(token): return try self.check_literal(token, expected)
             Name(name):
@@ -1371,7 +1512,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                 let value = Value.SignedInteger(value = integer)
                 return try self.require_type(self.push_constant(value, integer_type, span), expected)
 
-        let checked = try self.check_expression(operand, operand_context)
+        let checked = try self.value_of(try self.check_expression(operand, operand_context), none)
         let checked_type = self.state.type_of(checked)
         var operation = UnaryOperation.NumericIdentity(operand_type = checked_type)
         if operator == "~":
@@ -1498,7 +1639,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             let checked_left = try self.check_expression(left, self.state.type_of(checked_right))
             return CheckedBinaryOperands(left = checked_left, right = checked_right)
 
-        let checked_left = try self.check_expression(left, context)
+        let checked_left = try self.value_of(try self.check_expression(left, context), none)
         let checked_right = try self.check_expression(right, self.state.type_of(checked_left))
         return CheckedBinaryOperands(left = checked_left, right = checked_right)
 
@@ -1647,7 +1788,7 @@ pub class HirBodyChecker: HirSemanticChecker:
         # `(T*?)n` reads its integer as `usize`, so a literal takes that type.
         var value_context: TypeId? = none
         if self.is_pointer_cast(resolve_builtin_type(BuiltinType.unsigned_usize), destination): value_context = resolve_builtin_type(BuiltinType.unsigned_usize)
-        let checked = try self.check_expression(value, value_context)
+        let checked = try self.value_of(try self.check_expression(value, value_context), none)
         let source = self.state.type_of(checked)
         var numeric = is_numeric_type(self.state.types, source) and is_numeric_type(self.state.types, destination)
         # `(u32)flags` reads the representation and `(Access)n` is C's
@@ -1677,6 +1818,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             CFunction(parameters, result): return value_type
             Interface(index, arguments): return value_type
             Optional(inner): return none
+            Atomic(inner): return self.zero_blocker(inner)
             Array(element, count): return self.zero_blocker(element)
             Span(element, is_const): return none
             Tuple(elements):
@@ -2026,6 +2168,8 @@ pub class HirBodyChecker: HirSemanticChecker:
 
         let receiver = try self.check_expression(owner, none)
         let owner_type = self.state.type_of(receiver)
+        let atomic_type = atomic_inner(self.state.types, owner_type)
+        if atomic_type != none: return try self.check_atomic_call(receiver, atomic_type, name, arguments, callee_span, span, expected)
         let generic_index = self.declarations.find_generic_method(owner_type, name)
         if len(type_arguments) > 0:
             if generic_index < 0: try self.fail(span, "type arguments require a generic method")
@@ -3278,8 +3422,9 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     # The one gate every checked expression passes: its type must satisfy the
     # context that asked for it.
-    func require_type(value: NodeId, expected: TypeId?) -> NodeId!:
-        if expected == none: return value
+    func require_type(given: NodeId, expected: TypeId?) -> NodeId!:
+        if expected == none: return given
+        let value = try self.value_of(given, expected)
         let found = self.state.type_of(value)
         match self.state.types.definitions[found.value].form:
             Never:
@@ -3287,6 +3432,9 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return self.state.push_node(HirNodeForm.NeverCoercion(value = value), expected, self.state.span_of(value))
             else: pass
         if types_match(found, expected): return value
+        # A plain `T` fills an `@T` location (base.md §15.1).
+        let atomic_slot = atomic_inner(self.state.types, expected)
+        if atomic_slot != none and types_match(found, atomic_slot): return value
         # Base widens an integer to a wider one of the same signedness without
         # a spelling; no value can change (base.md §7.5).
         if self.in_base_module() and widens_implicitly(self.state.types, found, expected):
