@@ -846,6 +846,9 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 match self.state.program.types.definitions[node_type(self.state.program, iterable).value].form:
                     Range(element): try self.lower_range_for(module, function, span, symbol, iterable, statements, body)
                     String: try self.lower_string_for(module, function, span, symbol, iterable, statements, body)
+                    Span(element, is_const): try self.lower_span_for(module, function, span, symbol, iterable, statements, body)
+                    Array(element, count): try self.lower_span_for(module, function, span, symbol, iterable, statements, body)
+                    Pointer(pointee, is_const, is_volatile): try self.lower_span_for(module, function, span, symbol, iterable, statements, body)
                     else: try self.state.fail_unsupported(module, function, span, "a non-iterable built-in `for` value")
             Protocol(iterator_symbol, iterator, next):
                 try self.lower_protocol_for(module, function, span, symbol, iterator_symbol, iterator, next, statements, body)
@@ -1649,6 +1652,31 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     body.append(MirInstruction(form = InstructionForm.Unary(result = negated, operation = UnaryOp.neg_wrap, operand = index), span = span))
                     index = negated
                 return self.element_address(element_type, base, index, span, body)
+            SpanFromParts(pointer, length):
+                let data = try self.lower_expression(module, function, pointer, body)
+                let count = try self.lower_expression(module, function, length, body)
+                let temp = self.new_temp(value_type, span, body)
+                self.store_value(builtin_mir_type(BuiltinMirType.pointer), self.field_address(value_type, temp, 0, span, body), data, span, body)
+                self.store_value(pointer_int_type(self.state.types, false), self.field_address(value_type, temp, 1, span, body), count, span, body)
+                return temp
+            SpanLength(viewed):
+                let span_value = try self.lower_expression(module, function, viewed, body)
+                let span_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, viewed))
+                return try self.load_field(span_type, span_value, 1, span, body)
+            SpanData(viewed):
+                let span_value = try self.lower_expression(module, function, viewed, body)
+                let span_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, viewed))
+                return try self.load_field(span_type, span_value, 0, span, body)
+            SpanElementAddress(viewed, index):
+                let span_value = try self.lower_expression(module, function, viewed, body)
+                let position = try self.lower_expression(module, function, index, body)
+                let span_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, viewed))
+                let element_type = try self.state.mir_type_of(module, function, span, span_element_of(self.state.program.types, node_type(self.state.program, viewed)))
+                let data = try self.load_field(span_type, span_value, 0, span, body)
+                let length = try self.load_field(span_type, span_value, 1, span, body)
+                return self.checked_element_address_with_length(element_type, data, position, length, span, body)
+            SpanSlice(viewed, start, end, inclusive):
+                return try self.lower_span_slice(module, function, span, value_type, viewed, start, end, inclusive, body)
             PointerDifference(left, right):
                 let left_address = try self.lower_expression(module, function, left, body)
                 let right_address = try self.lower_expression(module, function, right, body)
@@ -2670,6 +2698,96 @@ pub class FunctionLowerer: FunctionLoweringHost:
         self.initialize_owned_value(operand_type, payload, wrapped, span, body)
         self.emit_end(span, body)
         return temp
+
+    # `s[start..<end]`: `start <= end <= length` or a trap, then the sub-span
+    # `(data + start, end - start)`; `..=` includes `end` (base.md §5.4).
+    func lower_span_slice(module: HirModule, function: HirFunction, span: SourceSpan, value_type: TypeId, viewed: NodeId, start: NodeId, end: NodeId, inclusive: bool, body: list[MirInstruction]) -> RegisterId!:
+        let span_value = try self.lower_expression(module, function, viewed, body)
+        let low = try self.lower_expression(module, function, start, body)
+        let usize_type = pointer_int_type(self.state.types, false)
+        var high = try self.load_field(value_type, span_value, 1, span, body)
+        if end.value != no_node: high = try self.lower_expression(module, function, end, body)
+        if inclusive:
+            let bumped = self.state.new_register(usize_type)
+            body.append(MirInstruction(form = InstructionForm.Binary(result = bumped, operation = BinaryOp.add, left = high, right = self.integer_constant(usize_type, 1, span, body)), span = span))
+            high = bumped
+        let element_type = try self.state.mir_type_of(module, function, span, span_element_of(self.state.program.types, node_type(self.state.program, viewed)))
+        let data = try self.load_field(value_type, span_value, 0, span, body)
+        let length = try self.load_field(value_type, span_value, 1, span, body)
+        let ordered = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = ordered, operation = BinaryOp.le, left = low, right = high), span = span))
+        let within = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = within, operation = BinaryOp.le, left = high, right = length), span = span))
+        let valid = self.lower_and(ordered, within, span, body)
+        self.open_if(valid, list[RegisterId](), span, body)
+        self.emit_else(span, body)
+        body.append(MirInstruction(form = InstructionForm.Trap(reason = "slice out of bounds"), span = span))
+        self.emit_end(span, body)
+        let temp = self.new_temp(value_type, span, body)
+        self.store_value(builtin_mir_type(BuiltinMirType.pointer), self.field_address(value_type, temp, 0, span, body), self.element_address(element_type, data, low, span, body), span, body)
+        let count = self.state.new_register(usize_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = count, operation = BinaryOp.sub, left = high, right = low), span = span))
+        self.store_value(usize_type, self.field_address(value_type, temp, 1, span, body), count, span, body)
+        return temp
+
+    # `for x in items` over a span or an array: index from 0 to the length,
+    # loading each element by value (base.md §8.3).
+    func lower_span_for(module: HirModule, function: HirFunction, span: SourceSpan, symbol: SymbolId, iterable: NodeId, statements: Operands, body: list[MirInstruction]) -> !:
+        var iterable_type = node_type(self.state.program, iterable)
+        let sequence = try self.lower_expression(module, function, iterable, body)
+        let usize_type = pointer_int_type(self.state.types, false)
+        # `&items` iterates the pointee's elements by address instead of by value.
+        var by_address = false
+        match self.state.program.types.definitions[iterable_type.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                by_address = true
+                iterable_type = pointee
+            else: pass
+        var data = sequence
+        var length = self.integer_constant(usize_type, 0, span, body)
+        var element_hir = resolve_builtin_type(BuiltinType.unit)
+        match self.state.program.types.definitions[iterable_type.value].form:
+            Span(element, is_const):
+                let span_type = try self.state.mir_type_of(module, function, span, iterable_type)
+                data = try self.load_field(span_type, sequence, 0, span, body)
+                length = try self.load_field(span_type, sequence, 1, span, body)
+                element_hir = element
+            Array(element, count):
+                length = self.integer_constant(usize_type, count, span, body)
+                element_hir = element
+            else: trap("span iteration over a non-sequence")
+        let element_type = try self.state.mir_type_of(module, function, span, element_hir)
+        let counter = self.new_temp(usize_type, span, body)
+        self.store_value(usize_type, counter, self.integer_constant(usize_type, 0, span, body), span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        body.append(MirInstruction(form = InstructionForm.Loop, span = span))
+        self.state.regions.append(Region.block)
+        self.state.regions.append(Region.loop_body)
+
+        let offset = self.load_value(usize_type, counter, span, body)
+        let done = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = done, operation = BinaryOp.ge, left = offset, right = length), span = span))
+        body.append(MirInstruction(form = InstructionForm.BrIf(condition = done, depth = 1, values = no_registers()), span = span))
+        let binding = (try self.state.local_of(module, function, span, symbol)).address
+        let element_address = self.element_address(element_type, data, offset, span, body)
+        if by_address: self.store_value(builtin_mir_type(BuiltinMirType.pointer), binding, element_address, span, body)
+        else: self.initialize_owned_value(element_type, binding, self.load_value(element_type, element_address, span, body), span, body)
+
+        body.append(MirInstruction(form = InstructionForm.Block(results = no_registers()), span = span))
+        self.state.regions.append(Region.for_continue)
+        try self.lower_loop_scope(module, function, statements, body)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+
+        let next = self.state.new_register(usize_type)
+        body.append(MirInstruction(form = InstructionForm.Binary(result = next, operation = BinaryOp.add, left = offset, right = self.integer_constant(usize_type, 1, span, body)), span = span))
+        self.store_value(usize_type, counter, next, span, body)
+        body.append(MirInstruction(form = InstructionForm.Br(depth = 0, values = no_registers()), span = span))
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.state.regions.remove(len(self.state.regions) - 1)
+        self.emit_end(span, body)
+        self.emit_end(span, body)
 
     # `&place` (base.md §6.6): the root's address, then the field and element
     # addresses of the path. Locals live in frame slots, so a local's address
@@ -3945,3 +4063,9 @@ func pointee_of(types: ir.TypeTable, pointer_type: ir.TypeId) -> ir.TypeId:
     match types.definitions[pointer_type.value].form:
         Pointer(pointee, is_const, is_volatile): return pointee
         else: trap("pointer operation on a non-pointer HIR type")
+
+# The element of a Base span type; a compiler bug if the type is not one.
+func span_element_of(types: ir.TypeTable, span_type: ir.TypeId) -> ir.TypeId:
+    match types.definitions[span_type.value].form:
+        Span(element, is_const): return element
+        else: trap("span operation on a non-span HIR type")

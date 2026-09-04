@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
   In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
   `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
@@ -2240,7 +2240,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
   of signedness, and `u64` into `usize` stay spelled and are refused by
   name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **The overflow operator family (B1, fifth slice)** (2026-09-03). `+%`,
   `-%`, `*%`, and unary `-%` wrap in two's complement, `+|`, `-|`, `*|`
   saturate at the type's bounds, and `+?`, `-?`, `*?` answer `T?` with
@@ -2264,7 +2264,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   wrapping, saturating, checked, layout) answer one number each through the
   reference interpreter, the MIR oracle at both pointer widths, both
   encoders, and a native QBE build linked to a C driver.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **C's cast between numbers (B1, sixth slice)** (2026-09-03). `(T)x`
   parses when the parenthesised text is a scalar type name followed by an
   operand, so `(value)` stays a group and `(Point)(x)` a call (base.md §7.5);
@@ -2278,7 +2278,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   narrow clamp; QBE compares against the bounds first). Pointer, enum, and
   text casts arrive with their types (B2, B3). The shared fixtures gain a
   cast fixture and `examples/base/c_arithmetic.lucb` casts twice.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **Pointers: `T*`, `&`, `*`, and `.` through them (B2, first slice)**
   (2026-09-03). A `.lucb` module names `T*`, `const T*`, and `volatile T*`
   (the qualifier prefixes the pointee and attaches to the `*` that follows;
@@ -2301,7 +2301,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   fixture and `examples/base/pointers.lucb` checks, runs, and builds. Open
   in B2: the `T*?` niche, `void*`, pointer arithmetic and ordering, arrays
   and spans, `str` views, and the escape rule.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **The nullable pointer niche (B2, second slice)** (2026-09-03). `T*?`
   is an ordinary optional in HIR and one word in canonical MIR: the new
   `NullablePtr` type (`ptr?`), pointer-sized, whose zero is `none`, never an
@@ -2314,7 +2314,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   interpreter is unchanged: `Absent`/`Present` over the frame-place
   pointer. The shared fixtures gain a linked-list fixture walked through
   `Node*?`.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **Pointer arithmetic, ordering, `void*`, and address casts (B2, third
   slice)** (2026-09-04). `p + n` and `p - n` are element-scaled and
   unchecked (`PointerOffset`, lowered to the unchecked `ElementAddress`
@@ -2334,7 +2334,39 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   §19.3); the MIR oracle and both backends answer them. The shared
   fixtures gain an arithmetic fixture and `examples/base/pointers.lucb`
   walks an array.
-  Gate: 1034 compiler tests across 53 files.
+  Gate: 1041 compiler tests across 54 files.
+- [x] **Arrays as `T[N]`, spans as `T[]`, and the escape rule (B2, fourth
+  slice)** (2026-09-04).
+  After a complete type, `[N]` is the fixed array (the existing `array[T, N]`
+  form, now spelled C's way) and `[]` a span, `const T[]` a read-only one; a
+  bracket that starts with a type stays a generic argument list (base.md
+  §5.4). A span is two words, the element pointer and a `usize` length, as
+  the HIR type `Span` and a canonical struct of `ptr` and `usize`. An array
+  in a place converts to a span implicitly (its first element's address and
+  its length), a span to a read-only span, `s[i]` is a checked element
+  address (`SpanElementAddress`, read through `Deref` or stored through the
+  pointer path), `s[a..<b]` and `s[a..=b]` are checked sub-spans
+  (`SpanSlice`: `start <= end <= length` or a trap), `s.length` and
+  `s.data` read the two words, `T[](pointer, count)` builds one from its
+  parts, and `for x in items` iterates an array or a span by value in a
+  Base module while `for x in &items` yields a pointer to each element,
+  `T*` through a `var` array or a mutable span and `const T*` otherwise
+  (base.md §8.3), one index loop in the lowerer for all of them. The
+  reference interpreter holds a span as its first element's place and a
+  length, so a store through a span reaches the array it views. The shared
+  fixtures gain a span fixture and `examples/base/spans.lucb` checks, runs,
+  and builds. The parser now takes the module's profile, so `T[N]`, `T[]`,
+  `(T)x`, and `T[](p, n)` are Base grammar that a `.luc` module never
+  reads (base.md §3.2). The escape rule lands in the same slice: `hir/escape.luc`
+  reads each finished Base function once: a value that is, or contains, the
+  address of a local (`&x`, a span over a local array, a struct holding one,
+  and every `let` alias of those within the function) may be passed to a
+  call but is refused when returned, passed as the message of `error(...)`,
+  stored in a global, or stored through a pointer parameter (base.md §6.6).
+  The pass runs in the semantic analyzer for `.lucb` modules only, names
+  the function and the use, and follows aliases but stops at calls, as the
+  rule promises.
+  Gate: 1041 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 

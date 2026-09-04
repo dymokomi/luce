@@ -160,6 +160,9 @@ ledger: parser coverage alone never counts as source-to-QBE completion.
 - `base/pointers.lucb` takes `&point` and `&count`, stores through `*counter`
   and `point.x`, and reads through a `const Point*`: Base's never-null
   pointers with the qualifier taken from the path's root (base.md §5.3, §6.6).
+- `base/spans.lucb` views an `i64[4]` array through an `i64[]` span, stores
+  through it, slices it with checked bounds, rebuilds a span from its
+  `data` and `length`, and walks both with `for` (base.md §5.4, §8.3).
 - `cfunc_values.luc` exercises the matching C-callable value shape through
   aliases, fields, parameters/results and selection. Capture-free named Luce
   functions use generated C adapters; HIR/MIR, Wasm and native QBE all run the

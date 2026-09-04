@@ -78,6 +78,11 @@ pub interface HirExternVariableHost:
     func load(variable: HirExternVariable) -> Value!
     func store(variable: HirExternVariable, value: Value) -> !
 
+# One evaluated Base span: its first element's address and its length.
+struct SpanView:
+    let base: BoxedValue
+    let length: i64
+
 # One resolved Base pointer: the place it names.
 struct AddressTarget:
     let frame: i64
@@ -323,6 +328,22 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                     Pointer(pointee, is_const, is_volatile): return true
                     else: return false
             else: return false
+
+    func evaluate_span(viewed: NodeId, bindings: list[Binding]) -> SpanView!:
+        match try self.evaluate(viewed, bindings):
+            Evaluated(item):
+                match item:
+                    Span(base, length): return SpanView(base = base, length = length)
+                    else: trap("typed span operation received a non-span HIR value")
+            Transferred(execution): error("interpreter: a span operand diverged")
+
+    # The address of element `position`: the base moved along its array.
+    func span_element_address(seen: SpanView, position: i64) -> Value!:
+        match seen.base.value:
+            Address(frame, symbol, global, path):
+                if position == 0: return seen.base.value
+                return try self.offset_address(AddressTarget(frame = frame, symbol = symbol, global = global, path = path), position)
+            else: trap("span base is not an address")
 
     func root_of(frame: i64, symbol: SymbolId, global: i64) -> Value!:
         if global >= 0: return self.globals[global]
@@ -1198,6 +1219,9 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         if collection != none: return collection
         match self.program.types.definitions[iterable_type.value].form:
             Range(element): return try self.execute_range_for(symbol, value, element, body, bindings)
+            Array(element, count): return try self.execute_sequence_for(symbol, value, body, bindings)
+            Span(element, is_const): return try self.execute_sequence_for(symbol, value, body, bindings)
+            Pointer(pointee, is_const, is_volatile): return try self.execute_address_for(symbol, value, body, bindings)
             String: return try self.execute_string_for(symbol, value, body, bindings)
             else: trap("typed `for` received a non-iterable value")
 
@@ -1252,6 +1276,64 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
         let outer_count = len(bindings)
         for character in text:
             bindings.append(Binding(symbol = symbol, value = Value.Character(value = character)))
+            let outcome = try self.execute_scope(body, bindings)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return Execution.Next
+                Returned(value): return Execution.Returned(value = value)
+                Raised(error_value): return Execution.Raised(error_value = error_value)
+                Recovered(value): return Execution.Recovered(value = value)
+                else: pass
+        return Execution.Next
+
+    # `for x in items` over an array value or a span: each element by value.
+    func execute_sequence_for(symbol: SymbolId, sequence: Value, body: Operands, bindings: list[Binding]) -> Execution!:
+        let elements = list[Value]()
+        match sequence:
+            Array(items):
+                for item in items: elements.append(item.value)
+            Span(base, length):
+                let seen = SpanView(base = base, length = length)
+                for position in range(0, length):
+                    match try self.span_element_address(seen, position):
+                        Address(frame, item_symbol, global, path): elements.append(try self.read_address(frame, item_symbol, global, path))
+                        else: trap("span element address is not an address")
+            else: trap("typed sequence iteration received a non-sequence value")
+        let outer_count = len(bindings)
+        for element in elements:
+            bindings.append(Binding(symbol = symbol, value = element))
+            let outcome = try self.execute_scope(body, bindings)
+            trim_bindings(bindings, outer_count)
+            match outcome:
+                Broke: return Execution.Next
+                Returned(value): return Execution.Returned(value = value)
+                Raised(error_value): return Execution.Raised(error_value = error_value)
+                Recovered(value): return Execution.Recovered(value = value)
+                else: pass
+        return Execution.Next
+
+    # `for x in &items`: the address of each element of the array or span the
+    # pointer names.
+    func execute_address_for(symbol: SymbolId, pointer: Value, body: Operands, bindings: list[Binding]) -> Execution!:
+        var target = AddressTarget(frame = 0, symbol = SymbolId(value = no_node), global = -1, path = list[i64]())
+        match pointer:
+            Address(frame, address_symbol, global, path): target = AddressTarget(frame = frame, symbol = address_symbol, global = global, path = path)
+            else: trap("typed address iteration received a non-address value")
+        let addresses = list[Value]()
+        match try self.read_address(target.frame, target.symbol, target.global, target.path):
+            Array(items):
+                for index in range(0, len(items)):
+                    let path = list[i64]()
+                    for step in target.path: path.append(step)
+                    path.append(index)
+                    addresses.append(Value.Address(frame = target.frame, symbol = target.symbol, global = target.global, path = path))
+            Span(base, length):
+                let seen = SpanView(base = base, length = length)
+                for index in range(0, length): addresses.append(try self.span_element_address(seen, index))
+            else: trap("typed address iteration received a non-sequence place")
+        let outer_count = len(bindings)
+        for address in addresses:
+            bindings.append(Binding(symbol = symbol, value = address))
             let outcome = try self.execute_scope(body, bindings)
             trim_bindings(bindings, outer_count)
             match outcome:
@@ -1422,6 +1504,56 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 if negate: count = 0 - count
                 if count == 0: return Evaluation.Evaluated(value = Value.Address(frame = target.frame, symbol = target.symbol, global = target.global, path = target.path))
                 return Evaluation.Evaluated(value = try self.offset_address(target, count))
+            SpanFromParts(pointer, length):
+                let base = try self.evaluate_address(pointer, bindings)
+                var count = 0
+                match try self.evaluate(length, bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(value): count = i64(value)
+                            else: trap("span length is not an unsigned integer")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                return Evaluation.Evaluated(value = Value.Span(base = BoxedValue(value = Value.Address(frame = base.frame, symbol = base.symbol, global = base.global, path = base.path)), length = count))
+            SpanLength(viewed):
+                let seen = try self.evaluate_span(viewed, bindings)
+                return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(seen.length)))
+            SpanData(viewed):
+                let seen = try self.evaluate_span(viewed, bindings)
+                return Evaluation.Evaluated(value = seen.base.value)
+            SpanElementAddress(viewed, index):
+                let seen = try self.evaluate_span(viewed, bindings)
+                var position = 0
+                match try self.evaluate(index, bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(value): position = i64(value)
+                            else: trap("span index is not an unsigned integer")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                if position < 0 or position >= seen.length: error("interpreter: index out of bounds")
+                return Evaluation.Evaluated(value = try self.span_element_address(seen, position))
+            SpanSlice(viewed, start, end, inclusive):
+                let seen = try self.evaluate_span(viewed, bindings)
+                var low = 0
+                var high = 0
+                match try self.evaluate(start, bindings):
+                    Evaluated(item):
+                        match item:
+                            UnsignedInteger(value): low = i64(value)
+                            else: trap("slice bound is not an unsigned integer")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                high = seen.length
+                if end.value != no_node:
+                    match try self.evaluate(end, bindings):
+                        Evaluated(item):
+                            match item:
+                                UnsignedInteger(value): high = i64(value)
+                                else: trap("slice bound is not an unsigned integer")
+                        Transferred(execution): return Evaluation.Transferred(execution = execution)
+                    if inclusive: high += 1
+                if low > high or high > seen.length: error("interpreter: slice out of bounds")
+                var first = seen.base.value
+                if low > 0: first = try self.span_element_address(seen, low)
+                return Evaluation.Evaluated(value = Value.Span(base = BoxedValue(value = first), length = high - low))
             PointerDifference(left, right):
                 let first = try self.evaluate_address(left, bindings)
                 let second = try self.evaluate_address(right, bindings)

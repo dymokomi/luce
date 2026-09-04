@@ -709,6 +709,9 @@ pub class HirBodyChecker: HirSemanticChecker:
                     Pointer(pointee, is_const, is_volatile):
                         let element = try self.pointer_element(try self.place_value(inspected, span), subscript, span)
                         return try self.pointer_place(element, span, mutate_value)
+                    Span(element_type, is_const):
+                        let element = try self.span_element(try self.place_value(inspected, span), element_type, is_const, subscript, span)
+                        return try self.pointer_place(element, span, mutate_value)
                     else: pass
                 var element_type = resolve_builtin_type(BuiltinType.unit)
                 var step = place_element_step
@@ -728,6 +731,84 @@ pub class HirBodyChecker: HirSemanticChecker:
                 place.steps.append(index.value)
                 return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
+
+    # An array converts to a span that points into it, and a span to a
+    # read-only span of the same element (base.md §5.4).
+    func span_conversion(value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        let span = self.state.span_of(value)
+        match self.state.types.definitions[expected.value].form:
+            Span(wanted, wants_const):
+                match self.state.types.definitions[found.value].form:
+                    Array(element, count):
+                        if not types_match(element, wanted): return none
+                        # The span starts at the first element's address.
+                        let address = try self.address_of_node(value, span)
+                        let first = self.push_constant(Value.UnsignedInteger(value = u64(0)), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                        address.steps.append(place_element_step)
+                        address.steps.append(first.value)
+                        let start = self.state.push_node(HirNodeForm.AddressOf(pointer = address.pointer, symbol = address.symbol, global = address.global, steps = self.state.push_run(address.steps)), self.state.intern_pointer(element, wants_const, false), span)
+                        let length = self.push_constant(Value.UnsignedInteger(value = u64(count)), resolve_builtin_type(BuiltinType.unsigned_usize), span)
+                        return self.state.push_node(HirNodeForm.SpanFromParts(pointer = start, length = length), expected, span)
+                    Span(element, is_const):
+                        if not types_match(element, wanted) or (is_const and not wants_const): return none
+                        return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, span)
+                    else: return none
+            else: return none
+
+    # The place a checked node reads, as the parts of an `AddressOf`; a value
+    # that is not a place has no address.
+    func address_of_node(value: NodeId, span: SourceSpan) -> AddressParts!:
+        match self.state.node_form(value):
+            Reference(symbol): return AddressParts(pointer = NodeId(value = no_node), symbol = symbol, global = -1, steps = list[u32]())
+            GlobalLoad(global): return AddressParts(pointer = NodeId(value = no_node), symbol = SymbolId(value = no_node), global = i64(global), steps = list[u32]())
+            Deref(pointer): return AddressParts(pointer = pointer, symbol = SymbolId(value = no_node), global = -1, steps = list[u32]())
+            FieldAccess(record, field):
+                let inner = try self.address_of_node(record, span)
+                inner.steps.append(place_field_step)
+                inner.steps.append(u32(field))
+                return inner
+            SequenceIndex(sequence, index):
+                let inner = try self.address_of_node(sequence, span)
+                inner.steps.append(place_element_step)
+                inner.steps.append(index.value)
+                return inner
+            else: error(self.diagnostic(span, "a span views an array that has a place; this array value has none (base.md §5.4)"))
+
+    # `u8[](pointer, count)`: a span from its parts; the pointer's qualifier
+    # is the span's (base.md §5.4).
+    func check_span_construct(element_syntax: TypeSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if not self.in_base_module(): try self.fail(span, "`T[](pointer, count)` belongs to Luce Base; a `.luc` module has no spans (base.md §5.4)")
+        let element = try self.declarations.resolve_type(self.state.current_module, element_syntax)
+        if len(arguments) != 2: try self.fail(span, "a span takes a pointer and a count: `u8[](pointer, count)`")
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "a span constructor uses positional arguments")
+        let pointer = try self.check_expression(arguments[0].value, none)
+        var is_const = false
+        match self.state.types.definitions[self.state.type_of(pointer).value].form:
+            Pointer(pointee, pointer_const, is_volatile):
+                if not types_match(pointee, element):
+                    try self.fail(arguments[0].span, "a span of `" + self.describe_type(element) + "` needs a `" + self.describe_type(element) + "*`, found `" + self.describe_type(self.state.type_of(pointer)) + "`")
+                is_const = pointer_const
+            else: try self.fail(arguments[0].span, "a span starts at a pointer, found `" + self.describe_type(self.state.type_of(pointer)) + "`")
+        let length = try self.check_expression(arguments[1].value, resolve_builtin_type(BuiltinType.unsigned_usize))
+        let node = self.state.push_node(HirNodeForm.SpanFromParts(pointer = pointer, length = length), self.state.intern_span(element, is_const), span)
+        return try self.require_type(node, expected)
+
+    # `s[a..<b]`, `s[a..=b]`, `s[a..]`, `s[..b]`: a checked sub-span; a missing
+    # start is 0 and a missing end the length (base.md §5.4).
+    func check_span_slice(value: NodeId, element: TypeId, is_const: bool, start: ExpressionSyntax?, operator: str, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let usize = resolve_builtin_type(BuiltinType.unsigned_usize)
+        var lower = self.push_constant(Value.UnsignedInteger(value = u64(0)), usize, span)
+        if start != none: lower = try self.check_expression(start, usize)
+        var upper = NodeId(value = no_node)
+        if end != none: upper = try self.check_expression(end, usize)
+        let node = self.state.push_node(HirNodeForm.SpanSlice(span = value, start = lower, end = upper, inclusive = operator == "..="), self.state.intern_span(element, is_const), span)
+        return try self.require_type(node, expected)
+
+    # `&s[i]`: the checked address of one element, `T*` or `const T*`.
+    func span_element(value: NodeId, element: TypeId, is_const: bool, subscript: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let index = try self.check_expression(subscript, resolve_builtin_type(BuiltinType.unsigned_usize))
+        return self.state.push_node(HirNodeForm.SpanElementAddress(span = value, index = index), self.state.intern_pointer(element, is_const, false), span)
 
     # `p + i` for indexing: the pointer must be typed, the index an integer.
     func pointer_element(pointer: NodeId, subscript: ExpressionSyntax, span: SourceSpan) -> NodeId!:
@@ -968,6 +1049,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                 error(self.diagnostic(value.span, "unknown name `" + name + "`"))
             Group(grouped): return try self.check_expression(grouped, expected)
             Cast(target, cast_value): return try self.check_cast(target, cast_value, value.span, expected)
+            SpanConstruct(element, arguments): return try self.check_span_construct(element, arguments, value.span, expected)
             TupleValue(elements):
                 return try self.check_tuple(elements, value.span, expected)
             Unary(operator, operand): return try self.check_unary(operator, operand, value.span, expected)
@@ -1002,6 +1084,11 @@ pub class HirBodyChecker: HirSemanticChecker:
             Index(indexed, subscript):
                 return try self.check_index(indexed, subscript, value.span, expected)
             Slice(sliced, start, operator, end):
+                if self.in_base_module():
+                    let viewed = try self.check_expression(sliced, none)
+                    match self.state.types.definitions[self.state.type_of(viewed).value].form:
+                        Span(element, is_const): return try self.check_span_slice(viewed, element, is_const, start, operator, end, value.span, expected)
+                        else: pass
                 return try self.full.check_slice(self, sliced, start, end, value.span, expected)
             Lambda(parameters, body):
                 let lambda = try self.full.check_lambda(self, parameters, body, value.span, expected)
@@ -2332,6 +2419,16 @@ pub class HirBodyChecker: HirSemanticChecker:
                 checked = self.state.push_node(HirNodeForm.Deref(pointer = first), pointee, span)
             else: pass
         let checked_type = self.state.type_of(checked)
+        match self.state.types.definitions[checked_type.value].form:
+            Span(element_type, is_const):
+                if name == "length":
+                    let length = self.state.push_node(HirNodeForm.SpanLength(span = checked), resolve_builtin_type(BuiltinType.unsigned_usize), span)
+                    return try self.require_type(length, expected)
+                if name == "data":
+                    let data = self.state.push_node(HirNodeForm.SpanData(span = checked), self.state.intern_pointer(element_type, is_const, false), span)
+                    return try self.require_type(data, expected)
+                try self.fail(span, "`" + self.describe_type(checked_type) + "` has `length` and `data`, not `" + name + "`")
+            else: pass
         if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
             let length = self.state.push_node(HirNodeForm.SequenceLength(value = checked), resolve_builtin_type(BuiltinType.unsigned_u64), span)
             return try self.require_type(length, expected)
@@ -2390,6 +2487,17 @@ pub class HirBodyChecker: HirSemanticChecker:
                 # `p[i]` is `*(p + i)`: unchecked (base.md §7.7).
                 let element = try self.pointer_element(value, subscript, span)
                 let loaded = self.state.push_node(HirNodeForm.Deref(pointer = element), pointee, span)
+                return try self.require_type(loaded, expected)
+            Span(element_type, is_const):
+                # `s[i]` is a checked element; a range subscript the parser kept
+                # as an index (`..=`) is a sub-span (base.md §5.4).
+                match subscript.form:
+                    Binary(lower, operator, upper):
+                        if operator == "..<" or operator == "..=":
+                            return try self.check_span_slice(value, element_type, is_const, lower, operator, upper, span, expected)
+                    else: pass
+                let address = try self.span_element(value, element_type, is_const, subscript, span)
+                let loaded = self.state.push_node(HirNodeForm.Deref(pointer = address), element_type, span)
                 return try self.require_type(loaded, expected)
             else: pass
         var element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
@@ -2965,6 +3073,9 @@ pub class HirBodyChecker: HirSemanticChecker:
             return self.state.push_node(HirNodeForm.NumericConvert(value = value), expected, self.state.span_of(value))
         if self.in_base_module() and qualifies_implicitly(self.state.types, found, expected):
             return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, self.state.span_of(value))
+        if self.in_base_module():
+            let viewed = try self.span_conversion(value, found, expected)
+            if viewed != none: return viewed
         let existential = try self.interfaces.convert(self, value, expected)
         if existential != none: return existential
         if self.is_function_fallibility_lift(found, expected):
@@ -3436,3 +3547,10 @@ func names_a_value(value: ExpressionSyntax) -> bool:
         Unary(operator, operand): return operator == "&" or operator == "*"
         Group(grouped): return names_a_value(grouped)
         else: return false
+
+# The root and steps of a place, as `AddressOf` spells them.
+struct AddressParts:
+    let pointer: NodeId
+    let symbol: SymbolId
+    let global: i64
+    let steps: list[u32]

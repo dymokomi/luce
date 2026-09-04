@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1034 compiler tests across 53 files, plus the
+The repository currently proves 1041 compiler tests across 54 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -355,8 +355,9 @@ backends only.
   pointer, implicit qualification, and address equality, with the
   reference interpreter modelling a pointer as a place in a call frame, and
   the `T*?` null niche as canonical `NullablePtr`, pointer arithmetic and
-  ordering, `void*`, and the pointer casts; arrays, spans, `str` views, and
-  the escape rule are open.* `T*`, `const`/`volatile` qualifiers, the
+  ordering, `void*`, the pointer casts, `T[N]` arrays, and `T[]` spans with
+  checked indexing, slicing, and iteration by value or by element pointer,
+  and the escape rule; `str` views and `cstr` are open.* `T*`, `const`/`volatile` qualifiers, the
   null-niche `T*?`, `void*`, `&x` with the path-derived qualifier and the
   escape rule (§6.6), pointer arithmetic and ordering, `T[N]` value arrays
   with C layout, `T[]` spans with checked indexing and slicing, `str` as a
