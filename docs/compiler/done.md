@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 986 compiler tests across 49 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 993 compiler tests across 50 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1009 compiler tests across 51 files.
 - [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
   In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
   `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
@@ -2240,7 +2240,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
   of signedness, and `u64` into `usize` stay spelled and are refused by
   name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1016 compiler tests across 52 files.
 - [x] **The overflow operator family (B1, fifth slice)** (2026-09-03). `+%`,
   `-%`, `*%`, and unary `-%` wrap in two's complement, `+|`, `-|`, `*|`
   saturate at the type's bounds, and `+?`, `-?`, `*?` answer `T?` with
@@ -2264,7 +2264,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   wrapping, saturating, checked, layout) answer one number each through the
   reference interpreter, the MIR oracle at both pointer widths, both
   encoders, and a native QBE build linked to a C driver.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1023 compiler tests across 53 files.
 - [x] **C's cast between numbers (B1, sixth slice)** (2026-09-03). `(T)x`
   parses when the parenthesised text is a scalar type name followed by an
   operand, so `(value)` stays a group and `(Point)(x)` a call (base.md §7.5);
@@ -2278,7 +2278,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   narrow clamp; QBE compares against the bounds first). Pointer, enum, and
   text casts arrive with their types (B2, B3). The shared fixtures gain a
   cast fixture and `examples/base/c_arithmetic.lucb` casts twice.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1025 compiler tests across 53 files.
 - [x] **Pointers: `T*`, `&`, `*`, and `.` through them (B2, first slice)**
   (2026-09-03). A `.lucb` module names `T*`, `const T*`, and `volatile T*`
   (the qualifier prefixes the pointee and attaches to the `*` that follows;
@@ -2301,7 +2301,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   fixture and `examples/base/pointers.lucb` checks, runs, and builds. Open
   in B2: the `T*?` niche, `void*`, pointer arithmetic and ordering, arrays
   and spans, `str` views, and the escape rule.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1029 compiler tests across 53 files.
 - [x] **The nullable pointer niche (B2, second slice)** (2026-09-03). `T*?`
   is an ordinary optional in HIR and one word in canonical MIR: the new
   `NullablePtr` type (`ptr?`), pointer-sized, whose zero is `none`, never an
@@ -2314,7 +2314,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   interpreter is unchanged: `Absent`/`Present` over the frame-place
   pointer. The shared fixtures gain a linked-list fixture walked through
   `Node*?`.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1031 compiler tests across 53 files.
 - [x] **Pointer arithmetic, ordering, `void*`, and address casts (B2, third
   slice)** (2026-09-04). `p + n` and `p - n` are element-scaled and
   unchecked (`PointerOffset`, lowered to the unchecked `ElementAddress`
@@ -2334,7 +2334,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   §19.3); the MIR oracle and both backends answer them. The shared
   fixtures gain an arithmetic fixture and `examples/base/pointers.lucb`
   walks an array.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **Arrays as `T[N]`, spans as `T[]`, and the escape rule (B2, fourth
   slice)** (2026-09-04).
   After a complete type, `[N]` is the fixed array (the existing `array[T, N]`
@@ -2366,7 +2366,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   The pass runs in the semantic analyzer for `.lucb` modules only, names
   the function and the use, and follows aliases but stops at calls, as the
   rule promises.
-  Gate: 1042 compiler tests across 54 files.
+  Gate: 1041 compiler tests across 54 files.
 - [x] **`str` as a view in Base (B2, fifth slice)** (2026-09-04). A `.lucb`
   module's `str` is the HIR type `StringView`, distinct from full Luce's
   owned string: a `const u8*` and a `usize` byte count, the same two words
@@ -2384,6 +2384,18 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   the reference interpreter reads the view's bytes as text. `cstr` and
   `str(bytes)` wait for the `c` module and the standard library (B4, B5).
   Gate: 1042 compiler tests across 54 files.
+- [x] **Zero values and `---` (B3, first slice)** (2026-09-04). In a `.lucb`
+  module a `var` with a written type and no initialiser holds that type's
+  zero (base.md §6.1): the parser reads the missing initialiser as the
+  expression `ZeroValue` and `= ---` as `Uninitialized`, the checker admits
+  the zero only for a zeroable type and names the first component that has
+  none (a bare pointer, a function, an interface view, or an aggregate
+  holding one), and refuses both spellings on a `let`. The lowerer emits
+  the new canonical `Zero(address, type)` for the zero and nothing for
+  `---`; QBE writes zero words then the tail, Wasm uses `memory.fill`, and
+  the MIR oracle clears the bytes. The reference interpreter's zero value
+  gains structs, spans, and text (an empty view of a dangling place).
+  Gate: 1044 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 
