@@ -2396,6 +2396,19 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   the MIR oracle clears the bytes. The reference interpreter's zero value
   gains structs, spans, and text (an empty view of a dangling place).
   Gate: 1044 compiler tests across 54 files.
+- [x] **Integer-backed enums (B3, second slice)** (2026-09-04). In a `.lucb`
+  module `enum Access as u32:` with `case = value` lines declares an enum
+  that is its representation (base.md §10.3): the parser reuses the
+  `export c enum` body, the declaration carries `is_integer_backed` beside
+  the value table, and the C export surfaces skip it until B4 settles its
+  header form (§17.6). `|`, `&`, `^`, and `~` produce the enum and run on
+  the representation, `(u32)e` and `(Access)n` are casts, `Access(n)` is
+  the checked conversion (`EnumFromInteger`, a flat compare chain ending in
+  a trap), and `match` requires `_`. MIR lowers the type to its integer, a
+  case to its constant, and a case pattern to an equality; both oracles hold
+  the integer, so hashing, equality, and the zero value follow the scalar
+  paths.
+  Gate: 1049 compiler tests across 54 files.
 
 ## 3. Bugs the multi-backend harness found
 
