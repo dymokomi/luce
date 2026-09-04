@@ -2169,7 +2169,22 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 986 compiler tests across 49 files.
+  Gate: 993 compiler tests across 50 files.
+
+- [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
+  second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
+  and marker spellings longest first (`+%=`, `-%=`, `*%=`, `+|=`, `-|=`,
+  `*|=`, `---`, `...`, `+%`, `-%`, `*%`, `+|`, `-|`, `*|`, `+?`, `-?`, `*?`,
+  `@`) and the eleven Base-only reserved words. The tokenizer takes the
+  module's profile from the package reader: in a `.lucb` module those
+  spellings are one token each and the words are keywords; in a `.luc` module
+  a Base spelling is a diagnostic naming Luce Base and the words stay
+  ordinary names, so `with`, `free`, and `union` remain valid identifiers in
+  full Luce. The full-only words `class`, `spawn`, and `weak` stay keywords in
+  both profiles and are refused by HIR in Base. The grammar for the new
+  tokens arrives with the slices that give them meaning; until then a Base
+  module that spells one gets a parse diagnostic, pinned by a fixture.
+  Gate: 993 compiler tests across 50 files.
 
 ## 3. Bugs the multi-backend harness found
 
