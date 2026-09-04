@@ -10,61 +10,74 @@ changes. Checked items stay here only when their condensed decision or
 dependency context is needed to understand the remaining sequence;
 `done.md` owns the full evidence. Do not let either drift into a wish list.
 
-Last updated: 2026-09-03 (Stage-0 0.30).
+Last updated: 2026-09-03 (Stage-0 0.30); Base sequenced into stage 1.
 
 ## Current resumption snapshot
 
 The only active development line is `main`, which on 2026-09-03 became the
 former `stage1-qbe` line; the superseded native-backend `main` is kept as
-`archive/main-native-2026-08-30`. Its purpose is the complete Luce 1.0
-source-to-QBE checkpoint: one target-neutral HIR and canonical MIR, three
-agreeing semantic/artifact executions, executable examples for every
-demonstrable capability, and stable diagnostics for every deliberate
-rejection. Do not merge the archived native-backend work, and do not begin a
-Luce-owned machine backend before this checkpoint is complete and audited.
-QBE itself is a baseline, not a destination: once Luce Base
-([`../language/base.md`](../language/base.md)) exists, the native backend is
-to be written in it against the same canonical MIR.
+`archive/main-native-2026-08-30`. Do not merge the archived native-backend
+work.
+
+The 1.0 checkpoint is now defined in two halves that share one compiler:
+
+1. **Full Luce on QBE**: one target-neutral HIR and canonical MIR, three
+   agreeing semantic/artifact executions, executable examples for every
+   demonstrable capability, and stable diagnostics for every deliberate
+   rejection. This half is nearly closed; the open rows are listed below.
+2. **Luce Base** ([`../language/base.md`](../language/base.md)): the C-like
+   profile of the same compiler, selected by the `.lucb` suffix. It is the
+   language the runtime, the standard library, and later the native backend
+   are written in. It was a post-1.0 effort until the 2026-09-03 audit showed
+   that the remaining 1.0 rows either need it (the standard library that
+   self-hosting depends on) or are made redundant by it (the three-layer C
+   import). It is therefore a stage-1 dependency, sequenced in §5.
+
+QBE is a baseline, not a destination: it is the native oracle that every
+Base slice and the eventual Luce-owned backend are proved against.
 
 The repository currently proves 972 compiler tests across 37 files, plus the
-CLI, Wasmtime, QBE differential, and host-native gates. FIIR 2 keeps
-Clang-proven pointer facts separate from reviewed binding recipes and generates
-ordinary safe Luce owners, checked call borrows, returned-borrow anchors, and
-integer-status failures for direct opaque handles. The next implementation
-slice is **S21 complete opaque-handle spellings and directions**, beginning at
-the first row under §5.2 below.
+CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
+and its fixes are recorded in `done.md`; compile time is linear in program
+size on the synthetic corpora, native traps name their reason, and the
+harness asserts that reason against the MIR oracle.
 
 There are three deliberately non-overlapping sources of truth:
 
 1. [`done.md`](done.md) records only committed, full-gate-green behavior and
    the evidence behind it.
-2. This file records architecture decisions and implementation order. Within
-   it, the nested FIIR list below is the exact S21 order.
+2. This file records architecture decisions and implementation order.
 3. [`../../examples/FEATURES.md`](../../examples/FEATURES.md) is the normative
    section-by-section conformance ledger. Its “Exact open stage-1 checklist”
-   is the exhaustive blocker list for the 1.0 source-to-QBE checkpoint.
+   is the exhaustive blocker list for the full-Luce half; the Base half gets
+   its own ledger section as its first slice lands.
 
-At this snapshot the open blocker groups are:
+At this snapshot the work is ordered as:
 
-| Order | Ledger IDs | Work remaining |
+| Order | Ledger IDs | Work |
 | --- | --- | --- |
-| 1 | S21, S23, S24 | Finish FIIR recipes and declaration vocabulary, resolve the extern-struct grammar contract, and enforce callback runtime/thread rules. |
-| 2 | S12, S13, S30 | Finish public text/bytes/codecs and required runtime services, complete error/trace/fatal diagnostics, and run the remaining proving examples through QBE. |
-| 3 | S02, S26, S27 | Implement source `test` semantics and isolation, then close its namespace rules, required command modes, structured diagnostics, and canonical formatting. |
-| 4 | S01, S28 | Close the naming/style audit and map every deliberate exclusion to a stable negative fixture. |
-| 5 | S29 | Compile the compiler with stage 1, compare observable behavior, and preserve the frozen bootstrap chain. |
-| 6 | all rows | Run the final conformance, architecture, ownership, file-size, performance, examples, and multi-backend audit; then pause for review. |
+| 1 | B1–B4 | Base frontend and HIR profile: suffix selection, pointers, spans, globals, unions, the §19.2 MIR additions, and QBE legalization for each. |
+| 2 | B5 | Port the sealed runtime to Base; prove it with the existing differential corpus. |
+| 3 | B6, S12, S30 | The standard library in Base behind the §18 crossing rules: memory, io, files, c, process, strings, json; automatic standard-module loading. |
+| 4 | S29 | Self-host: compile the compiler with stage 1 over that library, compare with the Stage-0 build, keep one prior compiler. |
+| 5 | S13, S26, S27, S28, S01, S02 | Trap/error provenance, source tests, command modes, formatter, naming audit, exclusion fixtures. Shared by both profiles; independent of Base; may be interleaved when a Base slice is blocked. |
+| 6 | all rows | Final conformance, architecture, ownership, file-size, performance, examples, and multi-backend audit; then pause for review. |
 
-The longer proving-program and host roadmap in §§4–5 is design context, not an
-implicit expansion of this checkpoint. A task there blocks 1.0 only when the
-conformance ledger names it (currently through S30). The Wasm engine, complete
-host application, Luce-owned native backends, image/link writers, persistent
-services, and post-1.0 packaging/release work explicitly begin after the
-source-to-QBE review.
+S21, S23, and S24 (the FIIR/C-import vocabulary) are **frozen** at the
+committed baseline: `base.md` §17 replaces the three-layer import with C
+bindings written directly in Base, and §18.6 makes the safe wrapper ordinary
+Base behind a `.lucn` module. What exists stays green and documented; no new
+FIIR vocabulary is added. The condensed dependency plan is kept in §5.3 for
+the day a Clang-validated binder is revisited.
 
-Local milestones use brief commit subjects and the sole author/committer
-`Dy Mokomi <dy@dymokomi.com>`. Keep the branch local until Dy explicitly asks
-for a push.
+The longer proving-program and host roadmap in §4 is design context, not an
+implicit expansion of this checkpoint. The Wasm engine, complete host
+application, image/link writers, persistent services, and post-1.0
+packaging/release work explicitly begin after the source-to-QBE review.
+
+Local milestones use one short lowercase commit subject and the sole
+author/committer `Dy Mokomi <dy@dymokomi.com>`, with no trailers. Keep the
+branch local until Dy explicitly asks for a push.
 
 ## Recovery audit of the unpublished native branch
 
@@ -219,6 +232,18 @@ does not duplicate those passes in stage 1.
   the shared MIR boundary, not by introducing target passes into the core.
 - `libluce_rt` is Luce compiled as ordinary MIR. During stage 1 QBE links it
   through the host toolchain; later native backends may own that final link.
+- **Luce Base shares every stage.** A `.lucb` module goes through the same
+  tokenizer, parser, HIR, MIR, verifier, and backends with the Base profile
+  active: the grammar additions of `base.md` §21 are admitted, runtime-
+  dependent constructs are rejected naming the tier they belong to, and the
+  freestanding property is checked by reachability. What Base adds to MIR is
+  the closed list in `base.md` §19.2; each addition is target-neutral and is
+  legalized by QBE as `base.md` §19.3 describes (atomics and volatile through
+  the `__atomic_*` calls, fences and `asm` as out-of-line assembly). Nothing
+  Base needs may introduce a target fact before the backend boundary.
+- **The Luce-owned native backend is written in Base**, against the same
+  canonical MIR, and must agree with QBE on the complete differential corpus
+  before it replaces it. It begins only after self-hosting (§5, order 4).
 
 ### WebAssembly
 
@@ -238,152 +263,178 @@ and proof belong in [done.md](done.md); the conformance ledger identifies the
 normative gap. Architecture decisions that constrain future work remain in
 §§2–3 and §6 rather than masquerading as unfinished tasks.
 
-### 5.1 Source-to-QBE closure order
+### 5.1 Base, runtime, standard library, self-hosting
 
-- [ ] **S21 — finish C import through FIIR.** Follow the dependency plan in
-  §5.2. Every slice must preserve one target-neutral HIR/MIR shape and prove
-  generated raw source, both semantic oracles, Wasm encoding where applicable,
-  and real linked QBE/C execution.
-- [ ] **S23 — settle the extern-struct grammar contract.** Resolve the
-  field-only grammar versus richer prose conflict in the language document,
-  then close the resulting positive/negative matrix without creating a second
-  nominal-record implementation.
-- [ ] **S24 — enforce callback runtime and thread rules.** Complete the
-  remaining C-export callback matrix using the existing exact cfunc identity.
-  Context, lifetime, thread entry, and runtime attachment must be explicit
-  recipe/runtime contracts, not backend guesses.
-- [ ] **S12/S30 — finish the standard/runtime surface required by the
-  examples.** Public text and bytes builders, UTF codecs, numeric
-  parsing/formatting policy, remaining arena/pool/generational-handle
-  contracts, automatic standard-module loading, required host libraries, and
-  source-test resource reports remain. Existing lists, maps, sets, immutable
-  strings/bytes, affine internal formatting, classes, tasks, and explicit
-  standard-source provenance are the proven foundation.
-- [ ] **S13 — close errors, fatal outcomes, and diagnostic provenance.** Add
-  error context/source traces, structured fatal reporting, complete trap source
-  locations, and the remaining stack-budget reporting. Finish the measured
-  recursion work in [recursion.md](recursion.md) only where evidence identifies
-  an unsafe recursive owner.
-- [ ] **S26/S02 — implement source tests and their scopes.** Lower source
-  test declarations through HIR/MIR into an isolated registry and runner;
-  implement test-only import pruning, selection/reporting, and
-  testing.expect_trap; then close the namespace/lifetime matrix that depends on
+Each row is one independently committable vertical slice with the same six
+gates as every full-Luce capability (`FEATURES.md`): frontend positive and
+negative fixtures, HIR resolution and stable rejections, HIR execution where
+the reference interpreter can express the slice, canonical MIR with verifier
+rules and MIR execution under explicit layout, optimized QBE execution, and a
+focused example. `base.md` §8.9 records the one exception: the reference
+interpreter rejects `asm`, so those programs are proved by the compiled
+backends only.
+
+- [ ] **B1 — the Base profile.** Select the profile by the `.lucb` suffix
+  (and rename the audited tier to `.lucn`, `base.md` §16.2); admit the Base
+  reserved words and the `@`, `---`, `...`, and wrapping/saturating/checked
+  operator tokens only in Base modules; reject classes, collections, closures,
+  workers, and `weak` in Base naming the tier they belong to; add the
+  freestanding reachability check. Deliver `usize`/`isize` as a pointer-width
+  integer with symbolic `sizeof`/`alignof`/`offsetof` folded by the backend
+  (§19.2), implicit same-signedness widening, C division and remainder, and
+  the `(T)x` cast family (§7.5), with the differences from full Luce pinned by
+  negative fixtures in both profiles.
+- [ ] **B2 — pointers and spans.** `T*`, `const`/`volatile` qualifiers, the
+  null-niche `T*?`, `void*`, `&x` with the path-derived qualifier and the
+  escape rule (§6.6), pointer arithmetic and ordering, `T[N]` value arrays
+  with C layout, `T[]` spans with checked indexing and slicing, `str` as a
+  view and `cstr`, and `for x in &items`. This slice adds the nullable
+  pointer type, pointer difference/conversion/ordering, and the volatile flag
+  to MIR.
+- [ ] **B3 — bindings, globals, unions, allocation.** Zero values and `---`,
+  module `var` and `thread_local var` with constant initializers, `union`,
+  integer-backed enums with `as` and bit operators, the `packed`/`align`
+  layout words, `new`/`alloc`/`free`/`with`/`in` over the `Allocator`
+  interface with recoverable `memory.exhausted`, `defer`/`errdefer`, labeled
+  loops, and match guards. This slice adds the union type and the
+  memory-zeroing instruction to MIR.
+- [ ] **B4 — interface views, atomics, `asm`, calling C.** Two-word
+  unmanaged interface views with a witness-table-address instruction, `@T`
+  atomics and fences with the C11 orderings, `volatile` loads and stores,
+  per-architecture `asm` blocks and `naked` functions, the declaration
+  attributes of §9.8, `extern` declarations with the one boundary check
+  (§17.1), variadic C calls with the literal rules of §17.2, `fmt` parameters
+  and `location()`, and `export` with the C-representable rule and generated
+  header (§17.6). Each MIR addition is legalized through QBE as §19.3 states.
+- [ ] **B5 — the runtime in Base.** Port `src/runtime` to a Base package
+  keeping only the two sealed `.lucn` intrinsics (§18.13). It must compile
+  freestanding, keep every runtime binding's exact signature, and pass the
+  complete differential corpus through both oracles and QBE unchanged. This
+  is the first real Base program and the proof that B1–B4 are sufficient.
+- [ ] **B6/S12/S30 — the standard library in Base.** `memory`, `io`,
+  `files`, `c`, `process` (spawn, wait, temporary directories), `strings`,
+  `paths`, `json`, `thread`, `sync`, and `atomic`, each a Base module with
+  the safe-Luce crossing of §18 (owned values lent in, views copied out,
+  adapters reported by `luce build --costs`). Public text/bytes builders,
+  UTF codecs, and numeric parsing/formatting land here as Base code over
+  caller buffers. Automatic standard-module loading replaces the explicit
+  `--standard-root`/`--runtime` flags; the shipped source location is
+  discovered from the installed toolchain, never from a checkout path.
+- [ ] **S29 — self-hosting.** Compile the compiler with stage 1 over that
+  library, compare observable behavior with the pinned Stage-0 0.30 build on
+  the full gate, retain one prior compiler forever, and measure source
+  throughput before any speculative representation tuning. The compiler
+  source may then leave the Stage-0 subset.
+
+### 5.2 Language rows shared by both profiles
+
+Independent of Base; schedule between Base slices when one is blocked.
+
+- [ ] **S13 — errors, fatal outcomes, and diagnostic provenance.** Error
+  context/source traces, structured fatal reporting, complete trap source
+  locations (native traps now print their reason; add the location), and the
+  remaining stack-budget reporting. Finish the measured recursion work in
+  [recursion.md](recursion.md) only where evidence identifies an unsafe
+  recursive owner.
+- [ ] **S26/S02 — source tests and their scopes.** Lower `test` declarations
+  through HIR/MIR into an isolated registry and runner (the Base runner of
+  `base.md` §16.5 shares it), test-only import pruning, selection/reporting,
+  `testing.expect_trap`, then the namespace/lifetime matrix that depends on
   that model.
-- [ ] **S27/S01 — finish the first-party command and formatting contract.**
-  Complete the required command modes, structured diagnostic/fix shape,
-  canonical formatter, and naming/style diagnostics. The existing check, run,
-  and build core is not the complete §24 contract.
-- [ ] **S28 — prove every deliberate exclusion.** Give each §25 exclusion a
-  stable negative fixture at its first rejecting stage; absence of an
-  implementation is not evidence.
-- [ ] **S29 — prove self-hosting and the bootstrap chain.** Compile the compiler
-  with stage 1, compare observable behavior with the pinned Stage-0 0.30 build,
-  retain one prior compiler forever, and measure source throughput before any
-  speculative representation tuning.
-- [ ] **Add generated-program and fuzzing gates.** Run deterministic generated
-  valid/invalid programs through the same HIR/MIR/QBE triangle, record seeds,
-  minimize failures, and never claim coverage that is not executing.
-- [ ] **Perform the final checkpoint audit and pause.** Reconcile every
-  conformance row, run every example and diagnostic gate, inspect ownership and
-  lifecycle seams, re-run the no-platform-before-backend check, review large
-  files and pass boundaries, measure the compiler, and run the complete test
-  suite. Then stop for Dy's review before changing main or beginning another
-  backend.
+- [ ] **S27/S01 — the first-party command and formatting contract.** The
+  required command modes, structured diagnostic/fix shape, canonical
+  formatter (one formatter for both profiles), and naming/style diagnostics.
+- [ ] **S28 — every deliberate exclusion.** A stable negative fixture at its
+  first rejecting stage for each §25 exclusion of `1.0.md` and each §20
+  exclusion of `base.md`; absence of an implementation is not evidence.
+- [ ] **Generated-program and fuzzing gates.** Deterministic generated
+  valid/invalid programs through the HIR/MIR/QBE triangle, recorded seeds,
+  minimized failures; never claim coverage that is not executing.
+- [ ] **Final checkpoint audit.** Reconcile every conformance row, run every
+  example and diagnostic gate, inspect ownership and lifecycle seams, re-run
+  the no-platform-before-backend check, review large files and pass
+  boundaries, measure the compiler, run the complete test suite, and stop for
+  Dy's review before beginning the Base-written native backend.
 
-### 5.2 FIIR dependency plan (S21)
+### 5.3 Frozen: the FIIR/C-import vocabulary (S21, S23, S24)
 
 The proven baseline is recorded in [done.md](done.md): C Boolean, every
 fundamental integer, exact IEEE binary16/32/64 values, the supported binary64
 long-double model, scalar typedef chains, open named/typedef-backed enums,
 constant-only anonymous enums, plain nested records, header-local scalar/enum
 constants, selected scalar macros, live scalar/enum objects, fixed functions,
-and direct pointers to typedef-backed incomplete records all pass Clang facts
-through deterministic FIIR/raw/C products, both semantic oracles, Wasm, and
-linked QBE/C. A separate reviewed recipe section now classifies every direct
-opaque boundary needed by a safe module; generated owners, call borrows,
-returned-borrow anchors, disposers, and integer-status failures execute through
-the same ordinary HIR/MIR pipeline. Typed pointers and layout still terminate
-in the C adapter.
+direct pointers to typedef-backed incomplete records, and one reviewed recipe
+vocabulary for opaque handles all pass Clang facts through deterministic
+FIIR/raw/C products, both semantic oracles, Wasm, and linked QBE/C.
 
-Unsupported declarations must continue to fail before HIR rather than acquire
-an approximate carrier. Resume in this order; each row is one independently
-committable vertical slice and updates the spec, examples, conformance ledger,
-and diagnostics with its tests:
+That baseline stays green and documented, and unsupported declarations keep
+failing before HIR rather than acquiring an approximate carrier. No further
+rows are implemented on it: `base.md` §17.5 makes `luce bind` emit a `.lucb`
+declaration module from a Luce-owned C declaration parser, with Clang as an
+optional validator and a recipe for what headers do not state. When that
+binder lands (after B4), the remaining vocabulary is closed there, in this
+order, one slice each: tagged-struct pointers and pointer typedef chains;
+pointer-plus-count arrays and strings as spans; function pointers and
+callbacks with the runtime/thread rule; unions and bit-fields (bit-fields
+through recipe-named accessor shims); atomic and thread-local objects;
+pointer/array/string macro constants; typed variadic shims; and support
+tiers with deterministic regeneration diagnostics. The audit's two FIIR
+findings, spelling-based type matching in `fiir/clang.luc` and the silent
+skip of macro-expanded declarations, are fixed only if that path is revived;
+otherwise they retire with it.
 
-- [ ] **Complete opaque-handle spellings and directions.** Add direct tagged
-  struct pointers, pointer typedef chains, const/read-only results, and
-  pointer-to-pointer/out-handle forms on the recipe model. Prove a SQLite-style
-  T-double-pointer output plus disposer without a general raw pointer in HIR or
-  MIR.
-- [ ] **Pointer-plus-count arrays and strings.** Map borrowed inputs, writable
-  call-scoped outputs, count/capacity/writeback relations, C-string copies, and
-  owned returned buffers onto the existing target-neutral list, slice, bytes,
-  string, and foreign-memory contracts. Arrays in records and returned storage
-  stay closed until ownership is explicit.
-- [ ] **Imported function pointers and callbacks.** Decode exact Clang
-  signatures into the existing cfunc model, including nullable slots and
-  context/lifetime recipes, then close S24's runtime/thread enforcement.
-- [ ] **Unions, bit-fields, and aggregate storage.** Prefer generated C thunks
-  with logical Luce carriers; never copy C byte layout into HIR/MIR. Admit
-  aggregate constants/objects only with complete value and writeback semantics.
-- [ ] **Atomic and thread-local objects.** Require explicit operation and
-  execution-domain recipes. Neither qualifier may become an ordinary shared
-  load/store.
-- [ ] **Pointer, array, and string macro constants.** Reuse the completed
-  storage/ownership carriers and keep Clang as the sole evaluator of
-  preprocessing and constant semantics.
-- [ ] **Typed variadic adapters.** Generate fixed, checked C thunks from an
-  explicitly requested signature; no untyped vararg operation enters Luce,
-  HIR, or MIR.
-- [ ] **Extended floating carriers.** Define a lossless logical carrier before
-  admitting any non-binary16/32/64 target model. Narrowing remains forbidden.
-- [ ] **Support tiers and deterministic regeneration diagnostics.** Record why
-  each declaration is direct, thunked, recipe-dependent, or unsupported;
-  compare regenerated products structurally and report stable declaration
-  origins. Freeze the FIIR format only after the vocabulary is represented;
-  no backward-compatibility layer is required while the project is in building
-  mode.
-
-### 5.3 Constraints while closing the checkpoint
+### 5.4 Constraints while closing the checkpoint
 
 - Keep the shared frontend, HIR, canonical MIR, verifier, optimizer, and
   lowerer free of target names, pointer widths, byte layouts, ABI classes, and
-  platform policy. QBE, Wasm, and later native backends begin from the same MIR.
-- Add a # mark: section heading whenever a touched file gains a distinct
-  cohesive region. Roughly 2,000 lines triggers an ownership review. Split only
-  at a real state/transaction boundary; a forwarding-only file is not a
+  platform policy. Base's pointer-width integer and layout constants are
+  symbolic in MIR and folded only by a backend. QBE, Wasm, and the later
+  Base-written native backend begin from the same MIR.
+- One vocabulary per concept: a new node form, type form, or instruction is
+  added in its one definition plus `node_children`/`type_form_key`/
+  `mir_type_key`; walkers match only the forms they treat specially. Do not
+  reintroduce per-walker child lists.
+- Every lookup over a program-wide table goes through an index (hash or
+  dense id table), never a scan; every emitted text is collected as
+  fragments, never appended to one string. Measure with the synthetic scaling
+  driver after touching any of them.
+- Add a `# mark:` section heading whenever a touched file gains a distinct
+  cohesive region. Roughly 2,000 lines triggers an ownership review. Split
+  only at a real state/transaction boundary; a forwarding-only file is not a
   refactor.
-- Extend the freestanding Luce runtime only when a remaining semantic service
-  needs it. Runtime discovery must not embed checkout paths or platform
-  syscalls in the compiler; automatic installed-toolchain discovery remains
-  part of S30.
 - Every source feature needs positive and negative frontend/HIR coverage,
-  independent HIR and MIR execution, optimized QBE execution, a focused example
-  when demonstrable, and Wasm evidence where the existing backend naturally
-  supports it.
+  independent HIR and MIR execution, optimized QBE execution, a focused
+  example when demonstrable, and Wasm evidence where the existing backend
+  naturally supports it. A Base feature additionally needs its full-Luce
+  negative fixture where the two profiles differ (`base.md` §23).
 - Keep small green commits with the sole author/committer
   Dy Mokomi <dy@dymokomi.com>, and do not push without explicit instruction.
 
-### 5.4 Explicitly after the source-to-QBE review
+### 5.5 Explicitly after the self-hosting review
 
 These are real project goals, but they do not extend the current completion
 contract unless the conformance ledger explicitly promotes one:
 
-- Luce-owned native backends, one target first, proved against QBE before a
-  second target;
+- the Luce-owned native backend, written in Base, one target first, proved
+  against QBE on the complete corpus before a second target;
 - native image/link writers after native code generation justifies them;
 - a Luce Wasm decoder/validator/interpreter and the complete host application;
 - storage, crypto, terminal, realm/network, UI/Metal, and the full guest/host
   proving products beyond the examples required by S30;
+- the remaining cleanup from the 2026-09-03 audit that no slice above forces:
+  the runtime-call dispatch duplicated between the QBE and Wasm emitters, the
+  per-instruction runtime-binding scans, the specializer's clone walker, the
+  package codecs' four node tables, and silent Wasm traps;
 - luce api diff, luce describe, and optional Wasm fuel/preemption;
 - post-1.0 package, cache, profile, persistent-service, documentation, and
   release-policy work.
 
 Do not freeze the language or add backward-compatibility machinery until Dy
 explicitly ends building mode. Also keep the standing deferrals: no bare-metal
-system profile, effects/uses clauses, dependent types, source macros,
-reflection, compile-time execution, transactional heap, or incremental binary
-patching without new evidence and a deliberate plan change.
+system profile beyond `--freestanding`, effects/uses clauses, dependent
+types, source macros, reflection, compile-time execution, transactional heap,
+or incremental binary patching without new evidence and a deliberate plan
+change. `goto` stays reserved (`base.md` §8.6).
 
 ## 6. Decision gates and standing rules
 
@@ -397,6 +448,10 @@ Gates — settle in `1.0.md` before the feature lands in `hir_gen`:
 | Closure capture: explicit vs §14.1 implicit shared cell, by the both-ways corpus test | closures | the compiler and all three C++ repos are closure-light corpora |
 | ~~Whether 1.0 has general const generics~~ | generics | **met**: §15.4 excludes them; `array[T, N]` is the sole compiler-built fixed value parameter |
 | ~~`hir_gen` keeps doc comments, parameter names, defaults~~ | structs | **met** (`done.md` §2) |
+| Base and full Luce keep one parser and one formatter; every Base-only token is admitted by profile, never by a second grammar | B1 | `base.md` §3.2, §21 notes |
+| Nullable pointers use the null niche; every other optional stays the uniform tagged enum (§2) | B2 | `base.md` §5.3, §5.8 |
+| The runtime's two sealed intrinsics are the only `.lucn` code in the runtime package | B5 | `base.md` §18.13 |
+| Owned values are lent into Base, views are copied out; no value that can dangle reaches safe code | B6 | `base.md` §18.4–18.5, `--costs` report |
 
 Standing rules:
 
