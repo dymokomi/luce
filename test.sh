@@ -45,7 +45,9 @@ if grep -R -n 'compiler\.profiles\.full' src/compiler/profiles/base; then
     echo "the base profile imports the full profile" >&2
     exit 1
 fi
-dispatch_points='src/compiler/hir/body_checker.luc
+dispatch_points='src/compiler/hir/analyzer.luc
+src/compiler/hir/body_checker.luc
+src/compiler/hir/declarations.luc
 src/compiler/hir/entry_points.luc
 src/compiler/mir/function_lowerer.luc
 src/compiler/backends/interpreter.luc
@@ -54,13 +56,27 @@ src/compiler/backends/qbe.luc
 src/compiler/backends/qbe_toolchain.luc
 src/compiler/backends/wasm.luc
 src/compiler/backends/wasm_plan.luc'
-profile_importers=$(grep -R -l 'compiler\.profiles\.' src/compiler/frontend src/compiler/hir src/compiler/mir src/compiler/backends src/compiler/*.luc || true)
+profile_importers=$(grep -R -l 'compiler\.profiles\.' src/compiler/frontend src/compiler/hir src/compiler/mir src/compiler/backends src/compiler/c_api src/compiler/packages src/compiler/*.luc || true)
 for importer in $profile_importers; do
     if ! printf '%s\n' "$dispatch_points" | grep -q -x "$importer"; then
         echo "$importer names a profile outside profile.luc and the dispatch points" >&2
         exit 1
     fi
 done
+# 1c. No dialect branches in shared code (decision of 2026-09-04, plan.md
+#     §5.0): a shared stage asks `profile.luc` what a profile admits or hands
+#     the decision to the profile's own class; it never compares profiles.
+#     `mir/freestanding.luc` asks the admission table for one profile and
+#     `packages/identity_codec.luc` decodes a stored authority tag.
+if grep -R -n 'in_base_module()' src/compiler; then
+    echo "a shared stage branches on the Base profile" >&2
+    exit 1
+fi
+if grep -R -n -E 'Profile\.(base|full)|ModuleAuthority\.base' src/compiler/frontend src/compiler/hir src/compiler/mir src/compiler/backends src/compiler/c_api src/compiler/packages \
+    | grep -v -E '^src/compiler/(mir/freestanding\.luc|packages/identity_codec\.luc|frontend/(parser|tokenizer)\.luc:[0-9]+: +pub init)'; then
+    echo "a shared stage names a profile outside profile.luc and the admission tables" >&2
+    exit 1
+fi
 
 # 2. Unit tests: every tests/compiler/**/*_test.luc file.
 "$luce" test

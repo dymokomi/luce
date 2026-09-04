@@ -31,7 +31,7 @@ from compiler.hir.ir import integer_bit_width, is_pointer_integer_type, is_unsig
 from compiler.hir.ir import place_element_step, place_field_step
 from compiler.hir.ir import HirCFunction, AtomicOperation, AtomicOrdering, HirRecordLayout, atomic_inner
 from compiler.hir.declarations import DeclarationCollector
-from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant
+from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant, AddressParts, ProfileChecks, names_a_value, type_path_of
 from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, HirGenerationState, HirSemanticChecker, ImportedBinding, ImportedModule
 from compiler.hir.generation_model import LocalBinding, LocalStorage, MatchCoverage, ModuleBindings, NativePointerType, ResolvedBinary, ResolvedCallee, builtin_type_id
 from compiler.hir.generics.functions import GenericFunctionChecker
@@ -41,8 +41,10 @@ from compiler.hir.interfaces.iteration import IterationChecker
 from compiler.hir.interfaces.structural import StructuralProtocolChecker
 from compiler.hir.interfaces.values import InterfaceValueChecker
 from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_formatted_text, decode_text_literal
-from compiler.profile import Profile, belongs_to_full_luce, profile_of
+from compiler.profile import Profile, belongs_to_full_luce, profile_of, Construct, admits_construct, construct_diagnostic
+from compiler.profiles.base.hir.base_checks import BaseProfileChecks
 from compiler.profiles.full.hir.checker import FullProfileChecker
+from compiler.profiles.full.hir.full_checks import FullProfileChecks
 from compiler.profiles.full.hir.closure_context import ClosureContext
 from compiler.formatting.formatted_strings import FormattedSourcePart, normalize_formatted_parts
 from compiler.formatting.ieee import normalize_ieee_float
@@ -65,6 +67,9 @@ pub class HirBodyChecker: HirSemanticChecker:
     ## The one dispatch point for full-Luce-only forms: closures, collections,
     ## classes, and workers (profiles/full/hir/checker.luc).
     let full: FullProfileChecker
+    ## Each profile's `ProfileChecks` (profiles/{base,full}/hir).
+    let base_checks: BaseProfileChecks
+    let full_checks: FullProfileChecks
 
     pub init(state: HirGenerationState, declarations: DeclarationCollector):
         self.state = state
@@ -80,6 +85,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         self.iterations = IterationChecker(state, declarations, generics, interfaces)
         self.structural = StructuralProtocolChecker(state, declarations)
         self.full = FullProfileChecker(state, declarations, generics, closures)
+        self.base_checks = BaseProfileChecks(state, declarations)
+        self.full_checks = FullProfileChecks(state)
 
     # mark: Constants and bodies ================================================================
 
@@ -127,6 +134,24 @@ pub class HirBodyChecker: HirSemanticChecker:
             subject,
             missing_subject,
         )
+
+    pub func push_constant_for_feature(value: Value, value_type: TypeId, span: SourceSpan) -> NodeId:
+        return self.push_constant(value, value_type, span)
+
+    pub func convert_existential_for_feature(value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        return try self.interfaces.convert_existential(self, value, found, expected)
+
+    pub func convert_interface_value_for_feature(value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        return try self.checks().convert_interface_value(self, value, found, expected)
+
+    pub func check_interface_receiver_for_feature(receiver: NodeId, is_mutating: bool, span: SourceSpan) -> !:
+        try self.checks().check_interface_receiver(self, receiver, is_mutating, span)
+
+    pub func address_of_node_for_feature(value: NodeId, span: SourceSpan) -> AddressParts!:
+        return try self.address_of_node(value, span)
+
+    pub func check_common_slice_for_feature(sliced: ExpressionSyntax, start: ExpressionSyntax?, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        return try self.full.check_slice(self, sliced, start, end, span, expected)
 
     pub func check_function_address_for_feature(function_index: i64, span: SourceSpan, expected: TypeId?) -> NodeId!:
         return try self.check_function_address(function_index, span, expected)
@@ -385,8 +410,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             DeferStatement(value):
                 return try self.check_defer(value, statement.span, false)
             ErrorDeferStatement(value):
-                if not self.in_base_module():
-                    try self.fail(statement.span, "`errdefer` belongs to Luce Base; a `.luc` module recovers with `catch` (base.md §8.8)")
+                try self.require_admitted(Construct.errdefer, statement.span, "")
                 if self.state.fallible_inner(self.state.current_result) == none:
                     try self.fail(statement.span, "`errdefer` needs a fallible function; no error can leave this one (base.md §8.8)")
                 return try self.check_defer(value, statement.span, true)
@@ -686,7 +710,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             Group(grouped): return try self.resolve_assignment_place(grouped, span, mutate_value)
             Unary(operator, operand):
                 if operator != "*": error(self.diagnostic(span, "assignment needs a named mutable place"))
-                if not self.in_base_module(): try self.fail(span, "`*` on a value belongs to Luce Base; a `.luc` module has no raw pointers (base.md §5.3)")
+                try self.require_admitted(Construct.pointer_deref, span, "")
                 return try self.pointer_place(try self.check_expression(operand, none), span, mutate_value)
             Name(root_name):
                 var local_index = self.state.find_local(root_name)
@@ -773,28 +797,6 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
 
-    # An array converts to a span that points into it, and a span to a
-    # read-only span of the same element (base.md §5.4).
-    func span_conversion(value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
-        let span = self.state.span_of(value)
-        match self.state.types.definitions[expected.value].form:
-            Span(wanted, wants_const):
-                match self.state.types.definitions[found.value].form:
-                    Array(element, count):
-                        if not types_match(element, wanted): return none
-                        # The span starts at the first element's address.
-                        let address = try self.address_of_node(value, span)
-                        let first = self.push_constant(Value.UnsignedInteger(value = u64(0)), resolve_builtin_type(BuiltinType.unsigned_u64), span)
-                        address.steps.append(place_element_step)
-                        address.steps.append(first.value)
-                        let start = self.state.push_node(HirNodeForm.AddressOf(pointer = address.pointer, symbol = address.symbol, global = address.global, steps = self.state.push_run(address.steps)), self.state.intern_pointer(element, wants_const, false), span)
-                        let length = self.push_constant(Value.UnsignedInteger(value = u64(count)), resolve_builtin_type(BuiltinType.unsigned_usize), span)
-                        return self.state.push_node(HirNodeForm.SpanFromParts(pointer = start, length = length), expected, span)
-                    Span(element, is_const):
-                        if not types_match(element, wanted) or (is_const and not wants_const): return none
-                        return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, span)
-                    else: return none
-            else: return none
 
     # The place a checked node reads, as the parts of an `AddressOf`; a value
     # that is not a place has no address.
@@ -818,7 +820,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     # `u8[](pointer, count)`: a span from its parts; the pointer's qualifier
     # is the span's (base.md §5.4).
     func check_span_construct(element_syntax: TypeSyntax, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
-        if not self.in_base_module(): try self.fail(span, "`T[](pointer, count)` belongs to Luce Base; a `.luc` module has no spans (base.md §5.4)")
+        try self.require_admitted(Construct.span_construct, span, "")
         let element = try self.declarations.resolve_type(self.state.current_module, element_syntax)
         if len(arguments) != 2: try self.fail(span, "a span takes a pointer and a count: `u8[](pointer, count)`")
         for argument in arguments:
@@ -835,16 +837,6 @@ pub class HirBodyChecker: HirSemanticChecker:
         let node = self.state.push_node(HirNodeForm.SpanFromParts(pointer = pointer, length = length), self.state.intern_span(element, is_const), span)
         return try self.require_type(node, expected)
 
-    # `s[a..<b]`, `s[a..=b]`, `s[a..]`, `s[..b]`: a checked sub-span; a missing
-    # start is 0 and a missing end the length (base.md §5.4).
-    func check_span_slice(value: NodeId, element: TypeId, is_const: bool, start: ExpressionSyntax?, operator: str, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
-        let usize = resolve_builtin_type(BuiltinType.unsigned_usize)
-        var lower = self.push_constant(Value.UnsignedInteger(value = u64(0)), usize, span)
-        if start != none: lower = try self.check_expression(start, usize)
-        var upper = NodeId(value = no_node)
-        if end != none: upper = try self.check_expression(end, usize)
-        let node = self.state.push_node(HirNodeForm.SpanSlice(span = value, start = lower, end = upper, inclusive = operator == "..="), self.state.intern_span(element, is_const), span)
-        return try self.require_type(node, expected)
 
     # `&s[i]`: the checked address of one element, `T*` or `const T*`.
     func span_element(value: NodeId, element: TypeId, is_const: bool, subscript: ExpressionSyntax, span: SourceSpan) -> NodeId!:
@@ -1109,7 +1101,7 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     # `free(x)`: `release` of the block `x` names, on the chosen allocator.
     func check_free(value: ExpressionSyntax, allocator: ExpressionSyntax?, span: SourceSpan) -> NodeId!:
-        if not self.in_base_module(): try self.fail(span, "`free` belongs to Luce Base; a `.luc` module has no allocators (base.md §12.2)")
+        try self.require_admitted(Construct.free_statement, span, "")
         let memory = try self.memory_module(span)
         let view = try self.chosen_allocator(memory, allocator, span)
         let checked = try self.check_expression(value, none)
@@ -1140,7 +1132,7 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     # `with allocator:` makes the view current for the suite (base.md §12.3).
     func check_with(allocator: ExpressionSyntax, body: SuiteSyntax, span: SourceSpan) -> NodeId!:
-        if not self.in_base_module(): try self.fail(span, "`with` belongs to Luce Base; a `.luc` module has no allocators (base.md §12.3)")
+        try self.require_admitted(Construct.with_statement, span, "")
         let memory = try self.memory_module(span)
         let view = try self.allocator_view(allocator, try self.allocator_interface(memory, span))
         let global = try self.current_allocator_global(memory, span)
@@ -1539,36 +1531,30 @@ pub class HirBodyChecker: HirSemanticChecker:
             ListValue(elements):
                 return try self.check_array_literal(elements, value.span, expected)
             MapValue(entries):
-                try self.reject_in_base(value.span, "a map literal", "has no built-in collections (base.md §12.1)")
+                try self.require_admitted(Construct.map_literal, value.span, "")
                 return try self.full.check_map_literal(self, entries, value.span, expected)
             Member(member_value, name):
                 return try self.check_field_access(member_value, name, value.span, expected)
             Index(indexed, subscript):
                 return try self.check_index(indexed, subscript, value.span, expected)
             Slice(sliced, start, operator, end):
-                if self.in_base_module():
-                    let viewed = try self.check_expression(sliced, none)
-                    match self.state.types.definitions[self.state.type_of(viewed).value].form:
-                        Span(element, is_const): return try self.check_span_slice(viewed, element, is_const, start, operator, end, value.span, expected)
-                        else: pass
-                return try self.full.check_slice(self, sliced, start, end, value.span, expected)
+                return try self.checks().check_slice(self, sliced, start, operator, end, value.span, expected)
             Lambda(parameters, body):
                 let lambda = try self.full.check_lambda(self, parameters, body, value.span, expected)
-                if self.in_base_module() and self.captures_environment(lambda):
-                    try self.fail(value.span, belongs_to_full_luce("a lambda that captures a local", "converts only capture-free lambdas to function pointers (base.md §9.6)"))
+                if self.captures_environment(lambda): try self.require_admitted(Construct.capturing_lambda, value.span, "")
                 return lambda
             Closure(captures, parameters, result, body):
-                try self.reject_in_base(value.span, "a block closure", "has no closures (base.md §9.6)")
+                try self.require_admitted(Construct.block_closure, value.span, "")
                 return try self.full.check_block_closure(self, captures, parameters, result, body, value.span, expected)
             MatchValue(subject, arms):
                 return try self.check_match_value(subject, arms, value.span, expected)
             NewValue(value_type, arguments):
-                try self.reject_in_base(value.span, "`new` of a class", "has no classes; Base `new` allocates from an allocator (base.md §12.2)")
+                try self.require_admitted(Construct.class_new, value.span, "")
                 return try self.full.check_class_new(self, value_type, arguments, value.span, expected)
             Allocate(shape, value_type, count, arguments, size, alignment, allocator):
                 return try self.check_allocation(shape, value_type, count, arguments, size, alignment, allocator, value.span, expected)
             SpawnValue(function, arguments):
-                try self.reject_in_base(value.span, "`spawn`", "has no workers; threads are the `thread` module (base.md §15.3)")
+                try self.require_admitted(Construct.spawn_expression, value.span, "")
                 return try self.full.check_spawn(self, function, arguments, value.span, expected)
             CatchValue(caught, failure_name, body):
                 return try self.check_catch(caught, failure_name, body, value.span, expected)
@@ -1617,14 +1603,12 @@ pub class HirBodyChecker: HirSemanticChecker:
             value_type = resolve_builtin_type(BuiltinType.character)
             value = Value.Character(value = try self.decode_character(token))
         elif token.kind == TokenKind.str_lit:
-            value_type = resolve_builtin_type(BuiltinType.string)
-            if self.in_base_module(): value_type = self.state.intern_string_view()
+            value_type = self.checks().text_literal_type()
             value = Value.Text(value = try self.decode_text(token))
-            # A literal where `cstr` is wanted is its NUL-terminated data
-            # (base.md §17.2): the cast a programmer would otherwise write.
-            if expected != none and self.in_base_module() and self.is_c_string_type(expected):
-                let text = self.push_constant(value, value_type, token.span)
-                return self.state.push_node(HirNodeForm.Cast(value = text), expected, token.span)
+            let text = self.push_constant(value, value_type, token.span)
+            let adapted = self.checks().adapt_text_literal(self, text, expected)
+            if adapted != none: return adapted
+            return try self.require_type(text, expected)
         elif token.kind == TokenKind.byte_lit:
             value_type = resolve_builtin_type(BuiltinType.byte_string)
             value = Value.Bytes(value = try self.decode_bytes(token))
@@ -1709,7 +1693,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             return try self.require_type(typed, expected)
 
         if operator == "&" or operator == "*":
-            if not self.in_base_module(): try self.fail(span, "`" + operator + "` on a value belongs to Luce Base; a `.luc` module has no raw pointers (base.md §5.3)")
+            try self.require_admitted(Construct.address_of, span, operator)
         if operator == "&": return try self.check_address_of(operand, span, expected)
         if operator == "*":
             # The pointer operand takes no type from context; its pointee does.
@@ -1779,68 +1763,17 @@ pub class HirBodyChecker: HirSemanticChecker:
             operand_context = self.optional_value_context(expected)
 
         var operands = CheckedBinaryOperands(left = NodeId(value = no_node), right = NodeId(value = no_node))
-        if self.in_base_module() and (operator == "+" or operator == "-") and names_a_value(left):
-            # A pointer on the left takes no type from context and its count is
-            # any integer (base.md §7.7). A named value is typed by itself, so
-            # checking it first and then applying the context leaves every
-            # non-pointer operand exactly as the contextual path types it.
-            var checked_left = try self.check_expression(left, none)
-            match self.state.types.definitions[self.state.type_of(checked_left).value].form:
-                Pointer(pointee, is_const, is_volatile):
-                    operands = CheckedBinaryOperands(left = checked_left, right = try self.check_expression(right, none))
-                else:
-                    if operand_context != none: checked_left = try self.require_type(checked_left, operand_context)
-                    operands = CheckedBinaryOperands(left = checked_left, right = try self.check_expression(right, self.state.type_of(checked_left)))
-        else:
-            operands = try self.check_binary_operands(left, right, operand_context)
-        if self.in_base_module():
-            let pointer_arithmetic = try self.check_pointer_arithmetic(operator, operands, span, expected)
-            if pointer_arithmetic != none: return pointer_arithmetic
-            operands = try self.widen_binary_operands(operands)
+        let profiled = try self.checks().check_binary_operands(self, left, right, operator, operand_context)
+        if profiled != none: operands = profiled
+        else: operands = try self.check_binary_operands(left, right, operand_context)
+        let pointer_arithmetic = try self.checks().resolve_pointer_arithmetic(self, operator, operands, span, expected)
+        if pointer_arithmetic != none: return pointer_arithmetic
+        operands = try self.checks().widen_binary_operands(self, operands)
         let resolved = try self.resolve_binary_operation(self.state.type_of(operands.left), operator, self.state.type_of(operands.right), span, conditional_arm_is_none(left) or conditional_arm_is_none(right))
         let typed = self.state.push_node(HirNodeForm.Binary(left = operands.left, operation = resolved.operation, right = operands.right), resolved.result, span)
         return try self.require_type(typed, expected)
 
-    # `p + n`, `p - n`, and `p - q` (base.md §7.7): element-scaled and
-    # unchecked; `n` is any integer, the difference is `isize`.
-    func check_pointer_arithmetic(operator: str, operands: CheckedBinaryOperands, span: SourceSpan, expected: TypeId?) -> NodeId?!:
-        if operator != "+" and operator != "-": return none
-        let left = self.state.type_of(operands.left)
-        let right = self.state.type_of(operands.right)
-        match self.state.types.definitions[left.value].form:
-            Pointer(pointee, is_const, is_volatile):
-                if types_match(pointee, resolve_builtin_type(BuiltinType.unit)):
-                    try self.fail(span, "`void*` has no element size; cast it to a typed pointer before arithmetic (base.md §7.7)")
-                if is_integer_type(self.state.types, right):
-                    let node = self.state.push_node(HirNodeForm.PointerOffset(pointer = operands.left, offset = operands.right, negate = operator == "-"), left, span)
-                    return try self.require_type(node, expected)
-                if operator == "-":
-                    match self.state.types.definitions[right.value].form:
-                        Pointer(other_pointee, other_const, other_volatile):
-                            if not types_match(pointee, other_pointee):
-                                try self.fail(span, "`-` needs pointers to one type, found `" + self.describe_type(left) + "` and `" + self.describe_type(right) + "`")
-                            let node = self.state.push_node(HirNodeForm.PointerDifference(left = operands.left, right = operands.right), resolve_builtin_type(BuiltinType.signed_isize), span)
-                            return try self.require_type(node, expected)
-                        else: pass
-                return none
-            else: return none
 
-    # Base widens the narrower integer operand to the wider one of the same
-    # signedness, so `byte + count` reads as C does (base.md §7.5).
-    func widen_binary_operands(operands: CheckedBinaryOperands) -> CheckedBinaryOperands!:
-        let left = self.state.type_of(operands.left)
-        let right = self.state.type_of(operands.right)
-        if widens_implicitly(self.state.types, left, right):
-            return CheckedBinaryOperands(left = try self.require_type(operands.left, right), right = operands.right)
-        if widens_implicitly(self.state.types, right, left):
-            return CheckedBinaryOperands(left = operands.left, right = try self.require_type(operands.right, left))
-        # Pointers compare across qualifiers (base.md §5.3): the less qualified
-        # side takes the other's type.
-        if qualifies_implicitly(self.state.types, left, right):
-            return CheckedBinaryOperands(left = try self.require_type(operands.left, right), right = operands.right)
-        if qualifies_implicitly(self.state.types, right, left):
-            return CheckedBinaryOperands(left = operands.left, right = try self.require_type(operands.right, left))
-        return operands
 
     # A range keeps equal-width integer bounds and whether its upper endpoint
     # is included. Unsuffixed literals take their width from either neighbor
@@ -1909,12 +1842,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             return ResolvedBinary(operation = base_overflow_operation(operator, left), result = base_overflow_result(self.state, operator, left))
         if operator == "//" or operator == "%":
             if not is_integer_type(self.state.types, left): try self.fail(span, "`" + operator + "` requires integer operands")
-            # Base follows C's instruction: truncation toward zero (base.md §7.2).
-            if self.in_base_module():
-                if operator == "//": return ResolvedBinary(operation = BinaryOperation.TruncDivide(operand_type = left), result = left)
-                return ResolvedBinary(operation = BinaryOperation.TruncRemainder(operand_type = left), result = left)
-            if operator == "//": return ResolvedBinary(operation = BinaryOperation.FloorDivide(operand_type = left), result = left)
-            return ResolvedBinary(operation = BinaryOperation.Remainder(operand_type = left), result = left)
+            return self.checks().integer_division(operator, left)
         if operator == "+":
             if self.full.is_concatenable(left): return ResolvedBinary(operation = BinaryOperation.Add(operand_type = left), result = left)
             match self.state.types.definitions[left.value].form:
@@ -1959,13 +1887,13 @@ pub class HirBodyChecker: HirSemanticChecker:
                     return try self.check_discard(type_arguments, arguments, span, expected)
                 if name == "hash" and self.state.find_local(name) < 0:
                     return try self.structural.check_hash_call(self, type_arguments, arguments, span, expected)
-                if (name == "sizeof" or name == "alignof" or name == "offsetof") and self.in_base_module() and self.state.find_local(name) < 0:
-                    return try self.check_layout_query(name, type_arguments, arguments, span, expected)
+                let builtin = try self.checks().check_named_builtin(self, name, type_arguments, arguments, span, expected)
+                if builtin != none: return builtin
                 if self.state.find_local(name) < 0:
                     if name == "list" or name == "map" or name == "set":
-                        try self.reject_in_base(span, "`" + name + "`", "has no built-in collections (base.md §12.1)")
-                    if name == "Weak": try self.reject_in_base(span, "`Weak`", "has no reference counting (base.md §23)")
-                    if name == "wait_all": try self.reject_in_base(span, "`wait_all`", "has no workers (base.md §15.3)")
+                        try self.require_admitted(Construct.collection_constructor, span, name)
+                    if name == "Weak": try self.require_admitted(Construct.weak_reference, span, "")
+                    if name == "wait_all": try self.require_admitted(Construct.wait_all, span, "")
                     let runtime_value = try self.full.check_named_call(self, name, type_arguments, arguments, span, expected)
                     if runtime_value != none: return runtime_value
                 let conversion_type = builtin_type_id(name)
@@ -2014,8 +1942,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     # `(T)x` is C's cast with every case defined (base.md §7.5); the numeric
     # cases land here, pointers and enums with theirs.
     func check_cast(target: TypeSyntax, value: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId!:
-        if not self.in_base_module():
-            try self.fail(span, "a `(T)x` cast belongs to Luce Base; a `.luc` module spells the checked conversion `T(x)` (base.md §7.5)")
+        try self.require_admitted(Construct.scalar_cast, span, "")
         let destination = try self.declarations.resolve_type(self.state.current_module, target)
         # `(T*?)n` reads its integer as `usize`, so a literal takes that type.
         var value_context: TypeId? = none
@@ -2106,52 +2033,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             Pointer(pointee, is_const, is_volatile): return true
             else: return false
 
-    # `sizeof(T)`, `sizeof(value)`, `alignof(T)`, and `offsetof(T, field)`: a
-    # Base module's layout questions (base.md §5.11). HIR records the question
-    # typed `usize`; the backend that knows the target answers it.
-    func check_layout_query(name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
-        if len(type_arguments) > 0: try self.fail(span, "`" + name + "` takes its type in parentheses and has no type arguments")
-        var query = LayoutQuery.size
-        var wanted = 1
-        if name == "alignof": query = LayoutQuery.align
-        if name == "offsetof":
-            query = LayoutQuery.offset
-            wanted = 2
-        if len(arguments) != wanted:
-            if wanted == 2: try self.fail(span, "`offsetof` takes a type and a field name: `offsetof(Point, x)`")
-            if name == "sizeof": try self.fail(span, "`sizeof` takes exactly one type or value in parentheses")
-            try self.fail(span, "`alignof` takes exactly one type in parentheses")
-        for argument in arguments:
-            if argument.label != none: try self.fail(argument.span, "`" + name + "` uses positional arguments")
-        let subject = try self.layout_subject(arguments[0].value, name, query == LayoutQuery.size)
-        var field = -1
-        if query == LayoutQuery.offset:
-            match arguments[1].value.form:
-                Name(field_name):
-                    match self.state.types.definitions[subject.value].form:
-                        Struct(index, struct_arguments):
-                            field = self.declarations.find_field(index, field_name)
-                            if field < 0: try self.fail(arguments[1].span, "`" + describe_type(self.state.types, subject) + "` has no field `" + field_name + "`")
-                        else: try self.fail(arguments[0].span, "`offsetof` needs a struct type; `" + describe_type(self.state.types, subject) + "` is not a struct")
-                else: try self.fail(arguments[1].span, "`offsetof` names a field: `offsetof(Point, x)`")
-        let node = self.state.push_node(HirNodeForm.LayoutConstant(query = query, subject = subject, field = field), resolve_builtin_type(BuiltinType.unsigned_usize), span)
-        return try self.require_type(node, expected)
 
-    # The type a layout question is about: a type name or, for `sizeof` only,
-    # any value's type. As in C the value is checked but never evaluated.
-    func layout_subject(value: ExpressionSyntax, name: str, admits_value: bool) -> TypeId!:
-        let path = type_path_of(value)
-        if path != none and not (len(path.parts) == 1 and self.state.find_local(path.parts[0]) >= 0):
-            let named = self.declarations.resolve_type(self.state.current_module, TypeSyntax(TypeForm.Named(path = path), value.span)) catch reason:
-                if not admits_value: error(reason)
-                # Neither a type nor a value: the type diagnostic names the intent.
-                let checked = self.check_expression(value, none) catch value_reason:
-                    error(reason)
-                return self.state.type_of(checked)
-            return named
-        if not admits_value: try self.fail(value.span, "`" + name + "` takes a type only, as in C (base.md §5.11)")
-        let checked = try self.check_expression(value, none)
-        return self.state.type_of(checked)
 
     func check_discard(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
         if len(type_arguments) > 0: try self.fail(span, "`discard` infers its value type and takes no type arguments")
@@ -2844,8 +2726,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     # An error's message is a `str` view in Base (base.md §11.3): a literal
     # costs nothing and no runtime owns it.
     func error_text_type() -> TypeId:
-        if self.in_base_module(): return self.state.intern_string_view()
-        return resolve_builtin_type(BuiltinType.string)
+        return self.checks().error_text_type()
 
     # `trap(message)` is an unconditional, non-recoverable terminator. Its
     # message is an ordinary string expression so dynamic owned text follows
@@ -3138,7 +3019,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                 match subscript.form:
                     Binary(lower, operator, upper):
                         if operator == "..<" or operator == "..=":
-                            return try self.check_span_slice(value, element_type, is_const, lower, operator, upper, span, expected)
+                            return try self.checks().check_span_slice(self, value, element_type, is_const, lower, operator, upper, span, expected)
                     else: pass
                 let address = try self.span_element(value, element_type, is_const, subscript, span)
                 let loaded = self.state.push_node(HirNodeForm.Deref(pointer = address), element_type, span)
@@ -3386,7 +3267,7 @@ pub class HirBodyChecker: HirSemanticChecker:
                     for element in elements: checked.append(try self.check_expression(element, element_type))
                     return self.state.push_node(HirNodeForm.Array(elements = self.state.push_nodes(checked)), expected, span)
                 else: pass
-        try self.reject_in_base(span, "a list literal", "has no built-in collections; a Base `[...]` is a fixed array and needs its array type from context (base.md §4.5)")
+        try self.require_admitted(Construct.list_literal, span, "")
         return try self.full.check_list_literal_value(self, elements, span, expected)
 
     # mark: Hash collection construction ======================================================
@@ -3741,13 +3622,8 @@ pub class HirBodyChecker: HirSemanticChecker:
         if atomic_slot != none and types_match(found, atomic_slot): return value
         # Base widens an integer to a wider one of the same signedness without
         # a spelling; no value can change (base.md §7.5).
-        if self.in_base_module() and widens_implicitly(self.state.types, found, expected):
-            return self.state.push_node(HirNodeForm.NumericConvert(value = value), expected, self.state.span_of(value))
-        if self.in_base_module() and qualifies_implicitly(self.state.types, found, expected):
-            return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, self.state.span_of(value))
-        if self.in_base_module():
-            let viewed = try self.span_conversion(value, found, expected)
-            if viewed != none: return viewed
+        let converted = try self.checks().convert_implicitly(self, value, found, expected)
+        if converted != none: return converted
         let existential = try self.interfaces.convert(self, value, expected)
         if existential != none: return existential
         if self.is_function_fallibility_lift(found, expected):
@@ -4011,13 +3887,21 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     # mark: Profile guards ======================================================================
 
-    # A Base module spells no runtime-backed construct. Each rejection names
-    # the construct and the tier it belongs to (base.md §3.6), never a trap.
-    func in_base_module() -> bool:
-        return profile_of(self.state.modules[self.state.current_module].authority) == Profile.base
+    # The profile's own decisions, reached through one accessor: the HIR
+    # dispatch point of plan.md §5.0 selects by module authority alone.
+    func checks() -> ProfileChecks:
+        match self.profile():
+            base: return self.base_checks
+            full: return self.full_checks
 
-    func reject_in_base(span: SourceSpan, construct: str, reason: str) -> !:
-        if self.in_base_module(): try self.fail(span, belongs_to_full_luce(construct, reason))
+    # A construct only one profile has: the admission table answers, and
+    # the diagnostic names the tier the construct belongs to (base.md §3.6).
+    func require_admitted(construct: Construct, span: SourceSpan, subject: str) -> !:
+        if not admits_construct(self.profile(), construct): try self.fail(span, construct_diagnostic(construct, subject))
+
+    # The profile of the module being checked, from `profile.luc` alone.
+    func profile() -> Profile:
+        return profile_of(self.state.modules[self.state.current_module].authority)
 
     # Whether a checked lambda became a closure with an environment; the
     # contextual conversion may have wrapped it in an optional.
@@ -4155,27 +4039,7 @@ func is_arithmetic_operator(operator: str) -> bool:
         "&", "|", "^", "<<", ">>" => true
         else => false
 
-# A `Point` or `geometry.Point` expression read as the type path it spells.
-func type_path_of(value: ExpressionSyntax) -> PathSyntax?:
-    match value.form:
-        Name(name): return PathSyntax([name], value.span)
-        Member(owner, name):
-            match owner.form:
-                Name(owner_name): return PathSyntax([owner_name, name], value.span)
-                else: return none
-        else: return none
 
-# Whether Base converts `found` to `expected` implicitly: both integers of one
-# signedness, and every value of `found` fits `expected` on every target. A
-# pointer-width integer is at least 32 and at most 64 bits wide, so it takes
-# the fixed widths up to 32 and widens to the 64-bit width (base.md §7.5).
-func widens_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> bool:
-    if not is_integer_type(types, found) or not is_integer_type(types, expected): return false
-    if is_unsigned_integer_type(types, found) != is_unsigned_integer_type(types, expected): return false
-    if is_pointer_integer_type(types, found):
-        return not is_pointer_integer_type(types, expected) and integer_bit_width(types, expected) == 64
-    if is_pointer_integer_type(types, expected): return integer_bit_width(types, found) <= 32
-    return integer_bit_width(types, expected) > integer_bit_width(types, found)
 
 # The Base operator family with an explicit overflow behaviour (base.md §7.2).
 func is_base_overflow_operator(operator: str) -> bool:
@@ -4200,38 +4064,4 @@ func base_overflow_result(state: HirGenerationState, operator: str, operand_type
     if operator == "+?" or operator == "-?" or operator == "*?": return state.intern_optional(operand_type)
     return operand_type
 
-# `T*` converts implicitly to `const T*`, `volatile T*`, and `const volatile T*`;
-# a qualifier is never removed without a cast (base.md §5.3).
-func qualifies_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> bool:
-    match types.definitions[found.value].form:
-        Pointer(pointee, is_const, is_volatile):
-            match types.definitions[expected.value].form:
-                Pointer(other_pointee, other_const, other_volatile):
-                    # Any object pointer converts to `void*` of the same qualification.
-                    let to_void = types_match(other_pointee, resolve_builtin_type(BuiltinType.unit))
-                    if pointee.value != other_pointee.value and not to_void: return false
-                    if is_const and not other_const: return false
-                    if is_volatile and not other_volatile: return false
-                    return true
-                else: return false
-        else: return false
 
-# An expression whose type is its own: a binding, member, index, call, cast,
-# address, or dereference. These carry no literal that context would type.
-func names_a_value(value: ExpressionSyntax) -> bool:
-    match value.form:
-        Name(name): return true
-        Member(owner, name): return true
-        Index(target, subscript): return true
-        Call(callee, type_arguments, arguments): return true
-        Cast(target, inner): return true
-        Unary(operator, operand): return operator == "&" or operator == "*"
-        Group(grouped): return names_a_value(grouped)
-        else: return false
-
-# The root and steps of a place, as `AddressOf` spells them.
-struct AddressParts:
-    let pointer: NodeId
-    let symbol: SymbolId
-    let global: i64
-    let steps: list[u32]

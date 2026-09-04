@@ -2662,6 +2662,29 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   runs natively on its own, printing through `printf`. This slice is the
   first written under the no-dialect-branches rule (`plan.md` §5.0).
   Gate: 1099 compiler tests across 58 files.
+- [x] **The Base profile split** (2026-09-04). Every `in_base_module()`
+  and `Profile.base` branch that B1–B4 had left in the shared parser,
+  tokenizer, checker, declaration collector, interfaces, lowering model,
+  function lowerer, analyzer, C exports, and C API is gone. `profile.luc`
+  now holds the admission tables: `GrammarFeature`/`admits_grammar` for
+  the one parser's profile-only spellings (plan.md §6's one-grammar
+  gate), `Construct`/`admits_construct`/`construct_diagnostic` for the
+  constructs only one tier has, with every "belongs to" diagnostic in
+  one place, and `admits_import`. Behaviour that differs by profile is a
+  class in the profile's folder behind a shared interface:
+  `ProfileChecks` (`profiles/{base,full}/hir/*_checks.luc`: text
+  literals, slices, pointer arithmetic and widening, integer division,
+  layout builtins, `Error` text, implicit conversions, interface values
+  and receivers), `ProfileDeclarations` (globals and the profile's own
+  type names), `ProfileRepresentation` and `ProfileLowering`
+  (`profiles/{base,full}/mir`: interface and optional layout, `Error`
+  text, and Base's view lowering), with the escape pass now
+  `profiles/base/hir/base_escape.luc`. Each shared stage selects the
+  profile once, by module authority, at its dispatch point (`analyzer`,
+  `body_checker`, `declarations`, `entry_points`, `function_lowerer`,
+  the interpreters, the backends). `test.sh` rule 1c refuses the old
+  spellings in the shared folders.
+  Gate: 1099 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

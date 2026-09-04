@@ -1,0 +1,288 @@
+#==============================================================================================
+#
+#   base_checks - What the checker decides only for a Base module
+#
+#   DESCRIPTION:
+#       Base's side of `ProfileChecks` (plan.md §5.0): text literals are
+#       views, `cstr` takes a literal, spans slice and convert from arrays,
+#       pointers add and subtract, narrow integers widen implicitly,
+#       integer division truncates as C's does, `sizeof`/`alignof`/`offsetof`
+#       answer layout questions, and `Error` carries its text as a view. The
+#       shared checker reaches this class through the interface and hands it
+#       the `HirSemanticChecker` services it needs; nothing here is shared
+#       with full Luce's `FullProfileChecks`.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax, TypeForm, TypeSyntax
+from compiler.hir.declarations import DeclarationCollector
+from compiler.hir.generation_model import CheckedBinaryOperands, HirGenerationState, HirSemanticChecker, ProfileChecks, ResolvedBinary, names_a_value, type_path_of
+from compiler.hir.ir import BinaryOperation, BuiltinType, HirNodeForm, NodeId, TypeId, TypeTable, Value, no_node
+from compiler.hir.ir import describe_type, integer_bit_width, is_integer_type, is_pointer_integer_type, is_unsigned_integer_type, place_element_step, resolve_builtin_type, types_match
+from compiler.layout_query import LayoutQuery
+
+pub class BaseProfileChecks: ProfileChecks:
+    let state: HirGenerationState
+    let declarations: DeclarationCollector
+
+    pub init(state: HirGenerationState, declarations: DeclarationCollector):
+        self.state = state
+        self.declarations = declarations
+
+    # mark: Text ================================================================================
+
+    ## A Base literal is the text view (base.md §5.5).
+    pub func text_literal_type() -> TypeId:
+        return self.state.intern_string_view()
+
+    ## A literal where `cstr` is wanted is its NUL-terminated data (base.md
+    ## §17.2): the cast a programmer would otherwise write.
+    pub func adapt_text_literal(semantics: HirSemanticChecker, text: NodeId, expected: TypeId?) -> NodeId?:
+        if expected == none or not self.is_c_string_type(expected): return none
+        return self.state.push_node(HirNodeForm.Cast(value = text), expected, self.state.span_of(text))
+
+    ## `cstr`: `const u8*` (base.md §5.2).
+    func is_c_string_type(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Pointer(pointee, is_const, is_volatile): return is_const and not is_volatile and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
+
+    ## `Error` and `ErrorCode` carry their text as a view (base.md §11.3).
+    pub func error_text_type() -> TypeId:
+        return self.state.intern_string_view()
+
+    # mark: Spans ===============================================================================
+
+    ## A span slices as a sub-span; anything else slices as the shared rule says.
+    pub func check_slice(semantics: HirSemanticChecker, sliced: ExpressionSyntax, start: ExpressionSyntax?, operator: str, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let viewed = try semantics.check_expression_for_feature(sliced, none)
+        match self.state.types.definitions[self.state.type_of(viewed).value].form:
+            Span(element, is_const): return try self.check_span_slice(semantics, viewed, element, is_const, start, operator, end, span, expected)
+            else: pass
+        return try semantics.check_common_slice_for_feature(sliced, start, end, span, expected)
+
+    # `s[a..<b]`, `s[a..=b]`, `s[a..]`, `s[..b]`: a checked sub-span; a missing
+    # start is 0 and a missing end the length (base.md §5.4).
+    pub func check_span_slice(semantics: HirSemanticChecker, value: NodeId, element: TypeId, is_const: bool, start: ExpressionSyntax?, operator: str, end: ExpressionSyntax?, span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let usize = resolve_builtin_type(BuiltinType.unsigned_usize)
+        var lower = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(0)), usize, span)
+        if start != none: lower = try semantics.check_expression_for_feature(start, usize)
+        var upper = NodeId(value = no_node)
+        if end != none: upper = try semantics.check_expression_for_feature(end, usize)
+        let node = self.state.push_node(HirNodeForm.SpanSlice(span = value, start = lower, end = upper, inclusive = operator == "..="), self.state.intern_span(element, is_const), span)
+        return try semantics.require_type_for_feature(node, expected)
+
+    # An array converts to a span that points into it, and a span to a
+    # read-only span of the same element (base.md §5.4).
+    func span_conversion(semantics: HirSemanticChecker, value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        let span = self.state.span_of(value)
+        match self.state.types.definitions[expected.value].form:
+            Span(wanted, wants_const):
+                match self.state.types.definitions[found.value].form:
+                    Array(element, count):
+                        if not types_match(element, wanted): return none
+                        # The span starts at the first element's address.
+                        let address = try semantics.address_of_node_for_feature(value, span)
+                        let first = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(0)), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+                        address.steps.append(place_element_step)
+                        address.steps.append(first.value)
+                        let start = self.state.push_node(HirNodeForm.AddressOf(pointer = address.pointer, symbol = address.symbol, global = address.global, steps = self.state.push_run(address.steps)), self.state.intern_pointer(element, wants_const, false), span)
+                        let length = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(count)), resolve_builtin_type(BuiltinType.unsigned_usize), span)
+                        return self.state.push_node(HirNodeForm.SpanFromParts(pointer = start, length = length), expected, span)
+                    Span(element, is_const):
+                        if not types_match(element, wanted) or (is_const and not wants_const): return none
+                        return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, span)
+                    else: return none
+            else: return none
+
+    # mark: Binary operations ===================================================================
+
+    ## A pointer on the left takes no type from context and its count is any
+    ## integer (base.md §7.7). A named value is typed by itself, so checking
+    ## it first and then applying the context leaves every non-pointer
+    ## operand exactly as the contextual path types it.
+    pub func check_binary_operands(semantics: HirSemanticChecker, left: ExpressionSyntax, right: ExpressionSyntax, operator: str, context: TypeId?) -> CheckedBinaryOperands?!:
+        if not ((operator == "+" or operator == "-") and names_a_value(left)): return none
+        var checked_left = try semantics.check_expression_for_feature(left, none)
+        match self.state.types.definitions[self.state.type_of(checked_left).value].form:
+            Pointer(pointee, is_const, is_volatile):
+                return CheckedBinaryOperands(left = checked_left, right = try semantics.check_expression_for_feature(right, none))
+            else:
+                if context != none: checked_left = try semantics.require_type_for_feature(checked_left, context)
+                return CheckedBinaryOperands(left = checked_left, right = try semantics.check_expression_for_feature(right, self.state.type_of(checked_left)))
+
+    # `p + n`, `p - n`, and `p - q` (base.md §7.7): element-scaled and
+    # unchecked; `n` is any integer, the difference is `isize`.
+    pub func resolve_pointer_arithmetic(semantics: HirSemanticChecker, operator: str, operands: CheckedBinaryOperands, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if operator != "+" and operator != "-": return none
+        let left = self.state.type_of(operands.left)
+        let right = self.state.type_of(operands.right)
+        match self.state.types.definitions[left.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                if types_match(pointee, resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`void*` has no element size; cast it to a typed pointer before arithmetic (base.md §7.7)")
+                if is_integer_type(self.state.types, right):
+                    let node = self.state.push_node(HirNodeForm.PointerOffset(pointer = operands.left, offset = operands.right, negate = operator == "-"), left, span)
+                    return try semantics.require_type_for_feature(node, expected)
+                if operator == "-":
+                    match self.state.types.definitions[right.value].form:
+                        Pointer(other_pointee, other_const, other_volatile):
+                            if not types_match(pointee, other_pointee):
+                                try self.fail(span, "`-` needs pointers to one type, found `" + self.state.describe_type(left) + "` and `" + self.state.describe_type(right) + "`")
+                            let node = self.state.push_node(HirNodeForm.PointerDifference(left = operands.left, right = operands.right), resolve_builtin_type(BuiltinType.signed_isize), span)
+                            return try semantics.require_type_for_feature(node, expected)
+                        else: pass
+                return none
+            else: return none
+
+    # Base widens the narrower integer operand to the wider one of the same
+    # signedness, so `byte + count` reads as C does (base.md §7.5).
+    pub func widen_binary_operands(semantics: HirSemanticChecker, operands: CheckedBinaryOperands) -> CheckedBinaryOperands!:
+        let left = self.state.type_of(operands.left)
+        let right = self.state.type_of(operands.right)
+        if widens_implicitly(self.state.types, left, right):
+            return CheckedBinaryOperands(left = try semantics.require_type_for_feature(operands.left, right), right = operands.right)
+        if widens_implicitly(self.state.types, right, left):
+            return CheckedBinaryOperands(left = operands.left, right = try semantics.require_type_for_feature(operands.right, left))
+        # Pointers compare across qualifiers (base.md §5.3): the less qualified
+        # side takes the other's type.
+        if qualifies_implicitly(self.state.types, left, right):
+            return CheckedBinaryOperands(left = try semantics.require_type_for_feature(operands.left, right), right = operands.right)
+        if qualifies_implicitly(self.state.types, right, left):
+            return CheckedBinaryOperands(left = operands.left, right = try semantics.require_type_for_feature(operands.right, left))
+        return operands
+
+    ## Base follows C's instruction: truncation toward zero (base.md §7.2).
+    pub func integer_division(operator: str, operand_type: TypeId) -> ResolvedBinary:
+        if operator == "//": return ResolvedBinary(operation = BinaryOperation.TruncDivide(operand_type = operand_type), result = operand_type)
+        return ResolvedBinary(operation = BinaryOperation.TruncRemainder(operand_type = operand_type), result = operand_type)
+
+    # mark: Layout questions ====================================================================
+
+    ## `sizeof`, `alignof`, and `offsetof` (base.md §5.11) when no local
+    ## shadows the name.
+    pub func check_named_builtin(semantics: HirSemanticChecker, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if name != "sizeof" and name != "alignof" and name != "offsetof": return none
+        if self.state.find_local(name) >= 0: return none
+        return try self.check_layout_query(semantics, name, type_arguments, arguments, span, expected)
+
+    # `sizeof(T)`, `sizeof(value)`, `alignof(T)`, and `offsetof(T, field)`: a
+    # Base module's layout questions (base.md §5.11). HIR records the question
+    # typed `usize`; the backend that knows the target answers it.
+    func check_layout_query(semantics: HirSemanticChecker, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) > 0: try self.fail(span, "`" + name + "` takes its type in parentheses and has no type arguments")
+        var query = LayoutQuery.size
+        var wanted = 1
+        if name == "alignof": query = LayoutQuery.align
+        if name == "offsetof":
+            query = LayoutQuery.offset
+            wanted = 2
+        if len(arguments) != wanted:
+            if wanted == 2: try self.fail(span, "`offsetof` takes a type and a field name: `offsetof(Point, x)`")
+            if name == "sizeof": try self.fail(span, "`sizeof` takes exactly one type or value in parentheses")
+            try self.fail(span, "`alignof` takes exactly one type in parentheses")
+        for argument in arguments:
+            if argument.label != none: try self.fail(argument.span, "`" + name + "` uses positional arguments")
+        let subject = try self.layout_subject(semantics, arguments[0].value, name, query == LayoutQuery.size)
+        var field = -1
+        if query == LayoutQuery.offset:
+            match arguments[1].value.form:
+                Name(field_name):
+                    match self.state.types.definitions[subject.value].form:
+                        Struct(index, struct_arguments):
+                            field = self.declarations.find_field(index, field_name)
+                            if field < 0: try self.fail(arguments[1].span, "`" + describe_type(self.state.types, subject) + "` has no field `" + field_name + "`")
+                        else: try self.fail(arguments[0].span, "`offsetof` needs a struct type; `" + describe_type(self.state.types, subject) + "` is not a struct")
+                else: try self.fail(arguments[1].span, "`offsetof` names a field: `offsetof(Point, x)`")
+        let node = self.state.push_node(HirNodeForm.LayoutConstant(query = query, subject = subject, field = field), resolve_builtin_type(BuiltinType.unsigned_usize), span)
+        return try semantics.require_type_for_feature(node, expected)
+
+    # The type a layout question is about: a type name or, for `sizeof` only,
+    # any value's type. As in C the value is checked but never evaluated.
+    func layout_subject(semantics: HirSemanticChecker, value: ExpressionSyntax, name: str, admits_value: bool) -> TypeId!:
+        let path = type_path_of(value)
+        if path != none and not (len(path.parts) == 1 and self.state.find_local(path.parts[0]) >= 0):
+            let named = self.declarations.resolve_type(self.state.current_module, TypeSyntax(TypeForm.Named(path = path), value.span)) catch reason:
+                if not admits_value: error(reason)
+                # Neither a type nor a value: the type diagnostic names the intent.
+                let checked = semantics.check_expression_for_feature(value, none) catch value_reason:
+                    error(reason)
+                return self.state.type_of(checked)
+            return named
+        if not admits_value: try self.fail(value.span, "`" + name + "` takes a type only, as in C (base.md §5.11)")
+        let checked = try semantics.check_expression_for_feature(value, none)
+        return self.state.type_of(checked)
+
+    # mark: Implicit conversions ================================================================
+
+    ## Base widens an integer to a wider one of the same signedness, adds
+    ## pointer qualifiers, and views an array as a span, all without a
+    ## spelling (base.md §5.3, §5.4, §7.5).
+    pub func convert_implicitly(semantics: HirSemanticChecker, value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        if widens_implicitly(self.state.types, found, expected):
+            return self.state.push_node(HirNodeForm.NumericConvert(value = value), expected, self.state.span_of(value))
+        if qualifies_implicitly(self.state.types, found, expected):
+            return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, self.state.span_of(value))
+        return try self.span_conversion(semantics, value, found, expected)
+
+    ## A Base interface value is a two-word view of a conformer that borrows
+    ## it (base.md §14.3): formed from `T*`, or from `const T*` when no
+    ## requirement mutates; mutability is fixed when the view is formed.
+    pub func convert_interface_value(semantics: HirSemanticChecker, value: NodeId, found: TypeId, expected: TypeId) -> NodeId?!:
+        let span = self.state.span_of(value)
+        match self.state.types.definitions[found.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                let conformance = try self.declarations.ensure_conformance(semantics, pointee, expected, span)
+                if conformance < 0:
+                    try self.state.fail_at(self.state.current_module, span, "type `" + self.state.describe_type(pointee) + "` does not conform to `" + self.state.describe_type(expected) + "`")
+                if is_const:
+                    match self.state.types.definitions[expected.value].form:
+                        Interface(index, arguments):
+                            for requirement in self.state.interfaces[index].requirements:
+                                if requirement.is_mutating:
+                                    try self.state.fail_at(self.state.current_module, span, "a view through `" + self.state.describe_type(found) + "` cannot satisfy the `mutating` requirement `" + requirement.name + "` of `" + self.state.describe_type(expected) + "`; form it from `" + self.state.describe_type(pointee) + "*` (base.md §14.3)")
+                        else: pass
+                return self.state.push_node(HirNodeForm.InterfaceValue(value = value, conformance = u32(conformance)), expected, span)
+            else:
+                error(self.state.diagnostic_at(self.state.current_module, span, "a Base interface value is a view of a conformer: form it from `&value` or a `" + self.state.describe_type(found) + "*` (base.md §14.3)"))
+
+
+    ## A view fixed its mutability when it was formed (base.md §14.3), so
+    ## the call asks nothing more of the receiver.
+    pub func check_interface_receiver(semantics: HirSemanticChecker, receiver: NodeId, is_mutating: bool, span: SourceSpan) -> !:
+        return
+
+    func fail(span: SourceSpan, message: str) -> !:
+        try self.state.fail_at(self.state.current_module, span, message)
+
+    func diagnostic(span: SourceSpan, message: str) -> str:
+        return self.state.diagnostic_at(self.state.current_module, span, message)
+
+# Whether Base converts `found` to `expected` implicitly: both integers of one
+# signedness, and every value of `found` fits `expected` on every target. A
+# pointer-width integer is at least 32 and at most 64 bits wide, so it takes
+# the fixed widths up to 32 and widens to the 64-bit width (base.md §7.5).
+func widens_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> bool:
+    if not is_integer_type(types, found) or not is_integer_type(types, expected): return false
+    if is_unsigned_integer_type(types, found) != is_unsigned_integer_type(types, expected): return false
+    if is_pointer_integer_type(types, found):
+        return not is_pointer_integer_type(types, expected) and integer_bit_width(types, expected) == 64
+    if is_pointer_integer_type(types, expected): return integer_bit_width(types, found) <= 32
+    return integer_bit_width(types, expected) > integer_bit_width(types, found)
+
+# `T*` converts implicitly to `const T*`, `volatile T*`, and `const volatile T*`;
+# a qualifier is never removed without a cast (base.md §5.3).
+func qualifies_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> bool:
+    match types.definitions[found.value].form:
+        Pointer(pointee, is_const, is_volatile):
+            match types.definitions[expected.value].form:
+                Pointer(other_pointee, other_const, other_volatile):
+                    # Any object pointer converts to `void*` of the same qualification.
+                    let to_void = types_match(other_pointee, resolve_builtin_type(BuiltinType.unit))
+                    if pointee.value != other_pointee.value and not to_void: return false
+                    if is_const and not other_const: return false
+                    if is_volatile and not other_volatile: return false
+                    return true
+                else: return false
+        else: return false

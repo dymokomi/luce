@@ -33,11 +33,13 @@ import compiler.hir.ir
 from compiler.mir.verifier import terminates
 from compiler.frontend.source import SourceSpan
 import std.strings
-from compiler.mir.lowering_model import COutputSlot, DeferredAction
+from compiler.mir.lowering_model import COutputSlot, DeferredAction, ProfileLowering, ProfileRepresentation
 from compiler.mir.lowering_model import FallibleResult, IndirectOperands, Local, MatchExit, MirLoweringState, contains_symbol
 from compiler.mir.lowering_model import CellStorage, CountedLoop, EqualityHelper, FunctionLoweringHost, GeneratedHelper, OwnershipHelper, RecoverTarget, Region
+from compiler.profiles.base.mir.base_lowering import BaseProfileLowerer, BaseProfileRepresentation
 from compiler.profiles.full.mir.lowering import FullProfileLowerer
-from compiler.profile import Profile
+from compiler.profiles.full.mir.full_representation import FullProfileRepresentation
+from compiler.profile import Profile, profile_of
 
 ## Storage owned solely by one in-flight C call. String results are decoded
 ## before these allocations are released because a C result may alias an
@@ -70,21 +72,37 @@ func atomic_op_of(operation: AtomicOperation) -> AtomicOp:
         minimum: return AtomicOp.minimum
 
 # The two loads a view call needs: the conformer's address and the witness.
-struct ViewDispatch:
-    let data: RegisterId
-    let callee: RegisterId
-
 pub class FunctionLowerer: FunctionLoweringHost:
     let state: MirLoweringState
     ## The one dispatch point for full-Luce-only forms: collections, classes,
     ## closures, existential values, and workers (profiles/full/mir/lowering.luc).
     let full: FullProfileLowerer
+    ## Base's lowering and each profile's representation (profiles/{base,full}/mir).
+    let base: BaseProfileLowerer
+    pub let base_representation: BaseProfileRepresentation
+    pub let full_representation: FullProfileRepresentation
 
     pub init(state: MirLoweringState):
         self.state = state
         self.full = FullProfileLowerer(state)
+        self.base = BaseProfileLowerer(state)
+        self.base_representation = BaseProfileRepresentation()
+        self.full_representation = FullProfileRepresentation()
 
     # mark: Profile entry points ===============================================================
+
+    # The MIR dispatch point of plan.md §5.0: one selection per module, by
+    # its authority through `profile.luc`, of what the profile lowers and
+    # how it represents its types.
+    func profile_lowering(module: HirModule) -> ProfileLowering:
+        match profile_of(module.authority):
+            base: return self.base
+            full: return self.full
+
+    pub func representation_for(module: HirModule) -> ProfileRepresentation:
+        match profile_of(module.authority):
+            base: return self.base_representation
+            full: return self.full_representation
     #
     # Program-level lowering names these generated bodies; the profile owns
     # their shape while this lowerer remains the sole consumer it reaches.
@@ -1421,13 +1439,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 if types_match(node_type(self.state.program, expression), resolve_builtin_type(BuiltinType.never_type)):
                     return try self.lower_match(module, function, expression, subject, arms, true, body)
             InterfaceValue(value, conformance):
-                if self.state.profile == Profile.base: return try self.lower_view(module, function, expression, value, i64(conformance), body)
-                let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
-                if runtime_value != none: return runtime_value
+                let profiled = try self.profile_lowering(module).lower_expression_form(self, module, function, expression, body)
+                if profiled != none: return profiled
             InterfaceCall(receiver, interface_type, requirement, arguments):
-                if self.state.profile == Profile.base: return try self.lower_view_call(module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
-                let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
-                if runtime_value != none: return runtime_value
+                let profiled = try self.profile_lowering(module).lower_expression_form(self, module, function, expression, body)
+                if profiled != none: return profiled
             else:
                 let runtime_value = try self.full.lower_expression_form(self, module, function, expression, body)
                 if runtime_value != none: return runtime_value
@@ -2132,9 +2148,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
             Allocate(prelude, request, initializer, count, zeroed, code, message):
                 return try self.lower_allocation(module, function, expression, prelude, request, initializer, count, zeroed, code, message, body)
             InterfaceCall(receiver, interface_type, requirement, arguments):
-                if self.state.profile == Profile.base: return try self.lower_fallible_view_call(module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
-                let runtime_value = try self.full.lower_fallible_expression(self, module, function, expression, body)
-                if runtime_value != none: return runtime_value
+                let profiled = try self.profile_lowering(module).lower_fallible_expression(self, module, function, expression, body)
+                if profiled != none: return profiled
                 error(self.state.unsupported(module, function, span, "fallible expression `" + str(node_form(self.state.program, expression)) + "`"))
             else:
                 let runtime_value = try self.full.lower_fallible_expression(self, module, function, expression, body)
@@ -3318,77 +3333,6 @@ pub class FunctionLowerer: FunctionLoweringHost:
         self.state.defers.append(DeferredAction.RestoreValue(address = address, saved = saved, value_type = global_type, span = span))
         try self.lower_scope_from(module, function, statements, defer_start, body)
 
-    # mark: Interface views (Base) =============================================================
-    #
-    # A Base interface value is two words, the conformer's address and its
-    # witness table's (base.md §14.3). The table is a global of witness thunk
-    # addresses in requirement order, and a call loads the slot and calls it
-    # indirectly with the conformer's address as the erased receiver.
-
-    func lower_view(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, conformance: i64, body: list[MirInstruction]) -> RegisterId!:
-        let span = node_span(self.state.program, expression)
-        let pointer = builtin_mir_type(BuiltinMirType.pointer)
-        let data = try self.lower_expression(module, function, value, body)
-        let view_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
-        let view = self.new_temp(view_type, span, body)
-        self.store_value(pointer, self.field_address(view_type, view, 0, span, body), data, span, body)
-        let table = self.state.new_register(pointer)
-        body.append(MirInstruction(form = InstructionForm.GlobalAddress(result = table, global = self.state.witness_table_global(conformance)), span = span))
-        self.store_value(pointer, self.field_address(view_type, view, 1, span, body), table, span, body)
-        return view
-
-    # The witness thunk address of one requirement, and the conformer's address.
-    func lower_view_dispatch(module: HirModule, function: HirFunction, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, span: SourceSpan, body: list[MirInstruction]) -> ViewDispatch!:
-        let pointer = builtin_mir_type(BuiltinMirType.pointer)
-        let view = try self.lower_expression(module, function, receiver, body)
-        let view_type = try self.state.mir_type_of(module, function, span, interface_type)
-        let data = self.load_value(pointer, self.field_address(view_type, view, 0, span, body), span, body)
-        let table = self.load_value(pointer, self.field_address(view_type, view, 1, span, body), span, body)
-        let slot = self.element_address(pointer, table, self.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), requirement, span, body), span, body)
-        let callee = self.load_value(pointer, slot, span, body)
-        return ViewDispatch(data = data, callee = callee)
-
-    func lower_view_arguments(module: HirModule, function: HirFunction, arguments: Operands, body: list[MirInstruction]) -> list[RegisterId]!:
-        let values = list[RegisterId]()
-        for pair in range(0, i64(arguments.count) // 2): values.append(RegisterId(value = no_register))
-        for pair in range(0, i64(arguments.count) // 2):
-            let parameter_index = entry_at(self.state.program, arguments, pair * 2)
-            let argument = NodeId(value = u32(entry_at(self.state.program, arguments, pair * 2 + 1)))
-            values[parameter_index] = try self.lower_expression(module, function, argument, body)
-        return values
-
-    func lower_view_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
-        let span = node_span(self.state.program, expression)
-        let signature = try self.state.view_call_signature(interface_type, requirement)
-        if signature.is_fallible: trap("fallible view call entered infallible lowering")
-        let dispatch = try self.lower_view_dispatch(module, function, receiver, interface_type, requirement, span, body)
-        let values = try self.lower_view_arguments(module, function, arguments, body)
-        let call_arguments = list[RegisterId]()
-        let results = list[RegisterId]()
-        let value = try self.place_call_result(module, function, span, node_type(self.state.program, expression), signature.returns_never, call_arguments, results, body)
-        call_arguments.append(dispatch.data)
-        for argument in values: call_arguments.append(argument)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
-        if signature.returns_never: body.append(MirInstruction(form = InstructionForm.Unreachable, span = span))
-        return value
-
-    func lower_fallible_view_call(module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
-        let span = node_span(self.state.program, expression)
-        let signature = try self.state.view_call_signature(interface_type, requirement)
-        let dispatch = try self.lower_view_dispatch(module, function, receiver, interface_type, requirement, span, body)
-        let values = try self.lower_view_arguments(module, function, arguments, body)
-        let successful = self.state.fallible_inner(node_type(self.state.program, expression)) else trap("fallible view call has an infallible result")
-        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
-        let call_arguments = [self.new_temp(error_type, span, body)]
-        let results = list[RegisterId]()
-        let value = try self.place_call_result(module, function, span, successful, signature.returns_never, call_arguments, results, body)
-        call_arguments.append(dispatch.data)
-        for argument in values: call_arguments.append(argument)
-        let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
-        results.append(reported_error)
-        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
-        return FallibleResult(value = value, error_value = reported_error)
-
     # A widening no target can narrow needs no guard; the backend that knows
     # the pointer width chooses between an extension and a copy.
     func lower_widening(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
@@ -3883,7 +3827,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         body.append(MirInstruction(form = InstructionForm.Load(result = register, value_type = value_type, address = address), span = span))
         return register
 
-    func field_address(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+    pub func field_address(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
         let address = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.FieldAddress(result = address, struct_type = struct_type, base = base, field = field), span = span))
         return address

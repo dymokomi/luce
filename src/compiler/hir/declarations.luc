@@ -11,7 +11,7 @@
 #
 #==============================================================================================
 
-from compiler.profile import Profile, belongs_to_full_luce, is_base_only_type_name, profile_of
+from compiler.profile import Profile, belongs_to_full_luce, is_base_only_type_name, profile_of, Construct, admits_construct, construct_diagnostic
 from compiler.core_types import is_core_type_name, is_reserved_core_name
 from compiler.frontend.source import SourceSpan
 from compiler.frontend.syntax import ConstantSyntax, EnumCaseSyntax, EnumSyntax, ExportEnumCaseSyntax, ExportEnumSyntax, ExportStructSyntax, ExternFunctionSyntax, ExternStructSyntax, ExternTypeSyntax, ExternVariableSyntax, FieldSyntax, FunctionSyntax, GenericParameterSyntax, InterfaceSyntax, NominalTypeKind, NominalTypeSyntax
@@ -23,7 +23,9 @@ from compiler.hir.ir import HirRecordLayout
 from compiler.hir.generation_model import CollectedAlias, CollectedClass, CollectedConstant, CollectedEnum, CollectedExternType, CollectedExternVariable, CollectedFunctionSource, CollectedInterface, CollectedNominalCallable
 from compiler.hir.generation_model import CollectedGlobal, CollectedStruct, CollectedStructSource, FunctionSymbol, GenericConformanceTemplate, GenericFunctionTemplate, HirGenerationState, HirSemanticChecker, ImportedModule
 from compiler.hir.generation_model import ImportedBinding, ModuleBindings, PendingGenericApplication, builtin_type_id
-from compiler.hir.generation_model import TypeBinding, collected_struct_is_exported, collected_struct_is_extern
+from compiler.hir.generation_model import ProfileDeclarations, TypeBinding, collected_struct_is_exported, collected_struct_is_extern
+from compiler.profiles.base.hir.base_declarations import BaseProfileDeclarations
+from compiler.profiles.full.hir.full_declarations import FullProfileDeclarations
 from compiler.hir.interfaces.standard import ensure_standard_interface, standard_interface_element, standard_interface_named, standard_interface_of, standard_interfaces_share_role
 
 ## One declaration-wide abstract type scope. Interfaces and nominal types use
@@ -110,8 +112,13 @@ func export_enum_nominal(syntax: ExportEnumSyntax) -> EnumSyntax:
 pub class DeclarationCollector:
     let state: HirGenerationState
     let materializing_conformances: list[ConformanceMaterialization]
+    ## Each profile's `ProfileDeclarations` (profiles/{base,full}/hir).
+    let base_declarations: BaseProfileDeclarations
+    let full_declarations: FullProfileDeclarations
 
     pub init(state: HirGenerationState):
+        self.base_declarations = BaseProfileDeclarations(state)
+        self.full_declarations = FullProfileDeclarations(state)
         self.state = state
         self.materializing_conformances = list[ConformanceMaterialization]()
 
@@ -656,16 +663,8 @@ pub class DeclarationCollector:
     # initialiser names, so there is no initialisation order; the sealed
     # runtime's private cells keep their structural-zero rule.
     func collect_global(checker: HirSemanticChecker, module_index: i64, is_public: bool, global: RuntimeGlobalSyntax, span: SourceSpan) -> !:
-        let is_base = profile_of(self.state.modules[module_index].authority) == Profile.base
-        if not is_base:
-            if self.state.package_role != PackageRole.sealed_runtime:
-                try self.state.fail_at(module_index, span, "mutable module globals are reserved for the sealed runtime package")
-            if is_public:
-                try self.state.fail_at(module_index, span, "a sealed runtime global must be module-private")
-            if global.initializer != none:
-                try self.state.fail_at(module_index, span, "a sealed runtime global begins at structural zero and takes no initialiser")
-            if global.is_thread_local:
-                try self.state.fail_at(module_index, span, "`thread_local` belongs to Luce Base (base.md §6.3)")
+        try self.profile_declarations(module_index).validate_global(module_index, is_public, global, span)
+        if global.is_thread_local: try self.require_admitted(module_index, Construct.thread_local, span, "")
         try self.require_free_module_name(module_index, global.name, span)
         let value_type = try self.resolve_type(module_index, global.value_type)
         if self.state.contains_fallible(value_type):
@@ -675,12 +674,8 @@ pub class DeclarationCollector:
         let initializer_syntax = global.initializer
         if initializer_syntax != none:
             initializer = try checker.check_constant_expression(module_index, initializer_syntax, value_type, "initialiser of global `" + global.name + "`")
-        elif is_base:
-            let blocker = checker.zero_blocker_for_feature(value_type)
-            if blocker != none:
-                try self.state.fail_at(module_index, global.value_type.span, "global `" + global.name + "` has no zero value because `" + self.state.describe_type(value_type) + "` holds `" + self.state.describe_type(blocker) + "`; write a constant initialiser (base.md §6.1, §6.3)")
-        elif not self.state.has_structural_zero(value_type):
-            try self.state.fail_at(module_index, global.value_type.span, "runtime global `" + global.name + "` needs a structurally zero-initializable value type")
+        else:
+            try self.profile_declarations(module_index).validate_uninitialised_global(checker, module_index, global, value_type)
         # A global's symbol is never exported yet (base.md §17.6 exports
         # functions), so nothing could override a weak one.
         if global.attributes.is_weak:
@@ -713,6 +708,21 @@ pub class DeclarationCollector:
             value_type = value_type,
             span = span,
         ))
+
+    # A construct only one profile has (see `profile.luc`).
+    func require_admitted(module_index: i64, construct: Construct, span: SourceSpan, subject: str) -> !:
+        if not admits_construct(self.module_profile(module_index), construct):
+            try self.state.fail_at(module_index, span, construct_diagnostic(construct, subject))
+
+    # The profile of one module, from `profile.luc` alone.
+    func module_profile(module_index: i64) -> Profile:
+        return profile_of(self.state.modules[module_index].authority)
+
+    # The profile's declaration-time decisions (profiles/{base,full}/hir).
+    func profile_declarations(module_index: i64) -> ProfileDeclarations:
+        match self.module_profile(module_index):
+            base: return self.base_declarations
+            full: return self.full_declarations
 
     func require_free_module_name(module_index: i64, name: str, span: SourceSpan) -> !:
         if is_reserved_core_name(name):
@@ -1244,7 +1254,7 @@ pub class DeclarationCollector:
     func is_c_representable_base_struct(index: i64) -> bool:
         let item = self.state.structs[index]
         if item.c_kind != none: return false
-        if profile_of(self.state.modules[item.module_index].authority) != Profile.base: return false
+        if not admits_construct(self.module_profile(item.module_index), Construct.c_record_struct): return false
         for field in item.fields:
             if not self.is_c_function_component(field.value_type): return false
         return true
@@ -1926,8 +1936,7 @@ pub class DeclarationCollector:
     # mark: Classes =============================================================================
 
     func collect_class_name(module_index: i64, is_public: bool, documentation: list[str], nominal: NominalTypeSyntax, span: SourceSpan) -> !:
-        if profile_of(self.state.modules[module_index].authority) == Profile.base:
-            try self.state.fail_at(module_index, span, belongs_to_full_luce("`class`", "has no classes; use a struct, and a pointer where identity is needed (base.md §23)"))
+        try self.require_admitted(module_index, Construct.class_declaration, span, "")
         try self.require_free_module_name(module_index, nominal.name, span)
         let declared = try self.declare_type_parameters(module_index, nominal.generic_parameters)
         let arguments = list[TypeId]()
@@ -2947,15 +2956,11 @@ pub class DeclarationCollector:
                 if alias_index >= 0: return try self.resolve_alias(alias_index)
                 if name == "Weak":
                     error(self.state.diagnostic_at(module_index, value.span, "`Weak` needs exactly one class type"))
-                # A Base module's `str` is the text view, not the owned string (base.md §5.5).
-                if name == "str" and profile_of(self.state.modules[module_index].authority) == Profile.base: return self.state.intern_string_view()
-                # `cstr` is C text, `const u8*` until the distinct `c.char`
-                # lands (base.md §5.2, §17.1).
-                if name == "cstr" and profile_of(self.state.modules[module_index].authority) == Profile.base: return self.state.intern_pointer(resolve_builtin_type(BuiltinType.unsigned_u8), true, false)
+                let profiled = self.profile_declarations(module_index).builtin_type_named(name)
+                if profiled != none: return profiled
                 let builtin = builtin_type_id(name)
                 if builtin != none:
-                    if profile_of(self.state.modules[module_index].authority) == Profile.full and is_base_only_type_name(name):
-                        try self.state.fail_at(module_index, path.span, "`" + name + "` belongs to Luce Base; a `.luc` module spells the integer width, and a `.lucb` module's `" + name + "` is the target's pointer width (base.md §5.1)")
+                    if is_base_only_type_name(name): try self.require_admitted(module_index, Construct.pointer_width_integer, path.span, name)
                     return builtin
                 let nominal = try self.find_visible_nominal(module_index, name, path.span)
                 if nominal != none: return try self.nominal_unapplied_type(module_index, nominal, value.span)
@@ -2982,8 +2987,7 @@ pub class DeclarationCollector:
                     return try self.resolve_value_interface_reference(module_index, value)
                 let nominal = try self.resolve_nominal_path(module_index, path.parts, path.span)
                 if nominal != none: return try self.nominal_application(module_index, nominal, arguments, value.span)
-                if profile_of(self.state.modules[module_index].authority) == Profile.base and is_runtime_type_name(path.dotted()):
-                    try self.state.fail_at(module_index, value.span, belongs_to_full_luce("`" + path.dotted() + "`", "has no built-in collections, workers, or reference counting (base.md §23)"))
+                if is_runtime_type_name(path.dotted()): try self.require_admitted(module_index, Construct.runtime_type, value.span, path.dotted())
                 if path.dotted() == "native_ptr" or path.dotted() == "native_mut_ptr":
                     if self.state.modules[module_index].authority != ModuleAuthority.native:
                         try self.state.fail_at(module_index, value.span, "native pointer types require a `.lucn` module")
@@ -3183,16 +3187,14 @@ pub class DeclarationCollector:
             FallibleType(successful_value):
                 return self.state.intern_fallible(try self.resolve_type(module_index, successful_value))
             SpanType(element, is_const):
-                if profile_of(self.state.modules[module_index].authority) != Profile.base:
-                    try self.state.fail_at(module_index, value.span, "`T[]` belongs to Luce Base; a `.luc` module spells `slice[T]` (base.md §5.4)")
+                try self.require_admitted(module_index, Construct.span_type, value.span, "")
                 let inner = try self.resolve_type(module_index, element)
                 try self.state.validate_stored_type(module_index, inner, element.span, "a span element")
                 return self.state.intern_span(inner, is_const)
             AtomicType(inner_syntax):
                 # `@T` for an integer, `bool`, `usize`/`isize`, or a pointer of
                 # at most pointer width (base.md §5.9).
-                if profile_of(self.state.modules[module_index].authority) != Profile.base:
-                    try self.state.fail_at(module_index, value.span, "`@T` belongs to Luce Base; a `.luc` module has no atomics (base.md §5.9)")
+                try self.require_admitted(module_index, Construct.atomic_type, value.span, "")
                 let inner = try self.resolve_type(module_index, inner_syntax)
                 var admitted = is_integer_type(self.state.types, inner) or types_match(inner, resolve_builtin_type(BuiltinType.boolean))
                 match self.state.types.definitions[inner.value].form:
@@ -3208,8 +3210,7 @@ pub class DeclarationCollector:
                     try self.state.fail_at(module_index, value.span, "`@" + self.state.describe_type(inner) + "` is not atomic; `@T` takes an integer, `bool`, `usize`/`isize`, a pointer, or a nullable pointer (base.md §5.9)")
                 return self.state.intern_atomic(inner)
             PointerType(pointee, is_const, is_volatile):
-                if profile_of(self.state.modules[module_index].authority) != Profile.base:
-                    try self.state.fail_at(module_index, value.span, "`T*` belongs to Luce Base; a `.luc` module has no raw pointers (base.md §5.3)")
+                try self.require_admitted(module_index, Construct.pointer_type, value.span, "")
                 # `void*` is the untyped pointer; `void` exists only before `*` (base.md §5.3).
                 match pointee.form:
                     Named(path):

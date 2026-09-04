@@ -298,19 +298,24 @@ chosen, and the move happens with the Base profile split below.
 
 - A profile folder never imports the other profile folder. The shared
   folders never name a profile except through `profile.luc` and the dispatch
-  points (`body_checker` for HIR forms, `entry_points` for the process entry
-  contract, `function_lowerer` for lowering, the interpreters for execution,
-  each backend for legalization). `test.sh` greps for both rules beside the
+  points (`body_checker` for HIR forms, `declarations` for declaration
+  rules, `analyzer` for profile-only passes, `entry_points` for the
+  process entry contract, `function_lowerer`
+  for lowering, the interpreters for execution, each backend for
+  legalization). `test.sh` greps for both rules beside the
   existing no-platform-before-backend check.
 - Shared functions do not branch on the profile. A behaviour that differs
   by profile is a method on the profile's class, reached through the host
   interface from the dispatch point, and a component that differs in kind
   is duplicated per profile rather than parameterised (decision of
-  2026-09-04). The Base slices of B1–B4 landed as `in_base_module()` and
-  `Profile.base` branches inside the shared checker, parser, declarations,
-  and lowering; the **Base profile split** slice moves them into
-  `profiles/base`, after which `test.sh` also greps the shared folders for
-  those spellings.
+  2026-09-04). The Base slices of B1–B4 had landed as `in_base_module()`
+  and `Profile.base` branches inside the shared checker, parser,
+  declarations, and lowering; the Base profile split (2026-09-04,
+  `done.md` §2) moved them: the parser asks `admits_grammar`, the checker
+  and collector ask `admits_construct` or call `ProfileChecks` and
+  `ProfileDeclarations`, the lowerer installs a `ProfileRepresentation`
+  and calls `ProfileLowering`, and `test.sh` rule 1c greps the shared
+  folders for the old spellings.
 - The pattern already exists: `hir/generics/` and `hir/interfaces/` are
   consumers of the shared `HirGenerationState`, and `FunctionLowerer`
   consumes `MirLoweringState`. Profile code is written the same way, as

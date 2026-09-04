@@ -1,0 +1,136 @@
+#==============================================================================================
+#
+#   base_lowering - What the lowerer decides only for a Base module
+#
+#   DESCRIPTION:
+#       Base's side of `ProfileLowering` and `ProfileRepresentation`
+#       (plan.md §5.0): an interface value is a two-word view of a conformer
+#       and its witness table, a dynamic call loads a thunk from that table,
+#       `T*?` and `Writer?` use the null niche, and `Error` carries its text
+#       as a view. The shared lowerer reaches this module through the host
+#       interface; full Luce's side is profiles/full/mir.
+#
+#==============================================================================================
+
+from compiler.frontend.source import SourceSpan
+from compiler.hir.ir import BuiltinType, HirFunction, HirModule, NodeId, Operands, entry_at, node_form, node_span, node_type, resolve_builtin_type
+import compiler.hir.ir as ir
+from compiler.mir.canonical import BuiltinMirType, CallingConvention, InstructionForm, MirInstruction, RegisterId, TypeId, builtin_mir_type, no_register, nullable_ptr_type
+from compiler.mir.lowering_model import FallibleResult, FunctionLoweringHost, MirLoweringState, ProfileLowering, ProfileRepresentation
+
+pub class BaseProfileRepresentation: ProfileRepresentation:
+    pub init():
+        pass
+
+    ## A Base interface value is a two-word view (base.md §14.3).
+    pub func interface_type(model: MirLoweringState, value: ir.TypeId) -> TypeId!:
+        return model.interface_view_type()
+
+    ## `T*?` is the null niche, one word whose zero is `none` (base.md §5.3);
+    ## `Writer?` is the view itself, `none` when its data word is null (§5.6);
+    ## every other optional is the uniform tagged enum.
+    pub func optional_type(model: MirLoweringState, inner: ir.TypeId) -> TypeId!:
+        if model.is_base_pointer(inner): return nullable_ptr_type(model.types)
+        if model.is_interface(inner): return model.interface_view_type()
+        return try model.tagged_optional_type(inner)
+
+    pub func error_text_type(model: MirLoweringState) -> TypeId:
+        return model.text_view_type()
+
+    pub func error_text_hir_type(model: MirLoweringState) -> ir.TypeId!:
+        return model.text_view_hir_type() else error("Base error text needs the `str` view type, which this program never spelled")
+
+struct ViewDispatch:
+    let data: RegisterId
+    let callee: RegisterId
+
+
+pub class BaseProfileLowerer: ProfileLowering:
+    let state: MirLoweringState
+
+    pub init(state: MirLoweringState):
+        self.state = state
+
+    ## Interface values and calls are views and thunk calls in Base.
+    pub func lower_expression_form(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId?!:
+        match node_form(self.state.program, expression):
+            InterfaceValue(value, conformance): return try self.lower_view(host, module, function, expression, value, i64(conformance), body)
+            InterfaceCall(receiver, interface_type, requirement, arguments): return try self.lower_view_call(host, module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
+            else: return none
+
+    pub func lower_fallible_expression(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> FallibleResult?!:
+        match node_form(self.state.program, expression):
+            InterfaceCall(receiver, interface_type, requirement, arguments): return try self.lower_fallible_view_call(host, module, function, expression, receiver, interface_type, i64(requirement), arguments, body)
+            else: return none
+
+    # mark: Interface views (Base) =============================================================
+    #
+    # A Base interface value is two words, the conformer's address and its
+    # witness table's (base.md §14.3). The table is a global of witness thunk
+    # addresses in requirement order, and a call loads the slot and calls it
+    # indirectly with the conformer's address as the erased receiver.
+
+    func lower_view(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, conformance: i64, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let data = try host.lower_expression(module, function, value, body)
+        let view_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        let view = host.new_temp(view_type, span, body)
+        host.store_value(pointer, host.field_address(view_type, view, 0, span, body), data, span, body)
+        let table = self.state.new_register(pointer)
+        body.append(MirInstruction(form = InstructionForm.GlobalAddress(result = table, global = self.state.witness_table_global(conformance)), span = span))
+        host.store_value(pointer, host.field_address(view_type, view, 1, span, body), table, span, body)
+        return view
+
+    # The witness thunk address of one requirement, and the conformer's address.
+    func lower_view_dispatch(host: FunctionLoweringHost, module: HirModule, function: HirFunction, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, span: SourceSpan, body: list[MirInstruction]) -> ViewDispatch!:
+        let pointer = builtin_mir_type(BuiltinMirType.pointer)
+        let view = try host.lower_expression(module, function, receiver, body)
+        let view_type = try self.state.mir_type_of(module, function, span, interface_type)
+        let data = host.load_value(pointer, host.field_address(view_type, view, 0, span, body), span, body)
+        let table = host.load_value(pointer, host.field_address(view_type, view, 1, span, body), span, body)
+        let slot = host.element_address(pointer, table, host.integer_constant(builtin_mir_type(BuiltinMirType.unsigned_u64), requirement, span, body), span, body)
+        let callee = host.load_value(pointer, slot, span, body)
+        return ViewDispatch(data = data, callee = callee)
+
+    func lower_view_arguments(host: FunctionLoweringHost, module: HirModule, function: HirFunction, arguments: Operands, body: list[MirInstruction]) -> list[RegisterId]!:
+        let values = list[RegisterId]()
+        for pair in range(0, i64(arguments.count) // 2): values.append(RegisterId(value = no_register))
+        for pair in range(0, i64(arguments.count) // 2):
+            let parameter_index = entry_at(self.state.program, arguments, pair * 2)
+            let argument = NodeId(value = u32(entry_at(self.state.program, arguments, pair * 2 + 1)))
+            values[parameter_index] = try host.lower_expression(module, function, argument, body)
+        return values
+
+    func lower_view_call(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let signature = try self.state.view_call_signature(interface_type, requirement)
+        if signature.is_fallible: trap("fallible view call entered infallible lowering")
+        let dispatch = try self.lower_view_dispatch(host, module, function, receiver, interface_type, requirement, span, body)
+        let values = try self.lower_view_arguments(host, module, function, arguments, body)
+        let call_arguments = list[RegisterId]()
+        let results = list[RegisterId]()
+        let value = try host.place_call_result(module, function, span, node_type(self.state.program, expression), signature.returns_never, call_arguments, results, body)
+        call_arguments.append(dispatch.data)
+        for argument in values: call_arguments.append(argument)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
+        if signature.returns_never: body.append(MirInstruction(form = InstructionForm.Unreachable, span = span))
+        return value
+
+    func lower_fallible_view_call(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, receiver: NodeId, interface_type: ir.TypeId, requirement: i64, arguments: Operands, body: list[MirInstruction]) -> FallibleResult!:
+        let span = node_span(self.state.program, expression)
+        let signature = try self.state.view_call_signature(interface_type, requirement)
+        let dispatch = try self.lower_view_dispatch(host, module, function, receiver, interface_type, requirement, span, body)
+        let values = try self.lower_view_arguments(host, module, function, arguments, body)
+        let successful = self.state.fallible_inner(node_type(self.state.program, expression)) else trap("fallible view call has an infallible result")
+        let error_type = try self.state.mir_type_of(module, function, span, resolve_builtin_type(BuiltinType.error_value))
+        let call_arguments = [host.new_temp(error_type, span, body)]
+        let results = list[RegisterId]()
+        let value = try host.place_call_result(module, function, span, successful, signature.returns_never, call_arguments, results, body)
+        call_arguments.append(dispatch.data)
+        for argument in values: call_arguments.append(argument)
+        let reported_error = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
+        results.append(reported_error)
+        body.append(MirInstruction(form = InstructionForm.CallIndirect(results = self.state.operands.run(results), signature = signature, convention = CallingConvention.luce, target = dispatch.callee, arguments = self.state.operands.run(call_arguments)), span = span))
+        return FallibleResult(value = value, error_value = reported_error)
+

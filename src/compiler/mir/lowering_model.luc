@@ -25,7 +25,6 @@ from compiler.hir.ir import HirModule, HirProgram, NodeId, SymbolId, describe_ty
 from compiler.hir.ir import nominal_cases, nominal_fields, resolve_builtin_type, types_match
 import compiler.hir.ir
 from compiler.frontend.source import SourceSpan, format_diagnostic
-from compiler.profile import Profile, profile_of
 import std.strings
 
 # mark: Shared lowering model ==================================================================
@@ -267,7 +266,8 @@ pub class MirLoweringState:
     ## The profile of the module being lowered: a Base module's `Error` and
     ## `ErrorCode` carry text as views (base.md §11.3), full Luce's as owned
     ## strings. Set by `enter_module` before each function or global.
-    pub var profile: Profile
+    ## Installed by `enter_module`; see `representation()`.
+    var current_representation: ProfileRepresentation?
     pub var result_slot: i64
     ## The compiler-internal task-group register, or `-1` when this function
     ## contains no direct spawn.
@@ -352,7 +352,7 @@ pub class MirLoweringState:
         self.recover_targets = list[RecoverTarget]()
         self.operands = OperandBuilder()
         self.error_slot = -1
-        self.profile = Profile.full
+        self.current_representation = none
         self.result_slot = -1
         self.task_group = -1
         self.newline_data = -1
@@ -648,25 +648,7 @@ pub class MirLoweringState:
                     Class(identity): return self.intern_lowered_type(MirType.WeakClass(identity = identity))
                     else: trap("HIR `Weak[T]` referent is not a class")
             Interface(declaration, arguments):
-                # A Base interface value is a two-word view (base.md §14.3).
-                if self.profile == Profile.base: return self.interface_view_type()
-                let existing = self.lowered_interface_types[value.value]
-                if existing != unlowered_nominal_type: return TypeId(value = existing)
-                let application = self.interface_application(value)
-                let identity = InterfaceId(value = u32(len(self.interfaces)))
-                let result = TypeId(value = u32(len(self.types.definitions)))
-                self.lowered_interface_types[value.value] = result.value
-                self.types.definitions.append(MirType.Interface(identity = identity))
-                self.type_index[mir_type_key(MirType.Interface(identity = identity))] = result.value
-                self.interfaces.append(MirInterface(requirements = list[MirInterfaceRequirement]()))
-                let requirements = list[MirInterfaceRequirement]()
-                for requirement in application.requirements:
-                    requirements.append(MirInterfaceRequirement(
-                        signature = try self.lower_interface_signature(requirement.parameters, requirement.result),
-                        is_mutating = requirement.is_mutating,
-                    ))
-                self.interfaces[identity.value] = MirInterface(requirements = requirements)
-                return result
+                return try self.representation().interface_type(self, value)
             Enum(index, arguments):
                 # An integer-backed enum is its representation (base.md §10.3).
                 let representation = ir.integer_enum_representation(self.program, value)
@@ -694,14 +676,7 @@ pub class MirLoweringState:
                 if completed != result.value: trap("nominal MIR type reservations are not nested")
                 return result
             Optional(inner):
-                # `T*?` is the null niche: one word whose zero is `none` (base.md §5.3).
-                if self.is_base_pointer(inner): return nullable_ptr_type(self.types)
-                # `Writer?` is the view itself, `none` when its data word is
-                # null (base.md §5.6), so a struct holding one keeps C's layout.
-                if self.profile == Profile.base and self.is_interface(inner): return self.interface_view_type()
-                let absent = self.intern_lowered_type(make_struct_type(list[TypeId]()))
-                let present = try self.lower_mir_type(inner)
-                return self.intern_lowered_type(make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
+                return try self.representation().optional_type(self, inner)
             Function(parameters, result):
                 return self.intern_lowered_type(MirType.Func(signature = try self.lower_luce_function_signature(parameters, result)))
             CFunction(parameters, result): return builtin_mir_type(BuiltinMirType.pointer)
@@ -1133,20 +1108,58 @@ pub class MirLoweringState:
     ## How `Error` and `ErrorCode` carry their text in the module being
     ## lowered: a view in Base, an owned string in full Luce.
     pub func error_text_type() -> TypeId:
-        if self.profile == Profile.base: return self.text_view_type()
-        return self.string_type()
+        return self.representation().error_text_type(self)
 
     ## The HIR type of that text, for field-wise equality and hashing.
     pub func error_text_hir_type() -> ir.TypeId!:
-        if self.profile != Profile.base: return resolve_builtin_type(BuiltinType.string)
+        return try self.representation().error_text_hir_type(self)
+
+    ## The HIR text-view type this program spelled, if any.
+    pub func text_view_hir_type() -> ir.TypeId?:
         for index in range(0, len(self.program.types.definitions)):
             match self.program.types.definitions[index].form:
                 StringView: return ir.TypeId(value = u32(index))
                 else: pass
-        error("Base error text needs the `str` view type, which this program never spelled")
+        return none
 
-    pub func enter_module(module: HirModule):
-        self.profile = profile_of(module.authority)
+    ## Full Luce's runtime interface: an identity the runtime dispatches on,
+    ## with one lowered requirement table (spec §14).
+    pub func lower_runtime_interface_type(value: ir.TypeId) -> TypeId!:
+        let existing = self.lowered_interface_types[value.value]
+        if existing != unlowered_nominal_type: return TypeId(value = existing)
+        let application = self.interface_application(value)
+        let identity = InterfaceId(value = u32(len(self.interfaces)))
+        let result = TypeId(value = u32(len(self.types.definitions)))
+        self.lowered_interface_types[value.value] = result.value
+        self.types.definitions.append(MirType.Interface(identity = identity))
+        self.type_index[mir_type_key(MirType.Interface(identity = identity))] = result.value
+        self.interfaces.append(MirInterface(requirements = list[MirInterfaceRequirement]()))
+        let requirements = list[MirInterfaceRequirement]()
+        for requirement in application.requirements:
+            requirements.append(MirInterfaceRequirement(
+                signature = try self.lower_interface_signature(requirement.parameters, requirement.result),
+                is_mutating = requirement.is_mutating,
+            ))
+        self.interfaces[identity.value] = MirInterface(requirements = requirements)
+        return result
+
+    ## The uniform tagged optional: a two-case `u8`-tagged enum (spec §2).
+    pub func tagged_optional_type(inner: ir.TypeId) -> TypeId!:
+        let absent = self.intern_lowered_type(make_struct_type(list[TypeId]()))
+        let present = try self.lower_mir_type(inner)
+        return self.intern_lowered_type(make_enum_type(builtin_mir_type(BuiltinMirType.unsigned_u8), [absent, present]))
+
+    ## The representation choices of the module being lowered, installed by
+    ## the lowering dispatch point (plan.md §5.0); this state never names a
+    ## profile itself.
+    pub func representation() -> ProfileRepresentation:
+        return self.current_representation else trap("no profile representation is installed for the module being lowered")
+
+    pub func enter_module(module: HirModule, representation: ProfileRepresentation):
+        self.current_representation = representation
+
+    pub func use_representation(representation: ProfileRepresentation):
+        self.current_representation = representation
 
     pub func bytes_type() -> TypeId:
         return self.buffer_value_type()
@@ -1207,7 +1220,25 @@ pub struct CountedLoop:
 ## The emission services `FunctionLowerer` lends to the profile lowerer. A
 ## profile consumer writes into the same function transaction through these
 ## and never imports the lowerer, so the dependency runs one way.
+## What one profile decides about representation while lowering (plan.md
+## §5.0): how an interface value and an optional are laid out, and what
+## text `Error` carries. Base and full Luce each implement it in their own
+## module; the dispatch point installs one per module.
+pub interface ProfileRepresentation:
+    func interface_type(model: MirLoweringState, value: ir.TypeId) -> TypeId!
+    func optional_type(model: MirLoweringState, inner: ir.TypeId) -> TypeId!
+    func error_text_type(model: MirLoweringState) -> TypeId
+    func error_text_hir_type(model: MirLoweringState) -> ir.TypeId!
+
+## What one profile lowers that the other does not: the expression forms
+## it alone gives meaning to (interface values and calls, runtime
+## collections, closures, workers).
+pub interface ProfileLowering:
+    func lower_expression_form(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> RegisterId?!
+    func lower_fallible_expression(host: FunctionLoweringHost, module: HirModule, function: HirFunction, expression: NodeId, body: list[MirInstruction]) -> FallibleResult?!
+
 pub interface FunctionLoweringHost:
+    func field_address(struct_type: TypeId, base: RegisterId, field: i64, span: SourceSpan, body: list[MirInstruction]) -> RegisterId
     func begin_counted_loop(start: RegisterId, limit: RegisterId, results: list[RegisterId], span: SourceSpan, body: list[MirInstruction]) -> CountedLoop
     func begin_counted_loop_body(start: RegisterId, limit: RegisterId, opened_block: bool, span: SourceSpan, body: list[MirInstruction]) -> CountedLoop
     func begin_function()
