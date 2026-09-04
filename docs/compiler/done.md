@@ -2614,6 +2614,37 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   `main`. Methods as `Type_method`, spans in parameter position, function
   pointers, unions, and the fallible status form remain open.
   Gate: 1092 compiler tests across 58 files.
+- [x] **Calling C from Base, first slice (B4)** (2026-09-04). Calling C
+  belongs to Luce Base alone (decision in `plan.md` B4). `extern func` in
+  a `.lucb` module now admits the Base boundary types an export admits:
+  `T*`, `const T*`, `T*?`, integer-backed enums, and Base structs by
+  value, with the one null check on a bare pointer in both directions
+  (base.md §17.1). `cstr` resolves to `const u8*` until the distinct
+  `c.char` lands; `(cstr)text` is the view's data word, a text literal
+  where `cstr` is wanted is that cast, and every text literal's data now
+  carries a NUL after its length so the literal is C text (§17.2). The
+  reference interpreter reports that a `cstr` has no value there. A
+  native test calls `abs` and `strlen` from Base under QBE. The `c` types
+  module, `as "symbol"`, `extern union`, and variadic calls remain open.
+  Gate: 1096 compiler tests across 58 files.
+- [x] **Variadic C calls, `as "symbol"`, and the `c` types module (B4)**
+  (2026-09-04). `extern func printf(format: cstr, ...)` declares a
+  variadic function (base.md §17.2); a call to it is the HIR
+  `CVariadicCall` node, whose declared arguments are placed as for any
+  call and whose extras are promoted by the checker as C promotes them:
+  an untyped integer literal is `int`, an untyped float literal `double`,
+  a string literal `cstr`, `char` and the narrow integers `int`, `f32`
+  `double`, an integer-backed enum its representation, and every other
+  integer, float, or pointer itself; `str`, spans, structs, and optionals
+  are refused, and a `bool` asks for `(i32)` for now. The canonical
+  signature carries `is_variadic`, the verifier admits the extras, QBE
+  writes the `...` marker, and Wasm says it has no variadic calls.
+  `extern func absolute as "abs"(...)` binds a C symbol under a Base name.
+  The standard `c` module (`src/standard/c.lucb`, §5.2) holds the alias
+  types; the distinct `char`, `long`, and `wchar`, `va_list`, and the
+  `errno`/`stdio` accessors wait. A native test calls `snprintf`, `atoi`,
+  and `abs` from Base.
+  Gate: 1096 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

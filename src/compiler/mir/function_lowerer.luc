@@ -1774,6 +1774,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
             AtomicFence(order, is_signal):
                 body.append(MirInstruction(form = InstructionForm.Fence(order = atomic_order_of(order), is_signal = is_signal), span = span))
                 return RegisterId(value = no_register)
+            CVariadicCall(callee, arguments, extras):
+                return try self.lower_variadic_call(module, function, expression, callee, arguments, extras, body)
             AtomicUpdate(operation, address, value, order):
                 let location = try self.lower_expression(module, function, address, body)
                 let operand = try self.lower_expression(module, function, value, body)
@@ -2263,6 +2265,24 @@ pub class FunctionLowerer: FunctionLoweringHost:
             values.append(try self.lower_expression(module, function, node_at(self.state.program, arguments, position), body))
         return IndirectOperands(target = target, values = values)
 
+    # A variadic C call (base.md §17.2): the declared arguments cross as in
+    # any extern call; each extra crosses under the boundary rule of its
+    # own promoted type.
+    func lower_variadic_call(module: HirModule, function: HirFunction, expression: NodeId, callee: SymbolId, arguments: Operands, extras: Operands, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let target = self.state.function_index_of(callee)
+        if target < 0: error(self.state.unsupported(module, function, span, "a variadic call to an unknown function"))
+        let called = self.state.program.functions[target]
+        let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
+        let extra_values = list[RegisterId]()
+        for position in range(0, i64(extras.count)):
+            let extra = node_at(self.state.program, extras, position)
+            let value = try self.lower_expression(module, function, extra, body)
+            extra_values.append(try self.encode_c_boundary_value(module, function, span, node_type(self.state.program, extra), value, body))
+        match called.implementation:
+            ExternalC(contract): return try self.lower_c_import_call(module, function, span, target, called, contract, placed, body, extra_values)
+            else: error(self.state.unsupported(module, function, span, "a variadic call to a function that is not an extern"))
+
     func lower_indirect_call(module: HirModule, function: HirFunction, expression: NodeId, callee: NodeId, arguments: Operands, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.state.program, expression)
         let operands = try self.lower_indirect_operands(module, function, callee, arguments, body)
@@ -2399,7 +2419,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
         let called = self.state.program.functions[target]
         let placed = try self.lower_placed_arguments(module, function, called, arguments, body)
         match called.implementation:
-            ExternalC(contract): return try self.lower_c_import_call(module, function, span, target, called, contract, placed, body)
+            ExternalC(contract): return try self.lower_c_import_call(module, function, span, target, called, contract, placed, body, list[RegisterId]())
             else: pass
         let call_arguments = list[RegisterId]()
         let results = list[RegisterId]()
@@ -2415,7 +2435,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # MIR value representations. Nullable pointer handles are tagged optionals
     # everywhere except the raw call operands/results; bare nulls trap at this
     # exact boundary in both directions.
-    func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, contract: HirCFunction, placed: list[RegisterId], body: list[MirInstruction]) -> RegisterId!:
+    func lower_c_import_call(module: HirModule, function: HirFunction, span: SourceSpan, target: i64, called: HirFunction, contract: HirCFunction, placed: list[RegisterId], body: list[MirInstruction], extras: list[RegisterId]) -> RegisterId!:
         let encoded = list[RegisterId]()
         let temporaries = list[CInputTemporary]()
         let output_slots = list[COutputSlot]()
@@ -2434,6 +2454,8 @@ pub class FunctionLowerer: FunctionLoweringHost:
                     let address = self.new_temp(raw_type, span, body)
                     encoded.append(address)
                     output_slots.append(COutputSlot(value_type = value_type, raw_type = raw_type, address = address))
+        # The extra arguments of a variadic call are already promoted.
+        for extra in extras: encoded.append(extra)
         let raw_results = list[RegisterId]()
         if not types_match(contract.declared_result, resolve_builtin_type(BuiltinType.unit)):
             let raw_result = try self.state.c_boundary_type_of(module, function, span, contract.declared_result)
@@ -2891,7 +2913,12 @@ pub class FunctionLowerer: FunctionLoweringHost:
     # The two words of a text literal: the data address and its byte count.
     func lower_text_constant(value_type: TypeId, text: str, span: SourceSpan, body: list[MirInstruction]) -> RegisterId!:
         let payload = strings.to_bytes(text)
-        let data_id = self.add_data("text", payload)
+        # The data carries a NUL after the text, outside the view's length,
+        # so `(cstr)"literal"` is C text (base.md §17.2).
+        let terminated = list[u8]()
+        for byte in payload: terminated.append(byte)
+        terminated.append(u8(0))
+        let data_id = self.add_data("text", terminated)
         let temp = self.new_temp(value_type, span, body)
         let pointer = self.state.new_register(builtin_mir_type(BuiltinMirType.pointer))
         body.append(MirInstruction(form = InstructionForm.DataAddress(result = pointer, data = DataId(value = u32(data_id))), span = span))
@@ -3156,6 +3183,9 @@ pub class FunctionLowerer: FunctionLoweringHost:
         let source_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
         let destination_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
         if source_type.value == destination_type.value: return operand
+        # `(cstr)text`: the data word of the view (base.md §17.1).
+        if self.is_aggregate(source_type) and is_ptr_type(self.state.types, destination_type):
+            return try self.load_field(source_type, operand, 0, span, body)
         var operation = ConvertOp.cast_int
         if is_ptr_type(self.state.types, source_type):
             operation = ConvertOp.ptr_to_int

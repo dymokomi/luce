@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1092 compiler tests across 58 files, plus the
+The repository currently proves 1096 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -392,7 +392,9 @@ backends only.
   without `wait`/`wake`; `Writer?` on the null-data niche; `export func`
   with Base pointers, structs by value, and integer-backed enums in the
   header, without methods, spans, function pointers, or the status form
-  yet; declaration attributes (§9.8), carried as one
+  yet; `extern func` with those types, `cstr` (`const u8*` for now),
+  variadic calls, `as "symbol"`, and the `c` alias types, calling libc
+  natively; declaration attributes (§9.8), carried as one
   `SymbolAttributes` value from syntax to MIR, with `used` a pruning
   root, `section` QBE linkage, and `weak`/`used` assembler directives
   the toolchain appends; `naked` waits for `asm`. Spec question: §5.9 says `&x` on an `@u32` is `@u32*` while

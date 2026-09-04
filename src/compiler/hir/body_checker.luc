@@ -29,7 +29,7 @@ from compiler.hir.ir import describe_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import integer_bit_width, is_pointer_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match, values_equal
 from compiler.hir.ir import place_element_step, place_field_step
-from compiler.hir.ir import AtomicOperation, AtomicOrdering, HirRecordLayout, atomic_inner
+from compiler.hir.ir import HirCFunction, AtomicOperation, AtomicOrdering, HirRecordLayout, atomic_inner
 from compiler.hir.declarations import DeclarationCollector
 from compiler.hir.generation_model import ArmBinding, CheckedBinaryOperands, CheckedPlace, CollectedConstant
 from compiler.hir.generation_model import DeclaredErrorCode, FunctionSymbol, HirGenerationState, HirSemanticChecker, ImportedBinding, ImportedModule
@@ -46,6 +46,7 @@ from compiler.profiles.full.hir.checker import FullProfileChecker
 from compiler.profiles.full.hir.closure_context import ClosureContext
 from compiler.formatting.formatted_strings import FormattedSourcePart, normalize_formatted_parts
 from compiler.formatting.ieee import normalize_ieee_float
+import std.strings
 
 # Largest finite IEEE binary32 value, represented exactly in binary64.
 let maximum_f32_value: f64 = 3.4028234663852886e38
@@ -1619,6 +1620,11 @@ pub class HirBodyChecker: HirSemanticChecker:
             value_type = resolve_builtin_type(BuiltinType.string)
             if self.in_base_module(): value_type = self.state.intern_string_view()
             value = Value.Text(value = try self.decode_text(token))
+            # A literal where `cstr` is wanted is its NUL-terminated data
+            # (base.md §17.2): the cast a programmer would otherwise write.
+            if expected != none and self.in_base_module() and self.is_c_string_type(expected):
+                let text = self.push_constant(value, value_type, token.span)
+                return self.state.push_node(HirNodeForm.Cast(value = text), expected, token.span)
         elif token.kind == TokenKind.byte_lit:
             value_type = resolve_builtin_type(BuiltinType.byte_string)
             value = Value.Bytes(value = try self.decode_bytes(token))
@@ -2067,8 +2073,19 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     # The pointer rows of base.md §7.5: pointer to pointer (any pointee or
     # qualifier, `void*` included), `(usize)p`, and `(T*?)n` from `usize`.
+    # `cstr`: `const u8*` (base.md §5.2).
+    func is_c_string_type(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Pointer(pointee, is_const, is_volatile): return is_const and not is_volatile and types_match(pointee, resolve_builtin_type(BuiltinType.unsigned_u8))
+            else: return false
+
     func is_pointer_cast(source: TypeId, destination: TypeId) -> bool:
         let types = self.state.types
+        # `(cstr)text` is the view's data pointer; the text must be
+        # NUL-terminated, which a literal always is (base.md §12.6).
+        match types.definitions[source.value].form:
+            StringView: return self.is_c_string_type(destination)
+            else: pass
         match types.definitions[source.value].form:
             Pointer(pointee, is_const, is_volatile):
                 match types.definitions[destination.value].form:
@@ -2478,6 +2495,10 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     func check_direct_function_call(function_index: i64, receiver_value: NodeId, arguments: list[ArgumentSyntax], callee_span: SourceSpan, span: SourceSpan, expected: TypeId?) -> NodeId!:
         let function = self.state.functions[function_index]
+        match function.source:
+            ExternalC(contract):
+                if contract.is_variadic: return try self.check_variadic_call(function, contract, arguments, span, expected)
+            else: pass
 
         # Pairs of (parameter index, argument node), in source order.
         let typed_arguments = list[u32]()
@@ -2499,6 +2520,61 @@ pub class HirBodyChecker: HirSemanticChecker:
         )
         let typed = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = placed), function.result, span)
         return try self.require_type(typed, expected)
+
+    # A variadic C call (base.md §17.2): the declared parameters take their
+    # arguments positionally, and each extra argument is promoted as C
+    # would promote it, with no parameter type to adapt a literal to.
+    func check_variadic_call(function: FunctionSymbol, contract: HirCFunction, arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        let declared = len(function.parameters)
+        if len(arguments) < declared: try self.fail(span, "call to `" + function.name + "` supplies " + str(len(arguments)) + " argument(s) but its declared parameters are " + str(declared))
+        let placed = list[u32]()
+        for index in range(0, len(arguments)):
+            if arguments[index].label != none: try self.fail(arguments[index].span, "a variadic C call uses positional arguments (base.md §17.2)")
+            if index >= declared: break
+            let checked = try self.check_expression(arguments[index].value, function.parameters[index].value_type)
+            placed.append(u32(index))
+            placed.append(checked.value)
+        let extras = list[NodeId]()
+        for index in range(declared, len(arguments)):
+            extras.append(try self.check_variadic_argument(arguments[index].value))
+        let typed = self.state.push_node(HirNodeForm.CVariadicCall(function = function.symbol, arguments = self.state.push_run(placed), extras = self.state.push_nodes(extras)), function.result, span)
+        return try self.require_type(typed, expected)
+
+    # The promotions of base.md §17.2, applied to one extra argument.
+    func check_variadic_argument(value: ExpressionSyntax) -> NodeId!:
+        let int32 = resolve_builtin_type(BuiltinType.signed_i32)
+        let float64 = resolve_builtin_type(BuiltinType.float64)
+        let literal = find_literal_token(value)
+        if literal != none:
+            # An untyped integer literal is `int`, an untyped float literal
+            # `double`, and a string literal `cstr`.
+            if literal.kind == TokenKind.int_lit and is_contextual_integer_expression(value): return try self.check_expression(value, int32)
+            if literal.kind == TokenKind.float_lit and not strings.contains(literal.text, "f"): return try self.check_expression(value, float64)
+            if literal.kind == TokenKind.str_lit: return try self.check_expression(value, self.state.intern_pointer(resolve_builtin_type(BuiltinType.unsigned_u8), true, false))
+        let checked = try self.value_of(try self.check_expression(value, none), none)
+        var found = self.state.type_of(checked)
+        var promoted = checked
+        let representation = self.declarations.integer_enum_representation(found)
+        if representation != none:
+            promoted = self.state.push_node(HirNodeForm.Cast(value = promoted), representation, value.span)
+            found = representation
+        match self.state.types.definitions[found.value].form:
+            Boolean: try self.fail(value.span, "`bool` in a variadic position is promoted to `int`; write `(i32)flag` for now (base.md §17.2)")
+            Character: return self.state.push_node(HirNodeForm.Cast(value = promoted), int32, value.span)
+            Integer(bits, is_signed):
+                if bits < 32: return self.state.push_node(HirNodeForm.Cast(value = promoted), int32, value.span)
+                return promoted
+            PointerInteger(is_signed): return promoted
+            Floating(bits):
+                if bits < 64: return self.state.push_node(HirNodeForm.Cast(value = promoted), float64, value.span)
+                return promoted
+            Pointer(pointee, is_const, is_volatile): return promoted
+            Optional(inner):
+                match self.state.types.definitions[inner.value].form:
+                    Pointer(pointee, is_const, is_volatile): return promoted
+                    else: pass
+            else: pass
+        error(self.diagnostic(value.span, "`" + self.describe_type(found) + "` cannot be passed in a variadic position; C takes integers, floats, and pointers there (base.md §17.2)"))
 
     # Calls through `func` and `cfunc` values share one semantic operation.
     # Neither type carries declaration labels or defaults; the convention is
