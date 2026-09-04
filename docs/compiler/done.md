@@ -2599,6 +2599,21 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   nothing.
   A non-case order, an unknown order, and a missing order are diagnosed.
   Gate: 1088 compiler tests across 58 files.
+- [x] **Base exports, first slice (B4)** (2026-09-04). `export func` is
+  the Base spelling (base.md §17.6); `export c func` stays full Luce's.
+  The C-representable rule now admits Base pointers `T*` and `const T*`,
+  nullable pointers `T*?`, integer-backed enums, and Base structs whose
+  fields are representable, passed and returned by value. The C API
+  model gains a `Pointer` type form, discovers the Base structs and
+  integer-backed enums an export reaches, and publishes them under their
+  own names; the header spells `T *`, `const T *`, `struct Name { ... }`,
+  and `typedef uint32_t Access;` with `#define Access_read` values, the
+  same form an exported C enum takes. The one boundary check (§17.1)
+  guards a bare Base pointer in both directions, and the ABI report
+  agrees on nullable words. A native test calls both exports from a C
+  `main`. Methods as `Type_method`, spans in parameter position, function
+  pointers, unions, and the fallible status form remain open.
+  Gate: 1092 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

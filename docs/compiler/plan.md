@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1088 compiler tests across 58 files, plus the
+The repository currently proves 1092 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -389,7 +389,10 @@ backends only.
   global of thunk addresses rather than a new instruction; `volatile`
   loads and stores; atomics, with `max`/`min` as a compare-exchange loop
   under QBE, `atomic.fence` through the standard `atomic` module, and
-  without `wait`/`wake`; `Writer?` on the null-data niche; declaration attributes (§9.8), carried as one
+  without `wait`/`wake`; `Writer?` on the null-data niche; `export func`
+  with Base pointers, structs by value, and integer-backed enums in the
+  header, without methods, spans, function pointers, or the status form
+  yet; declaration attributes (§9.8), carried as one
   `SymbolAttributes` value from syntax to MIR, with `used` a pruning
   root, `section` QBE linkage, and `weak`/`used` assembler directives
   the toolchain appends; `naked` waits for `asm`. Spec question: §5.9 says `&x` on an `@u32` is `@u32*` while
@@ -397,7 +400,16 @@ backends only.
   grammar and lets `@` head the whole type. Open decision: Base's `c` module of §5.2 (aliases plus
   the distinct `c.char`/`c.long`/`c.wchar`) shares its name with the
   standard `c.luc` that full Luce's C import uses (§21); `cstr` and Base
-  `extern` wait on how the two are told apart.* Two-word
+  `extern` waited on how the two are told apart. Decision (2026-09-04):
+  calling C belongs to Luce Base alone. The standard `c` module is a Base
+  module (`src/standard/c.lucb`, the types of §5.2), `extern`, `cstr`,
+  and variadic calls are Base features, and full Luce reaches C and the
+  outside world by importing a Base module through the safe crossing of
+  §18, never through a C import of its own. Full Luce's FIIR C import and
+  `src/standard/c.luc` are therefore a migration target to be retired
+  once Base `extern` can carry them, not a peer; until then a module's
+  identity is its name and its tier, so `import c` in a `.lucb` binds the
+  Base module and in a `.luc` the old one.* Two-word
   unmanaged interface views with a witness-table-address instruction, `@T`
   atomics and fences with the C11 orderings, `volatile` loads and stores,
   per-architecture `asm` blocks and `naked` functions, the declaration
