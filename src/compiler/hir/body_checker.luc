@@ -705,6 +705,11 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = field.value_type, steps = place.steps, initializer_field = place.initializer_field)
             Index(base, subscript):
                 let inspected = try self.resolve_assignment_place(base, span, false)
+                match self.state.types.definitions[inspected.value_type.value].form:
+                    Pointer(pointee, is_const, is_volatile):
+                        let element = try self.pointer_element(try self.place_value(inspected, span), subscript, span)
+                        return try self.pointer_place(element, span, mutate_value)
+                    else: pass
                 var element_type = resolve_builtin_type(BuiltinType.unit)
                 var step = place_element_step
                 var index_type = resolve_builtin_type(BuiltinType.unsigned_u64)
@@ -724,15 +729,33 @@ pub class HirBodyChecker: HirSemanticChecker:
                 return CheckedPlace(pointer = place.pointer, symbol = place.symbol, global = place.global, value_type = element_type, steps = place.steps, initializer_field = place.initializer_field)
             else: error(self.diagnostic(span, "assignment needs a named mutable place"))
 
+    # `p + i` for indexing: the pointer must be typed, the index an integer.
+    func pointer_element(pointer: NodeId, subscript: ExpressionSyntax, span: SourceSpan) -> NodeId!:
+        let pointer_type = self.state.type_of(pointer)
+        match self.state.types.definitions[pointer_type.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                if types_match(pointee, resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`void*` has no element size; cast it to a typed pointer before indexing (base.md §7.7)")
+            else: trap("pointer element requested from a non-pointer")
+        let index = try self.check_expression(subscript, none)
+        if not is_integer_type(self.state.types, self.state.type_of(index)):
+            try self.fail(span, "a pointer index is an integer, found `" + self.describe_type(self.state.type_of(index)) + "`")
+        return self.state.push_node(HirNodeForm.PointerOffset(pointer = pointer, offset = index, negate = false), pointer_type, span)
+
     # A place rooted at the pointee of a Base pointer. A store needs `T*`;
     # `const T*` reads only (base.md §6.6).
     func pointer_place(pointer: NodeId, span: SourceSpan, mutate_value: bool) -> CheckedPlace!:
         match self.state.types.definitions[self.state.type_of(pointer).value].form:
             Pointer(pointee, is_const, is_volatile):
+                try self.require_typed_pointee(pointee, span)
                 if mutate_value and is_const:
                     try self.fail(span, "cannot store through `" + self.describe_type(self.state.type_of(pointer)) + "`; a store needs `" + self.describe_type(pointee) + "*`")
                 return CheckedPlace(pointer = pointer, symbol = SymbolId(value = no_node), global = -1, value_type = pointee, steps = list[u32](), initializer_field = false)
             else: error(self.diagnostic(span, "`*` dereferences a pointer, found `" + self.describe_type(self.state.type_of(pointer)) + "`"))
+
+    func require_typed_pointee(pointee: TypeId, span: SourceSpan) -> !:
+        if types_match(pointee, resolve_builtin_type(BuiltinType.unit)):
+            try self.fail(span, "`void*` cannot be dereferenced; cast it to a typed pointer (base.md §5.3)")
 
     # Read the value a resolved place holds, as an expression node.
     func place_value(place: CheckedPlace, span: SourceSpan) -> NodeId!:
@@ -1136,6 +1159,7 @@ pub class HirBodyChecker: HirSemanticChecker:
             let pointer = try self.check_expression(operand, none)
             match self.state.types.definitions[self.state.type_of(pointer).value].form:
                 Pointer(pointee, is_const, is_volatile):
+                    try self.require_typed_pointee(pointee, span)
                     let loaded = self.state.push_node(HirNodeForm.Deref(pointer = pointer), pointee, span)
                     return try self.require_type(loaded, expected)
                 else: error(self.diagnostic(span, "`*` dereferences a pointer, found `" + self.describe_type(self.state.type_of(pointer)) + "`"))
@@ -1192,11 +1216,52 @@ pub class HirBodyChecker: HirSemanticChecker:
         if is_arithmetic_operator(operator) and expected != none:
             operand_context = self.optional_value_context(expected)
 
-        var operands = try self.check_binary_operands(left, right, operand_context)
-        if self.in_base_module(): operands = try self.widen_binary_operands(operands)
+        var operands = CheckedBinaryOperands(left = NodeId(value = no_node), right = NodeId(value = no_node))
+        if self.in_base_module() and (operator == "+" or operator == "-") and names_a_value(left):
+            # A pointer on the left takes no type from context and its count is
+            # any integer (base.md §7.7). A named value is typed by itself, so
+            # checking it first and then applying the context leaves every
+            # non-pointer operand exactly as the contextual path types it.
+            var checked_left = try self.check_expression(left, none)
+            match self.state.types.definitions[self.state.type_of(checked_left).value].form:
+                Pointer(pointee, is_const, is_volatile):
+                    operands = CheckedBinaryOperands(left = checked_left, right = try self.check_expression(right, none))
+                else:
+                    if operand_context != none: checked_left = try self.require_type(checked_left, operand_context)
+                    operands = CheckedBinaryOperands(left = checked_left, right = try self.check_expression(right, self.state.type_of(checked_left)))
+        else:
+            operands = try self.check_binary_operands(left, right, operand_context)
+        if self.in_base_module():
+            let pointer_arithmetic = try self.check_pointer_arithmetic(operator, operands, span, expected)
+            if pointer_arithmetic != none: return pointer_arithmetic
+            operands = try self.widen_binary_operands(operands)
         let resolved = try self.resolve_binary_operation(self.state.type_of(operands.left), operator, self.state.type_of(operands.right), span)
         let typed = self.state.push_node(HirNodeForm.Binary(left = operands.left, operation = resolved.operation, right = operands.right), resolved.result, span)
         return try self.require_type(typed, expected)
+
+    # `p + n`, `p - n`, and `p - q` (base.md §7.7): element-scaled and
+    # unchecked; `n` is any integer, the difference is `isize`.
+    func check_pointer_arithmetic(operator: str, operands: CheckedBinaryOperands, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if operator != "+" and operator != "-": return none
+        let left = self.state.type_of(operands.left)
+        let right = self.state.type_of(operands.right)
+        match self.state.types.definitions[left.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                if types_match(pointee, resolve_builtin_type(BuiltinType.unit)):
+                    try self.fail(span, "`void*` has no element size; cast it to a typed pointer before arithmetic (base.md §7.7)")
+                if is_integer_type(self.state.types, right):
+                    let node = self.state.push_node(HirNodeForm.PointerOffset(pointer = operands.left, offset = operands.right, negate = operator == "-"), left, span)
+                    return try self.require_type(node, expected)
+                if operator == "-":
+                    match self.state.types.definitions[right.value].form:
+                        Pointer(other_pointee, other_const, other_volatile):
+                            if not types_match(pointee, other_pointee):
+                                try self.fail(span, "`-` needs pointers to one type, found `" + self.describe_type(left) + "` and `" + self.describe_type(right) + "`")
+                            let node = self.state.push_node(HirNodeForm.PointerDifference(left = operands.left, right = operands.right), resolve_builtin_type(BuiltinType.signed_isize), span)
+                            return try self.require_type(node, expected)
+                        else: pass
+                return none
+            else: return none
 
     # Base widens the narrower integer operand to the wider one of the same
     # signedness, so `byte + count` reads as C does (base.md §7.5).
@@ -1379,12 +1444,33 @@ pub class HirBodyChecker: HirSemanticChecker:
         if not self.in_base_module():
             try self.fail(span, "a `(T)x` cast belongs to Luce Base; a `.luc` module spells the checked conversion `T(x)` (base.md §7.5)")
         let destination = try self.declarations.resolve_type(self.state.current_module, target)
-        let checked = try self.check_expression(value, none)
+        # `(T*?)n` reads its integer as `usize`, so a literal takes that type.
+        var value_context: TypeId? = none
+        if self.is_pointer_cast(resolve_builtin_type(BuiltinType.unsigned_usize), destination): value_context = resolve_builtin_type(BuiltinType.unsigned_usize)
+        let checked = try self.check_expression(value, value_context)
         let source = self.state.type_of(checked)
-        if not is_numeric_type(self.state.types, source) or not is_numeric_type(self.state.types, destination):
-            try self.fail(span, "`(" + self.describe_type(destination) + ")` casts a number; `" + self.describe_type(source) + "` to `" + self.describe_type(destination) + "` is not a numeric cast (base.md §7.5)")
+        let numeric = is_numeric_type(self.state.types, source) and is_numeric_type(self.state.types, destination)
+        if not numeric and not self.is_pointer_cast(source, destination):
+            try self.fail(span, "`(" + self.describe_type(destination) + ")` casts a number or a pointer; `" + self.describe_type(source) + "` to `" + self.describe_type(destination) + "` is not one of C's casts (base.md §7.5)")
         let node = self.state.push_node(HirNodeForm.Cast(value = checked), destination, span)
         return try self.require_type(node, expected)
+
+    # The pointer rows of base.md §7.5: pointer to pointer (any pointee or
+    # qualifier, `void*` included), `(usize)p`, and `(T*?)n` from `usize`.
+    func is_pointer_cast(source: TypeId, destination: TypeId) -> bool:
+        let types = self.state.types
+        match types.definitions[source.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                match types.definitions[destination.value].form:
+                    Pointer(other, other_const, other_volatile): return true
+                    PointerInteger(is_signed): return true
+                    else: return false
+            else: pass
+        if not types_match(source, resolve_builtin_type(BuiltinType.unsigned_usize)): return false
+        let inner = self.state.optional_inner(destination) else resolve_builtin_type(BuiltinType.unit)
+        match types.definitions[inner.value].form:
+            Pointer(pointee, is_const, is_volatile): return true
+            else: return false
 
     # `sizeof(T)`, `sizeof(value)`, `alignof(T)`, and `offsetof(T, field)`: a
     # Base module's layout questions (base.md §5.11). HIR records the question
@@ -2241,7 +2327,9 @@ pub class HirBodyChecker: HirSemanticChecker:
         var checked = first
         # `p.field` reads through a Base pointer; `->` is not needed (base.md §7.7).
         match self.state.types.definitions[self.state.type_of(first).value].form:
-            Pointer(pointee, is_const, is_volatile): checked = self.state.push_node(HirNodeForm.Deref(pointer = first), pointee, span)
+            Pointer(pointee, is_const, is_volatile):
+                try self.require_typed_pointee(pointee, span)
+                checked = self.state.push_node(HirNodeForm.Deref(pointer = first), pointee, span)
             else: pass
         let checked_type = self.state.type_of(checked)
         if types_match(checked_type, resolve_builtin_type(BuiltinType.byte_string)) and name == "length":
@@ -2297,6 +2385,13 @@ pub class HirBodyChecker: HirSemanticChecker:
         let value_type = self.state.type_of(value)
         let collection = try self.full.check_index(self, value, value_type, subscript, span, expected)
         if collection != none: return collection
+        match self.state.types.definitions[value_type.value].form:
+            Pointer(pointee, is_const, is_volatile):
+                # `p[i]` is `*(p + i)`: unchecked (base.md §7.7).
+                let element = try self.pointer_element(value, subscript, span)
+                let loaded = self.state.push_node(HirNodeForm.Deref(pointer = element), pointee, span)
+                return try self.require_type(loaded, expected)
+            else: pass
         var element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
         if types_match(value_type, resolve_builtin_type(BuiltinType.byte_string)):
             element_type = resolve_builtin_type(BuiltinType.unsigned_u8)
@@ -3320,9 +3415,24 @@ func qualifies_implicitly(types: TypeTable, found: TypeId, expected: TypeId) -> 
         Pointer(pointee, is_const, is_volatile):
             match types.definitions[expected.value].form:
                 Pointer(other_pointee, other_const, other_volatile):
-                    if pointee.value != other_pointee.value: return false
+                    # Any object pointer converts to `void*` of the same qualification.
+                    let to_void = types_match(other_pointee, resolve_builtin_type(BuiltinType.unit))
+                    if pointee.value != other_pointee.value and not to_void: return false
                     if is_const and not other_const: return false
                     if is_volatile and not other_volatile: return false
                     return true
                 else: return false
+        else: return false
+
+# An expression whose type is its own: a binding, member, index, call, cast,
+# address, or dereference. These carry no literal that context would type.
+func names_a_value(value: ExpressionSyntax) -> bool:
+    match value.form:
+        Name(name): return true
+        Member(owner, name): return true
+        Index(target, subscript): return true
+        Call(callee, type_arguments, arguments): return true
+        Cast(target, inner): return true
+        Unary(operator, operand): return operator == "&" or operator == "*"
+        Group(grouped): return names_a_value(grouped)
         else: return false

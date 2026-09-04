@@ -29,7 +29,7 @@ from compiler.profiles.full.backends.hir_execution import FullProfileExecution
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BoxedValue, BuiltinType, ClassFinalizer, NodeId
 from compiler.hir.ir import HirCEnum, HirCFunction, HirCFunctionIdentity, HirCStructKind, HirExternVariable, HirFunction, HirIteration, HirProgram, HirReceiverKind, Operands, SymbolId, TypeId, Value, no_node
 from compiler.hir.ir import entry_at, node_at, node_form, node_type, nominal_cases, nominal_fields
-from compiler.hir.ir import integer_maximum, integer_minimum, unsigned_integer_maximum
+from compiler.hir.ir import integer_maximum, integer_minimum, is_pointer_integer_type, unsigned_integer_maximum
 from compiler.hir.ir import describe_type, function_body, integer_values_match, is_floating_type, is_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match
 from compiler.hir.ir import place_element_step, place_field_step
 from compiler.hir.analyzer import AnalyzedProgram
@@ -290,6 +290,39 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                             else: trap("element step index is not an integer")
                     Transferred(execution): error("interpreter: an index expression diverged")
             else: error("interpreter: a pointer path crosses a runtime collection")
+
+    # Pointer arithmetic stays inside one array: the last step of the place
+    # must index an array, and the count moves that index (base.md §7.7 leaves
+    # anything else undefined; the oracle refuses it).
+    func offset_address(target: AddressTarget, count: i64) -> Value!:
+        if len(target.path) == 0: error("interpreter: trap: pointer arithmetic on a place that is not an array element")
+        let parent_path = list[i64]()
+        for index in range(0, len(target.path) - 1): parent_path.append(target.path[index])
+        match try self.read_address(target.frame, target.symbol, target.global, parent_path):
+            Array(elements):
+                let moved = list[i64]()
+                for step in parent_path: moved.append(step)
+                let last = target.path[len(target.path) - 1] + count
+                if last < 0 or last > len(elements): error("interpreter: trap: pointer arithmetic left its array")
+                moved.append(last)
+                return Value.Address(frame = target.frame, symbol = target.symbol, global = target.global, path = moved)
+            else: error("interpreter: trap: pointer arithmetic on a place that is not an array element")
+
+    func address_difference(left: AddressTarget, right: AddressTarget) -> i64!:
+        let same_root = left.frame == right.frame and left.symbol.value == right.symbol.value and left.global == right.global
+        if not same_root or len(left.path) != len(right.path) or len(left.path) == 0:
+            error("interpreter: trap: pointer difference between two objects")
+        for index in range(0, len(left.path) - 1):
+            if left.path[index] != right.path[index]: error("interpreter: trap: pointer difference between two objects")
+        return left.path[len(left.path) - 1] - right.path[len(right.path) - 1]
+
+    func state_optional_pointer(value_type: TypeId) -> bool:
+        match self.program.types.definitions[value_type.value].form:
+            Optional(inner):
+                match self.program.types.definitions[inner.value].form:
+                    Pointer(pointee, is_const, is_volatile): return true
+                    else: return false
+            else: return false
 
     func root_of(frame: i64, symbol: SymbolId, global: i64) -> Value!:
         if global >= 0: return self.globals[global]
@@ -1359,8 +1392,40 @@ class HirInterpreterRun: ClassFinalizer, HirExecutionHost:
                 return Evaluation.Evaluated(value = Value.UnsignedInteger(value = u64(try self.layout_answer(query, subject, field))))
             Cast(value):
                 match try self.evaluate(value, bindings):
-                    Evaluated(item): return Evaluation.Evaluated(value = cast_numeric_value(item, node_type(self.program, expression), self.program.types))
+                    Evaluated(item):
+                        match item:
+                            Address(frame, symbol, global, path):
+                                # A pointer-to-pointer cast keeps the place; the
+                                # reference interpreter has no numeric addresses.
+                                if is_pointer_integer_type(self.program.types, node_type(self.program, expression)):
+                                    error("interpreter: `(usize)p` has no value in the reference interpreter, whose addresses are places, not numbers (base.md §19.3)")
+                                return Evaluation.Evaluated(value = item)
+                            else: pass
+                        if self.state_optional_pointer(node_type(self.program, expression)):
+                            match item:
+                                UnsignedInteger(address):
+                                    if address == u64(0): return Evaluation.Evaluated(value = Value.Absent)
+                                    error("interpreter: `(T*?)n` names no place in the reference interpreter for a non-zero integer (base.md §19.3)")
+                                else: trap("integer-to-pointer cast received a non-integer")
+                        return Evaluation.Evaluated(value = cast_numeric_value(item, node_type(self.program, expression), self.program.types))
                     Transferred(execution): return Evaluation.Transferred(execution = execution)
+            PointerOffset(pointer, offset, negate):
+                let target = try self.evaluate_address(pointer, bindings)
+                var count = 0
+                match try self.evaluate(offset, bindings):
+                    Evaluated(item):
+                        match item:
+                            SignedInteger(value): count = value
+                            UnsignedInteger(value): count = i64(value)
+                            else: trap("pointer offset is not an integer")
+                    Transferred(execution): return Evaluation.Transferred(execution = execution)
+                if negate: count = 0 - count
+                if count == 0: return Evaluation.Evaluated(value = Value.Address(frame = target.frame, symbol = target.symbol, global = target.global, path = target.path))
+                return Evaluation.Evaluated(value = try self.offset_address(target, count))
+            PointerDifference(left, right):
+                let first = try self.evaluate_address(left, bindings)
+                let second = try self.evaluate_address(right, bindings)
+                return Evaluation.Evaluated(value = Value.SignedInteger(value = try self.address_difference(first, second)))
             QualifyPointer(value): return try self.evaluate(value, bindings)
             Deref(pointer):
                 let target = try self.evaluate_address(pointer, bindings)

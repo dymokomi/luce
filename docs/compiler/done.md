@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
   In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
   `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
@@ -2240,7 +2240,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
   of signedness, and `u64` into `usize` stay spelled and are refused by
   name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **The overflow operator family (B1, fifth slice)** (2026-09-03). `+%`,
   `-%`, `*%`, and unary `-%` wrap in two's complement, `+|`, `-|`, `*|`
   saturate at the type's bounds, and `+?`, `-?`, `*?` answer `T?` with
@@ -2264,7 +2264,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   wrapping, saturating, checked, layout) answer one number each through the
   reference interpreter, the MIR oracle at both pointer widths, both
   encoders, and a native QBE build linked to a C driver.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **C's cast between numbers (B1, sixth slice)** (2026-09-03). `(T)x`
   parses when the parenthesised text is a scalar type name followed by an
   operand, so `(value)` stays a group and `(Point)(x)` a call (base.md §7.5);
@@ -2278,7 +2278,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   narrow clamp; QBE compares against the bounds first). Pointer, enum, and
   text casts arrive with their types (B2, B3). The shared fixtures gain a
   cast fixture and `examples/base/c_arithmetic.lucb` casts twice.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **Pointers: `T*`, `&`, `*`, and `.` through them (B2, first slice)**
   (2026-09-03). A `.lucb` module names `T*`, `const T*`, and `volatile T*`
   (the qualifier prefixes the pointee and attaches to the `*` that follows;
@@ -2301,7 +2301,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   fixture and `examples/base/pointers.lucb` checks, runs, and builds. Open
   in B2: the `T*?` niche, `void*`, pointer arithmetic and ordering, arrays
   and spans, `str` views, and the escape rule.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
 - [x] **The nullable pointer niche (B2, second slice)** (2026-09-03). `T*?`
   is an ordinary optional in HIR and one word in canonical MIR: the new
   `NullablePtr` type (`ptr?`), pointer-sized, whose zero is `none`, never an
@@ -2314,7 +2314,27 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   interpreter is unchanged: `Absent`/`Present` over the frame-place
   pointer. The shared fixtures gain a linked-list fixture walked through
   `Node*?`.
-  Gate: 1031 compiler tests across 53 files.
+  Gate: 1034 compiler tests across 53 files.
+- [x] **Pointer arithmetic, ordering, `void*`, and address casts (B2, third
+  slice)** (2026-09-04). `p + n` and `p - n` are element-scaled and
+  unchecked (`PointerOffset`, lowered to the unchecked `ElementAddress`
+  with a signed count), `p[i]` is `*(p + i)` for reads and stores, `p - q`
+  is the element difference as `isize` (the new canonical
+  `PointerDifference`, which each backend divides by the element size from
+  its layout), and `<`/`<=`/`>`/`>=` order addresses totally, across
+  objects (the verifier admits ordered comparison of `ptr`, QBE compares
+  unsigned, Wasm already did). `void*` is the pointer to `unit`, spelled
+  `void*`, that any object pointer converts to implicitly and that cannot be
+  dereferenced, indexed, or offset. The cast rows for pointers land:
+  `(U*)p` between any pointers, `(usize)p` (`ptr_to_int`), and `(T*?)n`
+  from `usize` (`int_to_ptr`, into the niche). The reference interpreter
+  moves a place along the array it indexes and refuses arithmetic that
+  leaves one, orders places lexicographically, and names the two casts it
+  cannot answer because its addresses are places, not numbers (base.md
+  §19.3); the MIR oracle and both backends answer them. The shared
+  fixtures gain an arithmetic fixture and `examples/base/pointers.lucb`
+  walks an array.
+  Gate: 1034 compiler tests across 53 files.
 
 ## 3. Bugs the multi-backend harness found
 
