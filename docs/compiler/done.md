@@ -2169,7 +2169,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   only full Luce admits (`mir/freestanding.luc`, answered by `profile.luc`
   over `mir_type_key`). `examples/base/hello.lucb` checks, runs through the
   HIR oracle, and builds a freestanding Wasm library through the pipeline.
-  Gate: 1009 compiler tests across 51 files.
+  Gate: 1016 compiler tests across 52 files.
 
 - [x] **One lexer, two spellings: the Base tokens and reserved words (B1,
   second slice)** (2026-09-03). `profile.luc` lists the Base-only operator
@@ -2184,7 +2184,7 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   both profiles and are refused by HIR in Base. The grammar for the new
   tokens arrives with the slices that give them meaning; until then a Base
   module that spells one gets a parse diagnostic, pinned by a fixture.
-  Gate: 1009 compiler tests across 51 files.
+  Gate: 1016 compiler tests across 52 files.
 - [x] **Pointer-width integers and layout questions without a width in the IR
   (B1, third slice)** (2026-09-03). `usize` and `isize` resolve only in a
   `.lucb` module (a `.luc` module naming them is told they belong to Luce
@@ -2220,7 +2220,27 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   module-level `assert`s (base.md §5.1) waits for the Base constant
   evaluator. `examples/base/pointer_width.lucb` asks all three questions and
   answers 42 at either pointer width through check, run, and a Wasm build.
-  Gate: 1009 compiler tests across 51 files.
+  Gate: 1016 compiler tests across 52 files.
+- [x] **C's division and implicit widening (B1, fourth slice)** (2026-09-03).
+  In a `.lucb` module `//` and `%` are the HIR operations `TruncDivide` and
+  `TruncRemainder` and the canonical `trunc_div`/`trunc_rem`: the quotient
+  truncates toward zero and the remainder carries the dividend's sign, as in
+  C (base.md §7.2), while a `.luc` module keeps floor division; the same
+  source answers `-312` in Base and `-393` in full Luce through both
+  oracles. Division by zero and `minimum // -1` trap as before and
+  `minimum % -1` is 0. QBE emits its truncating `div`/`rem` without the
+  floor adjustment; Wasm uses `div_s`/`rem_s` directly. An integer widens
+  implicitly to a wider integer of one signedness in Base (base.md §7.5):
+  the checker inserts the conversion at every context (`require_type`) and
+  between binary operands, widening the narrower side. Widening to or from
+  the pointer width lowers to the new canonical `widen` conversion, which is
+  value-preserving on every target because a pointer-width integer is 32 to
+  64 bits wide: fixed widths up to 32 widen into it and it widens into 64.
+  The verifier admits `widen` only for such pairs; QBE extends or copies at
+  64 bits, Wasm at 32, and the oracle keeps the value. Narrowing, a change
+  of signedness, and `u64` into `usize` stay spelled and are refused by
+  name. `examples/base/c_arithmetic.lucb` checks, runs, and builds.
+  Gate: 1016 compiler tests across 52 files.
 
 ## 3. Bugs the multi-backend harness found
 

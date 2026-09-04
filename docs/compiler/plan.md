@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1009 compiler tests across 51 files, plus the
+The repository currently proves 1016 compiler tests across 52 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -336,8 +336,10 @@ backends only.
   rejections, the freestanding check, the Base-only tokens and reserved
   words in the shared lexer, `usize`/`isize` as a widthless canonical type
   each backend folds, and `sizeof`/`alignof`/`offsetof` as a symbolic
-  `LayoutConstant` folded the same way; widening, C division, the cast
-  family, and folding `usize` constants into array lengths are open.* Select the profile by the `.lucb` suffix
+  `LayoutConstant` folded the same way, C's `//` and `%`, and implicit
+  same-signedness widening with the canonical `widen` conversion; the
+  wrapping/saturating/checked operators, the `(T)x` cast family, and folding
+  `usize` constants into array lengths are open.* Select the profile by the `.lucb` suffix
   (and rename the audited tier to `.lucn`, `base.md` §16.2); admit the Base
   reserved words and the `@`, `---`, `...`, and wrapping/saturating/checked
   operator tokens only in Base modules; reject classes, collections, closures,
