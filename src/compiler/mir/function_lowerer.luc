@@ -24,7 +24,7 @@ from compiler.mir.canonical import BinaryOp, BuiltinMirType, CallingConvention, 
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
 from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
-from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, pointer_int_type, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, mir_type, no_register, no_registers, signature_register_type, uint_maximum
+from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_nullable_ptr_type, pointer_int_type, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, mir_type, no_register, no_registers, signature_register_type, uint_maximum
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirFunction, HirReceiverKind, Value
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, describe_type, no_node, node_children
 from compiler.hir.ir import entry_at, function_body, node_at, node_diverges, node_form, node_span, node_type, resolve_builtin_type, types_match
@@ -879,10 +879,9 @@ pub class FunctionLowerer: FunctionLoweringHost:
 
         let next_start = len(self.state.defers)
         let optional_value = try self.lower_expression(module, function, next, body)
-        let present = self.load_present(optional_value, span, body)
+        let present = self.optional_present(optional_type, optional_value, span, body)
         self.open_if(present, list[RegisterId](), span, body)
-        let payload = self.payload_address(optional_type, optional_value, span, body)
-        self.initialize_owned_value(element_type, element_address, self.load_value(element_type, payload, span, body), span, body)
+        self.initialize_owned_value(element_type, element_address, self.optional_payload(optional_type, element_type, optional_value, span, body), span, body)
         self.emit_end(span, body)
         try self.emit_temporaries_from(next_start, body)
         let absent = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
@@ -1730,10 +1729,17 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 let field = self.field_address(struct_type, base, field_index, span, body)
                 return self.load_value(value_type, field, span, body)
             NoneLiteral:
+                # The nullable pointer niche is one word whose zero is `none`.
+                if is_nullable_ptr_type(self.state.types, value_type): return self.typed_null_constant(value_type, span, body)
                 let temp = self.new_temp(value_type, span, body)
                 self.store_optional_tag(temp, 0, span, body)
                 return temp
             Some(inner):
+                if is_nullable_ptr_type(self.state.types, value_type):
+                    let pointer = try self.lower_expression(module, function, inner, body)
+                    let wrapped = self.state.new_register(value_type)
+                    body.append(MirInstruction(form = InstructionForm.Convert(result = wrapped, operation = ConvertOp.ptr_to_nullable, operand = pointer), span = span))
+                    return wrapped
                 let temp = self.new_temp(value_type, span, body)
                 self.store_optional_tag(temp, 1, span, body)
                 let payload = try self.lower_expression(module, function, inner, body)
@@ -1763,12 +1769,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 # absent arm evaluates and yields the fallback.
                 let optional = try self.lower_expression(module, function, optional_value, body)
                 let optional_type = try self.state.mir_type_of(module, function, node_span(self.state.program, optional_value), node_type(self.state.program, optional_value))
-                let present = self.load_present(optional, span, body)
+                let present = self.optional_present(optional_type, optional, span, body)
                 let result = self.state.new_register(self.register_type_for(value_type))
                 self.open_if(present, [result], span, body)
                 let present_start = len(self.state.defers)
-                let payload_address = self.payload_address(optional_type, optional, span, body)
-                let payload = self.load_value(value_type, payload_address, span, body)
+                let payload = self.optional_payload(optional_type, value_type, optional, span, body)
                 if self.type_needs_ownership(value_type): self.emit_value_ownership(value_type, payload, true, span, body)
                 try self.emit_temporaries_from(present_start, body)
                 self.emit_yield(payload, span, body)
@@ -2965,6 +2970,14 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 return self.lower_and(above, below, span, body)
             PatternCase(case_index, bindings):
                 let enum_type = try self.state.mir_type_of(module, function, span, subject_type)
+                if is_nullable_ptr_type(self.state.types, enum_type):
+                    # `.none` is case 0 and `.some` case 1 of the optional; the
+                    # niche answers both with one null test.
+                    let present = self.optional_present(enum_type, selected, span, body)
+                    if case_index == 1: return present
+                    let absent = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                    body.append(MirInstruction(form = InstructionForm.Unary(result = absent, operation = UnaryOp.bool_not, operand = present), span = span))
+                    return absent
                 let tag_type = self.enum_tag_type(enum_type)
                 let tag = self.load_enum_tag(enum_type, selected, span, body)
                 let wanted = self.state.new_register(tag_type)
@@ -2983,18 +2996,18 @@ pub class FunctionLowerer: FunctionLoweringHost:
             PatternCase(case_index, bindings):
                 if bindings.count == 0: return
                 let enum_type = try self.state.mir_type_of(module, function, span, subject_type)
-                let payload_base = self.payload_address(enum_type, selected, span, body)
                 match self.state.program.types.definitions[subject_type.value].form:
                     Optional(inner):
                         # `.some(value)`: the payload is the value itself.
                         let inner_type = try self.state.mir_type_of(module, function, span, inner)
                         let symbol = SymbolId(value = u32(entry_at(self.state.program, bindings, 0)))
                         let local = try self.state.local_of(module, function, span, symbol)
-                        self.initialize_owned_value(inner_type, local.address, self.load_value(inner_type, payload_base, span, body), span, body)
+                        self.initialize_owned_value(inner_type, local.address, self.optional_payload(enum_type, inner_type, selected, span, body), span, body)
                         if self.type_needs_ownership(inner_type):
                             self.state.defers.append(DeferredAction.DestroyAddress(address = local.address, value_type = inner_type, span = span))
                     Enum(enum_index, arguments):
                         let case_type = self.case_struct_type(enum_type, case_index)
+                        let payload_base = self.payload_address(enum_type, selected, span, body)
                         let fields = ir.nominal_cases(self.state.program, subject_type)[case_index].payload
                         for index in range(0, i64(bindings.count)):
                             let symbol = SymbolId(value = u32(entry_at(self.state.program, bindings, index)))
@@ -3206,6 +3219,25 @@ pub class FunctionLowerer: FunctionLoweringHost:
     func load_enum_tag(enum_type: TypeId, base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
         let tag_type = self.enum_tag_type(enum_type)
         return self.load_value(tag_type, base, span, body)
+
+    # Whether an optional holds a value: a null test for the nullable pointer
+    # niche, the tag otherwise. `optional` is the register-sized word or the
+    # tagged enum's address, as the type decides.
+    pub func optional_present(optional_type: TypeId, optional: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if not is_nullable_ptr_type(self.state.types, optional_type): return self.load_present(optional, span, body)
+        let null_value = self.typed_null_constant(optional_type, span, body)
+        let present = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+        body.append(MirInstruction(form = InstructionForm.Binary(result = present, operation = BinaryOp.ne, left = optional, right = null_value), span = span))
+        return present
+
+    # The payload of an optional proved present: the word read as an address
+    # for the niche, the enum payload otherwise.
+    pub func optional_payload(optional_type: TypeId, inner_type: TypeId, optional: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
+        if not is_nullable_ptr_type(self.state.types, optional_type):
+            return self.load_value(inner_type, self.payload_address(optional_type, optional, span, body), span, body)
+        let pointer = self.state.new_register(inner_type)
+        body.append(MirInstruction(form = InstructionForm.Convert(result = pointer, operation = ConvertOp.nullable_to_ptr, operand = optional), span = span))
+        return pointer
 
     # `tag == 1` as a bool register.
     pub func load_present(base: RegisterId, span: SourceSpan, body: list[MirInstruction]) -> RegisterId:
@@ -3465,13 +3497,13 @@ pub class FunctionLowerer: FunctionLoweringHost:
         return result
 
     func lower_optional_hash(module: HirModule, function: HirFunction, span: SourceSpan, optional_type: ir.TypeId, inner: ir.TypeId, value: RegisterId, initial: RegisterId, body: list[MirInstruction]) -> RegisterId!:
-        let present = self.load_present(value, span, body)
+        let mir_optional = try self.state.mir_type_of(module, function, span, optional_type)
+        let present = self.optional_present(mir_optional, value, span, body)
         let tagged = self.mix_hash(initial, self.hash_bool_code(present, span, body), span, body)
         let result = self.state.new_register(builtin_mir_type(BuiltinMirType.unsigned_u64))
         self.open_if(present, [result], span, body)
-        let mir_optional = try self.state.mir_type_of(module, function, span, optional_type)
         let inner_type = try self.state.mir_type_of(module, function, span, inner)
-        let payload = self.load_value(inner_type, self.payload_address(mir_optional, value, span, body), span, body)
+        let payload = self.optional_payload(mir_optional, inner_type, value, span, body)
         let code = try self.lower_structural_hash(module, function, span, inner, payload, body)
         self.emit_yield(self.mix_hash(tagged, code, span, body), span, body)
         self.emit_else(span, body)
@@ -3659,6 +3691,11 @@ pub class FunctionLowerer: FunctionLoweringHost:
                 for field in ir.nominal_fields(self.state.program, value_type): fields.append(field.value_type)
                 return try self.lower_structural_fields(module, function, span, mir_value_type, fields, left, right, context, body)
             Optional(inner):
+                if is_nullable_ptr_type(self.state.types, mir_value_type):
+                    # Two nullable pointers are equal when their words are.
+                    let same = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                    body.append(MirInstruction(form = InstructionForm.Binary(result = same, operation = BinaryOp.eq, left = left, right = right), span = span))
+                    return same
                 let left_present = self.load_present(left, span, body)
                 let right_present = self.load_present(right, span, body)
                 let tags_equal = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
