@@ -2860,6 +2860,19 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   with a literal. A fixture prints the edge cases through both oracles and
   natively.
   Gate: 1128 compiler tests across 63 files.
+- [x] **`str(bytes)` and `str(text)` (B4)** (2026-09-04). The two checked
+  text conversions of base.md §5.5 are Base code in the standard `io`
+  module: `text_from_bytes` validates UTF-8 (no overlong forms, surrogates,
+  or values past U+10FFFF) and answers the bytes as a view, `text_from_c`
+  scans a `cstr` to its NUL first, and both fail with `io.invalid_text`.
+  The Base checker maps `str(x)` onto them by the argument's type and
+  refuses anything else with the two spellings named. A fixture proves
+  both through the oracles and natively, including the refusal. Also:
+  `luce build --lib` no longer refuses a package that uses `atomic.fence`;
+  the fence shims are compiled beside the assembly and merged into the one
+  object with `ld -r`, so every Base example now builds as a library or an
+  executable.
+  Gate: 1129 compiler tests across 63 files.
 
 ## 3. Bugs the multi-backend harness found
 

@@ -1301,7 +1301,7 @@ The language depends on these modules by name. Their full surfaces are in the li
 | Module | What the language relies on |
 | --- | --- |
 | `memory` | `allocator` (thread-local current allocator), `heap` (the initial allocator), `exhausted` and `unset` (error codes), `read`, `write`, `copy`, `move`, `set` |
-| `io` | `stdout()` and `stderr()` as `Writer`s; `Location` (§9.1); the compiler-supplied `display` of §14.4 for integers, `bool`, `char`, `str`, and pointers is Base code here (`write_signed`, `write_unsigned`, `write_bool`, `write_char`, `write_text`, `write_pointer`, `write_float64`, `write_float32`), which formatted output calls |
+| `io` | `stdout()` and `stderr()` as `Writer`s; `Location` (§9.1); the validated text conversions behind `str(bytes)` and `str(text)` (§5.5); the compiler-supplied `display` of §14.4 for integers, `bool`, `char`, `str`, and pointers is Base code here (`write_signed`, `write_unsigned`, `write_bool`, `write_char`, `write_text`, `write_pointer`, `write_float64`, `write_float32`), which formatted output calls |
 | `files` | `read(path: cstr) -> u8[]!` allocating from the current allocator, `open`, `write`, `missing` (error code) |
 | `math` | `floor`, `mod`, `sqrt`, the NaN and infinity constants |
 | `thread` | `spawn`, `Handle`, `current`, `pause`, `yield`, `sleep` |
