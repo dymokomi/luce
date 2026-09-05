@@ -89,6 +89,26 @@ if [ "$native_output" != "Hello, world!" ]; then
     echo "cli: native executable printed '$native_output', expected 'Hello, world!'" >&2
     exit 1
 fi
+# A Base package finds the standard `.lucb` modules on its own (base.md §16.6).
+expect 0 "" "$cli" check --package org.luce.examples --root examples/base examples/base/allocation.lucb
+expect 0 "built $test_dir/base_main" "$cli" build --package org.luce.examples --root examples/base --target native "$test_dir/base_main" examples/base/main.lucb
+base_output=$("$test_dir/base_main" one two)
+if [ "$base_output" != "$(printf 'hello from luce base: 2 argument(s)\n  one\n  two')" ]; then
+    echo "cli: base executable printed '$base_output'" >&2
+    exit 1
+fi
+# A Base package without `main` builds with --lib to an object beside its C
+# header, and a C program links against both (base.md §17.6, §19.6).
+expect 0 "built $test_dir/exports.o" "$cli" build --package org.luce.examples --root examples/base --target native --lib --c-header "$test_dir/exports.h" "$test_dir/exports.o" examples/base/exports.lucb
+printf '#include "exports.h"\n#include <stdio.h>\nint main(void) { Point p = {1, 2}; Point by = {40, 0}; Point moved = shift(&p, by, Access_write); printf("%%d %%d\\n", moved.x, first(&p, 1)); return 0; }\n' > "$test_dir/use_exports.c"
+cc -I "$test_dir" -o "$test_dir/use_exports" "$test_dir/use_exports.c" "$test_dir/exports.o"
+object_output=$("$test_dir/use_exports")
+if [ "$object_output" != "41 41" ]; then
+    echo "cli: C program linked against the Base library printed '$object_output'" >&2
+    exit 1
+fi
+expect 2 "build: --lib may be supplied once" "$cli" build --package org.luce.tests --root examples/base --lib --lib "$test_dir/twice.o" examples/base/exports.lucb
+expect 1 "build: --lib requires \`--target native\`" "$cli" build --package org.luce.tests --root examples/base --target wasm --lib "$test_dir/wasm.o" examples/base/exports.lucb
 expect 0 "backend-code byte(s)" "$cli" build --package org.luce.tests --root examples/full --generic-specializations 5 --time-report --target native --runtime-root src/runtime --runtime src/runtime/allocator.lucn "$test_dir/generic-native" examples/full/generic_functions.luc
 expect 1 "C header and ABI report outputs require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-header "$test_dir/api.h" "$test_dir/api.wasm" "$test_dir/c_api.luc"
 expect 1 "C sources and arguments require \`--target native\`" "$cli" build --package org.luce.tests --root "$test_dir" --c-source examples/full/c_import/temperature.c "$test_dir/api.wasm" "$test_dir/c_api.luc"

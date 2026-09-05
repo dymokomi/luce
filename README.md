@@ -58,6 +58,25 @@ Native output uses the pinned QBE toolchain for the current host:
 ```
 
 `bootstrap.sh` installs QBE; the host C driver supplies assembly and linking.
+
+A Luce Base program (`docs/language/base.md`) needs no runtime: its standard
+`.lucb` modules are found in `src/standard` (or `LUCE_STANDARD_ROOT`), so a
+build names only the sources:
+
+```sh
+./build/luce build --package org.luce.examples --root examples/base --target native \
+  build/base_main examples/base/main.lucb
+./build/base_main one two
+```
+
+A Base package without `main` becomes a library: an object file and the C
+header its exports need (`base.md` §17.6):
+
+```sh
+./build/luce build --package org.luce.examples --root examples/base --target native \
+  --lib --c-header build/exports.h build/exports.o examples/base/exports.lucb
+cc -I build -o build/use_exports your_program.c build/exports.o
+```
 An application that also contains `export c` declarations can request its
 companion products explicitly with `--c-header PATH` and
 `--abi-report PATH`. The first is a standalone C11 header; the second is a

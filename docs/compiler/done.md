@@ -2730,6 +2730,20 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   revisit. A `bool` in a variadic position is promoted to `int` as 1 or
   0 (§17.2).
   Gate: 1104 compiler tests across 58 files.
+- [x] **Standard modules found on their own (B6, first step)**
+  (2026-09-04). A command line with a `.lucb` source and no
+  `--standard-root` loads every `.lucb` module of the standard root,
+  `LUCE_STANDARD_ROOT` or a checkout's `src/standard`, so
+  `luce build --target native out examples/base/main.lucb` builds and
+  runs a Base program with nothing else on the line (base.md §16.6).
+  Full-Luce packages keep their explicit flags, and discovery from the
+  installed toolchain's own location waits for the library port.
+  `luce build --target native --lib out.o sources` produces a library,
+  one relocatable object without needing `main`, beside `--c-header`'s
+  header, so a C program links against a Base package (base.md §17.6,
+  §19.6); a program that needs the fence or task shims is refused, since
+  the object is one translation unit.
+  Gate: 1106 compiler tests across 58 files.
 
 ## 3. Bugs the multi-backend harness found
 

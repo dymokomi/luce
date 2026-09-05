@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1104 compiler tests across 58 files, plus the
+The repository currently proves 1106 compiler tests across 58 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -413,7 +413,9 @@ backends only.
   without `wait`/`wake`; `Writer?` on the null-data niche; `export func`
   with Base pointers, structs by value, and integer-backed enums in the
   header, exported methods as `Type_method`, spans as pointer-and-count
-  parameters, function pointers, and the fallible status form; `extern func` with those types, `cstr` (`const u8*` for now),
+  parameters, function pointers, and the fallible status form, and a Base
+  package without `main` built with `--lib` to one object beside its
+  header (§17.6, §19.6); `extern func` with those types, `cstr` (`const u8*` for now),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
   natively; the Base entry point `main(arguments: str[]) -> i32` with
   QBE's startup shim; declaration attributes (§9.8), carried as one
@@ -453,8 +455,10 @@ backends only.
   adapters reported by `luce build --costs`). Public text/bytes builders,
   UTF codecs, and numeric parsing/formatting land here as Base code over
   caller buffers. Automatic standard-module loading replaces the explicit
-  `--standard-root`/`--runtime` flags; the shipped source location is
-  discovered from the installed toolchain, never from a checkout path.
+  `--standard-root`/`--runtime` flags (a `.lucb` package already loads the
+  standard `.lucb` modules from `LUCE_STANDARD_ROOT` or a checkout's
+  `src/standard`, 2026-09-04); the shipped source location is discovered
+  from the installed toolchain, never from a checkout path.
 - [ ] **S29 — self-hosting.** Compile the compiler with stage 1 over that
   library, compare observable behavior with the pinned Stage-0 0.30 build on
   the full gate, retain one prior compiler forever, and measure source
