@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1117 compiler tests across 59 files, plus the
+The repository currently proves 1122 compiler tests across 60 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -420,7 +420,10 @@ backends only.
   `stdout()`, and `stderr()` in `io.lucb` over the two `Builtin` write
   intrinsics a standard Base module may name (§5.5, §14.4, §16.6);
   `writer.write(f"...")` and `format(buffer, f"...") -> str!` as one
-  fallible sequence of display calls, `io.BufferWriter` behind `format`; `extern func` with those types, `cstr` (`const u8*` for now),
+  fallible sequence of display calls, `io.BufferWriter` behind `format`;
+  the distinct `c.char`/`c.long`/`c.ulong`/`c.wchar` as a target-width
+  integer family whose width a backend fixes, with constants that fit every
+  target and widening only where no target loses a value (§5.2); `extern func` with those types, `cstr` (`const u8*` for now),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
   natively; the Base entry point `main(arguments: str[]) -> i32` with
   QBE's startup shim; declaration attributes (§9.8), carried as one

@@ -2787,6 +2787,26 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   and answers a view of the text; a `write` receiver that is not the
   standard `Writer` keeps the ordinary call path and its diagnostic.
   Gate: 1117 compiler tests across 59 files.
+- [x] **Distinct `c.char`, `c.long`, `c.ulong`, `c.wchar` (B4)**
+  (2026-09-04). C's target-dependent integers (base.md §5.2) are their own
+  HIR type family, `TypeForm.CInteger(kind)`, beside the pointer-width
+  integers, and MIR `CInt(kind)`; only a backend fixes their width
+  (`LayoutRules.long_size`: 8 under QBE, 4 on wasm32; `char` 1 and
+  `wchar_t` 4 everywhere the compiler builds for, `char` signed). The
+  standard `c` module aliases them (`pub type long = c_long`), the one
+  place that may name the identities, so the spelling is `c.long`. A
+  constant must fit on every supported target (`c.long` takes the 32-bit
+  range, `c.char` 0..127, `c.wchar` 0..32767), implicit widening is
+  admitted only where no target loses a value (`i8`..`i32` to `c.long`,
+  `c.long` to `i64`, `c.char` to any signed type, `c.wchar` to 32 bits or
+  more), and the MIR verifier's `widen` rule says the same for the
+  canonical conversion. Exports and externs carry them as `char`, `long`,
+  `unsigned long`, and `wchar_t` in the header, formatted output displays
+  them through their 64-bit form, and `sizeof` answers the backend's
+  width. `cstr` stays `const u8*` until the text rules move to `c.char`,
+  and a checked conversion to or from a C integer (`c.long(x)`) still
+  waits for the cast family's canonical form (B1d).
+  Gate: 1122 compiler tests across 60 files.
 
 ## 3. Bugs the multi-backend harness found
 
