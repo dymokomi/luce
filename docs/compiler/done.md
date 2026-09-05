@@ -2807,6 +2807,17 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   and a checked conversion to or from a C integer (`c.long(x)`) still
   waits for the cast family's canonical form (B1d).
   Gate: 1122 compiler tests across 60 files.
+- [x] **Two fixes from the Base slices** (2026-09-04). The
+  `luce: N objects leaked` report at the end of a native Base build came
+  from `qbe_symbol_directives`, which copied each `MirGlobal` into a local
+  while looking at its attributes; a struct holding a recursive union
+  (`MirInitializer`) leaks its copy under stage-0 0.30. The scan now reads
+  the attribute in place, and a scratch driver over the compiler library
+  proved every pipeline stage clean. `p.method(...)` through a Base
+  pointer now dereferences to the pointee as `p.field` does (base.md
+  §7.7): a mutating method needs `T*`, and `const T*` is refused naming
+  the pointer type; a fixture proves the call in both oracles and natively.
+  Gate: 1124 compiler tests across 61 files.
 
 ## 3. Bugs the multi-backend harness found
 
