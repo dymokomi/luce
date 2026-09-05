@@ -230,6 +230,14 @@ pub class BaseProfileChecks: ProfileChecks:
             return self.state.push_node(HirNodeForm.NumericConvert(value = value), expected, self.state.span_of(value))
         if qualifies_implicitly(self.state.types, found, expected):
             return self.state.push_node(HirNodeForm.QualifyPointer(value = value), expected, self.state.span_of(value))
+        # A `str` where `fmt` is wanted is one text piece (base.md §9.1).
+        if self.is_fmt_type(expected):
+            match self.state.types.definitions[found.value].form:
+                StringView:
+                    let span = self.state.span_of(value)
+                    let io = try self.io_module(span, "a `fmt` parameter")
+                    return try self.piece_span(semantics, io, [try self.text_piece(semantics, io, value, span)], span)
+                else: pass
         return try self.span_conversion(semantics, value, found, expected)
 
     ## A Base interface value is a two-word view of a conformer that borrows
@@ -331,12 +339,18 @@ pub class BaseProfileChecks: ProfileChecks:
         let buffer = try semantics.check_expression_for_feature(arguments[0].value, buffer_type)
         var formatted_start: Token? = none
         var formatted_parts = list[FormatPartSyntax]()
+        var pieces_value: NodeId? = none
         match arguments[1].value.form:
             FormattedString(start, parts):
                 formatted_start = start
                 formatted_parts = parts
-            else: try self.fail(arguments[1].span, "`format` takes a formatted string `f\"...\"` as its second argument (base.md §5.5)")
-        let start = formatted_start else trap("formatted string start disappeared")
+            else:
+                # A `fmt` parameter forwarded into `format` (base.md §9.1).
+                let untyped: TypeId? = none
+                let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(arguments[1].value, untyped), untyped)
+                if not self.is_fmt_type(self.state.type_of(checked)):
+                    try self.fail(arguments[1].span, "`format` takes a formatted string `f\"...\"` or a `fmt` value as its second argument (base.md §5.5)")
+                pieces_value = checked
         let prelude = list[NodeId]()
         let make = try self.io_function(io, "buffer_writer", span)
         let writer_call = self.state.push_node(HirNodeForm.Call(function = make.symbol, arguments = self.state.push_run([u32(0), buffer.value])), make.result, span)
@@ -346,7 +360,13 @@ pub class BaseProfileChecks: ProfileChecks:
         let writer_type = try self.writer_type(io, span)
         let sink_view = try semantics.convert_interface_value_for_feature(writer_pointer, self.state.intern_pointer(make.result, false, false), writer_type) else error(self.state.diagnostic_at(self.state.current_module, span, "the standard `io` module's `BufferWriter` does not implement `Writer`"))
         let sink = try semantics.capture_defer_value_for_feature(sink_view, prelude)
-        let steps = try self.formatted_calls(semantics, io, sink, start, formatted_parts, span, false)
+        var steps = list[NodeId]()
+        let forwarded = pieces_value
+        if forwarded != none:
+            steps.append(try self.write_call(io, "write_pieces", sink, forwarded, span))
+        else:
+            let start = formatted_start else trap("formatted string start disappeared")
+            steps = try self.formatted_calls(semantics, io, sink, start, formatted_parts, span, false)
         let finish = try self.io_function(io, "finish", span)
         let text = self.state.push_node(HirNodeForm.Call(function = finish.symbol, arguments = self.state.push_run([u32(0), writer_pointer.value])), finish.result, span)
         let sequence = self.state.push_node(HirNodeForm.FallibleSequence(prelude = self.state.push_nodes(prelude), steps = self.state.push_nodes(steps), result = text), self.state.intern_fallible(finish.result), span)
@@ -378,6 +398,14 @@ pub class BaseProfileChecks: ProfileChecks:
             fields.append(u32(field_index))
             fields.append(value.value)
         return self.state.push_node(HirNodeForm.StructValue(struct_index = struct_index, fields = self.state.push_run(fields)), location_type, span)
+
+    ## `Location(...)` constructs the standard `io` module's struct, as the
+    ## bare type name spells it (base.md §9.1).
+    pub func builtin_struct_index(name: str) -> i64:
+        if name != "Location": return -1
+        let io = self.state.find_source("io")
+        if io < 0: return -1
+        return self.declarations.find_struct_in_module(io, "Location")
 
     ## The standard `io` module's `Location` struct.
     func location_type(span: SourceSpan) -> TypeId!:
@@ -429,6 +457,152 @@ pub class BaseProfileChecks: ProfileChecks:
             else: pass
         let call = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = self.state.push_run([u32(0), argument.value])), function.result, span)
         return try semantics.require_type_for_feature(call, expected)
+
+    # mark: fmt parameters =====================================================================
+
+    ## A formatted string where a `fmt` is wanted (base.md §9.1): the pieces
+    ## laid out in a hidden array on the caller's stack, passed as the span.
+    pub func check_formatted_value(semantics: HirSemanticChecker, start: Token, parts: list[FormatPartSyntax], span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if expected == none or not self.is_fmt_type(expected): return none
+        let io = try self.io_module(span, "a `fmt` parameter")
+        let source_parts = list[FormattedSourcePart]()
+        for part in parts:
+            match part:
+                Text(token): source_parts.append(FormattedSourcePart.Text(value = token.text))
+                Field(value, field_span): source_parts.append(FormattedSourcePart.Field)
+        let normalized = normalize_formatted_parts(source_parts, start.text == "f\"\"\"") catch reason:
+            try self.fail(span, reason)
+            return none
+        let pieces = list[NodeId]()
+        var text_index = 0
+        for part in parts:
+            match part:
+                Text(token):
+                    let decoded = decode_formatted_text(normalized[text_index]) catch reason:
+                        try self.fail(token.span, reason)
+                        return none
+                    text_index += 1
+                    if decoded != "":
+                        let text = semantics.push_constant_for_feature(Value.Text(value = decoded), self.state.intern_string_view(), token.span)
+                        pieces.append(try self.text_piece(semantics, io, text, token.span))
+                Field(value, field_span):
+                    let untyped: TypeId? = none
+                    let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(value, untyped), untyped)
+                    pieces.append(try self.field_piece(semantics, io, checked, field_span))
+        if len(pieces) == 0:
+            let empty = semantics.push_constant_for_feature(Value.Text(value = ""), self.state.intern_string_view(), span)
+            pieces.append(try self.text_piece(semantics, io, empty, span))
+        return try self.piece_span(semantics, io, pieces, span)
+
+    ## `print(message)` with a `fmt`: every piece to standard output, then the
+    ## line end, failures ignored (base.md §14.4).
+    pub func check_print_value(semantics: HirSemanticChecker, value: ExpressionSyntax, span: SourceSpan) -> list[NodeId]?!:
+        let untyped: TypeId? = none
+        let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(value, untyped), untyped)
+        if not self.is_fmt_type(self.state.type_of(checked)): return none
+        let io = try self.io_module(span, "`print`")
+        let statements = list[NodeId]()
+        let stdout = try self.io_function(io, "stdout", span)
+        let sink_call = self.state.push_node(HirNodeForm.Call(function = stdout.symbol, arguments = self.state.push_run(list[u32]())), stdout.result, span)
+        let sink = try semantics.capture_defer_value_for_feature(sink_call, statements)
+        statements.append(self.ignore_failure(semantics, try self.write_call(io, "write_pieces", sink, checked, span), span))
+        let end = semantics.push_constant_for_feature(Value.Text(value = "\n"), self.state.intern_string_view(), span)
+        statements.append(self.ignore_failure(semantics, try self.write_call(io, "write_text", sink, end, span), span))
+        return statements
+
+    ## `writer.write(message)` with a `fmt`: the pieces to the sink, `unit!`.
+    pub func check_write_value(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, value: ExpressionSyntax, span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        let io = self.state.find_source("io")
+        if io < 0: return none
+        if not self.is_writer_view(io, owner_type): return none
+        let untyped: TypeId? = none
+        let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(value, untyped), untyped)
+        if not self.is_fmt_type(self.state.type_of(checked)): return none
+        return try semantics.require_type_for_feature(try self.write_call(io, "write_pieces", receiver, checked, span), expected)
+
+    ## Is `value_type` the `fmt` span, `const io.Piece[]`?
+    func is_fmt_type(value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Span(element, is_const):
+                if not is_const: return false
+                let io = self.state.find_source("io")
+                if io < 0: return false
+                let index = self.declarations.struct_of(element)
+                return index >= 0 and self.state.structs[index].module_index == io and self.state.structs[index].name == "Piece"
+            else: return false
+
+    func piece_type(io: i64, span: SourceSpan) -> TypeId!:
+        let index = self.declarations.find_struct_in_module(io, "Piece")
+        if index < 0: try self.fail(span, "the standard `io` module has no `Piece` struct (base.md §9.1)")
+        return self.state.structs[index].type_id
+
+    ## One `io.Piece` value: its kind, the field's bits, and its text.
+    func piece(semantics: HirSemanticChecker, io: i64, kind: u64, bits: NodeId, text: NodeId, span: SourceSpan) -> NodeId!:
+        let piece_type = try self.piece_type(io, span)
+        let struct_index = self.declarations.struct_of(piece_type)
+        let kind_node = semantics.push_constant_for_feature(Value.UnsignedInteger(value = kind), resolve_builtin_type(BuiltinType.unsigned_u8), span)
+        let fields = list[u32]()
+        let names = ["kind", "bits", "text"]
+        let values = [kind_node, bits, text]
+        for position in range(0, len(names)):
+            let field_index = self.declarations.find_field(struct_index, names[position])
+            if field_index < 0: try self.fail(span, "the standard `io` module's `Piece` has no field `" + names[position] + "`")
+            fields.append(u32(field_index))
+            fields.append(values[position].value)
+        return self.state.push_node(HirNodeForm.StructValue(struct_index = struct_index, fields = self.state.push_run(fields)), piece_type, span)
+
+    func text_piece(semantics: HirSemanticChecker, io: i64, text: NodeId, span: SourceSpan) -> NodeId!:
+        let zero = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(0)), resolve_builtin_type(BuiltinType.unsigned_u64), span)
+        return try self.piece(semantics, io, u64(1), zero, text, span)
+
+    ## A field as a piece: its kind by type and its value as 64 bits.
+    func field_piece(semantics: HirSemanticChecker, io: i64, value: NodeId, span: SourceSpan) -> NodeId!:
+        let empty = semantics.push_constant_for_feature(Value.Text(value = ""), self.state.intern_string_view(), span)
+        let wide_unsigned = resolve_builtin_type(BuiltinType.unsigned_u64)
+        let value_type = self.state.type_of(value)
+        match self.state.types.definitions[value_type.value].form:
+            StringView: return try self.text_piece(semantics, io, value, span)
+            Boolean:
+                let one = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(1)), wide_unsigned, span)
+                let zero = semantics.push_constant_for_feature(Value.UnsignedInteger(value = u64(0)), wide_unsigned, span)
+                let bits = self.state.push_node(HirNodeForm.Conditional(value = one, condition = value, alternative = zero), wide_unsigned, span)
+                return try self.piece(semantics, io, u64(4), bits, empty, span)
+            Character:
+                let bits = self.state.push_node(HirNodeForm.NumericConvert(value = value), wide_unsigned, span)
+                return try self.piece(semantics, io, u64(5), bits, empty, span)
+            Integer(bits, is_signed): return try self.integer_piece(semantics, io, value, is_signed, empty, span)
+            PointerInteger(is_signed): return try self.integer_piece(semantics, io, value, is_signed, empty, span)
+            CInteger(kind): return try self.integer_piece(semantics, io, value, kind != CIntegerKind.c_ulong, empty, span)
+            Pointer(pointee, is_const, is_volatile):
+                let address = self.state.push_node(HirNodeForm.Cast(value = value), resolve_builtin_type(BuiltinType.unsigned_usize), span)
+                let bits = self.state.push_node(HirNodeForm.NumericConvert(value = address), wide_unsigned, span)
+                return try self.piece(semantics, io, u64(6), bits, empty, span)
+            Floating(bits):
+                let pattern = self.state.push_node(HirNodeForm.NativeFloatBits(value = value), wide_unsigned, span)
+                if bits == 64: return try self.piece(semantics, io, u64(7), pattern, empty, span)
+                if bits == 32: return try self.piece(semantics, io, u64(8), pattern, empty, span)
+            else: pass
+        try self.fail(span, "`" + self.state.describe_type(value_type) + "` has no display in a formatted string; integers, `bool`, `char`, `str`, floats, and pointers do (base.md §14.4)")
+        return value
+
+    func integer_piece(semantics: HirSemanticChecker, io: i64, value: NodeId, is_signed: bool, empty: NodeId, span: SourceSpan) -> NodeId!:
+        let wide_unsigned = resolve_builtin_type(BuiltinType.unsigned_u64)
+        let widened = self.widen_field(value, is_signed, span)
+        if is_signed:
+            let bits = self.state.push_node(HirNodeForm.Cast(value = widened), wide_unsigned, span)
+            return try self.piece(semantics, io, u64(2), bits, empty, span)
+        return try self.piece(semantics, io, u64(3), widened, empty, span)
+
+    ## The pieces in a hidden array, then the `fmt` span over it.
+    func piece_span(semantics: HirSemanticChecker, io: i64, pieces: list[NodeId], span: SourceSpan) -> NodeId!:
+        let piece_type = try self.piece_type(io, span)
+        let array_type = self.state.intern_array(piece_type, len(pieces))
+        let array = self.state.push_node(HirNodeForm.Array(elements = self.state.push_nodes(pieces)), array_type, span)
+        let prelude = list[NodeId]()
+        let stored = try semantics.capture_defer_value_for_feature(array, prelude)
+        let fmt_type = self.state.intern_span(piece_type, true)
+        let view = try self.span_conversion(semantics, stored, array_type, fmt_type) else error(self.state.diagnostic_at(self.state.current_module, span, "a `fmt` array did not convert to its span"))
+        return self.state.push_node(HirNodeForm.Sequence(prelude = self.state.push_nodes(prelude), value = view), fmt_type, span)
 
     ## The calls that write each piece of a formatted string to `sink`, in
     ## order; `newline` adds `print`'s trailing line end.

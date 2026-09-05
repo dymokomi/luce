@@ -2873,6 +2873,32 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   object with `ld -r`, so every Base example now builds as a library or an
   executable.
   Gate: 1129 compiler tests across 63 files.
+- [x] **Base polish: bare `Location(...)` and `luce run` for a Base `main`**
+  (2026-09-05). `Location(...)` constructs the standard `io` module's struct
+  under its bare name, as the type is spelled (base.md §9.1), through the
+  profile's `builtin_struct_index`. `luce run --package ID --root DIR
+  MODULE.main FILE... -- ARG...` runs a Base program's process entry in the
+  reference interpreter with the arguments after `--`, the entry module's
+  path standing in for C's `argv[0]` so `arguments.length` agrees with the
+  native shim; any other function keeps the plain `run`. The CLI test runs
+  `examples/base/format.lucb` both ways.
+  Gate: 1130 compiler tests across 63 files.
+- [x] **`fmt` parameters (B4)** (2026-09-05). A parameter of type `fmt`
+  accepts a formatted string or a `str` and may be printed, written to a
+  `Writer`, formatted into a buffer, or passed on (base.md §9.1). `fmt` is
+  the span `const io.Piece[]`: at the call site the checker lays the
+  caller's pieces, a text view or one field value with its kind, in a
+  hidden array on the caller's stack and passes the span, a pointer to the
+  caller's values with no allocation and no generated function; a `str`
+  argument is one text piece. Inside the callee `print(message)`,
+  `sink.write(message)`, and `format(buffer, message)` call
+  `io.write_pieces`, which dispatches each piece to the display function of
+  its kind, and forwarding is passing the span. The new HIR `Sequence`
+  node (statements, then a value) carries the hidden array. A fixture proves
+  every use through the oracles and natively. `fmt` is a span, so nothing
+  stops a program from storing one past the caller's frame; the spec's
+  "cannot be stored" rule is not yet enforced.
+  Gate: 1130 compiler tests across 63 files.
 
 ## 3. Bugs the multi-backend harness found
 

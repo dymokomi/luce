@@ -101,10 +101,14 @@ fi
 # module (base.md §5.5, §14.4).
 expect 0 "built $test_dir/base_format" "$cli" build --package org.luce.examples --root examples/base --target native "$test_dir/base_format" examples/base/format.lucb
 format_output=$("$test_dir/base_format" one two 2>"$test_dir/base_format.err")
-if [ "$format_output" != "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233\n[count=-7] 8')" ] || [ "$(cat "$test_dir/base_format.err")" != "to stderr -7" ]; then
+if [ "$format_output" != "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233\n[count=-7] 8')" ] || [ "$(cat "$test_dir/base_format.err")" != "$(printf 'to stderr -7\n39: logged -7 true\n40: plain')" ]; then
     echo "cli: Base formatted output printed '$format_output'" >&2
     exit 1
 fi
+# `luce run` executes a Base `main` in the reference interpreter with the
+# program's arguments after `--`.
+# The reference interpreter merges both streams into standard output.
+expect 0 "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233\n[count=-7] 8\nto stderr -7\n39: logged -7 true\n40: plain\n0')" "$cli" run --package org.luce.examples --root examples/base format.main examples/base/format.lucb -- one two
 # A Base package without `main` builds with --lib to an object beside its C
 # header, and a C program links against both (base.md §17.6, §19.6).
 expect 0 "built $test_dir/exports.o" "$cli" build --package org.luce.examples --root examples/base --target native --lib --c-header "$test_dir/exports.h" "$test_dir/exports.o" examples/base/exports.lucb

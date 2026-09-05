@@ -76,6 +76,14 @@ that reads back the same (`base.md` §5.5, §14.4); `format(buffer, f"...")`
 writes into a caller's buffer, and `location()` in a parameter default
 reports where the call was written (§9.1). See `examples/base/format.lucb`.
 
+The reference interpreter runs a Base program too, with its arguments after
+`--`, program name first as C passes it:
+
+```sh
+./build/luce run --package org.luce.examples --root examples/base \
+  format.main examples/base/format.lucb -- one two
+```
+
 A Base package without `main` becomes a library: an object file and the C
 header its exports need (`base.md` §17.6):
 

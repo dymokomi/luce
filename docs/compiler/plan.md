@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1129 compiler tests across 63 files, plus the
+The repository currently proves 1130 compiler tests across 63 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -461,6 +461,10 @@ backends only.
   (§17.1), variadic C calls with the literal rules of §17.2, `fmt` parameters
   and `location()`, and `export` with the C-representable rule and generated
   header (§17.6). Each MIR addition is legalized through QBE as §19.3 states.
+  `fmt` parameters landed on 2026-09-05 as spans of `io.Piece` built on the
+  caller's stack (§9.1). Remaining: `asm`/`naked`, atomic `wait`/`wake`
+  (they need B5's futex), the Wasm startup shim for a Base `main` (no
+  wasmtime on the build host to prove it), and the `fmt` storage rule.
 - [ ] **B5 — the runtime in Base.** Port `src/runtime` to a Base package
   keeping only the two sealed `.lucn` intrinsics (§18.13). It must compile
   freestanding, keep every runtime binding's exact signature, and pass the
