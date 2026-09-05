@@ -23,7 +23,8 @@
 from compiler.mir.canonical import AtomicOp, AtomicOrder, BinaryOp, BuiltinMirType, CallingConvention, DataId, FunctionId, GlobalId
 from compiler.mir.canonical import ConvertOp, InstructionForm, MirConstant, MirData, MirFunction, MirInstruction
 from compiler.mir.canonical import MirSignature, MirSlot, RegisterId
-from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type
+from compiler.mir.canonical import MirType, TypeId, UnaryOp, builtin_mir_type, is_target_width_int_type
+from compiler.layout_query import LayoutQuery
 from compiler.mir.canonical import OperandBuilder, bits_of, int_maximum, int_minimum, is_nullable_ptr_type, pointer_int_type, intern_mir_type, is_float_type, is_int_type, is_ptr_type, is_reference_type, is_signed_int_type, mir_type, no_register, no_registers, signature_register_type, uint_maximum
 from compiler.hir.ir import AssignmentOperation, AtomicOperation, AtomicOrdering, BinaryOperation, BuiltinType, HirCEnum, HirCFunction, HirFunction, HirReceiverKind, Value, exported_c_name
 from compiler.hir.ir import HirIteration, HirModule, NodeId, Operands, SymbolId, describe_type, no_node, node_children
@@ -2999,7 +3000,7 @@ pub class FunctionLowerer: FunctionLoweringHost:
             # Only the implicit widening of base.md §7.5 has a canonical form so far.
             if is_implicit_widening(self.state.program.types, hir_source, hir_destination):
                 return try self.lower_widening(module, function, expression, value, body)
-            try self.state.fail_unsupported(module, function, node_span(self.state.program, expression), "a numeric conversion to or from a pointer-width integer (the Base cast family, B1d)")
+            return try self.lower_target_width_conversion(module, function, expression, value, body)
         if ir.is_integer_type(self.state.program.types, hir_source) and ir.is_integer_type(self.state.program.types, hir_destination):
             return try self.lower_integer_conversion(module, function, expression, value, body)
         # A `char` is its scalar value, a `u32`, in MIR; reading it as an
@@ -3507,6 +3508,85 @@ pub class FunctionLowerer: FunctionLoweringHost:
 
     # A widening no target can narrow needs no guard; the backend that knows
     # the pointer width chooses between an extension and a copy.
+    # A checked conversion involving a target-width integer (`usize`,
+    # `isize`, `c.long`, ...; base.md §7.5): the destination's bounds follow
+    # from its size, which only the backend knows, so they are computed from
+    # a `LayoutConstant` at run time. The operand is widened to 64 bits of
+    # its own signedness, compared against those bounds, and narrowed with
+    # `cast_int` once it is known to fit. Every step is canonical MIR.
+    func lower_target_width_conversion(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
+        let span = node_span(self.state.program, expression)
+        let operand = try self.lower_expression(module, function, value, body)
+        let source_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, value))
+        let destination_type = try self.state.mir_type_of(module, function, span, node_type(self.state.program, expression))
+        if source_type.value == destination_type.value: return operand
+        let signed_wide = builtin_mir_type(BuiltinMirType.signed_i64)
+        let unsigned_wide = builtin_mir_type(BuiltinMirType.unsigned_u64)
+        let source_signed = is_signed_int_type(self.state.types, source_type)
+        let destination_signed = is_signed_int_type(self.state.types, destination_type)
+        var wide_type = unsigned_wide
+        if source_signed: wide_type = signed_wide
+        var wide = operand
+        if source_type.value != wide_type.value:
+            wide = self.state.new_register(wide_type)
+            body.append(MirInstruction(form = InstructionForm.Convert(result = wide, operation = ConvertOp.widen, operand = operand), span = span))
+
+        # The destination's inclusive maximum as `u64` and, when it is
+        # signed, its minimum as `i64`.
+        var maximum = self.state.new_register(unsigned_wide)
+        var minimum = self.state.new_register(signed_wide)
+        if is_target_width_int_type(self.state.types, destination_type):
+            let size = self.state.new_register(pointer_int_type(self.state.types, false))
+            body.append(MirInstruction(form = InstructionForm.LayoutConstant(result = size, query = LayoutQuery.size, subject = destination_type, field = -1), span = span))
+            let wide_size = self.state.new_register(unsigned_wide)
+            body.append(MirInstruction(form = InstructionForm.Convert(result = wide_size, operation = ConvertOp.widen, operand = size), span = span))
+            let bits = self.state.new_register(unsigned_wide)
+            body.append(MirInstruction(form = InstructionForm.Binary(result = bits, operation = BinaryOp.mul, left = wide_size, right = self.unsigned_integer_constant(unsigned_wide, u64(8), span, body)), span = span))
+            var excess = u64(64)
+            if destination_signed: excess = u64(65)
+            let shift = self.state.new_register(unsigned_wide)
+            body.append(MirInstruction(form = InstructionForm.Binary(result = shift, operation = BinaryOp.sub, left = self.unsigned_integer_constant(unsigned_wide, excess, span, body), right = bits), span = span))
+            let all_ones = self.state.new_register(unsigned_wide)
+            body.append(MirInstruction(form = InstructionForm.Unary(result = all_ones, operation = UnaryOp.bit_not, operand = self.unsigned_integer_constant(unsigned_wide, u64(0), span, body)), span = span))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = maximum, operation = BinaryOp.shift_right, left = all_ones, right = shift), span = span))
+            if destination_signed:
+                let signed_maximum = self.state.new_register(signed_wide)
+                body.append(MirInstruction(form = InstructionForm.Convert(result = signed_maximum, operation = ConvertOp.cast_int, operand = maximum), span = span))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = minimum, operation = BinaryOp.sub, left = self.signed_integer_constant(signed_wide, -1, span, body), right = signed_maximum), span = span))
+        elif destination_signed:
+            maximum = self.unsigned_integer_constant(unsigned_wide, u64(int_maximum(self.state.types, destination_type)), span, body)
+            minimum = self.signed_integer_constant(signed_wide, int_minimum(self.state.types, destination_type), span, body)
+        else:
+            maximum = self.unsigned_integer_constant(unsigned_wide, uint_maximum(self.state.types, destination_type), span, body)
+
+        if source_signed:
+            if destination_signed:
+                let below = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = below, operation = BinaryOp.lt, left = wide, right = minimum), span = span))
+                self.emit_integer_conversion_guard(below, span, body)
+                let signed_maximum = self.state.new_register(signed_wide)
+                body.append(MirInstruction(form = InstructionForm.Convert(result = signed_maximum, operation = ConvertOp.cast_int, operand = maximum), span = span))
+                let above = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = above, operation = BinaryOp.gt, left = wide, right = signed_maximum), span = span))
+                self.emit_integer_conversion_guard(above, span, body)
+            else:
+                let negative = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = negative, operation = BinaryOp.lt, left = wide, right = self.signed_integer_constant(signed_wide, 0, span, body)), span = span))
+                self.emit_integer_conversion_guard(negative, span, body)
+                let magnitude = self.state.new_register(unsigned_wide)
+                body.append(MirInstruction(form = InstructionForm.Convert(result = magnitude, operation = ConvertOp.cast_int, operand = wide), span = span))
+                let above = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+                body.append(MirInstruction(form = InstructionForm.Binary(result = above, operation = BinaryOp.gt, left = magnitude, right = maximum), span = span))
+                self.emit_integer_conversion_guard(above, span, body)
+        else:
+            let above = self.state.new_register(builtin_mir_type(BuiltinMirType.boolean))
+            body.append(MirInstruction(form = InstructionForm.Binary(result = above, operation = BinaryOp.gt, left = wide, right = maximum), span = span))
+            self.emit_integer_conversion_guard(above, span, body)
+
+        let result = self.state.new_register(destination_type)
+        body.append(MirInstruction(form = InstructionForm.Convert(result = result, operation = ConvertOp.cast_int, operand = wide), span = span))
+        return result
+
     func lower_widening(module: HirModule, function: HirFunction, expression: NodeId, value: NodeId, body: list[MirInstruction]) -> RegisterId!:
         let span = node_span(self.state.program, expression)
         let operand = try self.lower_expression(module, function, value, body)

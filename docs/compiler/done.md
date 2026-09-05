@@ -2818,6 +2818,23 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   §7.7): a mutating method needs `T*`, and `const T*` is refused naming
   the pointer type; a fixture proves the call in both oracles and natively.
   Gate: 1124 compiler tests across 61 files.
+- [x] **`cstr` is `const c.char*`, and checked conversions reach every
+  integer (B1d, B4)** (2026-09-04). `cstr` now names `const c.char*`
+  (base.md §5.2, §17.1), so a C header spells it `const char *` and the
+  literal, cast, and boundary rules test that pointee. A checked conversion
+  to or from a target-width integer, `usize(n)`, `u32(size)`, `c.long(n)`,
+  `i16(size)`, `c.char(n)`, has a canonical form: the operand widens to 64
+  bits of its own signedness, the destination's inclusive bounds are
+  computed from a `LayoutConstant` of its size (`~0 >> (64 - bits)`, and
+  `65 - bits` with `-1 - max` below for a signed destination) or are the
+  fixed width's constants, the compares trap with "integer conversion out
+  of range", and `cast_int` narrows a value known to fit; every step is
+  target-neutral MIR that the verifier's width rules admit. `c.long(n)`
+  resolves because a module's alias of a numeric type is that type's
+  conversion, and the import counts as used. A fixture proves the
+  conversions in both oracles at two pointer widths and natively; a QBE
+  test proves the trap.
+  Gate: 1125 compiler tests across 61 files.
 
 ## 3. Bugs the multi-backend harness found
 

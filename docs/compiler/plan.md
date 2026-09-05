@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1124 compiler tests across 61 files, plus the
+The repository currently proves 1125 compiler tests across 61 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -370,7 +370,11 @@ backends only.
   integer with symbolic `sizeof`/`alignof`/`offsetof` folded by the backend
   (§19.2), implicit same-signedness widening, C division and remainder, and
   the `(T)x` cast family (§7.5), with the differences from full Luce pinned by
-  negative fixtures in both profiles.
+  negative fixtures in both profiles. Checked conversions to and from
+  target-width integers (`usize(n)`, `u32(size)`, `c.long(n)`) landed on
+  2026-09-04, bounded at run time from a layout constant; the `(T)x` casts
+  between fixed widths already lower, and pointer/enum/text casts land with
+  their types.
 - [ ] **B2 — pointers and spans.** *Landed so far (2026-09-03, `done.md` §2):
   `T*`/`const T*`, `&place`, `*p`, stores through `T*`, `.` through a
   pointer, implicit qualification, and address equality, with the
@@ -423,7 +427,10 @@ backends only.
   fallible sequence of display calls, `io.BufferWriter` behind `format`;
   the distinct `c.char`/`c.long`/`c.ulong`/`c.wchar` as a target-width
   integer family whose width a backend fixes, with constants that fit every
-  target and widening only where no target loses a value (§5.2); `extern func` with those types, `cstr` (`const u8*` for now),
+  target and widening only where no target loses a value (§5.2); `cstr`
+  as `const c.char*`; checked conversions to and from target-width
+  integers bounded at run time from a layout constant (§7.5, closing the
+  integer half of B1d); `extern func` with those types, `cstr` (`const c.char*`),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
   natively; the Base entry point `main(arguments: str[]) -> i32` with
   QBE's startup shim; declaration attributes (§9.8), carried as one
