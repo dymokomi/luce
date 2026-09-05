@@ -25,7 +25,7 @@ from compiler.frontend.tokenizer import Token, TokenKind
 from compiler.hir.arena import clone_hir_constant
 from compiler.hir.ir import AssignmentOperation, BinaryOperation, BuiltinType, HirFunction, HirFunctionImplementation, HirNodeForm, HirParameter, HirReceiverKind
 from compiler.hir.ir import HirSymbol, ModuleAuthority, ModuleId, NodeId, Operands, PackageId, PackageRole, SymbolId, SymbolKind, TypeId, TypeTable, UnaryOperation, Value, no_node
-from compiler.hir.ir import describe_type
+from compiler.hir.ir import describe_type, is_character_type
 from compiler.hir.ir import floating_bit_width, integer_maximum, integer_minimum, is_floating_type, is_integer_type, is_numeric_type, is_ordered_type, unsigned_integer_maximum
 from compiler.hir.ir import integer_bit_width, is_pointer_integer_type, is_unsigned_integer_type, resolve_builtin_type, types_match, values_equal
 from compiler.hir.ir import place_element_step, place_field_step
@@ -41,7 +41,7 @@ from compiler.hir.interfaces.iteration import IterationChecker
 from compiler.hir.interfaces.structural import StructuralProtocolChecker
 from compiler.hir.interfaces.values import InterfaceValueChecker
 from compiler.hir.literal_decoder import decode_byte_literal, decode_character_literal, decode_formatted_text, decode_text_literal
-from compiler.profile import Profile, belongs_to_full_luce, profile_of, Construct, admits_construct, construct_diagnostic
+from compiler.profile import Profile, belongs_to_full_luce, profile_of, Construct, admits_construct, construct_diagnostic, admits_profile_intrinsics
 from compiler.profiles.base.hir.base_checks import BaseProfileChecks
 from compiler.profiles.full.hir.checker import FullProfileChecker
 from compiler.profiles.full.hir.full_checks import FullProfileChecks
@@ -170,6 +170,9 @@ pub class HirBodyChecker: HirSemanticChecker:
 
     pub func capture_defer_value_for_feature(value: NodeId, statements: list[NodeId]) -> NodeId!:
         return try self.capture_defer_value(value, statements)
+
+    pub func value_of_for_feature(value: NodeId, expected: TypeId?) -> NodeId!:
+        return try self.value_of(value, expected)
 
     pub func instantiate_generic_method_for_feature(owner_type: TypeId, name: str, span: SourceSpan) -> i64!:
         return try self.generics.instantiate_method(self, owner_type, name, span)
@@ -397,6 +400,8 @@ pub class HirBodyChecker: HirSemanticChecker:
             ReturnStatement(value):
                 return [try self.check_return(value, statement.span)]
             ExpressionStatement(value):
+                let formatted = try self.check_formatted_print_call(value)
+                if formatted != none: return formatted
                 let printed = try self.check_print_call(value)
                 if printed != none: return [printed]
                 let checked = try self.check_expression(value, none)
@@ -439,6 +444,22 @@ pub class HirBodyChecker: HirSemanticChecker:
     # `print` is the first terminal operation in the executable slice. A
     # string literal becomes `PrintText`, whose bytes are known now; any other
     # `str` expression becomes `PrintValue` and is written at run time.
+    # `print(f"...")` as a statement is the profile's to shape: Base writes
+    # each piece to standard output as it goes (base.md §5.5), full Luce
+    # prints the formatted value. Anything else answers `none`.
+    func check_formatted_print_call(value: ExpressionSyntax) -> list[NodeId]?!:
+        match value.form:
+            Call(callee, type_arguments, arguments):
+                match callee.form:
+                    Name(name):
+                        if name != "print" or len(type_arguments) > 0 or len(arguments) != 1 or arguments[0].label != none: return none
+                        match arguments[0].value.form:
+                            FormattedString(start, parts):
+                                return try self.checks().check_formatted_print(self, start, parts, value.span)
+                            else: return none
+                    else: return none
+            else: return none
+
     func check_print(type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan) -> NodeId!:
         if len(type_arguments) > 0 or len(arguments) != 1 or arguments[0].label != none:
             try self.fail(span, "`print` expects one positional string")
@@ -1620,6 +1641,7 @@ pub class HirBodyChecker: HirSemanticChecker:
     # conversion is checked in source order and retains either a closed
     # builtin conversion or an ordinary resolved Display call in HIR.
     func check_formatted_string(start: Token, parts: list[FormatPartSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        try self.require_admitted(Construct.formatted_value, span, "")
         let source_parts = list[FormattedSourcePart]()
         for part in parts:
             match part:
@@ -1904,8 +1926,12 @@ pub class HirBodyChecker: HirSemanticChecker:
                     Name(owner_name):
                         if owner_name == "native":
                             return try self.check_native_call(name, type_arguments, arguments, span, expected)
-                        if owner_name == "Builtin" and self.state.modules[self.state.current_module].authority == ModuleAuthority.standard:
-                            return try self.check_standard_intrinsic(name, type_arguments, arguments, span, expected)
+                        if owner_name == "Builtin":
+                            let module = self.state.modules[self.state.current_module]
+                            if module.authority == ModuleAuthority.standard:
+                                return try self.check_standard_intrinsic(name, type_arguments, arguments, span, expected)
+                            if admits_profile_intrinsics(module.authority, module.standard):
+                                return try self.checks().check_intrinsic(self, name, type_arguments, arguments, span, expected)
                         if owner_name == "ErrorCode" and name == "package" and self.state.find_local(owner_name) < 0:
                             return try self.check_error_code_package(arguments, span, expected)
                     else: pass
@@ -2060,7 +2086,11 @@ pub class HirBodyChecker: HirSemanticChecker:
         if len(arguments) != 1: try self.fail(span, "numeric conversion takes exactly one positional value")
         if arguments[0].label != none: try self.fail(arguments[0].span, "numeric conversion uses one positional value")
         let value = try self.check_expression(arguments[0].value, none)
-        if not is_numeric_type(self.state.types, self.state.type_of(value)):
+        # `u32(c)` reads a `char` as its Unicode scalar value; the checked
+        # conversion is the one spelling for it.
+        var convertible = is_numeric_type(self.state.types, self.state.type_of(value))
+        if is_character_type(self.state.types, self.state.type_of(value)) and is_integer_type(self.state.types, destination): convertible = true
+        if not convertible:
             try self.fail(arguments[0].span, "cannot convert `" + self.describe_type(self.state.type_of(value)) + "` to `" + self.describe_type(destination) + "`")
         match self.state.node_form(value):
             Constant(index):

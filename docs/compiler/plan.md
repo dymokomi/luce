@@ -36,7 +36,7 @@ The 1.0 checkpoint is now defined in two halves that share one compiler:
 QBE is a baseline, not a destination: it is the native oracle that every
 Base slice and the eventual Luce-owned backend are proved against.
 
-The repository currently proves 1106 compiler tests across 58 files, plus the
+The repository currently proves 1113 compiler tests across 59 files, plus the
 CLI, Wasmtime, QBE differential, and host-native gates. The 2026-09-03 audit
 and its fixes are recorded in `done.md`; compile time is linear in program
 size on the synthetic corpora, native traps name their reason, and the
@@ -415,7 +415,10 @@ backends only.
   header, exported methods as `Type_method`, spans as pointer-and-count
   parameters, function pointers, and the fallible status form, and a Base
   package without `main` built with `--lib` to one object beside its
-  header (§17.6, §19.6); `extern func` with those types, `cstr` (`const u8*` for now),
+  header (§17.6, §19.6); `print(f"...")` writing each piece to standard
+  output through the standard `io` module's display functions, with `Writer`,
+  `stdout()`, and `stderr()` in `io.lucb` over the two `Builtin` write
+  intrinsics a standard Base module may name (§5.5, §14.4, §16.6); `extern func` with those types, `cstr` (`const u8*` for now),
   variadic calls, `as "symbol"`, and the `c` alias types, calling libc
   natively; the Base entry point `main(arguments: str[]) -> i32` with
   QBE's startup shim; declaration attributes (§9.8), carried as one

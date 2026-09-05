@@ -521,7 +521,7 @@ Base has two conversion spellings with two meanings.
 
 **Widening is implicit.** An integer converts implicitly to a wider integer of the same signedness: `u8` to `u16`, `u32`, `u64`, or `usize`; `i32` to `i64` or `isize`. No value can change, so no spelling is required. Nothing else converts implicitly: narrowing, a change of signedness, and conversion to or from a float are always written.
 
-**`T(x)` is the checked conversion.** `u32(length)` traps if the value does not fit. `f64(count)` rounds to nearest. `i32(f)` truncates toward zero and traps on NaN or out of range. `c.long(n)` is checked. `Kind(n)` from an integer traps when `n` is not a declared case of the integer-backed enum `Kind`. `str(bytes)` and `str(value)` validate text (§5.5) and yield `str!` rather than trapping, because invalid input is ordinary data, not a program error. A conversion the compiler can prove impossible, such as `u32(-1)` from a negative literal, is an error.
+**`T(x)` is the checked conversion.** `u32(length)` traps if the value does not fit. `f64(count)` rounds to nearest. `i32(f)` truncates toward zero and traps on NaN or out of range. `c.long(n)` is checked. `u32(c)` reads a `char` as its Unicode scalar value, and is the one spelling for it. `Kind(n)` from an integer traps when `n` is not a declared case of the integer-backed enum `Kind`. `str(bytes)` and `str(value)` validate text (§5.5) and yield `str!` rather than trapping, because invalid input is ordinary data, not a program error. A conversion the compiler can prove impossible, such as `u32(-1)` from a negative literal, is an error.
 
 **`(T)x` is C's cast, with every case defined:**
 
@@ -1301,7 +1301,7 @@ The language depends on these modules by name. Their full surfaces are in the li
 | Module | What the language relies on |
 | --- | --- |
 | `memory` | `allocator` (thread-local current allocator), `heap` (the initial allocator), `exhausted` and `unset` (error codes), `read`, `write`, `copy`, `move`, `set` |
-| `io` | `stdout()` and `stderr()` as `Writer`s |
+| `io` | `stdout()` and `stderr()` as `Writer`s; the compiler-supplied `display` of §14.4 for integers, `bool`, `char`, `str`, and pointers is Base code here (`write_signed`, `write_unsigned`, `write_bool`, `write_char`, `write_text`, `write_pointer`), which formatted output calls |
 | `files` | `read(path: cstr) -> u8[]!` allocating from the current allocator, `open`, `write`, `missing` (error code) |
 | `math` | `floor`, `mod`, `sqrt`, the NaN and infinity constants |
 | `thread` | `spawn`, `Handle`, `current`, `pause`, `yield`, `sleep` |

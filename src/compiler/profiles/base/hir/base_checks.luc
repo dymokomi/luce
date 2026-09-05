@@ -15,10 +15,13 @@
 #==============================================================================================
 
 from compiler.frontend.source import SourceSpan
-from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, TypeArgumentSyntax, TypeForm, TypeSyntax
+from compiler.frontend.syntax import ArgumentSyntax, ExpressionSyntax, FormatPartSyntax, TypeArgumentSyntax, TypeForm, TypeSyntax
+from compiler.frontend.tokenizer import Token
+from compiler.formatting.formatted_strings import FormattedSourcePart, normalize_formatted_parts
+from compiler.hir.literal_decoder import decode_formatted_text
 from compiler.hir.declarations import DeclarationCollector
-from compiler.hir.generation_model import CheckedBinaryOperands, HirGenerationState, HirSemanticChecker, ProfileChecks, ResolvedBinary, names_a_value, type_path_of
-from compiler.hir.ir import BinaryOperation, BuiltinType, HirNodeForm, NodeId, TypeId, TypeTable, Value, no_node
+from compiler.hir.generation_model import CheckedBinaryOperands, FunctionSymbol, HirGenerationState, HirSemanticChecker, ProfileChecks, ResolvedBinary, names_a_value, type_path_of
+from compiler.hir.ir import BinaryOperation, BuiltinType, HirNodeForm, NodeId, OutputStream, SymbolId, SymbolKind, TypeId, TypeTable, Value, no_node
 from compiler.hir.ir import describe_type, integer_bit_width, is_integer_type, is_pointer_integer_type, is_unsigned_integer_type, place_element_step, resolve_builtin_type, types_match
 from compiler.layout_query import LayoutQuery
 
@@ -258,6 +261,119 @@ pub class BaseProfileChecks: ProfileChecks:
 
     func diagnostic(span: SourceSpan, message: str) -> str:
         return self.state.diagnostic_at(self.state.current_module, span, message)
+
+    # mark: Intrinsics ==========================================================================
+
+    ## The two intrinsics the standard `io` module is written over: raw bytes
+    ## to standard output or standard error, the streams the startup shim
+    ## owns (base.md §16.6, §19.4).
+    pub func check_intrinsic(semantics: HirSemanticChecker, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) > 0: try self.fail(span, "`Builtin." + name + "` does not take type arguments")
+        var stream = OutputStream.standard_output
+        match name:
+            "write_output": stream = OutputStream.standard_output
+            "write_error": stream = OutputStream.standard_error
+            else: try self.fail(span, "unknown Luce Base intrinsic `Builtin." + name + "`; the standard modules use `write_output` and `write_error`")
+        if len(arguments) != 1 or arguments[0].label != none: try self.fail(span, "`Builtin." + name + "` takes one `const u8[]`")
+        let bytes_type = self.state.intern_span(resolve_builtin_type(BuiltinType.unsigned_u8), true)
+        let data = try semantics.check_expression_for_feature(arguments[0].value, bytes_type)
+        let written = self.state.push_node(HirNodeForm.WriteBytes(data = data, stream = stream), resolve_builtin_type(BuiltinType.unit), span)
+        return try semantics.require_type_for_feature(written, expected)
+
+    # mark: Formatted output ====================================================================
+
+    ## `print(f"...")` writes each piece to standard output as it goes and
+    ## ignores a failed write (base.md §5.5, §14.4): the sink is
+    ## `io.stdout()`, held once, and every text piece and field becomes one
+    ## call on the standard `io` module's display functions, `write_text`
+    ## for text and `str`, `write_signed`/`write_unsigned` for integers
+    ## widened to 64 bits, `write_bool`, `write_char`, and `write_pointer`.
+    ## Nothing is allocated and no string value exists.
+    pub func check_formatted_print(semantics: HirSemanticChecker, start: Token, parts: list[FormatPartSyntax], span: SourceSpan) -> list[NodeId]?!:
+        let io = self.state.find_source("io")
+        if io < 0: try self.fail(span, "`print` with a formatted string needs the standard `io` module; build with the standard modules (base.md §16.6)")
+        let source_parts = list[FormattedSourcePart]()
+        for part in parts:
+            match part:
+                Text(token): source_parts.append(FormattedSourcePart.Text(value = token.text))
+                Field(value, field_span): source_parts.append(FormattedSourcePart.Field)
+        let normalized = normalize_formatted_parts(source_parts, start.text == "f\"\"\"") catch reason:
+            try self.fail(span, reason)
+            return none
+
+        let statements = list[NodeId]()
+        let stdout = try self.io_function(io, "stdout", span)
+        let sink_call = self.state.push_node(HirNodeForm.Call(function = stdout.symbol, arguments = self.state.push_run(list[u32]())), stdout.result, span)
+        let sink = try semantics.capture_defer_value_for_feature(sink_call, statements)
+        var text_index = 0
+        for part in parts:
+            match part:
+                Text(token):
+                    let decoded = decode_formatted_text(normalized[text_index]) catch reason:
+                        try self.fail(token.span, reason)
+                        return none
+                    text_index += 1
+                    if decoded != "":
+                        let text = semantics.push_constant_for_feature(Value.Text(value = decoded), self.state.intern_string_view(), token.span)
+                        statements.append(try self.write_piece(semantics, io, "write_text", sink, text, token.span))
+                Field(value, field_span):
+                    let untyped: TypeId? = none
+                    let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(value, untyped), untyped)
+                    statements.append(try self.write_field(semantics, io, sink, checked, field_span))
+        let newline = semantics.push_constant_for_feature(Value.Text(value = "\n"), self.state.intern_string_view(), span)
+        statements.append(try self.write_piece(semantics, io, "write_text", sink, newline, span))
+        return statements
+
+    ## One field of a formatted string, dispatched on its type to the `io`
+    ## display function the compiler supplies for it (base.md §14.4).
+    func write_field(semantics: HirSemanticChecker, io: i64, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
+        let value_type = self.state.type_of(value)
+        match self.state.types.definitions[value_type.value].form:
+            Boolean: return try self.write_piece(semantics, io, "write_bool", sink, value, span)
+            Character: return try self.write_piece(semantics, io, "write_char", sink, value, span)
+            StringView: return try self.write_piece(semantics, io, "write_text", sink, value, span)
+            Integer(bits, is_signed):
+                return try self.write_piece(semantics, io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
+            PointerInteger(is_signed):
+                return try self.write_piece(semantics, io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
+            Pointer(pointee, is_const, is_volatile):
+                let erased = self.state.push_node(HirNodeForm.Cast(value = value), self.state.intern_pointer(resolve_builtin_type(BuiltinType.unit), true, false), span)
+                return try self.write_piece(semantics, io, "write_pointer", sink, erased, span)
+            Floating(bits):
+                try self.fail(span, "a floating-point field in a formatted string waits for Luce Base's shortest-round-trip printer (base.md §14.4)")
+            else: pass
+        try self.fail(span, "`" + self.state.describe_type(value_type) + "` has no display in a formatted string; integers, `bool`, `char`, `str`, and pointers do (base.md §14.4)")
+        return value
+
+    func integer_display(is_signed: bool) -> str:
+        if is_signed: return "write_signed"
+        return "write_unsigned"
+
+    ## Integers display through their 64-bit form.
+    func widen_field(value: NodeId, is_signed: bool, span: SourceSpan) -> NodeId:
+        var wide = resolve_builtin_type(BuiltinType.unsigned_u64)
+        if is_signed: wide = resolve_builtin_type(BuiltinType.signed_i64)
+        if types_match(self.state.type_of(value), wide): return value
+        return self.state.push_node(HirNodeForm.NumericConvert(value = value), wide, span)
+
+    ## `io.function(sink, value)` with its failure ignored: the call under a
+    ## `catch` whose one path recovers `unit`, so the statement proves the
+    ## same transfer rule as a written handler.
+    func write_piece(semantics: HirSemanticChecker, io: i64, name: str, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
+        let function = try self.io_function(io, name, span)
+        let arguments = self.state.push_run([u32(0), sink.value, u32(1), value.value])
+        let call = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = arguments), function.result, span)
+        let failure = self.state.make_symbol("$print_failure_" + str(self.state.next_symbol), SymbolKind.local, resolve_builtin_type(BuiltinType.error_value))
+        let recovered = semantics.push_constant_for_feature(Value.Unit, resolve_builtin_type(BuiltinType.unit), span)
+        let recover = self.state.push_statement(HirNodeForm.RecoverStatement(value = recovered), span)
+        let caught = self.state.push_node(HirNodeForm.Catch(value = call, failure = failure, body = self.state.push_nodes([recover])), resolve_builtin_type(BuiltinType.unit), span)
+        return self.state.push_statement(HirNodeForm.ExpressionStatement(value = caught), span)
+
+    func io_function(io: i64, name: str, span: SourceSpan) -> FunctionSymbol!:
+        let index = self.state.find_function_in_module(io, name)
+        if index < 0: try self.fail(span, "the standard `io` module has no `" + name + "`; formatted output needs it (base.md §16.6)")
+        return self.state.functions[index]
+
 
 # Whether Base converts `found` to `expected` implicitly: both integers of one
 # signedness, and every value of `found` fits `expected` on every target. A

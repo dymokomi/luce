@@ -69,6 +69,11 @@ build names only the sources:
 ./build/base_main one two
 ```
 
+Formatted output in Base goes straight to the sink, with no string value in
+between: `print(f"count {count} word {word}")` calls the standard `io`
+module's display functions for each piece (`base.md` §5.5, §14.4); see
+`examples/base/format.lucb`.
+
 A Base package without `main` becomes a library: an object file and the C
 header its exports need (`base.md` §17.6):
 

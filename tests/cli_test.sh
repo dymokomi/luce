@@ -97,6 +97,14 @@ if [ "$base_output" != "$(printf 'hello from luce base: 2 argument(s)\n  one\n  
     echo "cli: base executable printed '$base_output'" >&2
     exit 1
 fi
+# Formatted output in Base reaches standard output through the standard `io`
+# module (base.md §5.5, §14.4).
+expect 0 "built $test_dir/base_format" "$cli" build --package org.luce.examples --root examples/base --target native "$test_dir/base_format" examples/base/format.lucb
+format_output=$("$test_dir/base_format" one two)
+if [ "$format_output" != "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233')" ]; then
+    echo "cli: Base formatted output printed '$format_output'" >&2
+    exit 1
+fi
 # A Base package without `main` builds with --lib to an object beside its C
 # header, and a C program links against both (base.md §17.6, §19.6).
 expect 0 "built $test_dir/exports.o" "$cli" build --package org.luce.examples --root examples/base --target native --lib --c-header "$test_dir/exports.h" "$test_dir/exports.o" examples/base/exports.lucb

@@ -2744,6 +2744,34 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   §19.6); a program that needs the fence or task shims is refused, since
   the object is one translation unit.
   Gate: 1106 compiler tests across 58 files.
+- [x] **Formatted output in Base (B4)** (2026-09-04). `print(f"...")` in
+  a Base module writes each piece to standard output as it goes and never
+  forms a string (base.md §5.5, §14.4): the checker holds `io.stdout()`
+  once and turns every text piece and field into one call on the standard
+  `io` module's display functions, `write_text`, `write_signed`,
+  `write_unsigned` (integers widened to 64 bits), `write_bool`,
+  `write_char` (UTF-8), and `write_pointer` (`0x` hex), each under a
+  `catch` that recovers `unit`, so a failed write is ignored as §14.4
+  says. Those functions are Base code in `src/standard/io.lucb`, which
+  also declares `Writer` and answers `stdout()`/`stderr()` as views of
+  two globals; the only intrinsics are `Builtin.write_output` and
+  `Builtin.write_error`, admitted in a Base module the standard loader
+  supplied (provenance on `SourceModule`/`HirModule`, never spelling) and
+  carried as the target-neutral HIR node `WriteBytes`, which lowers to
+  the shim's `luce_rt_write`/`luce_rt_write_error` externs; QBE writes
+  descriptors 1 and 2, Wasm `fd_write`, and both oracles append to their
+  output. `u32(c)` is the checked conversion from `char` in both
+  profiles. A formatted string anywhere else in Base, a field with no
+  display, a float field (the shortest-round-trip printer is open), and
+  a program without the `io` module are each refused with a diagnostic.
+  Every Base fixture now also proves what it printed through the MIR
+  oracle and natively. Known: a native Base build may end with
+  `luce: N objects leaked` from the compiler's own process; the count
+  depends on which declarations the standard modules carry, it predates
+  this slice (a struct global with an initialiser that a function uses
+  reproduces it at aa51dd2), `check` and the Wasm path do not show it, and
+  the artifact is correct. Isolating it is open.
+  Gate: 1113 compiler tests across 59 files.
 
 ## 3. Bugs the multi-backend harness found
 
