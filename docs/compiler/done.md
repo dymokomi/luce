@@ -2772,6 +2772,21 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   reproduces it at aa51dd2), `check` and the Wasm path do not show it, and
   the artifact is correct. Isolating it is open.
   Gate: 1113 compiler tests across 59 files.
+- [x] **Formatted strings reach every sink (B4)** (2026-09-04).
+  `writer.write(f"...")` on an `io.Writer` view and
+  `format(buffer, f"...") -> str!` join `print` as the ways a Base module
+  consumes a formatted string (base.md §5.5). Both become one HIR
+  `FallibleSequence`: a prelude that binds the sink once, the display
+  calls of the pieces as fallible steps, and a result, typed `T!`; the
+  first failing step is the expression's failure, so `try` and `catch`
+  see a full buffer or a failed write as they would any call. The lowerer
+  turns it into nested `if`s on the error of each step with one `Yield`
+  per path, and the HIR oracle runs the steps in order. `format` writes
+  through `io.BufferWriter` over the caller's `u8[]`, fails with
+  `io.full` when the text does not fit, appends a NUL when there is room,
+  and answers a view of the text; a `write` receiver that is not the
+  standard `Writer` keeps the ordinary call path and its diagnostic.
+  Gate: 1117 compiler tests across 59 files.
 
 ## 3. Bugs the multi-backend harness found
 

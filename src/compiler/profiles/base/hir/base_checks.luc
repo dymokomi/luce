@@ -166,6 +166,7 @@ pub class BaseProfileChecks: ProfileChecks:
     ## `sizeof`, `alignof`, and `offsetof` (base.md §5.11) when no local
     ## shadows the name.
     pub func check_named_builtin(semantics: HirSemanticChecker, name: str, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId?!:
+        if name == "format" and self.state.find_local(name) < 0: return try self.check_format(semantics, type_arguments, arguments, span, expected)
         if name != "sizeof" and name != "alignof" and name != "offsetof": return none
         if self.state.find_local(name) >= 0: return none
         return try self.check_layout_query(semantics, name, type_arguments, arguments, span, expected)
@@ -290,8 +291,68 @@ pub class BaseProfileChecks: ProfileChecks:
     ## widened to 64 bits, `write_bool`, `write_char`, and `write_pointer`.
     ## Nothing is allocated and no string value exists.
     pub func check_formatted_print(semantics: HirSemanticChecker, start: Token, parts: list[FormatPartSyntax], span: SourceSpan) -> list[NodeId]?!:
+        let io = try self.io_module(span, "`print` with a formatted string")
+        let statements = list[NodeId]()
+        let stdout = try self.io_function(io, "stdout", span)
+        let sink_call = self.state.push_node(HirNodeForm.Call(function = stdout.symbol, arguments = self.state.push_run(list[u32]())), stdout.result, span)
+        let sink = try semantics.capture_defer_value_for_feature(sink_call, statements)
+        for call in try self.formatted_calls(semantics, io, sink, start, parts, span, true):
+            statements.append(self.ignore_failure(semantics, call, span))
+        return statements
+
+    ## `writer.write(f"...")` on a `Writer` view: the sink held once, then
+    ## each piece written in order; the first failure is the call's, and the
+    ## result is `unit!` (base.md §5.5). Any other receiver keeps the
+    ## ordinary call path, which refuses the formatted string as a value.
+    pub func check_formatted_write(semantics: HirSemanticChecker, receiver: NodeId, owner_type: TypeId, start: Token, parts: list[FormatPartSyntax], span: SourceSpan, expected: TypeId?) -> NodeId?!:
         let io = self.state.find_source("io")
-        if io < 0: try self.fail(span, "`print` with a formatted string needs the standard `io` module; build with the standard modules (base.md §16.6)")
+        if io < 0: return none
+        if not self.is_writer_view(io, owner_type): return none
+        let prelude = list[NodeId]()
+        let sink = try semantics.capture_defer_value_for_feature(receiver, prelude)
+        let steps = try self.formatted_calls(semantics, io, sink, start, parts, span, false)
+        let unit = resolve_builtin_type(BuiltinType.unit)
+        let done = semantics.push_constant_for_feature(Value.Unit, unit, span)
+        let sequence = self.state.push_node(HirNodeForm.FallibleSequence(prelude = self.state.push_nodes(prelude), steps = self.state.push_nodes(steps), result = done), self.state.intern_fallible(unit), span)
+        return try semantics.require_type_for_feature(sequence, expected)
+
+    ## `format(buffer, f"...") -> str!` writes into the caller's `u8[]`
+    ## through the standard `io` module's `BufferWriter`, appends a NUL when
+    ## there is room, and answers a view of the text; a full buffer is the
+    ## failure (base.md §5.5).
+    func check_format(semantics: HirSemanticChecker, type_arguments: list[TypeArgumentSyntax], arguments: list[ArgumentSyntax], span: SourceSpan, expected: TypeId?) -> NodeId!:
+        if len(type_arguments) > 0: try self.fail(span, "`format` takes no type arguments")
+        if len(arguments) != 2 or arguments[0].label != none or arguments[1].label != none:
+            try self.fail(span, "`format` takes a `u8[]` buffer and a formatted string: `format(buffer, f\"...\")` (base.md §5.5)")
+        let io = try self.io_module(span, "`format`")
+        let buffer_type = self.state.intern_span(resolve_builtin_type(BuiltinType.unsigned_u8), false)
+        let buffer = try semantics.check_expression_for_feature(arguments[0].value, buffer_type)
+        var formatted_start: Token? = none
+        var formatted_parts = list[FormatPartSyntax]()
+        match arguments[1].value.form:
+            FormattedString(start, parts):
+                formatted_start = start
+                formatted_parts = parts
+            else: try self.fail(arguments[1].span, "`format` takes a formatted string `f\"...\"` as its second argument (base.md §5.5)")
+        let start = formatted_start else trap("formatted string start disappeared")
+        let prelude = list[NodeId]()
+        let make = try self.io_function(io, "buffer_writer", span)
+        let writer_call = self.state.push_node(HirNodeForm.Call(function = make.symbol, arguments = self.state.push_run([u32(0), buffer.value])), make.result, span)
+        let writer = try semantics.capture_defer_value_for_feature(writer_call, prelude)
+        let address = try semantics.address_of_node_for_feature(writer, span)
+        let writer_pointer = self.state.push_node(HirNodeForm.AddressOf(pointer = address.pointer, symbol = address.symbol, global = address.global, steps = self.state.push_run(address.steps)), self.state.intern_pointer(make.result, false, false), span)
+        let writer_type = try self.writer_type(io, span)
+        let sink_view = try semantics.convert_interface_value_for_feature(writer_pointer, self.state.intern_pointer(make.result, false, false), writer_type) else error(self.state.diagnostic_at(self.state.current_module, span, "the standard `io` module's `BufferWriter` does not implement `Writer`"))
+        let sink = try semantics.capture_defer_value_for_feature(sink_view, prelude)
+        let steps = try self.formatted_calls(semantics, io, sink, start, formatted_parts, span, false)
+        let finish = try self.io_function(io, "finish", span)
+        let text = self.state.push_node(HirNodeForm.Call(function = finish.symbol, arguments = self.state.push_run([u32(0), writer_pointer.value])), finish.result, span)
+        let sequence = self.state.push_node(HirNodeForm.FallibleSequence(prelude = self.state.push_nodes(prelude), steps = self.state.push_nodes(steps), result = text), self.state.intern_fallible(finish.result), span)
+        return try semantics.require_type_for_feature(sequence, expected)
+
+    ## The calls that write each piece of a formatted string to `sink`, in
+    ## order; `newline` adds `print`'s trailing line end.
+    func formatted_calls(semantics: HirSemanticChecker, io: i64, sink: NodeId, start: Token, parts: list[FormatPartSyntax], span: SourceSpan, newline: bool) -> list[NodeId]!:
         let source_parts = list[FormattedSourcePart]()
         for part in parts:
             match part:
@@ -299,46 +360,70 @@ pub class BaseProfileChecks: ProfileChecks:
                 Field(value, field_span): source_parts.append(FormattedSourcePart.Field)
         let normalized = normalize_formatted_parts(source_parts, start.text == "f\"\"\"") catch reason:
             try self.fail(span, reason)
-            return none
-
-        let statements = list[NodeId]()
-        let stdout = try self.io_function(io, "stdout", span)
-        let sink_call = self.state.push_node(HirNodeForm.Call(function = stdout.symbol, arguments = self.state.push_run(list[u32]())), stdout.result, span)
-        let sink = try semantics.capture_defer_value_for_feature(sink_call, statements)
+            return list[NodeId]()
+        let calls = list[NodeId]()
         var text_index = 0
         for part in parts:
             match part:
                 Text(token):
                     let decoded = decode_formatted_text(normalized[text_index]) catch reason:
                         try self.fail(token.span, reason)
-                        return none
+                        return calls
                     text_index += 1
                     if decoded != "":
                         let text = semantics.push_constant_for_feature(Value.Text(value = decoded), self.state.intern_string_view(), token.span)
-                        statements.append(try self.write_piece(semantics, io, "write_text", sink, text, token.span))
+                        calls.append(try self.write_call(io, "write_text", sink, text, token.span))
                 Field(value, field_span):
                     let untyped: TypeId? = none
                     let checked = try semantics.value_of_for_feature(try semantics.check_expression_for_feature(value, untyped), untyped)
-                    statements.append(try self.write_field(semantics, io, sink, checked, field_span))
-        let newline = semantics.push_constant_for_feature(Value.Text(value = "\n"), self.state.intern_string_view(), span)
-        statements.append(try self.write_piece(semantics, io, "write_text", sink, newline, span))
-        return statements
+                    calls.append(try self.write_field(io, sink, checked, field_span))
+        if newline:
+            let end = semantics.push_constant_for_feature(Value.Text(value = "\n"), self.state.intern_string_view(), span)
+            calls.append(try self.write_call(io, "write_text", sink, end, span))
+        return calls
+
+    ## The standard `io` module, or the diagnostic that formatted output
+    ## needs it.
+    func io_module(span: SourceSpan, subject: str) -> i64!:
+        let io = self.state.find_source("io")
+        if io < 0: try self.fail(span, subject + " needs the standard `io` module; build with the standard modules (base.md §16.6)")
+        return io
+
+    ## Is `value_type` the standard `io.Writer` view?
+    func is_writer_view(io: i64, value_type: TypeId) -> bool:
+        match self.state.types.definitions[value_type.value].form:
+            Interface(index, arguments):
+                let declared = self.state.interfaces[index]
+                return declared.name == "Writer" and self.interface_module(index) == io
+            else: return false
+
+    func interface_module(index: i64) -> i64:
+        match self.state.interfaces[index].origin:
+            Source(module): return i64(module.value)
+            else: return -1
+
+    func writer_type(io: i64, span: SourceSpan) -> TypeId!:
+        for index in range(0, len(self.state.interfaces)):
+            if self.state.interfaces[index].name == "Writer" and self.interface_module(index) == io:
+                return self.state.intern_interface(index, list[TypeId]())
+        try self.fail(span, "the standard `io` module has no `Writer` interface (base.md §14.4)")
+        return resolve_builtin_type(BuiltinType.unit)
 
     ## One field of a formatted string, dispatched on its type to the `io`
     ## display function the compiler supplies for it (base.md §14.4).
-    func write_field(semantics: HirSemanticChecker, io: i64, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
+    func write_field(io: i64, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
         let value_type = self.state.type_of(value)
         match self.state.types.definitions[value_type.value].form:
-            Boolean: return try self.write_piece(semantics, io, "write_bool", sink, value, span)
-            Character: return try self.write_piece(semantics, io, "write_char", sink, value, span)
-            StringView: return try self.write_piece(semantics, io, "write_text", sink, value, span)
+            Boolean: return try self.write_call(io, "write_bool", sink, value, span)
+            Character: return try self.write_call(io, "write_char", sink, value, span)
+            StringView: return try self.write_call(io, "write_text", sink, value, span)
             Integer(bits, is_signed):
-                return try self.write_piece(semantics, io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
+                return try self.write_call(io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
             PointerInteger(is_signed):
-                return try self.write_piece(semantics, io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
+                return try self.write_call(io, self.integer_display(is_signed), sink, self.widen_field(value, is_signed, span), span)
             Pointer(pointee, is_const, is_volatile):
                 let erased = self.state.push_node(HirNodeForm.Cast(value = value), self.state.intern_pointer(resolve_builtin_type(BuiltinType.unit), true, false), span)
-                return try self.write_piece(semantics, io, "write_pointer", sink, erased, span)
+                return try self.write_call(io, "write_pointer", sink, erased, span)
             Floating(bits):
                 try self.fail(span, "a floating-point field in a formatted string waits for Luce Base's shortest-round-trip printer (base.md §14.4)")
             else: pass
@@ -356,13 +441,16 @@ pub class BaseProfileChecks: ProfileChecks:
         if types_match(self.state.type_of(value), wide): return value
         return self.state.push_node(HirNodeForm.NumericConvert(value = value), wide, span)
 
-    ## `io.function(sink, value)` with its failure ignored: the call under a
-    ## `catch` whose one path recovers `unit`, so the statement proves the
-    ## same transfer rule as a written handler.
-    func write_piece(semantics: HirSemanticChecker, io: i64, name: str, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
+    ## `io.function(sink, value)`: one display call, typed `unit!`.
+    func write_call(io: i64, name: str, sink: NodeId, value: NodeId, span: SourceSpan) -> NodeId!:
         let function = try self.io_function(io, name, span)
         let arguments = self.state.push_run([u32(0), sink.value, u32(1), value.value])
-        let call = self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = arguments), function.result, span)
+        return self.state.push_node(HirNodeForm.Call(function = function.symbol, arguments = arguments), function.result, span)
+
+    ## A call with its failure ignored: the call under a `catch` whose one
+    ## path recovers `unit`, so the statement proves the same transfer rule
+    ## as a written handler.
+    func ignore_failure(semantics: HirSemanticChecker, call: NodeId, span: SourceSpan) -> NodeId:
         let failure = self.state.make_symbol("$print_failure_" + str(self.state.next_symbol), SymbolKind.local, resolve_builtin_type(BuiltinType.error_value))
         let recovered = semantics.push_constant_for_feature(Value.Unit, resolve_builtin_type(BuiltinType.unit), span)
         let recover = self.state.push_statement(HirNodeForm.RecoverStatement(value = recovered), span)

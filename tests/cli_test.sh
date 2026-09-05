@@ -100,8 +100,8 @@ fi
 # Formatted output in Base reaches standard output through the standard `io`
 # module (base.md §5.5, §14.4).
 expect 0 "built $test_dir/base_format" "$cli" build --package org.luce.examples --root examples/base --target native "$test_dir/base_format" examples/base/format.lucb
-format_output=$("$test_dir/base_format" one two)
-if [ "$format_output" != "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233')" ]; then
+format_output=$("$test_dir/base_format" one two 2>"$test_dir/base_format.err")
+if [ "$format_output" != "$(printf 'count -7 flag true letter \303\251 word hello\narguments 3 code 233\n[count=-7] 8')" ] || [ "$(cat "$test_dir/base_format.err")" != "to stderr -7" ]; then
     echo "cli: Base formatted output printed '$format_output'" >&2
     exit 1
 fi
