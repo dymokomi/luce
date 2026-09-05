@@ -2899,6 +2899,18 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   stops a program from storing one past the caller's frame; the spec's
   "cannot be stored" rule is not yet enforced.
   Gate: 1130 compiler tests across 63 files.
+- [x] **`f64.bits(n)`, `f32.bits(n)`, and `char(n)` (B1, B4)** (2026-09-05).
+  The two conversions base.md §7.5 still lacked: `f64.bits(n)` and
+  `f32.bits(n)` build a float from its IEEE pattern through the new HIR
+  `FloatFromBits` node and MIR `FloatFromBits` instruction (QBE `cast`,
+  Wasm `reinterpret`, the oracles through the shared IEEE decoder), typed
+  by the Base profile's builtin-type-function hook; `char(n)` is the
+  checked conversion from any integer to a Unicode scalar value, widened,
+  refused above U+10FFFF and in the surrogate range with the integer
+  conversion trap, and narrowed to the `u32` a `char` is in MIR, with the
+  HIR oracle applying the same rule. A fixture proves both through the
+  oracles and natively; a QBE test proves the surrogate trap.
+  Gate: 1132 compiler tests across 63 files.
 
 ## 3. Bugs the multi-backend harness found
 
