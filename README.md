@@ -70,9 +70,11 @@ build names only the sources:
 ```
 
 Formatted output in Base goes straight to the sink, with no string value in
-between: `print(f"count {count} word {word}")` calls the standard `io`
-module's display functions for each piece (`base.md` §5.5, §14.4); see
-`examples/base/format.lucb`.
+between: `print(f"count {count} ratio {ratio}")` calls the standard `io`
+module's display functions for each piece, floats as the shortest decimal
+that reads back the same (`base.md` §5.5, §14.4); `format(buffer, f"...")`
+writes into a caller's buffer, and `location()` in a parameter default
+reports where the call was written (§9.1). See `examples/base/format.lucb`.
 
 A Base package without `main` becomes a library: an object file and the C
 header its exports need (`base.md` §17.6):

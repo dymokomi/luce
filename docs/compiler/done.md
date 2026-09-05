@@ -2835,6 +2835,31 @@ Last updated: 2026-09-03 (Stage-0 0.30).
   conversions in both oracles at two pointer widths and natively; a QBE
   test proves the trap.
   Gate: 1125 compiler tests across 61 files.
+- [x] **`location()` (B4)** (2026-09-04). `Location` is the standard `io`
+  module's struct, `file`, `line`, and `function`, spelled bare in a Base
+  module through the profile's builtin type names (base.md §9.1);
+  `location()` answers a `StructValue` of the module path, the span's line,
+  and the function being checked. Written as a parameter default it stays
+  the marker node `CallSiteLocation`, admitted as a constant expression,
+  and `check_function_arguments` replaces the marker with the caller's
+  location at every call site that omits the argument, so a logging helper
+  reports where it was called. A fixture prints locations through both
+  oracles and natively. Constructing one by hand is `io.Location(...)`.
+  Gate: 1128 compiler tests across 63 files.
+- [x] **Float display and `bits()` (B4)** (2026-09-04). A float field in a
+  formatted string displays as the shortest decimal that reads back the
+  same value (base.md §14.4): the full-Luce runtime's Ryū, portable 64-bit
+  words and compact power-of-five tables included, is now also Base code
+  in `src/standard/io.lucb` (`write_float64`, `write_float32`), building
+  the text in a stack buffer and writing it once; `-0.0` and whole values
+  keep their `.0`, magnitudes outside the fixed window take the `e` form,
+  and `inf`/`nan` are spelled so. `value.bits()` reads an `f32` as `u32`
+  and an `f64` as `u64` (§7.5) through the existing `NativeFloatBits`
+  node, admitted by the Base profile's scalar-method hook. `trap(message)`
+  now types its message as the profile's text, so a Base module may trap
+  with a literal. A fixture prints the edge cases through both oracles and
+  natively.
+  Gate: 1128 compiler tests across 63 files.
 
 ## 3. Bugs the multi-backend harness found
 
