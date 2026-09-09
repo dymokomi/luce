@@ -10,7 +10,6 @@ alive.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 6c. Match expressions over tuples and texts | the emitter writes them as it writes the statement form; today it refuses them and asks for the statement | the §8 programs with the expression form |
 | 7. Closures | §7.4: captures, cells, escaping closures | §7 programs |
 | 8. Interfaces and generics | §13: conformance, interface values, bounds, the closed protocols, `for` over `Iterable` | §13 programs and rejections |
 | 9. The Base boundary | §16: importing a Base module through luce-base's description, the crossings, handles; luce-base gains `pub handle`, the position directive and the description command first | §16 programs against a Base package in the tree |

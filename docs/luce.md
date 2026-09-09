@@ -454,6 +454,10 @@ name, which binds the whole value or the payload of an optional that is present,
 each with an optional guard. The statement form has suites; the expression form has `=>` arms of
 one type.
 
+A match expression over a tuple or over `bytes` reads its subject in every arm, so the
+subject is a name, a literal, or a tuple of those, and its arms bind no names; bind the
+value or use the statement form otherwise.
+
 ### 8.5 `return`, `defer`-less cleanup, `with`
 
 `return` leaves the function with a value. There is no `defer`. A resource is closed by
