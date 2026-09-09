@@ -99,6 +99,28 @@ alive; a literal read is therefore borrowed. Iterating a text yields a new one-s
 per step, owned by the loop's binding. The interpreter's texts are plain values and are
 not counted; the two executions agree because neither reports a text at exit.
 
+## Closures
+
+A function value is a closure object: a header, then the address of a function taking the
+object first and the parameters after, then whatever the closure captured. A lambda's
+object holds a copy of every `let` it captured, taken when the lambda was evaluated, and
+the cell of every `var`: a captured `var` is a cell object holding the value, shared by
+the scope that declared it and every closure that captured it, so all of them see every
+assignment. A named function used as a value is an immortal closure holding nothing; a
+method bound to a receiver is a closure holding the receiver. A closure is released like
+any object, and lets its captures go when it goes; the collector traces through them.
+
+## Interface values
+
+An interface value (§13.2) is a pointer to a box: an object whose header is followed by a
+pointer to the table of the boxed type's methods for that interface, then the value itself,
+a copy taken when the conversion happened. Copies of the interface value share the box;
+a box is never changed, so sharing is invisible. A call through the interface is one
+indirect call through the table. Releasing the last copy drops the boxed value, which is
+how a class behind an interface value goes when the value does; the collector traces
+through the box, so a cycle through interface values is found like any cycle. Every
+box of one interface and one conforming type shares one table, emitted once.
+
 ## Hashing
 
 `hash(x)` (§4.4) is the same number in both executions: FNV-1a over 64 bits (offset
@@ -111,7 +133,9 @@ case's index as an `int` then its payload; an optional the byte 0 for `none` or 
 then the value; a range its two bounds and a byte for inclusion; a list its elements in
 order; a set its elements' hashes summed (as unsigned arithmetic, wrapping); a map each
 entry's key hash times 31 plus its value hash, summed the same way; an `ErrorCode` its
-number. A class hashes as its `Hashable` conformance says, never structurally.
+number. A type that declares `Hashable` (§13.3) hashes as the `int` its `hashed` returns
+(so `hash(v)` is the hash of that `int`, and `v` inside a tuple or list mixes the same way);
+a class hashes only that way, never structurally.
 
 Maps and sets keep insertion order, and removing an entry keeps the order of the rest, so
 iteration and display never depend on the hash.

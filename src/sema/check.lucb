@@ -14,6 +14,7 @@
 
 import c
 import front.ast
+import support.prelude
 import front.parser
 import front.source
 import front.token
@@ -78,6 +79,10 @@ pub struct Checker:
     pub var in_init: bool
     ## Inside `deinit`, where `self` is only ever a receiver (§10.3).
     pub var in_deinit: bool
+    ## Inside an interface's signatures, where `Self` names the conforming type.
+    var in_interface: bool
+    ## Whether a conformance list is being resolved, where a closed protocol may be named.
+    var in_conformance: bool
     ## Set just before a receiver is checked: `self` there is not published.
     pub var self_receiver: bool
     pub var loop_depth: u32
@@ -93,6 +98,10 @@ pub struct Checker:
     pub var package_codes: list.List[u64]
     ## Inside a top-level constant initialiser.
     pub var at_top_level: bool
+    ## The lambdas being checked, innermost last, each with the scope depth it opened at:
+    ## a name bound no deeper than that depth is captured (§7.4).
+    pub var lambdas: list.List[ast.Node*]
+    pub var lambda_bases: list.List[u32]
     ## The type of the `main` function, once seen.
     pub var main_seen: bool
 
@@ -100,9 +109,10 @@ pub struct Checker:
         return Checker(table = try types.Table.create(), modules = try list.List[Module].create(16),
                        scope = try list.List[Binding].create(512), depth = 0, scratch = scratch, current = 0,
                        current_func = none, result_type = types.unit_id, fallible = false, self_type = types.none_id,
-                       self_mutable = false, in_init = false, in_deinit = false, self_receiver = false, loop_depth = 0, label_count = 0, in_catch = false,
+                       self_mutable = false, in_init = false, in_deinit = false, in_interface = false, in_conformance = false, self_receiver = false, loop_depth = 0, label_count = 0, in_catch = false,
                        catch_result = types.none_id, package_name = "app", package_codes = try list.List[u64].create(16),
-                       at_top_level = false, main_seen = false)
+                       at_top_level = false, main_seen = false, lambdas = try list.List[ast.Node*].create(8),
+                       lambda_bases = try list.List[u32].create(8))
 
     # -- diagnostics ----------------------------------------------------------------------
 
@@ -112,7 +122,9 @@ pub struct Checker:
         var name: str = "?"
         var line: u32 = node.line
         var column: u32 = 1
-        if self.current < self.modules.count:
+        if node.has(ast.flag_prelude):
+            name = "prelude"
+        elif self.current < self.modules.count:
             let m = self.modules.get(self.current)
             name = m.src.path
             let (l, col) = m.src.position(node.start)
@@ -192,15 +204,46 @@ pub struct Checker:
         let src = try source.Source.load(path)
         var p = try parser.Parser.over(src, self.scratch)
         let tree = try p.parse_module()
+        try self.with_prelude(tree)
         try self.modules.push(Module(name = module_name_of((str)path), tree = tree, src = src))
         self.current = self.modules.count - 1
         try self.check_module(tree)
 
     ## Check a module already parsed (tests).
     pub mutating func check_tree(tree: ast.Node*, src: source.Source) -> !:
+        try self.with_prelude(tree)
         try self.modules.push(Module(name = "t", tree = tree, src = src))
         self.current = self.modules.count - 1
         try self.check_module(tree)
+
+    ## Whether a declaration lists a conformance to the interface named.
+    func lists_conformance(d: ast.Node*, name: str) -> bool:
+        var cursor = d.right
+        while let t = cursor:
+            if t.text == name:
+                return true
+            cursor = t.next
+        return false
+
+    ## Whether a declaration is one of the prelude's (a closed protocol).
+    func is_prelude(d: ast.Node*) -> bool:
+        return d.has(ast.flag_prelude)
+
+    ## The closed protocols (§13.3) declared before the program's own declarations, so a
+    ## type may conform to them and nothing may redeclare them.
+    mutating func with_prelude(tree: ast.Node*) -> !:
+        let src = try source.Source.over("prelude", prelude.source.bytes)
+        var p = try parser.Parser.over(src, self.scratch)
+        let declarations = try p.parse_module()
+        var last: ast.Node*? = none
+        var cursor = declarations.body
+        while let d = cursor:
+            d.flags |= ast.flag_prelude
+            last = d
+            cursor = d.next
+        if let tail = last:
+            tail.next = tree.body
+            tree.body = declarations.body
 
     pub func tree() -> ast.Node*:
         return self.modules.get(self.current).tree
@@ -235,6 +278,25 @@ pub struct Checker:
         try self.declare_types(tree)
         try self.resolve_signatures(tree)
         try mark_mutating_methods(tree)
+        try self.conformances_read_only(tree)
+
+    ## A value type's method for a requirement leaves `self` alone: an interface value is
+    ## a copy that is read through the interface, never changed through it (§13.1).
+    mutating func conformances_read_only(tree: ast.Node*) -> !:
+        var cursor = tree.body
+        while let d = cursor:
+            if d.kind == ast.Kind.struct_ or d.kind == ast.Kind.enum_:
+                var conformance = d.right
+                while let t = conformance:
+                    let iface = self.table.get(t.type_id).decl else return try self.fail(t, "no declaration")
+                    var req = iface.body
+                    while let r = req:
+                        if let have = self.find_member(d, r.text):
+                            if have.has(flag_mutating):
+                                return try self.fail(have, try self.named("the method ", r.text, " changes `self`, which a method an interface requires may not (§13.1)"))
+                        req = r.next
+                    conformance = t.next
+            cursor = d.next
 
     ## Every top-level name once, none of them a core name (the parser refused those).
     mutating func collect(tree: ast.Node*) -> !:
@@ -242,10 +304,12 @@ pub struct Checker:
         while let d = cursor:
             if d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import:
                 return try self.fail(d, "imports arrive with the module slice; a program is one file for now")
-            if d.kind != ast.Kind.test_:
+            if d.kind != ast.Kind.test_ and not d.has(ast.flag_prelude):
                 var other = tree.body
                 while let o = other:
                     if o != d and o.kind != ast.Kind.test_ and o.text == d.text:
+                        if o.has(ast.flag_prelude):
+                            return try self.fail(d, try self.named("", d.text, " is a closed protocol the language declares (§13.3)"))
                         return try self.fail(d, try self.named("", d.text, " is declared twice"))
                     other = o.next
                 if d.ty != none and d.kind != ast.Kind.type_alias:
@@ -298,12 +362,15 @@ pub struct Checker:
                         m = member.next
                     try self.resolve_conformance(d)
                 .interface_:
+                    self.in_interface = true
                     var m = d.body
                     while let member = m:
                         member.type_id = try self.signature_of(member, d.type_id)
                         if not has_self(member):
                             return try self.fail(member, "an interface method takes `self`")
                         m = member.next
+                    self.in_interface = false
+                    try self.resolve_conformance(d)
                 .constant:
                     if let t = d.ty:
                         d.type_id = try self.resolve_type(t)
@@ -355,15 +422,19 @@ pub struct Checker:
     mutating func resolve_conformance(d: ast.Node*) -> !:
         var cursor = d.right
         while let t = cursor:
+            self.in_conformance = true
             let id = try self.resolve_type(t)
+            self.in_conformance = false
             if self.table.kind(id) != types.Kind.interface_:
                 return try self.fail(t, "a type conforms to an interface")
             t.type_id = id
             let iface = self.table.get(id).decl else return try self.fail(t, "no declaration")
+            if (iface.text == "Hashable" or iface.text == "Ordered") and self.is_prelude(iface) and not self.lists_conformance(d, "Equatable"):
+                return try self.fail(t, try self.named("", iface.text, " needs `Equatable` declared beside it (§13.3)"))
             var req = iface.body
             while let r = req:
                 let have = self.find_member(d, r.text) else return try self.fail(t, try self.named("the conformance to this interface lacks the method ", r.text, ""))
-                if have.kind != ast.Kind.func_ or have.type_id != r.type_id:
+                if have.kind != ast.Kind.func_ or have.type_id != (try self.table.substitute(r.type_id, d.type_id)):
                     return try self.fail(have, try self.named("the method ", r.text, " does not have the signature the interface requires"))
                 if not have.has(ast.flag_pub) and iface.has(ast.flag_pub):
                     return try self.fail(have, try self.named("the method ", r.text, " of a public interface is `pub`"))
@@ -463,6 +534,10 @@ pub struct Checker:
             return try self.table.function(params[..<i], result)
         let name = t.text
         let args = ast.count(t.body)
+        if name == "Self":
+            if not self.in_interface:
+                return try self.fail(t, "`Self` belongs inside an interface (§13.3)")
+            return types.self_id
         if name == "int" or name == "float" or name == "bool" or name == "str" or name == "bytes" or name == "unit" or name == "never" or name == "Error" or name == "ErrorCode":
             if args > 0:
                 return try self.fail(t, try self.named("", name, " takes no type arguments"))
@@ -494,6 +569,8 @@ pub struct Checker:
         if args > 0:
             return try self.fail(t, "generics arrive with the interfaces slice")
         let d = self.find_declaration(name) else return try self.fail(t, try self.named("unknown type ", name, ""))
+        if d.kind == ast.Kind.interface_ and d.has(ast.flag_prelude) and not self.in_conformance:
+            return try self.fail(t, try self.named("", name, " is a closed protocol: a type declares it, no value has it as its type (§13.3)"))
         match d.kind:
             .struct_, .enum_, .class_, .interface_, .type_alias:
                 if d.type_id == types.none_id:

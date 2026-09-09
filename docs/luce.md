@@ -715,7 +715,7 @@ interface Shape:
     func area(self) -> float
     func name(self) -> str
 
-struct Circle: Shape
+struct Circle: Shape:
     var radius: float
 
     func area(self) -> float:
@@ -726,9 +726,11 @@ struct Circle: Shape
 ```
 
 An interface is a set of method signatures. A struct, enum or class declares its conformance
-at its declaration, `: Shape`, and provides every method with the exact signature. There are
-no default methods, no inheritance between interfaces beyond listing several, no associated
-types, and no downcast from an interface value to a concrete type.
+at its declaration, `: Shape`, and provides every method with the exact signature. A struct's
+or enum's method for a requirement does not change `self`: an interface value is read
+through the interface, never changed through it. There are no default methods, no
+inheritance between interfaces beyond listing several, no associated types, and no downcast
+from an interface value to a concrete type.
 
 ### 13.2 Interface values and generics
 
@@ -743,8 +745,12 @@ func largest[T: Ordered](values: list[T]) -> T?:
     ...
 ```
 
-A value of a conforming type converts to an interface value where one is expected, and the
-call dispatches to the value's own method. A generic function or type takes type parameters
+A value of a conforming type converts to an interface value where one is expected: a copy
+of the value behind the interface, with the ownership of a value (§10.5, `docs/RUNTIME.md`),
+so a class behind it lives while any copy of the interface value does. A call dispatches to
+the value's own method; an interface value has no `==`, no ordering, no hash and no display
+of its own, and an optional of one is compared with `none` like any optional. A generic
+function or type takes type parameters
 in `[...]`, each optionally bounded by interfaces, and is checked once against its bounds;
 inside it, only the bounds' methods and the operations every type has are available. Type
 arguments are inferred from arguments or written, `parse[Config](text)`.
@@ -764,7 +770,12 @@ The compiler knows these interfaces, and syntax uses them:
 
 Values get `Equatable`, `Hashable`, `Ordered` and `Display` structurally as §4.4 and §10.5
 say; a type declares one only to replace the structural meaning, and a class must declare
-them to have them at all.
+them to have them at all. A closed protocol names what a type declares, never a value's
+type: `let e: Equatable = x` is an error, and no program may declare one itself. A type that
+declares `Equatable` keys a map or sits in a set only when it declares `Hashable` beside
+it, so its hash agrees with its `equals`; `Hashable` and `Ordered` are declared beside
+`Equatable`, never alone. A value with a declared `hashed` hashes as the `int` it returns
+(`docs/RUNTIME.md`).
 
 ## 14. Workers
 

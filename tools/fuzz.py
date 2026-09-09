@@ -133,6 +133,7 @@ class Gen:
             return r.choice(["true", "false"])
         pool = {
             "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count", "nums.length", "(nums.first else 0)",
+                    "apply((n) => n % 4096 + a % 4096, b)", "apply(halve, a)", "counter()", "(nums.map((n) => n % 8).first else 0)",
                     "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(hash(a) % 1000)", "(hash(s) % 1000)",
                     "(s.index_of(t) else -1)", "s.byte_count"],
             "float": ["d", "e", "float(a % 256)", "p.f"],
@@ -208,6 +209,22 @@ class Gen:
             return f"({self.expr(depth - 1, 'str')} in {self.expr(depth - 1, 'str')})"
         return f"(o == none)"
 
+    def interface_statement(self, k, depth, indent):
+        """Interface values (§13.2): made of a struct, an enum or a class, kept in a list
+        and an optional, called through, and let go of; a class behind one prints when it
+        goes, so the releases must agree."""
+        r = self.rng
+        pad = "    " * indent
+        n = self.expr(1)
+        if k == 26:
+            return [r.choice([f"{pad}names.append(named({n}, obj))", f"{pad}names.append(Tag(text = short({self.expr(1, 'str')})))",
+                              f"{pad}names.append(Badge({self.fresh(n)}))", f"{pad}pick = named({n}, obj)", f"{pad}pick = none",
+                              f"{pad}pick = names.first", f"{pad}names = [Level.high(by = {n} % 100), Level.low]",
+                              f"{pad}names.clear()"])]
+        return [r.choice([f"{pad}print(heaviest(names), name_label(pick))", f"{pad}print(names.map((x) => x.label()))",
+                          f"{pad}sum = (sum * 31 + heaviest(names)) % 1000000007", f"{pad}print(named({n}, {self.fresh(n)}).label())",
+                          f"{pad}a = (pick else Level.low).weight() % 4096"])]
+
     def object_statement(self, k, depth, indent):
         """Objects: made, shared, stored in fields, let go of, closed; each `deinit` prints,
         so the two executions must agree on every release."""
@@ -264,6 +281,14 @@ class Gen:
         if k == 23:
             return [r.choice([f"{pad}seen.insert({n} % 8)", f"{pad}flag = seen.remove({n} % 8)", f"{pad}seen = seen.union({{{n} % 8, 1}})",
                               f"{pad}seen = seen.intersection({{1, 2, 3, {n} % 8}})", f"{pad}seen = seen.difference({{{n} % 8}})"])]
+        if k == 24 and depth > 0 and r.random() < 0.4:
+            # a closure over the locals: made, called, kept in a variable
+            m = self.loops; self.loops += 1
+            lines = [f"{pad}let f{m} = func (n: int) -> int:", f"{pad}    a = (a % 4096) + (n % 4096)", f"{pad}    return a + obj.n"]
+            lines.append(f"{pad}c = f{m}({n})")
+            lines.append(f"{pad}fs.append(f{m})")
+            lines.append(f"{pad}if fs.length > 3:\n{pad}    fs.clear()")
+            return lines
         if k == 24 and depth > 0:
             m = self.loops; self.loops += 1
             which = r.choice(["nums", "words", "seen"])
@@ -288,7 +313,10 @@ class Gen:
         pad = "    " * indent
         saved = list(self.locals)
         for _ in range(r.randint(1, 4)):
-            k = r.randrange(14 if self.in_helper else 26)
+            k = r.randrange(14 if self.in_helper else 28)
+            if k >= 26:
+                lines += self.interface_statement(k, depth, indent)
+                continue
             if k >= 20:
                 lines += self.collection_statement(k, depth, indent)
                 continue
@@ -390,9 +418,18 @@ class Gen:
                 "func make(name: str, n: int) -> Tracer:", "    let t = Tracer(name)", "    discard(t.bump(n))", "    return t", "",
                 "func hold(t: Tracer?) -> Holder:", "    return Holder(item = t, count = 1)", "",
                 "func name_of(t: Tracer?) -> str:", "    if let x = t:", "        return x.tag()", "    return \"-\"", "",
+                "func name_label(n: Named?) -> str:", "    if let x = n:", "        return x.label()", "    return \"-\"", "",
                 "func is_small(n: int) -> bool:", "    return n < 100", "",
                 "func halve(n: int) -> int:", "    return n // 2", "",
                 "func sorted_copy(values: list[int]) -> list[int]:", "    return values.sorted()", "",
+                "func apply(f: func(int) -> int, x: int) -> int:", "    return f(x)", "",
+                "func make_counter() -> func() -> int:", "    var count = 0", "    return func () -> int:", "        count += 1", "        return count", "",
+                "interface Named:", "    func label(self) -> str", "    func weight(self) -> int", "",
+                "struct Tag: Named:", "    var text: str", "", "    func label(self) -> str:", "        return self.text", "", "    func weight(self) -> int:", "        return self.text.length", "",
+                "enum Level: Named:", "    low", "    high(by: int)", "", "    func label(self) -> str:", "        match self:", "            .low: return \"low\"", "            .high(by): return f\"high{by}\"", "", "    func weight(self) -> int:", "        match self:", "            .low: return 1", "            .high(by): return by % 1024", "",
+                "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "",
+                "func named(x: int, t: Tracer) -> Named:", "    match x % 3:", "        0: return Tag(text = f\"t{x % 100}\")", "        1: return Level.high(by = x % 50)", "        _: return Badge(t)", "",
+                "func heaviest(items: list[Named]) -> int:", "    var best = 0", "    for item in items:", "        if item.weight() > best:", "            best = item.weight()", "    return best", "",
                 "var_block"]
         return "\n".join(text)
 
@@ -433,12 +470,17 @@ def generate(rng):
     body.append('    var words = ["b", "a"]')
     body.append('    var ages = {"a": 1, "b": 2}')
     body.append("    var seen = {1, 2}")
+    body.append("    let counter = make_counter()")
+    body.append("    var fs: list[func(int) -> int] = []")
+    body.append("    var names: list[Named] = [Level.low]")
+    body.append("    var pick: Named? = none")
     body.append("    var sum = 0")
     body.append("    func_mix")
     lines = g.statements(3, 1)
     body += lines
     body.append('    print(f"{sum} {a} {b} {c} {d} {e} {s} {t} {flag} {o else -1} {p} {q.n} {obj.tag()} {name_of(opt)} {name_of(h.item)} {h.count}")')
     body.append("    print(nums, words, ages, seen)")
+    body.append("    print(heaviest(names), names.length, pick.label() if let pick else \"-\")" if False else "    print(heaviest(names), names.length, name_label(pick))")
     body.append("    return 0")
     text = "\n".join(header + body) + "\n"
     # `mix` reads the locals: written as a nested reading of the same names through a

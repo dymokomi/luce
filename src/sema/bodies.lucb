@@ -296,6 +296,7 @@ func check_place(c: check.Checker*, place: ast.Node*) -> u32!:
             c.mark_used(place.text)
             place.type_id = b.type_id
             place.resolved = b.decl
+            try note_capture(c, b)
             return b.type_id
         .member:
             let receiver = place.left else return try c.fail(place, "no receiver")
@@ -680,12 +681,29 @@ pub func coerce(c: check.Checker*, e: ast.Node*, got: u32, target: u32) -> u32!:
         return try c.mismatch(e, target, got)
     if t.kind == types.Kind.interface_:
         if conforms(c, got, target):
-            e.type_id = got
+            try convert(e, got, target)
             return target
         return try c.fail(e, try c.with_type("this value does not conform to `", target, "`"))
     if t.kind == types.Kind.optional and c.table.kind(t.elem) == types.Kind.interface_ and conforms(c, got, t.elem):
+        try convert(e, got, target)
         return target
     return try c.mismatch(e, target, got)
+
+## The expression becomes a `convert` node over a copy of itself: an interface value made
+## of a conforming one (§13.2). The emitter boxes it; the interpreter, whose values know
+## their type, passes it through.
+func convert(e: ast.Node*, got: u32, target: u32) -> !:
+    let inner = try ast.Node.make(e.kind, e.text, e.start, e.line)
+    *inner = *e
+    inner.next = none
+    inner.type_id = got
+    e.kind = ast.Kind.convert
+    e.left = inner
+    e.right = none
+    e.body = none
+    e.ty = none
+    e.resolved = none
+    e.type_id = target
 
 ## Whether a type declares conformance to an interface (§13.1).
 pub func conforms(c: check.Checker*, id: u32, iface: u32) -> bool:
@@ -713,10 +731,13 @@ func expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
             c.self_receiver = false
             if c.in_deinit and not as_receiver:
                 return try c.fail(e, "`deinit` does not publish `self`; it reads and calls its own members (§10.3)")
+            if let b = c.lookup("self"):
+                try note_capture(c, b)
             return c.self_type
         .group:
             let inner = e.left else return try c.fail(e, "empty group")
             return try check_expr(c, inner, hint)
+        .convert: return e.type_id
         .unary: return try unary_type(c, e, hint)
         .binary: return try binary_type(c, e, hint)
         .conditional:
@@ -750,7 +771,7 @@ func expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         .set_lit: return try set_literal_type(c, e, hint)
         .map_lit: return try map_literal_type(c, e, hint)
         .map_entry: return try c.fail(e, "an entry belongs in a map literal")
-        .lambda: return try c.fail(e, "closures arrive with the closures slice")
+        .lambda: return try lambda_type(c, e, hint)
         .else_: return try else_type(c, e, hint)
         .catch_: return try catch_type(c, e, hint)
         .case_value: return try case_type(c, e, hint)
@@ -798,6 +819,7 @@ func name_type(c: check.Checker*, e: ast.Node*) -> u32!:
     if let b = c.lookup(e.text):
         c.mark_used(e.text)
         e.resolved = b.decl
+        try note_capture(c, b)
         return b.type_id
     if let d = c.find_declaration(e.text):
         e.resolved = d
@@ -807,6 +829,118 @@ func name_type(c: check.Checker*, e: ast.Node*) -> u32!:
     if e.text == "print" or e.text == "assert" or e.text == "trap" or e.text == "error" or e.text == "discard" or e.text == "int" or e.text == "float" or e.text == "str" or e.text == "bool" or e.text == "ErrorCode":
         return try c.fail(e, try c.named("", e.text, " is called, not read"))
     return try c.fail(e, try c.named("unknown name ", e.text, ""))
+
+## A name read inside a lambda but bound outside it is captured by that lambda and by
+## every lambda between (§7.4): each records the declaration once; a `var` captured is
+## flagged, since it becomes a cell.
+func note_capture(c: check.Checker*, b: check.Binding) -> !:
+    let decl = b.decl else return
+    var i = c.lambdas.count
+    while i > 0:
+        i -= 1
+        if b.depth > c.lambda_bases.get(i):
+            return
+        let lambda = c.lambdas.get(i)
+        var seen = false
+        var cursor = lambda.left
+        while let capture = cursor:
+            if capture.resolved == decl:
+                seen = true
+            cursor = capture.next
+        if not seen:
+            let capture = try ast.Node.make(ast.Kind.name, b.name, lambda.start, lambda.line)
+            capture.resolved = decl
+            capture.type_id = b.type_id
+            if b.mutable:
+                capture.flags |= ast.flag_var_field
+                decl.flags |= ast.flag_captured
+            var tail = lambda.left
+            if let first = tail:
+                var last = first
+                while let n = last.next:
+                    last = n
+                last.next = capture
+            else:
+                lambda.left = capture
+
+## `(params) => e` takes its parameter types from the function type expected of it;
+## `func (params) -> R:` writes everything. Either is a closure over what it reads.
+func lambda_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let expected = c.table.get(hint)
+    let from_context = expected.kind == types.Kind.func_
+    let block = e.has(ast.flag_block_lambda)
+    if from_context and ast.count(e.right) != expected.args.length:
+        return try c.fail(e, try c.with_type("the lambda is used as a `", hint, "`, which takes another number of parameters"))
+    var params = try alloc u32[ast.count(e.right)]
+    var i: usize = 0
+    var cursor = e.right
+    while let p = cursor:
+        if let t = p.ty:
+            p.type_id = try c.resolve_type(t)
+            if from_context and i < expected.args.length and p.type_id != expected.args[i]:
+                return try c.fail(p, try c.with_type("this parameter is a `", expected.args[i], "` where the lambda is used"))
+        elif from_context and i < expected.args.length:
+            p.type_id = expected.args[i]
+        elif p.type_id != types.none_id:
+            discard(0)   # checked before, from a context that gave the type
+        else:
+            return try c.fail(p, "a parameter's type is written here, or comes from the function type the lambda is used as")
+        params[i] = p.type_id
+        i += 1
+        cursor = p.next
+    if from_context and i != expected.args.length:
+        return try c.fail(e, try c.with_type("the lambda is used as a `", hint, "`, which takes another number of parameters"))
+    var result = types.unit_id
+    if block:
+        if let t = e.ty:
+            result = try c.resolve_type(t)
+    elif from_context and expected.elem != types.none_id:
+        result = expected.elem
+    # the body: a fresh function context over the enclosing one, the outer names visible
+    # but captured (RUNTIME)
+    let saved_result = c.result_type
+    let saved_fallible = c.fallible
+    let saved_loops = c.loop_depth
+    let saved_labels = c.label_count
+    let saved_func = c.current_func
+    var bare = result
+    c.fallible = false
+    if c.table.kind(result) == types.Kind.fallible:
+        c.fallible = true
+        bare = c.table.get(result).elem
+    c.result_type = bare
+    c.loop_depth = 0
+    c.label_count = 0
+    c.current_func = e
+    try c.lambdas.push(e)
+    try c.lambda_bases.push(c.depth)
+    c.push_scope()
+    cursor = e.right
+    while let p = cursor:
+        try c.bind(p, p.text, p.type_id, p, false)
+        cursor = p.next
+    let body = e.body else return try c.fail(e, "a lambda needs a body")
+    if block:
+        let exits = try check_block(c, body)
+        if bare != types.unit_id and not exits:
+            return try c.fail(e, "not every path returns a value (§7.1)")
+    else:
+        if from_context and expected.elem != types.none_id:
+            let got = try expect(c, body, bare)
+            discard(got)
+        else:
+            result = try check_expr(c, body, types.none_id)
+            if result == types.untyped_none_id:
+                return try c.fail(body, "a lambda's `none` needs the function type from the context")
+    c.pop_scope()
+    c.lambdas.count -= 1
+    c.lambda_bases.count -= 1
+    c.result_type = saved_result
+    c.fallible = saved_fallible
+    c.loop_depth = saved_loops
+    c.label_count = saved_labels
+    c.current_func = saved_func
+    return try c.table.function(params, result)
 
 func unary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let inner = e.left else return try c.fail(e, "missing operand")
@@ -862,6 +996,9 @@ func binary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         else:
             t = try unify(c, l, lt, r, rt)
         if op == "==" or op == "!=":
+            if is_none(l) or is_none(r):
+                # a presence test, which every optional has (§12.1)
+                return types.bool_id
             if c.table.kind(t) == types.Kind.class_:
                 if not conforms(c, t, try equatable_interface(c)):
                     return try c.fail(e, "a class has identity, not equality: compare with `is`, or declare `Equatable` (§4.4)")
@@ -1166,9 +1303,39 @@ func text_method_type(c: check.Checker*, e: ast.Node*, callee: ast.Node*, t: u32
     return try c.fail(callee, try c.named("a `str` has no ", name, "; its operations are those of §11.3"))
 
 ## Whether a value of the type may key a map or sit in a set (§4.4, §11.2): equatable, and
-## its hash consistent with its equality.
+## its hash consistent with its equality, so a type that declares `Equatable` declares
+## `Hashable` beside it, and a class hashes only as declared (§13.3).
 pub func hashable(c: check.Checker*, id: u32) -> bool:
-    return equatable(c, id)
+    if not equatable(c, id):
+        return false
+    let t = c.table.get(id)
+    match t.kind:
+        .optional: return hashable(c, t.elem)
+        .tuple:
+            for m in t.args:
+                if not hashable(c, m):
+                    return false
+            return true
+        .list_, .set_: return hashable(c, t.elem)
+        .map_: return hashable(c, t.elem) and hashable(c, c.table.map_value(id))
+        .class_: return conforms(c, id, hashable_interface(c) catch failure: recover types.none_id)
+        .struct_, .enum_:
+            if conforms(c, id, equatable_interface(c) catch failure: recover types.none_id):
+                return conforms(c, id, hashable_interface(c) catch failure: recover types.none_id)
+            let d = t.decl else return false
+            var cursor = d.body
+            while let m = cursor:
+                if m.kind == ast.Kind.field and not hashable(c, m.type_id):
+                    return false
+                if m.kind == ast.Kind.enum_case:
+                    var p = m.body
+                    while let field = p:
+                        if not hashable(c, field.type_id):
+                            return false
+                        p = field.next
+                cursor = m.next
+            return true
+        _: return true
 
 ## `values.method(args)` for a list (§11.1): the call is marked builtin and typed here.
 func list_method_type(c: check.Checker*, e: ast.Node*, callee: ast.Node*, lt: u32) -> u32!:
@@ -1221,7 +1388,12 @@ func list_method_type(c: check.Checker*, e: ast.Node*, callee: ast.Node*, lt: u3
             return try c.fail(e, try c.named("`", name, "(f)` takes one function"))
         let first = e.body else return try c.fail(e, "no argument")
         let f = first.left else return try c.fail(e, "no argument")
-        let ft = try check_expr(c, f, types.none_id)
+        # a lambda written here takes the element as its parameter; `map`'s result comes
+        # from the lambda's body, so its hint leaves the result open
+        var one = try alloc u32[1]
+        one[0] = elem
+        let hint = try c.table.function(one, types.bool_id if name == "filter" else types.none_id)
+        let ft = try check_expr(c, f, hint)
         let t = c.table.get(ft)
         if t.kind != types.Kind.func_ or t.args.length != 1 or t.args[0] != elem:
             return try c.fail(f, try c.with_type("`", lt, "`'s `map` and `filter` take a function of one element"))
@@ -1347,13 +1519,16 @@ func call_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     if t.kind == types.Kind.type_name:
         return try construction_type(c, e, callee, t)
     if t.kind == types.Kind.func_:
-        if let d = callee.resolved:
-            if d.kind == ast.Kind.func_:
-                e.resolved = d
-                if check.has_self(d):
-                    try check_receiver(c, e, callee, d)
-                try check_arguments(c, e, e.body, d.right, true)
-                return t.elem
+        # a name or a member naming a function is called directly; anything else, a call
+        # returning a function among them, is a value called through its type
+        if callee.kind == ast.Kind.name or callee.kind == ast.Kind.member:
+            if let d = callee.resolved:
+                if d.kind == ast.Kind.func_:
+                    e.resolved = d
+                    if check.has_self(d):
+                        try check_receiver(c, e, callee, d)
+                    try check_arguments(c, e, e.body, d.right, true)
+                    return t.elem
         # a function value: positional arguments only
         var n: usize = 0
         var cursor = e.body
@@ -1545,6 +1720,8 @@ func core_call(c: check.Checker*, e: ast.Node*, name: str) -> u32!:
         let v = first.left else return try c.fail(e, "no value")
         let t = try check_expr(c, v, types.none_id)
         if not hashable(c, t):
+            if equatable(c, t):
+                return try c.fail(v, try c.with_type("a `", t, "` has no hash: its `Equatable` needs `Hashable` beside it (§13.3)"))
             return try c.fail(v, try c.with_type("a `", t, "` has no hash; it has no `==` (§4.4)"))
         return types.int_id
     if name == "Weak":
@@ -1705,6 +1882,10 @@ pub func displayable(c: check.Checker*, id: u32) -> bool:
         _: return false
 
 ## Structural equality (§4.4).
+## Whether the expression is the literal `none`.
+func is_none(e: ast.Node*) -> bool:
+    return e.kind == ast.Kind.literal and e.text == "none"
+
 pub func equatable(c: check.Checker*, id: u32) -> bool:
     let t = c.table.get(id)
     match t.kind:
@@ -1746,6 +1927,9 @@ pub func orderable(c: check.Checker*, id: u32) -> bool:
             return true
         .struct_, .class_, .enum_: return conforms(c, id, ordered_interface(c) catch failure: recover types.none_id)
         _: return false
+
+pub func hashable_interface(c: check.Checker*) -> u32!:
+    return try closed_interface(c, "Hashable")
 
 ## The closed protocols a program may declare (§13.3): looked up by name in the module.
 func closed_interface(c: check.Checker*, name: str) -> u32!:

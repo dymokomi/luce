@@ -73,7 +73,7 @@ pub struct Interp:
     ## After `main`, the collector runs and what is still alive is reported (RUNTIME).
     pub mutating func run_main(arguments: str[]) -> i64!:
         let main = self.checker.find_declaration("main") else error(fault, "no main")
-        let store = try heap.allocate_collection()
+        let store = try heap.allocate_collection(types.str_id, types.none_id)
         for a in arguments:
             try heap.push(store, value.text(a))
         let args = value.collection(value.Kind.list_, store)
@@ -96,6 +96,8 @@ pub struct Interp:
     ## flow is kept aside, since destruction may happen while a `return` is in flight.
     mutating func run_deinit(o: value.Object*) -> !:
         let owner = o.decl else return
+        if owner.kind != ast.Kind.class_:
+            return
         let d = self.checker.find_member(owner, "deinit") else return
         let flow = self.flow
         let label = self.label
@@ -117,10 +119,16 @@ pub struct Interp:
     mutating func pop_frame():
         self.pop_to(self.base)
 
-    ## An owned value, bound: the cell holds the one reference.
+    ## An owned value, bound: the cell holds the one reference. A `var` some closure
+    ## captures is bound to a cell object instead, which the closures share (§7.4).
     mutating func bind(decl: ast.Node*, v: value.Value) -> !:
         let cell = try new value.Value
-        *cell = v
+        if decl.has(ast.flag_captured):
+            let o = try heap.allocate(decl, 1)
+            o.fields[0] = v
+            *cell = value.cell(o)
+        else:
+            *cell = v
         try self.slots.push(Slot(decl = decl, cell = cell, owned = true))
 
     ## A parameter: it borrows what the caller holds for the length of the call.
@@ -142,6 +150,14 @@ pub struct Interp:
         self.slots.count = mark
 
     func cell_of(decl: ast.Node*) -> value.Value*!:
+        let slot = try self.slot_of(decl)
+        if slot.kind == value.Kind.cell_:
+            let o = slot.obj else error(fault, "an empty cell")
+            return &o.fields[0]
+        return slot
+
+    ## The slot itself, a cell object when the binding is a captured `var`.
+    func slot_of(decl: ast.Node*) -> value.Value*!:
         var i = self.slots.count
         while i > self.base:
             i -= 1
@@ -172,8 +188,20 @@ pub struct Interp:
                 try self.bind_borrowed(p, args[i])
                 i += 1
             cursor = p.next
+        # a lambda's captures: each outer name bound to what the closure holds, a `let`
+        # as the copy it took, a `var` as the shared cell (§7.4)
+        if f.kind == ast.Kind.lambda:
+            let env = receiver else error(fault, "a closure without its environment")
+            let o = env.obj else error(fault, "a closure without its environment")
+            var k: usize = 0
+            var capture = f.left
+            while let cap = capture:
+                let decl = cap.resolved else error(fault, "an unresolved capture")
+                try self.slots.push(Slot(decl = decl, cell = &o.fields[k], owned = false))
+                k += 1
+                capture = cap.next
         # a failure leaving the body restores the caller's frame before it travels on
-        self.block(body) catch failure:
+        self.run_body(f, body) catch failure:
             self.flow = Flow.normal
             let pending = self.pending
             self.pop_to(saved_count)
@@ -190,6 +218,16 @@ pub struct Interp:
         self.base = saved_base
         self.depth -= 1
         return result
+
+    ## A function's suite, or an expression lambda's expression as its returned value.
+    mutating func run_body(f: ast.Node*, body: ast.Node*) -> !:
+        if f.kind == ast.Kind.lambda and not f.has(ast.flag_block_lambda):
+            let mark = heap.mark()
+            self.carried = try self.eval_owned(body)
+            heap.drain(mark)
+            self.flow = Flow.returned
+            return
+        try self.block(body)
 
     ## The arguments of a call in parameter order, defaults filled in, on the heap; each
     ## is borrowed for the call, a temporary among them pooled until the statement ends.
@@ -670,6 +708,10 @@ pub struct Interp:
             .group:
                 let inner = e.left else error(fault, "empty group")
                 return try self.evaluate(inner)
+            .convert:
+                # the value knows its type; the interface adds nothing here (§13.2)
+                let inner = e.left else error(fault, "no value")
+                return try self.evaluate(inner)
             .unary:
                 let inner = e.left else error(fault, "no operand")
                 if e.text == "try":
@@ -693,22 +735,38 @@ pub struct Interp:
                     cursor = m.next
                 return (t, true)
             .unit_: return (value.nothing(), true)
+            .lambda:
+                # the closure: an object holding a copy of every captured `let` and the
+                # cell of every captured `var`
+                let o = try heap.allocate(e, ast.count(e.left))
+                var k: usize = 0
+                var capture = e.left
+                while let cap = capture:
+                    let decl = cap.resolved else error(fault, "an unresolved capture")
+                    if cap.has(ast.flag_var_field):
+                        let slot = try self.slot_of(decl)
+                        o.fields[k] = try heap.copy(*slot)
+                    else:
+                        o.fields[k] = try heap.copy(*(try self.cell_of(decl)))
+                    k += 1
+                    capture = cap.next
+                return (value.closure(e, o), true)
             .list_lit:
-                let store = try heap.allocate_collection()
+                let store = try heap.allocate_collection(self.checker.table.get(e.type_id).elem, types.none_id)
                 var cursor = e.body
                 while let item = cursor:
                     try heap.push(store, try self.eval_owned(item))
                     cursor = item.next
                 return (value.collection(value.Kind.list_, store), true)
             .set_lit:
-                let store = try heap.allocate_collection()
+                let store = try heap.allocate_collection(self.checker.table.get(e.type_id).elem, types.none_id)
                 var cursor = e.body
                 while let item = cursor:
                     try heap.set_insert(store, try self.eval_owned(item))
                     cursor = item.next
                 return (value.collection(value.Kind.set_, store), true)
             .map_lit:
-                let store = try heap.allocate_collection()
+                let store = try heap.allocate_collection(self.checker.table.get(e.type_id).elem, self.checker.table.map_value(e.type_id))
                 var cursor = e.body
                 while let entry = cursor:
                     let k = entry.left else error(fault, "no key")
@@ -729,9 +787,9 @@ pub struct Interp:
                     let i = try checked_index(index.i, container.b.length)
                     return (value.integer((i64)container.b[i]), true)
                 if container.kind == value.Kind.map_:
-                    let items = value.elements(container)
-                    let at = value.find_in(items, index, 2) else return (value.absent(), true)
-                    return (try heap.copy(items[at + 1]), true)
+                    let store = container.obj else error(fault, "no map")
+                    let at = heap.map_find(store, index) else return (value.absent(), true)
+                    return (try heap.copy(store.fields[at + 1]), true)
                 let items = value.elements(container)
                 let i = try checked_index(index.i, items.length)
                 return (try heap.copy(items[i]), true)
@@ -756,7 +814,7 @@ pub struct Interp:
                         try b.put(try unescape_format(part.text))
                     else:
                         let v = part.left else error(fault, "empty field")
-                        try value.display(&b, try self.eval(v))
+                        try self.show_value(&b, v.type_id, try self.eval(v))
                     cursor = part.next
                 let out = try strings.copy(b.view())
                 b.destroy()
@@ -828,17 +886,17 @@ pub struct Interp:
         if op == "..<" or op == "..=":
             return value.range(a.i, b.i, op == "..=")
         if op == "==":
-            return value.boolean(value.equal(a, b))
+            return value.boolean(try self.equal_value(l.type_id, a, b))
         if op == "!=":
-            return value.boolean(not value.equal(a, b))
+            return value.boolean(not try self.equal_value(l.type_id, a, b))
         if op == "<":
-            return value.boolean(value.compare(a, b) < 0)
+            return value.boolean(try self.compare_value(l.type_id, a, b) < 0)
         if op == "<=":
-            return value.boolean(value.compare(a, b) <= 0)
+            return value.boolean(try self.compare_value(l.type_id, a, b) <= 0)
         if op == ">":
-            return value.boolean(value.compare(a, b) > 0)
+            return value.boolean(try self.compare_value(l.type_id, a, b) > 0)
         if op == ">=":
-            return value.boolean(value.compare(a, b) >= 0)
+            return value.boolean(try self.compare_value(l.type_id, a, b) >= 0)
         if op == "in":
             match b.kind:
                 .text: return value.boolean(strings.contains(b.s, a.s))
@@ -847,13 +905,14 @@ pub struct Interp:
                     let store = b.obj else error(fault, "no collection")
                     return value.boolean(heap.find(store, a) != none)
                 .map_:
-                    return value.boolean(value.find_in(value.elements(b), a, 2) != none)
+                    let store = b.obj else error(fault, "no map")
+                    return value.boolean(heap.map_find(store, a) != none)
                 _: error(fault, "`in` over this value")
         if a.kind == value.Kind.list_:
             # `a + b`: a new list of both
             let x = value.elements(a)
             let y = value.elements(b)
-            let store = try heap.allocate_collection()
+            let store = try heap.allocate_collection(self.checker.table.get(l.type_id).elem, types.none_id)
             for item in x:
                 try heap.push(store, try heap.copy(item))
             for item in y:
@@ -970,11 +1029,10 @@ pub struct Interp:
                 return (try heap.copy(o.fields[index]), true)
             return (try heap.copy(v.items[index]), true)
         if m.kind == ast.Kind.func_:
-            # a method bound to its receiver: the value is kept beside the function
-            var bound = value.function(m)
-            bound.items = try alloc value.Value[1]
-            bound.items[0] = try heap.copy(v)
-            return (bound, true)
+            # a method bound to its receiver: an object holding the receiver
+            let env = try heap.allocate(m, 1)
+            env.fields[0] = try heap.copy(v)
+            return (value.closure(m, env), true)
         error(fault, "an unknown member")
 
     mutating func call_expr(e: ast.Node*) -> value.Value!:
@@ -1009,13 +1067,17 @@ pub struct Interp:
                         let receiver = callee.left else error(fault, "no receiver")
                         let cell = try self.receiver_cell(receiver)
                         let args = try self.arguments(e, d.right, true)
-                        return try self.call(d, cell, args)
+                        # a method of an interface dispatches to the value's own (§13.2)
+                        var target = d
+                        if d.body == none:
+                            let owner = cell.decl else error(fault, "an interface value without a declaration")
+                            target = self.checker.find_member(owner, d.text) else error(fault, "a conformance without the method")
+                        return try self.call(target, cell, args)
                     let args = try self.arguments(e, d.right, true)
                     return try self.call(d, none, args)
                 _: discard(0)
         # a function value
         let f = try self.eval(callee)
-        let d = f.decl else error(fault, "not a function")
         var n: usize = 0
         var cursor = e.body
         while cursor != none:
@@ -1029,9 +1091,20 @@ pub struct Interp:
             args[i] = try self.eval(v)
             i += 1
             cursor = a.next
-        if f.items.length > 0:
-            return try self.call(d, &f.items[0], args[..<n])
-        return try self.call(d, none, args[..<n])
+        return try self.call_value(f, args[..<n])
+
+    ## A function value called: a named function, a closure over its environment, or a
+    ## method over the receiver it was bound to.
+    mutating func call_value(f: value.Value, args: value.Value[]) -> value.Value!:
+        let d = f.decl else error(fault, "not a function")
+        if d.kind == ast.Kind.lambda:
+            let cell = try new value.Value
+            *cell = f
+            return try self.call(d, cell, args)
+        if let env = f.obj:
+            # a bound method: the receiver is the environment's one field
+            return try self.call(d, &env.fields[0], args)
+        return try self.call(d, none, args)
 
     ## A list's own method (§11.1), the same operation as the kernel's.
     mutating func list_method(e: ast.Node*, callee: ast.Node*) -> value.Value!:
@@ -1098,13 +1171,12 @@ pub struct Interp:
             return value.text(out)
         if name == "map" or name == "filter":
             let f = args[0]
-            let d = f.decl else error(fault, "not a function")
-            let out = try heap.allocate_collection()
+            let out = try heap.allocate_collection(self.checker.table.get(e.type_id).elem, types.none_id)
             var i: usize = 0
             while i < store.count:
                 var one = try alloc value.Value[1]
                 one[0] = store.fields[i]
-                let r = try self.call(d, &f.items[0] if f.items.length > 0 else none, one)
+                let r = try self.call_value(f, one)
                 if name == "map":
                     try heap.push(out, r)
                 elif value.truth(r):
@@ -1133,7 +1205,7 @@ pub struct Interp:
             if name == "remove":
                 let out = heap.map_remove(store, arg) else return value.absent()
                 return out
-            let out = try heap.allocate_collection()
+            let out = try heap.allocate_collection(self.checker.table.get(e.type_id).elem, types.none_id)
             var i: usize = 0
             while i < store.count:
                 if name == "keys":
@@ -1154,7 +1226,7 @@ pub struct Interp:
             return value.boolean(heap.set_remove(store, arg))
         # union, intersection, difference: a new set
         let other = arg.obj else error(fault, "no set")
-        let out = try heap.allocate_collection()
+        let out = try heap.allocate_collection(store.elem, types.none_id)
         var i: usize = 0
         if name == "union":
             while i < store.count:
@@ -1205,7 +1277,7 @@ pub struct Interp:
             let separator = args[0].s
             if separator.length == 0:
                 trap("split needs a separator")
-            let out = try heap.allocate_collection()
+            let out = try heap.allocate_collection(types.str_id, types.none_id)
             var start: usize = 0
             while true:
                 let at = find_bytes(text.bytes, separator.bytes, start) else break
@@ -1214,7 +1286,7 @@ pub struct Interp:
             try heap.push(out, value.text(try strings.copy((str)text.bytes[start..])))
             return value.collection(value.Kind.list_, out)
         if name == "lines":
-            let out = try heap.allocate_collection()
+            let out = try heap.allocate_collection(types.str_id, types.none_id)
             let b = text.bytes
             var start: usize = 0
             var i: usize = 0
@@ -1280,9 +1352,193 @@ pub struct Interp:
             return value.blob(text.bytes)
         error(fault, "an unknown text method")
 
+    ## The method a type declares for a closed protocol (§13.3), if it declares one.
+    func protocol_method(t: u32, protocol: str, method: str) -> ast.Node*?:
+        let ty = self.checker.table.get(t)
+        if ty.kind != types.Kind.struct_ and ty.kind != types.Kind.class_ and ty.kind != types.Kind.enum_:
+            return none
+        let d = ty.decl else return none
+        let iface = self.checker.find_declaration(protocol) else return none
+        var cursor = d.right
+        while let conformance = cursor:
+            if conformance.type_id == iface.type_id:
+                return self.checker.find_member(d, method)
+            cursor = conformance.next
+        return none
+
+    ## `a == b` by the type: a declared `equals`, else by structure (§4.4).
+    mutating func equal_value(t: u32, a: value.Value, b: value.Value) -> bool!:
+        if let m = self.protocol_method(t, "Equatable", "equals"):
+            let cell = try new value.Value
+            *cell = a
+            var one = try alloc value.Value[1]
+            one[0] = b
+            return value.truth(try self.call(m, cell, one))
+        let ty = self.checker.table.get(t)
+        match ty.kind:
+            .optional:
+                if a.kind == value.Kind.absent or b.kind == value.Kind.absent:
+                    return a.kind == b.kind
+                return try self.equal_value(ty.elem, a, b)
+            .tuple:
+                var i: usize = 0
+                while i < ty.args.length:
+                    if not try self.equal_value(ty.args[i], a.items[i], b.items[i]):
+                        return false
+                    i += 1
+                return true
+            .struct_:
+                let d = ty.decl else return false
+                var i: usize = 0
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.field:
+                        if not try self.equal_value(m.type_id, a.items[i], b.items[i]):
+                            return false
+                        i += 1
+                    cursor = m.next
+                return true
+            .enum_:
+                if a.case_node != b.case_node:
+                    return false
+                let case_node = a.case_node else return true
+                var i: usize = 0
+                var cursor = case_node.body
+                while let field = cursor:
+                    if not try self.equal_value(field.type_id, a.items[i], b.items[i]):
+                        return false
+                    i += 1
+                    cursor = field.next
+                return true
+            .list_:
+                let x = value.elements(a)
+                let y = value.elements(b)
+                if x.length != y.length:
+                    return false
+                var i: usize = 0
+                while i < x.length:
+                    if not try self.equal_value(ty.elem, x[i], y[i]):
+                        return false
+                    i += 1
+                return true
+            _: return value.equal(a, b)
+
+    ## `a < b` by the type: a declared `compare`, else the structural order (§4.4).
+    mutating func compare_value(t: u32, a: value.Value, b: value.Value) -> i64!:
+        if let m = self.protocol_method(t, "Ordered", "compare"):
+            let cell = try new value.Value
+            *cell = a
+            var one = try alloc value.Value[1]
+            one[0] = b
+            return (try self.call(m, cell, one)).i
+        let ty = self.checker.table.get(t)
+        if ty.kind == types.Kind.tuple:
+            var i: usize = 0
+            while i < ty.args.length:
+                let order = try self.compare_value(ty.args[i], a.items[i], b.items[i])
+                if order != 0:
+                    return order
+                i += 1
+            return 0
+        return value.compare(a, b)
+
+    ## The display of a value by its type: a declared `display`, else by structure (§10.5).
+    mutating func show_value(out: strings.Builder*, t: u32, v: value.Value) -> !:
+        if let m = self.protocol_method(t, "Display", "display"):
+            let cell = try new value.Value
+            *cell = v
+            let shown = try self.call(m, cell, try alloc value.Value[0])
+            try out.put(shown.s)
+            return
+        let ty = self.checker.table.get(t)
+        match ty.kind:
+            .optional:
+                if v.kind == value.Kind.absent:
+                    try out.put("none")
+                else:
+                    try self.show_value(out, ty.elem, v)
+            .tuple:
+                try out.put("(")
+                var i: usize = 0
+                while i < ty.args.length:
+                    if i > 0:
+                        try out.put(", ")
+                    try self.show_value(out, ty.args[i], v.items[i])
+                    i += 1
+                if ty.args.length == 1:
+                    try out.put(",")
+                try out.put(")")
+            .struct_:
+                let d = ty.decl else return
+                try out.put(d.text)
+                try out.put("(")
+                var i: usize = 0
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.field:
+                        if i > 0:
+                            try out.put(", ")
+                        try out.put(m.text)
+                        try out.put(" = ")
+                        try self.show_value(out, m.type_id, v.items[i])
+                        i += 1
+                    cursor = m.next
+                try out.put(")")
+            .enum_:
+                let d = ty.decl else return
+                let case_node = v.case_node else return
+                try out.put(d.text)
+                try out.put(".")
+                try out.put(case_node.text)
+                if v.items.length > 0:
+                    try out.put("(")
+                    var i: usize = 0
+                    var cursor = case_node.body
+                    while let field = cursor:
+                        if i > 0:
+                            try out.put(", ")
+                        try out.put(field.text)
+                        try out.put(" = ")
+                        try self.show_value(out, field.type_id, v.items[i])
+                        i += 1
+                        cursor = field.next
+                    try out.put(")")
+            .list_, .set_:
+                try out.put("[" if ty.kind == types.Kind.list_ else "{")
+                let items = value.elements(v)
+                var i: usize = 0
+                while i < items.length:
+                    if i > 0:
+                        try out.put(", ")
+                    try self.show_value(out, ty.elem, items[i])
+                    i += 1
+                try out.put("]" if ty.kind == types.Kind.list_ else "}")
+            .map_:
+                try out.put("{")
+                let items = value.elements(v)
+                var i: usize = 0
+                while i < items.length:
+                    if i > 0:
+                        try out.put(", ")
+                    try self.show_value(out, ty.elem, items[i])
+                    try out.put(": ")
+                    try self.show_value(out, self.checker.table.map_value(t), items[i + 1])
+                    i += 2
+                try out.put("}")
+            _: try value.display(out, v)
+
     ## `hash(x)` (§4.4): FNV-1a over the value's canonical bytes, walked with its static
-    ## type, the same number the runtime computes.
+    ## type, the same number the runtime computes; a declared `hashed` stands in.
     mutating func hash_value(h: u64, t: u32, v: value.Value) -> u64:
+        if let m = self.protocol_method(t, "Hashable", "hashed"):
+            let cell = new value.Value catch failure:
+                trap("out of memory")
+            *cell = v
+            let one = alloc value.Value[0] catch failure:
+                trap("out of memory")
+            let hashed = self.call(m, cell, one) catch failure:
+                trap("`hashed` failed")
+            return hash_int(h, hashed.i)
         let ty = self.checker.table.get(t)
         match ty.kind:
             .int_: return hash_int(h, v.i)
@@ -1452,7 +1708,7 @@ pub struct Interp:
                 if not first:
                     try b.put(" ")
                 first = false
-                try value.display(&b, try self.eval(v))
+                try self.show_value(&b, v.type_id, try self.eval(v))
                 cursor = a.next
             try b.put("\n")
             discard(try self.out.write(b.view().bytes))
@@ -1508,7 +1764,11 @@ pub struct Interp:
                 return value.boolean(false)
             return try self.raise(0, "not a boolean")
         if name == "str":
-            return value.text(try value.shown(v))
+            var b = try strings.Builder.create(64)
+            try self.show_value(&b, arg.type_id, v)
+            let out = try strings.copy(b.view())
+            b.destroy()
+            return value.text(out)
         error(fault, "an unknown core function")
 
     ## A Luce failure: the `Error` kept aside, the Base failure carrying the message.
@@ -1528,10 +1788,24 @@ func finish_object(context: void*, o: value.Object*):
     me.run_deinit(o) catch failure:
         trap("`deinit` failed")
 
+## The heap's hook for equality by type: a declared `equals` counts in a collection too.
+func equal_by_type(context: void*, t: u32, a: value.Value, b: value.Value) -> bool:
+    let me = (Interp*)context
+    return me.equal_value(t, a, b) catch failure:
+        trap("`equals` failed")
+
+## The heap's hook for ordering by type: a declared `compare` sorts a list too.
+func compare_by_type(context: void*, t: u32, a: value.Value, b: value.Value) -> i64:
+    let me = (Interp*)context
+    return me.compare_value(t, a, b) catch failure:
+        trap("`compare` failed")
+
 ## Installs the interpreter behind the heap; `me` must outlive every run.
 pub func attach(me: Interp*):
     heap.finisher = finish_object
     heap.finisher_context = (void*)me
+    heap.equal_hook = equal_by_type
+    heap.compare_hook = compare_by_type
 
 # mark: Helpers ================================================================================
 
