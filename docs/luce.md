@@ -107,7 +107,7 @@ The core names are reserved everywhere and cannot be declared at any level: `ass
 
 ```text
 and as break catch class continue elif else enum false for from func if import in
-interface let match none not or pub recover return self spawn struct test true try
+interface is let match none not or pub recover return self spawn struct test true try
 type var wait while with
 ```
 
@@ -322,8 +322,9 @@ and `a..=b` are values of type `range` that iterate `int`s.
 
 ### 6.7 Precedence
 
-From tightest: member, call, index; unary `-`, `not`; `**`; `* / // %`; `+ -`; `..<` `..=`;
-`in`, comparisons; `and`; `or`; `if`-`else`; `=>`; assignment.
+From tightest: member, call, index; unary `-`; `**`; `* / // %`; `+ -`; `..<` `..=`; `in`,
+`is`, `is not`, comparisons; `not`; `and`; `or`; `if`-`else`; `=>`; assignment. `not` sits
+below the comparisons so that `not a == b` negates the comparison, as in Python.
 
 ## 7. Functions
 
@@ -945,7 +946,7 @@ expression  = lambda | conditional
 lambda      = "(" [params] ")" "=>" expression | "func" "(" [params] ")" ["->" type] ":" suite
 conditional = or ["if" or "else" expression]
 or          = and {"or" and}             and = not {"and" not}       not = "not" not | compare
-compare     = range [("==" | "!=" | "<" | "<=" | ">" | ">=" | "in") range]
+compare     = range [("==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "is" | "is" "not") range]
 range       = add [("..<" | "..=") add]
 add         = mul {("+" | "-") mul}       mul = unary {("*" | "/" | "//" | "%") unary}
 unary       = "-" unary | power           power = postfix ["**" unary]

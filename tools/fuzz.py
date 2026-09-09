@@ -209,7 +209,8 @@ class Gen:
             elif k == 2:
                 lines.append(f"{pad}{r.choice(['d', 'e'])} = {self.expr(2, 'float')}")
             elif k == 3:
-                lines.append(f"{pad}{r.choice(['s', 't'])} = {self.expr(2, 'str')}")
+                # `short` keeps a text bounded: `s = s + s` in nested loops grows without limit
+                lines.append(f"{pad}{r.choice(['s', 't'])} = short({self.expr(2, 'str')})")
             elif k == 4:
                 lines.append(f"{pad}flag = {self.expr(2, 'bool')}")
             elif k == 5:
@@ -229,13 +230,15 @@ class Gen:
                 lines.append(f"{pad}{r.choice(['a', 'b', 'c'])} = risky({self.expr(2)}) catch failure:")
                 lines.append(f"{pad}    recover {self.expr(2)} + (1 if failure.code == bad else 0)")
             elif k == 9 and depth > 0:
+                # bindings carry the nesting number: a nested arm cannot rebind `radius` (§2.4)
+                n = self.loops; self.loops += 1
                 lines.append(f"{pad}match shape({self.expr(2)}):")
-                lines.append(f"{pad}    .circle(radius):")
-                self.locals.append(("radius", "float"))
+                lines.append(f"{pad}    .circle(radius{n}):")
+                self.locals.append((f"radius{n}", "float"))
                 lines += self.statements(depth - 1, indent + 2)
                 self.locals.pop()
-                lines.append(f"{pad}    .rect(w, h):")
-                self.locals += [("w", "int"), ("h", "int")]
+                lines.append(f"{pad}    .rect(w{n}, h{n}):")
+                self.locals += [(f"w{n}", "int"), (f"h{n}", "int")]
                 lines += self.statements(depth - 1, indent + 2)
                 self.locals.pop(); self.locals.pop()
                 lines.append(f"{pad}    .empty:")
@@ -281,6 +284,7 @@ class Gen:
                 "struct Counter:", "    var n: int", "", "    func bump(self, by: int):", "        self.n = (self.n % 4096) + by", "",
                 "enum Shape:", "    circle(radius: float)", "    rect(w: int, h: int)", "    empty", "",
                 "func shape(x: int) -> Shape:", "    match x % 4:", "        0: return Shape.empty", "        1: return Shape.circle(radius = float(x % 256))", "        _: return Shape.rect(w = x % 256, h = (x % 16) + 1)", "",
+                "func short(text: str) -> str:", "    return text if text.length < 64 else \"long\"", "",
                 "func describe(s: Shape) -> str:", "    match s:", "        .circle(radius): return f\"c{radius}\"", "        .rect(w, h): return f\"r{w}x{h}\"", "        .empty: return \"e\"", "",
                 "func len(text: str) -> int:", "    return text.length", "",
                 "func find(x: int) -> int?:", "    if (x % 4) == 0:", "        return none", "    return x % 1024", "",
