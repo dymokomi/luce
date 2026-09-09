@@ -11,13 +11,14 @@ programs=0
 rejections=0
 parsed=0
 # every program the suite holds parses, whatever slice runs it
-for f in tests/conformance/[0-9]*/*.luc; do
-    [ -e "$f" ] || continue
+for f in $(find tests/conformance -name '*.luc' -not -path '*/errors/*' | sort); do
     ./build/luce parse "$f" > /dev/null
     parsed=$((parsed + 1))
 done
+# a program is a file beside its `.expect`, or a directory of modules whose entry is
+# `main.luc` (§15), a `src/main.luc` under a manifest among them
 for dir in tests/conformance/[0-9]*/; do
-    for f in "$dir"*.expect; do
+    for f in "$dir"*.expect "$dir"*/main.expect "$dir"*/src/main.expect; do
         [ -e "$f" ] || continue
         src="${f%.expect}.luc"
         echo "== $src"
@@ -50,9 +51,10 @@ for dir in tests/conformance/[0-9]*/; do
         done
         programs=$((programs + 1))
     done
-    for f in "$dir"errors/*.luc; do
+    for f in "$dir"errors/*.luc "$dir"errors/*/main.luc; do
         [ -e "$f" ] || continue
         want=$(LC_ALL=C sed -n 's/^# error: //p' "$f")
+        [ -n "$want" ] || continue
         got=$(./build/luce check "$f" 2>&1) && rc=0 || rc=$?
         if [ "$rc" -eq 0 ]; then echo "FAIL $f: accepted"; exit 1; fi
         if [ "$rc" -ne 1 ]; then echo "FAIL $f: status $rc: [$got]"; exit 1; fi

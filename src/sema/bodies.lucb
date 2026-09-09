@@ -22,11 +22,46 @@ import support.literals
 # mark: Entry ==================================================================================
 
 ## Type every body of the module the checker holds current.
+## The bodies of every module, imports first (§15); an instance a body makes is appended
+## to its generic's module and checked in turn, until none is left.
 pub func check_module(c: check.Checker*) -> !:
-    let tree = c.tree()
     c.satisfies_hook = satisfies
+    var i: usize = 0
+    while i < c.order.count:
+        c.current = (usize)c.order.get(i)
+        try check_declarations(c, c.tree())
+        try imports_used(c)
+        i += 1
+    var progressed = true
+    while progressed:
+        progressed = false
+        i = 0
+        while i < c.order.count:
+            c.current = (usize)c.order.get(i)
+            if try check_declarations(c, c.tree()):
+                progressed = true
+            i += 1
+    c.current = (usize)c.entry
+    if not c.main_seen:
+        var has_test = false
+        var cursor = c.tree().body
+        while let d = cursor:
+            if d.kind == ast.Kind.test_:
+                has_test = true
+            cursor = d.next
+        if not has_test:
+            return try c.fail(c.tree(), "a program declares `pub func main(arguments: list[str]) -> int!` (§15.4)")
+
+## The bodies of one module's declarations not checked yet; whether any was.
+func check_declarations(c: check.Checker*, tree: ast.Node*) -> bool!:
+    var any = false
     var cursor = tree.body
     while let d = cursor:
+        if d.has(ast.flag_checked) or (d.has(ast.flag_prelude) and not d.has(ast.flag_instance)):
+            cursor = d.next
+            continue
+        d.flags |= ast.flag_checked
+        any = true
         match d.kind:
             .constant: try check_constant(c, d)
             .func_: try check_function(c, d, types.none_id)
@@ -48,15 +83,17 @@ pub func check_module(c: check.Checker*) -> !:
             .test_: try check_test(c, d)
             _: discard(0)
         cursor = d.next
-    if not c.main_seen:
-        var has_test = false
-        cursor = tree.body
-        while let d = cursor:
-            if d.kind == ast.Kind.test_:
-                has_test = true
-            cursor = d.next
-        if not has_test:
-            return try c.fail(tree, "a program declares `pub func main(arguments: list[str]) -> int!` (§15.4)")
+    return any
+
+## Every import of the current module is used (§15.2).
+func imports_used(c: check.Checker*) -> !:
+    let m = c.modules.get(c.current)
+    var i: usize = 0
+    while i < m.imports.count:
+        let imp = m.imports.get(i)
+        if not imp.used:
+            return try c.fail(imp.node, try c.named("the import ", imp.name, " is unused (§15.2)"))
+        i += 1
 
 func check_constant(c: check.Checker*, d: ast.Node*) -> !:
     let init = d.left else return try c.fail(d, "a constant needs a value")
@@ -892,6 +929,7 @@ func name_type(c: check.Checker*, e: ast.Node*) -> u32!:
         return b.type_id
     if let d = c.find_declaration(e.text):
         e.resolved = d
+        discard(c.find_import(e.text))
         if d.kind == ast.Kind.constant and d.type_id == types.none_id:
             return try c.fail(e, try c.named("the constant ", e.text, " depends on itself"))
         if d.kind == ast.Kind.func_ and d.ty != none:
@@ -903,6 +941,12 @@ func name_type(c: check.Checker*, e: ast.Node*) -> u32!:
             e.resolved = inst
             return try c.type_of_declaration(inst)
         return try c.type_of_declaration(d)
+    if let module = c.find_module(e.text):
+        # an imported module, read only to reach a member (§15.2)
+        let imp = c.find_import(e.text) else return try c.fail(e, "no import")
+        e.resolved = imp.node
+        discard(module)
+        return try c.table.module(imp.node)
     if e.text == "print" or e.text == "assert" or e.text == "trap" or e.text == "error" or e.text == "discard" or e.text == "int" or e.text == "float" or e.text == "str" or e.text == "bool" or e.text == "ErrorCode":
         return try c.fail(e, try c.named("", e.text, " is called, not read"))
     return try c.fail(e, try c.named("unknown name ", e.text, ""))
@@ -1154,6 +1198,20 @@ func member_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let rt = try check_expr(c, receiver, types.none_id)
     c.self_receiver = false
     let t = c.table.get(rt)
+    if t.kind == types.Kind.module:
+        # `module.name`: a public declaration of an imported module (§15.2)
+        let node = t.decl else return try c.fail(e, "no import")
+        let d = try c.public_declaration(node.module, e.text, e)
+        e.resolved = d
+        if d.kind == ast.Kind.func_ and d.ty != none:
+            return try c.fail(e, try c.named("", e.text, " is generic: it is called with its type arguments known, not read as a value (§13.2)"))
+        if let written = e.ty:
+            if d.ty == none or d.kind == ast.Kind.func_:
+                return try c.fail(e, try c.named("", e.text, " takes no type arguments"))
+            let inst = try instance_for(c, e, d, written)
+            e.resolved = inst
+            return try c.type_of_declaration(inst)
+        return try c.type_of_declaration(d)
     if t.kind == types.Kind.type_name:
         # `Type.member`: a type function, a case, or a constant of the type
         var d = t.decl else return try c.fail(e, "no declaration")
@@ -1232,7 +1290,11 @@ func member_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
 
 ## A member of another module's type must be `pub` (§15.2); one file is one module now.
 func check_visible(c: check.Checker*, e: ast.Node*, d: ast.Node*, m: ast.Node*) -> !:
-    return
+    # an interface's requirements are as visible as the interface itself
+    if (usize)d.module == c.current or d.module == 0 or m.has(ast.flag_pub) or d.kind == ast.Kind.interface_:
+        return
+    let home = c.modules.get((usize)d.module)
+    return try c.fail(e, try c.message(["`", m.text, "` of `", c.display_name(d), "` is private to the module `", home.name, "` (§15.2)"]))
 
 ## `[a, b, c]`: the element type from the context, or from the elements, which agree.
 func list_literal_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
@@ -1555,10 +1617,22 @@ func call_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     if callee.kind == ast.Kind.name and c.lookup(callee.text) == none:
         if let d = c.find_declaration(callee.text):
             if d.kind == ast.Kind.func_ and d.ty != none:
+                discard(c.find_import(callee.text))
                 return try generic_call(c, e, callee, d)
-    if e.ty != none and callee.kind != ast.Kind.name:
+    if callee.kind == ast.Kind.member:
+        # `module.f(...)`: a generic function of an imported module is called the same way
+        if let owner = callee.left:
+            if owner.kind == ast.Kind.name and c.lookup(owner.text) == none and c.find_declaration(owner.text) == none:
+                if let module = c.find_module(owner.text):
+                    let d = try c.public_declaration(module, callee.text, callee)
+                    if d.kind == ast.Kind.func_ and d.ty != none:
+                        let imp = c.find_import(owner.text) else return try c.fail(owner, "no import")
+                        owner.resolved = imp.node
+                        owner.type_id = try c.table.module(imp.node)
+                        return try generic_call(c, e, callee, d)
+    if e.ty != none and callee.kind != ast.Kind.name and callee.kind != ast.Kind.member:
         return try c.fail(e, "only a generic function or type takes type arguments (§13.2)")
-    if callee.kind == ast.Kind.name and c.lookup(callee.text) == none and c.find_declaration(callee.text) == none:
+    if callee.kind == ast.Kind.name and c.lookup(callee.text) == none and c.find_declaration(callee.text) == none and c.find_module(callee.text) == none:
         return try core_call(c, e, callee.text)
     if callee.kind == ast.Kind.member and callee.text == "package":
         if let owner = callee.left:

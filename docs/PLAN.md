@@ -10,7 +10,7 @@ alive.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 9. The Base boundary | §16: importing a Base module through luce-base's description, the crossings, handles; luce-base gains `pub handle`, the position directive and the description command first | §16 programs against a Base package in the tree |
+| 9. The Base boundary | §16: importing a Base module through luce-base's description, the crossings, handles; luce-base gains `pub handle`, the position directive and the description command first (§15 modules and packages are done) | §16 programs against a Base package in the tree |
 | 10. Workers | §14 | §14 programs |
 | 11. Tooling | §17: `luce test`, `luce fmt`, `luce doc`, `luce explain`, several diagnostics per run | §17 |
 | 12. Proving programs and the generator | applications big enough to break a compiler; the fuzzer's generator widened to the whole language | each program under the gate; an hour of the generator clean |

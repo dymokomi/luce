@@ -13,7 +13,10 @@
 #==============================================================================================
 
 import c
+import files
 import front.ast
+import paths
+import strings
 import support.prelude
 import front.parser
 import front.source
@@ -44,11 +47,22 @@ pub struct Binding:
     ## Some expression read or assigned the name.
     pub var used: bool
 
-## One module of the program: its tree and its source for positions.
+## One name an import brings into a module (§15.2): a module under a name, or one
+## declaration of a module through `from`.
+pub struct Import:
+    pub var name: str
+    pub var module: u32
+    pub var decl: ast.Node*?
+    pub var node: ast.Node*
+    pub var used: bool
+
+## One module of the program: its dotted name, its tree, its source for positions, and
+## what it imports. Module 0 is the prelude (§13.3).
 pub struct Module:
     pub var name: str
     pub var tree: ast.Node*
     pub var src: source.Source
+    pub var imports: list.List[Import]
 
 ## A `Writer` over a caller's buffer, for spelling types into diagnostics.
 pub struct SpanWriter: io.Writer:
@@ -120,6 +134,12 @@ pub struct Checker:
     pub var instance_depth: u32
     ## Which of the two type-description areas `type_text` writes next.
     var type_slot: u32
+    ## The entry module, the package's source root, the modules being loaded (a cycle
+    ## is one loaded twice), and every module in dependency order, imports first.
+    pub var entry: u32
+    pub var root: str
+    var loading: list.List[str]
+    pub var order: list.List[u32]
 
     pub static func create(scratch: u8[]) -> Checker!:
         return Checker(table = try types.Table.create(), modules = try list.List[Module].create(16),
@@ -130,7 +150,8 @@ pub struct Checker:
                        at_top_level = false, main_seen = false, lambdas = try list.List[ast.Node*].create(8),
                        lambda_bases = try list.List[u32].create(8), type_params = try list.List[TypeParam].create(16),
                        generics = try list.List[ast.Node*].create(8), templates = try list.List[ast.Node*].create(8),
-                       instances = try list.List[ast.Node*].create(16), instance_depth = 0, type_slot = 0)
+                       instances = try list.List[ast.Node*].create(16), instance_depth = 0, type_slot = 0,
+                       entry = 0, root = "", loading = try list.List[str].create(16), order = try list.List[u32].create(16))
 
     # -- diagnostics ----------------------------------------------------------------------
 
@@ -237,21 +258,265 @@ pub struct Checker:
     # -- modules and declarations ---------------------------------------------------------
 
     ## Parse and check one file as the program's module.
+    ## Load the program whose entry module is at `path`: the package around it, every
+    ## module it imports, and the declarations of all of them, imports first (§15).
     pub mutating func load(path: c.str) -> !:
-        let src = try source.Source.load(path)
+        try self.load_prelude()
+        let entry_path = (str)path
+        try self.discover_package(entry_path)
+        self.entry = try self.load_module(entry_path, try self.module_name(entry_path), none)
+        try self.check_loaded()
+
+    ## Check a module already parsed (tests): a package of one module.
+    pub mutating func check_tree(tree: ast.Node*, src: source.Source) -> !:
+        try self.load_prelude()
+        try self.modules.push(Module(name = "t", tree = tree, src = src, imports = try list.List[Import].create(4)))
+        self.entry = (u32)(self.modules.count - 1)
+        try self.order.push(self.entry)
+        try self.check_loaded()
+
+    ## The declarations of every loaded module, in dependency order.
+    mutating func check_loaded() -> !:
+        var i: usize = 0
+        while i < self.order.count:
+            self.current = (usize)self.order.get(i)
+            try self.check_module(self.tree())
+            i += 1
+        self.current = (usize)self.entry
+
+    ## The prelude as module 0: the closed protocols every module sees (§13.3).
+    mutating func load_prelude() -> !:
+        let src = try source.Source.over("prelude", prelude.source.bytes)
         var p = try parser.Parser.over(src, self.scratch)
         let tree = try p.parse_module()
-        try self.with_prelude(tree)
-        try self.modules.push(Module(name = module_name_of((str)path), tree = tree, src = src))
-        self.current = self.modules.count - 1
-        try self.check_module(tree)
+        var cursor = tree.body
+        while let d = cursor:
+            d.flags |= ast.flag_prelude
+            cursor = d.next
+        try self.modules.push(Module(name = "prelude", tree = tree, src = src, imports = try list.List[Import].create(1)))
+        self.current = 0
+        try self.order.push(0)
 
-    ## Check a module already parsed (tests).
-    pub mutating func check_tree(tree: ast.Node*, src: source.Source) -> !:
-        try self.with_prelude(tree)
-        try self.modules.push(Module(name = "t", tree = tree, src = src))
-        self.current = self.modules.count - 1
-        try self.check_module(tree)
+    ## The package the entry module is in: the nearest `luce.toml` above it whose source
+    ## root holds the module names the package and the root; without one, the module's
+    ## directory is the root of a package named `app` (§15.5).
+    mutating func discover_package(path: str) -> !:
+        var dir = paths.directory(path)
+        if dir.length == 0:
+            dir = "."
+        self.root = dir
+        var levels: u32 = 0
+        var probe = dir
+        while levels < 16:
+            let manifest = try paths.join(probe, "luce.toml")
+            if files.exists(try c_text(manifest)):
+                let (name, source_dir) = try self.read_manifest(manifest)
+                let root = try copy_text((try paths.join(probe, source_dir)).bytes)
+                if starts_with(path, root) and path.length > root.length and path.bytes[root.length] == '/':
+                    if not files.exists(try c_text(root)):
+                        return try self.manifest_error(manifest, 0, "the source root does not exist")
+                    self.package_name = name
+                    self.root = root
+                    return
+            let parent = paths.directory(probe)
+            if parent.length == 0 or parent == probe:
+                return
+            probe = parent
+            levels += 1
+
+    ## `[package]` with `name` and `source` (the root, `src` by default) from the manifest.
+    mutating func read_manifest(manifest: str) -> (str, str)!:
+        let data = try files.read(try c_text(manifest))
+        var section = ""
+        var line_number: u32 = 0
+        var source_dir = "src"
+        var name = "app"
+        var i: usize = 0
+        while i < data.length:
+            var end = i
+            while end < data.length and data[end] != '\n':
+                end += 1
+            line_number += 1
+            let line = trim((str)data[i..<end])
+            i = end + 1
+            if line.length == 0 or line.bytes[0] == '#':
+                continue
+            if line.bytes[0] == '[':
+                section = line
+                continue
+            if section != "[package]":
+                continue
+            let eq = index_of(line, '=') else return try self.manifest_error(manifest, line_number, "expected `key = \"value\"`")
+            let key = trim((str)line.bytes[..<eq])
+            let raw = trim((str)line.bytes[eq + 1..])
+            if raw.length < 2 or raw.bytes[0] != '"' or raw.bytes[raw.length - 1] != '"':
+                return try self.manifest_error(manifest, line_number, "a value is a quoted text")
+            let value = (str)raw.bytes[1..<raw.length - 1]
+            if key == "name":
+                name = try copy_text(value.bytes)
+            elif key == "source":
+                source_dir = try copy_text(value.bytes)
+        return (name, source_dir)
+
+    func manifest_error(manifest: str, line: u32, what: str) -> never!:
+        let half = self.scratch.length // 2
+        error(type_error, try format(self.scratch[..<half], f"{manifest}:{line}:1: {what}"))
+
+    ## The dotted module name of a file under the source root (§15.1).
+    mutating func module_name(path: str) -> str!:
+        var relative = path
+        if path.length > self.root.length and starts_with(path, self.root) and path.bytes[self.root.length] == '/':
+            relative = (str)path.bytes[self.root.length + 1..]
+        elif self.root == "." and starts_with(path, "./"):
+            relative = (str)path.bytes[2..]
+        else:
+            relative = paths.base(path)
+        let half = self.scratch.length // 2
+        var sink = SpanWriter(data = self.scratch[half..], used = 0)
+        var end = relative.length
+        if end >= 4 and (str)relative.bytes[end - 4..] == ".luc":
+            end -= 4
+        var i: usize = 0
+        while i < end:
+            let b = relative.bytes[i]
+            discard(try sink.write(("." if b == '/' else (str)relative.bytes[i..<i + 1]).bytes))
+            i += 1
+        return try copy_text(self.scratch[half..<half + sink.used])
+
+    ## Parse one module and load what it imports; its index. A module already loaded is
+    ## the same module; one still loading closes a cycle (§15.1).
+    mutating func load_module(path: str, name: str, at: ast.Node*?) -> u32!:
+        var i: usize = 0
+        while i < self.loading.count:
+            if self.loading.get(i) == name:
+                let node = at else error(type_error, "a module cycle")
+                return try self.fail(node, try self.named("the module ", name, " is being imported already: module cycles are errors (§15.1)"))
+            i += 1
+        i = 1
+        while i < self.modules.count:
+            if self.modules.get(i).name == name:
+                return (u32)i
+            i += 1
+        try self.loading.push(name)
+        let src = try source.Source.load(try c_text(path))
+        var p = try parser.Parser.over(src, self.scratch)
+        let tree = try p.parse_module()
+        let index = (u32)self.modules.count
+        try self.modules.push(Module(name = name, tree = tree, src = src, imports = try list.List[Import].create(8)))
+        var cursor = tree.body
+        while let d = cursor:
+            d.module = index
+            cursor = d.next
+        let importer = self.current
+        self.current = (usize)index
+        cursor = tree.body
+        while let d = cursor:
+            if d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import:
+                try self.load_import(index, d)
+            cursor = d.next
+        self.current = importer
+        self.loading.count -= 1
+        try self.order.push(index)
+        return index
+
+    ## One import of module `index`: the file under the root, loaded, and the names it
+    ## brings in, each once.
+    mutating func load_import(index: u32, d: ast.Node*) -> !:
+        var path_bytes = try alloc u8[self.root.length + 1 + d.text.length]
+        var k: usize = 0
+        while k < self.root.length:
+            path_bytes[k] = self.root.bytes[k]
+            k += 1
+        path_bytes[k] = '/'
+        k += 1
+        var j: usize = 0
+        while j < d.text.length:
+            path_bytes[k] = '/' if d.text.bytes[j] == '.' else d.text.bytes[j]
+            k += 1
+            j += 1
+        let file = (str)path_bytes
+        let candidate = try copy_text((try format(self.scratch[..<self.scratch.length // 2], f"{file}.luc")).bytes)
+        if not files.exists(try c_text(candidate)):
+            let base_module = try format(self.scratch[..<self.scratch.length // 2], f"{file}.lucb")
+            if files.exists(try c_text(base_module)):
+                return try self.fail(d, "Base modules arrive with the boundary slice (§16)")
+            return try self.fail(d, try self.message(["no module `", d.text, "` under `", self.root, "` (§15.1)"]))
+        let child = try self.load_module(candidate, d.text, d)
+        d.module = child
+        var m = self.modules.get((usize)index)
+        if d.kind == ast.Kind.import_:
+            var under = last_component(d.text)
+            if let alias = d.left:
+                under = alias.text
+            try self.add_import(&m, Import(name = under, module = child, decl = none, node = d, used = false))
+        else:
+            var cursor = d.body
+            while let n = cursor:
+                let target = try self.public_declaration(child, n.text, n)
+                try self.add_import(&m, Import(name = n.text, module = child, decl = target, node = n, used = false))
+                cursor = n.next
+        self.modules.set((usize)index, m)
+
+    mutating func add_import(m: Module*, imp: Import) -> !:
+        var i: usize = 0
+        while i < m.imports.count:
+            if m.imports.get(i).name == imp.name:
+                return try self.fail(imp.node, try self.named("", imp.name, " is imported twice (§15.2)"))
+            i += 1
+        var cursor = m.tree.body
+        while let d = cursor:
+            if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and d.kind != ast.Kind.test_ and d.text == imp.name:
+                return try self.fail(imp.node, try self.named("", imp.name, " is imported and declared in this module (§15.2)"))
+            cursor = d.next
+        try m.imports.push(imp)
+
+    ## The public declaration `name` of module `index`, for an import or a qualified name.
+    pub func public_declaration(index: u32, name: str, at: ast.Node*) -> ast.Node*!:
+        let m = self.modules.get((usize)index)
+        var cursor = m.tree.body
+        while let d = cursor:
+            if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and d.kind != ast.Kind.test_ and d.text == name:
+                if not d.has(ast.flag_pub):
+                    return try self.fail(at, try self.message(["`", name, "` is not public in the module `", m.name, "` (§15.2)"]))
+                return d
+            cursor = d.next
+        return try self.fail(at, try self.message(["the module `", m.name, "` has no `", name, "`"]))
+
+    ## The import of the current module under `name`, marked used.
+    pub mutating func find_import(name: str) -> Import?:
+        var m = self.modules.get(self.current)
+        var i: usize = 0
+        while i < m.imports.count:
+            var imp = m.imports.get(i)
+            if imp.name == name:
+                imp.used = true
+                m.imports.set(i, imp)
+                return imp
+            i += 1
+        return none
+
+    ## The module the current module imports under `name`.
+    pub mutating func find_module(name: str) -> u32?:
+        let imp = self.find_import(name) else return none
+        if imp.decl != none:
+            return none
+        return imp.module
+
+    ## The name the emitter gives a top-level declaration: its own in the entry module and
+    ## the prelude, qualified by its module elsewhere, so two modules' `Point` differ.
+    pub func emitted_name(d: ast.Node*) -> str!:
+        if d.module == self.entry or d.module == 0:
+            return d.text
+        let m = self.modules.get((usize)d.module)
+        let half = self.scratch.length // 2
+        var sink = SpanWriter(data = self.scratch[half..], used = 0)
+        var i: usize = 0
+        while i < m.name.length:
+            discard(try sink.write(("_" if m.name.bytes[i] == '.' else (str)m.name.bytes[i..<i + 1]).bytes))
+            i += 1
+        discard(try sink.write("__".bytes))
+        discard(try sink.write(d.text.bytes))
+        return try copy_text(self.scratch[half..<half + sink.used])
 
     ## Whether a declaration lists a conformance to the interface named.
     func lists_conformance(d: ast.Node*, name: str) -> bool:
@@ -285,15 +550,22 @@ pub struct Checker:
     pub func tree() -> ast.Node*:
         return self.modules.get(self.current).tree
 
-    ## The top-level declaration named `name` in the current module.
+    ## The top-level declaration named `name` visible in the current module: its own, one
+    ## brought in by `from ... import`, or the prelude's (§15.2).
     pub func find_declaration(name: str) -> ast.Node*?:
         if self.modules.count == 0:
             return none
-        var cursor = self.tree().body
-        while let d = cursor:
-            if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and d.kind != ast.Kind.test_ and d.text == name:
-                return d
-            cursor = d.next
+        if let d = declared_in(self.modules.get(self.current).tree, name):
+            return d
+        let m = self.modules.get(self.current)
+        var i: usize = 0
+        while i < m.imports.count:
+            let imp = m.imports.get(i)
+            if imp.name == name:
+                return imp.decl
+            i += 1
+        if self.current != 0:
+            return declared_in(self.modules.get(0).tree, name)
         return none
 
     ## The member of a type declaration named `name`: a field, method, or case.
@@ -343,13 +615,14 @@ pub struct Checker:
         var cursor = tree.body
         while let d = cursor:
             if d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import:
-                return try self.fail(d, "imports arrive with the module slice; a program is one file for now")
+                cursor = d.next
+                continue
             if d.kind != ast.Kind.test_ and not d.has(ast.flag_prelude):
+                if self.current != 0 and declared_in(self.modules.get(0).tree, d.text) != none:
+                    return try self.fail(d, try self.named("", d.text, " is a closed protocol the language declares (§13.3)"))
                 var other = tree.body
                 while let o = other:
                     if o != d and o.kind != ast.Kind.test_ and o.text == d.text:
-                        if o.has(ast.flag_prelude):
-                            return try self.fail(d, try self.named("", d.text, " is a closed protocol the language declares (§13.3)"))
                         return try self.fail(d, try self.named("", d.text, " is declared twice"))
                     other = o.next
             if d.ty != none and d.kind != ast.Kind.type_alias and d.kind != ast.Kind.test_:
@@ -449,33 +722,48 @@ pub struct Checker:
         inst.resolved = d
         inst.flags |= ast.flag_instance
         let params = inst.ty else return try self.fail(at, "not generic")
+        inst.text = try self.instance_name(d, inst, args)
+        try self.instances.push(inst)
+        try self.append_to_module(d.module, inst)
+        self.instance_depth += 1
+        let home = self.current
+        self.current = (usize)d.module
+        try self.declare_type_params(inst)
+        try self.enter_type_params(inst)
+        inst.type_id = try self.signature_of(inst, types.none_id)
+        self.leave_type_params(inst)
+        self.current = home
+        self.instance_depth -= 1
+        return inst
+
+    ## `name__5__7`: the emitted name of the generic declaration and the argument ids.
+    mutating func instance_name(d: ast.Node*, inst: ast.Node*, args: u32[]) -> str!:
+        let base = try self.emitted_name(d)
         let half = self.scratch.length // 2
-        var sink = SpanWriter(data = self.scratch[half..], used = 0)
-        discard(try sink.write(d.text.bytes))
+        var sink = SpanWriter(data = self.scratch[half + self.scratch.length // 4..], used = 0)
+        discard(try sink.write(base.bytes))
+        let params = inst.ty else return try self.fail(inst, "not generic")
         var cursor = params.body
-        i = 0
+        var i: usize = 0
         while let p = cursor:
             p.type_id = args[i]
             discard(try sink.write("__".bytes))
             try write_u64(&sink, (u64)args[i])
             i += 1
             cursor = p.next
-        inst.text = try copy_text(self.scratch[half..<half + sink.used])
-        try self.instances.push(inst)
-        var tail = self.tree()
-        var last = tail.body
+        let at = half + self.scratch.length // 4
+        return try copy_text(self.scratch[at..<at + sink.used])
+
+    ## An instance belongs to its generic declaration's module: it is checked in that
+    ## module's scope and written with its name.
+    mutating func append_to_module(index: u32, inst: ast.Node*) -> !:
+        inst.module = index
+        var last = self.modules.get((usize)index).tree.body
         while let n = last:
             if n.next == none:
                 n.next = inst
                 break
             last = n.next
-        self.instance_depth += 1
-        try self.declare_type_params(inst)
-        try self.enter_type_params(inst)
-        inst.type_id = try self.signature_of(inst, types.none_id)
-        self.leave_type_params(inst)
-        self.instance_depth -= 1
-        return inst
 
     ## Whether an instance's arguments mention a type parameter: one made while a generic
     ## body was checked, checked in turn but never run or compiled.
@@ -643,19 +931,7 @@ pub struct Checker:
         inst.flags |= ast.flag_instance
         if d.has(ast.flag_prelude):
             inst.flags |= ast.flag_prelude
-        let inst_params = inst.ty else return try self.fail(at, "not generic")
-        let half = self.scratch.length // 2
-        var sink = SpanWriter(data = self.scratch[half..], used = 0)
-        discard(try sink.write(d.text.bytes))
-        cursor = inst_params.body
-        i = 0
-        while let p = cursor:
-            p.type_id = args[i]
-            discard(try sink.write("__".bytes))
-            try write_u64(&sink, (u64)args[i])
-            i += 1
-            cursor = p.next
-        inst.text = try copy_text(self.scratch[half..<half + sink.used])
+        inst.text = try self.instance_name(d, inst, args)
         var kind = types.Kind.struct_
         match d.kind:
             .enum_: kind = types.Kind.enum_
@@ -664,15 +940,12 @@ pub struct Checker:
             _: discard(0)
         inst.type_id = try self.table.nominal(kind, inst, try types.no_args())
         try self.instances.push(inst)
-        var last = self.tree().body
-        while let n = last:
-            if n.next == none:
-                n.next = inst
-                break
-            last = n.next
+        try self.append_to_module(d.module, inst)
         self.instance_depth += 1
         let saved_interface = self.in_interface
         let saved_conformance = self.in_conformance
+        let home = self.current
+        self.current = (usize)d.module
         self.in_interface = false
         self.in_conformance = false
         try self.declare_type_params(inst)
@@ -681,6 +954,7 @@ pub struct Checker:
         self.leave_type_params(inst)
         self.in_interface = saved_interface
         self.in_conformance = saved_conformance
+        self.current = home
         self.instance_depth -= 1
         try mark_mutating_declaration(inst)
         try self.conformance_read_only(inst)
@@ -715,10 +989,10 @@ pub struct Checker:
         var cursor = tree.body
         while let d = cursor:
             match d.kind:
-                .struct_: d.type_id = try self.table.nominal(types.Kind.struct_, d, try types.no_args())
-                .enum_: d.type_id = try self.table.nominal(types.Kind.enum_, d, try types.no_args())
-                .class_: d.type_id = try self.table.nominal(types.Kind.class_, d, try types.no_args())
-                .interface_: d.type_id = try self.table.nominal(types.Kind.interface_, d, try types.no_args())
+                .struct_: d.type_id = try self.table.nominal_as(types.Kind.struct_, d, try types.no_args(), try self.emitted_name(d))
+                .enum_: d.type_id = try self.table.nominal_as(types.Kind.enum_, d, try types.no_args(), try self.emitted_name(d))
+                .class_: d.type_id = try self.table.nominal_as(types.Kind.class_, d, try types.no_args(), try self.emitted_name(d))
+                .interface_: d.type_id = try self.table.nominal_as(types.Kind.interface_, d, try types.no_args(), try self.emitted_name(d))
                 _: discard(0)
             cursor = d.next
         # a generic type's parameters, once every interface a bound may name has its type
@@ -745,12 +1019,14 @@ pub struct Checker:
                         try self.enter_type_params(d)
                         d.type_id = try self.signature_of(d, types.none_id)
                         self.leave_type_params(d)
-                        if d.text == "main":
+                        if d.text == "main" and self.current == (usize)self.entry:
                             return try self.fail(d, "`main` takes no type parameters (§15.4)")
                     else:
                         d.type_id = try self.signature_of(d, types.none_id)
-                    if d.text == "main":
+                    if d.text == "main" and self.current == (usize)self.entry:
                         try self.check_main(d)
+                    if d.has(ast.flag_pub):
+                        try self.public_signature(d, d.type_id)
                 .struct_, .class_, .enum_, .interface_:
                     try self.enter_type_params(d)
                     try self.resolve_type_declaration(d)
@@ -892,6 +1168,44 @@ pub struct Checker:
             return try self.fail(f, "a function does not return `never`; `error` or `trap` in the body says it")
         return try self.table.function(params[..<i], result)
 
+    ## A public signature mentions only public types (§15.2).
+    mutating func public_signature(d: ast.Node*, id: u32) -> !:
+        if let private = self.private_type_in(id):
+            return try self.fail(d, try self.message(["the public `", d.text, "` mentions the private type `", try self.type_text(private), "` (§15.2)"]))
+
+    ## A type in `id` whose declaration is not public, if any.
+    func private_type_in(id: u32) -> u32?:
+        let t = self.table.get(id)
+        match t.kind:
+            .struct_, .enum_, .class_, .interface_:
+                let d = t.decl else return none
+                var generic = d
+                if d.has(ast.flag_instance):
+                    generic = d.resolved else return none
+                if not generic.has(ast.flag_pub) and not generic.has(ast.flag_prelude):
+                    return id
+                if d.has(ast.flag_instance):
+                    if let params = d.ty:
+                        var cursor = params.body
+                        while let p = cursor:
+                            if let inner = self.private_type_in(p.type_id):
+                                return inner
+                            cursor = p.next
+                return none
+            .optional, .fallible, .list_, .set_, .weak_, .task_: return self.private_type_in(t.elem)
+            .map_:
+                if let inner = self.private_type_in(t.elem):
+                    return inner
+                return self.private_type_in(self.table.map_value(id))
+            .tuple, .func_:
+                for m in t.args:
+                    if let inner = self.private_type_in(m):
+                        return inner
+                if t.kind == types.Kind.func_:
+                    return self.private_type_in(t.elem)
+                return none
+            _: return none
+
     ## `main(arguments: list[str]) -> int!`, once.
     mutating func check_main(d: ast.Node*) -> !:
         let t = self.table.get(d.type_id)
@@ -992,7 +1306,16 @@ pub struct Checker:
                 if args > 0:
                     return try self.fail(t, try self.named("the type parameter ", name, " takes no arguments"))
                 return tp.type_id
-        let d = self.find_declaration(name) else return try self.fail(t, try self.named("unknown type ", name, ""))
+        var found: ast.Node*? = none
+        if let dot = strings.last(name, '.'):
+            # `geometry.Point`: a public type of an imported module
+            let prefix = (str)name.bytes[..<dot]
+            let module = self.find_module(prefix) else return try self.fail(t, try self.named("unknown module ", prefix, ""))
+            found = try self.public_declaration(module, (str)name.bytes[dot + 1..], t)
+        else:
+            found = self.find_declaration(name)
+            discard(self.find_import(name))
+        let d = found else return try self.fail(t, try self.named("unknown type ", name, ""))
         if d.kind == ast.Kind.interface_ and d.has(ast.flag_prelude) and d.ty == none and not self.in_conformance:
             return try self.fail(t, try self.named("", name, " is a closed protocol: a type declares it, no value has it as its type (§13.3)"))
         if d.ty != none and d.kind != ast.Kind.type_alias and d.kind != ast.Kind.func_:
@@ -1034,6 +1357,45 @@ pub struct Checker:
                 return try self.table.intern(t)
             _: return types.none_id
 
+## The top-level declaration named `name` of a module's tree.
+func declared_in(tree: ast.Node*, name: str) -> ast.Node*?:
+    var cursor = tree.body
+    while let d = cursor:
+        if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and d.kind != ast.Kind.test_ and d.text == name:
+            return d
+        cursor = d.next
+    return none
+
+## Text as C text, for the file functions.
+func c_text(text: str) -> c.str!:
+    var out = try alloc u8[text.length + 1]
+    var i: usize = 0
+    while i < text.length:
+        out[i] = text.bytes[i]
+        i += 1
+    out[text.length] = 0
+    return (c.str)out.data
+
+func trim(text: str) -> str:
+    return strings.trim(text)
+
+func starts_with(text: str, prefix: str) -> bool:
+    return strings.starts_with(text, prefix)
+
+func index_of(text: str, byte: u8) -> usize?:
+    var i: usize = 0
+    while i < text.length:
+        if text.bytes[i] == byte:
+            return i
+        i += 1
+    return none
+
+## `c` of `a.b.c`.
+func last_component(path: str) -> str:
+    if let dot = strings.last(path, '.'):
+        return (str)path.bytes[dot + 1..]
+    return path
+
 ## A number in decimal, into a sink.
 func write_u64(sink: SpanWriter*, v: u64) -> !:
     var digits: u8[24]
@@ -1050,7 +1412,7 @@ func write_u64(sink: SpanWriter*, v: u64) -> !:
         discard(try sink.write(digits[n..<n + 1]))
 
 ## A copy of text that outlives the scratch buffer it was written in.
-func copy_text(text: u8[]) -> str!:
+func copy_text(text: const u8[]) -> str!:
     var out = try alloc u8[text.length]
     var i: usize = 0
     while i < text.length:

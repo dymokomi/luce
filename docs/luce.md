@@ -820,7 +820,9 @@ nothing, so there are no locks and no races in the language.
 
 One `.luc` file is one module; its path under the package's source root is its name:
 `src/image/color.luc` is `image.color`. A file's name is an identifier. A `.lucb` file in the
-same package is a Base module (§16). Module cycles are errors.
+same package is a Base module (§16). Module cycles are errors. The source root is the one the
+package's manifest names (§15.5); a program run without a manifest has its entry module's
+directory as the root and `app` as its package name.
 
 ### 15.2 Imports and visibility
 
@@ -831,10 +833,12 @@ from image.geometry import Point, Size
 ```
 
 `import` keeps a module qualified, with an optional alias; `from ... import` brings the named
-public declarations in. Imports come first and are used. Declarations, fields and methods are
-private to their module unless `pub`: a `pub` type with no `pub` member can be named and
-passed but not read or called from another module. A public signature mentions only public
-types.
+public declarations in. Imports come first and are used; a name is imported once and never
+declared beside its import. Declarations, fields and methods are private to their module
+unless `pub`: a `pub` type with no `pub` member can be named and passed but not read or
+called from another module. A public signature mentions only public types. A module's name
+is read only to reach a member, `shapes.origin`, `shapes.Point`; the closed protocols
+(§13.3) are visible in every module without an import.
 
 ### 15.3 Top level
 
@@ -855,6 +859,15 @@ pub func main(arguments: list[str]) -> int!:
 A package is a directory with a `luce.toml` naming the package, its source root, its tests,
 and its dependencies exactly. There is no build script and no network during a build. The
 manifest is the same document for the Base modules the package contains.
+
+```toml
+[package]
+name = "demo"
+source = "src"
+```
+
+`name` is the package's identity (§12.3); `source` is the root the modules are named
+from, `src` unless written. The nearest manifest above the entry module is the program's.
 
 ## 16. The Base boundary
 
