@@ -98,6 +98,10 @@ pub struct Emitter:
     ## Operands hoisted before the statement (RUNTIME 5): `let` lines, written ahead of the
     ## statement when it is wrapped.
     var prelude: buffer.Buffer
+    ## The operands hoisted for the statement being written, and their names: a node
+    ## written again in the statement is written by its name, so a call runs once.
+    var hoisted_nodes: list.List[ast.Node*]
+    var hoisted_names: list.List[str]
     ## `luce test --build`: the tests are written as functions and `main` runs them (§17.3).
     pub var tests_mode: bool
     var test_names: list.List[str]
@@ -126,7 +130,8 @@ pub struct Emitter:
                        spawns = try list.List[ast.Node*].create(8), spawns_done = 0, waits = try list.List[u32].create(8), waits_done = 0, sends = try list.List[u32].create(16), sends_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self",
-                       tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024))
+                       tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024),
+                       hoisted_nodes = try list.List[ast.Node*].create(8), hoisted_names = try list.List[str].create(8))
 
     pub func text() -> str:
         return self.out.view()
@@ -199,6 +204,8 @@ pub struct Emitter:
                 try self.put(m)
                 try self.put(")")
                 try self.end()
+        self.hoisted_nodes.count = 0
+        self.hoisted_names.count = 0
         self.pooled = pooled_before
 
     ## Whether every path through the statement leaves the function, as the checker
@@ -2223,6 +2230,11 @@ pub struct Emitter:
         let place = s.left else return
         let value = s.right else return
         if place.kind == ast.Kind.tuple:
+            # the places' receivers and indexes come first (§5.3), then the tuple, then the stores
+            var ahead = place.body
+            while let part = ahead:
+                try self.place_ahead(part)
+                ahead = part.next
             let t = try self.temp("tuple")
             try self.begin("let ")
             try self.put(t)
@@ -2246,7 +2258,7 @@ pub struct Emitter:
                 try self.begin("kernel.map_set[")
                 try self.map_types(receiver.type_id)
                 try self.put("](")
-                if self.may_fail(value) or self.may_fail(index):
+                if self.may_fail(value) or self.may_fail(index) or self.has_call(value):
                     let r = try self.hoist(receiver, false)
                     let k = try self.hoist(index, true)
                     let v = try self.hoist(value, true)
@@ -2265,7 +2277,11 @@ pub struct Emitter:
                 try self.end()
                 return
             if self.checker.table.kind(receiver.type_id) == types.Kind.list_:
-                # `values[i] = x`, or `values[i] op= x` as the operation then the store
+                # `values[i] = x`, or `values[i] op= x` as the operation then the store; the
+                # place is computed once, ahead of the value (§5.3)
+                if s.text != "=" and (self.has_call(receiver) or self.has_call(index)):
+                    discard(try self.hoist(receiver, false))
+                    discard(try self.hoist(index, false))
                 try self.begin("kernel.list_set[")
                 try self.type_of(place.type_id)
                 try self.put("](")
@@ -2329,6 +2345,21 @@ pub struct Emitter:
         try self.arithmetic(op, place.type_id, place, value)
         try self.end()
 
+    ## What a place reaches through a call, computed ahead of the value it takes (§5.3): a
+    ## list's or map's receiver and index, a field's object.
+    mutating func place_ahead(place: ast.Node*) -> !:
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            if self.has_call(receiver) or self.has_call(index):
+                discard(try self.hoist(receiver, false))
+                let is_map = self.checker.table.kind(receiver.type_id) == types.Kind.map_
+                discard(try self.hoist(index, is_map))
+        elif place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
+                discard(try self.hoist(receiver, false))
+
     ## `place = name`, the old value dropped after the store when it held references.
     mutating func store(place: ast.Node*, name: str) -> !:
         if place.kind == ast.Kind.name:
@@ -2388,7 +2419,11 @@ pub struct Emitter:
             .name, .self_, .group, .index: try self.expr(e)
             .member:
                 let receiver = e.left else return
-                try self.place_expr(receiver)
+                if self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
+                    # `f().field = v`: the object is computed once, ahead of the value (§5.3)
+                    try self.put(try self.hoist(receiver, false))
+                else:
+                    try self.place_expr(receiver)
                 try self.put(".L_")
                 try self.put(e.text)
             _: return try self.fail(e, "this is not a place the emitter knows")
@@ -3208,7 +3243,8 @@ pub struct Emitter:
 
     ## The expression as a value the reader will keep: a borrowed one is copied.
     mutating func owned(e: ast.Node*) -> !:
-        if self.checker.table.has_references(e.type_id) and self.borrowed(e):
+        if self.checker.table.has_references(e.type_id) and (self.borrowed(e) or self.hoisted_name(e) != none):
+            # a hoisted operand is the statement's temporary: an owner takes a copy
             try self.put(try self.lifetime_name("L_copy_", e.type_id))
             try self.put("(")
             try self.expr(e)
@@ -3222,6 +3258,11 @@ pub struct Emitter:
     ## (RUNTIME 5). The name to write at the site: a copy of the temporary for an owned
     ## reference, the temporary itself otherwise.
     mutating func hoist(e: ast.Node*, owned: bool) -> str!:
+        if let already = self.hoisted_name(e):
+            if owned and self.checker.table.has_references(e.type_id):
+                let half = self.checker.scratch.length // 2
+                return try copy_name(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({already})"))
+            return already
         let name = try self.temp("arg")
         let start = self.out.used
         if owned:
@@ -3250,7 +3291,18 @@ pub struct Emitter:
         if owned and refs:
             let half = self.checker.scratch.length // 2
             return try copy_name(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({name})"))
+        try self.hoisted_nodes.push(e)
+        try self.hoisted_names.push(name)
         return name
+
+    ## The name an operand was hoisted under in this statement, if it was.
+    func hoisted_name(e: ast.Node*) -> str?:
+        var i: usize = 0
+        while i < self.hoisted_nodes.count:
+            if self.hoisted_nodes.get(i) == e:
+                return self.hoisted_names.get(i)
+            i += 1
+        return none
 
     ## Whether a call appears anywhere in the expression: evaluating it may have an effect.
     func has_call(n: ast.Node*?) -> bool:
@@ -3301,6 +3353,10 @@ pub struct Emitter:
     ## The expression as a value used and let go of: an owned one becomes a temporary of
     ## the statement, pooled until the drain.
     mutating func use(e: ast.Node*) -> !:
+        if let name = self.hoisted_name(e):
+            # pooled when it was hoisted
+            try self.put(name)
+            return
         if self.checker.table.has_references(e.type_id) and not self.borrowed(e):
             try self.put(try self.lifetime_name("L_pool_", e.type_id))
             try self.put("(")
@@ -3312,6 +3368,9 @@ pub struct Emitter:
 
     ## Writes the value: borrowed for a read of a binding, owned for everything else.
     pub mutating func expr(e: ast.Node*) -> !:
+        if let name = self.hoisted_name(e):
+            try self.put(name)
+            return
         match e.kind:
             .literal: try self.literal(e)
             .name:
