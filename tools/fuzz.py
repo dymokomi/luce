@@ -136,11 +136,11 @@ class Gen:
                     "apply((n) => n % 4096 + a % 4096, b)", "apply(halve, a)", "counter()", "(nums.map((n) => n % 8).first else 0)",
                     "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(hash(a) % 1000)", "(hash(s) % 1000)",
                     "(s.index_of(t) else -1)", "s.byte_count", "choose(a, b, flag)", "count_of(nums, a)", "count_of(words, s)",
-                    "(largest(nums) else 0)", "shown(nums).length"],
+                    "(largest(nums) else 0)", "shown(nums).length", "Two(first = a, second = s).flipped().second", "Two(first = s, second = b).second"],
             "float": ["d", "e", "float(a % 256)", "p.f"],
             "str": ["s", "t", "p.name", "obj.tag()", "name_of(opt)", "name_of(h.item)", "words.join(\"-\")", "s.upper()",
                     "s.trim()", "t.replace(\"a\", \"o\")", "(words.last else \"-\")", "str(nums)", "str(seen)", "str(ages)",
-                    "choose(s, t, flag)", "(largest(words) else \"-\")", "shown(words)"],
+                    "choose(s, t, flag)", "(largest(words) else \"-\")", "shown(words)", "Two(first = s, second = a).first", "str(Two(first = a, second = b))"],
             "bool": ["flag", "(a > b)", "(opt is none)", "(obj is opt)", "(a in nums)", "(s in ages)", "(a in seen)",
                      "s.contains(t)", "s.starts_with(\"a\")", "(nums == sorted_copy(nums))", "(seen == {1, 2})"],
         }[ty] + [n for n, t in self.locals if t == ty]
@@ -328,7 +328,14 @@ class Gen:
             if k < 2:
                 lines.append(f"{pad}{r.choice(['a', 'b', 'c'])} = {self.expr(3)}")
             elif k == 2:
-                lines.append(f"{pad}{r.choice(['d', 'e'])} = {self.expr(2, 'float')}")
+                if r.random() < 0.3 and depth > 0:
+                    m = self.loops; self.loops += 1
+                    lines.append(f"{pad}for j{m} in Countdown({self.expr(1)} % 5):")
+                    self.locals.append((f"j{m}", "int"))
+                    lines += self.statements(depth - 1, indent + 1)
+                    self.locals.pop()
+                else:
+                    lines.append(f"{pad}{r.choice(['d', 'e'])} = {self.expr(2, 'float')}")
             elif k == 3:
                 # `short` keeps a text bounded: `s = s + s` in nested loops grows without limit
                 lines.append(f"{pad}{r.choice(['s', 't'])} = short({self.expr(2, 'str')})")
@@ -436,6 +443,9 @@ class Gen:
                 "func count_of[T: Equatable](values: list[T], x: T) -> int:", "    var n = 0", "    for v in values:", "        if v == x:", "            n += 1", "    return n", "",
                 "func largest[T: Ordered](values: list[T]) -> T?:", "    var best: T? = none", "    for v in values:", "        if let b = best:", "            if v > b:", "                best = v", "        else:", "            best = v", "    return best", "",
                 "func shown[T: Display](values: list[T]) -> str:", "    return values.map((v) => str(v)).join(\"|\")", "",
+                "struct Two[A, B]:", "    var first: A", "    var second: B", "", "    func flipped(self) -> Two[B, A]:", "        return Two(first = self.second, second = self.first)", "",
+                "class Countdown: Iterable[int]:", "    let start: int", "", "    func init(self, start: int):", "        self.start = start", "", "    func iterator(self) -> Iterator[int]:", "        return Steps(self.start % 6)", "",
+                "class Steps: Iterator[int]:", "    var left: int", "", "    func init(self, left: int):", "        self.left = left", "", "    func next(self) -> int?:", "        if self.left <= 0:", "            return none", "        self.left -= 1", "        return self.left", "",
                 "var_block"]
         return "\n".join(text)
 

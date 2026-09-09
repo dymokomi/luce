@@ -761,7 +761,17 @@ and held in tuples, optionals and collections. Type arguments are inferred from 
 arguments, those given to a parameter of a bare parameter type first, or written,
 `largest[int](values)`; each must satisfy its bounds. The program gets one instance of the
 function per distinct type arguments; a generic function is called, never read as a value,
-and a method has no type parameters of its own. Generic types arrive with a later slice.
+and a method has no type parameters of its own.
+
+A struct, enum, class or interface takes type parameters the same way, `struct Pair[A, B]`,
+`enum Option[T]`, `class Stack[T]`, `interface Container[T]`, and `Pair[int, str]` names
+an instance, a type of its own with the parameters replaced. A construction infers the
+arguments from the expected type or from the values given to the fields, `init` or the
+case's payload, `Pair(first = 1, second = "one")`; `Option.empty` needs the expected type
+known or the arguments written, `Option[int].empty`; a class with an `init` taking no
+value that fixes a parameter is written `Stack[int]()`. An instance displays as
+`Pair(first = 1, second = one)`, its generic name; a bound may name an instance,
+`[I: Iterable[int]]`.
 
 ### 13.3 The closed protocols
 
@@ -778,7 +788,10 @@ The compiler knows these interfaces, and syntax uses them:
 
 Values get `Equatable`, `Hashable`, `Ordered` and `Display` structurally as §4.4 and §10.5
 say; a type declares one only to replace the structural meaning, and a class must declare
-them to have them at all. A closed protocol names what a type declares, never a value's
+them to have them at all. `for x in v` over a value declaring `Iterable[T]` calls
+`v.iterator()` once and `next()` before every pass until it answers `none`; the iterator
+is a class, since a struct's method for a requirement may not change `self` (§13.1), and
+`while let x = it.next()` walks it by hand. A closed protocol names what a type declares, never a value's
 type: `let e: Equatable = x` is an error, and no program may declare one itself. A type that
 declares `Equatable` keys a map or sits in a set only when it declares `Hashable` beside
 it, so its hash agrees with its `equals`; `Hashable` and `Ordered` are declared beside

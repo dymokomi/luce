@@ -10,7 +10,6 @@ alive.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 8. Interfaces and generics | §13: generic types, `for` over `Iterable` (conformance, interface values, the closed protocols and generic functions are done) | §13 programs and rejections |
 | 9. The Base boundary | §16: importing a Base module through luce-base's description, the crossings, handles; luce-base gains `pub handle`, the position directive and the description command first | §16 programs against a Base package in the tree |
 | 10. Workers | §14 | §14 programs |
 | 11. Tooling | §17: `luce test`, `luce fmt`, `luce doc`, `luce explain`, several diagnostics per run | §17 |
