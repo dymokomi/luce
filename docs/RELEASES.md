@@ -2,6 +2,8 @@
 
 ## 0.1.3
 
+- Pin Base 0.11.28 for native x86 correctness, library failure handling and
+  development DWARF support.
 - Imported Base functions used as values become proper Luce closures. Indirect calls
   preserve fallible results, unit results, handles and close-once destruction.
 - Named callbacks crossing an indirect Base function call retain a static callback
