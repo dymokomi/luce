@@ -1,0 +1,489 @@
+#==============================================================================================
+#
+#   lexer - Bytes to tokens, then layout
+#
+#   DESCRIPTION:
+#       Tokens are spans; the literal decoder of a later slice turns spellings into values.
+#       Layout is part of lexing: a newline at the top level becomes `newline`, a deeper first
+#       column becomes `indent`, and a shallower one becomes one `dedent` per closed block.
+#       Inside `()`, `[]`, and `{}` newlines are spacing, except that a `:` ending a line
+#       reopens layout and the bracket that closes the suite ends it (luce.md §2.2). A
+#       formatted string lexes as `format_start`, `format_text` runs, ordinary tokens for each
+#       `{field}`, then `format_end`. Every bound is a diagnostic, never a fault: blocks and
+#       brackets nest to a depth the table holds, an identifier is at most 128 bytes.
+#
+#==============================================================================================
+
+import front.source
+import front.token
+
+pub let bad_indent: ErrorCode = ErrorCode.package(3)
+pub let unterminated: ErrorCode = ErrorCode.package(4)
+pub let bad_character: ErrorCode = ErrorCode.package(5)
+
+## The longest identifier (§2.1): a diagnostic quoting one fits its buffer.
+pub let longest_name: usize = 128
+pub let tab: ErrorCode = ErrorCode.package(6)
+
+let max_blocks: usize = 64
+let max_modes: usize = 32
+
+pub struct Lexer:
+    pub var src: source.Source
+    var offset: usize
+    var line: u32
+    var line_start: usize
+    var at_line_start: bool
+    var levels: u32[64]
+    var depth: usize
+    var pending_dedents: usize
+    var delimiters: i32
+    ## 0: code; 1: inside a formatted string's literal part; 2: inside a `{field}`
+    var modes: u8[32]
+    var mode_depth: usize
+    ## Offset just past the last comment, so a `:` inside it does not open a suite.
+    var comment_end: usize
+    ## The block depth when each open bracket was seen; a closer ends any suite
+    ## opened inside it (base.md §3.2: closers on the body's last line).
+    var bracket_base: usize[64]
+    ## A colon ended a line inside brackets: the next line's indentation counts.
+    var reopened: bool
+
+    pub static func over(src: source.Source) -> Lexer:
+        return Lexer(src = src, offset = 0, line = 1, line_start = 0, at_line_start = true,
+                     depth = 0, pending_dedents = 0, delimiters = 0, mode_depth = 0,
+                     comment_end = 0, reopened = false)
+
+    ## The one-based line and column of the byte about to be read, for diagnostics.
+    pub func position() -> (u32, u32):
+        return (self.line, u32(self.offset - self.line_start) + 1)
+
+    func peek() -> u8:
+        if self.offset >= self.src.bytes.length:
+            return 0
+        return self.src.bytes[self.offset]
+
+    func peek_at(ahead: usize) -> u8:
+        if self.offset + ahead >= self.src.bytes.length:
+            return 0
+        return self.src.bytes[self.offset + ahead]
+
+    func is_letter(c: u8) -> bool:
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+
+    func is_digit(c: u8) -> bool:
+        return c >= '0' and c <= '9'
+
+    func is_hex(c: u8) -> bool:
+        return self.is_digit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+
+    func make(kind: token.Kind, start: usize) -> token.Token:
+        return token.Token(kind = kind, start = start, end = self.offset, line = self.line,
+                           column = u32(start - self.line_start) + 1)
+
+    func mode() -> u8:
+        if self.mode_depth == 0:
+            return 0
+        return self.modes[self.mode_depth - 1]
+
+    mutating func push_mode(m: u8) -> !:
+        if self.mode_depth >= max_modes:
+            error(unterminated, "formatted strings nest too deeply")
+        self.modes[self.mode_depth] = m
+        self.mode_depth += 1
+
+    mutating func pop_mode():
+        if self.mode_depth > 0:
+            self.mode_depth -= 1
+
+    mutating func newline_here():
+        self.offset += 1
+        self.line += 1
+        self.line_start = self.offset
+        self.at_line_start = true
+
+    ## Skip spaces and a trailing comment; a `##` at a line's start is a token.
+    mutating func skip_trivia() -> token.Token?!:
+        while true:
+            let c = self.peek()
+            if c == ' ':
+                self.offset += 1
+            elif c == '\t':
+                error(tab, "tabs are not allowed; use four spaces")
+            elif c == '\r' and self.peek_at(1) == '\n':
+                self.offset += 1
+            elif c == '#':
+                let start = self.offset
+                let doc = self.peek_at(1) == '#' and start == self.line_start
+                while self.peek() != '\n' and self.peek() != 0:
+                    self.offset += 1
+                self.comment_end = self.offset
+                if doc:
+                    return self.make(token.Kind.doc_comment, start)
+            else:
+                return none
+
+    ## Measure the current line's indentation and queue layout tokens.
+    mutating func layout() -> token.Token?!:
+        var column: u32 = 0
+        while true:
+            column = 0
+            while self.peek() == ' ':
+                self.offset += 1
+                column += 1
+            let c = self.peek()
+            if c == '#' and not (self.peek_at(1) == '#' and column == 0):
+                while self.peek() != '\n' and self.peek() != 0:
+                    self.offset += 1            # a comment-only line
+                continue
+            if c == '\n':
+                self.newline_here()             # a blank line
+                continue
+            if c == '\r' and self.peek_at(1) == '\n':
+                self.offset += 1
+                continue
+            break
+        if self.peek() == 0 or self.peek() == '#':
+            return none                         # end of input, or a doc comment
+        self.at_line_start = false
+        if self.delimiters > 0 and not self.reopened and self.depth <= self.bracket_base[(usize)self.delimiters - 1]:
+            return none                         # spacing inside brackets
+        self.reopened = false
+        let current = self.levels[self.depth]
+        if column > current:
+            if self.depth + 1 >= max_blocks:
+                error(bad_indent, "blocks nest too deeply")
+            if column != current + 4:
+                error(bad_indent, "a block indents by exactly four spaces")
+            self.depth += 1
+            self.levels[self.depth] = column
+            return self.make(token.Kind.indent, self.offset)
+        while column < self.levels[self.depth]:
+            self.depth -= 1
+            self.pending_dedents += 1
+        if column != self.levels[self.depth]:
+            error(bad_indent, "indentation does not match an open block")
+        if self.pending_dedents > 0:
+            self.pending_dedents -= 1
+            return self.make(token.Kind.dedent, self.offset)
+        return none
+
+    mutating func number(start: usize) -> token.Token!:
+        var kind = token.Kind.integer
+        if self.peek() == '0' and (self.peek_at(1) == 'X' or self.peek_at(1) == 'O' or self.peek_at(1) == 'B'):
+            error(bad_character, "a based integer prefix is lowercase: `0x`, `0o`, or `0b`")
+        if self.peek() == '0' and (self.peek_at(1) == 'x' or self.peek_at(1) == 'o' or self.peek_at(1) == 'b'):
+            self.offset += 2
+            while self.is_hex(self.peek()) or self.peek() == '_':
+                self.offset += 1
+        else:
+            while self.is_digit(self.peek()) or self.peek() == '_':
+                self.offset += 1
+            if self.peek() == '.' and self.is_digit(self.peek_at(1)):
+                kind = token.Kind.float
+                self.offset += 1
+                while self.is_digit(self.peek()) or self.peek() == '_':
+                    self.offset += 1
+            if (self.peek() == 'e' or self.peek() == 'E') and (self.is_digit(self.peek_at(1)) or ((self.peek_at(1) == '+' or self.peek_at(1) == '-') and self.is_digit(self.peek_at(2)))):
+                kind = token.Kind.float
+                self.offset += 2
+                while self.is_digit(self.peek()):
+                    self.offset += 1
+        if self.is_letter(self.peek()):
+            error(bad_character, "a number has no suffix: `int` and `float` are the only widths")
+        return self.make(kind, start)
+
+    ## The escapes of §3.3: `\\ \" \n \r \t \0 \u{HEX}`, and `\xNN` in a byte literal only.
+    mutating func escape(bytes: bool) -> !:
+        self.offset += 1                        # the backslash
+        let c = self.peek()
+        if c == 'u' and self.peek_at(1) == '{':
+            self.offset += 2
+            var digits: usize = 0
+            while self.is_hex(self.peek()):
+                self.offset += 1
+                digits += 1
+            if self.peek() != '}' or digits == 0 or digits > 6:
+                error(bad_character, "a Unicode escape is \\u{HEX} with one to six digits")
+            self.offset += 1
+            return
+        if c == 0 or c == '\n':
+            error(unterminated, "escape at the end of the line")
+        if bytes and c == 'x':
+            if not (self.is_hex(self.peek_at(1)) and self.is_hex(self.peek_at(2))):
+                error(bad_character, "a byte escape is \\xNN")
+            self.offset += 3
+            return
+        if c != '\\' and c != '"' and c != 'n' and c != 'r' and c != 't' and c != '0':
+            error(bad_character, "unknown escape")
+        self.offset += 1
+
+    ## A quoted literal after its opening quote: text, bytes, raw, or triple.
+    mutating func quoted(kind: token.Kind, start: usize, triple: bool, raw: bool) -> token.Token!:
+        # a triple-quoted literal spans lines; its token keeps the line and column it opened on
+        let first_line = self.line
+        let first_start = self.line_start
+        while true:
+            let c = self.peek()
+            if c == 0:
+                error(unterminated, "unterminated string literal")
+            if c == '\n' and not triple:
+                error(unterminated, "a string literal does not span lines")
+            if c == '\\' and not raw:
+                try self.escape(kind == token.Kind.bytes)
+                continue
+            if kind == token.Kind.bytes and c >= 0x80:
+                error(bad_character, "a byte literal holds ASCII text and `\\xNN` escapes")
+            if c == '"':
+                if not triple:
+                    self.offset += 1
+                    return self.make(kind, start)
+                if self.peek_at(1) == '"' and self.peek_at(2) == '"':
+                    self.offset += 3
+                    return token.Token(kind = kind, start = start, end = self.offset, line = first_line,
+                                       column = u32(start - first_start) + 1)
+            if c == '\n':
+                self.line += 1
+                self.line_start = self.offset + 1
+            self.offset += 1
+
+    ## The literal part of a formatted string up to the next field or its end.
+    mutating func format_part() -> token.Token!:
+        let start = self.offset
+        while true:
+            let c = self.peek()
+            if c == 0 or c == '\n':
+                error(unterminated, "unterminated formatted string")
+            if c == '"':
+                if self.offset > start:
+                    return self.make(token.Kind.format_text, start)
+                self.offset += 1
+                self.pop_mode()
+                return self.make(token.Kind.format_end, start)
+            if c == '{':
+                if self.peek_at(1) == '{':
+                    self.offset += 2
+                    continue
+                if self.offset > start:
+                    return self.make(token.Kind.format_text, start)
+                self.offset += 1
+                try self.push_mode(2)
+                return self.make(token.Kind.operator, start)
+            if c == '}' and self.peek_at(1) == '}':
+                self.offset += 2
+                continue
+            if c == '\\':
+                try self.escape(false)
+                continue
+            self.offset += 1
+
+    mutating func operator(start: usize) -> token.Token!:
+        for op in token.operators:
+            if self.offset + op.length <= self.src.bytes.length and (str)self.src.bytes[self.offset..<self.offset + op.length] == op:
+                self.offset += op.length
+                return self.make(token.Kind.operator, start)
+        for op in token.singles:
+            if self.peek() == op.bytes[0]:
+                self.offset += 1
+                return self.make(token.Kind.operator, start)
+        error(bad_character, "unexpected character")
+
+    pub mutating func next() -> token.Token!:
+        if self.pending_dedents > 0:
+            self.pending_dedents -= 1
+            return self.make(token.Kind.dedent, self.offset)
+        if self.mode() == 1:
+            return try self.format_part()
+        if self.at_line_start:
+            if let layout_token = try self.layout():
+                return layout_token
+        if let comment = try self.skip_trivia():
+            return comment
+        let start = self.offset
+        let c = self.peek()
+        if c == 0:
+            if self.depth > 0:
+                self.depth -= 1
+                return self.make(token.Kind.dedent, start)
+            return self.make(token.Kind.eof, start)
+        if c == '\n':
+            self.newline_here()
+            if self.delimiters > 0 and self.depth <= self.bracket_base[(usize)self.delimiters - 1]:
+                if not self.colon_ended(start):
+                    return try self.next()      # spacing inside brackets
+                self.reopened = true
+            let t = token.Token(kind = token.Kind.newline, start = start, end = start + 1,
+                                line = self.line - 1, column = u32(start - self.line_start_before(start)) + 1)
+            return t
+        if self.is_letter(c):
+            # b"...", r"...", f"..." are literals, not names
+            if (c == 'b' or c == 'r' or c == 'f') and self.peek_at(1) == '"':
+                self.offset += 2
+                if c == 'f':
+                    try self.push_mode(1)
+                    return self.make(token.Kind.format_start, start)
+                let triple = self.peek() == '"' and self.peek_at(1) == '"'
+                if triple:
+                    self.offset += 2
+                return try self.quoted(token.Kind.bytes if c == 'b' else token.Kind.raw, start, triple, c == 'r')
+            while self.is_letter(self.peek()) or self.is_digit(self.peek()):
+                self.offset += 1
+            if self.offset - start > longest_name:
+                error(bad_character, "an identifier is at most 128 bytes")
+            let word = self.src.text(start, self.offset)
+            if token.is_keyword(word):
+                return self.make(token.Kind.keyword, start)
+            return self.make(token.Kind.name, start)
+        if self.is_digit(c):
+            return try self.number(start)
+        if c == '"':
+            self.offset += 1
+            if self.peek() == '"' and self.peek_at(1) == '"':
+                self.offset += 2
+                return try self.quoted(token.Kind.text, start, true, false)
+            return try self.quoted(token.Kind.text, start, false, false)
+        if c == '(' or c == '[' or c == '{':
+            # the depth a bracket was opened at is kept for each; more open brackets than
+            # the table holds is a diagnostic, never a fault
+            if (usize)self.delimiters >= self.bracket_base.length:
+                error(bad_indent, "brackets nest too deeply")
+            self.bracket_base[(usize)self.delimiters] = self.depth
+            self.delimiters += 1
+        elif c == ')' or c == ']' or (c == '}' and self.mode() != 2):
+            if self.delimiters > 0:
+                # a closer on a suite's last line ends the suite first
+                let base = self.bracket_base[(usize)self.delimiters - 1]
+                if self.depth > base:
+                    while self.depth > base:
+                        self.depth -= 1
+                        self.pending_dedents += 1
+                    self.pending_dedents -= 1
+                    self.reopened = false
+                    return self.make(token.Kind.dedent, start)
+                self.delimiters -= 1
+        elif c == '}':
+            self.offset += 1
+            self.pop_mode()
+            return self.make(token.Kind.operator, start)
+        return try self.operator(start)
+
+    ## Whether the physical line ending at `end` ends with `:` (a suite inside brackets).
+    func colon_ended(end: usize) -> bool:
+        if self.comment_end == end:
+            return false                        # the line ends in a comment
+        var i = end
+        while i > 0:
+            i -= 1
+            let c = self.src.bytes[i]
+            if c == ' ':
+                continue
+            return c == ':'
+        return false
+
+    ## The start of the line containing `offset`, for a token made after a newline.
+    func line_start_before(offset: usize) -> usize:
+        var i = offset
+        while i > 0 and self.src.bytes[i - 1] != '\n':
+            i -= 1
+        return i
+
+    pub func text(t: token.Token) -> str:
+        return self.src.text(t.start, t.end)
+
+# mark: Entry point and tests =================================================================
+
+## Tokenize `text` into `out`; the number of tokens, `eof` excluded.
+pub func tokenize(text: str, out: token.Token[]) -> usize!:
+    let src = try source.Source.over("test", text.bytes)
+    var lexer = Lexer.over(src)
+    var n: usize = 0
+    while true:
+        let t = try lexer.next()
+        if t.kind == token.Kind.eof:
+            return n
+        if n >= out.length:
+            error(unterminated, "token buffer is full")
+        out[n] = t
+        n += 1
+
+test "names, keywords and operators":
+    var toks: token.Token[16] = ---
+    let n = tokenize("let x **= 40_000", toks) catch failure: recover 0
+    assert(n == 4)
+    assert(toks[0].kind == token.Kind.keyword)
+    assert(toks[1].kind == token.Kind.name)
+    assert(toks[2].kind == token.Kind.operator)
+    assert(toks[2].end - toks[2].start == 3)
+    assert(toks[3].kind == token.Kind.integer)
+
+test "layout makes indent and dedent":
+    var toks: token.Token[32] = ---
+    let n = tokenize("if a:\n    b\n    c\nd\n", toks) catch failure: recover 0
+    assert(n == 12)
+    assert(toks[4].kind == token.Kind.indent)
+    assert(toks[9].kind == token.Kind.dedent)
+
+test "newlines inside brackets are spacing":
+    var toks: token.Token[32] = ---
+    let n = tokenize("f(1,\n  2)\n", toks) catch failure: recover 0
+    assert(n == 7)
+
+test "formatted strings split into parts":
+    var toks: token.Token[32] = ---
+    let n = tokenize("f\"a {b} c\"", toks) catch failure: recover 0
+    assert(n == 7)
+    assert(toks[0].kind == token.Kind.format_start)
+    assert(toks[3].kind == token.Kind.name)
+    assert(toks[6].kind == token.Kind.format_end)
+
+test "literals":
+    var toks: token.Token[32] = ---
+    let n = tokenize("\"s\" b\"\\x00\" r\"\\\" 1.5e3 0xff \"\"\"\nx\n\"\"\"", toks) catch failure: recover 0
+    assert(n == 6)
+    assert(toks[0].kind == token.Kind.text)
+    assert(toks[1].kind == token.Kind.bytes)
+    assert(toks[2].kind == token.Kind.raw)
+    assert(toks[3].kind == token.Kind.float)
+    assert(toks[4].kind == token.Kind.integer)
+    assert(toks[5].kind == token.Kind.text)
+
+test "a number has no suffix and a tab is an error":
+    var toks: token.Token[8] = ---
+    var refused = false
+    discard(tokenize("12u8", toks) catch failure:
+        refused = failure.code == bad_character
+        recover 0)
+    assert(refused)
+    refused = false
+    discard(tokenize("\tx", toks) catch failure:
+        refused = failure.code == tab
+        recover 0)
+    assert(refused)
+
+test "a suite inside brackets closes with the bracket":
+    var toks: token.Token[64] = ---
+    let n = tokenize("f(x catch e:\n    recover 0)\ny\n", toks) catch failure: recover 0
+    assert(n == 15)
+    assert(toks[7].kind == token.Kind.indent)
+    assert(toks[10].kind == token.Kind.dedent)
+    assert(toks[11].kind == token.Kind.operator)
+
+test "a colon in a trailing comment does not open a suite":
+    var toks: token.Token[64] = ---
+    let n = tokenize("f(1,   # note:\n  2)\n", toks) catch failure: recover 0
+    assert(n == 7)
+
+test "an identifier is at most 128 bytes":
+    var toks: token.Token[8] = ---
+    var long: u8[130] = ---
+    var i: usize = 0
+    while i < 130:
+        long[i] = 'a'
+        i += 1
+    var refused = false
+    discard(tokenize((str)long[..<129], toks) catch failure:
+        refused = true
+        recover 0)
+    assert(refused)
+    let n = tokenize((str)long[..<128], toks) catch failure: recover 0
+    assert(n == 1)

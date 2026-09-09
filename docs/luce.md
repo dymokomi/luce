@@ -780,8 +780,10 @@ from image.geometry import Point, Size
 ```
 
 `import` keeps a module qualified, with an optional alias; `from ... import` brings the named
-public declarations in. Imports come first and are used. Declarations and fields are private
-to their module unless `pub`. A public signature mentions only public types.
+public declarations in. Imports come first and are used. Declarations, fields and methods are
+private to their module unless `pub`: a `pub` type with no `pub` member can be named and
+passed but not read or called from another module. A public signature mentions only public
+types.
 
 ### 15.3 Top level
 
