@@ -1,5 +1,16 @@
 # Releases
 
+## 0.1.2
+
+- Dynamic error messages remain counted and are released when their last owner goes.
+  Caught `Error` values can safely escape in collections or return values. Nested
+  failures during cleanup preserve a message still propagating.
+- Workers keep failed-task messages until the waiter copies them; abandoned tasks
+  release their messages too. Sending an ordinary `Error` copies its text.
+- Unhandled main and test failures release their messages before the heap exit check.
+- Pin Base 0.11.27 for correct deferred cleanup on `recover` and the native `--opt 1`
+  indirect-call fix.
+
 ## 0.1.1
 
 - Declared Base handle destroy functions use Luce's close-once bookkeeping, so direct
