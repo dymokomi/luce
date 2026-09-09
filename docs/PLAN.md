@@ -8,9 +8,10 @@ and generics, modules and packages, the Base boundary, workers, the tooling, and
 name their statement, over the runtime of `docs/RUNTIME.md`, with four executions agreeing
 on every conformance program and every run proving it left nothing alive.
 
-| Slice | Scope | Gate |
-| --- | --- | --- |
-| 13. Proving programs and the generator | applications big enough to break a compiler; the fuzzer's generator widened to the whole language | each program under the gate; an hour of the generator clean |
+The table is empty: every slice of the plan closed, and the next work is decided with the
+language's author rather than listed here. What stands ready for it: `tests/programs/`
+holds the proving programs, `tools/fuzz.py --minutes 60` runs the generator for an hour,
+and the standing rules below hold for whatever comes next.
 
 ## Standing rules
 
