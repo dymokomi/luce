@@ -77,6 +77,14 @@ pub struct Emitter:
     var crossings_done: usize
     var callbacks: list.List[ast.Node*]
     var callbacks_done: usize
+    ## Workers (§14): each `spawn` gets a task object, a run and a cleanup after the
+    ## program; each result type a `wait`; each sent type a copy that shares nothing.
+    var spawns: list.List[ast.Node*]
+    var spawns_done: usize
+    var waits: list.List[u32]
+    var waits_done: usize
+    var sends: list.List[u32]
+    var sends_done: usize
     ## The lambda whose body is being written, so its captures read from its object.
     var lambda: ast.Node*?
     ## How many of each list are written out, since writing one set of functions can
@@ -108,7 +116,8 @@ pub struct Emitter:
                        bounds = try list.List[ast.Node*].create(16), bounds_done = 0, calls = try list.List[u32].create(16), calls_done = 0,
                        cells = try list.List[u32].create(16), cells_done = 0, lambda = none,
                        box_interfaces = try list.List[u32].create(16), box_types = try list.List[u32].create(16), boxes_done = 0,
-                       crossings = try list.List[ast.Node*].create(16), crossing_owners = try list.List[ast.Node*].create(16), crossings_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0,
+                       crossings = try list.List[ast.Node*].create(16), crossing_owners = try list.List[ast.Node*].create(16), crossings_done = 0,
+                       spawns = try list.List[ast.Node*].create(8), spawns_done = 0, waits = try list.List[u32].create(8), waits_done = 0, sends = try list.List[u32].create(16), sends_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self")
 
@@ -553,6 +562,451 @@ pub struct Emitter:
             try self.put("*)o")
             try self.end()
             try self.line("")
+
+    # -- workers (§14) ---------------------------------------------------------------------
+
+    ## The type a task's result is kept as: the success type, `u8` for nothing.
+    func task_payload(task_type: u32) -> u32:
+        var r = self.checker.table.get(task_type).elem
+        if self.checker.table.kind(r) == types.Kind.fallible:
+            r = self.checker.table.get(r).elem
+        return types.bool_id if r == types.unit_id else r
+
+    mutating func spawn_name(e: ast.Node*) -> str!:
+        var i: usize = 0
+        var at = self.spawns.count
+        while i < self.spawns.count:
+            if self.spawns.get(i) == e:
+                at = i
+            i += 1
+        if at == self.spawns.count:
+            try self.spawns.push(e)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_task_{at}__spawn"))
+
+    mutating func wait_name(task_type: u32) -> str!:
+        var i: usize = 0
+        var seen = false
+        while i < self.waits.count:
+            if self.waits.get(i) == task_type:
+                seen = true
+            i += 1
+        if not seen:
+            try self.waits.push(task_type)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_wait_{task_type}"))
+
+    ## `L_send_N(v)` for a type whose values are copied to share nothing, or `v` itself for
+    ## a scalar, which is its own copy.
+    mutating func send_of(t: u32, v: str) -> !:
+        let k = self.checker.table.kind(t)
+        if k == types.Kind.int_ or k == types.Kind.float_ or k == types.Kind.bool_ or k == types.Kind.unit_ or k == types.Kind.error_code or k == types.Kind.range_:
+            try self.put(v)
+            return
+        var i: usize = 0
+        var seen = false
+        while i < self.sends.count:
+            if self.sends.get(i) == t:
+                seen = true
+            i += 1
+        if not seen:
+            try self.sends.push(t)
+        try self.put("L_send_")
+        try self.put_u64((u64)t)
+        try self.put("(")
+        try self.put(v)
+        try self.put(")")
+
+    mutating func worker_support() -> !:
+        while self.spawns_done < self.spawns.count:
+            let e = self.spawns.get(self.spawns_done)
+            let index = self.spawns_done
+            self.spawns_done += 1
+            try self.task_object(e, index)
+        while self.waits_done < self.waits.count:
+            let t = self.waits.get(self.waits_done)
+            self.waits_done += 1
+            try self.wait_function(t)
+        while self.sends_done < self.sends.count:
+            let t = self.sends.get(self.sends_done)
+            self.sends_done += 1
+            try self.send_function(t)
+
+    ## One spawn's task: the object holding the spawner's arguments, then the worker's own
+    ## copies and the result; `run` on the worker, `cleanup` on the worker once the result
+    ## was taken, `spawn` on the spawner (RUNTIME).
+    mutating func task_object(e: ast.Node*, index: usize) -> !:
+        let call = e.left else return
+        let d = call.resolved else return try self.fail(e, "an unresolved spawn")
+        let ft = self.checker.table.get(d.type_id)
+        let fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        let payload = self.task_payload(e.type_id)
+        let has_result = payload != types.bool_id or (ft.elem != types.unit_id and not (fallible and self.checker.table.get(ft.elem).elem == types.unit_id))
+        let half = self.checker.scratch.length // 2
+        let name = try copy_name(try format(self.checker.scratch[half..], f"L_task_{index}"))
+        try self.begin("struct ")
+        try self.put(name)
+        try self.put(":")
+        try self.end()
+        try self.begin("    var base: kernel.TaskOf[")
+        try self.type_of(payload)
+        try self.put("]")
+        try self.end()
+        var cursor = d.right
+        while let p = cursor:
+            try self.begin("    var L_")
+            try self.put(p.text)
+            try self.put(": ")
+            try self.type_of(p.type_id)
+            try self.end()
+            try self.begin("    var W_")
+            try self.put(p.text)
+            try self.put(": ")
+            try self.type_of(p.type_id)
+            try self.end()
+            cursor = p.next
+        try self.line("")
+        # run: on the worker
+        try self.begin("func ")
+        try self.put(name)
+        try self.put("__run(t: kernel.Task*):")
+        try self.end()
+        try self.begin("    let o = (")
+        try self.put(name)
+        try self.put("*)t")
+        try self.end()
+        cursor = d.right
+        while let p = cursor:
+            try self.begin("    o.W_")
+            try self.put(p.text)
+            try self.put(" = ")
+            let source = try copy_name(try format(self.checker.scratch[half..], f"o.L_{p.text}"))
+            try self.send_of(p.type_id, source)
+            try self.end()
+            cursor = p.next
+        try self.line("    kernel.task_copied(t)")
+        try self.begin("    ")
+        if has_result:
+            try self.put("o.base.result = ")
+        try self.put("L_")
+        try self.put(try self.decl_name(d))
+        try self.put("(")
+        var first = true
+        cursor = d.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put("o.W_")
+            try self.put(p.text)
+            cursor = p.next
+        try self.put(")")
+        if fallible:
+            try self.put(" catch failure:")
+            try self.end()
+            try self.line("        kernel.task_failed(t, failure.code, failure.message)")
+            try self.line("        return")
+        else:
+            try self.end()
+        try self.line("")
+        # cleanup: on the worker, after the waiter took the result
+        try self.begin("func ")
+        try self.put(name)
+        try self.put("__cleanup(t: kernel.Task*):")
+        try self.end()
+        try self.begin("    let o = (")
+        try self.put(name)
+        try self.put("*)t")
+        try self.end()
+        var any = false
+        cursor = d.right
+        while let p = cursor:
+            if self.checker.table.has_references(p.type_id):
+                try self.begin("    ")
+                try self.put(try self.lifetime_name("L_drop_", p.type_id))
+                try self.put("(o.W_")
+                try self.put(p.text)
+                try self.put(")")
+                try self.end()
+                any = true
+            cursor = p.next
+        if has_result and self.checker.table.has_references(payload):
+            try self.line("    if not t.failed:")
+            try self.begin("        ")
+            try self.put(try self.lifetime_name("L_drop_", payload))
+            try self.put("(o.base.result)")
+            try self.end()
+            any = true
+        if not any:
+            try self.line("    discard(o)")
+        try self.line("")
+        # drop and trace: the spawner lets the task go
+        try self.begin("func ")
+        try self.put(name)
+        try self.put("__drop(obj: heap.Object*):")
+        try self.end()
+        try self.line("    kernel.task_abandon((kernel.Task*)obj)")
+        try self.begin("func ")
+        try self.put(name)
+        try self.put("__trace(obj: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):")
+        try self.end()
+        try self.line("    discard(obj)")
+        try self.begin("var ")
+        try self.put(name)
+        try self.put("__info: heap.Info = heap.Info(name = \"task\", size = sizeof(")
+        try self.put(name)
+        try self.put("), finish = none, drop = ")
+        try self.put(name)
+        try self.put("__drop, trace = ")
+        try self.put(name)
+        try self.put("__trace)")
+        try self.end()
+        try self.line("")
+        # spawn: on the spawner
+        try self.begin("func ")
+        try self.put(name)
+        try self.put("__spawn(")
+        first = true
+        cursor = d.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put("L_")
+            try self.put(p.text)
+            try self.put(": ")
+            try self.type_of(p.type_id)
+            cursor = p.next
+        try self.put(") -> kernel.TaskOf[")
+        try self.type_of(payload)
+        try self.put("]*:")
+        try self.end()
+        try self.begin("    let o = (")
+        try self.put(name)
+        try self.put("*)heap.allocate(&")
+        try self.put(name)
+        try self.put("__info)")
+        try self.end()
+        cursor = d.right
+        while let p = cursor:
+            try self.begin("    o.L_")
+            try self.put(p.text)
+            try self.put(" = L_")
+            try self.put(p.text)
+            try self.end()
+            cursor = p.next
+        try self.begin("    kernel.task_start(&o.base.task, ")
+        try self.put(name)
+        try self.put("__run, ")
+        try self.put(name)
+        try self.put("__cleanup)")
+        try self.end()
+        cursor = d.right
+        while let p = cursor:
+            if self.checker.table.has_references(p.type_id):
+                try self.begin("    ")
+                try self.put(try self.lifetime_name("L_drop_", p.type_id))
+                try self.put("(o.L_")
+                try self.put(p.text)
+                try self.put(")")
+                try self.end()
+            cursor = p.next
+        try self.line("    return &o.base")
+        try self.line("")
+
+    ## `wait` for one task type: the result copied onto the waiter's heap, or the failure.
+    mutating func wait_function(task_type: u32) -> !:
+        let elem = self.checker.table.get(task_type).elem
+        let fallible = self.checker.table.kind(elem) == types.Kind.fallible
+        let payload = self.task_payload(task_type)
+        var success = elem
+        if fallible:
+            success = self.checker.table.get(elem).elem
+        try self.begin("func L_wait_")
+        try self.put_u64((u64)task_type)
+        try self.put("(t: ")
+        try self.type_of(task_type)
+        try self.put(")")
+        try self.result_type(elem)
+        try self.put(":")
+        try self.end()
+        try self.line("    kernel.task_join(&t.task)")
+        if fallible:
+            try self.line("    if t.task.failed:")
+            try self.line("        let code = t.task.code")
+            try self.line("        let message = t.task.message")
+            try self.line("        kernel.task_finish(&t.task)")
+            try self.line("        error(code, message)")
+        if success != types.unit_id:
+            try self.begin("    let answer = ")
+            try self.send_of(payload, "t.result")
+            try self.end()
+        try self.line("    kernel.task_finish(&t.task)")
+        if success != types.unit_id:
+            try self.line("    return answer")
+        try self.line("")
+
+    ## A copy of a value that shares nothing with the original (§14): a text and bytes
+    ## anew, a collection with its elements sent, a struct, enum, tuple or optional
+    ## member by member.
+    mutating func send_function(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.begin("func L_send_")
+        try self.put_u64((u64)id)
+        try self.put("(v: ")
+        try self.type_of(id)
+        try self.put(") -> ")
+        try self.type_of(id)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        let half = self.checker.scratch.length // 2
+        match t.kind:
+            .str_: try self.line("return kernel.text_of(kernel.text_view(v))")
+            .bytes_: try self.line("return kernel.bytes_of(kernel.bytes_view(v))")
+            .list_:
+                try self.begin("let out = kernel.list_new[")
+                try self.type_of(t.elem)
+                try self.put("](&")
+                try self.put(try self.lifetime_name("L_info_", id))
+                try self.put(", ")
+                try self.put(try self.ops_name(t.elem))
+                try self.put(")")
+                try self.end()
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.list_append[")
+                try self.type_of(t.elem)
+                try self.put("](out, ")
+                try self.send_of(t.elem, "v.items[i]")
+                try self.put(")")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return out")
+            .set_:
+                try self.begin("let out = kernel.set_new[")
+                try self.type_of(t.elem)
+                try self.put("](&")
+                try self.put(try self.lifetime_name("L_info_", id))
+                try self.put(", ")
+                try self.put(try self.ops_name(t.elem))
+                try self.put(")")
+                try self.end()
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.set_insert[")
+                try self.type_of(t.elem)
+                try self.put("](out, ")
+                try self.send_of(t.elem, "v.keys[i]")
+                try self.put(")")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return out")
+            .map_:
+                let value_type = self.checker.table.map_value(id)
+                try self.begin("let out = kernel.map_new[")
+                try self.type_of(t.elem)
+                try self.put(", ")
+                try self.type_of(value_type)
+                try self.put("](&")
+                try self.put(try self.lifetime_name("L_info_", id))
+                try self.put(", ")
+                try self.put(try self.ops_name(t.elem))
+                try self.put(", ")
+                try self.put(try self.ops_name(value_type))
+                try self.put(")")
+                try self.end()
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.map_set[")
+                try self.type_of(t.elem)
+                try self.put(", ")
+                try self.type_of(value_type)
+                try self.put("](out, ")
+                try self.send_of(t.elem, "v.keys[i]")
+                try self.put(", ")
+                try self.send_of(value_type, "v.values[i]")
+                try self.put(")")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return out")
+            .optional:
+                try self.line("if let x = v:")
+                try self.begin("    return ")
+                try self.send_of(t.elem, "x")
+                try self.end()
+                try self.line("return none")
+            .tuple:
+                try self.begin("return (")
+                var i: usize = 0
+                while i < t.args.length:
+                    if i > 0:
+                        try self.put(", ")
+                    let member = try copy_name(try format(self.checker.scratch[half..], f"v.{i}"))
+                    try self.send_of(t.args[i], member)
+                    i += 1
+                if t.args.length == 1:
+                    try self.put(",")
+                try self.put(")")
+                try self.end()
+            .struct_:
+                let d = t.decl else return try self.fail(self.checker.tree(), "a struct without a declaration")
+                try self.begin("return L_")
+                try self.put(t.name)
+                try self.put("(")
+                var first = true
+                var cursor = d.body
+                while let f = cursor:
+                    if f.kind == ast.Kind.field:
+                        if not first:
+                            try self.put(", ")
+                        first = false
+                        let member = try copy_name(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
+                        try self.send_of(f.type_id, member)
+                    cursor = f.next
+                try self.put(")")
+                try self.end()
+            .enum_:
+                let d = t.decl else return try self.fail(self.checker.tree(), "an enum without a declaration")
+                try self.line("match v:")
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.enum_case:
+                        try self.begin("    .L_")
+                        try self.put(m.text)
+                        if m.body != none:
+                            try self.put("(")
+                            var p = m.body
+                            var first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(", ")
+                                first = false
+                                try self.put("L_")
+                                try self.put(field.text)
+                                p = field.next
+                            try self.put(")")
+                        try self.put(": return L_")
+                        try self.put(t.name)
+                        try self.put(".L_")
+                        try self.put(m.text)
+                        if m.body != none:
+                            try self.put("(")
+                            var p = m.body
+                            var first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(", ")
+                                first = false
+                                let member = try copy_name(try format(self.checker.scratch[half..], f"L_{field.text}"))
+                                try self.send_of(field.type_id, member)
+                                p = field.next
+                            try self.put(")")
+                        try self.end()
+                    cursor = m.next
+            _: return try self.fail(self.checker.tree(), "a value that is not sendable reached a worker")
+        self.indent -= 1
+        try self.line("")
 
     # -- the Base boundary (§16) -----------------------------------------------------------
 
@@ -1475,6 +1929,10 @@ pub struct Emitter:
                 try self.put("*")
             .weak_:
                 try self.put("heap.Weak")
+            .task_:
+                try self.put("kernel.TaskOf[")
+                try self.type_of(self.task_payload(id))
+                try self.put("]*")
             _:
                 error(unsupported, "a type this slice does not compile")
 
@@ -2587,6 +3045,27 @@ pub struct Emitter:
                 try self.put("(")
                 try self.expr(inner)
                 try self.put(")")
+            .spawn_:
+                # a task object of this spawn's own shape, given the arguments (§14)
+                let call = e.left else return
+                try self.put(try self.spawn_name(e))
+                try self.put("(")
+                var first = true
+                var a = call.body
+                while let arg = a:
+                    if not first:
+                        try self.put(", ")
+                    first = false
+                    let v = arg.left else return
+                    try self.owned(v)
+                    a = arg.next
+                try self.put(")")
+            .wait_:
+                let inner = e.left else return
+                try self.put(try self.wait_name(inner.type_id))
+                try self.put("(")
+                try self.use(inner)
+                try self.put(")")
             .convert:
                 # a conforming value boxed as an interface value (§13.2); the box owns a copy
                 let inner = e.left else return
@@ -3669,8 +4148,8 @@ pub struct Emitter:
     ## can register more, so the sets are walked until nothing new appears.
     mutating func support_functions() -> !:
         while true:
-            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count + self.crossings.count + self.callbacks.count
-            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done + self.crossings_done + self.callbacks_done
+            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count + self.crossings.count + self.callbacks.count + self.spawns.count + self.waits.count + self.sends.count
+            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done + self.crossings_done + self.callbacks_done + self.spawns_done + self.waits_done + self.sends_done
             if before == done:
                 return
             try self.show_functions()
@@ -3682,6 +4161,7 @@ pub struct Emitter:
             try self.closure_support()
             try self.box_support()
             try self.boundary_support()
+            try self.worker_support()
 
     ## `&L_text_N`: the immortal object of a literal, one per distinct text (RUNTIME).
     mutating func text_ref(text: str, as_bytes: bool) -> str!:
@@ -3727,7 +4207,7 @@ pub struct Emitter:
         try self.lifetime_head("L_copy_", id, ") -> ", id)
         self.indent += 1
         match t.kind:
-            .class_, .interface_, .list_, .map_, .set_, .str_, .bytes_, .func_:
+            .class_, .interface_, .list_, .map_, .set_, .str_, .bytes_, .func_, .task_:
                 try self.begin("return (")
                 try self.type_of(id)
                 try self.put(")heap.retain((heap.Object*)v)")
@@ -3888,7 +4368,7 @@ pub struct Emitter:
             try self.collection_support(id, t)
 
     func is_object_kind(k: types.Kind) -> bool:
-        return k == types.Kind.class_ or k == types.Kind.interface_ or k == types.Kind.list_ or k == types.Kind.map_ or k == types.Kind.set_ or k == types.Kind.str_ or k == types.Kind.bytes_ or k == types.Kind.func_
+        return k == types.Kind.class_ or k == types.Kind.interface_ or k == types.Kind.list_ or k == types.Kind.map_ or k == types.Kind.set_ or k == types.Kind.str_ or k == types.Kind.bytes_ or k == types.Kind.func_ or k == types.Kind.task_
 
     ## What a collection needs beside its lifetime functions: the runtime's descriptor and
     ## the drop and trace it calls; the element operations come per element type.
@@ -4999,7 +5479,7 @@ pub struct Emitter:
                     try self.line("    heap.release((heap.Object*)v)")
                 else:
                     try self.line("discard(v)")
-            .class_, .interface_, .list_, .map_, .set_, .func_:
+            .class_, .interface_, .list_, .map_, .set_, .func_, .task_:
                 try self.line("if (usize)v != 0:")
                 if prefix == "L_drop_":
                     try self.line("    heap.release((heap.Object*)v)")

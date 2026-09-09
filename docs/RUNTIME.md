@@ -121,6 +121,20 @@ how a class behind an interface value goes when the value does; the collector tr
 through the box, so a cycle through interface values is found like any cycle. Every
 box of one interface and one conforming type shares one table, emitted once.
 
+## Workers
+
+A task (§14) is an object of the spawner's heap holding the arguments, the worker's copies
+of them, and the result. Every thread has a heap of its own: the object counts, the
+temporaries pool and the collector's candidates are thread-local. The worker copies the
+arguments onto its heap (a text or bytes anew, a collection with its elements copied, a
+struct, enum, tuple or optional member by member) and only then does `spawn` return, so
+the spawner may change what it passed; it runs the call, keeps the result or the failure's
+code and message, and signals. `wait` copies the result onto the waiter's heap, or raises
+the failure, and lets the worker release its copies and end; a worker that leaves objects
+alive stops the program with `luce: N objects alive when a task ended`. A task is waited
+once; a second `wait` traps. Releasing a task not yet waited waits for it and discards the
+result. The interpreter runs the call at `spawn`, with copies in and out the same way.
+
 ## Handles
 
 A handle (§16.4) is an object holding the Base value and whether it was closed. `close()`

@@ -810,9 +810,14 @@ let (a, b) = (wait work, wait other)
 `task[T]`; `wait task` yields its result, or its failure if `f` is `!`. Arguments and results
 are sendable: scalars, `str`, `bytes`, tuples, structs and enums of sendable members,
 optionals and results of them, and copies of collections of them. A class instance, a
-closure, or a collection identity never crosses. A worker's tasks are waited before the
-function that spawned them returns; a failure or a `return` cancels the rest. Workers share
-nothing, so there are no locks and no races in the language.
+closure, or a collection identity never crosses. `f` is a named function of the program,
+never a method, a closure or a Base function. A task is bound and waited, once, by the
+function that spawned it: it is not stored in a field or a collection, returned, or
+captured. A worker's tasks are waited before the function that spawned them returns; a
+failure or a `return` cancels the rest, whose results are discarded when they end.
+Workers share nothing, so there are no locks and no races in the language; what a worker
+prints interleaves with other output in an order the program does not fix, and the
+interpreter runs each task when it is spawned.
 
 ## 15. Modules and packages
 

@@ -10,10 +10,9 @@ alive.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 9. Trap positions | §17.2: base.md gains a position directive and traps that name their position; luce-base and the seed report `file:line:column` on every trap; luce's emitted Base carries the Luce position through the directive, so the interpreter and the compiled program trap alike (§15 modules, §16 the boundary, handles and `luce-base describe` are done) | trap programs whose `.trap` files name the position, in every execution |
-| 10. Workers | §14 | §14 programs |
 | 11. Tooling | §17: `luce test`, `luce fmt`, `luce doc`, `luce explain`, several diagnostics per run | §17 |
-| 12. Proving programs and the generator | applications big enough to break a compiler; the fuzzer's generator widened to the whole language | each program under the gate; an hour of the generator clean |
+| 12. Trap positions | §17.2: base.md gains a position directive and traps that name their position; luce-base and the seed report `file:line:column` on every trap; luce's emitted Base carries the Luce position through the directive, so the interpreter and the compiled program trap alike (§15 modules, §16 the boundary, handles and `luce-base describe` are done) | trap programs whose `.trap` files name the position, in every execution |
+| 13. Proving programs and the generator | applications big enough to break a compiler; the fuzzer's generator widened to the whole language | each program under the gate; an hour of the generator clean |
 
 ## Standing rules
 
