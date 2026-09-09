@@ -1,0 +1,397 @@
+#==============================================================================================
+#
+#   heap - The interpreter's objects, by the runtime's contract
+#
+#   DESCRIPTION:
+#       The interpreter's side of docs/RUNTIME.md: counts on every object, the temporaries
+#       pool, the cycle collector, weak references, and the count of what is alive. It is
+#       the same algorithm as rt/heap.lucb over the interpreter's values, so that the two
+#       executions destroy objects in the same order, which `deinit` makes observable. A
+#       `deinit` is run through the hook the interpreter installs.
+#
+#==============================================================================================
+
+import front.ast
+import hir.value
+import io
+
+let black: u8 = 0
+let gray: u8 = 1
+let white: u8 = 2
+let purple: u8 = 3
+let color_mask: u8 = 3
+let buffered: u8 = 4
+let dead: u8 = 8
+let collecting: u8 = 16
+
+pub let candidate_limit: usize = 1024
+
+## Objects alive: allocated and not yet destroyed.
+pub var live: usize = 0
+
+## Runs a `deinit`: the interpreter, over its own state.
+pub var finisher: (func(void*, value.Object*) -> unit)?
+pub var finisher_context: void*?
+
+# mark: Objects ================================================================================
+
+func color_of(o: value.Object*) -> u8:
+    return o.flags & color_mask
+
+func set_color(o: value.Object*, c: u8):
+    o.flags = (o.flags & ~color_mask) | c
+
+func has(o: value.Object*, flag: u8) -> bool:
+    return (o.flags & flag) != 0
+
+pub func is_dead(o: value.Object*) -> bool:
+    return has(o, dead)
+
+## A fresh object with `n` fields, each `unit` until set, held once.
+pub func allocate(decl: ast.Node*, n: usize) -> value.Object*!:
+    var fields = try alloc value.Value[n if n > 0 else 1]
+    var i: usize = 0
+    while i < n:
+        fields[i] = value.nothing()
+        i += 1
+    let o = try new value.Object(strong = 1, weak = 0, flags = black, decl = decl, fields = fields[..<n])
+    live += 1
+    return o
+
+pub func retain_object(o: value.Object*):
+    o.strong += 1
+    set_color(o, black)
+
+pub func release_object(o: value.Object*):
+    if has(o, collecting):
+        if o.strong > 0:
+            o.strong -= 1
+        return
+    o.strong -= 1
+    if o.strong == 0:
+        destroy(o)
+    else:
+        possible_root(o)
+
+func run_finisher(o: value.Object*):
+    if let f = finisher:
+        let before = o.strong
+        o.strong += 1
+        f(finisher_context else trap("no interpreter behind the heap"), o)
+        if o.strong != before + 1:
+            trap("`deinit` published `self`")
+        o.strong = before
+
+## `deinit`, then the fields in reverse order; the shell stays for weak references.
+func destroy(o: value.Object*):
+    set_color(o, black)
+    run_finisher(o)
+    drop_fields(o)
+    live -= 1
+    o.flags |= dead
+
+func drop_fields(o: value.Object*):
+    var i = o.fields.length
+    while i > 0:
+        i -= 1
+        let f = o.fields[i]
+        o.fields[i] = value.nothing()
+        release(f)
+
+## An `init` that failed: the fields assigned so far go, no `deinit` runs.
+pub func abandon(o: value.Object*):
+    drop_fields(o)
+    live -= 1
+    o.strong = 0
+    o.flags |= dead
+
+# mark: Values =================================================================================
+
+## Whether a value can hold a reference at all, so the scalars cost nothing.
+pub func holds_references(v: value.Value) -> bool:
+    match v.kind:
+        .object, .weak_: return true
+        .tuple, .record, .variant:
+            var i: usize = 0
+            while i < v.items.length:
+                if holds_references(v.items[i]):
+                    return true
+                i += 1
+            return false
+        _: return false
+
+## One more reference to every object the value holds.
+pub func retain(v: value.Value):
+    match v.kind:
+        .object:
+            if let o = v.obj:
+                retain_object(o)
+        .weak_:
+            if let o = v.obj:
+                o.weak += 1
+        .tuple, .record, .variant:
+            var i: usize = 0
+            while i < v.items.length:
+                retain(v.items[i])
+                i += 1
+        _: discard(0)
+
+## One reference fewer to every object the value holds.
+pub func release(v: value.Value):
+    match v.kind:
+        .object:
+            if let o = v.obj:
+                release_object(o)
+        .weak_:
+            if let o = v.obj:
+                o.weak -= 1
+        .tuple, .record, .variant:
+            var i: usize = 0
+            while i < v.items.length:
+                release(v.items[i])
+                i += 1
+        _: discard(0)
+
+## An owned copy: its own storage for a value type, a reference of its own to every object.
+pub func copy(v: value.Value) -> value.Value!:
+    let out = try value.clone(v)
+    retain(out)
+    return out
+
+## The objects a value refers to directly, in order.
+func trace(v: value.Value, visit: func(value.Object*) -> unit):
+    match v.kind:
+        .object:
+            if let o = v.obj:
+                visit(o)
+        .tuple, .record, .variant:
+            var i: usize = 0
+            while i < v.items.length:
+                trace(v.items[i], visit)
+                i += 1
+        _: discard(0)
+
+func trace_fields(o: value.Object*, visit: func(value.Object*) -> unit):
+    var i: usize = 0
+    while i < o.fields.length:
+        trace(o.fields[i], visit)
+        i += 1
+
+# mark: The temporaries pool ===================================================================
+
+var pending: value.Value[]
+var pending_count: usize = 0
+
+pub func mark() -> usize:
+    return pending_count
+
+## An owned value handed on as a temporary: released by the next `drain`.
+pub func pool(v: value.Value) -> !:
+    if not holds_references(v):
+        return
+    if pending_count == pending.length:
+        let grown = try alloc value.Value[pending.length * 2 if pending.length > 0 else 64]
+        var i: usize = 0
+        while i < pending_count:
+            grown[i] = pending[i]
+            i += 1
+        if pending.length > 0:
+            free(pending)
+        pending = grown
+    pending[pending_count] = v
+    pending_count += 1
+
+## Releases every temporary pooled since `since`, in the order they were pooled.
+pub func drain(since: usize):
+    if pending_count <= since:
+        return
+    let count = pending_count
+    var i = since
+    while i < count:
+        release(pending[i])
+        i += 1
+    pending_count = since
+
+# mark: The cycle collector ====================================================================
+
+var roots: value.Object*[]
+var root_count: usize = 0
+var whites: value.Object*[]
+var white_count: usize = 0
+var collector_running: bool = false
+
+func push_root(o: value.Object*):
+    if root_count == roots.length:
+        let grown = alloc value.Object*[roots.length * 2 if roots.length > 0 else candidate_limit] catch failure:
+            trap("out of memory")
+        var i: usize = 0
+        while i < root_count:
+            grown[i] = roots[i]
+            i += 1
+        if roots.length > 0:
+            free(roots)
+        roots = grown
+    roots[root_count] = o
+    root_count += 1
+
+func push_white(o: value.Object*):
+    if white_count == whites.length:
+        let grown = alloc value.Object*[whites.length * 2 if whites.length > 0 else 256] catch failure:
+            trap("out of memory")
+        var i: usize = 0
+        while i < white_count:
+            grown[i] = whites[i]
+            i += 1
+        if whites.length > 0:
+            free(whites)
+        whites = grown
+    whites[white_count] = o
+    white_count += 1
+
+func possible_root(o: value.Object*):
+    if color_of(o) != purple:
+        set_color(o, purple)
+        if not has(o, buffered):
+            o.flags |= buffered
+            push_root(o)
+            if root_count >= candidate_limit and not collector_running:
+                collect()
+
+func visit_mark_gray(child: value.Object*):
+    child.strong -= 1
+    mark_gray(child)
+
+func mark_gray(o: value.Object*):
+    if color_of(o) != gray:
+        set_color(o, gray)
+        trace_fields(o, visit_mark_gray)
+
+func visit_scan(child: value.Object*):
+    scan(child)
+
+func visit_scan_black(child: value.Object*):
+    child.strong += 1
+    if color_of(child) != black:
+        scan_black(child)
+
+func scan(o: value.Object*):
+    if color_of(o) == gray:
+        if o.strong > 0:
+            scan_black(o)
+        else:
+            set_color(o, white)
+            trace_fields(o, visit_scan)
+
+func scan_black(o: value.Object*):
+    set_color(o, black)
+    trace_fields(o, visit_scan_black)
+
+func visit_gather(child: value.Object*):
+    gather(child)
+
+func gather(o: value.Object*):
+    if color_of(o) == white and not has(o, collecting):
+        o.flags |= collecting
+        push_white(o)
+        trace_fields(o, visit_gather)
+
+func visit_restore(child: value.Object*):
+    if has(child, collecting):
+        child.strong += 1
+
+## Free the garbage: deinits first, then every object's fields, then the shells.
+pub func collect():
+    if collector_running:
+        return
+    collector_running = true
+    var kept: usize = 0
+    var i: usize = 0
+    while i < root_count:
+        let o = roots[i]
+        if color_of(o) == purple and o.strong > 0 and not has(o, dead):
+            roots[kept] = o
+            kept += 1
+        else:
+            o.flags &= ~buffered
+        i += 1
+    root_count = kept
+    i = 0
+    while i < root_count:
+        mark_gray(roots[i])
+        i += 1
+    i = 0
+    while i < root_count:
+        scan(roots[i])
+        i += 1
+    white_count = 0
+    i = 0
+    while i < root_count:
+        gather(roots[i])
+        i += 1
+    i = 0
+    while i < root_count:
+        roots[i].flags &= ~buffered
+        i += 1
+    root_count = 0
+    i = 0
+    while i < white_count:
+        trace_fields(whites[i], visit_restore)
+        i += 1
+    i = 0
+    while i < white_count:
+        run_finisher(whites[i])
+        i += 1
+    i = 0
+    while i < white_count:
+        drop_fields(whites[i])
+        i += 1
+    i = 0
+    while i < white_count:
+        let o = whites[i]
+        live -= 1
+        o.strong = 0
+        o.flags = dead
+        i += 1
+    white_count = 0
+    collector_running = false
+
+# mark: Weak references ========================================================================
+
+pub func weak_make(o: value.Object*) -> value.Value:
+    o.weak += 1
+    return value.weak(o)
+
+## The object with a fresh strong reference, or none once it is dead.
+pub func weak_get(w: value.Value) -> value.Value:
+    if let o = w.obj:
+        if not has(o, dead):
+            retain_object(o)
+            return value.object(o)
+    return value.absent()
+
+# mark: The end of a run =======================================================================
+
+## After `main`: the collector runs, and anything still alive is a defect. The exit status.
+pub func finish_run(status: i64) -> i64:
+    drain(0)
+    collect()
+    if live != 0:
+        var room: u8[96]
+        let text = format(room, f"luce: {live} objects alive at exit\n") catch failure:
+            recover "luce: objects alive at exit\n"
+        var e = io.stderr()
+        discard(e.write(text.bytes) catch failure: recover 0)
+        return 3
+    return status
+
+## For tests: the heap as at the start of a run.
+pub func reset():
+    roots = roots[..<0]
+    root_count = 0
+    whites = whites[..<0]
+    white_count = 0
+    pending = pending[..<0]
+    pending_count = 0
+    live = 0
+    finisher = none
+    finisher_context = none

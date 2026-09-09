@@ -8,6 +8,7 @@ written in, and a Luce program compiles to Base, so every backend Base has is Lu
 
 - `docs/luce.md` is the language. It is the whole contract.
 - `docs/DESIGN.md` is the shape of the compiler.
+- `docs/RUNTIME.md` is the contract of the runtime: when objects die, in what order.
 - `docs/PLAN.md` is what remains, in order, each step with the gate that closes it.
 
 ```text

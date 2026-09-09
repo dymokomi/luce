@@ -568,8 +568,13 @@ through any binding of the object.
 ### 10.3 Lifetime
 
 Nothing in the language allocates, retains, releases or frees; the compiler and the runtime
-do. An object is destroyed when the last reference to it goes away, deterministically, and a
-cycle of objects that nothing else refers to is reclaimed by the runtime's cycle collector.
+do. An object is destroyed when the last reference to it goes away, deterministically: a
+binding releases its reference when it leaves its scope or is reassigned, a field when it is
+reassigned or its owner is destroyed, and an object that no binding took, the result of a
+call or a construction inside an expression, at the end of the statement that produced it.
+A cycle of objects that nothing else refers to is reclaimed by the runtime's cycle
+collector, which runs at the end of the program and periodically before; `docs/RUNTIME.md`
+states the exact order.
 A class may declare `deinit(self)`, run once at destruction, taking no arguments, returning
 `unit`, unable to fail, spawn, or publish `self`. Fields are then released in reverse
 declaration order. A class that holds a resource also offers `close()`, so that `with` can
@@ -578,9 +583,10 @@ close it on time; `deinit` is the safety net.
 ### 10.4 Weak references
 
 `Weak[T]` is a library type holding a non-owning reference to a class instance: `Weak(object)`
-makes one and `.get()` yields `T?`, `none` once the object is gone. It is for observer lists
-and caches. An ordinary back edge, a child's parent, may be a plain field; the collector
-handles the cycle.
+makes one and `.get()` yields `T?`, `none` once the object is gone. A `Weak` is a value:
+copying it copies the reference, and it has no display and no equality. It is for observer
+lists and caches. An ordinary back edge, a child's parent, may be a plain field; the
+collector handles the cycle.
 
 ### 10.5 Display
 

@@ -78,9 +78,11 @@ admits and demands the same agreement, from the first slice.
 ## The runtime
 
 `rt/` is a Base package compiled by luce-base with the program. It provides the object
-header, retain and release, the cycle collector, the weak table, `deinit` dispatch, owned
-text and bytes, the three collections, closure cells, workers, and the trap reporter, and
-nothing else. `docs/RUNTIME.md` is its written contract once it exists.
+header, retain and release, the temporaries pool, the cycle collector, weak references,
+`deinit` dispatch, owned text and bytes, the three collections, closure cells, workers, and
+the trap reporter, and nothing else. `docs/RUNTIME.md` is its written contract, and the
+interpreter follows the same contract so that the two executions destroy objects in the same
+order.
 
 ## Diagnostics and robustness
 

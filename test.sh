@@ -7,7 +7,7 @@ base=build/luce-base/build/luce-base
 export LUCE_BASE=$PWD/$base
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
-for f in src/*.lucb src/*/*.lucb; do
+for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
     [ -e "$f" ] || continue
     echo "== check $f"
     "$base" check "$f"

@@ -90,6 +90,7 @@ func check_function(c: check.Checker*, f: ast.Node*, owner: u32) -> !:
     c.self_type = owner
     c.self_mutable = f.has(check.flag_mutating) or c.table.kind(owner) == types.Kind.class_
     c.in_init = f.text == "init" and owner != types.none_id
+    c.in_deinit = f.text == "deinit" and owner != types.none_id
     var result = t.elem
     c.fallible = false
     if c.table.kind(result) == types.Kind.fallible:
@@ -122,6 +123,7 @@ func check_function(c: check.Checker*, f: ast.Node*, owner: u32) -> !:
     c.current_func = none
     c.self_type = types.none_id
     c.in_init = false
+    c.in_deinit = false
 
 ## `init` assigns every field without a default exactly once before it ends, reads none
 ## before, and does not hand `self` out first (§10.1). The walk is over the statements in
@@ -707,6 +709,10 @@ func expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         .self_:
             if c.self_type == types.none_id:
                 return try c.fail(e, "`self` belongs inside a method")
+            let as_receiver = c.self_receiver
+            c.self_receiver = false
+            if c.in_deinit and not as_receiver:
+                return try c.fail(e, "`deinit` does not publish `self`; it reads and calls its own members (§10.3)")
             return c.self_type
         .group:
             let inner = e.left else return try c.fail(e, "empty group")
@@ -864,12 +870,13 @@ func binary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         return types.bool_id
     if op == "is" or op == "is not":
         let lt = try check_expr(c, l, types.none_id)
-        let rt = try check_expr(c, r, lt)
+        let rt = try check_expr(c, r, types.none_id)
         var t = lt
-        if rt == types.untyped_none_id:
-            t = try coerce(c, r, rt, lt)
-        elif lt == types.untyped_none_id:
-            t = try coerce(c, l, lt, rt)
+        if rt == types.untyped_none_id or lt == types.untyped_none_id:
+            let other = lt if rt == types.untyped_none_id else rt
+            if c.table.kind(other) != types.Kind.optional:
+                return try c.fail(e, try c.with_type("a `", other, "` is never `none`; only an optional is compared with `none`"))
+            t = other
         else:
             t = try unify(c, l, lt, r, rt)
         var bare = t
@@ -927,7 +934,9 @@ func unify(c: check.Checker*, l: ast.Node*, lt: u32, r: ast.Node*, rt: u32) -> u
 
 func member_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let receiver = e.left else return try c.fail(e, "no receiver")
+    c.self_receiver = receiver.kind == ast.Kind.self_
     let rt = try check_expr(c, receiver, types.none_id)
+    c.self_receiver = false
     let t = c.table.get(rt)
     if t.kind == types.Kind.type_name:
         # `Type.member`: a type function, a case, or a constant of the type
@@ -953,6 +962,8 @@ func member_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         return t.args[(usize)index]
     if t.kind == types.Kind.optional:
         return try c.fail(e, "an optional is read with `if let`, `else`, or `match` first (§12.1)")
+    if t.kind == types.Kind.weak_:
+        return try c.fail(e, "a `Weak` has `get()` and nothing else (§10.4)")
     if e.text == "length" and (t.kind == types.Kind.str_ or t.kind == types.Kind.bytes_ or t.kind == types.Kind.list_ or t.kind == types.Kind.map_ or t.kind == types.Kind.set_):
         return types.int_id
     if t.kind == types.Kind.error_value:
@@ -1062,6 +1073,16 @@ func call_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
                             e.resolved = m
                             try check_arguments(c, e, e.body, m.body, false)
                             return o.elem
+    if callee.kind == ast.Kind.member and callee.text == "get":
+        # `weak.get()`: the object, or none once it is gone (§10.4)
+        if let owner = callee.left:
+            if owner.kind != ast.Kind.self_:
+                let ot = try check_expr(c, owner, types.none_id)
+                if c.table.kind(ot) == types.Kind.weak_:
+                    if e.body != none:
+                        return try c.fail(e, "`get()` takes no arguments")
+                    callee.type_id = ot
+                    return try c.table.optional(c.table.get(ot).elem)
     let ct = try check_expr(c, callee, types.none_id)
     let t = c.table.get(ct)
     if t.kind == types.Kind.type_name:
@@ -1260,6 +1281,15 @@ func core_call(c: check.Checker*, e: ast.Node*, name: str) -> u32!:
         return types.str_id
     if name == "hash":
         return try c.fail(e, "`hash` arrives with the collections slice")
+    if name == "Weak":
+        let first = e.body else return try c.fail(e, "`Weak(object)` takes a class instance (§10.4)")
+        let v = first.left else return try c.fail(e, "no value")
+        if n != 1 or first.text.length > 0:
+            return try c.fail(e, "`Weak(object)` takes one class instance (§10.4)")
+        let t = try check_expr(c, v, types.none_id)
+        if c.table.kind(t) != types.Kind.class_:
+            return try c.fail(v, try c.with_type("`Weak` holds a class instance, not a `", t, "` (§10.4)"))
+        return try c.table.weak_of(t)
     return try c.fail(e, try c.named("unknown name ", name, ""))
 
 ## `ErrorCode.package(n)`: a constant of this package, `n` from 1 to 65535, no two alike.
@@ -1316,7 +1346,11 @@ func catch_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let lt = try check_expr(c, l, try c.table.fallible(hint) if hint != types.none_id else types.none_id)
     if c.table.kind(lt) != types.Kind.fallible:
         return try c.fail(l, "`catch` handles a result, `T!`")
-    let payload = c.table.get(lt).elem
+    var payload = c.table.get(lt).elem
+    # `let x: T? = f() catch: recover none`: the expression takes the optional it is
+    # expected to be, and the suite recovers with it
+    if hint != types.none_id and c.table.kind(hint) == types.Kind.optional and c.table.get(hint).elem == payload:
+        payload = hint
     c.push_scope()
     if e.text.length > 0:
         try c.bind(e, e.text, types.error_value_id, e, false)

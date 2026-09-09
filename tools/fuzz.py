@@ -113,6 +113,13 @@ class Gen:
         self.locals = []
         # inside a helper function, where only its parameters and literals are in scope
         self.in_helper = False
+        # objects made so far, so every one has a name of its own in the trace
+        self.made = 0
+
+    def fresh(self, n):
+        """`make("tK", n)`: a new object, its deinit visible in the output."""
+        self.made += 1
+        return f'make("t{self.made}", {n})'
 
     def leaf(self, ty):
         r = self.rng
@@ -125,10 +132,10 @@ class Gen:
             if ty == "str": return r.choice(['"ab"', '"xyz"', '"hé"', '""'])
             return r.choice(["true", "false"])
         pool = {
-            "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n"],
+            "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count"],
             "float": ["d", "e", "float(a % 256)", "p.f"],
-            "str": ["s", "t", "p.name"],
-            "bool": ["flag", "(a > b)"],
+            "str": ["s", "t", "p.name", "obj.tag()", "name_of(opt)", "name_of(h.item)"],
+            "bool": ["flag", "(a > b)", "(opt is none)", "(obj is opt)"],
         }[ty] + [n for n, t in self.locals if t == ty]
         if r.random() < 0.3:
             if ty == "int": return str(r.randint(-999, 999))
@@ -197,13 +204,49 @@ class Gen:
             return f"({self.expr(depth - 1, 'str')} in {self.expr(depth - 1, 'str')})"
         return f"(o == none)"
 
+    def object_statement(self, k, depth, indent):
+        """Objects: made, shared, stored in fields, let go of, closed; each `deinit` prints,
+        so the two executions must agree on every release."""
+        r = self.rng
+        pad = "    " * indent
+        n = self.expr(1)
+        if k == 14:
+            return [r.choice([f"{pad}obj = {self.fresh(n)}", f"{pad}opt = {self.fresh(n)}", f"{pad}opt = none",
+                              f"{pad}opt = obj", f"{pad}obj = (opt else obj)", f"{pad}opt = obj.link"])]
+        if k == 15:
+            return [r.choice([f"{pad}obj.link = opt", f"{pad}obj.link = {self.fresh(n)}", f"{pad}obj.link = none",
+                              f"{pad}obj.link = obj", f"{pad}h = hold(opt)", f"{pad}h.item = {self.fresh(n)}",
+                              f"{pad}h.item = none", f"{pad}h.count = obj.bump({n})"])]
+        if k == 16:
+            return [r.choice([f"{pad}print(name_of(opt), obj.tag(), name_of(h.item))",
+                              f"{pad}print({self.fresh(n)}.tag())", f"{pad}discard(obj.bump({n}))",
+                              f"{pad}print(name_of(hold({self.fresh(n)}).item))",
+                              f"{pad}print(obj is opt, opt is none, obj.link is none)"])]
+        if k == 17 and depth > 0:
+            m = self.loops; self.loops += 1
+            lines = [f"{pad}if let x{m} = opt:"]
+            lines.append(f"{pad}    x{m}.link = {r.choice(['obj', 'none', self.fresh(n)])}")
+            lines.append(f"{pad}    print(x{m}.tag())")
+            return lines
+        if k == 18 and depth > 0:
+            m = self.loops; self.loops += 1
+            lines = [f"{pad}with {self.fresh(n)} as r{m}:"]
+            lines.append(f"{pad}    print(r{m}.tag(), name_of(r{m}.link))")
+            lines.append(f"{pad}    obj.link = r{m}")
+            return lines
+        return [r.choice([f"{pad}obj = make(obj.tag(), {n})", f"{pad}opt = (opt else {self.fresh(n)})",
+                          f"{pad}h = Holder(item = obj, count = h.count + 1)"])]
+
     def statements(self, depth, indent):
         r = self.rng
         lines = []
         pad = "    " * indent
         saved = list(self.locals)
         for _ in range(r.randint(1, 4)):
-            k = r.randrange(14)
+            k = r.randrange(14 if self.in_helper else 20)
+            if k >= 14:
+                lines += self.object_statement(k, depth, indent)
+                continue
             if k < 2:
                 lines.append(f"{pad}{r.choice(['a', 'b', 'c'])} = {self.expr(3)}")
             elif k == 2:
@@ -289,6 +332,16 @@ class Gen:
                 "func len(text: str) -> int:", "    return text.length", "",
                 "func find(x: int) -> int?:", "    if (x % 4) == 0:", "        return none", "    return x % 1024", "",
                 "func risky(x: int) -> int!:", "    if (x % 8) == 3:", "        error(bad, \"three\")", "    return (x % 4096) + 11", "",
+                "class Tracer:", "    let name: str", "    var n: int = 0", "    var link: Tracer? = none", "",
+                "    func init(self, name: str):", "        self.name = name", "        print(f\"make {name}\")", "",
+                "    func deinit(self):", "        print(f\"gone {self.name}\")", "",
+                "    pub func bump(self, by: int) -> int:", "        self.n = (self.n + (by % 4096)) % 4096", "        return self.n", "",
+                "    pub func tag(self) -> str:", "        return f\"{self.name}/{self.n}\"", "",
+                "    pub func close(self):", "        print(f\"close {self.name}\")", "",
+                "struct Holder:", "    var item: Tracer?", "    var count: int", "",
+                "func make(name: str, n: int) -> Tracer:", "    let t = Tracer(name)", "    discard(t.bump(n))", "    return t", "",
+                "func hold(t: Tracer?) -> Holder:", "    return Holder(item = t, count = 1)", "",
+                "func name_of(t: Tracer?) -> str:", "    if let x = t:", "        return x.tag()", "    return \"-\"", "",
                 "var_block"]
         return "\n".join(text)
 
@@ -322,11 +375,14 @@ def generate(rng):
     body.append("    var o: int? = none")
     body.append('    var p = Point(x = 1, f = 0.5, name = "pt")')
     body.append("    var q = Counter(n = 3)")
+    body.append('    var obj = make("o", 1)')
+    body.append("    var opt: Tracer? = none")
+    body.append("    var h = Holder(item = none, count = 0)")
     body.append("    var sum = 0")
     body.append("    func_mix")
     lines = g.statements(3, 1)
     body += lines
-    body.append('    print(f"{sum} {a} {b} {c} {d} {e} {s} {t} {flag} {o else -1} {p} {q.n}")')
+    body.append('    print(f"{sum} {a} {b} {c} {d} {e} {s} {t} {flag} {o else -1} {p} {q.n} {obj.tag()} {name_of(opt)} {name_of(h.item)} {h.count}")')
     body.append("    return 0")
     text = "\n".join(header + body) + "\n"
     # `mix` reads the locals: written as a nested reading of the same names through a

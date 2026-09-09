@@ -3,11 +3,12 @@
 What remains, in the order it is built. A slice closes when the gate is green with its
 programs in, and nothing is written here about what was done: the tree and the suite are the
 record. The compiler today lexes, parses, checks, interprets and compiles the value language
-of §2 to §9 and §12, with four executions agreeing on every conformance program.
+of §2 to §9 and §12 and the classes of §10 over the runtime of `docs/RUNTIME.md`, with four
+executions agreeing on every conformance program and every run proving it left nothing
+alive.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 5. The runtime and classes | `rt/` to its contract; §10: classes, `init`, identity, destruction, `deinit`, `Weak`, the cycle collector; `with` | §10 programs, incl. what a run leaves alive |
 | 6. Collections and text | §11: `list`, `map`, `set`, `str`, `bytes` and their operations, the iteration guard | §11 programs and traps |
 | 7. Closures | §7.4: captures, cells, escaping closures | §7 programs |
 | 8. Interfaces and generics | §13: conformance, interface values, bounds, the closed protocols, `for` over `Iterable` | §13 programs and rejections |

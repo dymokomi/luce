@@ -5,15 +5,20 @@
 #   DESCRIPTION:
 #       Executes the typed tree directly: `luce run`, and the definition of behaviour that
 #       the emitted Base must agree with. Every binding is a cell on the heap; a value type
-#       is cloned when bound, passed, stored or returned, a reference type shares. Control
-#       flow leaves a block as a `Flow`; a Luce failure travels as Base's own failure with
-#       the `Error` kept aside; a violated rule traps through Base's `trap`, with the text
-#       the emitted program's trap carries.
+#       is copied when bound, stored or returned, a reference type shares. Objects live on
+#       `hir.heap` by docs/RUNTIME.md: `evaluate` says of every value whether the caller
+#       owns it or borrows it, a binding owns what it holds and releases it when it goes,
+#       and an owned value nobody binds is pooled and drained when its statement ends, so
+#       the order in which `deinit` runs is the one the emitted program shows. Control flow
+#       leaves a block as a `Flow`; a Luce failure travels as Base's own failure with the
+#       `Error` kept aside; a violated rule traps through Base's `trap`, with the text the
+#       emitted program's trap carries.
 #
 #==============================================================================================
 
 import c
 import front.ast
+import hir.heap
 import hir.value
 import io
 import sema.check
@@ -36,10 +41,12 @@ pub enum Flow as u8:
     continued = 3
     recovered = 4
 
-## One binding of a frame: its declaration and its cell.
+## One binding of a frame: its declaration, its cell, and whether the cell owns what it
+## holds (a parameter borrows, §RUNTIME).
 struct Slot:
     var decl: ast.Node*
     var cell: value.Value*
+    var owned: bool
 
 pub struct Interp:
     var checker: check.Checker*
@@ -62,6 +69,7 @@ pub struct Interp:
     # -- running --------------------------------------------------------------------------
 
     ## Run `main` with the program's arguments; its result, or the failure it ended with.
+    ## After `main`, the collector runs and what is still alive is reported (RUNTIME).
     pub mutating func run_main(arguments: str[]) -> i64!:
         let main = self.checker.find_declaration("main") else error(fault, "no main")
         var args = try value.members(value.Kind.list_, arguments.length, none)
@@ -73,7 +81,7 @@ pub struct Interp:
         var one = try alloc value.Value[1]
         one[0] = args
         let result = try self.call(main, none, one)
-        return result.i
+        return heap.finish_run(result.i)
 
     ## Run one `test`: fails when the test does.
     pub mutating func run_test(d: ast.Node*) -> !:
@@ -82,21 +90,53 @@ pub struct Interp:
         try self.block(body)
         self.pop_frame()
 
+    ## `deinit` on an object being destroyed, through the heap's hook: the interpreter's
+    ## flow is kept aside, since destruction may happen while a `return` is in flight.
+    mutating func run_deinit(o: value.Object*) -> !:
+        let d = self.checker.find_member(o.decl, "deinit") else return
+        let flow = self.flow
+        let label = self.label
+        let carried = self.carried
+        let pending = self.pending
+        let cell = try new value.Value
+        *cell = value.object(o)
+        discard(try self.call(d, cell, try alloc value.Value[0]))
+        self.flow = flow
+        self.label = label
+        self.carried = carried
+        self.pending = pending
+
     # -- frames ---------------------------------------------------------------------------
 
     mutating func push_frame():
         self.base = self.slots.count
 
     mutating func pop_frame():
-        self.slots.count = self.base
-        # the frame below: its base is not recorded, so scan back to the previous function's
-        # bindings is not needed; a call restores its own base after returning
-        discard(0)
+        self.pop_to(self.base)
 
+    ## An owned value, bound: the cell holds the one reference.
     mutating func bind(decl: ast.Node*, v: value.Value) -> !:
         let cell = try new value.Value
         *cell = v
-        try self.slots.push(Slot(decl = decl, cell = cell))
+        try self.slots.push(Slot(decl = decl, cell = cell, owned = true))
+
+    ## A parameter: it borrows what the caller holds for the length of the call.
+    mutating func bind_borrowed(decl: ast.Node*, v: value.Value) -> !:
+        let cell = try new value.Value
+        *cell = v
+        try self.slots.push(Slot(decl = decl, cell = cell, owned = false))
+
+    ## Leave the bindings above `mark`: later ones first, each releasing what it owned.
+    mutating func pop_to(mark: usize):
+        var i = self.slots.count
+        while i > mark:
+            i -= 1
+            let s = self.slots.get(i)
+            if s.owned:
+                let v = *s.cell
+                *s.cell = value.nothing()
+                heap.release(v)
+        self.slots.count = mark
 
     func cell_of(decl: ast.Node*) -> value.Value*!:
         var i = self.slots.count
@@ -109,7 +149,8 @@ pub struct Interp:
 
     # -- calls ----------------------------------------------------------------------------
 
-    ## Call a function or method with its arguments in parameter order (`self` excluded).
+    ## Call a function or method with its arguments in parameter order (`self` excluded);
+    ## the arguments are borrowed, the result is owned by the caller.
     pub mutating func call(f: ast.Node*, receiver: value.Value*?, args: value.Value[]) -> value.Value!:
         let body = f.body else error(fault, "a function without a body")
         if self.depth >= max_depth:
@@ -123,28 +164,32 @@ pub struct Interp:
         while let p = cursor:
             if p.text == "self":
                 let r = receiver else error(fault, "a method without a receiver")
-                try self.slots.push(Slot(decl = p, cell = r))
+                try self.slots.push(Slot(decl = p, cell = r, owned = false))
             else:
-                try self.bind(p, try value.clone(args[i]))
+                try self.bind_borrowed(p, args[i])
                 i += 1
             cursor = p.next
         # a failure leaving the body restores the caller's frame before it travels on
         self.block(body) catch failure:
             self.flow = Flow.normal
-            self.slots.count = saved_count
+            let pending = self.pending
+            self.pop_to(saved_count)
+            self.pending = pending
             self.base = saved_base
             self.depth -= 1
             error(failure.code, failure.message)
         var result = value.nothing()
         if self.flow == Flow.returned:
             result = self.carried
+            self.carried = value.nothing()
         self.flow = Flow.normal
-        self.slots.count = saved_count
+        self.pop_to(saved_count)
         self.base = saved_base
         self.depth -= 1
-        return try value.clone(result)
+        return result
 
-    ## The arguments of a call in parameter order, defaults filled in, on the heap.
+    ## The arguments of a call in parameter order, defaults filled in, on the heap; each
+    ## is borrowed for the call, a temporary among them pooled until the statement ends.
     mutating func arguments(e: ast.Node*, params: ast.Node*?, skip_self: bool) -> value.Value[]!:
         var n: usize = 0
         var cursor = params
@@ -180,7 +225,7 @@ pub struct Interp:
 
     # -- statements -----------------------------------------------------------------------
 
-    ## Run a block; `self.flow` says how it left.
+    ## Run a block; `self.flow` says how it left. Its bindings go when it does.
     mutating func block(b: ast.Node*) -> !:
         let mark = self.slots.count
         var cursor = b.body
@@ -189,40 +234,56 @@ pub struct Interp:
             if self.flow != Flow.normal:
                 break
             cursor = s.next
-        self.slots.count = mark
+        self.pop_to(mark)
 
+    ## One statement: the temporaries it produces die when it ends, however it ends.
     mutating func statement(s: ast.Node*) -> !:
+        let mark = heap.mark()
+        self.run_statement(s) catch failure:
+            let pending = self.pending
+            heap.drain(mark)
+            self.pending = pending
+            error(failure.code, failure.message)
+        heap.drain(mark)
+
+    mutating func run_statement(s: ast.Node*) -> !:
         match s.kind:
             .let_, .var_:
                 let init = s.left else return
-                let v = try self.eval(init)
+                let v = try self.eval_owned(init)
                 if s.body != none:
+                    # the tuple's members move into the bindings
                     var i: usize = 0
                     var cursor = s.body
                     while let part = cursor:
-                        try self.bind(part, try value.clone(v.items[i]))
+                        try self.bind(part, v.items[i])
                         i += 1
                         cursor = part.next
                 else:
-                    try self.bind(s, try value.clone(v))
+                    try self.bind(s, v)
             .assign: try self.assign(s)
             .if_: try self.if_statement(s)
             .while_:
                 while true:
+                    let mark = heap.mark()
                     if s.has(ast.flag_if_let):
                         let cond = s.left else return
                         let init = cond.left else return
-                        let v = try self.eval(init)
+                        let (v, owned) = try self.evaluate(init)
                         if v.kind == value.Kind.absent:
+                            heap.drain(mark)
                             break
-                        let mark = self.slots.count
-                        try self.bind(cond, try value.clone(v))
+                        let slots = self.slots.count
+                        try self.bind(cond, v if owned else try heap.copy(v))
+                        heap.drain(mark)
                         let body = s.body else return
                         try self.block(body)
-                        self.slots.count = mark
+                        self.pop_to(slots)
                     else:
                         let cond = s.left else return
-                        if not value.truth(try self.eval(cond)):
+                        let go = value.truth(try self.eval(cond))
+                        heap.drain(mark)
+                        if not go:
                             break
                         let body = s.body else return
                         try self.block(body)
@@ -240,7 +301,7 @@ pub struct Interp:
             .return_:
                 var v = value.nothing()
                 if let e = s.left:
-                    v = try self.eval(e)
+                    v = try self.eval_owned(e)
                 self.carried = v
                 self.flow = Flow.returned
             .break_:
@@ -251,26 +312,29 @@ pub struct Interp:
                 self.label = s.text
             .recover_:
                 let e = s.left else return
-                self.carried = try self.eval(e)
+                self.carried = try self.eval_owned(e)
                 self.flow = Flow.recovered
             .expr_stmt:
                 let e = s.left else return
                 discard(try self.eval(e))
             _: error(fault, "unexpected statement")
 
+    ## The condition's temporaries die before a branch runs.
     mutating func if_statement(s: ast.Node*) -> !:
-        let mark = self.slots.count
+        let slots = self.slots.count
         var taken = false
+        let mark = heap.mark()
         if s.has(ast.flag_if_let):
             let cond = s.left else return
             let init = cond.left else return
-            let v = try self.eval(init)
+            let (v, owned) = try self.evaluate(init)
             if v.kind != value.Kind.absent:
-                try self.bind(cond, try value.clone(v))
+                try self.bind(cond, v if owned else try heap.copy(v))
                 taken = true
         else:
             let cond = s.left else return
             taken = value.truth(try self.eval(cond))
+        heap.drain(mark)
         if taken:
             let body = s.body else return
             try self.block(body)
@@ -279,12 +343,13 @@ pub struct Interp:
                 try self.if_statement(rest)
             else:
                 try self.block(rest)
-        self.slots.count = mark
+        self.pop_to(slots)
 
     mutating func for_statement(s: ast.Node*) -> !:
         let binding = s.left else return
         let seq = s.right else return
         let body = s.body else return
+        # the sequence lives until the loop ends: a temporary among the statement's
         let source = try self.eval(seq)
         var count: usize = 0
         match source.kind:
@@ -334,13 +399,13 @@ pub struct Interp:
             var i: usize = 0
             var cursor = binding.body
             while let part = cursor:
-                try self.bind(part, try value.clone(element.items[i]))
+                try self.bind(part, try heap.copy(element.items[i]))
                 i += 1
                 cursor = part.next
         else:
-            try self.bind(binding, try value.clone(element))
+            try self.bind(binding, try heap.copy(element))
         try self.block(body)
-        self.slots.count = mark
+        self.pop_to(mark)
         if self.flow == Flow.broke and (self.label.length == 0 or self.label == s.text):
             self.flow = Flow.normal
             self.label = ""
@@ -360,9 +425,9 @@ pub struct Interp:
             if try self.arm_matches(arm, v):
                 let body = arm.body else return
                 try self.block(body)
-                self.slots.count = mark
+                self.pop_to(mark)
                 return
-            self.slots.count = mark
+            self.pop_to(mark)
             cursor = arm.next
         trap("no arm of the match applied")
 
@@ -386,7 +451,7 @@ pub struct Interp:
             return true
         if p.text == "bind":
             let name = p.left else return true
-            try self.bind(name, try value.clone(v))
+            try self.bind(name, try heap.copy(v))
             return true
         if p.text == "tuple":
             var i: usize = 0
@@ -408,7 +473,7 @@ pub struct Interp:
             var cursor = lit.body
             while let name = cursor:
                 if not name.has(ast.flag_wildcard):
-                    try self.bind(name, try value.clone(v.items[i]))
+                    try self.bind(name, try heap.copy(v.items[i]))
                 i += 1
                 cursor = name.next
             return true
@@ -423,14 +488,14 @@ pub struct Interp:
             return false
         return value.equal(try self.eval(lit), v)
 
-    ## `with e as name:` closes `name` however the suite ends (§8.5).
+    ## `with e as name:` closes `name` however the suite ends (§8.5), then lets it go.
     mutating func with_statement(s: ast.Node*) -> !:
         let body = s.body else return
         let mark = self.slots.count
         var cursor = s.left
         while let item = cursor:
             let e = item.left else return
-            try self.bind(item, try self.eval(e))
+            try self.bind(item, try self.eval_owned(e))
             cursor = item.next
         var failed = false
         var code = luce_failure
@@ -441,7 +506,12 @@ pub struct Interp:
             code = failure.code
             message = failure.message
             pending = self.pending
-        # close in reverse order, each through its `close`
+        # the suite's flow, a `return` or a `break`, survives the closing calls
+        let flow = self.flow
+        let label = self.label
+        let carried = self.carried
+        self.flow = Flow.normal
+        # last first: each is closed through its `close`, then let go of
         var n = ast.count(s.left)
         while n > 0:
             n -= 1
@@ -452,9 +522,13 @@ pub struct Interp:
                     let close = item.resolved else return
                     let cell = try self.cell_of(item)
                     discard(try self.call(close, cell, try alloc value.Value[0]))
+                    self.pop_to(mark + n)
                 i += 1
                 it = item.next
-        self.slots.count = mark
+        self.pop_to(mark)
+        self.flow = flow
+        self.label = label
+        self.carried = carried
         if failed:
             self.pending = pending
             error(code, message)
@@ -473,9 +547,14 @@ pub struct Interp:
             .member:
                 let receiver = e.left else error(fault, "no receiver")
                 let field = e.resolved else error(fault, "no field")
-                let container = try self.place(receiver)
                 let owner = self.checker.table.get(receiver.type_id).decl else error(fault, "no owner")
                 let index = field_index(owner, field)
+                if self.checker.table.kind(receiver.type_id) == types.Kind.class_:
+                    # any expression yields the object; its field is the place
+                    let v = try self.eval(receiver)
+                    let o = v.obj else error(fault, "no object")
+                    return &o.fields[index]
+                let container = try self.place(receiver)
                 return &container.items[index]
             .index:
                 let receiver = e.left else error(fault, "no receiver")
@@ -494,23 +573,28 @@ pub struct Interp:
                 return first.decl
         return none
 
+    ## The new value is computed and stored, then the old one is released (RUNTIME 1, 2).
     mutating func assign(s: ast.Node*) -> !:
         let place_expr = s.left else return
         let value_expr = s.right else return
         if place_expr.kind == ast.Kind.tuple:
-            let v = try self.eval(value_expr)
+            let v = try self.eval_owned(value_expr)
             var i: usize = 0
             var cursor = place_expr.body
             while let part = cursor:
                 let cell = try self.place(part)
-                *cell = try value.clone(v.items[i])
+                let old = *cell
+                *cell = v.items[i]
+                heap.release(old)
                 i += 1
                 cursor = part.next
             return
         if s.text == "=":
-            let v = try self.eval(value_expr)
+            let v = try self.eval_owned(value_expr)
             let cell = try self.place(place_expr)
-            *cell = try value.clone(v)
+            let old = *cell
+            *cell = v
+            heap.release(old)
             return
         let cell = try self.place(place_expr)
         let current = *cell
@@ -520,43 +604,63 @@ pub struct Interp:
 
     # -- expressions ----------------------------------------------------------------------
 
+    ## A value to use and let go of: a temporary among the statement's when it was owned.
     pub mutating func eval(e: ast.Node*) -> value.Value!:
+        let (v, owned) = try self.evaluate(e)
+        if owned:
+            try heap.pool(v)
+        return v
+
+    ## A value to keep: a reference of its own to every object it holds.
+    pub mutating func eval_owned(e: ast.Node*) -> value.Value!:
+        let (v, owned) = try self.evaluate(e)
+        if owned:
+            return v
+        return try heap.copy(v)
+
+    ## The value of an expression, and whether the caller owns it: a read of a binding is
+    ## borrowed, everything else, a call, a construction, a field read, is owned (RUNTIME 4).
+    mutating func evaluate(e: ast.Node*) -> (value.Value, bool)!:
         match e.kind:
-            .literal: return try self.literal(e)
+            .literal: return (try self.literal(e), true)
             .name:
                 let d = e.resolved else error(fault, "an unresolved name")
                 if d.kind == ast.Kind.func_:
-                    return value.function(d)
+                    return (value.function(d), true)
                 if d.kind == ast.Kind.constant:
                     let init = d.left else error(fault, "a constant without a value")
-                    return try self.eval(init)
-                return *(try self.cell_of(d))
+                    return (try self.eval_owned(init), true)
+                return (*(try self.cell_of(d)), false)
             .self_:
                 let d = self.self_param() else error(fault, "no self")
-                return *(try self.cell_of(d))
+                return (*(try self.cell_of(d)), false)
             .group:
                 let inner = e.left else error(fault, "empty group")
-                return try self.eval(inner)
-            .unary: return try self.unary(e)
-            .binary: return try self.binary(e)
+                return try self.evaluate(inner)
+            .unary:
+                let inner = e.left else error(fault, "no operand")
+                if e.text == "try":
+                    return try self.evaluate(inner)
+                return (try self.unary(e), true)
+            .binary: return (try self.binary(e), true)
             .conditional:
                 let cond = e.ty else error(fault, "no condition")
                 let l = e.left else error(fault, "no value")
                 let r = e.right else error(fault, "no alternative")
                 if value.truth(try self.eval(cond)):
-                    return try self.eval(l)
-                return try self.eval(r)
+                    return (try self.eval_owned(l), true)
+                return (try self.eval_owned(r), true)
             .tuple:
                 var t = try value.members(value.Kind.tuple, ast.count(e.body), none)
                 var i: usize = 0
                 var cursor = e.body
                 while let m = cursor:
-                    t.items[i] = try self.eval(m)
+                    t.items[i] = try self.eval_owned(m)
                     i += 1
                     cursor = m.next
-                return t
-            .unit_: return value.nothing()
-            .call: return try self.call_expr(e)
+                return (t, true)
+            .unit_: return (value.nothing(), true)
+            .call: return (try self.call_expr(e), true)
             .member: return try self.member(e)
             .index:
                 let receiver = e.left else error(fault, "no receiver")
@@ -565,22 +669,22 @@ pub struct Interp:
                 let index = try self.eval(index_expr)
                 if container.kind == value.Kind.blob:
                     let i = try checked_index(index.i, container.b.length)
-                    return value.integer((i64)container.b[i])
+                    return (value.integer((i64)container.b[i]), true)
                 let i = try checked_index(index.i, container.count)
-                return container.items[i]
-            .slice: return try self.slice(e)
+                return (try heap.copy(container.items[i]), true)
+            .slice: return (try self.slice(e), true)
             .else_:
                 let l = e.left else error(fault, "no value")
                 let r = e.right else error(fault, "no fallback")
-                let v = try self.eval(l)
+                let (v, owned) = try self.evaluate(l)
                 if v.kind != value.Kind.absent:
-                    return v
+                    return (v if owned else try heap.copy(v), true)
                 if r.kind == ast.Kind.return_ or r.kind == ast.Kind.break_ or r.kind == ast.Kind.continue_:
-                    try self.statement(r)
-                    return value.absent()
-                return try self.eval(r)
-            .catch_: return try self.catch_expr(e)
-            .case_value: return try self.construct_case(e, e.body)
+                    try self.run_statement(r)
+                    return (value.absent(), true)
+                return (try self.eval_owned(r), true)
+            .catch_: return (try self.catch_expr(e), true)
+            .case_value: return (try self.construct_case(e, e.body), true)
             .formatted:
                 var b = try strings.Builder.create(64)
                 var cursor = e.body
@@ -593,7 +697,7 @@ pub struct Interp:
                     cursor = part.next
                 let out = try strings.copy(b.view())
                 b.destroy()
-                return value.text(out)
+                return (value.text(out), true)
             .match_expr:
                 let subject = e.left else error(fault, "no value")
                 let v = try self.eval(subject)
@@ -602,10 +706,10 @@ pub struct Interp:
                     let mark = self.slots.count
                     if try self.arm_matches(arm, v):
                         let body = arm.body else error(fault, "no arm value")
-                        let result = try self.eval(body)
-                        self.slots.count = mark
-                        return result
-                    self.slots.count = mark
+                        let result = try self.eval_owned(body)
+                        self.pop_to(mark)
+                        return (result, true)
+                    self.pop_to(mark)
                     cursor = arm.next
                 trap("no arm of the match applied")
             _:
@@ -632,8 +736,6 @@ pub struct Interp:
 
     mutating func unary(e: ast.Node*) -> value.Value!:
         let inner = e.left else error(fault, "no operand")
-        if e.text == "try":
-            return try self.eval(inner)
         if e.text == "not":
             return value.boolean(not value.truth(try self.eval(inner)))
         let v = try self.eval(inner)
@@ -657,6 +759,9 @@ pub struct Interp:
             return value.boolean(value.truth(try self.eval(r)))
         let a = try self.eval(l)
         let b = try self.eval(r)
+        if op == "is" or op == "is not":
+            let same = a.obj == b.obj
+            return value.boolean(same if op == "is" else not same)
         if op == "..<" or op == "..=":
             return value.range(a.i, b.i, op == "..=")
         if op == "==":
@@ -746,44 +851,49 @@ pub struct Interp:
                 var out = try value.members(value.Kind.list_, (usize)(high - low), none)
                 var i: usize = 0
                 while i < (usize)(high - low):
-                    out.items[i] = try value.clone(v.items[(usize)low + i])
+                    out.items[i] = try heap.copy(v.items[(usize)low + i])
                     i += 1
                 return out
             _: error(fault, "cannot slice this value")
 
-    mutating func member(e: ast.Node*) -> value.Value!:
+    ## A member read: a field's value is an owned copy (RUNTIME 4).
+    mutating func member(e: ast.Node*) -> (value.Value, bool)!:
         let receiver = e.left else error(fault, "no receiver")
         let rt = self.checker.table.get(receiver.type_id)
         if rt.kind == types.Kind.type_name:
             # a case without a payload, or a type function
             let m = e.resolved else error(fault, "no member")
             if m.kind == ast.Kind.enum_case:
-                return try self.construct_case(e, none)
-            return value.function(m)
+                return (try self.construct_case(e, none), true)
+            return (value.function(m), true)
         let v = try self.eval(receiver)
         if rt.kind == types.Kind.tuple:
             let index = try literals.decode_integer(e.text)
-            return v.items[(usize)index]
+            return (try heap.copy(v.items[(usize)index]), true)
         if e.text == "length" and (v.kind == value.Kind.text or v.kind == value.Kind.blob or v.kind == value.Kind.list_):
             if v.kind == value.Kind.text:
-                return value.integer((i64)scalar_length(v.s))
+                return (value.integer((i64)scalar_length(v.s)), true)
             if v.kind == value.Kind.blob:
-                return value.integer((i64)v.b.length)
-            return value.integer((i64)v.count)
+                return (value.integer((i64)v.b.length), true)
+            return (value.integer((i64)v.count), true)
         if v.kind == value.Kind.failure:
             if e.text == "code":
-                return value.code(v.i)
-            return value.text(v.s)
+                return (value.code(v.i), true)
+            return (value.text(v.s), true)
         let m = e.resolved else error(fault, "no member")
         if m.kind == ast.Kind.field:
             let owner = rt.decl else error(fault, "no owner")
-            return v.items[field_index(owner, m)]
+            let index = field_index(owner, m)
+            if v.kind == value.Kind.object:
+                let o = v.obj else error(fault, "no object")
+                return (try heap.copy(o.fields[index]), true)
+            return (try heap.copy(v.items[index]), true)
         if m.kind == ast.Kind.func_:
             # a method bound to its receiver: the value is kept beside the function
             var bound = value.function(m)
             bound.items = try alloc value.Value[1]
-            bound.items[0] = v
-            return bound
+            bound.items[0] = try heap.copy(v)
+            return (bound, true)
         error(fault, "an unknown member")
 
     mutating func call_expr(e: ast.Node*) -> value.Value!:
@@ -792,6 +902,10 @@ pub struct Interp:
             return try self.core_call(e, callee.text)
         if callee.kind == ast.Kind.member and callee.text == "package":
             return value.code(try self.package_code(e))
+        if callee.kind == ast.Kind.member and callee.text == "get" and self.checker.table.kind(callee.type_id) == types.Kind.weak_:
+            let receiver = callee.left else error(fault, "no receiver")
+            let w = try self.eval(receiver)
+            return heap.weak_get(w)
         if callee.kind == ast.Kind.case_value:
             return try self.construct_case(e, e.body)
         if let d = e.resolved:
@@ -831,7 +945,8 @@ pub struct Interp:
             return try self.call(d, &f.items[0], args[..<n])
         return try self.call(d, none, args[..<n])
 
-    ## The cell a method's receiver lives in: a place's cell, or a fresh cell for a temporary.
+    ## The cell a method's receiver lives in: a place's cell, or a fresh cell holding a
+    ## temporary that the statement's pool keeps alive.
     mutating func receiver_cell(receiver: ast.Node*) -> value.Value*!:
         if receiver.kind == ast.Kind.name or receiver.kind == ast.Kind.self_ or receiver.kind == ast.Kind.member or receiver.kind == ast.Kind.index:
             return self.place(receiver) catch failure:
@@ -847,29 +962,33 @@ pub struct Interp:
         var v = try value.members(value.Kind.record, args.length, d)
         var i: usize = 0
         while i < args.length:
-            v.items[i] = try value.clone(args[i])
+            v.items[i] = try heap.copy(args[i])
             i += 1
         return v
 
-    ## A class instance: fields from their defaults, then `init` over it.
+    ## A class instance: fields from their defaults, then `init` over it; an `init` that
+    ## fails leaves no object behind (RUNTIME).
     mutating func construct_object(e: ast.Node*, owner: ast.Node*, init: ast.Node*?) -> value.Value!:
         let n = field_count(owner)
-        var v = try value.members(value.Kind.object, n, owner)
+        let o = try heap.allocate(owner, n)
         var i: usize = 0
         var cursor = owner.body
         while let m = cursor:
             if m.kind == ast.Kind.field:
                 if let default = m.left:
-                    v.items[i] = try self.eval(default)
+                    o.fields[i] = try self.eval_owned(default)
                 i += 1
             cursor = m.next
         if let f = init:
             let cell = try new value.Value
-            *cell = v
+            *cell = value.object(o)
             let args = try self.arguments(e, f.right, true)
-            discard(try self.call(f, cell, args))
-            return *cell
-        return v
+            self.call(f, cell, args) catch failure:
+                let pending = self.pending
+                heap.abandon(o)
+                self.pending = pending
+                error(failure.code, failure.message)
+        return value.object(o)
 
     ## A case value: the enum, the case, and its payload from the arguments.
     mutating func construct_case(e: ast.Node*, args_list: ast.Node*?) -> value.Value!:
@@ -894,7 +1013,7 @@ pub struct Interp:
             e.body = saved
             var i: usize = 0
             while i < n:
-                v.items[i] = try value.clone(args[i])
+                v.items[i] = try heap.copy(args[i])
                 i += 1
         return v
 
@@ -902,17 +1021,19 @@ pub struct Interp:
         let l = e.left else error(fault, "no value")
         let body = e.body else error(fault, "no suite")
         let mark = self.slots.count
-        let result = self.eval(l) catch failure:
+        let result = self.eval_owned(l) catch failure:
             if failure.code != luce_failure:
                 error(failure.code, failure.message)
             let err = self.pending
             if e.text.length > 0:
                 try self.bind(e, err)
             try self.block(body)
-            self.slots.count = mark
+            self.pop_to(mark)
             if self.flow == Flow.recovered:
                 self.flow = Flow.normal
-                recover self.carried
+                let carried = self.carried
+                self.carried = value.nothing()
+                recover carried
             recover value.nothing()
         return result
 
@@ -957,6 +1078,10 @@ pub struct Interp:
         if name == "discard":
             discard(try self.eval(arg))
             return value.nothing()
+        if name == "Weak":
+            let v = try self.eval(arg)
+            let o = v.obj else error(fault, "no object")
+            return heap.weak_make(o)
         let v = try self.eval(arg)
         if name == "int":
             if v.kind == value.Kind.floating:
@@ -989,6 +1114,17 @@ pub struct Interp:
         let v = first.left else error(fault, "no code")
         let n = try literals.decode_integer(v.text)
         return (i64)(((u64)package_identity(self.checker.package_name) << 16) | n)
+
+## The heap's hook: a `deinit` runs on the interpreter behind the context.
+func finish_object(context: void*, o: value.Object*):
+    let me = (Interp*)context
+    me.run_deinit(o) catch failure:
+        trap("`deinit` failed")
+
+## Installs the interpreter behind the heap; `me` must outlive every run.
+pub func attach(me: Interp*):
+    heap.finisher = finish_object
+    heap.finisher_context = (void*)me
 
 # mark: Helpers ================================================================================
 
