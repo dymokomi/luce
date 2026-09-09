@@ -219,3 +219,11 @@ A worker keeps its failure until the waiter copies the text to its own heap. The
 then releases it, including when a task is abandoned. Sending an `Error` as an ordinary
 argument or result also copies its text. Unhandled main and test failures release their
 messages before the final heap check.
+
+A module function used as a Luce value is an immortal closure over its existing call
+adapter. Fallible closure calls propagate Base failures explicitly. Named functions
+with callback-compatible signatures also carry a static Base entry; an indirect call
+to a Base function taking a callback uses that entry. It remains valid if Base stores
+it. Capturing closures and bound methods have no such entry and trap if an indirect
+Base call attempts to pass them as callbacks. Direct calls retain the named-function
+check in the checker.
