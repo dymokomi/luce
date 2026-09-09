@@ -95,6 +95,9 @@ pub struct Emitter:
     var orderings_done: usize
     var hashes_done: usize
     var ops_done: usize
+    ## Operands hoisted before the statement (RUNTIME 5): `let` lines, written ahead of the
+    ## statement when it is wrapped.
+    var prelude: buffer.Buffer
     ## `luce test --build`: the tests are written as functions and `main` runs them (§17.3).
     pub var tests_mode: bool
     var test_names: list.List[str]
@@ -123,7 +126,7 @@ pub struct Emitter:
                        spawns = try list.List[ast.Node*].create(8), spawns_done = 0, waits = try list.List[u32].create(8), waits_done = 0, sends = try list.List[u32].create(16), sends_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self",
-                       tests_mode = false, test_names = try list.List[str].create(8))
+                       tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024))
 
     pub func text() -> str:
         return self.out.view()
@@ -181,6 +184,9 @@ pub struct Emitter:
                 try self.put(m)
                 try self.put(")")
                 try self.end()
+            if self.prelude.used > 0:
+                try self.put(self.prelude.view())
+                self.prelude.used = 0
             try self.put(text)
             try self.begin("heap.drain(")
             try self.put(m)
@@ -2191,11 +2197,21 @@ pub struct Emitter:
                 try self.begin("kernel.map_set[")
                 try self.map_types(receiver.type_id)
                 try self.put("](")
-                try self.use(receiver)
-                try self.put(", ")
-                try self.owned(index)
-                try self.put(", ")
-                try self.owned(value)
+                if self.may_fail(value) or self.may_fail(index):
+                    let r = try self.hoist(receiver, false)
+                    let k = try self.hoist(index, true)
+                    let v = try self.hoist(value, true)
+                    try self.put(r)
+                    try self.put(", ")
+                    try self.put(k)
+                    try self.put(", ")
+                    try self.put(v)
+                else:
+                    try self.use(receiver)
+                    try self.put(", ")
+                    try self.owned(index)
+                    try self.put(", ")
+                    try self.owned(value)
                 try self.put(")")
                 try self.end()
                 return
@@ -3094,6 +3110,87 @@ pub struct Emitter:
             return
         try self.expr(e)
 
+    ## An operand of a construct whose other operand may fail (a `try` beside it): evaluated
+    ## ahead of the statement into a temporary of the statement, in source order, so that a
+    ## failure drains what was made and nothing is copied for a taker that never took it
+    ## (RUNTIME 5). The name to write at the site: a copy of the temporary for an owned
+    ## reference, the temporary itself otherwise.
+    mutating func hoist(e: ast.Node*, owned: bool) -> str!:
+        let name = try self.temp("arg")
+        let start = self.out.used
+        if owned:
+            try self.owned(e)
+        else:
+            try self.use(e)
+        let text = try self.capture(start)
+        let refs = self.checker.table.has_references(e.type_id)
+        var i: u32 = 0
+        while i < self.indent:
+            try self.prelude.put("    ")
+            i += 1
+        try self.prelude.put("let ")
+        try self.prelude.put(name)
+        try self.prelude.put(" = ")
+        if owned and refs:
+            try self.prelude.put(try self.lifetime_name("L_pool_", e.type_id))
+            try self.prelude.put("(")
+            try self.prelude.put(text)
+            try self.prelude.put(")")
+            self.pooled = true
+        else:
+            try self.prelude.put(text)
+        try self.prelude.put("\n")
+        if owned and refs:
+            let half = self.checker.scratch.length // 2
+            return try copy_name(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({name})"))
+        return name
+
+    ## Whether a call appears anywhere in the expression: evaluating it may have an effect.
+    func has_call(n: ast.Node*?) -> bool:
+        let node = n else return false
+        if node.kind == ast.Kind.call or node.kind == ast.Kind.spawn_ or node.kind == ast.Kind.wait_:
+            return true
+        if node.kind == ast.Kind.lambda:
+            return false
+        return self.has_call(node.left) or self.has_call(node.right) or self.has_call(node.body) or self.has_call(node.ty) or self.has_call(node.next)
+
+    ## Whether `try` appears anywhere in the expression: evaluating it may fail.
+    func may_fail(n: ast.Node*?) -> bool:
+        let node = n else return false
+        if node.kind == ast.Kind.unary and node.text == "try":
+            return true
+        if node.kind == ast.Kind.lambda:
+            return false
+        return self.may_fail(node.left) or self.may_fail(node.right) or self.may_fail(node.body) or self.may_fail(node.ty) or self.may_fail(node.next)
+
+    ## The elements of a list, set or tuple literal, each owned; hoisted when one may fail.
+    mutating func owned_items(items: ast.Node*?) -> !:
+        var risky = false
+        var cursor = items
+        while let item = cursor:
+            if self.may_fail(item):
+                risky = true
+            cursor = item.next
+        var names = try list.List[str].create(8)
+        if risky:
+            cursor = items
+            while let item = cursor:
+                try names.push(try self.hoist(item, true))
+                cursor = item.next
+        cursor = items
+        var first = true
+        var i: usize = 0
+        while let item = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            if risky:
+                try self.put(names.get(i))
+            else:
+                try self.owned(item)
+            i += 1
+            cursor = item.next
+
     ## The expression as a value used and let go of: an owned one becomes a temporary of
     ## the statement, pooled until the drain.
     mutating func use(e: ast.Node*) -> !:
@@ -3190,14 +3287,7 @@ pub struct Emitter:
                 try self.put(")")
             .tuple:
                 try self.put("(")
-                var cursor = e.body
-                var first = true
-                while let m = cursor:
-                    if not first:
-                        try self.put(", ")
-                    first = false
-                    try self.owned(m)
-                    cursor = m.next
+                try self.owned_items(e.body)
                 if ast.count(e.body) == 1:
                     try self.put(",")
                 try self.put(")")
@@ -3244,14 +3334,7 @@ pub struct Emitter:
                 try self.put(try self.ops_name(t.elem))
                 if e.body != none:
                     try self.put(", [")
-                    var cursor = e.body
-                    var first = true
-                    while let item = cursor:
-                        if not first:
-                            try self.put(", ")
-                        first = false
-                        try self.owned(item)
-                        cursor = item.next
+                    try self.owned_items(e.body)
                     try self.put("]")
                 try self.put(")")
             .set_lit, .map_lit:
@@ -3265,14 +3348,7 @@ pub struct Emitter:
                     try self.put(try self.ops_name(t.elem))
                     if e.body != none:
                         try self.put(", [")
-                        var cursor = e.body
-                        var first = true
-                        while let item = cursor:
-                            if not first:
-                                try self.put(", ")
-                            first = false
-                            try self.owned(item)
-                            cursor = item.next
+                        try self.owned_items(e.body)
                         try self.put("]")
                     try self.put(")")
                 else:
@@ -3288,15 +3364,34 @@ pub struct Emitter:
                     try self.put(", ")
                     try self.put(try self.ops_name(value_type))
                     if e.body != none:
-                        try self.put(", [")
+                        # keys then values in Base; hoisted in source order when one may fail
+                        # or call anything, so the entries are evaluated as written
+                        var risky = false
                         var cursor = e.body
+                        while let entry = cursor:
+                            if self.may_fail(entry.left) or self.may_fail(entry.right) or self.has_call(entry.left) or self.has_call(entry.right):
+                                risky = true
+                            cursor = entry.next
+                        if risky:
+                            cursor = e.body
+                            while let entry = cursor:
+                                let k = entry.left else return
+                                let v = entry.right else return
+                                entry.text = try self.hoist(k, true)
+                                entry.doc = try self.hoist(v, true)
+                                cursor = entry.next
+                        try self.put(", [")
+                        cursor = e.body
                         var first = true
                         while let entry = cursor:
                             let k = entry.left else return
                             if not first:
                                 try self.put(", ")
                             first = false
-                            try self.owned(k)
+                            if risky:
+                                try self.put(entry.text)
+                            else:
+                                try self.owned(k)
                             cursor = entry.next
                         try self.put("], [")
                         cursor = e.body
@@ -3306,7 +3401,10 @@ pub struct Emitter:
                             if not first:
                                 try self.put(", ")
                             first = false
-                            try self.owned(v)
+                            if risky:
+                                try self.put(entry.doc)
+                            else:
+                                try self.owned(v)
                             cursor = entry.next
                         try self.put("]")
                     try self.put(")")
@@ -4021,6 +4119,20 @@ pub struct Emitter:
         try self.put(")")
 
     mutating func arguments_bare(e: ast.Node*, params: ast.Node*?, skip_self: bool, own: bool) -> !:
+        var hoisted = false
+        if own:
+            var a = e.body
+            while let arg = a:
+                if self.may_fail(arg.left):
+                    hoisted = true
+                a = arg.next
+        if hoisted:
+            # in source order, each argument a temporary; the defaults are constants
+            var a = e.body
+            while let arg = a:
+                let v = arg.left else return
+                arg.text = try self.hoist(v, true)
+                a = arg.next
         var first = true
         var cursor = params
         while let p = cursor:
@@ -4033,7 +4145,9 @@ pub struct Emitter:
                 while let arg = a:
                     if arg.resolved == p:
                         let v = arg.left else return
-                        if own:
+                        if hoisted:
+                            try self.put(arg.text)
+                        elif own:
                             try self.owned(v)
                         else:
                             try self.use(v)
@@ -5281,27 +5395,43 @@ pub struct Emitter:
     ## Whether `==` on the type is a call: a collection, or a value holding one, since Base's
     ## own `==` on the pointer would compare identity; a declared `equals` too.
     func needs_equality(id: u32) -> bool:
+        return self.equality_at(id, 0)
+
+    func equality_at(id: u32, depth: u32) -> bool:
+        if depth > 32:
+            return true
+        let k = self.checker.table.kind(id)
+        if k == types.Kind.struct_ or k == types.Kind.enum_:
+            let fresh = self.checker.entering(id) catch failure: recover false
+            if not fresh:
+                return true
+            let answer = self.equality_walk(id, depth)
+            self.checker.leave_walk()
+            return answer
+        return self.equality_walk(id, depth)
+
+    func equality_walk(id: u32, depth: u32) -> bool:
         if self.protocol_method(id, "Equatable", "equals") != none:
             return true
         let t = self.checker.table.get(id)
         match t.kind:
             .list_, .map_, .set_, .bytes_, .str_: return true
-            .optional: return self.needs_equality(t.elem)
+            .optional: return self.equality_at(t.elem, depth + 1)
             .tuple:
                 for m in t.args:
-                    if self.needs_equality(m):
+                    if self.equality_at(m, depth + 1):
                         return true
                 return false
             .struct_, .enum_:
                 let d = t.decl else return false
                 var cursor = d.body
                 while let m = cursor:
-                    if m.kind == ast.Kind.field and self.needs_equality(m.type_id):
+                    if m.kind == ast.Kind.field and self.equality_at(m.type_id, depth + 1):
                         return true
                     if m.kind == ast.Kind.enum_case:
                         var p = m.body
                         while let field = p:
-                            if self.needs_equality(field.type_id):
+                            if self.equality_at(field.type_id, depth + 1):
                                 return true
                             p = field.next
                     cursor = m.next

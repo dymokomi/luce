@@ -5,7 +5,7 @@ set -eu
 cd "$(dirname "$0")/.."
 mkdir -p build/fmt
 checked=0
-for f in $(find tests/conformance -name '*.luc' -not -path '*/errors/*' | sort); do
+for f in $(find tests/conformance tests/programs -name '*.luc' -not -path '*/errors/*' | sort); do
     ./build/luce fmt "$f" > build/fmt/once.luc
     ./build/luce parse "$f" | sed -e 's/ @[0-9]*//g' -e '1s/(module .*/(module/' > build/fmt/before.txt
     ./build/luce parse build/fmt/once.luc | sed -e 's/ @[0-9]*//g' -e '1s/(module .*/(module/' > build/fmt/after.txt

@@ -11,13 +11,14 @@ programs=0
 rejections=0
 parsed=0
 # every program the suite holds parses, whatever slice runs it
-for f in $(find tests/conformance -name '*.luc' -not -path '*/errors/*' | sort); do
+for f in $(find tests/conformance tests/programs -name '*.luc' -not -path '*/errors/*' | sort); do
     ./build/luce parse "$f" > /dev/null
     parsed=$((parsed + 1))
 done
 # a program is a file beside its `.expect`, or a directory of modules whose entry is
 # `main.luc` (§15), a `src/main.luc` under a manifest among them
-for dir in tests/conformance/[0-9]*/; do
+# the proving programs under tests/programs are run the same way, each a directory
+for dir in tests/conformance/[0-9]*/ tests/programs/; do
     for f in "$dir"*.expect "$dir"*/main.expect "$dir"*/src/main.expect; do
         [ -e "$f" ] || continue
         src="${f%.expect}.luc"

@@ -110,6 +110,11 @@ assignment. A named function used as a value is an immortal closure holding noth
 method bound to a receiver is a closure holding the receiver. A closure is released like
 any object, and lets its captures go when it goes; the collector traces through them.
 
+When an operand of a construction, a collection literal or a map store sits beside another
+whose `try` may fail (or, in a map literal, beside a call), every operand is evaluated ahead
+of the statement into a temporary, in source order, and the taker gets a copy of it: a
+failure then drains what was made, and nothing is copied for a taker that never took it.
+
 ## Interface values
 
 An interface value (§13.2) is a pointer to a box: an object whose header is followed by a
