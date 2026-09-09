@@ -8,6 +8,13 @@ set -eu
 cd "$(dirname "$0")/../.."
 programs=0
 rejections=0
+parsed=0
+# every program the suite holds parses, whatever slice runs it
+for f in tests/conformance/[0-9]*/*.luc; do
+    [ -e "$f" ] || continue
+    ./build/luce parse "$f" > /dev/null
+    parsed=$((parsed + 1))
+done
 for dir in tests/conformance/[0-9]*/; do
     for f in "$dir"*.expect; do
         [ -e "$f" ] || continue
@@ -34,4 +41,4 @@ for dir in tests/conformance/[0-9]*/; do
         rejections=$((rejections + 1))
     done
 done
-echo "ok conformance: $programs programs, $rejections rejections"
+echo "ok conformance: $programs programs, $rejections rejections, $parsed parsed"
