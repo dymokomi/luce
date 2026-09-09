@@ -306,9 +306,9 @@ membership: an element of a list or set, a key of a map, a substring of a `str`.
 | Call | Meaning |
 | --- | --- |
 | `int(f)` | truncates a `float` toward zero; traps on NaN or out of range |
-| `int(s)` | parses a `str` as a decimal integer; `int!` |
+| `int(s)` | parses a `str` as a decimal integer, a sign and digits with spaces around them; `int!` |
 | `float(i)` | the nearest `float` |
-| `float(s)` | parses a `str`; `float!` |
+| `float(s)` | parses a `str` as a decimal number, a sign, digits with an optional fraction and an optional exponent, spaces around them; `float!` |
 | `str(x)` | the display of any value with one (§10.5) |
 | `bool(x)` | only from `str`: `"true"` or `"false"`, else fails |
 
