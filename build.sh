@@ -7,6 +7,7 @@ set -eu
 cd "$(dirname "$0")"
 mkdir -p build
 python3 tools/embed_version.py > /dev/null
+python3 tools/embed_runtime.py > /dev/null
 tag=$(cat bootstrap/BASE)
 source=${LUCE_BASE_SOURCE:-../luce-base}
 base=build/luce-base/build/luce-base

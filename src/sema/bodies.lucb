@@ -1,0 +1,1498 @@
+#==============================================================================================
+#
+#   bodies - Every statement and expression typed
+#
+#   DESCRIPTION:
+#       The rules of luce.md §5 to §9, §12 and §13 applied to the bodies of a module, over
+#       the state `sema.check` prepared: bindings and their mutability, evaluation and
+#       arithmetic, calls with named and default arguments, construction, methods and their
+#       receivers, control flow with definite return, patterns and exhaustiveness, optionals
+#       and results, traps. Every node leaves with its `type_id`, and every name, member,
+#       case and call with its `resolved` declaration, so the interpreter and the emitter
+#       never look a name up again.
+#
+#==============================================================================================
+
+import front.ast
+import sema.check
+import sema.types
+import support.list
+import support.literals
+
+# mark: Entry ==================================================================================
+
+## Type every body of the module the checker holds current.
+pub func check_module(c: check.Checker*) -> !:
+    let tree = c.tree()
+    var cursor = tree.body
+    while let d = cursor:
+        match d.kind:
+            .constant: try check_constant(c, d)
+            .func_: try check_function(c, d, types.none_id)
+            .struct_, .class_, .enum_:
+                var m = d.body
+                while let member = m:
+                    if member.kind == ast.Kind.field:
+                        if let default = member.left:
+                            c.at_top_level = true
+                            try expect(c, default, member.type_id)
+                            c.at_top_level = false
+                            if not is_constant(default):
+                                return try c.fail(default, "a field default is a constant expression")
+                    elif member.kind == ast.Kind.func_:
+                        try check_function(c, member, d.type_id)
+                    m = member.next
+            .test_: try check_test(c, d)
+            _: discard(0)
+        cursor = d.next
+    if not c.main_seen:
+        var has_test = false
+        cursor = tree.body
+        while let d = cursor:
+            if d.kind == ast.Kind.test_:
+                has_test = true
+            cursor = d.next
+        if not has_test:
+            return try c.fail(tree, "a program declares `pub func main(arguments: list[str]) -> int!` (§15.4)")
+
+func check_constant(c: check.Checker*, d: ast.Node*) -> !:
+    let init = d.left else return try c.fail(d, "a constant needs a value")
+    c.at_top_level = true
+    var got = types.none_id
+    if d.type_id != types.none_id:
+        got = try expect(c, init, d.type_id)
+    else:
+        got = try check_expr(c, init, types.none_id)
+        if got == types.untyped_none_id:
+            return try c.fail(init, "`none` needs a written optional type")
+        d.type_id = got
+    c.at_top_level = false
+    if not is_constant(init):
+        return try c.fail(init, "a top-level `let` is a constant expression (§15.3)")
+
+## A test is a function of no parameters that may fail.
+func check_test(c: check.Checker*, d: ast.Node*) -> !:
+    let body = d.body else return try c.fail(d, "a test needs a body")
+    c.current_func = d
+    c.result_type = types.unit_id
+    c.fallible = true
+    c.self_type = types.none_id
+    c.push_scope()
+    discard(try check_block(c, body))
+    c.pop_scope()
+    c.current_func = none
+
+## A function or method: parameters bound, the body checked, a value on every path.
+func check_function(c: check.Checker*, f: ast.Node*, owner: u32) -> !:
+    let body = f.body else return try c.fail(f, "a function needs a body")
+    let t = c.table.get(f.type_id)
+    c.current_func = f
+    c.self_type = owner
+    c.self_mutable = f.has(check.flag_mutating) or c.table.kind(owner) == types.Kind.class_
+    c.in_init = f.text == "init" and owner != types.none_id
+    var result = t.elem
+    c.fallible = false
+    if c.table.kind(result) == types.Kind.fallible:
+        c.fallible = true
+        result = c.table.get(result).elem
+    c.result_type = result
+    c.loop_depth = 0
+    c.label_count = 0
+    c.push_scope()
+    var cursor = f.right
+    while let p = cursor:
+        if p.text == "self":
+            try c.bind(p, "self", owner, p, false)
+        else:
+            if let default = p.left:
+                c.at_top_level = true
+                try expect(c, default, p.type_id)
+                c.at_top_level = false
+                if not is_constant(default):
+                    return try c.fail(default, "a parameter default is a constant expression (§7.1)")
+            try c.bind(p, p.text, p.type_id, p, false)
+        cursor = p.next
+    if c.in_init:
+        try check_init(c, f, body)
+    else:
+        let exits = try check_block(c, body)
+        if result != types.unit_id and not exits:
+            return try c.fail(f, "not every path returns a value (§7.1)")
+    c.pop_scope()
+    c.current_func = none
+    c.self_type = types.none_id
+    c.in_init = false
+
+## `init` assigns every field without a default exactly once before it ends, reads none
+## before, and does not hand `self` out first (§10.1). The walk is over the statements in
+## order; a branch must assign the same fields on each side.
+func check_init(c: check.Checker*, f: ast.Node*, body: ast.Node*) -> !:
+    let owner = c.table.get(c.self_type).decl else return try c.fail(f, "no owner")
+    var assigned = try list.List[str].create(16)
+    discard(try check_block(c, body))
+    # a simple rule that is right for the common shape: every statement of the body that
+    # is `self.field = ...` at the top level counts; a field assigned only under a branch
+    # is reported as unassigned
+    var cursor = body.body
+    while let s = cursor:
+        if s.kind == ast.Kind.assign and s.text == "=":
+            if let place = s.left:
+                if place.kind == ast.Kind.member:
+                    if let receiver = place.left:
+                        if receiver.kind == ast.Kind.self_:
+                            try assigned.push(place.text)
+        cursor = s.next
+    var m = owner.body
+    while let member = m:
+        if member.kind == ast.Kind.field and member.left == none:
+            var found = false
+            var i: usize = 0
+            while i < assigned.count:
+                if assigned.get(i) == member.text:
+                    found = true
+                i += 1
+            if not found:
+                return try c.fail(f, try c.named("`init` does not assign the field ", member.text, " on every path (§10.1)"))
+        m = member.next
+
+# mark: Statements =============================================================================
+
+## Check a block; whether it exits on every path (§7.1).
+pub func check_block(c: check.Checker*, block: ast.Node*) -> bool!:
+    c.push_scope()
+    var exits = false
+    var cursor = block.body
+    while let s = cursor:
+        if exits:
+            return try c.fail(s, "this statement is never reached")
+        exits = try check_statement(c, s)
+        cursor = s.next
+    c.pop_scope()
+    return exits
+
+func check_statement(c: check.Checker*, s: ast.Node*) -> bool!:
+    match s.kind:
+        .let_, .var_: try check_binding(c, s)
+        .assign: try check_assign(c, s)
+        .if_: return try check_if(c, s)
+        .while_: try check_while(c, s)
+        .for_: try check_for(c, s)
+        .match_: return try check_match_statement(c, s)
+        .with_: return try check_with(c, s)
+        .return_: return try check_return(c, s)
+        .break_, .continue_:
+            if c.loop_depth == 0:
+                return try c.fail(s, "`break` and `continue` belong inside a loop")
+            if s.text.length > 0 and not has_label(c, s.text):
+                return try c.fail(s, try c.named("no enclosing loop is labelled ", s.text, ""))
+            return true
+        .recover_:
+            if not c.in_catch:
+                return try c.fail(s, "`recover` belongs in a `catch` suite (§12.2)")
+            let v = s.left else return try c.fail(s, "`recover` needs a value")
+            discard(try expect(c, v, c.catch_result))
+            return true
+        .expr_stmt:
+            let e = s.left else return try c.fail(s, "empty statement")
+            let t = try check_expr(c, e, types.none_id)
+            if t == types.never_id:
+                return true
+            if t != types.unit_id and not (e.kind == ast.Kind.catch_):
+                if c.table.kind(t) == types.Kind.fallible:
+                    return try c.fail(e, "a result is handled: `try`, `catch`, or bind it (§12.2)")
+                return try c.fail(e, "this value is unused; `discard(...)` it or bind it")
+            if e.kind == ast.Kind.catch_ and t != types.unit_id and t != types.never_id:
+                return try c.fail(e, "this value is unused; bind it")
+            return false
+        _: return try c.fail(s, "unexpected statement")
+    return false
+
+func has_label(c: check.Checker*, name: str) -> bool:
+    var i: usize = 0
+    while i < c.label_count:
+        if c.labels[i] == name:
+            return true
+        i += 1
+    return false
+
+func check_binding(c: check.Checker*, s: ast.Node*) -> !:
+    let init = s.left else return try c.fail(s, "a binding needs a value")
+    let mutable = s.kind == ast.Kind.var_
+    var declared = types.none_id
+    if let t = s.ty:
+        declared = try c.resolve_type(t)
+    var got = types.none_id
+    if declared != types.none_id:
+        got = try expect(c, init, declared)
+        got = declared
+    else:
+        got = try check_expr(c, init, types.none_id)
+        if got == types.untyped_none_id:
+            return try c.fail(init, "`none` needs a written optional type: `var x: T? = none` (§5.1)")
+        if got == types.unit_id:
+            return try c.fail(init, "this expression has no value")
+        if got == types.never_id:
+            return try c.fail(init, "this expression never yields a value")
+        if c.table.kind(got) == types.Kind.fallible:
+            return try c.fail(init, "a result is handled: `try`, `catch`, or `else` (§12.2)")
+        if c.table.kind(got) == types.Kind.type_name:
+            return try c.fail(init, "a type is not a value")
+    s.type_id = got
+    if s.body != none:
+        # `let (a, b) = pair`
+        if c.table.kind(got) != types.Kind.tuple:
+            return try c.fail(init, "only a tuple destructures")
+        let members = c.table.get(got).args
+        if ast.count(s.body) != members.length:
+            return try c.fail(s, "the binding names as many parts as the tuple has members")
+        var i: usize = 0
+        var cursor = s.body
+        while let part = cursor:
+            part.type_id = members[i]
+            try c.bind(part, part.text, members[i], part, mutable)
+            i += 1
+            cursor = part.next
+        return
+    try c.bind(s, s.text, got, s, mutable)
+
+## `place = value`, `place += value`: the place is a `var`, and the value its type.
+func check_assign(c: check.Checker*, s: ast.Node*) -> !:
+    let place = s.left else return try c.fail(s, "nothing to assign to")
+    let value = s.right else return try c.fail(s, "nothing to assign")
+    if place.kind == ast.Kind.tuple and s.text == "=":
+        # `(a, b) = pair`
+        var members = try alloc u32[ast.count(place.body)]
+        var i: usize = 0
+        var cursor = place.body
+        while let part = cursor:
+            members[i] = try check_place(c, part)
+            i += 1
+            cursor = part.next
+        let t = try c.table.tuple(members)
+        discard(try expect(c, value, t))
+        place.type_id = t
+        return
+    let pt = try check_place(c, place)
+    if s.text == "=":
+        discard(try expect(c, value, pt))
+        return
+    # a compound assignment is the binary operation, then the store
+    let vt = try check_expr(c, value, pt)
+    let op = (str)s.text.bytes[..<s.text.length - 1]
+    let rt = try arithmetic_type(c, s, op, pt, vt)
+    if rt != pt:
+        return try c.mismatch(s, pt, rt)
+
+## The type of a place, which must be assignable: a `var` local, a `var` field reached
+## through a path, an element of a list or map, or a `let` field of `self` inside `init`.
+func check_place(c: check.Checker*, place: ast.Node*) -> u32!:
+    match place.kind:
+        .name:
+            let b = c.lookup(place.text) else return try c.fail(place, try c.named("unknown name ", place.text, ""))
+            if not b.mutable:
+                return try c.fail(place, try c.named("", place.text, " is a `let` and cannot be assigned; declare it `var`"))
+            c.mark_used(place.text)
+            place.type_id = b.type_id
+            place.resolved = b.decl
+            return b.type_id
+        .member:
+            let receiver = place.left else return try c.fail(place, "no receiver")
+            let rt = try check_expr(c, receiver, types.none_id)
+            let t = try check_expr(c, place, types.none_id)
+            let field = place.resolved else return try c.fail(place, "only a field is assigned")
+            if field.kind != ast.Kind.field:
+                return try c.fail(place, "only a field is assigned")
+            let receiver_is_var = try place_is_mutable(c, receiver)
+            if not field.has(ast.flag_var_field):
+                let self_in_init = receiver.kind == ast.Kind.self_ and c.in_init
+                if not self_in_init:
+                    return try c.fail(place, try c.named("the field ", place.text, " is a `let`; it is assigned once, in `init`"))
+                return t
+            if c.table.is_value(rt) and not receiver_is_var:
+                return try c.fail(place, "a field of a `let` value cannot change; the binding is `var` or the type is a class (§5.1)")
+            return t
+        .index:
+            let receiver = place.left else return try c.fail(place, "no receiver")
+            let t = try check_expr(c, place, types.none_id)
+            let rt = receiver.type_id
+            let k = c.table.kind(rt)
+            if k != types.Kind.list_ and k != types.Kind.map_:
+                return try c.fail(place, "only an element of a list or a map is assigned")
+            return t
+        .self_:
+            return try c.fail(place, "`self` is not assigned")
+        _:
+            return try c.fail(place, "this is not a place that can be assigned")
+
+## Whether an expression is a `var` place, or a class value (whose fields always change).
+func place_is_mutable(c: check.Checker*, e: ast.Node*) -> bool!:
+    if c.table.kind(e.type_id) == types.Kind.class_:
+        return true
+    match e.kind:
+        .name:
+            let b = c.lookup(e.text) else return false
+            return b.mutable
+        .self_:
+            return c.self_mutable
+        .member:
+            let inner = e.left else return false
+            let field = e.resolved else return false
+            if field.kind != ast.Kind.field:
+                return false
+            if not field.has(ast.flag_var_field) and not (inner.kind == ast.Kind.self_ and c.in_init):
+                return false
+            return try place_is_mutable(c, inner)
+        .index:
+            let inner = e.left else return false
+            return c.table.is_reference(inner.type_id) or try place_is_mutable(c, inner)
+        _: return false
+
+func check_condition(c: check.Checker*, s: ast.Node*) -> !:
+    let cond = s.left else return try c.fail(s, "a condition is missing")
+    if s.has(ast.flag_if_let):
+        let init = cond.left else return try c.fail(cond, "`if let` needs a value")
+        let t = try check_expr(c, init, types.none_id)
+        if c.table.kind(t) != types.Kind.optional:
+            return try c.fail(init, "`if let` binds the payload of an optional (§8.2)")
+        cond.type_id = c.table.get(t).elem
+        try c.bind(cond, cond.text, cond.type_id, cond, false)
+        return
+    discard(try expect(c, cond, types.bool_id))
+
+func check_if(c: check.Checker*, s: ast.Node*) -> bool!:
+    c.push_scope()
+    try check_condition(c, s)
+    let body = s.body else return try c.fail(s, "an `if` needs a body")
+    let then_exits = try check_block(c, body)
+    c.pop_scope()
+    var else_exits = false
+    if let rest = s.right:
+        if rest.kind == ast.Kind.if_:
+            else_exits = try check_if(c, rest)
+        else:
+            else_exits = try check_block(c, rest)
+        return then_exits and else_exits
+    return false
+
+func check_while(c: check.Checker*, s: ast.Node*) -> !:
+    c.push_scope()
+    try check_condition(c, s)
+    try enter_loop(c, s)
+    let body = s.body else return try c.fail(s, "a loop needs a body")
+    discard(try check_block(c, body))
+    leave_loop(c, s)
+    c.pop_scope()
+
+func enter_loop(c: check.Checker*, s: ast.Node*) -> !:
+    c.loop_depth += 1
+    if s.text.length > 0:
+        if has_label(c, s.text):
+            return try c.fail(s, "this label is already in use")
+        if c.label_count >= c.labels.length:
+            return try c.fail(s, "loops nest too deeply to label")
+        c.labels[c.label_count] = s.text
+        c.label_count += 1
+
+func leave_loop(c: check.Checker*, s: ast.Node*):
+    c.loop_depth -= 1
+    if s.text.length > 0:
+        c.label_count -= 1
+
+## `for x in e`: `e` is a range, a list, a set, a map, a `str`, or `bytes` (§8.3).
+func check_for(c: check.Checker*, s: ast.Node*) -> !:
+    let binding = s.left else return try c.fail(s, "a `for` binds a name")
+    let seq = s.right else return try c.fail(s, "a `for` needs something to iterate")
+    let st = try check_expr(c, seq, types.none_id)
+    var elem = types.none_id
+    let t = c.table.get(st)
+    match t.kind:
+        .range_: elem = types.int_id
+        .list_, .set_: elem = t.elem
+        .str_: elem = types.str_id
+        .bytes_: elem = types.int_id
+        .map_:
+            var pair = try alloc u32[2]
+            pair[0] = t.elem
+            pair[1] = c.table.map_value(st)
+            elem = try c.table.tuple(pair)
+        _: return try c.fail(seq, try c.with_type("cannot iterate a `", st, "` (§8.3)"))
+    c.push_scope()
+    binding.type_id = elem
+    if binding.body != none:
+        if c.table.kind(elem) != types.Kind.tuple:
+            return try c.fail(binding, "only a tuple element destructures")
+        let members = c.table.get(elem).args
+        if ast.count(binding.body) != members.length:
+            return try c.fail(binding, "the binding names as many parts as the tuple has members")
+        var i: usize = 0
+        var cursor = binding.body
+        while let part = cursor:
+            part.type_id = members[i]
+            try c.bind(part, part.text, members[i], part, false)
+            i += 1
+            cursor = part.next
+    else:
+        try c.bind(binding, binding.text, elem, binding, false)
+    try enter_loop(c, s)
+    let body = s.body else return try c.fail(s, "a loop needs a body")
+    discard(try check_block(c, body))
+    leave_loop(c, s)
+    c.pop_scope()
+
+## `with e as name:` closes `name` when the suite ends (§8.5).
+func check_with(c: check.Checker*, s: ast.Node*) -> bool!:
+    c.push_scope()
+    var cursor = s.left
+    while let item = cursor:
+        let e = item.left else return try c.fail(item, "`with` needs a value")
+        let t = try check_expr(c, e, types.none_id)
+        let d = c.table.get(t).decl else return try c.fail(e, "`with` takes a value whose type has a `close()` method")
+        let close = c.find_member(d, "close") else return try c.fail(e, "`with` takes a value whose type has a `close()` method")
+        if close.kind != ast.Kind.func_ or not check.has_self(close) or c.table.get(close.type_id).args.length != 0 or c.table.get(close.type_id).elem != types.unit_id:
+            return try c.fail(e, "`close(self)` takes nothing and returns nothing")
+        item.type_id = t
+        item.resolved = close
+        try c.bind(item, item.text, t, item, false)
+        cursor = item.next
+    let body = s.body else return try c.fail(s, "`with` needs a body")
+    let exits = try check_block(c, body)
+    c.pop_scope()
+    return exits
+
+func check_return(c: check.Checker*, s: ast.Node*) -> bool!:
+    if c.in_init:
+        if s.left != none:
+            return try c.fail(s, "`init` returns nothing")
+        return true
+    if let v = s.left:
+        if c.result_type == types.unit_id:
+            return try c.fail(v, "this function returns nothing")
+        discard(try expect(c, v, c.result_type))
+    elif c.result_type != types.unit_id:
+        return try c.fail(s, try c.with_type("`return` needs a value of type `", c.result_type, "`"))
+    return true
+
+# mark: Match ==================================================================================
+
+func check_match_statement(c: check.Checker*, s: ast.Node*) -> bool!:
+    let subject = s.left else return try c.fail(s, "`match` needs a value")
+    let st = try check_expr(c, subject, types.none_id)
+    var all_exit = true
+    var covered = try list.List[str].create(8)
+    var has_wildcard = false
+    var cursor = s.body
+    while let arm = cursor:
+        c.push_scope()
+        var p = arm.left
+        var binds = 0
+        while let pattern = p:
+            let w = try check_pattern(c, pattern, st)
+            if w:
+                has_wildcard = true
+            if let case_node = pattern.left:
+                if pattern.left != none and case_node.kind == ast.Kind.case_value:
+                    try covered.push(case_node.text)
+            p = pattern.next
+            binds += 1
+        if binds > 1 and arm_binds_names(arm.left):
+            return try c.fail(arm, "an arm with several patterns binds no names")
+        if let guard = arm.right:
+            discard(try expect(c, guard, types.bool_id))
+            if single_wildcard(arm):
+                has_wildcard = false    # `_ if cond` covers nothing for sure
+        let body = arm.body else return try c.fail(arm, "an arm needs a body")
+        let exits = try check_block(c, body)
+        if not exits:
+            all_exit = false
+        c.pop_scope()
+        cursor = arm.next
+    try check_exhaustive(c, s, st, covered, has_wildcard)
+    if all_exit:
+        s.flags |= ast.flag_all_exit
+    return all_exit
+
+## Whether the arm's one pattern is `_`.
+func single_wildcard(arm: ast.Node*) -> bool:
+    let first = arm.left else return false
+    return first.next == none and first.has(ast.flag_wildcard)
+
+func arm_binds_names(patterns: ast.Node*?) -> bool:
+    var cursor = patterns
+    while let p = cursor:
+        if p.text == "bind":
+            return true
+        if let v = p.left:
+            if v.kind == ast.Kind.case_value and v.body != none:
+                return true
+        cursor = p.next
+    return false
+
+## Every case of an enum, or `_`, or a name that binds everything (§8.4).
+func check_exhaustive(c: check.Checker*, s: ast.Node*, st: u32, covered: list.List[str], has_wildcard: bool) -> !:
+    if has_wildcard:
+        return
+    if c.table.kind(st) == types.Kind.enum_:
+        let d = c.table.get(st).decl else return
+        var m = d.body
+        while let member = m:
+            if member.kind == ast.Kind.enum_case:
+                var found = false
+                var i: usize = 0
+                while i < covered.count:
+                    if covered.get(i) == member.text:
+                        found = true
+                    i += 1
+                if not found:
+                    return try c.fail(s, try c.named("this match does not cover the case ", member.text, ""))
+            m = member.next
+        return
+    if c.table.kind(st) == types.Kind.optional:
+        var some = false
+        var absent = false
+        var i: usize = 0
+        while i < covered.count:
+            if covered.get(i) == "none":
+                absent = true
+            else:
+                some = true
+            i += 1
+        if some and absent:
+            return
+    if st == types.bool_id:
+        var t = false
+        var f = false
+        var i: usize = 0
+        while i < covered.count:
+            if covered.get(i) == "true":
+                t = true
+            if covered.get(i) == "false":
+                f = true
+            i += 1
+        if t and f:
+            return
+    return try c.fail(s, "this match needs a `_` arm: not every value is covered")
+
+## A pattern against a value of type `st`; whether it matches everything.
+func check_pattern(c: check.Checker*, p: ast.Node*, st: u32) -> bool!:
+    p.type_id = st
+    if p.has(ast.flag_wildcard):
+        return true
+    if p.text == "bind":
+        # a name binds the whole value, or the payload of an optional that is present
+        let name = p.left else return true
+        var bound = st
+        if c.table.kind(st) == types.Kind.optional:
+            bound = c.table.get(st).elem
+        try c.bind(name, name.text, bound, name, false)
+        name.type_id = bound
+        return true
+    if p.text == "tuple":
+        if c.table.kind(st) != types.Kind.tuple:
+            return try c.fail(p, "a tuple pattern matches a tuple")
+        let members = c.table.get(st).args
+        if ast.count(p.body) != members.length:
+            return try c.fail(p, "the pattern has as many parts as the tuple has members")
+        var all = true
+        var i: usize = 0
+        var cursor = p.body
+        while let sub = cursor:
+            if not try check_pattern(c, sub, members[i]):
+                all = false
+            i += 1
+            cursor = sub.next
+        return all
+    let v = p.left else return try c.fail(p, "empty pattern")
+    if v.kind == ast.Kind.case_value:
+        var enum_type = st
+        if c.table.kind(st) == types.Kind.optional and v.text == "none" and v.body == none:
+            p.text = "none"
+            return false
+        if c.table.kind(enum_type) != types.Kind.enum_:
+            return try c.fail(p, "a case pattern matches an enum")
+        let d = c.table.get(enum_type).decl else return try c.fail(p, "no declaration")
+        if let owner = v.left:
+            if owner.text != d.text:
+                return try c.fail(owner, try c.named("the pattern names the type ", owner.text, ", which is not the enum being matched"))
+        let case_node = c.find_member(d, v.text) else return try c.fail(v, try c.named("no case ", v.text, ""))
+        if case_node.kind != ast.Kind.enum_case:
+            return try c.fail(v, try c.named("", v.text, " is not a case"))
+        v.resolved = case_node
+        v.type_id = enum_type
+        let arity = ast.count(case_node.body)
+        let given = ast.count(v.body)
+        if given != arity:
+            return try c.fail(v, try c.named("the case ", v.text, " binds as many names as it has payload fields"))
+        var b = v.body
+        var f = case_node.body
+        while let name = b:
+            let field = f else return false
+            name.type_id = field.type_id
+            if not name.has(ast.flag_wildcard):
+                try c.bind(name, name.text, field.type_id, name, false)
+            b = name.next
+            f = field.next
+        return false
+    # a literal, or a range of two literals
+    if p.text == "..<" or p.text == "..=":
+        let hi = p.right else return try c.fail(p, "a range pattern needs both ends")
+        discard(try expect(c, v, st))
+        discard(try expect(c, hi, st))
+        if st != types.int_id:
+            return try c.fail(p, "a range pattern matches an `int`")
+        return false
+    if v.kind == ast.Kind.literal and v.text == "none":
+        if c.table.kind(st) != types.Kind.optional:
+            return try c.fail(v, "`none` matches an optional")
+        p.text = "none"
+        v.type_id = st
+        return false
+    discard(try expect(c, v, st))
+    if not c.table.is_value(st):
+        return try c.fail(v, "a literal pattern matches a value")
+    return false
+
+# mark: Expressions ============================================================================
+
+## Check `e` against `target`, then require assignability. `none` takes the optional.
+pub func expect(c: check.Checker*, e: ast.Node*, target: u32) -> u32!:
+    let got = try check_expr(c, e, target)
+    return try coerce(c, e, got, target)
+
+## Whether a value of `got` may stand where `target` is expected: the same type, a `T`
+## where `T?` is wanted, `none` where any optional is, `never` anywhere, a conforming
+## value where an interface is wanted.
+pub func coerce(c: check.Checker*, e: ast.Node*, got: u32, target: u32) -> u32!:
+    if target == types.none_id or got == target or got == types.never_id:
+        return target if target != types.none_id else got
+    if c.table.kind(got) == types.Kind.fallible and c.table.kind(target) != types.Kind.fallible:
+        return try c.fail(e, "a result is handled: `try`, `catch`, or `else` (§12.2)")
+    if got == types.untyped_none_id:
+        if c.table.kind(target) != types.Kind.optional:
+            return try c.fail(e, try c.with_type("`none` needs an optional type; expected `", target, "`"))
+        e.type_id = target
+        return target
+    let t = c.table.get(target)
+    if t.kind == types.Kind.optional and got == t.elem:
+        return target
+    if t.kind == types.Kind.optional and c.table.kind(got) == types.Kind.optional:
+        return try c.mismatch(e, target, got)
+    if t.kind == types.Kind.interface_:
+        if conforms(c, got, target):
+            e.type_id = got
+            return target
+        return try c.fail(e, try c.with_type("this value does not conform to `", target, "`"))
+    if t.kind == types.Kind.optional and c.table.kind(t.elem) == types.Kind.interface_ and conforms(c, got, t.elem):
+        return target
+    return try c.mismatch(e, target, got)
+
+## Whether a type declares conformance to an interface (§13.1).
+pub func conforms(c: check.Checker*, id: u32, iface: u32) -> bool:
+    let d = c.table.get(id).decl else return false
+    var cursor = d.right
+    while let t = cursor:
+        if t.type_id == iface:
+            return true
+        cursor = t.next
+    return false
+
+pub func check_expr(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let id = try expr_type(c, e, hint)
+    e.type_id = id
+    return id
+
+func expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    match e.kind:
+        .literal: return try literal_type(c, e, hint)
+        .name: return try name_type(c, e)
+        .self_:
+            if c.self_type == types.none_id:
+                return try c.fail(e, "`self` belongs inside a method")
+            return c.self_type
+        .group:
+            let inner = e.left else return try c.fail(e, "empty group")
+            return try check_expr(c, inner, hint)
+        .unary: return try unary_type(c, e, hint)
+        .binary: return try binary_type(c, e, hint)
+        .conditional:
+            let cond = e.ty else return try c.fail(e, "a conditional needs a condition")
+            discard(try expect(c, cond, types.bool_id))
+            let l = e.left else return try c.fail(e, "a conditional needs a value")
+            let r = e.right else return try c.fail(e, "a conditional needs an alternative")
+            let lt = try check_expr(c, l, hint)
+            let rt = try check_expr(c, r, hint if hint != types.none_id else lt)
+            return try unify(c, l, lt, r, rt)
+        .call: return try call_type(c, e, hint)
+        .member: return try member_type(c, e, hint)
+        .index: return try index_type(c, e)
+        .slice: return try slice_type(c, e)
+        .tuple:
+            let n = ast.count(e.body)
+            var members = try alloc u32[n]
+            var i: usize = 0
+            var cursor = e.body
+            var hints = c.table.get(hint).args if c.table.kind(hint) == types.Kind.tuple else try types.no_args()
+            while let m = cursor:
+                let mh = hints[i] if i < hints.length else types.none_id
+                members[i] = try check_expr(c, m, mh)
+                if members[i] == types.untyped_none_id:
+                    return try c.fail(m, "`none` needs a type here")
+                i += 1
+                cursor = m.next
+            return try c.table.tuple(members)
+        .unit_: return types.unit_id
+        .list_lit, .set_lit, .map_lit, .map_entry:
+            return try c.fail(e, "collections arrive with the collections slice")
+        .lambda: return try c.fail(e, "closures arrive with the closures slice")
+        .else_: return try else_type(c, e, hint)
+        .catch_: return try catch_type(c, e, hint)
+        .case_value: return try case_type(c, e, hint)
+        .formatted:
+            var cursor = e.body
+            while let part = cursor:
+                if part.kind == ast.Kind.format_field:
+                    let v = part.left else return try c.fail(part, "empty field")
+                    let vt = try check_expr(c, v, types.none_id)
+                    if not displayable(c, vt):
+                        return try c.fail(v, try c.with_type("a `", vt, "` has no display (§10.5)"))
+                cursor = part.next
+            return types.str_id
+        .match_expr: return try match_expr_type(c, e, hint)
+        .spawn_, .wait_: return try c.fail(e, "workers arrive with the workers slice")
+        _: return try c.fail(e, "expected an expression")
+
+func literal_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let b = e.text.bytes
+    if e.text == "true" or e.text == "false":
+        return types.bool_id
+    if e.text == "none":
+        if c.table.kind(hint) == types.Kind.optional:
+            return hint
+        return types.untyped_none_id
+    let first = b[0]
+    if first == '"' or (first == 'r' and b.length > 1 and b[1] == '"'):
+        return types.str_id
+    if first == 'b' and b.length > 1 and b[1] == '"':
+        return types.bytes_id
+    if literals.is_float_text(e.text):
+        return types.float_id
+    let value = literals.decode_integer(e.text) catch failure:
+        return try c.fail(e, "integer literal does not fit an `int`")
+    if value > 9223372036854775807:
+        # the one value that fits only under a leading `-`
+        if value != 9223372036854775808 or not e.has(flag_negated):
+            return try c.fail(e, "integer literal does not fit an `int` (§3.2)")
+    return types.int_id
+
+## Marked on a literal directly under unary `-`, so `-9223372036854775808` fits.
+pub let flag_negated: u32 = 8192
+
+func name_type(c: check.Checker*, e: ast.Node*) -> u32!:
+    if let b = c.lookup(e.text):
+        c.mark_used(e.text)
+        e.resolved = b.decl
+        return b.type_id
+    if let d = c.find_declaration(e.text):
+        e.resolved = d
+        if d.kind == ast.Kind.constant and d.type_id == types.none_id:
+            return try c.fail(e, try c.named("the constant ", e.text, " depends on itself"))
+        return try c.type_of_declaration(d)
+    if e.text == "print" or e.text == "assert" or e.text == "trap" or e.text == "error" or e.text == "discard" or e.text == "int" or e.text == "float" or e.text == "str" or e.text == "bool" or e.text == "ErrorCode":
+        return try c.fail(e, try c.named("", e.text, " is called, not read"))
+    return try c.fail(e, try c.named("unknown name ", e.text, ""))
+
+func unary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let inner = e.left else return try c.fail(e, "missing operand")
+    if e.text == "try":
+        if not c.fallible:
+            return try c.fail(e, "`try` belongs in a function whose result is `!` (§12.2)")
+        let it = try check_expr(c, inner, try c.table.fallible(hint) if hint != types.none_id else types.none_id)
+        if c.table.kind(it) != types.Kind.fallible:
+            return try c.fail(e, "`try` takes a result, `T!`")
+        return c.table.get(it).elem
+    if e.text == "not":
+        discard(try expect(c, inner, types.bool_id))
+        return types.bool_id
+    if inner.kind == ast.Kind.literal:
+        inner.flags |= flag_negated
+    let it = try check_expr(c, inner, hint)
+    if it != types.int_id and it != types.float_id:
+        return try c.fail(e, "`-` takes an `int` or a `float`")
+    return it
+
+func binary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let l = e.left else return try c.fail(e, "missing operand")
+    let r = e.right else return try c.fail(e, "missing operand")
+    let op = e.text
+    if op == "and" or op == "or":
+        discard(try expect(c, l, types.bool_id))
+        discard(try expect(c, r, types.bool_id))
+        return types.bool_id
+    if op == "..<" or op == "..=":
+        discard(try expect(c, l, types.int_id))
+        discard(try expect(c, r, types.int_id))
+        return types.range_id
+    if op == "in":
+        let rt = try check_expr(c, r, types.none_id)
+        let t = c.table.get(rt)
+        match t.kind:
+            .str_: discard(try expect(c, l, types.str_id))
+            .list_, .set_: discard(try expect(c, l, t.elem))
+            .map_: discard(try expect(c, l, t.elem))
+            .range_: discard(try expect(c, l, types.int_id))
+            _: return try c.fail(r, "`in` looks in a `str`, a range, a list, a set, or a map's keys (§6.3)")
+        if t.kind != types.Kind.str_ and t.kind != types.Kind.range_ and not equatable(c, t.elem):
+            return try c.fail(r, "`in` needs equatable elements")
+        return types.bool_id
+    if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=":
+        let lt = try check_expr(c, l, types.none_id)
+        var rt = try check_expr(c, r, lt if lt != types.untyped_none_id else types.none_id)
+        var t = lt
+        if lt == types.untyped_none_id and rt != types.untyped_none_id:
+            t = try coerce(c, l, lt, rt)
+        elif rt == types.untyped_none_id:
+            t = try coerce(c, r, rt, lt)
+        else:
+            t = try unify(c, l, lt, r, rt)
+        if op == "==" or op == "!=":
+            if c.table.kind(t) == types.Kind.class_:
+                if not conforms(c, t, try equatable_interface(c)):
+                    return try c.fail(e, "a class has identity, not equality: compare with `is`, or declare `Equatable` (§4.4)")
+            elif not equatable(c, t):
+                return try c.fail(e, try c.with_type("a `", t, "` has no `==` (§4.4)"))
+        elif not orderable(c, t):
+            return try c.fail(e, try c.with_type("a `", t, "` has no ordering (§4.4)"))
+        return types.bool_id
+    if op == "is" or op == "is not":
+        return types.bool_id
+    let lt = try check_expr(c, l, hint)
+    let rt = try check_expr(c, r, lt)
+    return try arithmetic_type(c, e, op, lt, rt)
+
+## The result of `l op r` for the arithmetic operators (§6.2); `+` also joins texts.
+func arithmetic_type(c: check.Checker*, e: ast.Node*, op: str, lt: u32, rt: u32) -> u32!:
+    if op == "+" and lt == types.str_id and rt == types.str_id:
+        return types.str_id
+    if op == "+" and lt == types.bytes_id and rt == types.bytes_id:
+        return types.bytes_id
+    if op == "+" and c.table.kind(lt) == types.Kind.list_ and lt == rt:
+        return lt
+    if (lt == types.int_id or lt == types.float_id) and lt != rt:
+        return try c.fail(e, "`int` and `float` do not mix; convert one with `int(...)` or `float(...)` (§6.2)")
+    if lt != types.int_id and lt != types.float_id:
+        return try c.fail(e, try c.with_type("arithmetic takes an `int` or a `float`, not a `", lt, "`"))
+    if op == "/":
+        return types.float_id
+    if op == "**" and lt == types.int_id:
+        return types.int_id
+    if op == "+" or op == "-" or op == "*" or op == "//" or op == "%" or op == "**":
+        return lt
+    return try c.fail(e, "unknown operator")
+
+## Two operand types made one; `none` follows the other side.
+func unify(c: check.Checker*, l: ast.Node*, lt: u32, r: ast.Node*, rt: u32) -> u32!:
+    if lt == rt:
+        return lt
+    if lt == types.never_id:
+        return rt
+    if rt == types.never_id:
+        return lt
+    if lt == types.untyped_none_id:
+        # `none if c else 3` is an `int?`
+        let target = rt if c.table.kind(rt) == types.Kind.optional else try c.table.optional(rt)
+        return try coerce(c, l, lt, target)
+    if rt == types.untyped_none_id:
+        let target = lt if c.table.kind(lt) == types.Kind.optional else try c.table.optional(lt)
+        return try coerce(c, r, rt, target)
+    if c.table.kind(lt) == types.Kind.optional and c.table.get(lt).elem == rt:
+        return lt
+    if c.table.kind(rt) == types.Kind.optional and c.table.get(rt).elem == lt:
+        return rt
+    return try c.mismatch(r, lt, rt)
+
+# mark: Members, calls, construction ==========================================================
+
+func member_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let receiver = e.left else return try c.fail(e, "no receiver")
+    let rt = try check_expr(c, receiver, types.none_id)
+    let t = c.table.get(rt)
+    if t.kind == types.Kind.type_name:
+        # `Type.member`: a type function, a case, or a constant of the type
+        let d = t.decl else return try c.fail(e, "no declaration")
+        let inner = c.table.get(t.elem)
+        let m = c.find_member(d, e.text) else return try c.fail(e, try c.named("", d.text, " has no member ") if false else try c.named("no member ", e.text, ""))
+        e.resolved = m
+        if m.kind == ast.Kind.enum_case:
+            if m.body != none:
+                return try c.fail(e, try c.named("the case ", e.text, " carries a payload; construct it with arguments"))
+            return t.elem
+        if m.kind == ast.Kind.func_:
+            if check.has_self(m):
+                return try c.fail(e, try c.named("the method ", e.text, " is called on a value, not through its type"))
+            try check_visible(c, e, d, m)
+            return m.type_id
+        return try c.fail(e, try c.named("", e.text, " is not a member reached through the type"))
+    if t.kind == types.Kind.tuple:
+        let index = literals.decode_integer(e.text) catch failure:
+            return try c.fail(e, "a tuple has no named members; use `.0`, `.1` or destructure")
+        if index >= (u64)t.args.length:
+            return try c.fail(e, "no such tuple member")
+        return t.args[(usize)index]
+    if t.kind == types.Kind.optional:
+        return try c.fail(e, "an optional is read with `if let`, `else`, or `match` first (§12.1)")
+    if e.text == "length" and (t.kind == types.Kind.str_ or t.kind == types.Kind.bytes_ or t.kind == types.Kind.list_ or t.kind == types.Kind.map_ or t.kind == types.Kind.set_):
+        return types.int_id
+    if t.kind == types.Kind.error_value:
+        if e.text == "code":
+            return types.error_code_id
+        if e.text == "message":
+            return types.str_id
+        return try c.fail(e, "an `Error` has `code` and `message`")
+    if t.kind == types.Kind.str_ or t.kind == types.Kind.bytes_ or t.kind == types.Kind.list_ or t.kind == types.Kind.map_ or t.kind == types.Kind.set_:
+        return try c.fail(e, "the operations of text and collections arrive with the collections slice")
+    let d = t.decl else return try c.fail(e, "this value has no members")
+    let m = c.find_member(d, e.text) else return try c.fail(e, try c.named("no member ", e.text, ""))
+    e.resolved = m
+    if m.kind == ast.Kind.field:
+        try check_visible(c, e, d, m)
+        return m.type_id
+    if m.kind == ast.Kind.func_:
+        if not check.has_self(m):
+            return try c.fail(e, try c.named("", e.text, " is a type function; call it through the type"))
+        try check_visible(c, e, d, m)
+        return m.type_id
+    if m.kind == ast.Kind.enum_case:
+        return try c.fail(e, "a case is reached through the type, `Shape.empty`")
+    return try c.fail(e, "unknown member")
+
+## A member of another module's type must be `pub` (§15.2); one file is one module now.
+func check_visible(c: check.Checker*, e: ast.Node*, d: ast.Node*, m: ast.Node*) -> !:
+    return
+
+func index_type(c: check.Checker*, e: ast.Node*) -> u32!:
+    let receiver = e.left else return try c.fail(e, "no receiver")
+    let index = e.body else return try c.fail(e, "no index")
+    let rt = try check_expr(c, receiver, types.none_id)
+    let t = c.table.get(rt)
+    match t.kind:
+        .list_:
+            discard(try expect(c, index, types.int_id))
+            return t.elem
+        .bytes_:
+            discard(try expect(c, index, types.int_id))
+            return types.int_id
+        .map_:
+            discard(try expect(c, index, t.elem))
+            return try c.table.optional(c.table.map_value(rt))
+        .str_:
+            return try c.fail(e, "a `str` is not indexed; slice it, iterate it, or use its bytes (§11.3)")
+        _: return try c.fail(e, try c.with_type("a `", rt, "` is not indexed"))
+
+func slice_type(c: check.Checker*, e: ast.Node*) -> u32!:
+    let receiver = e.left else return try c.fail(e, "no receiver")
+    let rt = try check_expr(c, receiver, types.none_id)
+    let k = c.table.kind(rt)
+    if k != types.Kind.list_ and k != types.Kind.str_ and k != types.Kind.bytes_:
+        return try c.fail(e, try c.with_type("a `", rt, "` is not sliced"))
+    if let low = e.body:
+        discard(try expect(c, low, types.int_id))
+    if let high = e.right:
+        discard(try expect(c, high, types.int_id))
+    return rt
+
+## `.case` or `.case(args)` where the enum is known from context.
+func case_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    var target = hint
+    if c.table.kind(target) == types.Kind.optional:
+        target = c.table.get(target).elem
+    if c.table.kind(target) != types.Kind.enum_:
+        return try c.fail(e, "a leading `.` needs an enum known from context; write `Type.case`")
+    let d = c.table.get(target).decl else return try c.fail(e, "no declaration")
+    let m = c.find_member(d, e.text) else return try c.fail(e, try c.named("no case ", e.text, ""))
+    if m.kind != ast.Kind.enum_case:
+        return try c.fail(e, try c.named("", e.text, " is not a case"))
+    e.resolved = m
+    if m.body != none or e.body != none:
+        try check_arguments(c, e, e.body, m.body, false)
+    return target
+
+func call_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let callee = e.left else return try c.fail(e, "nothing to call")
+    if e.ty != none:
+        return try c.fail(e, "generics arrive with the interfaces slice")
+    if callee.kind == ast.Kind.name and c.lookup(callee.text) == none and c.find_declaration(callee.text) == none:
+        return try core_call(c, e, callee.text)
+    if callee.kind == ast.Kind.member and callee.text == "package":
+        if let owner = callee.left:
+            if owner.kind == ast.Kind.name and owner.text == "ErrorCode" and c.lookup("ErrorCode") == none:
+                return try package_code(c, e)
+    if callee.kind == ast.Kind.case_value:
+        callee.body = e.body
+        e.body = none
+        let t = try check_expr(c, callee, hint)
+        e.resolved = callee.resolved
+        e.body = callee.body
+        callee.body = none
+        return t
+    if callee.kind == ast.Kind.member:
+        # `Shape.circle(radius = 2.0)`: a case with a payload, through its enum
+        if let owner = callee.left:
+            let ot = try check_expr(c, owner, types.none_id)
+            let o = c.table.get(ot)
+            if o.kind == types.Kind.type_name:
+                if let d = o.decl:
+                    if d.kind == ast.Kind.enum_:
+                        let m = c.find_member(d, callee.text) else return try c.fail(callee, try c.named("no case ", callee.text, ""))
+                        if m.kind == ast.Kind.enum_case:
+                            callee.resolved = m
+                            callee.type_id = o.elem
+                            e.resolved = m
+                            try check_arguments(c, e, e.body, m.body, false)
+                            return o.elem
+    let ct = try check_expr(c, callee, types.none_id)
+    let t = c.table.get(ct)
+    if t.kind == types.Kind.type_name:
+        return try construction_type(c, e, callee, t)
+    if t.kind == types.Kind.func_:
+        if let d = callee.resolved:
+            if d.kind == ast.Kind.func_:
+                e.resolved = d
+                if check.has_self(d):
+                    try check_receiver(c, e, callee, d)
+                try check_arguments(c, e, e.body, d.right, true)
+                return t.elem
+        # a function value: positional arguments only
+        var n: usize = 0
+        var cursor = e.body
+        while let a = cursor:
+            if a.text.length > 0:
+                return try c.fail(a, "a function value takes positional arguments")
+            if n >= t.args.length:
+                return try c.fail(a, "too many arguments")
+            let v = a.left else return try c.fail(a, "empty argument")
+            discard(try expect(c, v, t.args[n]))
+            n += 1
+            cursor = a.next
+        if n < t.args.length:
+            return try c.fail(e, "too few arguments")
+        return t.elem
+    return try c.fail(callee, try c.with_type("a `", ct, "` is not called"))
+
+## `Name(args)`: a struct memberwise or through `init`, a class through `init`.
+func construction_type(c: check.Checker*, e: ast.Node*, callee: ast.Node*, t: types.Type) -> u32!:
+    let d = t.decl else return try c.fail(e, "no declaration")
+    let target = t.elem
+    if d.kind == ast.Kind.type_alias:
+        return try c.fail(e, "an alias is not constructed; name the type")
+    if d.kind == ast.Kind.enum_:
+        return try c.fail(e, "an enum is constructed by case: `Shape.circle(radius = 2.0)`")
+    if d.kind == ast.Kind.interface_:
+        return try c.fail(e, "an interface is not constructed")
+    e.resolved = d
+    if let init = c.find_member(d, "init"):
+        e.resolved = init
+        try check_arguments(c, e, e.body, init.right, true)
+        let result = c.table.get(init.type_id).elem
+        if c.table.kind(result) == types.Kind.fallible:
+            return try c.table.fallible(target)
+        return target
+    if d.kind == ast.Kind.class_:
+        if e.body != none:
+            return try c.fail(e, "this class has no `init`; it is constructed with no arguments")
+        return target
+    # memberwise: every field once, defaults may be omitted
+    try check_arguments(c, e, e.body, d.body, false)
+    return target
+
+## A method's receiver: a mutating method on a struct needs a `var` (§7.3).
+func check_receiver(c: check.Checker*, e: ast.Node*, callee: ast.Node*, d: ast.Node*) -> !:
+    let receiver = callee.left else return
+    if d.has(check.flag_mutating) and c.table.is_value(receiver.type_id):
+        if not try place_is_mutable(c, receiver):
+            return try c.fail(callee, try c.named("the method ", d.text, " changes its receiver, which must be a `var` (§7.3)"))
+
+## Arguments against parameters or fields: positional then named, each once, defaults for
+## the rest. `params` are `param` nodes (with `self` skipped) or `field` nodes.
+func check_arguments(c: check.Checker*, e: ast.Node*, args: ast.Node*?, params: ast.Node*?, skip_self: bool) -> !:
+    var n: usize = 0
+    var cursor = params
+    while let p = cursor:
+        if not (skip_self and p.text == "self") and (p.kind == ast.Kind.param or p.kind == ast.Kind.field):
+            n += 1
+        cursor = p.next
+    var given = try alloc bool[n if n > 0 else 1]
+    var i: usize = 0
+    while i < n:
+        given[i] = false
+        i += 1
+    var position: usize = 0
+    var a = args
+    while let arg = a:
+        var target: ast.Node*? = none
+        var slot: usize = 0
+        if arg.text.length > 0:
+            var k: usize = 0
+            var pc = params
+            while let p = pc:
+                if not (skip_self and p.text == "self") and (p.kind == ast.Kind.param or p.kind == ast.Kind.field):
+                    if p.text == arg.text:
+                        target = p
+                        slot = k
+                    k += 1
+                pc = p.next
+            if target == none:
+                return try c.fail(arg, try c.named("no parameter or field named ", arg.text, ""))
+        else:
+            var k: usize = 0
+            var pc = params
+            while let p = pc:
+                if not (skip_self and p.text == "self") and (p.kind == ast.Kind.param or p.kind == ast.Kind.field):
+                    if k == position:
+                        target = p
+                        slot = k
+                    k += 1
+                pc = p.next
+            if target == none:
+                return try c.fail(arg, "too many arguments")
+            position += 1
+        let p = target else return try c.fail(arg, "no parameter")
+        if given[slot]:
+            return try c.fail(arg, try c.named("the argument ", p.text, " is given twice"))
+        given[slot] = true
+        let v = arg.left else return try c.fail(arg, "empty argument")
+        discard(try expect(c, v, p.type_id))
+        arg.resolved = p
+        a = arg.next
+    var k: usize = 0
+    var pc = params
+    while let p = pc:
+        if not (skip_self and p.text == "self") and (p.kind == ast.Kind.param or p.kind == ast.Kind.field):
+            if not given[k] and p.left == none:
+                return try c.fail(e, try c.named("the argument ", p.text, " is missing"))
+            k += 1
+        pc = p.next
+
+## The language's own functions (§2.4, §6.5, §12.4).
+func core_call(c: check.Checker*, e: ast.Node*, name: str) -> u32!:
+    let n = ast.count(e.body)
+    if name == "print":
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return try c.fail(a, "empty argument")
+            if a.text.length > 0:
+                return try c.fail(a, "`print` takes positional arguments")
+            let t = try check_expr(c, v, types.none_id)
+            if not displayable(c, t):
+                return try c.fail(v, try c.with_type("a `", t, "` has no display (§10.5)"))
+            cursor = a.next
+        return types.unit_id
+    if name == "assert":
+        if n < 1 or n > 2:
+            return try c.fail(e, "`assert(condition)` or `assert(condition, message)`")
+        let first = e.body else return try c.fail(e, "no condition")
+        let cond = first.left else return try c.fail(e, "no condition")
+        discard(try expect(c, cond, types.bool_id))
+        if let second = first.next:
+            let m = second.left else return try c.fail(second, "empty argument")
+            discard(try expect(c, m, types.str_id))
+        return types.unit_id
+    if name == "trap":
+        if n != 1:
+            return try c.fail(e, "`trap(message)` takes one text")
+        let first = e.body else return try c.fail(e, "no message")
+        let m = first.left else return try c.fail(e, "no message")
+        discard(try expect(c, m, types.str_id))
+        return types.never_id
+    if name == "error":
+        if not c.fallible:
+            return try c.fail(e, "`error` belongs in a function whose result is `!` (§12.2)")
+        if n != 2:
+            return try c.fail(e, "`error(code, message)` takes a code and a text")
+        let first = e.body else return try c.fail(e, "no code")
+        let code = first.left else return try c.fail(e, "no code")
+        let second = first.next else return try c.fail(e, "no message")
+        let message = second.left else return try c.fail(e, "no message")
+        discard(try expect(c, code, types.error_code_id))
+        discard(try expect(c, message, types.str_id))
+        return types.never_id
+    if name == "discard":
+        if n != 1:
+            return try c.fail(e, "`discard(value)` takes one value")
+        let first = e.body else return try c.fail(e, "no value")
+        let v = first.left else return try c.fail(e, "no value")
+        let t = try check_expr(c, v, types.none_id)
+        if c.table.kind(t) == types.Kind.fallible:
+            return try c.fail(v, "a result is handled, not discarded (§12.2)")
+        return types.unit_id
+    if name == "int" or name == "float" or name == "str" or name == "bool":
+        if n != 1:
+            return try c.fail(e, try c.named("", name, "(value) takes one value"))
+        let first = e.body else return try c.fail(e, "no value")
+        let v = first.left else return try c.fail(e, "no value")
+        let t = try check_expr(c, v, types.none_id)
+        if name == "int":
+            if t == types.float_id: return types.int_id
+            if t == types.str_id: return try c.table.fallible(types.int_id)
+            if t == types.int_id: return try c.fail(e, "this is already an `int`")
+            return try c.fail(v, "`int(...)` converts a `float` or parses a `str` (§6.5)")
+        if name == "float":
+            if t == types.int_id: return types.float_id
+            if t == types.str_id: return try c.table.fallible(types.float_id)
+            return try c.fail(v, "`float(...)` converts an `int` or parses a `str` (§6.5)")
+        if name == "bool":
+            if t == types.str_id: return try c.table.fallible(types.bool_id)
+            return try c.fail(v, "`bool(...)` parses a `str` (§6.5)")
+        if not displayable(c, t):
+            return try c.fail(v, try c.with_type("a `", t, "` has no display (§10.5)"))
+        return types.str_id
+    if name == "hash":
+        return try c.fail(e, "`hash` arrives with the collections slice")
+    return try c.fail(e, try c.named("unknown name ", name, ""))
+
+## `ErrorCode.package(n)`: a constant of this package, `n` from 1 to 65535, no two alike.
+func package_code(c: check.Checker*, e: ast.Node*) -> u32!:
+    if not c.at_top_level:
+        return try c.fail(e, "`ErrorCode.package(n)` declares a top-level `let` (§12.3)")
+    let first = e.body else return try c.fail(e, "`ErrorCode.package(n)` takes a number")
+    let v = first.left else return try c.fail(e, "no number")
+    if v.kind != ast.Kind.literal or first.next != none:
+        return try c.fail(e, "`ErrorCode.package(n)` takes one integer literal")
+    let n = literals.decode_integer(v.text) catch failure:
+        return try c.fail(v, "an error code is 1 to 65535")
+    if n == 0 or n > 65535:
+        return try c.fail(v, "an error code is 1 to 65535")
+    var i: usize = 0
+    while i < c.package_codes.count:
+        if c.package_codes.get(i) == n:
+            return try c.fail(v, "two constants of one package share this error code (§12.3)")
+        i += 1
+    try c.package_codes.push(n)
+    v.type_id = types.int_id
+    return types.error_code_id
+
+# mark: Optionals, results, match expressions =================================================
+
+func else_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let l = e.left else return try c.fail(e, "`else` needs a value on its left")
+    let r = e.right else return try c.fail(e, "`else` needs a fallback")
+    let lt = try check_expr(c, l, try c.table.optional(hint) if hint != types.none_id and c.table.kind(hint) != types.Kind.optional else types.none_id)
+    if c.table.kind(lt) != types.Kind.optional:
+        if c.table.kind(lt) == types.Kind.fallible:
+            return try c.fail(l, "a result is handled with `try` or `catch`; `else` reads an optional (§12.1)")
+        return try c.fail(l, "`else` reads an optional (§12.1)")
+    let payload = c.table.get(lt).elem
+    if r.kind == ast.Kind.return_:
+        discard(try check_return(c, r))
+        return payload
+    if r.kind == ast.Kind.break_ or r.kind == ast.Kind.continue_:
+        if c.loop_depth == 0:
+            return try c.fail(r, "`break` and `continue` belong inside a loop")
+        return payload
+    if r.kind == ast.Kind.call:
+        if let callee = r.left:
+            if callee.kind == ast.Kind.name and (callee.text == "error" or callee.text == "trap") and c.lookup(callee.text) == none:
+                discard(try check_expr(c, r, types.none_id))
+                return payload
+    discard(try expect(c, r, payload))
+    return payload
+
+## `e catch failure:` suite: the suite ends in `recover`, `return`, or `error`.
+func catch_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let l = e.left else return try c.fail(e, "`catch` needs an expression")
+    let body = e.body else return try c.fail(e, "`catch` needs a suite")
+    let lt = try check_expr(c, l, try c.table.fallible(hint) if hint != types.none_id else types.none_id)
+    if c.table.kind(lt) != types.Kind.fallible:
+        return try c.fail(l, "`catch` handles a result, `T!`")
+    let payload = c.table.get(lt).elem
+    c.push_scope()
+    if e.text.length > 0:
+        try c.bind(e, e.text, types.error_value_id, e, false)
+    let saved_in = c.in_catch
+    let saved_result = c.catch_result
+    c.in_catch = true
+    c.catch_result = payload
+    let exits = try check_block(c, body)
+    c.in_catch = saved_in
+    c.catch_result = saved_result
+    c.pop_scope()
+    if payload != types.unit_id and not exits:
+        return try c.fail(e, "a `catch` suite ends in `recover`, `return`, or `error` (§12.2)")
+    return payload
+
+func match_expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
+    let subject = e.left else return try c.fail(e, "`match` needs a value")
+    let st = try check_expr(c, subject, types.none_id)
+    var result = hint
+    var covered = try list.List[str].create(8)
+    var has_wildcard = false
+    var cursor = e.body
+    while let arm = cursor:
+        c.push_scope()
+        var p = arm.left
+        while let pattern = p:
+            if try check_pattern(c, pattern, st):
+                has_wildcard = true
+            if let case_node = pattern.left:
+                if case_node.kind == ast.Kind.case_value:
+                    try covered.push(case_node.text)
+                elif case_node.kind == ast.Kind.literal:
+                    try covered.push(case_node.text)
+            p = pattern.next
+        if let guard = arm.right:
+            discard(try expect(c, guard, types.bool_id))
+            if single_wildcard(arm):
+                has_wildcard = false
+        let body = arm.body else return try c.fail(arm, "an arm needs a value")
+        let bt = try check_expr(c, body, result)
+        if result == types.none_id:
+            if bt == types.untyped_none_id:
+                return try c.fail(body, "`none` needs a type here")
+            result = bt
+        elif bt != types.never_id:
+            result = try unify(c, body, result, body, bt) if bt != result else result
+            discard(try coerce(c, body, bt, result))
+        c.pop_scope()
+        cursor = arm.next
+    try check_exhaustive(c, e, st, covered, has_wildcard)
+    return result
+
+# mark: Properties of types ====================================================================
+
+## A display for `print`, `str(x)` and f-strings (§10.5).
+pub func displayable(c: check.Checker*, id: u32) -> bool:
+    let t = c.table.get(id)
+    match t.kind:
+        .int_, .float_, .bool_, .str_, .bytes_, .unit_, .error_code, .error_value, .range_: return true
+        .optional: return displayable(c, t.elem)
+        .tuple:
+            for m in t.args:
+                if not displayable(c, m):
+                    return false
+            return true
+        .struct_, .enum_:
+            let d = t.decl else return false
+            if conforms(c, id, display_interface(c) catch failure: recover types.none_id):
+                return true
+            var cursor = d.body
+            while let m = cursor:
+                if m.kind == ast.Kind.field and not displayable(c, m.type_id):
+                    return false
+                if m.kind == ast.Kind.enum_case:
+                    var p = m.body
+                    while let field = p:
+                        if not displayable(c, field.type_id):
+                            return false
+                        p = field.next
+                cursor = m.next
+            return true
+        .class_:
+            return conforms(c, id, display_interface(c) catch failure: recover types.none_id)
+        .list_, .set_: return displayable(c, t.elem)
+        .map_: return displayable(c, t.elem) and displayable(c, c.table.map_value(id))
+        _: return false
+
+## Structural equality (§4.4).
+pub func equatable(c: check.Checker*, id: u32) -> bool:
+    let t = c.table.get(id)
+    match t.kind:
+        .int_, .float_, .bool_, .str_, .bytes_, .unit_, .error_code, .range_: return true
+        .optional: return equatable(c, t.elem)
+        .tuple:
+            for m in t.args:
+                if not equatable(c, m):
+                    return false
+            return true
+        .struct_, .enum_:
+            let d = t.decl else return false
+            var cursor = d.body
+            while let m = cursor:
+                if m.kind == ast.Kind.field and not equatable(c, m.type_id):
+                    return false
+                if m.kind == ast.Kind.enum_case:
+                    var p = m.body
+                    while let field = p:
+                        if not equatable(c, field.type_id):
+                            return false
+                        p = field.next
+                cursor = m.next
+            return true
+        .list_, .set_: return equatable(c, t.elem)
+        .map_: return equatable(c, t.elem) and equatable(c, c.table.map_value(id))
+        .class_: return conforms(c, id, equatable_interface(c) catch failure: recover types.none_id)
+        _: return false
+
+## Ordering (§4.4).
+pub func orderable(c: check.Checker*, id: u32) -> bool:
+    let t = c.table.get(id)
+    match t.kind:
+        .int_, .float_, .str_, .bytes_: return true
+        .tuple:
+            for m in t.args:
+                if not orderable(c, m):
+                    return false
+            return true
+        .struct_, .class_, .enum_: return conforms(c, id, ordered_interface(c) catch failure: recover types.none_id)
+        _: return false
+
+## The closed protocols a program may declare (§13.3): looked up by name in the module.
+func closed_interface(c: check.Checker*, name: str) -> u32!:
+    let d = c.find_declaration(name) else return types.none_id
+    if d.kind != ast.Kind.interface_:
+        return types.none_id
+    return d.type_id
+
+pub func equatable_interface(c: check.Checker*) -> u32!:
+    return try closed_interface(c, "Equatable")
+
+pub func display_interface(c: check.Checker*) -> u32!:
+    return try closed_interface(c, "Display")
+
+pub func ordered_interface(c: check.Checker*) -> u32!:
+    return try closed_interface(c, "Ordered")
+
+## A constant expression (§15.3): literals, arithmetic on them, tuples, cases, and
+## constructions of structs from those.
+pub func is_constant(e: ast.Node*) -> bool:
+    match e.kind:
+        .literal, .unit_: return true
+        .name:
+            let d = e.resolved else return false
+            return d.kind == ast.Kind.constant
+        .unary, .group:
+            let inner = e.left else return false
+            return is_constant(inner)
+        .binary:
+            let l = e.left else return false
+            let r = e.right else return false
+            return e.text != "in" and is_constant(l) and is_constant(r)
+        .tuple, .case_value:
+            var cursor = e.body
+            while let m = cursor:
+                if not is_constant(m):
+                    return false
+                cursor = m.next
+            return true
+        .argument:
+            let inner = e.left else return false
+            return is_constant(inner)
+        .member:
+            let d = e.resolved else return false
+            return d.kind == ast.Kind.enum_case and d.body == none
+        .call:
+            if let callee = e.left:
+                if callee.kind == ast.Kind.member and callee.text == "package":
+                    return true
+            let d = e.resolved else return false
+            if d.kind == ast.Kind.enum_case or d.kind == ast.Kind.struct_:
+                var cursor = e.body
+                while let a = cursor:
+                    if not is_constant(a):
+                        return false
+                    cursor = a.next
+                return true
+            return false
+        .conditional:
+            let cond = e.ty else return false
+            let l = e.left else return false
+            let r = e.right else return false
+            return is_constant(cond) and is_constant(l) and is_constant(r)
+        _: return false

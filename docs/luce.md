@@ -446,9 +446,10 @@ let word = match n:
     _ => "many"
 ```
 
-`match` is exhaustive over an enum's cases, and over anything else with `_`. Patterns are
-enum cases with bound payloads, literals, ranges, tuples of patterns, `none` and `_`, each
-with an optional guard. The statement form has suites; the expression form has `=>` arms of
+`match` is exhaustive over an enum's cases, and over anything else with `_` or a name.
+Patterns are enum cases with bound payloads, literals, ranges, tuples of patterns, `none`, a
+name, which binds the whole value or the payload of an optional that is present, and `_`,
+each with an optional guard. The statement form has suites; the expression form has `=>` arms of
 one type.
 
 ### 8.5 `return`, `defer`-less cleanup, `with`

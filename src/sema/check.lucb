@@ -1,0 +1,597 @@
+#==============================================================================================
+#
+#   check - Declarations, names, scopes, and type resolution
+#
+#   DESCRIPTION:
+#       The checker's state and everything that is not a statement or an expression: the
+#       modules of a program, the scope stack, diagnostics with a position, the declarations
+#       of a module collected so order does not matter, every signature and field type
+#       resolved, and the rules a declaration must obey on its own (§2.4, §7, §9, §10, §13,
+#       §15). What it learns is written onto the tree: a declaration's `type_id`, a name's
+#       `resolved`. `sema.bodies` types the bodies over this state.
+#
+#==============================================================================================
+
+import c
+import front.ast
+import front.parser
+import front.source
+import front.token
+import io
+import memory
+import sema.types
+import support.list
+
+pub let unknown_name: ErrorCode = ErrorCode.package(9)
+pub let type_error: ErrorCode = ErrorCode.package(10)
+
+# mark: Bindings and modules ===================================================================
+
+## One name in scope: what it is, what type it has, whether it may change.
+pub struct Binding:
+    pub var name: str
+    pub var type_id: u32
+    pub var decl: ast.Node*?
+    pub var mutable: bool
+    pub var depth: u32
+    ## Some expression read or assigned the name.
+    pub var used: bool
+
+## One module of the program: its tree and its source for positions.
+pub struct Module:
+    pub var name: str
+    pub var tree: ast.Node*
+    pub var src: source.Source
+
+## A `Writer` over a caller's buffer, for spelling types into diagnostics.
+pub struct SpanWriter: io.Writer:
+    pub var data: u8[]
+    pub var used: usize
+
+    pub mutating func write(bytes: const u8[]) -> usize!:
+        var i: usize = 0
+        while i < bytes.length and self.used < self.data.length:
+            self.data[self.used] = bytes[i]
+            self.used += 1
+            i += 1
+        return i
+
+# mark: The checker ============================================================================
+
+pub struct Checker:
+    pub var table: types.Table
+    pub var modules: list.List[Module]
+    pub var scope: list.List[Binding]
+    pub var depth: u32
+    ## Diagnostics are formatted into the first half; type spellings into the second.
+    pub var scratch: u8[]
+    ## The module being checked, as an index into `modules`.
+    pub var current: usize
+    pub var current_func: ast.Node*?
+    ## The unwrapped result type of the function being checked, and whether it may fail.
+    pub var result_type: u32
+    pub var fallible: bool
+    ## The type `self` has in the method being checked, and whether it may be assigned.
+    pub var self_type: u32
+    pub var self_mutable: bool
+    ## Inside `init`, where `let` fields take their first value.
+    pub var in_init: bool
+    pub var loop_depth: u32
+    ## The labels of the loops open around the statement being checked.
+    pub var labels: str[16]
+    pub var label_count: usize
+    ## Inside a `catch` suite, where `recover` is allowed, and the type it must produce.
+    pub var in_catch: bool
+    pub var catch_result: u32
+    ## The manifest's name: the identity of the package's error codes (§12.3).
+    pub var package_name: str
+    ## Every `ErrorCode.package(n)` folded so far: no two alike.
+    pub var package_codes: list.List[u64]
+    ## Inside a top-level constant initialiser.
+    pub var at_top_level: bool
+    ## The type of the `main` function, once seen.
+    pub var main_seen: bool
+
+    pub static func create(scratch: u8[]) -> Checker!:
+        return Checker(table = try types.Table.create(), modules = try list.List[Module].create(16),
+                       scope = try list.List[Binding].create(512), depth = 0, scratch = scratch, current = 0,
+                       current_func = none, result_type = types.unit_id, fallible = false, self_type = types.none_id,
+                       self_mutable = false, in_init = false, loop_depth = 0, label_count = 0, in_catch = false,
+                       catch_result = types.none_id, package_name = "app", package_codes = try list.List[u64].create(16),
+                       at_top_level = false, main_seen = false)
+
+    # -- diagnostics ----------------------------------------------------------------------
+
+    ## A diagnostic at `node`: `path:line:column: what`, in the first half of `scratch`.
+    pub func fail(node: ast.Node*, what: str) -> never!:
+        let half = self.scratch.length // 2
+        var name: str = "?"
+        var line: u32 = node.line
+        var column: u32 = 1
+        if self.current < self.modules.count:
+            let m = self.modules.get(self.current)
+            name = m.src.path
+            let (l, col) = m.src.position(node.start)
+            line = l
+            column = col
+        let message = try format(self.scratch[..<half], f"{name}:{line}:{column}: {what}")
+        error(type_error, message)
+
+    ## `prefix` + the spelling of a type + `suffix`, in the second half of `scratch`.
+    pub func with_type(prefix: str, id: u32, suffix: str) -> str!:
+        let half = self.scratch.length // 2
+        var sink = SpanWriter(data = self.scratch[half..], used = 0)
+        discard(try sink.write(prefix.bytes))
+        try self.table.describe(&sink, id)
+        discard(try sink.write(suffix.bytes))
+        return (str)self.scratch[half..<half + sink.used]
+
+    ## `expected T, got U` at `node`.
+    pub func mismatch(node: ast.Node*, expected: u32, got: u32) -> never!:
+        let half = self.scratch.length // 2
+        var sink = SpanWriter(data = self.scratch[half..], used = 0)
+        discard(try sink.write("expected `".bytes))
+        try self.table.describe(&sink, expected)
+        discard(try sink.write("`, got `".bytes))
+        try self.table.describe(&sink, got)
+        discard(try sink.write("`".bytes))
+        return try self.fail(node, (str)self.scratch[half..<half + sink.used])
+
+    ## A message with one name in it: `prefix`name`suffix`.
+    pub func named(prefix: str, name: str, suffix: str) -> str!:
+        let half = self.scratch.length // 2
+        return try format(self.scratch[half..], f"{prefix}`{name}`{suffix}")
+
+    # -- scopes ---------------------------------------------------------------------------
+
+    pub mutating func push_scope():
+        self.depth += 1
+
+    pub mutating func pop_scope():
+        while self.scope.count > 0 and self.scope.get(self.scope.count - 1).depth == self.depth:
+            self.scope.count -= 1
+        self.depth -= 1
+
+    ## Bind a local; a name already visible, or a declaration's, may not be reused (§2.4).
+    pub mutating func bind(at: ast.Node*, name: str, type_id: u32, decl: ast.Node*?, mutable: bool) -> !:
+        if name == "_":
+            return
+        if self.lookup(name) != none:
+            discard(try self.fail(at, try self.named("", name, " is already in scope; a name is not shadowed (§2.4)")))
+        if self.find_declaration(name) != none:
+            discard(try self.fail(at, try self.named("", name, " is a declaration of this module; a local may not shadow it (§2.4)")))
+        try self.scope.push(Binding(name = name, type_id = type_id, decl = decl, mutable = mutable, depth = self.depth, used = false))
+
+    pub func lookup(name: str) -> Binding?:
+        var i = self.scope.count
+        while i > 0:
+            i -= 1
+            let b = self.scope.get(i)
+            if b.name == name:
+                return b
+        return none
+
+    pub mutating func mark_used(name: str):
+        var i = self.scope.count
+        while i > 0:
+            i -= 1
+            if self.scope.get(i).name == name:
+                var b = self.scope.get(i)
+                b.used = true
+                self.scope.set(i, b)
+                return
+
+    # -- modules and declarations ---------------------------------------------------------
+
+    ## Parse and check one file as the program's module.
+    pub mutating func load(path: c.str) -> !:
+        let src = try source.Source.load(path)
+        var p = try parser.Parser.over(src, self.scratch)
+        let tree = try p.parse_module()
+        try self.modules.push(Module(name = module_name_of((str)path), tree = tree, src = src))
+        self.current = self.modules.count - 1
+        try self.check_module(tree)
+
+    ## Check a module already parsed (tests).
+    pub mutating func check_tree(tree: ast.Node*, src: source.Source) -> !:
+        try self.modules.push(Module(name = "t", tree = tree, src = src))
+        self.current = self.modules.count - 1
+        try self.check_module(tree)
+
+    pub func tree() -> ast.Node*:
+        return self.modules.get(self.current).tree
+
+    ## The top-level declaration named `name` in the current module.
+    pub func find_declaration(name: str) -> ast.Node*?:
+        if self.modules.count == 0:
+            return none
+        var cursor = self.tree().body
+        while let d = cursor:
+            if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and d.kind != ast.Kind.test_ and d.text == name:
+                return d
+            cursor = d.next
+        return none
+
+    ## The member of a type declaration named `name`: a field, method, or case.
+    pub func find_member(decl: ast.Node*, name: str) -> ast.Node*?:
+        var cursor = decl.body
+        while let m = cursor:
+            if m.text == name:
+                return m
+            cursor = m.next
+        return none
+
+    ## The nominal declaration behind a type, through optionals.
+    pub func decl_of(id: u32) -> ast.Node*?:
+        return self.table.get(id).decl
+
+    ## Everything but the bodies: `sema.bodies` types those over this state next.
+    mutating func check_module(tree: ast.Node*) -> !:
+        try self.collect(tree)
+        try self.declare_types(tree)
+        try self.resolve_signatures(tree)
+        try mark_mutating_methods(tree)
+
+    ## Every top-level name once, none of them a core name (the parser refused those).
+    mutating func collect(tree: ast.Node*) -> !:
+        var cursor = tree.body
+        while let d = cursor:
+            if d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import:
+                return try self.fail(d, "imports arrive with the module slice; a program is one file for now")
+            if d.kind != ast.Kind.test_:
+                var other = tree.body
+                while let o = other:
+                    if o != d and o.kind != ast.Kind.test_ and o.text == d.text:
+                        return try self.fail(d, try self.named("", d.text, " is declared twice"))
+                    other = o.next
+                if d.ty != none and d.kind != ast.Kind.type_alias:
+                    return try self.fail(d, "generics arrive with the interfaces slice")
+            cursor = d.next
+
+    ## A type id for every struct, enum, class, and interface, so fields may refer to
+    ## each other in any order; aliases resolve after.
+    mutating func declare_types(tree: ast.Node*) -> !:
+        var cursor = tree.body
+        while let d = cursor:
+            match d.kind:
+                .struct_: d.type_id = try self.table.nominal(types.Kind.struct_, d, try types.no_args())
+                .enum_: d.type_id = try self.table.nominal(types.Kind.enum_, d, try types.no_args())
+                .class_: d.type_id = try self.table.nominal(types.Kind.class_, d, try types.no_args())
+                .interface_: d.type_id = try self.table.nominal(types.Kind.interface_, d, try types.no_args())
+                _: discard(0)
+            cursor = d.next
+        cursor = tree.body
+        while let d = cursor:
+            if d.kind == ast.Kind.type_alias:
+                let t = d.ty else return try self.fail(d, "an alias needs a type")
+                d.type_id = try self.resolve_type(t)
+            cursor = d.next
+
+    ## Field types, case payloads, method and function signatures, conformances.
+    mutating func resolve_signatures(tree: ast.Node*) -> !:
+        var cursor = tree.body
+        while let d = cursor:
+            match d.kind:
+                .func_:
+                    d.type_id = try self.signature_of(d, types.none_id)
+                    if d.text == "main":
+                        try self.check_main(d)
+                .struct_, .class_:
+                    try self.resolve_members(d)
+                .enum_:
+                    var m = d.body
+                    while let member = m:
+                        if member.kind == ast.Kind.enum_case:
+                            var p = member.body
+                            while let param = p:
+                                let t = param.ty else return try self.fail(param, "a payload field needs a type")
+                                param.type_id = try self.resolve_type(t)
+                                if param.left != none:
+                                    return try self.fail(param, "a payload field has no default")
+                                p = param.next
+                        elif member.kind == ast.Kind.func_:
+                            member.type_id = try self.signature_of(member, d.type_id)
+                        m = member.next
+                    try self.resolve_conformance(d)
+                .interface_:
+                    var m = d.body
+                    while let member = m:
+                        member.type_id = try self.signature_of(member, d.type_id)
+                        if not has_self(member):
+                            return try self.fail(member, "an interface method takes `self`")
+                        m = member.next
+                .constant:
+                    if let t = d.ty:
+                        d.type_id = try self.resolve_type(t)
+                _: discard(0)
+            cursor = d.next
+
+    mutating func resolve_members(d: ast.Node*) -> !:
+        var m = d.body
+        var inits: u32 = 0
+        while let member = m:
+            if member.kind == ast.Kind.field:
+                let t = member.ty else return try self.fail(member, "a field needs a type")
+                member.type_id = try self.resolve_type(t)
+                if d.kind == ast.Kind.struct_ and self.table.is_reference(member.type_id) and self.table.kind(member.type_id) != types.Kind.func_:
+                    discard(0)   # a struct may hold a class or a collection: it copies the reference
+                if member.type_id == d.type_id:
+                    return try self.fail(member, "a struct or enum may not contain itself by value (§4.5)")
+                if self.table.kind(member.type_id) == types.Kind.optional and self.table.get(member.type_id).elem == d.type_id and d.kind == ast.Kind.struct_:
+                    return try self.fail(member, "a struct or enum may not contain itself by value (§4.5)")
+            elif member.kind == ast.Kind.func_:
+                member.type_id = try self.signature_of(member, d.type_id)
+                if member.text == "init":
+                    inits += 1
+                    if not has_self(member):
+                        return try self.fail(member, "`init` takes `self` first")
+                    let result = self.table.get(member.type_id).elem
+                    let bare = self.table.get(result).elem if self.table.kind(result) == types.Kind.fallible else result
+                    if bare != types.unit_id:
+                        return try self.fail(member, "`init` returns nothing, or `unit!`")
+                if member.text == "deinit":
+                    if d.kind != ast.Kind.class_:
+                        return try self.fail(member, "only a class has `deinit`")
+                    if ast.count(member.right) != 1 or not has_self(member) or self.table.get(member.type_id).elem != types.unit_id:
+                        return try self.fail(member, "`deinit(self)` takes nothing and returns nothing")
+            m = member.next
+        if inits > 1:
+            return try self.fail(d, "a type declares one `init`")
+        try self.resolve_conformance(d)
+        # a field with no default and no `init` must be given at construction; a struct
+        # never needs `init`, a class needs one when any field lacks a default
+        if d.kind == ast.Kind.class_ and inits == 0:
+            var f = d.body
+            while let field = f:
+                if field.kind == ast.Kind.field and field.left == none:
+                    return try self.fail(field, "a class field without a default is assigned in `init`; declare one (§10.1)")
+                f = field.next
+
+    ## The interfaces a type declares it conforms to, each with every method present.
+    mutating func resolve_conformance(d: ast.Node*) -> !:
+        var cursor = d.right
+        while let t = cursor:
+            let id = try self.resolve_type(t)
+            if self.table.kind(id) != types.Kind.interface_:
+                return try self.fail(t, "a type conforms to an interface")
+            t.type_id = id
+            let iface = self.table.get(id).decl else return try self.fail(t, "no declaration")
+            var req = iface.body
+            while let r = req:
+                let have = self.find_member(d, r.text) else return try self.fail(t, try self.named("the conformance to this interface lacks the method ", r.text, ""))
+                if have.kind != ast.Kind.func_ or have.type_id != r.type_id:
+                    return try self.fail(have, try self.named("the method ", r.text, " does not have the signature the interface requires"))
+                if not have.has(ast.flag_pub) and iface.has(ast.flag_pub):
+                    return try self.fail(have, try self.named("the method ", r.text, " of a public interface is `pub`"))
+                req = r.next
+            cursor = t.next
+
+    ## The function type of a declaration; `self` is not a parameter of the type.
+    mutating func signature_of(f: ast.Node*, owner: u32) -> u32!:
+        var n = ast.count(f.right)
+        if has_self(f):
+            n -= 1
+        var params = try alloc u32[n if n > 0 else 1]
+        var i: usize = 0
+        var cursor = f.right
+        var seen_default = false
+        while let p = cursor:
+            if p.text == "self":
+                if p != f.right:
+                    return try self.fail(p, "`self` comes first")
+                if owner == types.none_id:
+                    return try self.fail(p, "`self` belongs to a method inside a type")
+                p.type_id = owner
+            else:
+                let t = p.ty else return try self.fail(p, "a parameter needs a type")
+                p.type_id = try self.resolve_type(t)
+                params[i] = p.type_id
+                i += 1
+                if p.left != none:
+                    seen_default = true
+                elif seen_default:
+                    return try self.fail(p, "a parameter with a default comes after those without")
+            cursor = p.next
+        var result = types.unit_id
+        if let r = f.left:
+            result = try self.resolve_type(r)
+        if result == types.never_id:
+            return try self.fail(f, "a function does not return `never`; `error` or `trap` in the body says it")
+        return try self.table.function(params[..<i], result)
+
+    ## `main(arguments: list[str]) -> int!`, once.
+    mutating func check_main(d: ast.Node*) -> !:
+        let t = self.table.get(d.type_id)
+        let ok = t.args.length == 1 and t.args[0] == try self.table.list_of(types.str_id) and t.elem == try self.table.fallible(types.int_id)
+        if not ok or not d.has(ast.flag_pub):
+            return try self.fail(d, "`main` is `pub func main(arguments: list[str]) -> int!` (§15.4)")
+        self.main_seen = true
+
+    # -- types ----------------------------------------------------------------------------
+
+    ## The type a type node names; the node keeps the id.
+    pub mutating func resolve_type(t: ast.Node*) -> u32!:
+        let id = try self.resolve_type_inner(t)
+        t.type_id = id
+        return id
+
+    mutating func resolve_type_inner(t: ast.Node*) -> u32!:
+        if t.has(ast.flag_optional):
+            let inner = t.left else return try self.fail(t, "an optional needs a type")
+            let e = try self.resolve_type(inner)
+            if self.table.kind(e) == types.Kind.optional:
+                return try self.fail(t, "an optional of an optional, `T??`, does not exist (§12.1)")
+            if e == types.unit_id or e == types.never_id:
+                return try self.fail(t, "`unit` and `never` have no optional")
+            return try self.table.optional(e)
+        if t.has(ast.flag_fallible):
+            let inner = t.left else return try self.fail(t, "a result needs a type")
+            let e = try self.resolve_type(inner)
+            if self.table.kind(e) == types.Kind.fallible:
+                return try self.fail(t, "a result of a result, `T!!`, does not exist (§12.2)")
+            return try self.table.fallible(e)
+        if t.has(ast.flag_tuple_type):
+            let n = ast.count(t.body)
+            if n == 0:
+                return types.unit_id
+            var members = try alloc u32[n]
+            var i: usize = 0
+            var cursor = t.body
+            while let m = cursor:
+                members[i] = try self.resolve_type(m)
+                i += 1
+                cursor = m.next
+            if n == 1:
+                return try self.fail(t, "a tuple of one member is written `(T,)` only as a value; use `T`")
+            return try self.table.tuple(members)
+        if t.has(ast.flag_func_type):
+            let n = ast.count(t.body)
+            var params = try alloc u32[n if n > 0 else 1]
+            var i: usize = 0
+            var cursor = t.body
+            while let m = cursor:
+                params[i] = try self.resolve_type(m)
+                i += 1
+                cursor = m.next
+            var result = types.unit_id
+            if let r = t.right:
+                result = try self.resolve_type(r)
+            return try self.table.function(params[..<i], result)
+        let name = t.text
+        let args = ast.count(t.body)
+        if name == "int" or name == "float" or name == "bool" or name == "str" or name == "bytes" or name == "unit" or name == "never" or name == "Error" or name == "ErrorCode":
+            if args > 0:
+                return try self.fail(t, try self.named("", name, " takes no type arguments"))
+            if name == "int": return types.int_id
+            if name == "float": return types.float_id
+            if name == "bool": return types.bool_id
+            if name == "str": return types.str_id
+            if name == "bytes": return types.bytes_id
+            if name == "unit": return types.unit_id
+            if name == "never": return types.never_id
+            if name == "Error": return types.error_value_id
+            return types.error_code_id
+        if name == "list" or name == "set" or name == "task" or name == "Weak":
+            if args != 1:
+                return try self.fail(t, try self.named("", name, " takes one type argument"))
+            let elem = try self.resolve_type(t.body else return try self.fail(t, "no argument"))
+            if name == "list": return try self.table.list_of(elem)
+            if name == "set": return try self.table.set_of(elem)
+            if name == "task": return try self.table.task_of(elem)
+            if self.table.kind(elem) != types.Kind.class_:
+                return try self.fail(t, "`Weak[T]` holds a class instance (§10.4)")
+            return try self.table.weak_of(elem)
+        if name == "map":
+            if args != 2:
+                return try self.fail(t, "`map` takes a key type and a value type")
+            let k = t.body else return try self.fail(t, "no argument")
+            let v = k.next else return try self.fail(t, "no argument")
+            return try self.table.map_of(try self.resolve_type(k), try self.resolve_type(v))
+        if args > 0:
+            return try self.fail(t, "generics arrive with the interfaces slice")
+        let d = self.find_declaration(name) else return try self.fail(t, try self.named("unknown type ", name, ""))
+        match d.kind:
+            .struct_, .enum_, .class_, .interface_, .type_alias:
+                if d.type_id == types.none_id:
+                    return try self.fail(t, try self.named("the alias ", name, " refers to itself"))
+                return d.type_id
+            _:
+                return try self.fail(t, try self.named("", name, " is not a type"))
+
+    # -- what bodies need ------------------------------------------------------------------
+
+    ## The type of a declaration's name used as a value.
+    pub mutating func type_of_declaration(d: ast.Node*) -> u32!:
+        match d.kind:
+            .func_: return d.type_id
+            .constant: return d.type_id
+            .struct_, .enum_, .class_, .interface_, .type_alias:
+                var t = types.Type(kind = types.Kind.type_name, elem = d.type_id, args = try types.no_args(), decl = d, name = d.text)
+                return try self.table.intern(t)
+            _: return types.none_id
+
+## `dir/name.luc` -> `name`.
+pub func module_name_of(path: str) -> str:
+    let b = path.bytes
+    var start: usize = 0
+    var end: usize = b.length
+    var i: usize = 0
+    while i < b.length:
+        if b[i] == '/':
+            start = i + 1
+        i += 1
+    i = start
+    while i < b.length:
+        if b[i] == '.':
+            end = i
+        i += 1
+    return (str)b[start..<end]
+
+## Whether a function's first parameter is `self`.
+pub func has_self(f: ast.Node*) -> bool:
+    let first = f.right else return false
+    return first.text == "self"
+
+## The parameter at index `i` of `f`, `self` excluded.
+pub func param_at(f: ast.Node*, i: usize) -> ast.Node*?:
+    var cursor = f.right
+    var k: usize = 0
+    while let p = cursor:
+        if p.text != "self":
+            if k == i:
+                return p
+            k += 1
+        cursor = p.next
+    return none
+
+## A method assigns through `self`, so it needs a `var` receiver on a struct (§7.3):
+## found by looking at the assignments of every method, then at the methods each calls
+## on `self`, until nothing changes.
+pub let flag_mutating: u32 = 4096
+
+func mark_mutating_methods(tree: ast.Node*) -> !:
+    var d = tree.body
+    while let decl = d:
+        if decl.kind == ast.Kind.struct_ or decl.kind == ast.Kind.class_ or decl.kind == ast.Kind.enum_:
+            var changed = true
+            while changed:
+                changed = false
+                var m = decl.body
+                while let method = m:
+                    if method.kind == ast.Kind.func_ and not method.has(flag_mutating) and has_self(method):
+                        if method.text == "init" or (method.body != none and mutates_self(decl, method.body)):
+                            method.flags |= flag_mutating
+                            changed = true
+                    m = method.next
+        d = decl.next
+
+## Whether the statements under `n` assign a field of `self`, or call a mutating method on it.
+func mutates_self(decl: ast.Node*, n: ast.Node*?) -> bool:
+    var cursor = n
+    while let s = cursor:
+        if s.kind == ast.Kind.assign:
+            if let place = s.left:
+                if root_is_self(place):
+                    return true
+        if s.kind == ast.Kind.call:
+            if let callee = s.left:
+                if callee.kind == ast.Kind.member:
+                    if let receiver = callee.left:
+                        if receiver.kind == ast.Kind.self_:
+                            var m = decl.body
+                            while let method = m:
+                                if method.kind == ast.Kind.func_ and method.text == callee.text and method.has(flag_mutating):
+                                    return true
+                                m = method.next
+        if mutates_self(decl, s.left) or mutates_self(decl, s.right) or mutates_self(decl, s.body) or mutates_self(decl, s.ty):
+            return true
+        cursor = s.next
+    return false
+
+func root_is_self(place: ast.Node*) -> bool:
+    if place.kind == ast.Kind.self_:
+        return true
+    if place.kind == ast.Kind.member or place.kind == ast.Kind.index:
+        let inner = place.left else return false
+        return root_is_self(inner)
+    return false

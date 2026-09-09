@@ -1,0 +1,1172 @@
+#==============================================================================================
+#
+#   interp - The semantic oracle
+#
+#   DESCRIPTION:
+#       Executes the typed tree directly: `luce run`, and the definition of behaviour that
+#       the emitted Base must agree with. Every binding is a cell on the heap; a value type
+#       is cloned when bound, passed, stored or returned, a reference type shares. Control
+#       flow leaves a block as a `Flow`; a Luce failure travels as Base's own failure with
+#       the `Error` kept aside; a violated rule traps through Base's `trap`, with the text
+#       the emitted program's trap carries.
+#
+#==============================================================================================
+
+import c
+import front.ast
+import hir.value
+import io
+import sema.check
+import sema.types
+import strings
+import support.list
+import support.literals
+
+## A Luce failure passing through the interpreter's own results.
+pub let luce_failure: ErrorCode = ErrorCode.package(13)
+## An interpreter fault: something the checker should have refused.
+let fault: ErrorCode = ErrorCode.package(14)
+
+let max_depth: u32 = 4000
+
+pub enum Flow as u8:
+    normal = 0
+    returned = 1
+    broke = 2
+    continued = 3
+    recovered = 4
+
+## One binding of a frame: its declaration and its cell.
+struct Slot:
+    var decl: ast.Node*
+    var cell: value.Value*
+
+pub struct Interp:
+    var checker: check.Checker*
+    var slots: list.List[Slot]
+    ## The first slot of the current frame: a name resolves within it.
+    var base: usize
+    var depth: u32
+    ## The control flow leaving the statement just run, its label, and its value.
+    var flow: Flow
+    var label: str
+    var carried: value.Value
+    ## The `Error` of the failure in flight.
+    pub var pending: value.Value
+    var out: io.Writer
+
+    pub static func over(checker: check.Checker*) -> Interp!:
+        return Interp(checker = checker, slots = try list.List[Slot].create(256), base = 0, depth = 0, flow = Flow.normal,
+                      label = "", carried = value.nothing(), pending = value.nothing(), out = io.stdout())
+
+    # -- running --------------------------------------------------------------------------
+
+    ## Run `main` with the program's arguments; its result, or the failure it ended with.
+    pub mutating func run_main(arguments: str[]) -> i64!:
+        let main = self.checker.find_declaration("main") else error(fault, "no main")
+        var args = try value.members(value.Kind.list_, arguments.length, none)
+        var i: usize = 0
+        while i < arguments.length:
+            args.items[i] = value.text(arguments[i])
+            i += 1
+        args.count = arguments.length
+        var one = try alloc value.Value[1]
+        one[0] = args
+        let result = try self.call(main, none, one)
+        return result.i
+
+    ## Run one `test`: fails when the test does.
+    pub mutating func run_test(d: ast.Node*) -> !:
+        let body = d.body else return
+        self.push_frame()
+        try self.block(body)
+        self.pop_frame()
+
+    # -- frames ---------------------------------------------------------------------------
+
+    mutating func push_frame():
+        self.base = self.slots.count
+
+    mutating func pop_frame():
+        self.slots.count = self.base
+        # the frame below: its base is not recorded, so scan back to the previous function's
+        # bindings is not needed; a call restores its own base after returning
+        discard(0)
+
+    mutating func bind(decl: ast.Node*, v: value.Value) -> !:
+        let cell = try new value.Value
+        *cell = v
+        try self.slots.push(Slot(decl = decl, cell = cell))
+
+    func cell_of(decl: ast.Node*) -> value.Value*!:
+        var i = self.slots.count
+        while i > self.base:
+            i -= 1
+            let s = self.slots.get(i)
+            if s.decl == decl:
+                return s.cell
+        error(fault, "an unbound name reached the interpreter")
+
+    # -- calls ----------------------------------------------------------------------------
+
+    ## Call a function or method with its arguments in parameter order (`self` excluded).
+    pub mutating func call(f: ast.Node*, receiver: value.Value*?, args: value.Value[]) -> value.Value!:
+        let body = f.body else error(fault, "a function without a body")
+        if self.depth >= max_depth:
+            trap("call depth exceeded")
+        self.depth += 1
+        let saved_base = self.base
+        let saved_count = self.slots.count
+        self.base = self.slots.count
+        var i: usize = 0
+        var cursor = f.right
+        while let p = cursor:
+            if p.text == "self":
+                let r = receiver else error(fault, "a method without a receiver")
+                try self.slots.push(Slot(decl = p, cell = r))
+            else:
+                try self.bind(p, try value.clone(args[i]))
+                i += 1
+            cursor = p.next
+        # a failure leaving the body restores the caller's frame before it travels on
+        self.block(body) catch failure:
+            self.flow = Flow.normal
+            self.slots.count = saved_count
+            self.base = saved_base
+            self.depth -= 1
+            error(failure.code, failure.message)
+        var result = value.nothing()
+        if self.flow == Flow.returned:
+            result = self.carried
+        self.flow = Flow.normal
+        self.slots.count = saved_count
+        self.base = saved_base
+        self.depth -= 1
+        return try value.clone(result)
+
+    ## The arguments of a call in parameter order, defaults filled in, on the heap.
+    mutating func arguments(e: ast.Node*, params: ast.Node*?, skip_self: bool) -> value.Value[]!:
+        var n: usize = 0
+        var cursor = params
+        while let p = cursor:
+            if counts_as_param(p, skip_self):
+                n += 1
+            cursor = p.next
+        var out = try alloc value.Value[n if n > 0 else 1]
+        var given = try alloc bool[n if n > 0 else 1]
+        var i: usize = 0
+        while i < n:
+            given[i] = false
+            i += 1
+        # arguments evaluate left to right, in the order written
+        var a = e.body
+        while let arg = a:
+            let p = arg.resolved else error(fault, "an argument without its parameter")
+            let v = arg.left else error(fault, "an empty argument")
+            let slot = try index_of_param(params, p, skip_self)
+            out[slot] = try self.eval(v)
+            given[slot] = true
+            a = arg.next
+        i = 0
+        cursor = params
+        while let p = cursor:
+            if counts_as_param(p, skip_self):
+                if not given[i]:
+                    let d = p.left else error(fault, "a missing argument without a default")
+                    out[i] = try self.eval(d)
+                i += 1
+            cursor = p.next
+        return out[..<n]
+
+    # -- statements -----------------------------------------------------------------------
+
+    ## Run a block; `self.flow` says how it left.
+    mutating func block(b: ast.Node*) -> !:
+        let mark = self.slots.count
+        var cursor = b.body
+        while let s = cursor:
+            try self.statement(s)
+            if self.flow != Flow.normal:
+                break
+            cursor = s.next
+        self.slots.count = mark
+
+    mutating func statement(s: ast.Node*) -> !:
+        match s.kind:
+            .let_, .var_:
+                let init = s.left else return
+                let v = try self.eval(init)
+                if s.body != none:
+                    var i: usize = 0
+                    var cursor = s.body
+                    while let part = cursor:
+                        try self.bind(part, try value.clone(v.items[i]))
+                        i += 1
+                        cursor = part.next
+                else:
+                    try self.bind(s, try value.clone(v))
+            .assign: try self.assign(s)
+            .if_: try self.if_statement(s)
+            .while_:
+                while true:
+                    if s.has(ast.flag_if_let):
+                        let cond = s.left else return
+                        let init = cond.left else return
+                        let v = try self.eval(init)
+                        if v.kind == value.Kind.absent:
+                            break
+                        let mark = self.slots.count
+                        try self.bind(cond, try value.clone(v))
+                        let body = s.body else return
+                        try self.block(body)
+                        self.slots.count = mark
+                    else:
+                        let cond = s.left else return
+                        if not value.truth(try self.eval(cond)):
+                            break
+                        let body = s.body else return
+                        try self.block(body)
+                    if self.flow == Flow.broke and (self.label.length == 0 or self.label == s.text):
+                        self.flow = Flow.normal
+                        break
+                    if self.flow == Flow.continued and (self.label.length == 0 or self.label == s.text):
+                        self.flow = Flow.normal
+                        continue
+                    if self.flow != Flow.normal:
+                        break
+            .for_: try self.for_statement(s)
+            .match_: try self.match_statement(s)
+            .with_: try self.with_statement(s)
+            .return_:
+                var v = value.nothing()
+                if let e = s.left:
+                    v = try self.eval(e)
+                self.carried = v
+                self.flow = Flow.returned
+            .break_:
+                self.flow = Flow.broke
+                self.label = s.text
+            .continue_:
+                self.flow = Flow.continued
+                self.label = s.text
+            .recover_:
+                let e = s.left else return
+                self.carried = try self.eval(e)
+                self.flow = Flow.recovered
+            .expr_stmt:
+                let e = s.left else return
+                discard(try self.eval(e))
+            _: error(fault, "unexpected statement")
+
+    mutating func if_statement(s: ast.Node*) -> !:
+        let mark = self.slots.count
+        var taken = false
+        if s.has(ast.flag_if_let):
+            let cond = s.left else return
+            let init = cond.left else return
+            let v = try self.eval(init)
+            if v.kind != value.Kind.absent:
+                try self.bind(cond, try value.clone(v))
+                taken = true
+        else:
+            let cond = s.left else return
+            taken = value.truth(try self.eval(cond))
+        if taken:
+            let body = s.body else return
+            try self.block(body)
+        elif let rest = s.right:
+            if rest.kind == ast.Kind.if_:
+                try self.if_statement(rest)
+            else:
+                try self.block(rest)
+        self.slots.count = mark
+
+    mutating func for_statement(s: ast.Node*) -> !:
+        let binding = s.left else return
+        let seq = s.right else return
+        let body = s.body else return
+        let source = try self.eval(seq)
+        var count: usize = 0
+        match source.kind:
+            .range_:
+                var i = source.i
+                let limit = source.hi + 1 if source.inclusive else source.hi
+                while i < limit:
+                    if try self.iteration(s, binding, body, value.integer(i)):
+                        break
+                    i += 1
+                return
+            .list_:
+                count = source.count
+                var i: usize = 0
+                while i < count:
+                    if source.count != count:
+                        trap("the list changed while it was iterated")
+                    if try self.iteration(s, binding, body, source.items[i]):
+                        break
+                    i += 1
+                return
+            .text:
+                let b = source.s.bytes
+                var i: usize = 0
+                while i < b.length:
+                    var n: usize = 1
+                    while i + n < b.length and (b[i + n] & 0xC0) == 0x80:
+                        n += 1
+                    if try self.iteration(s, binding, body, value.text((str)b[i..<i + n])):
+                        break
+                    i += n
+                return
+            .blob:
+                var i: usize = 0
+                while i < source.b.length:
+                    if try self.iteration(s, binding, body, value.integer((i64)source.b[i])):
+                        break
+                    i += 1
+                return
+            _: error(fault, "cannot iterate this value")
+
+    ## One pass of a `for` body with the element bound; `break`/`continue` settled here.
+    ## Whether the loop stops.
+    mutating func iteration(s: ast.Node*, binding: ast.Node*, body: ast.Node*, element: value.Value) -> bool!:
+        let mark = self.slots.count
+        if binding.body != none:
+            var i: usize = 0
+            var cursor = binding.body
+            while let part = cursor:
+                try self.bind(part, try value.clone(element.items[i]))
+                i += 1
+                cursor = part.next
+        else:
+            try self.bind(binding, try value.clone(element))
+        try self.block(body)
+        self.slots.count = mark
+        if self.flow == Flow.broke and (self.label.length == 0 or self.label == s.text):
+            self.flow = Flow.normal
+            self.label = ""
+            return true
+        if self.flow == Flow.continued and (self.label.length == 0 or self.label == s.text):
+            self.flow = Flow.normal
+            self.label = ""
+            return false
+        return self.flow != Flow.normal
+
+    mutating func match_statement(s: ast.Node*) -> !:
+        let subject = s.left else return
+        let v = try self.eval(subject)
+        var cursor = s.body
+        while let arm = cursor:
+            let mark = self.slots.count
+            if try self.arm_matches(arm, v):
+                let body = arm.body else return
+                try self.block(body)
+                self.slots.count = mark
+                return
+            self.slots.count = mark
+            cursor = arm.next
+        trap("no arm of the match applied")
+
+    ## Whether an arm's patterns match `v`, binding what they bind; the guard included.
+    mutating func arm_matches(arm: ast.Node*, v: value.Value) -> bool!:
+        var p = arm.left
+        var any = false
+        while let pattern = p:
+            if try self.pattern_matches(pattern, v):
+                any = true
+                break
+            p = pattern.next
+        if not any:
+            return false
+        if let guard = arm.right:
+            return value.truth(try self.eval(guard))
+        return true
+
+    mutating func pattern_matches(p: ast.Node*, v: value.Value) -> bool!:
+        if p.has(ast.flag_wildcard):
+            return true
+        if p.text == "bind":
+            let name = p.left else return true
+            try self.bind(name, try value.clone(v))
+            return true
+        if p.text == "tuple":
+            var i: usize = 0
+            var cursor = p.body
+            while let sub = cursor:
+                if not try self.pattern_matches(sub, v.items[i]):
+                    return false
+                i += 1
+                cursor = sub.next
+            return true
+        if p.text == "none":
+            return v.kind == value.Kind.absent
+        let lit = p.left else return false
+        if lit.kind == ast.Kind.case_value:
+            let case_node = lit.resolved else return false
+            if v.kind == value.Kind.absent or v.case_node != case_node:
+                return false
+            var i: usize = 0
+            var cursor = lit.body
+            while let name = cursor:
+                if not name.has(ast.flag_wildcard):
+                    try self.bind(name, try value.clone(v.items[i]))
+                i += 1
+                cursor = name.next
+            return true
+        if p.text == "..<" or p.text == "..=":
+            let hi = p.right else return false
+            let low = try self.eval(lit)
+            let high = try self.eval(hi)
+            if v.kind == value.Kind.absent:
+                return false
+            return v.i >= low.i and (v.i < high.i if p.text == "..<" else v.i <= high.i)
+        if v.kind == value.Kind.absent:
+            return false
+        return value.equal(try self.eval(lit), v)
+
+    ## `with e as name:` closes `name` however the suite ends (§8.5).
+    mutating func with_statement(s: ast.Node*) -> !:
+        let body = s.body else return
+        let mark = self.slots.count
+        var cursor = s.left
+        while let item = cursor:
+            let e = item.left else return
+            try self.bind(item, try self.eval(e))
+            cursor = item.next
+        var failed = false
+        var code = luce_failure
+        var message: str = ""
+        var pending = self.pending
+        self.block(body) catch failure:
+            failed = true
+            code = failure.code
+            message = failure.message
+            pending = self.pending
+        # close in reverse order, each through its `close`
+        var n = ast.count(s.left)
+        while n > 0:
+            n -= 1
+            var i: usize = 0
+            var it = s.left
+            while let item = it:
+                if i == n:
+                    let close = item.resolved else return
+                    let cell = try self.cell_of(item)
+                    discard(try self.call(close, cell, try alloc value.Value[0]))
+                i += 1
+                it = item.next
+        self.slots.count = mark
+        if failed:
+            self.pending = pending
+            error(code, message)
+
+    # -- places and assignment ------------------------------------------------------------
+
+    ## The cell an assignable expression names.
+    mutating func place(e: ast.Node*) -> value.Value*!:
+        match e.kind:
+            .name:
+                let d = e.resolved else error(fault, "an unresolved place")
+                return try self.cell_of(d)
+            .self_:
+                let d = self.self_param() else error(fault, "no self")
+                return try self.cell_of(d)
+            .member:
+                let receiver = e.left else error(fault, "no receiver")
+                let field = e.resolved else error(fault, "no field")
+                let container = try self.place(receiver)
+                let owner = self.checker.table.get(receiver.type_id).decl else error(fault, "no owner")
+                let index = field_index(owner, field)
+                return &container.items[index]
+            .index:
+                let receiver = e.left else error(fault, "no receiver")
+                let index_expr = e.body else error(fault, "no index")
+                let container = try self.place(receiver)
+                let index = try self.eval(index_expr)
+                let i = try checked_index(index.i, container.count)
+                return &container.items[i]
+            _: error(fault, "not a place")
+
+    ## The `self` parameter of the function whose frame is current.
+    func self_param() -> ast.Node*?:
+        if self.slots.count > self.base:
+            let first = self.slots.get(self.base)
+            if first.decl.text == "self":
+                return first.decl
+        return none
+
+    mutating func assign(s: ast.Node*) -> !:
+        let place_expr = s.left else return
+        let value_expr = s.right else return
+        if place_expr.kind == ast.Kind.tuple:
+            let v = try self.eval(value_expr)
+            var i: usize = 0
+            var cursor = place_expr.body
+            while let part = cursor:
+                let cell = try self.place(part)
+                *cell = try value.clone(v.items[i])
+                i += 1
+                cursor = part.next
+            return
+        if s.text == "=":
+            let v = try self.eval(value_expr)
+            let cell = try self.place(place_expr)
+            *cell = try value.clone(v)
+            return
+        let cell = try self.place(place_expr)
+        let current = *cell
+        let v = try self.eval(value_expr)
+        let op = (str)s.text.bytes[..<s.text.length - 1]
+        *cell = try self.arithmetic(op, current, v)
+
+    # -- expressions ----------------------------------------------------------------------
+
+    pub mutating func eval(e: ast.Node*) -> value.Value!:
+        match e.kind:
+            .literal: return try self.literal(e)
+            .name:
+                let d = e.resolved else error(fault, "an unresolved name")
+                if d.kind == ast.Kind.func_:
+                    return value.function(d)
+                if d.kind == ast.Kind.constant:
+                    let init = d.left else error(fault, "a constant without a value")
+                    return try self.eval(init)
+                return *(try self.cell_of(d))
+            .self_:
+                let d = self.self_param() else error(fault, "no self")
+                return *(try self.cell_of(d))
+            .group:
+                let inner = e.left else error(fault, "empty group")
+                return try self.eval(inner)
+            .unary: return try self.unary(e)
+            .binary: return try self.binary(e)
+            .conditional:
+                let cond = e.ty else error(fault, "no condition")
+                let l = e.left else error(fault, "no value")
+                let r = e.right else error(fault, "no alternative")
+                if value.truth(try self.eval(cond)):
+                    return try self.eval(l)
+                return try self.eval(r)
+            .tuple:
+                var t = try value.members(value.Kind.tuple, ast.count(e.body), none)
+                var i: usize = 0
+                var cursor = e.body
+                while let m = cursor:
+                    t.items[i] = try self.eval(m)
+                    i += 1
+                    cursor = m.next
+                return t
+            .unit_: return value.nothing()
+            .call: return try self.call_expr(e)
+            .member: return try self.member(e)
+            .index:
+                let receiver = e.left else error(fault, "no receiver")
+                let index_expr = e.body else error(fault, "no index")
+                let container = try self.eval(receiver)
+                let index = try self.eval(index_expr)
+                if container.kind == value.Kind.blob:
+                    let i = try checked_index(index.i, container.b.length)
+                    return value.integer((i64)container.b[i])
+                let i = try checked_index(index.i, container.count)
+                return container.items[i]
+            .slice: return try self.slice(e)
+            .else_:
+                let l = e.left else error(fault, "no value")
+                let r = e.right else error(fault, "no fallback")
+                let v = try self.eval(l)
+                if v.kind != value.Kind.absent:
+                    return v
+                if r.kind == ast.Kind.return_ or r.kind == ast.Kind.break_ or r.kind == ast.Kind.continue_:
+                    try self.statement(r)
+                    return value.absent()
+                return try self.eval(r)
+            .catch_: return try self.catch_expr(e)
+            .case_value: return try self.construct_case(e, e.body)
+            .formatted:
+                var b = try strings.Builder.create(64)
+                var cursor = e.body
+                while let part = cursor:
+                    if part.kind == ast.Kind.format_text:
+                        try b.put(try unescape_format(part.text))
+                    else:
+                        let v = part.left else error(fault, "empty field")
+                        try value.display(&b, try self.eval(v))
+                    cursor = part.next
+                let out = try strings.copy(b.view())
+                b.destroy()
+                return value.text(out)
+            .match_expr:
+                let subject = e.left else error(fault, "no value")
+                let v = try self.eval(subject)
+                var cursor = e.body
+                while let arm = cursor:
+                    let mark = self.slots.count
+                    if try self.arm_matches(arm, v):
+                        let body = arm.body else error(fault, "no arm value")
+                        let result = try self.eval(body)
+                        self.slots.count = mark
+                        return result
+                    self.slots.count = mark
+                    cursor = arm.next
+                trap("no arm of the match applied")
+            _:
+                error(fault, try format(self.checker.scratch, f"an expression the interpreter does not know: {ast.kind_name(e.kind)} at line {e.line}"))
+
+    mutating func literal(e: ast.Node*) -> value.Value!:
+        let b = e.text.bytes
+        if e.text == "true":
+            return value.boolean(true)
+        if e.text == "false":
+            return value.boolean(false)
+        if e.text == "none":
+            return value.absent()
+        if b[0] == '"' or (b[0] == 'r' and b.length > 1 and b[1] == '"'):
+            return value.text(try literals.decode_text(e.text))
+        if b[0] == 'b' and b.length > 1 and b[1] == '"':
+            return value.blob((try literals.decode_text(e.text)).bytes)
+        if literals.is_float_text(e.text):
+            return value.floating(try parse_float(e.text))
+        let magnitude = try literals.decode_integer(e.text)
+        if magnitude == 9223372036854775808:
+            return value.integer(-9223372036854775807 - 1)   # under the `-` that admits it
+        return value.integer((i64)magnitude)
+
+    mutating func unary(e: ast.Node*) -> value.Value!:
+        let inner = e.left else error(fault, "no operand")
+        if e.text == "try":
+            return try self.eval(inner)
+        if e.text == "not":
+            return value.boolean(not value.truth(try self.eval(inner)))
+        let v = try self.eval(inner)
+        if v.kind == value.Kind.floating:
+            return value.floating(-v.f)
+        if inner.kind == ast.Kind.literal and v.i == -9223372036854775807 - 1:
+            return v
+        return value.integer(0 - v.i)
+
+    mutating func binary(e: ast.Node*) -> value.Value!:
+        let l = e.left else error(fault, "no operand")
+        let r = e.right else error(fault, "no operand")
+        let op = e.text
+        if op == "and":
+            if not value.truth(try self.eval(l)):
+                return value.boolean(false)
+            return value.boolean(value.truth(try self.eval(r)))
+        if op == "or":
+            if value.truth(try self.eval(l)):
+                return value.boolean(true)
+            return value.boolean(value.truth(try self.eval(r)))
+        let a = try self.eval(l)
+        let b = try self.eval(r)
+        if op == "..<" or op == "..=":
+            return value.range(a.i, b.i, op == "..=")
+        if op == "==":
+            return value.boolean(value.equal(a, b))
+        if op == "!=":
+            return value.boolean(not value.equal(a, b))
+        if op == "<":
+            return value.boolean(value.compare(a, b) < 0)
+        if op == "<=":
+            return value.boolean(value.compare(a, b) <= 0)
+        if op == ">":
+            return value.boolean(value.compare(a, b) > 0)
+        if op == ">=":
+            return value.boolean(value.compare(a, b) >= 0)
+        if op == "in":
+            match b.kind:
+                .text: return value.boolean(strings.contains(b.s, a.s))
+                .range_: return value.boolean(a.i >= b.i and (a.i <= b.hi if b.inclusive else a.i < b.hi))
+                .list_:
+                    var i: usize = 0
+                    while i < b.count:
+                        if value.equal(b.items[i], a):
+                            return value.boolean(true)
+                        i += 1
+                    return value.boolean(false)
+                _: error(fault, "`in` over this value")
+        return try self.arithmetic(op, a, b)
+
+    ## `a op b` for the arithmetic operators (§6.2): checked on `int`, IEEE on `float`.
+    mutating func arithmetic(op: str, a: value.Value, b: value.Value) -> value.Value!:
+        if a.kind == value.Kind.text:
+            let joined = try alloc u8[a.s.length + b.s.length]
+            var i: usize = 0
+            while i < a.s.length:
+                joined[i] = a.s.bytes[i]
+                i += 1
+            var k: usize = 0
+            while k < b.s.length:
+                joined[i + k] = b.s.bytes[k]
+                k += 1
+            return value.text((str)joined)
+        if a.kind == value.Kind.floating:
+            if op == "+": return value.floating(a.f + b.f)
+            if op == "-": return value.floating(a.f - b.f)
+            if op == "*": return value.floating(a.f * b.f)
+            if op == "/": return value.floating(a.f / b.f)
+            if op == "//": return value.floating(floor_float(a.f / b.f))
+            if op == "%": return value.floating(a.f - floor_float(a.f / b.f) * b.f)
+            if op == "**": return value.floating(power_float(a.f, b.f))
+            error(fault, "unknown float operator")
+        if op == "+": return value.integer(a.i + b.i)
+        if op == "-": return value.integer(a.i - b.i)
+        if op == "*": return value.integer(a.i * b.i)
+        if op == "/": return value.floating(f64(a.i) / f64(b.i))
+        if op == "//": return value.integer(floor_div(a.i, b.i))
+        if op == "%": return value.integer(floor_mod(a.i, b.i))
+        if op == "**": return value.integer(power_int(a.i, b.i))
+        error(fault, "unknown operator")
+
+    mutating func slice(e: ast.Node*) -> value.Value!:
+        let receiver = e.left else error(fault, "no receiver")
+        let v = try self.eval(receiver)
+        var low: i64 = 0
+        var high: i64 = 0
+        if let l = e.body:
+            low = (try self.eval(l)).i
+        if let h = e.right:
+            high = (try self.eval(h)).i
+        match v.kind:
+            .text:
+                let n = (i64)scalar_length(v.s)
+                if e.has(ast.flag_no_high):
+                    high = n
+                try check_bounds(low, high, n)
+                return value.text(scalar_slice(v.s, (usize)low, (usize)high))
+            .blob:
+                let n = (i64)v.b.length
+                if e.has(ast.flag_no_high):
+                    high = n
+                try check_bounds(low, high, n)
+                return value.blob(v.b[(usize)low..<(usize)high])
+            .list_:
+                let n = (i64)v.count
+                if e.has(ast.flag_no_high):
+                    high = n
+                try check_bounds(low, high, n)
+                var out = try value.members(value.Kind.list_, (usize)(high - low), none)
+                var i: usize = 0
+                while i < (usize)(high - low):
+                    out.items[i] = try value.clone(v.items[(usize)low + i])
+                    i += 1
+                return out
+            _: error(fault, "cannot slice this value")
+
+    mutating func member(e: ast.Node*) -> value.Value!:
+        let receiver = e.left else error(fault, "no receiver")
+        let rt = self.checker.table.get(receiver.type_id)
+        if rt.kind == types.Kind.type_name:
+            # a case without a payload, or a type function
+            let m = e.resolved else error(fault, "no member")
+            if m.kind == ast.Kind.enum_case:
+                return try self.construct_case(e, none)
+            return value.function(m)
+        let v = try self.eval(receiver)
+        if rt.kind == types.Kind.tuple:
+            let index = try literals.decode_integer(e.text)
+            return v.items[(usize)index]
+        if e.text == "length" and (v.kind == value.Kind.text or v.kind == value.Kind.blob or v.kind == value.Kind.list_):
+            if v.kind == value.Kind.text:
+                return value.integer((i64)scalar_length(v.s))
+            if v.kind == value.Kind.blob:
+                return value.integer((i64)v.b.length)
+            return value.integer((i64)v.count)
+        if v.kind == value.Kind.failure:
+            if e.text == "code":
+                return value.code(v.i)
+            return value.text(v.s)
+        let m = e.resolved else error(fault, "no member")
+        if m.kind == ast.Kind.field:
+            let owner = rt.decl else error(fault, "no owner")
+            return v.items[field_index(owner, m)]
+        if m.kind == ast.Kind.func_:
+            # a method bound to its receiver: the value is kept beside the function
+            var bound = value.function(m)
+            bound.items = try alloc value.Value[1]
+            bound.items[0] = v
+            return bound
+        error(fault, "an unknown member")
+
+    mutating func call_expr(e: ast.Node*) -> value.Value!:
+        let callee = e.left else error(fault, "nothing to call")
+        if callee.kind == ast.Kind.name and callee.resolved == none and self.checker.find_declaration(callee.text) == none:
+            return try self.core_call(e, callee.text)
+        if callee.kind == ast.Kind.member and callee.text == "package":
+            return value.code(try self.package_code(e))
+        if callee.kind == ast.Kind.case_value:
+            return try self.construct_case(e, e.body)
+        if let d = e.resolved:
+            match d.kind:
+                .enum_case: return try self.construct_case(e, e.body)
+                .struct_: return try self.construct_struct(e, d)
+                .class_: return try self.construct_object(e, d, none)
+                .func_:
+                    if d.text == "init":
+                        let owner = callee.resolved else error(fault, "no class")
+                        return try self.construct_object(e, owner, d)
+                    if check.has_self(d):
+                        let receiver = callee.left else error(fault, "no receiver")
+                        let cell = try self.receiver_cell(receiver)
+                        let args = try self.arguments(e, d.right, true)
+                        return try self.call(d, cell, args)
+                    let args = try self.arguments(e, d.right, true)
+                    return try self.call(d, none, args)
+                _: discard(0)
+        # a function value
+        let f = try self.eval(callee)
+        let d = f.decl else error(fault, "not a function")
+        var n: usize = 0
+        var cursor = e.body
+        while cursor != none:
+            n += 1
+            cursor = (cursor else error(fault, "")).next
+        var args = try alloc value.Value[n if n > 0 else 1]
+        var i: usize = 0
+        cursor = e.body
+        while let a = cursor:
+            let v = a.left else error(fault, "empty argument")
+            args[i] = try self.eval(v)
+            i += 1
+            cursor = a.next
+        if f.items.length > 0:
+            return try self.call(d, &f.items[0], args[..<n])
+        return try self.call(d, none, args[..<n])
+
+    ## The cell a method's receiver lives in: a place's cell, or a fresh cell for a temporary.
+    mutating func receiver_cell(receiver: ast.Node*) -> value.Value*!:
+        if receiver.kind == ast.Kind.name or receiver.kind == ast.Kind.self_ or receiver.kind == ast.Kind.member or receiver.kind == ast.Kind.index:
+            return self.place(receiver) catch failure:
+                let cell = try new value.Value
+                *cell = try self.eval(receiver)
+                recover cell
+        let cell = try new value.Value
+        *cell = try self.eval(receiver)
+        return cell
+
+    mutating func construct_struct(e: ast.Node*, d: ast.Node*) -> value.Value!:
+        let args = try self.arguments(e, d.body, false)
+        var v = try value.members(value.Kind.record, args.length, d)
+        var i: usize = 0
+        while i < args.length:
+            v.items[i] = try value.clone(args[i])
+            i += 1
+        return v
+
+    ## A class instance: fields from their defaults, then `init` over it.
+    mutating func construct_object(e: ast.Node*, owner: ast.Node*, init: ast.Node*?) -> value.Value!:
+        let n = field_count(owner)
+        var v = try value.members(value.Kind.object, n, owner)
+        var i: usize = 0
+        var cursor = owner.body
+        while let m = cursor:
+            if m.kind == ast.Kind.field:
+                if let default = m.left:
+                    v.items[i] = try self.eval(default)
+                i += 1
+            cursor = m.next
+        if let f = init:
+            let cell = try new value.Value
+            *cell = v
+            let args = try self.arguments(e, f.right, true)
+            discard(try self.call(f, cell, args))
+            return *cell
+        return v
+
+    ## A case value: the enum, the case, and its payload from the arguments.
+    mutating func construct_case(e: ast.Node*, args_list: ast.Node*?) -> value.Value!:
+        let case_node = e.resolved else error(fault, "no case")
+        var d: ast.Node*? = none
+        let t = self.checker.table.get(e.type_id)
+        if t.kind == types.Kind.enum_:
+            d = t.decl
+        elif t.kind == types.Kind.optional:
+            d = self.checker.table.get(t.elem).decl
+        elif t.kind == types.Kind.type_name:
+            d = self.checker.table.get(t.elem).decl
+        let owner = d else error(fault, "no enum")
+        let n = ast.count(case_node.body)
+        var v = try value.members(value.Kind.variant, n, owner)
+        v.case_node = case_node
+        v.i = (i64)case_index(owner, case_node)
+        if n > 0:
+            var saved = e.body
+            e.body = args_list
+            let args = try self.arguments(e, case_node.body, false)
+            e.body = saved
+            var i: usize = 0
+            while i < n:
+                v.items[i] = try value.clone(args[i])
+                i += 1
+        return v
+
+    mutating func catch_expr(e: ast.Node*) -> value.Value!:
+        let l = e.left else error(fault, "no value")
+        let body = e.body else error(fault, "no suite")
+        let mark = self.slots.count
+        let result = self.eval(l) catch failure:
+            if failure.code != luce_failure:
+                error(failure.code, failure.message)
+            let err = self.pending
+            if e.text.length > 0:
+                try self.bind(e, err)
+            try self.block(body)
+            self.slots.count = mark
+            if self.flow == Flow.recovered:
+                self.flow = Flow.normal
+                recover self.carried
+            recover value.nothing()
+        return result
+
+    ## The language's own functions.
+    mutating func core_call(e: ast.Node*, name: str) -> value.Value!:
+        if name == "print":
+            var b = try strings.Builder.create(64)
+            var cursor = e.body
+            var first = true
+            while let a = cursor:
+                let v = a.left else error(fault, "empty argument")
+                if not first:
+                    try b.put(" ")
+                first = false
+                try value.display(&b, try self.eval(v))
+                cursor = a.next
+            try b.put("\n")
+            discard(try self.out.write(b.view().bytes))
+            b.destroy()
+            return value.nothing()
+        let first = e.body else error(fault, "no argument")
+        let arg = first.left else error(fault, "no argument")
+        if name == "assert":
+            let ok = value.truth(try self.eval(arg))
+            if not ok:
+                if let second = first.next:
+                    let m = second.left else error(fault, "no message")
+                    let text = try self.eval(m)
+                    var room: u8[512]
+                    trap(try format(room, f"assert failed: {text.s}"))
+                trap("assert failed")
+            return value.nothing()
+        if name == "trap":
+            let m = try self.eval(arg)
+            trap(m.s)
+        if name == "error":
+            let second = first.next else error(fault, "no message")
+            let m = second.left else error(fault, "no message")
+            let code = try self.eval(arg)
+            let message = try self.eval(m)
+            return try self.raise(code.i, message.s)
+        if name == "discard":
+            discard(try self.eval(arg))
+            return value.nothing()
+        let v = try self.eval(arg)
+        if name == "int":
+            if v.kind == value.Kind.floating:
+                return value.integer(i64(v.f))
+            let parsed = strings.to_i64(strings.trim(v.s)) else return try self.raise(0, "not an integer")
+            return value.integer(parsed)
+        if name == "float":
+            if v.kind == value.Kind.integer:
+                return value.floating(f64(v.i))
+            let parsed = parse_float(strings.trim(v.s)) catch failure:
+                return try self.raise(0, "not a number")
+            return value.floating(parsed)
+        if name == "bool":
+            if v.s == "true":
+                return value.boolean(true)
+            if v.s == "false":
+                return value.boolean(false)
+            return try self.raise(0, "not a boolean")
+        if name == "str":
+            return value.text(try value.shown(v))
+        error(fault, "an unknown core function")
+
+    ## A Luce failure: the `Error` kept aside, the Base failure carrying the message.
+    mutating func raise(code: i64, message: str) -> never!:
+        self.pending = value.failure(code, message)
+        error(luce_failure, message)
+
+    func package_code(e: ast.Node*) -> i64!:
+        let first = e.body else error(fault, "no code")
+        let v = first.left else error(fault, "no code")
+        let n = try literals.decode_integer(v.text)
+        return (i64)(((u64)package_identity(self.checker.package_name) << 16) | n)
+
+# mark: Helpers ================================================================================
+
+## A parameter or a field of the list, `self` and methods excluded.
+func counts_as_param(p: ast.Node*, skip_self: bool) -> bool:
+    if p.kind != ast.Kind.param and p.kind != ast.Kind.field:
+        return false
+    return not (skip_self and p.text == "self")
+
+func index_of_param(params: ast.Node*?, p: ast.Node*, skip_self: bool) -> usize!:
+    var i: usize = 0
+    var cursor = params
+    while let q = cursor:
+        if counts_as_param(q, skip_self):
+            if q == p:
+                return i
+            i += 1
+        cursor = q.next
+    error(fault, "a parameter that is not in its list")
+
+pub func field_index(owner: ast.Node*, field: ast.Node*) -> usize:
+    var i: usize = 0
+    var cursor = owner.body
+    while let m = cursor:
+        if m == field:
+            return i
+        if m.kind == ast.Kind.field:
+            i += 1
+        cursor = m.next
+    return 0
+
+pub func field_count(owner: ast.Node*) -> usize:
+    var n: usize = 0
+    var cursor = owner.body
+    while let m = cursor:
+        if m.kind == ast.Kind.field:
+            n += 1
+        cursor = m.next
+    return n
+
+pub func case_index(owner: ast.Node*, case_node: ast.Node*) -> usize:
+    var i: usize = 0
+    var cursor = owner.body
+    while let m = cursor:
+        if m == case_node:
+            return i
+        if m.kind == ast.Kind.enum_case:
+            i += 1
+        cursor = m.next
+    return 0
+
+func checked_index(i: i64, count: usize) -> usize!:
+    var k = i
+    if k < 0:
+        k += (i64)count
+    if k < 0 or k >= (i64)count:
+        trap("index out of range")
+    return (usize)k
+
+func check_bounds(low: i64, high: i64, n: i64) -> !:
+    if low < 0 or high < low or high > n:
+        trap("slice out of range")
+
+## `{{` and `}}` in the literal part of a formatted string are one brace each.
+func unescape_format(text: str) -> str!:
+    let b = text.bytes
+    var out = try alloc u8[b.length + 1]
+    var n: usize = 0
+    var i: usize = 0
+    while i < b.length:
+        if (b[i] == '{' or b[i] == '}') and i + 1 < b.length and b[i + 1] == b[i]:
+            out[n] = b[i]
+            n += 1
+            i += 2
+            continue
+        if b[i] == '\\' and i + 1 < b.length:
+            let e = b[i + 1]
+            out[n] = '\n' if e == 'n' else '\t' if e == 't' else '\r' if e == 'r' else 0 if e == '0' else e
+            n += 1
+            i += 2
+            continue
+        out[n] = b[i]
+        n += 1
+        i += 1
+    return (str)out[..<n]
+
+## Scalars in a text, and a slice by scalar index (§11.3).
+pub func scalar_length(s: str) -> usize:
+    var n: usize = 0
+    for b in s.bytes:
+        if (b & 0xC0) != 0x80:
+            n += 1
+    return n
+
+pub func scalar_slice(s: str, low: usize, high: usize) -> str:
+    let b = s.bytes
+    var start: usize = 0
+    var end: usize = b.length
+    var scalar: usize = 0
+    var i: usize = 0
+    var found_start = low == 0
+    while i < b.length:
+        if (b[i] & 0xC0) != 0x80:
+            if scalar == low:
+                start = i
+                found_start = true
+            if scalar == high:
+                end = i
+                break
+            scalar += 1
+        i += 1
+    if not found_start:
+        start = b.length
+    return (str)b[start..<end]
+
+## Floor division and remainder as Python's (§6.2).
+pub func floor_div(a: i64, b: i64) -> i64:
+    let q = a // b
+    if (a % b != 0) and ((a < 0) != (b < 0)):
+        return q - 1
+    return q
+
+pub func floor_mod(a: i64, b: i64) -> i64:
+    let r = a % b
+    if r != 0 and ((r < 0) != (b < 0)):
+        return r + b
+    return r
+
+pub func power_int(base: i64, exponent: i64) -> i64:
+    if exponent < 0:
+        trap("a negative exponent needs a float base")
+    var result: i64 = 1
+    var i: i64 = 0
+    while i < exponent:
+        result = result * base
+        i += 1
+    return result
+
+func floor_float(x: f64) -> f64:
+    let t = f64(i64(x))
+    return t - 1.0 if t > x else t
+
+func power_float(base: f64, exponent: f64) -> f64:
+    # exact for whole exponents, which is what programs write; `math.pow` otherwise
+    if exponent == f64(i64(exponent)) and exponent >= 0.0 and exponent < 64.0:
+        var result = 1.0
+        var i: i64 = 0
+        while i < i64(exponent):
+            result = result * base
+            i += 1
+        return result
+    return c_pow(base, exponent)
+
+extern func c_pow as "pow"(x: f64, y: f64) -> f64
+extern func c_strtod as "strtod"(text: c.str, end: c.str*?) -> f64
+
+func parse_float(text: str) -> f64!:
+    var buffer = try alloc u8[text.length + 1]
+    var i: usize = 0
+    while i < text.length:
+        buffer[i] = text.bytes[i]
+        i += 1
+    buffer[text.length] = 0
+    return c_strtod((c.str)buffer.data, none)
+
+## The identity of a package's error codes (§12.3): sixteen bits of its name, the same
+## computation in every compiler of the language.
+pub func package_identity(name: str) -> u32:
+    var h: u32 = 2166136261
+    for byte in name.bytes:
+        h = (h ^ (u32)byte) *% 16777619
+    return (h ^ (h >> 16)) & 65535
+
+test "floor division and remainder follow the divisor's sign":
+    assert(floor_div(7, 2) == 3)
+    assert(floor_div(-7, 2) == -4)
+    assert(floor_mod(-7, 3) == 2)
+    assert(floor_mod(7, -3) == -2)
+    assert(power_int(2, 10) == 1024)
+    assert(scalar_length("héllo") == 5)
+    assert(scalar_slice("héllo", 1, 3) == "él")

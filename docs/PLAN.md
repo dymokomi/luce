@@ -2,14 +2,11 @@
 
 What remains, in the order it is built. A slice closes when the gate is green with its
 programs in, and nothing is written here about what was done: the tree and the suite are the
-record.
+record. The compiler today lexes, parses, checks, interprets and compiles the value language
+of §2 to §9 and §12, with four executions agreeing on every conformance program.
 
 | Slice | Scope | Gate |
 | --- | --- | --- |
-| 1. Tree and gate | `build.sh` building the pinned luce-base from its tag; `test.sh`; the conformance runner; the fuzzer's mutate mode; `luce --version`; the diagnostic contract | `./test.sh` green; a mutated file is accepted or rejected with a position |
-| 2. Lexer and layout | §2 and §3: the encoding gate, layout, every literal, the reserved words, the bounds | `luce lex`; §2 and §3 rejections |
-| 3. Parser | the grammar of §19 with the nesting guard | `luce parse`; every conformance program parses; §19 rejections |
-| 4. The value core | §4 to §9 and §12: names, types, bindings, expressions, functions, control, structs, enums, tuples, optionals, results, traps; the interpreter and the emitter together | both executions agree on every §4 to §9 and §12 program and trap |
 | 5. The runtime and classes | `rt/` to its contract; §10: classes, `init`, identity, destruction, `deinit`, `Weak`, the cycle collector; `with` | §10 programs, incl. what a run leaves alive |
 | 6. Collections and text | §11: `list`, `map`, `set`, `str`, `bytes` and their operations, the iteration guard | §11 programs and traps |
 | 7. Closures | §7.4: captures, cells, escaping closures | §7 programs |

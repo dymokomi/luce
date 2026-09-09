@@ -6,6 +6,7 @@
 # diagnostic its `# error:` line names, at a position.
 set -eu
 cd "$(dirname "$0")/../.."
+export LUCE_BASE=${LUCE_BASE:-$PWD/build/luce-base/build/luce-base}
 programs=0
 rejections=0
 parsed=0
@@ -22,6 +23,31 @@ for dir in tests/conformance/[0-9]*/; do
         echo "== $src"
         ./build/luce run "$src" > build/conformance.out
         cmp build/conformance.out "$f"
+        # the emitted Base through every generator luce-base has
+        for flags in "" "--release" "--native"; do
+            ./build/luce build "$src" -o build/conformance $flags
+            ./build/conformance > build/conformance.out
+            cmp build/conformance.out "$f"
+        done
+        programs=$((programs + 1))
+    done
+    # a program beside a `.trap` file must stop with that text on every execution
+    for f in "$dir"*.trap; do
+        [ -e "$f" ] || continue
+        src="${f%.trap}.luc"
+        want=$(cat "$f")
+        echo "== $src (traps)"
+        if ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
+            echo "FAIL $src: expected a trap, the program finished"; exit 1
+        fi
+        grep -q "$want" build/conformance.err || { echo "FAIL $src: expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
+        for flags in "" "--native"; do
+            ./build/luce build "$src" -o build/conformance $flags
+            if ./build/conformance > build/conformance.out 2> build/conformance.err; then
+                echo "FAIL $src ($flags): expected a trap, the compiled program finished"; exit 1
+            fi
+            grep -q "$want" build/conformance.err || { echo "FAIL $src ($flags): expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
+        done
         programs=$((programs + 1))
     done
     for f in "$dir"errors/*.luc; do
