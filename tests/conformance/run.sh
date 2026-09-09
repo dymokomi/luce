@@ -9,6 +9,7 @@ cd "$(dirname "$0")/../.."
 export LUCE_BASE=${LUCE_BASE:-$PWD/build/luce-base/build/luce-base}
 run() { python3 tools/run_case.py -- "$@"; }
 reject() { python3 tools/run_case.py --expected 1 -- "$@"; }
+compare() { diff -u "$1" build/conformance.out; }
 programs=0
 rejections=0
 parsed=0
@@ -35,14 +36,16 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
             fi
             grep -q "the interpreter runs Luce alone" build/conformance.err || { echo "FAIL $src: [$(cat build/conformance.err)]"; exit 1; }
         else
+            echo "   interpreter"
             run ./build/luce run "$src" > build/conformance.out
-            cmp build/conformance.out "$f"
+            compare "$f"
         fi
         # the emitted Base through every generator luce-base has
         for flags in "" "--release" "--native"; do
+            echo "   compiled ${flags:-C}"
             run ./build/luce build "$src" -o build/conformance $flags
             run ./build/conformance > build/conformance.out
-            cmp build/conformance.out "$f"
+            compare "$f"
         done
         programs=$((programs + 1))
     done
