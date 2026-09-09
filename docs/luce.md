@@ -743,6 +743,9 @@ func total(shapes: list[Shape]) -> float:
 
 func largest[T: Ordered](values: list[T]) -> T?:
     ...
+
+func show_sorted[T: Ordered & Display](values: list[T]) -> str:
+    ...
 ```
 
 A value of a conforming type converts to an interface value where one is expected: a copy
@@ -750,10 +753,15 @@ of the value behind the interface, with the ownership of a value (§10.5, `docs/
 so a class behind it lives while any copy of the interface value does. A call dispatches to
 the value's own method; an interface value has no `==`, no ordering, no hash and no display
 of its own, and an optional of one is compared with `none` like any optional. A generic
-function or type takes type parameters
-in `[...]`, each optionally bounded by interfaces, and is checked once against its bounds;
-inside it, only the bounds' methods and the operations every type has are available. Type
-arguments are inferred from arguments or written, `parse[Config](text)`.
+function takes type parameters in `[...]`, each optionally bounded by interfaces joined
+with `&`, and is checked once against its bounds; inside it, a value of a parameter type
+has the bounds' methods, `==` with `Equatable`, `<` with `Ordered`, `hash` with `Hashable`,
+display with `Display`, and the operations every type has: it is bound, passed, returned,
+and held in tuples, optionals and collections. Type arguments are inferred from the
+arguments, those given to a parameter of a bare parameter type first, or written,
+`largest[int](values)`; each must satisfy its bounds. The program gets one instance of the
+function per distinct type arguments; a generic function is called, never read as a value,
+and a method has no type parameters of its own. Generic types arrive with a later slice.
 
 ### 13.3 The closed protocols
 
@@ -956,7 +964,7 @@ alias       = "type" NAME "=" type
 constant    = "let" NAME [":" type] "=" expression
 test        = "test" STRING ":" suite
 params      = param {"," param}           param = NAME ":" type ["=" expression]
-generics    = "[" NAME [":" NAME {"," NAME}] {"," ...} "]"
+generics    = "[" generic {"," generic} "]"     generic = NAME [":" NAME {"&" NAME}]
 type        = path ["[" type {"," type} "]"] | "(" [type {"," type}] ")"
             | "func" "(" [type {"," type}] ")" ["->" type] | type "?" | type "!"
 suite       = simple NEWLINE | NEWLINE INDENT {statement} DEDENT

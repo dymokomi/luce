@@ -29,6 +29,12 @@ pub let type_error: ErrorCode = ErrorCode.package(10)
 # mark: Bindings and modules ===================================================================
 
 ## One name in scope: what it is, what type it has, whether it may change.
+## A type parameter in scope: its name and the type it stands for, the parameter itself
+## in the generic declaration, the argument in an instance (§13.2).
+pub struct TypeParam:
+    pub var name: str
+    pub var type_id: u32
+
 pub struct Binding:
     pub var name: str
     pub var type_id: u32
@@ -104,6 +110,16 @@ pub struct Checker:
     pub var lambda_bases: list.List[u32]
     ## The type of the `main` function, once seen.
     pub var main_seen: bool
+    ## The type parameters in scope, innermost last (§13.2).
+    pub var type_params: list.List[TypeParam]
+    ## Generic declarations and the pristine copies they are instantiated from, in step;
+    ## every instance made so far; how deep instantiation is nested.
+    pub var generics: list.List[ast.Node*]
+    pub var templates: list.List[ast.Node*]
+    pub var instances: list.List[ast.Node*]
+    pub var instance_depth: u32
+    ## Which of the two type-description areas `type_text` writes next.
+    var type_slot: u32
 
     pub static func create(scratch: u8[]) -> Checker!:
         return Checker(table = try types.Table.create(), modules = try list.List[Module].create(16),
@@ -112,7 +128,9 @@ pub struct Checker:
                        self_mutable = false, in_init = false, in_deinit = false, in_interface = false, in_conformance = false, self_receiver = false, loop_depth = 0, label_count = 0, in_catch = false,
                        catch_result = types.none_id, package_name = "app", package_codes = try list.List[u64].create(16),
                        at_top_level = false, main_seen = false, lambdas = try list.List[ast.Node*].create(8),
-                       lambda_bases = try list.List[u32].create(8))
+                       lambda_bases = try list.List[u32].create(8), type_params = try list.List[TypeParam].create(16),
+                       generics = try list.List[ast.Node*].create(8), templates = try list.List[ast.Node*].create(8),
+                       instances = try list.List[ast.Node*].create(16), instance_depth = 0, type_slot = 0)
 
     # -- diagnostics ----------------------------------------------------------------------
 
@@ -141,6 +159,25 @@ pub struct Checker:
         try self.table.describe(&sink, id)
         discard(try sink.write(suffix.bytes))
         return (str)self.scratch[half..<half + sink.used]
+
+    ## A message from pieces: text, names, and the descriptions `type_text` gives; written
+    ## into the fourth quarter of the scratch space, after what `named` and `with_type` use.
+    pub func message(pieces: const str[]) -> str!:
+        let at = self.scratch.length // 2 + self.scratch.length // 4
+        var sink = SpanWriter(data = self.scratch[at..<at + self.scratch.length // 8], used = 0)
+        for piece in pieces:
+            discard(try sink.write(piece.bytes))
+        return (str)self.scratch[at..<at + sink.used]
+
+    ## A type's description, in one of two small areas at the end of the scratch space, so
+    ## a message may mention two types.
+    pub mutating func type_text(id: u32) -> str!:
+        let room = self.scratch.length // 16
+        let at = self.scratch.length - room * (1 + (usize)self.type_slot)
+        self.type_slot = 1 - self.type_slot
+        var sink = SpanWriter(data = self.scratch[at..<at + room], used = 0)
+        try self.table.describe(&sink, id)
+        return (str)self.scratch[at..<at + sink.used]
 
     ## `expected T, got U` at `node`.
     pub func mismatch(node: ast.Node*, expected: u32, got: u32) -> never!:
@@ -313,8 +350,204 @@ pub struct Checker:
                         return try self.fail(d, try self.named("", d.text, " is declared twice"))
                     other = o.next
                 if d.ty != none and d.kind != ast.Kind.type_alias:
-                    return try self.fail(d, "generics arrive with the interfaces slice")
+                    if d.kind != ast.Kind.func_:
+                        return try self.fail(d, "generic types arrive with the interfaces slice")
+                    try self.remember_generic(d)
             cursor = d.next
+
+    ## A generic declaration is kept as the parser made it, so each instance is checked
+    ## from a pristine copy with its type arguments bound (§13.2).
+    mutating func remember_generic(d: ast.Node*) -> !:
+        let params = d.ty else return
+        var cursor = params.body
+        while let p = cursor:
+            var other = params.body
+            while let o = other:
+                if o != p and o.text == p.text:
+                    return try self.fail(p, try self.named("the type parameter ", p.text, " is listed twice"))
+                other = o.next
+            if self.find_declaration(p.text) != none or self.is_core_type(p.text):
+                return try self.fail(p, try self.named("the type parameter ", p.text, " hides a type; pick another name"))
+            cursor = p.next
+        let template = try ast.clone(d) else return try self.fail(d, "no declaration")
+        template.next = none
+        try self.generics.push(d)
+        try self.templates.push(template)
+
+    func is_core_type(name: str) -> bool:
+        return name == "int" or name == "float" or name == "bool" or name == "str" or name == "bytes" or name == "unit" or name == "never" or name == "list" or name == "map" or name == "set" or name == "task" or name == "Weak" or name == "Error" or name == "ErrorCode" or name == "Self"
+
+    ## The type parameters of a generic declaration get a type each: the parameter itself
+    ## (an instance's were set to its arguments); every bound resolves to an interface.
+    mutating func declare_type_params(d: ast.Node*) -> !:
+        let params = d.ty else return
+        var cursor = params.body
+        while let p = cursor:
+            if not d.has(ast.flag_instance):
+                p.type_id = try self.table.parameter(d, p.text)
+            cursor = p.next
+        cursor = params.body
+        while let p = cursor:
+            var b = p.body
+            while let bound = b:
+                self.in_conformance = true
+                let id = try self.resolve_type(bound)
+                self.in_conformance = false
+                if self.table.kind(id) != types.Kind.interface_:
+                    return try self.fail(bound, "a bound is an interface (§13.2)")
+                b = bound.next
+            cursor = p.next
+
+    ## Brings a declaration's type parameters into scope; `leave_type_params` takes them out.
+    pub mutating func enter_type_params(d: ast.Node*) -> !:
+        let params = d.ty else return
+        var cursor = params.body
+        while let p = cursor:
+            try self.type_params.push(TypeParam(name = p.text, type_id = p.type_id))
+            cursor = p.next
+
+    pub mutating func leave_type_params(d: ast.Node*):
+        let params = d.ty else return
+        self.type_params.count -= ast.count(params.body)
+
+    ## The generic_param node of a parameter type: where its bounds are.
+    pub func param_node(id: u32) -> ast.Node*?:
+        let t = self.table.get(id)
+        if t.kind != types.Kind.param:
+            return none
+        let d = t.decl else return none
+        let params = d.ty else return none
+        var cursor = params.body
+        while let p = cursor:
+            if p.text == t.name:
+                return p
+            cursor = p.next
+        return none
+
+    ## The instance of a generic declaration for these type arguments: the one made
+    ## before, or a fresh copy of the template with the arguments bound, named after
+    ## them, appended to the module so it is checked and compiled like any declaration.
+    pub mutating func instantiate(at: ast.Node*, d: ast.Node*, args: u32[]) -> ast.Node*!:
+        var i: usize = 0
+        while i < self.instances.count:
+            let inst = self.instances.get(i)
+            if inst.resolved == d and self.same_arguments(inst, args):
+                return inst
+            i += 1
+        var k: usize = 0
+        var template: ast.Node*? = none
+        while k < self.generics.count:
+            if self.generics.get(k) == d:
+                template = self.templates.get(k)
+            k += 1
+        let pristine = template else return try self.fail(at, "not a generic declaration")
+        if self.instance_depth >= 32:
+            return try self.fail(at, "generic instantiation nests too deep (32 levels)")
+        let inst = try ast.clone(pristine) else return try self.fail(at, "no declaration")
+        inst.next = none
+        inst.resolved = d
+        inst.flags |= ast.flag_instance
+        let params = inst.ty else return try self.fail(at, "not generic")
+        let half = self.scratch.length // 2
+        var sink = SpanWriter(data = self.scratch[half..], used = 0)
+        discard(try sink.write(d.text.bytes))
+        var cursor = params.body
+        i = 0
+        while let p = cursor:
+            p.type_id = args[i]
+            discard(try sink.write("__".bytes))
+            try write_u64(&sink, (u64)args[i])
+            i += 1
+            cursor = p.next
+        inst.text = try copy_text(self.scratch[half..<half + sink.used])
+        try self.instances.push(inst)
+        var tail = self.tree()
+        var last = tail.body
+        while let n = last:
+            if n.next == none:
+                n.next = inst
+                break
+            last = n.next
+        self.instance_depth += 1
+        try self.declare_type_params(inst)
+        try self.enter_type_params(inst)
+        inst.type_id = try self.signature_of(inst, types.none_id)
+        self.leave_type_params(inst)
+        self.instance_depth -= 1
+        return inst
+
+    ## Whether an instance's arguments mention a type parameter: one made while a generic
+    ## body was checked, checked in turn but never run or compiled.
+    pub func abstract_instance(d: ast.Node*) -> bool:
+        let params = d.ty else return false
+        var cursor = params.body
+        while let p = cursor:
+            if self.mentions_param(p.type_id):
+                return true
+            cursor = p.next
+        return false
+
+    ## Whether a type mentions a type parameter anywhere.
+    pub func mentions_param(id: u32) -> bool:
+        let t = self.table.get(id)
+        match t.kind:
+            .param: return true
+            .optional, .fallible, .list_, .set_, .weak_, .task_: return self.mentions_param(t.elem)
+            .map_: return self.mentions_param(t.elem) or self.mentions_param(self.table.map_value(id))
+            .tuple, .func_:
+                for m in t.args:
+                    if self.mentions_param(m):
+                        return true
+                return self.mentions_param(t.elem) if t.kind == types.Kind.func_ else false
+            _: return false
+
+    ## The type with every parameter of `d` replaced by its binding, where bound; a
+    ## parameter still open leaves the type as it is.
+    pub mutating func bind_params(d: ast.Node*, id: u32, bound: u32[]) -> u32!:
+        let t = self.table.get(id)
+        match t.kind:
+            .param:
+                if t.decl != d:
+                    return id
+                let params = d.ty else return id
+                var i: usize = 0
+                var cursor = params.body
+                while let p = cursor:
+                    if p.text == t.name:
+                        return bound[i] if bound[i] != types.none_id else id
+                    i += 1
+                    cursor = p.next
+                return id
+            .optional: return try self.table.optional(try self.bind_params(d, t.elem, bound))
+            .fallible: return try self.table.fallible(try self.bind_params(d, t.elem, bound))
+            .list_: return try self.table.list_of(try self.bind_params(d, t.elem, bound))
+            .set_: return try self.table.set_of(try self.bind_params(d, t.elem, bound))
+            .weak_: return try self.table.weak_of(try self.bind_params(d, t.elem, bound))
+            .map_: return try self.table.map_of(try self.bind_params(d, t.elem, bound), try self.bind_params(d, self.map_value_of(id), bound))
+            .tuple, .func_:
+                var args = try alloc u32[t.args.length if t.args.length > 0 else 1]
+                var i: usize = 0
+                while i < t.args.length:
+                    args[i] = try self.bind_params(d, t.args[i], bound)
+                    i += 1
+                if t.kind == types.Kind.tuple:
+                    return try self.table.tuple(args[..<t.args.length])
+                return try self.table.function(args[..<t.args.length], try self.bind_params(d, t.elem, bound))
+            _: return id
+
+    func map_value_of(id: u32) -> u32:
+        return self.table.map_value(id)
+
+    func same_arguments(inst: ast.Node*, args: u32[]) -> bool:
+        let params = inst.ty else return false
+        var cursor = params.body
+        var i: usize = 0
+        while let p = cursor:
+            if i >= args.length or p.type_id != args[i]:
+                return false
+            i += 1
+            cursor = p.next
+        return i == args.length
 
     ## A type id for every struct, enum, class, and interface, so fields may refer to
     ## each other in any order; aliases resolve after.
@@ -341,7 +574,15 @@ pub struct Checker:
         while let d = cursor:
             match d.kind:
                 .func_:
-                    d.type_id = try self.signature_of(d, types.none_id)
+                    if d.ty != none:
+                        try self.declare_type_params(d)
+                        try self.enter_type_params(d)
+                        d.type_id = try self.signature_of(d, types.none_id)
+                        self.leave_type_params(d)
+                        if d.text == "main":
+                            return try self.fail(d, "`main` takes no type parameters (§15.4)")
+                    else:
+                        d.type_id = try self.signature_of(d, types.none_id)
                     if d.text == "main":
                         try self.check_main(d)
                 .struct_, .class_:
@@ -443,6 +684,8 @@ pub struct Checker:
 
     ## The function type of a declaration; `self` is not a parameter of the type.
     mutating func signature_of(f: ast.Node*, owner: u32) -> u32!:
+        if owner != types.none_id and f.ty != none:
+            return try self.fail(f, "a method takes no type parameters of its own; the type does (§13.2)")
         var n = ast.count(f.right)
         if has_self(f):
             n -= 1
@@ -566,8 +809,16 @@ pub struct Checker:
             let k = t.body else return try self.fail(t, "no argument")
             let v = k.next else return try self.fail(t, "no argument")
             return try self.table.map_of(try self.resolve_type(k), try self.resolve_type(v))
+        var k = self.type_params.count
+        while k > 0:
+            k -= 1
+            let tp = self.type_params.get(k)
+            if tp.name == name:
+                if args > 0:
+                    return try self.fail(t, try self.named("the type parameter ", name, " takes no arguments"))
+                return tp.type_id
         if args > 0:
-            return try self.fail(t, "generics arrive with the interfaces slice")
+            return try self.fail(t, "generic types arrive with the interfaces slice")
         let d = self.find_declaration(name) else return try self.fail(t, try self.named("unknown type ", name, ""))
         if d.kind == ast.Kind.interface_ and d.has(ast.flag_prelude) and not self.in_conformance:
             return try self.fail(t, try self.named("", name, " is a closed protocol: a type declares it, no value has it as its type (§13.3)"))
@@ -590,6 +841,30 @@ pub struct Checker:
                 var t = types.Type(kind = types.Kind.type_name, elem = d.type_id, args = try types.no_args(), decl = d, name = d.text)
                 return try self.table.intern(t)
             _: return types.none_id
+
+## A number in decimal, into a sink.
+func write_u64(sink: SpanWriter*, v: u64) -> !:
+    var digits: u8[24]
+    var n: usize = 0
+    var rest = v
+    while true:
+        digits[n] = (u8)(48 + (rest % 10))
+        n += 1
+        rest = rest // 10
+        if rest == 0:
+            break
+    while n > 0:
+        n -= 1
+        discard(try sink.write(digits[n..<n + 1]))
+
+## A copy of text that outlives the scratch buffer it was written in.
+func copy_text(text: u8[]) -> str!:
+    var out = try alloc u8[text.length]
+    var i: usize = 0
+    while i < text.length:
+        out[i] = text[i]
+        i += 1
+    return (str)out
 
 ## `dir/name.luc` -> `name`.
 pub func module_name_of(path: str) -> str:

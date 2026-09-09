@@ -52,7 +52,7 @@ admits and demands the same agreement, from the first slice.
 | `list`, `map`, `set`, owned `str`, `bytes` | generic Base types in the runtime; the emitter names them, never their storage |
 | closures | an environment struct per closure and a shared cell per captured `var`, both runtime objects |
 | interface values | an object holding the payload and a Base interface view into it |
-| generics | Base generics, one to one; luce-base instantiates |
+| generics | instantiated by the checker: one copy of a generic function per distinct type arguments, checked with the parameters bound, so the interpreter and the emitter see only concrete declarations |
 | `T?`, `T!`, traps, arithmetic | Base's own, which mean the same; `/` on `int` and `**` are the two the emitter spells out |
 | workers | the runtime's workers over Base's threads; the checker proves sendability |
 | handles | a Base `pub handle`, seen as a class whose `close` is its `destroy` |

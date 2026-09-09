@@ -135,10 +135,12 @@ class Gen:
             "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count", "nums.length", "(nums.first else 0)",
                     "apply((n) => n % 4096 + a % 4096, b)", "apply(halve, a)", "counter()", "(nums.map((n) => n % 8).first else 0)",
                     "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(hash(a) % 1000)", "(hash(s) % 1000)",
-                    "(s.index_of(t) else -1)", "s.byte_count"],
+                    "(s.index_of(t) else -1)", "s.byte_count", "choose(a, b, flag)", "count_of(nums, a)", "count_of(words, s)",
+                    "(largest(nums) else 0)", "shown(nums).length"],
             "float": ["d", "e", "float(a % 256)", "p.f"],
             "str": ["s", "t", "p.name", "obj.tag()", "name_of(opt)", "name_of(h.item)", "words.join(\"-\")", "s.upper()",
-                    "s.trim()", "t.replace(\"a\", \"o\")", "(words.last else \"-\")", "str(nums)", "str(seen)", "str(ages)"],
+                    "s.trim()", "t.replace(\"a\", \"o\")", "(words.last else \"-\")", "str(nums)", "str(seen)", "str(ages)",
+                    "choose(s, t, flag)", "(largest(words) else \"-\")", "shown(words)"],
             "bool": ["flag", "(a > b)", "(opt is none)", "(obj is opt)", "(a in nums)", "(s in ages)", "(a in seen)",
                      "s.contains(t)", "s.starts_with(\"a\")", "(nums == sorted_copy(nums))", "(seen == {1, 2})"],
         }[ty] + [n for n, t in self.locals if t == ty]
@@ -430,6 +432,10 @@ class Gen:
                 "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "",
                 "func named(x: int, t: Tracer) -> Named:", "    match x % 3:", "        0: return Tag(text = f\"t{x % 100}\")", "        1: return Level.high(by = x % 50)", "        _: return Badge(t)", "",
                 "func heaviest(items: list[Named]) -> int:", "    var best = 0", "    for item in items:", "        if item.weight() > best:", "            best = item.weight()", "    return best", "",
+                "func choose[T](a: T, b: T, first: bool) -> T:", "    return a if first else b", "",
+                "func count_of[T: Equatable](values: list[T], x: T) -> int:", "    var n = 0", "    for v in values:", "        if v == x:", "            n += 1", "    return n", "",
+                "func largest[T: Ordered](values: list[T]) -> T?:", "    var best: T? = none", "    for v in values:", "        if let b = best:", "            if v > b:", "                best = v", "        else:", "            best = v", "    return best", "",
+                "func shown[T: Display](values: list[T]) -> str:", "    return values.map((v) => str(v)).join(\"|\")", "",
                 "var_block"]
         return "\n".join(text)
 
