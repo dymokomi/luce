@@ -939,7 +939,9 @@ with files.open(path) as file:
 A Base module declares a `handle` for a resource it owns: a pointer-sized value whose
 `destroy` names the Base function that releases it. A Luce program sees the handle as a class
 with identity, no fields, and a `close()` that calls `destroy` once; the runtime calls it at
-the last reference if the program did not. A handle is never constructed in Luce, only
+the last reference if the program did not. Calling the declared destroy function from
+Luce is another spelling of `close()`: it shares the same closed state, including through
+aliases of the handle, and repeated calls do nothing. A handle is never constructed in Luce, only
 answered by the module's functions; a closed handle handed back to Base traps. Every
 file, socket, window, texture and device is a handle behind a Base package, and this one
 form is all Luce knows about resources.

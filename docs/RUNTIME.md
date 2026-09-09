@@ -155,7 +155,10 @@ result. The interpreter runs the call at `spawn`, with copies in and out the sam
 
 A handle (§16.4) is an object holding the Base value and whether it was closed. `close()`
 calls the module's `destroy` once and remembers it; releasing the last reference calls
-`close()`; a closed handle handed to Base traps. Base functions are reached through a
+`close()`; a closed handle handed to Base traps. The handle's declared destroy function
+is reached through a shim that calls the wrapper's `close()`
+instead of handing its raw value to Base, so direct and automatic destruction share the
+same closed state. Other Base functions are reached through a
 shim per function that lends texts and lists as views, converts structs, enums and
 optionals member by member, copies a text or bytes answered, and wraps a handle answered.
 
