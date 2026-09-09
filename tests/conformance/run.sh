@@ -22,8 +22,16 @@ for dir in tests/conformance/[0-9]*/; do
         [ -e "$f" ] || continue
         src="${f%.expect}.luc"
         echo "== $src"
-        ./build/luce run "$src" > build/conformance.out
-        cmp build/conformance.out "$f"
+        if ls "$(dirname "$src")"/*.lucb > /dev/null 2>&1; then
+            # a program importing a Base module is built, never run in the interpreter (§16)
+            if ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
+                echo "FAIL $src: the interpreter ran a program that imports a Base module"; exit 1
+            fi
+            grep -q "the interpreter runs Luce alone" build/conformance.err || { echo "FAIL $src: [$(cat build/conformance.err)]"; exit 1; }
+        else
+            ./build/luce run "$src" > build/conformance.out
+            cmp build/conformance.out "$f"
+        fi
         # the emitted Base through every generator luce-base has
         for flags in "" "--release" "--native"; do
             ./build/luce build "$src" -o build/conformance $flags

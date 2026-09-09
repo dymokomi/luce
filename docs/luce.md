@@ -873,11 +873,15 @@ from, `src` unless written. The nearest manifest above the entry module is the p
 
 ### 16.1 What a Luce module sees of a Base module
 
-A Luce module imports a Base module by the same `import`. It sees the module's `pub`
-functions, `pub let` constants, `pub` structs and integer-backed enums whose fields are
-crossable, and `pub handle` types. It does not see pointers, spans, arrays, unions, atomics,
-`c` types, or any function whose signature mentions one: those are the Base package's own,
-and the package writes the function a Luce program can call.
+A Luce module imports a Base module by the same `import`, a `.lucb` file under the source
+root. It sees the module's `pub` functions, `pub let` constants, `pub` structs and
+integer-backed enums whose fields are crossable, and `pub handle` types, through the
+description luce-base prints for the module (base.md §17.7): the compiler never parses
+Base. It does not see pointers, spans, arrays, unions, atomics, `c` types, `extern`
+declarations, generic declarations, or any function, constant or struct whose signature
+mentions one of those: those are the Base package's own, and the package writes the
+function a Luce program can call. A program that imports a Base module is built; the
+interpreter runs Luce alone and refuses it (§17.1).
 
 ### 16.2 Crossable types
 
@@ -888,16 +892,17 @@ and the package writes the function a Luce program can call.
 | `bool` | `bool` | by value |
 | `str` | `str` | lent as Base's view of the bytes; a Base result is copied into an owned `str` |
 | `bytes` | `const u8[]` | lent; a Base result is copied |
-| `list[T]` of a crossable `T` | `const T[]` | lent, under the mutation guard, and never kept by Base |
+| `list[T]` of `int`, `float`, `bool` or `str` | `const T[]` | lent as a span over the elements (texts as views that live to the end of the statement), never kept by Base; a Base span never crosses back |
 | struct of crossable fields | the same struct, declared in Base | by value |
 | integer-backed `enum` declared in Base | that enum | by value |
 | `T?` | `T?` | by value |
 | `T!` | `T!` | the code and the message |
-| `func(A) -> R` of crossable types, capture-free | `func(A) -> R` | by value; a closure is rejected |
+| `func(A) -> R` of scalars, `str` and `bytes` answering a scalar or nothing | `func(A) -> R` | a named function, never a closure; Base calls a thunk that copies the texts for the call |
 | handle | `pub handle` | as an object (§16.4) |
 
 Nothing else crosses in either direction. A `usize` in Base is an `int` in Luce and a
-negative or oversized value traps at the crossing.
+negative or oversized value traps at the crossing. A Base enum value that names no
+declared case traps as it crosses.
 
 ### 16.3 Errors and traps
 
@@ -925,8 +930,10 @@ with files.open(path) as file:
 A Base module declares a `handle` for a resource it owns: a pointer-sized value whose
 `destroy` names the Base function that releases it. A Luce program sees the handle as a class
 with identity, no fields, and a `close()` that calls `destroy` once; the runtime calls it at
-the last reference if the program did not. Every file, socket, window, texture and device is
-a handle behind a Base package, and this one form is all Luce knows about resources.
+the last reference if the program did not. A handle is never constructed in Luce, only
+answered by the module's functions; a closed handle handed back to Base traps. Every
+file, socket, window, texture and device is a handle behind a Base package, and this one
+form is all Luce knows about resources.
 
 ### 16.5 What Base sees of Luce
 
@@ -939,7 +946,7 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 
 | Command | Does |
 | --- | --- |
-| `luce run program.luc` | runs it in the interpreter, the definition of behaviour |
+| `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package |
 | `luce check`, `luce test`, `luce fmt`, `luce doc`, `luce explain` | as named |
 

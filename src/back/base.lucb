@@ -69,6 +69,14 @@ pub struct Emitter:
     var box_interfaces: list.List[u32]
     var box_types: list.List[u32]
     var boxes_done: usize
+    ## The Base boundary (§16): types converted at a crossing, each with a pair of
+    ## functions after the program; named functions handed to Base as callbacks, each
+    ## with a thunk over Base's types.
+    var crossings: list.List[ast.Node*]
+    var crossing_owners: list.List[ast.Node*]
+    var crossings_done: usize
+    var callbacks: list.List[ast.Node*]
+    var callbacks_done: usize
     ## The lambda whose body is being written, so its captures read from its object.
     var lambda: ast.Node*?
     ## How many of each list are written out, since writing one set of functions can
@@ -100,6 +108,7 @@ pub struct Emitter:
                        bounds = try list.List[ast.Node*].create(16), bounds_done = 0, calls = try list.List[u32].create(16), calls_done = 0,
                        cells = try list.List[u32].create(16), cells_done = 0, lambda = none,
                        box_interfaces = try list.List[u32].create(16), box_types = try list.List[u32].create(16), boxes_done = 0,
+                       crossings = try list.List[ast.Node*].create(16), crossing_owners = try list.List[ast.Node*].create(16), crossings_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self")
 
@@ -173,8 +182,16 @@ pub struct Emitter:
         try self.line("import memory")
         try self.line("import rt.heap")
         try self.line("import rt.kernel")
-        try self.line("")
         var k: usize = 0
+        while k < self.checker.modules.count:
+            let m = self.checker.modules.get(k)
+            if m.base:
+                try self.begin("import ")
+                try self.put(m.name)
+                try self.end()
+            k += 1
+        try self.line("")
+        k = 0
         while k < self.checker.order.count:
             let tree = self.checker.modules.get((usize)self.checker.order.get(k)).tree
             k += 1
@@ -187,6 +204,17 @@ pub struct Emitter:
         while let d = cursor:
             # a generic declaration is never written, nor an instance over a parameter
             let concrete = d.ty == none or (d.has(ast.flag_instance) and not self.checker.abstract_instance(d))
+            if d.has(ast.flag_base):
+                # a Base module's declarations (§16): a shim per function, a class per handle,
+                # the crossing types as they are; constants are read where they are used
+                match d.kind:
+                    .func_: try self.shim(d)
+                    .class_: try self.handle_decl(d)
+                    .struct_: try self.struct_decl(d)
+                    .enum_: try self.enum_decl(d)
+                    _: discard(0)
+                cursor = d.next
+                continue
             match d.kind:
                 .constant: try self.constant(d)
                 .struct_:
@@ -525,6 +553,591 @@ pub struct Emitter:
             try self.put("*)o")
             try self.end()
             try self.line("")
+
+    # -- the Base boundary (§16) -----------------------------------------------------------
+
+    ## The Base module a declaration read from a description belongs to, by its dotted name.
+    func base_module(d: ast.Node*) -> str:
+        return self.checker.modules.get((usize)d.module).name
+
+    ## A Base function's shim: a function under the Luce name over Luce types, which lends
+    ## or converts every argument as §16.2 says, calls the Base function, and copies or
+    ## wraps what it answers. A failure crosses as it is.
+    mutating func shim(d: ast.Node*) -> !:
+        let ft = self.checker.table.get(d.type_id)
+        self.fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        try self.begin("func L_")
+        try self.put(try self.decl_name(d))
+        try self.put("(")
+        var first = true
+        var cursor = d.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put("L_")
+            try self.put(p.text)
+            try self.put(": ")
+            let t = p.ty else return try self.fail(d, "a Base parameter without a type")
+            if t.has(ast.flag_func_type):
+                try self.base_type(t, d)
+            else:
+                try self.type_of(p.type_id)
+            cursor = p.next
+        try self.put(")")
+        try self.result_type(ft.elem)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        var pools = false
+        cursor = d.right
+        while let p = cursor:
+            let t = p.ty else break
+            if t.text == "list" and (t.body else break).text == "str":
+                pools = true
+            cursor = p.next
+        if pools:
+            try self.line("let mark = heap.mark()")
+            if self.fallible:
+                try self.line("errdefer heap.drain(mark)")
+        var result = ft.elem
+        if self.checker.table.kind(result) == types.Kind.fallible:
+            result = self.checker.table.get(result).elem
+        try self.begin("")
+        if result != types.unit_id:
+            try self.put("let answer = ")
+        if self.fallible:
+            try self.put("try ")
+        try self.put(self.base_module(d))
+        try self.put(".")
+        try self.put(d.text)
+        try self.put("(")
+        first = true
+        cursor = d.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            let t = p.ty else break
+            let half = self.checker.scratch.length // 2
+            let name = try copy_name(try format(self.checker.scratch[half..], f"L_{p.text}"))
+            try self.to_base(t, name, d)
+            cursor = p.next
+        try self.put(")")
+        try self.end()
+        if pools:
+            try self.line("heap.drain(mark)")
+        if result != types.unit_id:
+            let r = d.left else return try self.fail(d, "a Base result without a type")
+            var inner = r
+            if r.has(ast.flag_fallible):
+                inner = r.left else return try self.fail(d, "a result without a type")
+            try self.begin("return ")
+            try self.from_base(inner, "answer", d)
+            try self.end()
+        self.indent -= 1
+        try self.line("")
+
+    ## The arguments of a call into Base: a function-typed parameter gets the thunk of the
+    ## named function given (§16.2), every other its value as any call would pass it.
+    mutating func base_arguments(e: ast.Node*, d: ast.Node*) -> !:
+        try self.put("(")
+        var first = true
+        var a = e.body
+        while let arg = a:
+            if not first:
+                try self.put(", ")
+            first = false
+            let p = arg.resolved else return try self.fail(arg, "an argument without its parameter")
+            let v = arg.left else return try self.fail(arg, "empty argument")
+            if self.checker.table.kind(p.type_id) == types.Kind.func_:
+                let f = v.resolved else return try self.fail(v, "a callback that is not a named function")
+                try self.put(try self.callback_name(f))
+            else:
+                try self.use(v)
+            a = arg.next
+        try self.put(")")
+
+    ## A Base constant read: its value converted where it is read; a text copied into a
+    ## text of the program's own.
+    mutating func base_constant(d: ast.Node*) -> !:
+        let t = d.ty else return try self.fail(d, "a Base constant without a type")
+        let half = self.checker.scratch.length // 2
+        let spelled = try copy_name(try format(self.checker.scratch[half..], f"{self.base_module(d)}.{d.text}"))
+        try self.from_base(t, spelled, d)
+
+    ## The Base spelling of a type read from a description, `mod.Name` for the module's own.
+    mutating func base_type(t: ast.Node*, owner: ast.Node*) -> !:
+        if t.has(ast.flag_fallible):
+            let inner = t.left else return
+            if not inner.has(ast.flag_tuple_type):
+                try self.base_type(inner, owner)
+            try self.put("!")
+            return
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.base_type(inner, owner)
+            try self.put("?")
+            return
+        if t.has(ast.flag_func_type):
+            try self.put("func(")
+            var first = true
+            var cursor = t.body
+            while let a = cursor:
+                if not first:
+                    try self.put(", ")
+                first = false
+                try self.base_type(a, owner)
+                cursor = a.next
+            try self.put(")")
+            if let r = t.right:
+                try self.put(" -> ")
+                try self.base_type(r, owner)
+            else:
+                try self.put(" -> unit")
+            return
+        if t.text == "int":
+            try self.put("usize" if t.has(ast.flag_usize) else "i64")
+        elif t.text == "float":
+            try self.put("f64")
+        elif t.text == "bool":
+            try self.put("bool")
+        elif t.text == "str":
+            try self.put("str")
+        elif t.text == "bytes":
+            try self.put("const u8[]")
+        elif t.text == "list":
+            try self.put("const ")
+            let e = t.body else return
+            try self.base_type(e, owner)
+            try self.put("[]")
+        else:
+            try self.put(self.base_module(owner))
+            try self.put(".")
+            try self.put(t.text)
+
+    ## A Luce value named `v` as Base takes it (§16.2): lent, converted, or unwrapped.
+    mutating func to_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_optional) or t.has(ast.flag_func_type):
+            if t.has(ast.flag_func_type):
+                try self.put(v)
+                return
+            try self.put(try self.crossing_name(t, "L_tobase_", owner))
+            try self.put("(")
+            try self.put(v)
+            try self.put(")")
+            return
+        if t.text == "int":
+            if t.has(ast.flag_usize):
+                try self.put("kernel.usize_of_int(")
+                try self.put(v)
+                try self.put(")")
+            else:
+                try self.put(v)
+        elif t.text == "float" or t.text == "bool":
+            try self.put(v)
+        elif t.text == "str":
+            try self.put("kernel.text_view(")
+            try self.put(v)
+            try self.put(")")
+        elif t.text == "bytes":
+            try self.put("kernel.bytes_view(")
+            try self.put(v)
+            try self.put(")")
+        elif t.text == "list":
+            let e = t.body else return
+            if e.text == "str":
+                try self.put("kernel.str_views(")
+            else:
+                try self.put("kernel.list_span[")
+                try self.type_of(e.type_id)
+                try self.put("](")
+            try self.put(v)
+            try self.put(")")
+        else:
+            let kind = self.checker.table.kind(t.type_id)
+            if kind == types.Kind.class_:
+                try self.put("L_")
+                try self.put(self.checker.table.get(t.type_id).name)
+                try self.put("__value(")
+                try self.put(v)
+                try self.put(")")
+            else:
+                try self.put(try self.crossing_name(t, "L_tobase_", owner))
+                try self.put("(")
+                try self.put(v)
+                try self.put(")")
+
+    ## A Base value named `v` as Luce keeps it: copied, converted, or wrapped.
+    mutating func from_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_optional):
+            try self.put(try self.crossing_name(t, "L_frombase_", owner))
+            try self.put("(")
+            try self.put(v)
+            try self.put(")")
+            return
+        if t.text == "int":
+            if t.has(ast.flag_usize):
+                try self.put("kernel.int_of_usize(")
+                try self.put(v)
+                try self.put(")")
+            else:
+                try self.put(v)
+        elif t.text == "float" or t.text == "bool":
+            try self.put(v)
+        elif t.text == "str":
+            try self.put("kernel.text_of(")
+            try self.put(v)
+            try self.put(")")
+        elif t.text == "bytes":
+            try self.put("kernel.bytes_of(")
+            try self.put(v)
+            try self.put(")")
+        else:
+            let kind = self.checker.table.kind(t.type_id)
+            if kind == types.Kind.class_:
+                try self.put("L_")
+                try self.put(self.checker.table.get(t.type_id).name)
+                try self.put("__wrap(")
+                try self.put(v)
+                try self.put(")")
+            else:
+                try self.put(try self.crossing_name(t, "L_frombase_", owner))
+                try self.put("(")
+                try self.put(v)
+                try self.put(")")
+
+    ## `L_tobase_N` or `L_frombase_N` for a type node, registered for the support pass.
+    mutating func crossing_name(t: ast.Node*, prefix: str, owner: ast.Node*) -> str!:
+        var i: usize = 0
+        var seen = false
+        while i < self.crossings.count:
+            if self.crossings.get(i).type_id == t.type_id:
+                seen = true
+            i += 1
+        if not seen:
+            try self.crossings.push(t)
+            try self.crossing_owners.push(owner)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"{prefix}{t.type_id}"))
+
+    ## `L_callback_N`: the thunk over Base's types that calls a named Luce function.
+    mutating func callback_name(f: ast.Node*) -> str!:
+        var i: usize = 0
+        var at = self.callbacks.count
+        while i < self.callbacks.count:
+            if self.callbacks.get(i) == f:
+                at = i
+            i += 1
+        if at == self.callbacks.count:
+            try self.callbacks.push(f)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_callback_{at}"))
+
+    ## The pair of functions for every crossing type, and the thunk for every callback.
+    mutating func boundary_support() -> !:
+        while self.crossings_done < self.crossings.count:
+            let t = self.crossings.get(self.crossings_done)
+            let owner = self.crossing_owners.get(self.crossings_done)
+            self.crossings_done += 1
+            try self.crossing_functions(t, owner)
+        while self.callbacks_done < self.callbacks.count:
+            let f = self.callbacks.get(self.callbacks_done)
+            self.callbacks_done += 1
+            try self.callback_thunk(f, self.callbacks_done - 1)
+
+    mutating func crossing_functions(t: ast.Node*, owner: ast.Node*) -> !:
+        # the module's own struct or enum being converted, or the owner for an optional of
+        # anything, which only needs the module's name
+        var module_decl = owner
+        if not t.has(ast.flag_optional):
+            module_decl = self.checker.table.get(t.type_id).decl else return try self.fail(t, "a crossing type without a declaration")
+        let half = self.checker.scratch.length // 2
+        let toward = try copy_name(try format(self.checker.scratch[half..], f"L_tobase_{t.type_id}"))
+        let back = try copy_name(try format(self.checker.scratch[half..], f"L_frombase_{t.type_id}"))
+        # to Base
+        try self.begin("func ")
+        try self.put(toward)
+        try self.put("(v: ")
+        try self.type_of(t.type_id)
+        try self.put(") -> ")
+        try self.base_type(t, module_decl)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.line("if let x = v:")
+            try self.begin("    return ")
+            try self.to_base(inner, "x", module_decl)
+            try self.end()
+            try self.line("return none")
+        elif module_decl.kind == ast.Kind.struct_:
+            try self.begin("return ")
+            try self.put(self.base_module(module_decl))
+            try self.put(".")
+            try self.put(module_decl.text)
+            try self.put("(")
+            var first = true
+            var cursor = module_decl.body
+            while let f = cursor:
+                if f.kind == ast.Kind.field:
+                    if not first:
+                        try self.put(", ")
+                    first = false
+                    try self.put(f.text)
+                    try self.put(" = ")
+                    let ft = f.ty else return
+                    let field = try copy_name(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
+                    try self.to_base(ft, field, module_decl)
+                cursor = f.next
+            try self.put(")")
+            try self.end()
+        else:
+            try self.line("match v:")
+            var cursor = module_decl.body
+            while let c = cursor:
+                if c.kind == ast.Kind.enum_case:
+                    try self.begin("    .L_")
+                    try self.put(c.text)
+                    try self.put(": return ")
+                    try self.put(self.base_module(module_decl))
+                    try self.put(".")
+                    try self.put(module_decl.text)
+                    try self.put(".")
+                    try self.put(c.text)
+                    try self.end()
+                cursor = c.next
+        self.indent -= 1
+        try self.line("")
+        # from Base
+        try self.begin("func ")
+        try self.put(back)
+        try self.put("(v: ")
+        try self.base_type(t, module_decl)
+        try self.put(") -> ")
+        try self.type_of(t.type_id)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.line("if let x = v:")
+            try self.begin("    return ")
+            try self.from_base(inner, "x", module_decl)
+            try self.end()
+            try self.line("return none")
+        elif module_decl.kind == ast.Kind.struct_:
+            try self.begin("return L_")
+            try self.put(self.checker.table.get(module_decl.type_id).name)
+            try self.put("(")
+            var first = true
+            var cursor = module_decl.body
+            while let f = cursor:
+                if f.kind == ast.Kind.field:
+                    if not first:
+                        try self.put(", ")
+                    first = false
+                    let ft = f.ty else return
+                    let field = try copy_name(try format(self.checker.scratch[half..], f"v.{f.text}"))
+                    try self.from_base(ft, field, module_decl)
+                cursor = f.next
+            try self.put(")")
+            try self.end()
+        else:
+            try self.line("match v:")
+            var cursor = module_decl.body
+            while let c = cursor:
+                if c.kind == ast.Kind.enum_case:
+                    try self.begin("    .")
+                    try self.put(c.text)
+                    try self.put(": return L_")
+                    try self.put(self.checker.table.get(module_decl.type_id).name)
+                    try self.put(".L_")
+                    try self.put(c.text)
+                    try self.end()
+                cursor = c.next
+            # an integer-backed enum from Base may hold a combination no case names
+            try self.line("    _: trap(\"a Base enum value that is no declared case crossed into Luce\")")
+        self.indent -= 1
+        try self.line("")
+
+    ## A callback's thunk: Base's arguments made into Luce values for the call, released
+    ## after it; the answer a scalar (the description admits no other).
+    mutating func callback_thunk(f: ast.Node*, index: usize) -> !:
+        let ft = self.checker.table.get(f.type_id)
+        try self.begin("func L_callback_")
+        try self.put_u64((u64)index)
+        try self.put("(")
+        var first = true
+        var i: usize = 0
+        var cursor = f.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put("a")
+            try self.put_u64((u64)i)
+            try self.put(": ")
+            try self.base_luce_type(p.type_id)
+            i += 1
+            cursor = p.next
+        try self.put(")")
+        if ft.elem != types.unit_id:
+            try self.put(" -> ")
+            try self.base_luce_type(ft.elem)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        try self.line("let mark = heap.mark()")
+        try self.begin("")
+        if ft.elem != types.unit_id:
+            try self.put("let answer = ")
+        try self.put("L_")
+        try self.put(try self.decl_name(f))
+        try self.put("(")
+        first = true
+        i = 0
+        cursor = f.right
+        while let p = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            let half = self.checker.scratch.length // 2
+            let name = try copy_name(try format(self.checker.scratch[half..], f"a{i}"))
+            try self.luce_from_base_value(p.type_id, name)
+            i += 1
+            cursor = p.next
+        try self.put(")")
+        try self.end()
+        try self.line("heap.drain(mark)")
+        if ft.elem != types.unit_id:
+            try self.line("return answer")
+        self.indent -= 1
+        try self.line("")
+
+    ## The Base spelling of a Luce type at a callback's edge: scalars, texts and bytes.
+    mutating func base_luce_type(id: u32) -> !:
+        match self.checker.table.kind(id):
+            .int_: try self.put("i64")
+            .float_: try self.put("f64")
+            .bool_: try self.put("bool")
+            .str_: try self.put("str")
+            .bytes_: try self.put("const u8[]")
+            _: return try self.fail(self.checker.tree(), "a callback parameter Base cannot pass")
+
+    ## A Base argument as a Luce value for a callback, a temporary of the call for texts.
+    mutating func luce_from_base_value(id: u32, v: str) -> !:
+        match self.checker.table.kind(id):
+            .str_:
+                try self.put(try self.lifetime_name("L_pool_", id))
+                try self.put("(kernel.text_of(")
+                try self.put(v)
+                try self.put("))")
+            .bytes_:
+                try self.put(try self.lifetime_name("L_pool_", id))
+                try self.put("(kernel.bytes_of(")
+                try self.put(v)
+                try self.put("))")
+            _: try self.put(v)
+
+    ## A handle (§16.4): a class holding the Base value, closed once by `close()` or when
+    ## its last reference goes; a closed handle handed to Base traps.
+    mutating func handle_decl(d: ast.Node*) -> !:
+        let name = self.type_name(d)
+        let destroy = d.left else return try self.fail(d, "a handle without its destroy function")
+        let module_name = self.base_module(d)
+        try self.begin("struct L_")
+        try self.put(name)
+        try self.put(":")
+        try self.end()
+        try self.line("    var header: heap.Object")
+        try self.begin("    var value: ")
+        try self.put(module_name)
+        try self.put(".")
+        try self.put(d.text)
+        try self.end()
+        try self.line("    var closed: bool")
+        try self.line("")
+        try self.begin("func L_")
+        try self.put(name)
+        try self.put("__L_close(L_self: L_")
+        try self.put(name)
+        try self.put("*):")
+        try self.end()
+        try self.line("    if not L_self.closed:")
+        try self.line("        L_self.closed = true")
+        try self.begin("        ")
+        try self.put(module_name)
+        try self.put(".")
+        try self.put(destroy.text)
+        try self.put("(L_self.value)")
+        try self.end()
+        try self.line("")
+        try self.begin("func L_")
+        try self.put(name)
+        try self.put("__drop(o: heap.Object*):")
+        try self.end()
+        try self.begin("    L_")
+        try self.put(name)
+        try self.put("__L_close((L_")
+        try self.put(name)
+        try self.put("*)o)")
+        try self.end()
+        try self.line("")
+        try self.begin("func L_")
+        try self.put(name)
+        try self.put("__trace(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):")
+        try self.end()
+        try self.line("    discard(o)")
+        try self.line("")
+        try self.begin("var L_")
+        try self.put(name)
+        try self.put("__info: heap.Info = heap.Info(name = \"")
+        try self.put(d.text)
+        try self.put("\", size = sizeof(L_")
+        try self.put(name)
+        try self.put("), finish = none, drop = L_")
+        try self.put(name)
+        try self.put("__drop, trace = L_")
+        try self.put(name)
+        try self.put("__trace)")
+        try self.end()
+        try self.line("")
+        try self.begin("func L_")
+        try self.put(name)
+        try self.put("__wrap(v: ")
+        try self.put(module_name)
+        try self.put(".")
+        try self.put(d.text)
+        try self.put(") -> L_")
+        try self.put(name)
+        try self.put("*:")
+        try self.end()
+        try self.begin("    let o = (L_")
+        try self.put(name)
+        try self.put("*)heap.allocate(&L_")
+        try self.put(name)
+        try self.put("__info)")
+        try self.end()
+        try self.line("    o.value = v")
+        try self.line("    o.closed = false")
+        try self.line("    return o")
+        try self.line("")
+        try self.begin("func L_")
+        try self.put(name)
+        try self.put("__value(h: L_")
+        try self.put(name)
+        try self.put("*) -> ")
+        try self.put(module_name)
+        try self.put(".")
+        try self.put(d.text)
+        try self.put(":")
+        try self.end()
+        try self.line("    if h.closed:")
+        try self.line("        trap(\"a closed handle was handed to Base\")")
+        try self.line("    return h.value")
+        try self.line("")
 
     ## A class: a Base struct with the runtime's header first, its methods as free functions
     ## over a pointer, the descriptor the runtime destroys and traces it by, and `new`.
@@ -1959,6 +2572,9 @@ pub struct Emitter:
                     try self.put(try self.thunk_name(d, "L_fn_"))
                     return
                 if d.kind == ast.Kind.constant:
+                    if d.has(ast.flag_base):
+                        try self.base_constant(d)
+                        return
                     try self.put("L_")
                     try self.put(try self.decl_name(d))
                     return
@@ -2505,6 +3121,9 @@ pub struct Emitter:
         if rt.kind == types.Kind.module:
             # `module.name`: the declaration under its own name (§15)
             let d = e.resolved else return
+            if d.kind == ast.Kind.constant and d.has(ast.flag_base):
+                try self.base_constant(d)
+                return
             try self.put("L_")
             if d.kind == ast.Kind.constant or d.kind == ast.Kind.func_:
                 try self.put(try self.decl_name(d))
@@ -2692,6 +3311,9 @@ pub struct Emitter:
                 else:
                     try self.put("L_")
                     try self.put(try self.decl_name(d))
+                if d.has(ast.flag_base):
+                    try self.base_arguments(e, d)
+                    return
                 try self.arguments(e, d.right, true, false)
             _: return try self.fail(e, "a call this slice does not compile")
 
@@ -3047,8 +3669,8 @@ pub struct Emitter:
     ## can register more, so the sets are walked until nothing new appears.
     mutating func support_functions() -> !:
         while true:
-            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count
-            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done
+            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count + self.crossings.count + self.callbacks.count
+            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done + self.crossings_done + self.callbacks_done
             if before == done:
                 return
             try self.show_functions()
@@ -3059,6 +3681,7 @@ pub struct Emitter:
             try self.text_objects()
             try self.closure_support()
             try self.box_support()
+            try self.boundary_support()
 
     ## `&L_text_N`: the immortal object of a literal, one per distinct text (RUNTIME).
     mutating func text_ref(text: str, as_bytes: bool) -> str!:

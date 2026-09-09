@@ -121,6 +121,14 @@ how a class behind an interface value goes when the value does; the collector tr
 through the box, so a cycle through interface values is found like any cycle. Every
 box of one interface and one conforming type shares one table, emitted once.
 
+## Handles
+
+A handle (§16.4) is an object holding the Base value and whether it was closed. `close()`
+calls the module's `destroy` once and remembers it; releasing the last reference calls
+`close()`; a closed handle handed to Base traps. Base functions are reached through a
+shim per function that lends texts and lists as views, converts structs, enums and
+optionals member by member, copies a text or bytes answered, and wraps a handle answered.
+
 ## Hashing
 
 `hash(x)` (§4.4) is the same number in both executions: FNV-1a over 64 bits (offset
