@@ -13,7 +13,10 @@
 import c
 import files
 import io
+import process
+import paths
 import front.ast
+import front.layout
 import front.lexer
 import front.parser
 import front.source
@@ -23,10 +26,12 @@ import back.package
 import hir.interp
 import sema.bodies
 import sema.check
+import sema.types
+import strings
 import support.version
 
 func usage(out: io.Writer*) -> !:
-    try out.write("usage: luce lex FILE\n       luce parse FILE\n       luce check FILE\n       luce run FILE [ARGS]\n       luce build FILE [-o OUT] [--emit=base] [--native] [--release]\n       luce --version\n")
+    try out.write("usage: luce lex FILE\n       luce parse FILE\n       luce check FILE\n       luce run FILE [ARGS]\n       luce build FILE [-o OUT] [--emit=base] [--native] [--release]\n       luce test FILE [--build] [--native] [--release]\n       luce doc FILE\n       luce explain FILE:LINE:COLUMN\n       luce fmt FILE [--write | --check]\n       luce --version\n")
 
 ## A diagnostic for a failure raised while reading `path`: a located message stands as it
 ## is; a bare one, the lexer's, is placed at the byte the lexer stopped on.
@@ -101,9 +106,347 @@ func check_command(path: c.str) -> i32!:
         try report((str)path, none, failure.message)
         return 1
     bodies.check_module(&checker) catch failure:
-        try report((str)path, none, failure.message)
+        try report_checker((str)path, &checker, failure.message)
         return 1
     return 0
+
+## `luce fmt` (§17.6): the module in the canonical layout, printed; `--write` puts it back
+## in the file; `--check` prints nothing and exits 1 when the file is not in that layout.
+func fmt_command(path: c.str, arguments: str[]) -> i32!:
+    var write = false
+    var check_only = false
+    for a in arguments:
+        if a == "--write":
+            write = true
+        elif a == "--check":
+            check_only = true
+        else:
+            try io.stderr().write(f"luce: fmt takes --write or --check, not {a}\n")
+            return 2
+    var scratch: u8[4096]
+    let src = source.Source.load(path) catch failure:
+        try report((str)path, none, failure.message)
+        return 1
+    var p = try parser.Parser.over(src, scratch)
+    let module = p.parse_module() catch failure:
+        try report((str)path, none, failure.message)
+        return 1
+    var f = try layout.Formatter.over(src, p.tokens[..<p.count])
+    try f.module(module)
+    let text = f.text()
+    let same = text == (str)src.bytes
+    if check_only:
+        if not same:
+            try io.stderr().write(f"luce: {(str)path} is not formatted\n")
+            return 1
+        return 0
+    if write:
+        if not same:
+            try files.write(path, text.bytes)
+        return 0
+    try io.stdout().write(text)
+    return 0
+
+## `luce explain file:line:column` (§17.5): what the name at that place is: a local, a
+## parameter, a function, a type, a member, with its type and where it was declared.
+func explain_command(place: str) -> i32!:
+    var second = place.length
+    var first = place.length
+    var i = place.length
+    while i > 0:
+        i -= 1
+        if place.bytes[i] == ':':
+            if second == place.length:
+                second = i
+            elif first == place.length:
+                first = i
+                break
+    if first == place.length:
+        try io.stderr().write("luce: explain takes FILE:LINE:COLUMN\n")
+        return 2
+    let path = (str)place.bytes[..<first]
+    let line = strings.to_i64((str)place.bytes[first + 1..<second]) else return try bad_place()
+    let column = strings.to_i64((str)place.bytes[second + 1..]) else return try bad_place()
+    var scratch: u8[8192]
+    var checker = try check.Checker.create(scratch)
+    checker.load(try base_path(path)) catch failure:
+        try report(path, none, failure.message)
+        return 1
+    bodies.check_module(&checker) catch failure:
+        try report_checker(path, &checker, failure.message)
+        return 1
+    # the module the file is, and the name on that line ending nearest before the column
+    var k: usize = 0
+    while k < checker.modules.count:
+        let m = checker.modules.get(k)
+        if m.src.path == path:
+            var best: ast.Node*? = none
+            find_name(m.tree, (u32)line, (u32)column, &m.src, &best)
+            let found = best else break
+            var out = io.stdout()
+            let (fl, fc) = m.src.position(found.start)
+            try out.write(f"{path}:{fl}:{fc}: ")
+            try describe_found(out, &checker, found)
+            try out.write("\n")
+            return 0
+        k += 1
+    try io.stderr().write(f"luce: {place}: no name here\n")
+    return 1
+
+func bad_place() -> i32!:
+    try io.stderr().write("luce: explain takes FILE:LINE:COLUMN\n")
+    return 2
+
+## The name or member on `line` whose start is nearest before `column`.
+func find_name(n: ast.Node*?, line: u32, column: u32, src: const source.Source*, best: ast.Node*?*):
+    let node = n else return
+    if names_something(node):
+        let (nl, nc) = src.position(node.start)
+        if nl == line and nc <= column:
+            var better = true
+            if let b = *best:
+                better = node.start >= b.start
+            if better:
+                *best = node
+    find_name(node.left, line, column, src, best)
+    find_name(node.right, line, column, src, best)
+    find_name(node.body, line, column, src, best)
+    find_name(node.ty, line, column, src, best)
+    find_name(node.next, line, column, src, best)
+
+## A use of a name, or a declaration of one: what `luce explain` can speak of.
+func names_something(n: ast.Node*) -> bool:
+    match n.kind:
+        .name, .member, .self_, .param, .field, .let_, .var_, .func_, .constant, .struct_, .class_, .enum_, .enum_case, .interface_, .type_alias: return true
+        _: return false
+
+func describe_found(out: io.Writer, checker: check.Checker*, n: ast.Node*) -> !:
+    if n.kind == ast.Kind.self_:
+        try out.write("`self`, of type `")
+        try checker.table.describe(out, n.type_id)
+        try out.write("`")
+        return
+    let name = n.text
+    var declared = n.kind != ast.Kind.name and n.kind != ast.Kind.member
+    if not declared and n.resolved == none:
+        try out.write(f"`{name}`")
+        return
+    let d = n if declared else (n.resolved else return)
+    var what = "a name"
+    match d.kind:
+        .func_: what = "a method" if check.has_self(d) else "a function"
+        .constant: what = "a constant"
+        .struct_: what = "a struct"
+        .class_: what = "a class"
+        .enum_: what = "an enum"
+        .enum_case: what = "a case"
+        .interface_: what = "an interface"
+        .type_alias: what = "a type alias"
+        .param: what = "a parameter"
+        .field: what = "a field"
+        .let_: what = "a `let` binding"
+        .var_: what = "a `var` binding"
+        .import_, .from_import: what = "a module"
+        _: what = "a name"
+    try out.write(f"`{name}` is {what}")
+    if n.type_id != 0 and d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import:
+        try out.write(" of type `")
+        try checker.table.describe(out, n.type_id)
+        try out.write("`")
+    if d.kind != ast.Kind.import_ and d.kind != ast.Kind.from_import and (usize)d.module < checker.modules.count:
+        let home = checker.modules.get((usize)d.module)
+        let (dl, dc) = home.src.position(d.start)
+        try out.write(f", declared at {home.src.path}:{dl}:{dc}")
+
+## The public declarations of the program's modules with their doc comments, as Markdown
+## (§17.4): a heading per module, a heading per declaration with its signature, the doc
+## lines beneath, and a public type's public members as a list.
+func doc_command(path: c.str) -> i32!:
+    var scratch: u8[8192]
+    var checker = try check.Checker.create(scratch)
+    checker.load(path) catch failure:
+        try report((str)path, none, failure.message)
+        return 1
+    bodies.check_module(&checker) catch failure:
+        try report_checker((str)path, &checker, failure.message)
+        return 1
+    var out = io.stdout()
+    var k: usize = 0
+    var first = true
+    while k < checker.order.count:
+        let index = (usize)checker.order.get(k)
+        k += 1
+        let m = checker.modules.get(index)
+        if index == 0 or m.base:
+            continue
+        if not first:
+            try out.write("\n")
+        first = false
+        try out.write(f"# {m.name}\n")
+        var cursor = m.tree.body
+        while let d = cursor:
+            if d.has(ast.flag_pub) and not d.has(ast.flag_instance):
+                try out.write("\n## ")
+                try signature(out, &checker, d, m.name)
+                try out.write("\n")
+                try doc_lines(out, d.doc, "")
+                if d.kind == ast.Kind.struct_ or d.kind == ast.Kind.class_ or d.kind == ast.Kind.enum_ or d.kind == ast.Kind.interface_:
+                    var member = d.body
+                    while let mb = member:
+                        if mb.has(ast.flag_pub) or d.kind == ast.Kind.interface_ or mb.kind == ast.Kind.enum_case:
+                            try out.write("\n- ")
+                            try signature(out, &checker, mb, "")
+                            try out.write("\n")
+                            try doc_lines(out, mb.doc, "  ")
+                        member = mb.next
+            cursor = d.next
+    return 0
+
+## `func name(p: T) -> R`, `struct Name`, `field name: T`, `case name`, `let name: T`.
+func signature(out: io.Writer, checker: check.Checker*, d: ast.Node*, module_name: str) -> !:
+    match d.kind:
+        .func_:
+            try out.write(f"func {d.text}(")
+            var first = true
+            var p = d.right
+            while let param = p:
+                if not first:
+                    try out.write(", ")
+                first = false
+                if param.text == "self":
+                    try out.write("self")
+                else:
+                    try out.write(f"{param.text}: ")
+                    try checker.table.describe(out, param.type_id)
+                p = param.next
+            try out.write(")")
+            let result = checker.table.get(d.type_id).elem
+            if result != types.unit_id:
+                try out.write(" -> ")
+                try checker.table.describe(out, result)
+        .constant:
+            try out.write(f"let {d.text}: ")
+            try checker.table.describe(out, d.type_id)
+        .struct_: try out.write(f"struct {d.text}")
+        .class_: try out.write(f"class {d.text}")
+        .enum_: try out.write(f"enum {d.text}")
+        .interface_: try out.write(f"interface {d.text}")
+        .type_alias:
+            try out.write(f"type {d.text} = ")
+            try checker.table.describe(out, d.type_id)
+        .field:
+            try out.write(f"{d.text}: ")
+            try checker.table.describe(out, d.type_id)
+        .enum_case:
+            try out.write(f"case {d.text}")
+            if d.body != none:
+                try out.write("(")
+                var first = true
+                var p = d.body
+                while let field = p:
+                    if not first:
+                        try out.write(", ")
+                    first = false
+                    try out.write(f"{field.text}: ")
+                    try checker.table.describe(out, field.type_id)
+                    p = field.next
+                try out.write(")")
+        _: try out.write(d.text)
+    discard(module_name)
+
+## The doc comment's lines without their `## `, each under `indent`.
+func doc_lines(out: io.Writer, doc: str, indent: str) -> !:
+    if doc.length == 0:
+        return
+    var start: usize = 0
+    var i: usize = 0
+    while i <= doc.length:
+        if i == doc.length or doc.bytes[i] == '\n':
+            var line = (str)doc.bytes[start..<i]
+            var skip: usize = 0
+            while skip < line.length and line.bytes[skip] == ' ':
+                skip += 1
+            line = (str)line.bytes[skip..]
+            if line.length >= 2 and line.bytes[0] == '#' and line.bytes[1] == '#':
+                line = (str)line.bytes[2..]
+                if line.length > 0 and line.bytes[0] == ' ':
+                    line = (str)line.bytes[1..]
+            try out.write(indent)
+            try out.write(line)
+            try out.write("\n")
+            start = i + 1
+        i += 1
+
+## Every diagnostic the checker recorded (§17.2), the first one first; the failure's own
+## message when it recorded none.
+func report_checker(path: str, checker: check.Checker*, message: str) -> !:
+    if checker.errors.count == 0:
+        try report(path, none, message)
+        return
+    var i: usize = 0
+    while i < checker.errors.count:
+        try report(path, none, checker.errors.get(i))
+        i += 1
+
+## Run every `test` of the program (§17.3): in the interpreter, or with `--build` as a
+## runner luce-base compiles, natively with `--native`. The report is the same.
+func test_command(path: c.str, arguments: str[]) -> i32!:
+    var scratch: u8[8192]
+    var checker = try check.Checker.create(scratch)
+    checker.load(path) catch failure:
+        try report((str)path, none, failure.message)
+        return 1
+    bodies.check_module(&checker) catch failure:
+        try report_checker((str)path, &checker, failure.message)
+        return 1
+    var build = false
+    var flags = try alloc str[arguments.length]
+    var n: usize = 0
+    for a in arguments:
+        if a == "--build":
+            build = true
+        else:
+            flags[n] = a
+            n += 1
+    if not build:
+        if checker.imports_base():
+            try io.stderr().write(f"luce: {(str)path}: the program imports a Base module; the interpreter runs Luce alone, so test it with `--build` (§16)\n")
+            return 1
+        var machine = try interp.Interp.over(&checker)
+        interp.attach(&machine)
+        let status = machine.run_tests() catch failure:
+            var err = io.stderr()
+            try err.write(f"luce: {failure.message}\n")
+            recover 2
+        return status
+    var emitter = try base.Emitter.over(&checker)
+    emitter.tests_mode = true
+    emitter.program() catch failure:
+        try report((str)path, none, failure.message)
+        return 1
+    var room: u8[1024]
+    let stem = paths.stem((str)path)
+    let output = try format(room, f"build/tests/{stem}")
+    var dir_room: u8[1024]
+    let dir = try format(dir_room, f"{output}.base")
+    try package.write(dir, checker.package_name, emitter.text())
+    var k: usize = 0
+    while k < checker.modules.count:
+        let m = checker.modules.get(k)
+        if m.base:
+            let data = try files.read(try base_path(m.path))
+            try package.write_module(dir, m.name, data)
+        k += 1
+    package.compile(dir, output, flags[..<n]) catch failure:
+        try io.stderr().write(f"luce: {failure.message}\n")
+        return 1
+    var no_arguments: c.str[1] = [(c.str)""]
+    let (status, out, err) = try process.run(try base_path(output), no_arguments[..<0])
+    discard(try io.stdout().write(out.bytes))
+    discard(try io.stderr().write(err.bytes))
+    process.release(out)
+    process.release(err)
+    return status
 
 ## Parse, check, and run the file in the interpreter; its `main`'s result is the status.
 func run_command(path: c.str, arguments: str[]) -> i32!:
@@ -113,7 +456,7 @@ func run_command(path: c.str, arguments: str[]) -> i32!:
         try report((str)path, none, failure.message)
         return 1
     bodies.check_module(&checker) catch failure:
-        try report((str)path, none, failure.message)
+        try report_checker((str)path, &checker, failure.message)
         return 1
     if checker.imports_base():
         try io.stderr().write(f"luce: {(str)path}: the program imports a Base module; the interpreter runs Luce alone, so build it (§16)\n")
@@ -138,7 +481,7 @@ func build_command(path: c.str, arguments: str[]) -> i32!:
         try report((str)path, none, failure.message)
         return 1
     bodies.check_module(&checker) catch failure:
-        try report((str)path, none, failure.message)
+        try report_checker((str)path, &checker, failure.message)
         return 1
     var emitter = try base.Emitter.over(&checker)
     emitter.program() catch failure:
@@ -218,5 +561,13 @@ pub func main(arguments: str[]) -> i32!:
         return try run_command((c.str)arguments[2], arguments[3..])
     if command == "build" and arguments.length >= 3:
         return try build_command((c.str)arguments[2], arguments[3..])
+    if command == "test" and arguments.length >= 3:
+        return try test_command((c.str)arguments[2], arguments[3..])
+    if command == "doc" and arguments.length == 3:
+        return try doc_command((c.str)arguments[2])
+    if command == "explain" and arguments.length == 3:
+        return try explain_command(arguments[2])
+    if command == "fmt" and arguments.length >= 3:
+        return try fmt_command((c.str)arguments[2], arguments[3..])
     try usage(&out)
     return 2

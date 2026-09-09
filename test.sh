@@ -20,5 +20,6 @@ done
 echo "== luce --version"
 ./build/luce --version
 tests/conformance/run.sh
+tools/fmt_check.sh
 python3 tools/fuzz.py --gate
 echo ok

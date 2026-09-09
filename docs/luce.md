@@ -953,14 +953,43 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | --- | --- |
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package |
-| `luce check`, `luce test`, `luce fmt`, `luce doc`, `luce explain` | as named |
+| `luce check program.luc` | checks it and prints every diagnostic |
+| `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, `--native` through the native backend |
+| `luce fmt`, `luce doc`, `luce explain` | as named |
 
 ### 17.2 Diagnostics
 
 Every diagnostic is `file:line:column: message`, one per line, the first one first, and a
-rejection exits with status 1. A crash, a hang, or a message without a position is a
+rejection exits with status 1. A declaration that does not check is reported and the next
+is checked, so one run names several; a syntax error ends the run. A crash, a hang, or a message without a position is a
 compiler bug. The interpreter and the emitted Base trap with the same message and the Luce
 position, which the emitted Base carries through base.md's position directive.
+
+### 17.4 Documentation
+
+`luce doc program.luc` prints the public declarations of the program's modules as Markdown:
+a heading per module, a heading per declaration with its signature, the declaration's doc
+comment beneath, and a type's public members (an interface's methods, an enum's cases) as
+a list, each with its own doc comment. A doc comment is the `##` lines directly above a
+declaration or a member (§3.3); one anywhere else documents nothing.
+
+### 17.6 Formatting
+
+`luce fmt program.luc` prints the module in the canonical layout; `--write` puts it back in
+the file, `--check` prints nothing and exits with 1 when the file is not in that layout.
+The layout: four spaces per block, one statement per line, one space around a binary
+operator and after a comma, none inside brackets, a blank line between declarations and
+before a method, at most one blank line between statements where the source had one, and
+comments kept: one on a line of its own stays before what follows it, one after code stays
+after that line. The parser reads the result back into the same tree, and formatting it
+again changes nothing.
+
+### 17.5 Explanations
+
+`luce explain program.luc:line:column` names what the identifier at that place is: a
+binding, a parameter, a function or method, a type, a member or a module, with its type and
+where it was declared, as one line `file:line:column: `name` is a … of type `T`, declared
+at file:line:column`.
 
 ### 17.3 Tests
 
@@ -971,8 +1000,11 @@ test "parsing an empty document fails":
 ```
 
 A `test` is a registered function that runs under `luce test` and never in a build. It may
-`try`, `assert`, and `error`; a test that fails or traps is reported with its name and
-position.
+`try`, `assert`, and `error`; a test that fails is reported with its name, its position and
+the failure's message, and one that traps ends the run after its name. The report is one
+line per test, `ok    name` or `FAIL  name` followed by an indented `file:line:column:
+message`, then `N passed` and, when any failed, `M failed`; the status is 1 then. The
+interpreter and a built runner print the same report.
 
 ## 18. Deliberate exclusions
 
