@@ -960,7 +960,7 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package |
 | `luce check program.luc` | checks it and prints every diagnostic |
-| `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, `--native` through the native backend |
+| `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, native by default; `--backend=c` explicitly selects Base’s C comparison backend |
 | `luce fmt`, `luce doc`, `luce explain` | as named |
 
 ### 17.2 Diagnostics

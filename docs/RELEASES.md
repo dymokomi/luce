@@ -1,5 +1,12 @@
 # Releases
 
+## 0.1.4
+
+- Ordinary builds and built test runners explicitly request Base's native backend.
+  Pin Base 0.11.30, whose default compilation and self-hosting stages are native.
+- Retain explicit `--backend=c` comparisons in the test suite. A regression blocks
+  generated-C compilation while checking default and release builds and built tests.
+
 ## 0.1.3
 
 - Pin Base 0.11.29 for native x86 correctness, library failure handling and

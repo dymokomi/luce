@@ -41,8 +41,8 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
             compare "$f"
         fi
         # the emitted Base through every generator luce-base has
-        for flags in "" "--release" "--native"; do
-            echo "   compiled ${flags:-C}"
+        for flags in "" "--backend=c" "--backend=c --release"; do
+            echo "   compiled ${flags:-native}"
             run ./build/luce build "$src" -o build/conformance $flags
             run ./build/conformance > build/conformance.out
             compare "$f"
@@ -56,7 +56,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         src="${f%.tests}.luc"
         echo "== $src (tests)"
         if grep -q ' failed$' "$f"; then want_status=1; else want_status=0; fi
-        for flags in "" "--build" "--build --native"; do
+        for flags in "" "--build" "--build --backend=c"; do
             python3 tools/run_case.py --expected "$want_status" -- ./build/luce test "$src" $flags > build/conformance.out 2>&1 && status=0 || status=$?
             [ "$status" -eq "$want_status" ] || { echo "FAIL $src ($flags): status $status, expected $want_status: [$(cat build/conformance.out)]"; exit 1; }
             cmp build/conformance.out "$f"
@@ -97,7 +97,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
             [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
         fi
         grep -q "$want" build/conformance.err || { echo "FAIL $src: expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
-        for flags in "" "--release" "--native"; do
+        for flags in "" "--backend=c" "--backend=c --release"; do
             run ./build/luce build "$src" -o build/conformance $flags
             if reject ./build/conformance > build/conformance.out 2> build/conformance.err; then
                 echo "FAIL $src ($flags): expected a trap, the compiled program finished"; exit 1

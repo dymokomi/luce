@@ -574,7 +574,7 @@ def differential(text, timeout, findings, label):
         findings.report("run-interp", text.encode(), f"{label}: the interpreter stopped with {status}: {(so + se).decode('utf-8', 'replace')[:300]!r}")
         return
     outputs["interp"] = so
-    for name, flags in (("c", []), ("release", ["--release"]), ("native", ["--native"])):
+    for name, flags in (("native", []), ("c", ["--backend=c"]), ("release", ["--backend=c", "--release"])):
         status, so, se = run([str(compiler), "build", str(path), "-o", str(exe), *flags], timeout * 4)
         if status != 0:
             findings.report("build-" + name, text.encode(), f"{label}: the build ({name}) failed: {(so + se).decode('utf-8', 'replace')[:300]!r}")

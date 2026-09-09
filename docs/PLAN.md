@@ -20,3 +20,7 @@ and the standing rules below hold for whatever comes next.
 - Every rejection names a position; every literal is checked where it sits.
 - luce-base is a pinned release; a change it needs is made there, released, and pinned.
 - No history here: this file says what to do, `git log` says what was done.
+
+Native compilation is the production path and the main hardening target. Prioritize
+native ABI/optimizer checks and ARC/worker lifetime stress. Base C-backend comparisons
+and sanitizer checks are supplemental evidence, not substitutes for native validation.

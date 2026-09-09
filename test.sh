@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 python3 tools/test_run_case.py
 base=build/luce-base/build/luce-base
 export LUCE_BASE=$PWD/$base
+python3 tools/test_native_default.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
 for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
@@ -15,7 +16,7 @@ for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
     if grep -q '^test "' "$f"; then
         echo "== test $f"
         "$base" test "$f"
-        "$base" test "$f" --native
+        "$base" test "$f" --backend=c
     fi
 done
 echo "== luce --version"

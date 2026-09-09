@@ -19,3 +19,7 @@ build/luce build program.luc -o app  Base out, then the Base compiler, native in
 ```
 
 Licensed under MIT or Apache-2.0, at your option.
+
+Compiled Luce programs and `luce test --build` use Base’s native backend by default.
+Luce emits Base; it does not emit C. `--backend=c` is an explicit diagnostic comparison
+through Base’s retained C backend. Native compilation is the production path.
