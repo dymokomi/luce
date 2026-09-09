@@ -1,5 +1,16 @@
 # Releases
 
+## 0.1.3
+
+- Imported Base functions used as values become proper Luce closures. Indirect calls
+  preserve fallible results, unit results, handles and close-once destruction.
+- Named callbacks crossing an indirect Base function call retain a static callback
+  entry, including callbacks Base keeps after the local Luce alias leaves scope.
+  Capturing closures remain outside the supported Base callback contract.
+- Both-host correctness workflows retain provenance and failure evidence. Conformance
+  runs have deadlines and require exact expected statuses, so a crash cannot satisfy
+  a rejection test merely by printing a matching diagnostic.
+
 ## 0.1.2
 
 - Dynamic error messages remain counted and are released when their last owner goes.
