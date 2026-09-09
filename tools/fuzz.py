@@ -310,13 +310,54 @@ class Gen:
             return lines
         return [f"{pad}print(nums, words, ages, seen)"]
 
+    def failure_statement(self, k, depth, indent):
+        """What bit the compiler once (§5.3, §8.3, §8.4, §12, §13): `+=` on a text, a tuple
+        destructured by `for`, a `match` expression followed by an `if`, a `try` inside a
+        literal or a construction, a fallible interface method, a nested tuple type."""
+        r = self.rng
+        pad = "    " * indent
+        n = self.expr(1)
+        if k == 28:
+            return [r.choice([f"{pad}s += {self.expr(1, 'str')}\n{pad}s = short(s)", f"{pad}t += t\n{pad}t = short(t)",
+                              f"{pad}pairs.append((short({self.expr(1, 'str')}), {n}))", f"{pad}pairs = pairs.sorted()",
+                              f"{pad}nested.append(((short(s), {n}), {n} % 8))", f"{pad}if pairs.length > 4:\n{pad}    pairs.clear()",
+                              f"{pad}if nested.length > 4:\n{pad}    nested = nested[1..]"])]
+        if k == 29 and depth > 0:
+            m = self.loops; self.loops += 1
+            which = r.choice(["pairs", "nested"])
+            lines = [f"{pad}for (p{m}, q{m}) in {which}.copy():"]
+            if which == "pairs":
+                self.locals += [(f"p{m}", "str"), (f"q{m}", "int")]
+            else:
+                lines.append(f"{pad}    let (name{m}, k{m}) = p{m}")
+                self.locals += [(f"name{m}", "str"), (f"k{m}", "int"), (f"q{m}", "int")]
+            lines += self.statements(depth - 1, indent + 1)
+            if which == "pairs":
+                self.locals.pop(); self.locals.pop()
+            else:
+                self.locals.pop(); self.locals.pop(); self.locals.pop()
+            return lines
+        if k == 30:
+            lines = [f"{pad}{r.choice(['a', 'b'])} = match ({n} % 4):", f"{pad}    0 => {self.expr(1)}", f"{pad}    1, 2 => {self.expr(1)}", f"{pad}    _ => {self.expr(1)}"]
+            lines.append(f"{pad}if {self.expr(1, 'bool')}:")
+            lines.append(f"{pad}    c = {self.expr(1)}")
+            return lines
+        return [r.choice([f"{pad}nums = gather({n}) catch failure:\n{pad}    recover [{n}]",
+                          f"{pad}s = packed({n}) catch failure:\n{pad}    recover short(failure.message)",
+                          f"{pad}ages = keyed({n}) catch failure:\n{pad}    recover {{}}",
+                          f"{pad}a = (pick else Level.low).check() catch failure:\n{pad}    recover {n} % 64",
+                          f"{pad}print(named({n}, obj).check() catch failure: recover -1)"])]
+
     def statements(self, depth, indent):
         r = self.rng
         lines = []
         pad = "    " * indent
         saved = list(self.locals)
         for _ in range(r.randint(1, 4)):
-            k = r.randrange(14 if self.in_helper else 28)
+            k = r.randrange(14 if self.in_helper else 32)
+            if k >= 28:
+                lines += self.failure_statement(k, depth, indent)
+                continue
             if k >= 26:
                 lines += self.interface_statement(k, depth, indent)
                 continue
@@ -418,6 +459,9 @@ class Gen:
                 "func len(text: str) -> int:", "    return text.length", "",
                 "func find(x: int) -> int?:", "    if (x % 4) == 0:", "        return none", "    return x % 1024", "",
                 "func risky(x: int) -> int!:", "    if (x % 8) == 3:", "        error(bad, \"three\")", "    return (x % 4096) + 11", "",
+                "func gather(x: int) -> list[int]!:", "    return [x % 4096, try risky(x), (x % 4096) + 1]", "",
+                "func packed(x: int) -> str!:", "    let pair = (str(x % 100), try risky(x))", "    return f\"{pair.0}:{pair.1}\"", "",
+                "func keyed(x: int) -> map[str, int]!:", "    return {\"k\" + str(x % 10): x % 100, \"r\": try risky(x)}", "",
                 "class Tracer:", "    let name: str", "    var n: int = 0", "    var link: Tracer? = none", "",
                 "    func init(self, name: str):", "        self.name = name", "        print(f\"make {name}\")", "",
                 "    func deinit(self):", "        print(f\"gone {self.name}\")", "",
@@ -434,10 +478,10 @@ class Gen:
                 "func sorted_copy(values: list[int]) -> list[int]:", "    return values.sorted()", "",
                 "func apply(f: func(int) -> int, x: int) -> int:", "    return f(x)", "",
                 "func make_counter() -> func() -> int:", "    var count = 0", "    return func () -> int:", "        count += 1", "        return count", "",
-                "interface Named:", "    func label(self) -> str", "    func weight(self) -> int", "",
-                "struct Tag: Named:", "    var text: str", "", "    func label(self) -> str:", "        return self.text", "", "    func weight(self) -> int:", "        return self.text.length", "",
-                "enum Level: Named:", "    low", "    high(by: int)", "", "    func label(self) -> str:", "        match self:", "            .low: return \"low\"", "            .high(by): return f\"high{by}\"", "", "    func weight(self) -> int:", "        match self:", "            .low: return 1", "            .high(by): return by % 1024", "",
-                "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "",
+                "interface Named:", "    func label(self) -> str", "    func weight(self) -> int", "    func check(self) -> int!", "",
+                "struct Tag: Named:", "    var text: str", "", "    func label(self) -> str:", "        return self.text", "", "    func weight(self) -> int:", "        return self.text.length", "", "    func check(self) -> int!:", "        return try risky(self.text.length)", "",
+                "enum Level: Named:", "    low", "    high(by: int)", "", "    func label(self) -> str:", "        match self:", "            .low: return \"low\"", "            .high(by): return f\"high{by}\"", "", "    func weight(self) -> int:", "        match self:", "            .low: return 1", "            .high(by): return by % 1024", "", "    func check(self) -> int!:", "        match self:", "            .low: return 0", "            .high(by): return try risky(by)", "",
+                "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "", "    func check(self) -> int!:", "        let w = match self.owner.n % 3:", "            0 => 1", "            _ => 2", "        if w == 1:", "            error(bad, \"one\")", "        return try risky(self.owner.n)", "",
                 "func named(x: int, t: Tracer) -> Named:", "    match x % 3:", "        0: return Tag(text = f\"t{x % 100}\")", "        1: return Level.high(by = x % 50)", "        _: return Badge(t)", "",
                 "func heaviest(items: list[Named]) -> int:", "    var best = 0", "    for item in items:", "        if item.weight() > best:", "            best = item.weight()", "    return best", "",
                 "func choose[T](a: T, b: T, first: bool) -> T:", "    return a if first else b", "",
@@ -491,13 +535,16 @@ def generate(rng):
     body.append("    var fs: list[func(int) -> int] = []")
     body.append("    var names: list[Named] = [Level.low]")
     body.append("    var pick: Named? = none")
+    body.append('    var pairs: list[(str, int)] = [("a", 1)]')
+    body.append("    var nested: list[((str, int), int)] = []")
     body.append("    var sum = 0")
     body.append("    func_mix")
     lines = g.statements(3, 1)
     body += lines
     body.append('    print(f"{sum} {a} {b} {c} {d} {e} {s} {t} {flag} {o else -1} {p} {q.n} {obj.tag()} {name_of(opt)} {name_of(h.item)} {h.count}")')
     body.append("    print(nums, words, ages, seen)")
-    body.append("    print(heaviest(names), names.length, pick.label() if let pick else \"-\")" if False else "    print(heaviest(names), names.length, name_label(pick))")
+    body.append("    print(heaviest(names), names.length, name_label(pick))")
+    body.append("    print(pairs, nested)")
     body.append("    return 0")
     text = "\n".join(header + body) + "\n"
     # `mix` reads the locals: written as a nested reading of the same names through a
