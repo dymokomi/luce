@@ -151,7 +151,8 @@ let data = b"\x00\x01"
 A `str` literal is UTF-8 with the escapes `\\ \" \n \r \t \0 \u{HEX}`. A raw literal `r"..."`
 has no escapes. A formatted literal `f"..."` interpolates any expression whose type has a
 display (§10.5); a format spec after `:` is not part of the language and a `{` is written
-`{{`. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
+`{{`. A field's expression holds no brace of its own: a set or map literal is bound to a
+name first. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
 `b"..."` admits `\xNN` and is the only place a byte is spelled.
 
 There is no character literal: a text of one scalar is a `str` of length one.
@@ -701,10 +702,13 @@ codes from two packages never collide. A Base package's errors cross unchanged (
 
 ### 12.4 Traps
 
-A trap ends the program with a message and a source trace, and cannot be caught: `int`
-overflow, division by zero, an index out of range, an `int(x)` that does not fit, an
-`assert` that fails, a mutation during iteration, a `trap("message")`, and out of memory.
-`assert(condition)` and `assert(condition, "message")` stay in every build.
+A trap ends the program and cannot be caught: `int` overflow, division by zero, an index
+out of range, an `int(x)` that does not fit, an `assert` that fails, a mutation during
+iteration, a `trap("message")`, and out of memory. It writes `trap: file:line:column:
+message` to standard error and exits with status 1: the position is the statement the
+program was running, the innermost one inside a called function, and the interpreter and
+a built program name the same one. `assert(condition)` and `assert(condition, "message")`
+stay in every build and report `assert failed`, then the message when one is given.
 
 ## 13. Interfaces and generics
 

@@ -152,6 +152,14 @@ class Gen:
             return r.choice(["true", "false"])
         return r.choice(pool)
 
+    def field(self, depth, ty="int"):
+        """An expression for a formatted string's field: one without braces (§3.3)."""
+        for _ in range(8):
+            e = self.expr(depth, ty)
+            if "{" not in e:
+                return e
+        return self.leaf(ty) if ty != "bool" else "flag"
+
     def expr(self, depth, ty="int"):
         r = self.rng
         if depth <= 0 or r.random() < 0.3:
@@ -196,7 +204,8 @@ class Gen:
             if k < 6:
                 return f"str({self.expr(depth - 1)})"
             if k == 6:
-                return f"f\"{{{self.expr(depth - 1)}}}-{{{self.expr(depth - 1, 'str')}}}\""
+                # a field holds no brace (§3.3): a set literal in the expression is left out
+                return f"f\"{{{self.field(depth - 1)}}}-{{{self.field(depth - 1, 'str')}}}\""
             if k == 7:
                 return f"({self.expr(depth - 1, 'str')} if {self.expr(depth - 1, 'bool')} else {self.expr(depth - 1, 'str')})"
             return f"describe(Shape.circle(radius = {self.expr(depth - 1, 'float')}))"

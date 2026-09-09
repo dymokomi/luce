@@ -115,6 +115,17 @@ whose `try` may fail (or, in a map literal, beside a call), every operand is eva
 of the statement into a temporary, in source order, and the taker gets a copy of it: a
 failure then drains what was made, and nothing is copied for a taker that never took it.
 
+## Traps
+
+A trap writes `trap: file:line:column: message` and exits with status 1 (luce.md §12.4).
+The position is the Luce statement running: the compiled program keeps it in the kernel's
+per-thread `heap.site`, which every emitted function's statements set and a deferred
+`restore_site` gives back to the caller, and the kernel's own traps report it through
+`heap.stop`; a trap Base inserts into the emitted code, an overflow or a division by zero,
+reports the same position through the `#:` directive written before each statement
+(base.md §3.3). The interpreter keeps the statement per frame and checks its own
+arithmetic, so it stops with the same text.
+
 ## Interface values
 
 An interface value (§13.2) is a pointer to a box: an object whose header is followed by a
