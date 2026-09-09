@@ -132,10 +132,14 @@ class Gen:
             if ty == "str": return r.choice(['"ab"', '"xyz"', '"hé"', '""'])
             return r.choice(["true", "false"])
         pool = {
-            "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count"],
+            "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count", "nums.length", "(nums.first else 0)",
+                    "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(hash(a) % 1000)", "(hash(s) % 1000)",
+                    "(s.index_of(t) else -1)", "s.byte_count"],
             "float": ["d", "e", "float(a % 256)", "p.f"],
-            "str": ["s", "t", "p.name", "obj.tag()", "name_of(opt)", "name_of(h.item)"],
-            "bool": ["flag", "(a > b)", "(opt is none)", "(obj is opt)"],
+            "str": ["s", "t", "p.name", "obj.tag()", "name_of(opt)", "name_of(h.item)", "words.join(\"-\")", "s.upper()",
+                    "s.trim()", "t.replace(\"a\", \"o\")", "(words.last else \"-\")", "str(nums)", "str(seen)", "str(ages)"],
+            "bool": ["flag", "(a > b)", "(opt is none)", "(obj is opt)", "(a in nums)", "(s in ages)", "(a in seen)",
+                     "s.contains(t)", "s.starts_with(\"a\")", "(nums == sorted_copy(nums))", "(seen == {1, 2})"],
         }[ty] + [n for n, t in self.locals if t == ty]
         if r.random() < 0.3:
             if ty == "int": return str(r.randint(-999, 999))
@@ -237,13 +241,57 @@ class Gen:
         return [r.choice([f"{pad}obj = make(obj.tag(), {n})", f"{pad}opt = (opt else {self.fresh(n)})",
                           f"{pad}h = Holder(item = obj, count = h.count + 1)"])]
 
+    def collection_statement(self, k, depth, indent):
+        """Lists, maps and sets: grown, read, sliced, sorted, iterated; every shape change
+        in a loop over the same collection would trap, so loops iterate copies."""
+        r = self.rng
+        pad = "    " * indent
+        n = self.expr(1)
+        if k == 20:
+            return [r.choice([f"{pad}nums.append({n})", f"{pad}nums.insert(0, {n})", f"{pad}nums = nums.sorted()",
+                              f"{pad}nums.reverse()", f"{pad}nums = nums[..<(nums.length // 2)]", f"{pad}nums = nums + [{n}]",
+                              f"{pad}nums = nums.filter(is_small)", f"{pad}nums = nums.map(halve)",
+                              f"{pad}if nums.length > 0:\n{pad}    nums[{n} % nums.length] = {n}",
+                              f"{pad}if nums.length > 0:\n{pad}    a = nums.pop()"])]
+        if k == 21:
+            return [r.choice([f"{pad}words.append(short({self.expr(1, 'str')}))", f"{pad}words.sort()", f"{pad}words = words.reversed()",
+                              f"{pad}words = words + short({self.expr(1, 'str')}).split(\"a\")", f"{pad}words = short(s).lines()",
+                              f"{pad}if words.length > 3:\n{pad}    words.clear()"])]
+        if k == 22:
+            return [r.choice([f"{pad}ages[short({self.expr(1, 'str')})] = {n}", f"{pad}a = (ages.remove(s) else {n})",
+                              f"{pad}ages = ages.copy()", f"{pad}words = ages.keys()", f"{pad}nums = ages.values()",
+                              f"{pad}if ages.length > 4:\n{pad}    ages.clear()"])]
+        if k == 23:
+            return [r.choice([f"{pad}seen.insert({n} % 8)", f"{pad}flag = seen.remove({n} % 8)", f"{pad}seen = seen.union({{{n} % 8, 1}})",
+                              f"{pad}seen = seen.intersection({{1, 2, 3, {n} % 8}})", f"{pad}seen = seen.difference({{{n} % 8}})"])]
+        if k == 24 and depth > 0:
+            m = self.loops; self.loops += 1
+            which = r.choice(["nums", "words", "seen"])
+            ty = "str" if which == "words" else "int"
+            lines = [f"{pad}for x{m} in {which}.copy():"]
+            self.locals.append((f"x{m}", ty))
+            lines += self.statements(depth - 1, indent + 1)
+            self.locals.pop()
+            return lines
+        if k == 25 and depth > 0:
+            m = self.loops; self.loops += 1
+            lines = [f"{pad}for (k{m}, v{m}) in ages.copy():"]
+            self.locals += [(f"k{m}", "str"), (f"v{m}", "int")]
+            lines += self.statements(depth - 1, indent + 1)
+            self.locals.pop(); self.locals.pop()
+            return lines
+        return [f"{pad}print(nums, words, ages, seen)"]
+
     def statements(self, depth, indent):
         r = self.rng
         lines = []
         pad = "    " * indent
         saved = list(self.locals)
         for _ in range(r.randint(1, 4)):
-            k = r.randrange(14 if self.in_helper else 20)
+            k = r.randrange(14 if self.in_helper else 26)
+            if k >= 20:
+                lines += self.collection_statement(k, depth, indent)
+                continue
             if k >= 14:
                 lines += self.object_statement(k, depth, indent)
                 continue
@@ -342,6 +390,9 @@ class Gen:
                 "func make(name: str, n: int) -> Tracer:", "    let t = Tracer(name)", "    discard(t.bump(n))", "    return t", "",
                 "func hold(t: Tracer?) -> Holder:", "    return Holder(item = t, count = 1)", "",
                 "func name_of(t: Tracer?) -> str:", "    if let x = t:", "        return x.tag()", "    return \"-\"", "",
+                "func is_small(n: int) -> bool:", "    return n < 100", "",
+                "func halve(n: int) -> int:", "    return n // 2", "",
+                "func sorted_copy(values: list[int]) -> list[int]:", "    return values.sorted()", "",
                 "var_block"]
         return "\n".join(text)
 
@@ -378,11 +429,16 @@ def generate(rng):
     body.append('    var obj = make("o", 1)')
     body.append("    var opt: Tracer? = none")
     body.append("    var h = Holder(item = none, count = 0)")
+    body.append("    var nums = [3, 1, 2]")
+    body.append('    var words = ["b", "a"]')
+    body.append('    var ages = {"a": 1, "b": 2}')
+    body.append("    var seen = {1, 2}")
     body.append("    var sum = 0")
     body.append("    func_mix")
     lines = g.statements(3, 1)
     body += lines
     body.append('    print(f"{sum} {a} {b} {c} {d} {e} {s} {t} {flag} {o else -1} {p} {q.n} {obj.tag()} {name_of(opt)} {name_of(h.item)} {h.count}")')
+    body.append("    print(nums, words, ages, seen)")
     body.append("    return 0")
     text = "\n".join(header + body) + "\n"
     # `mix` reads the locals: written as a nested reading of the same names through a

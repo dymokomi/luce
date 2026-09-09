@@ -33,7 +33,8 @@ and the interpreter follows in its evaluator:
    of a loop body) or when the binding is reassigned: the new value is computed and stored,
    then the old value is released.
 2. A field or element owns its value. It is released when the field is reassigned (after the
-   store) or when the owner is destroyed.
+   store) or when the owner is destroyed: a class's fields last first, a collection's
+   elements in order.
 3. A parameter borrows: calling a function does not retain the arguments, and the callee
    retains what it stores. `self` borrows likewise.
 4. A call returns an owned reference to the caller; a construction is owned; a read of a
@@ -86,6 +87,34 @@ order.
 `Weak(object)` is a value holding a non-owning reference: constructing or copying it raises
 the weak count, dropping it lowers the count, and `.get()` returns the object with a fresh
 strong reference, or `none` once it is dead.
+
+## Text and bytes
+
+A compiled program's `str` is a `Text` object: a header, then the bytes, held and released
+like any object, so that a run leaves no text behind and the exit check covers it. `bytes`
+is the same shape. Every operation that makes text (`+`, an f-string, a slice, `trim`,
+`upper`, `split`, a display) makes a new object owned by whoever asked. A literal is an
+immortal object: its count never moves, it is never released, and it is never counted as
+alive; a literal read is therefore borrowed. Iterating a text yields a new one-scalar text
+per step, owned by the loop's binding. The interpreter's texts are plain values and are
+not counted; the two executions agree because neither reports a text at exit.
+
+## Hashing
+
+`hash(x)` (§4.4) is the same number in both executions: FNV-1a over 64 bits (offset
+14695981039346656037, prime 1099511628211) of the value's canonical bytes, and the result
+reinterpreted as an `int`. The canonical bytes: an `int` is its eight bytes little-endian;
+a `float` the eight bytes of its IEEE encoding, with `-0.0` written as `0.0`; a `bool` one
+byte, 0 or 1; a `str` or `bytes` its bytes then the byte 255 (so that `("a", "b")` and
+`("ab", "")` differ); `unit` nothing; a tuple or struct its members in order; an enum its
+case's index as an `int` then its payload; an optional the byte 0 for `none` or the byte 1
+then the value; a range its two bounds and a byte for inclusion; a list its elements in
+order; a set its elements' hashes summed (as unsigned arithmetic, wrapping); a map each
+entry's key hash times 31 plus its value hash, summed the same way; an `ErrorCode` its
+number. A class hashes as its `Hashable` conformance says, never structurally.
+
+Maps and sets keep insertion order, and removing an entry keeps the order of the rest, so
+iteration and display never depend on the hash.
 
 ## Temporaries in emitted Base
 

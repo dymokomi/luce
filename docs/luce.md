@@ -224,7 +224,8 @@ Every value type has `==` and `!=` by structure: scalars, `str`, `bytes`, tuples
 whose fields have it, enums whose payloads have it, optionals of it, and collections of it.
 `<`, `<=`, `>`, `>=` are defined for `int`, `float`, `str` (scalar-value order, not locale),
 `bytes`, and tuples of those, and for a struct that declares `Ordered` (§13.3). `hash` is
-defined for every equatable value, consistently with `==`. Classes have identity, not
+defined for every equatable value, consistently with `==`, and is the same number in every
+execution (`docs/RUNTIME.md` states the function). Classes have identity, not
 equality: `is` and `is not` compare identity, and `==` on a class is an error unless it
 declares `Equatable` (§13.3).
 
@@ -637,12 +638,18 @@ Maps and sets have identity, keep insertion order, and require equatable and has
 | `split(separator) -> list[str]`, `lines()`, `trim()`, `upper()`, `lower()`, `replace(a, b)`, `repeat(n)` | the common transforms |
 | `bytes()` | the UTF-8 as `bytes` |
 
+`split(separator)` cuts at every occurrence of a non-empty separator, keeping empty pieces,
+so `"a,,b".split(",")` is `["a", "", "b"]`; an empty separator traps. `lines()` cuts at
+`"\n"`, drops a `"\r"` before it, and a trailing newline ends the last line rather than
+opening an empty one. `trim()` removes spaces, tabs and newlines at both ends; `upper()`
+and `lower()` map the ASCII letters; `replace(a, b)` replaces every non-overlapping
+occurrence left to right and traps on an empty `a`; `repeat(n)` traps on a negative `n`.
 Normalisation, grapheme segmentation, collation and locale are library operations.
 
 ### 11.4 `bytes`
 
 Immutable, with `length`, `data[i]` as an `int` 0 to 255, slicing, `+`, equality, and
-`text()`, which decodes UTF-8 and is `str!`. Bytes are what a Base package hands a Luce
+`text()`, which decodes UTF-8 and is `str!`, failing with the message `invalid UTF-8`. Bytes are what a Base package hands a Luce
 program when the data is not text; a Luce program does not compute on bytes, it passes them.
 
 ## 12. Absence and failure

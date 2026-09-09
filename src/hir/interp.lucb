@@ -21,6 +21,7 @@ import front.ast
 import hir.heap
 import hir.value
 import io
+import memory
 import sema.check
 import sema.types
 import strings
@@ -72,15 +73,16 @@ pub struct Interp:
     ## After `main`, the collector runs and what is still alive is reported (RUNTIME).
     pub mutating func run_main(arguments: str[]) -> i64!:
         let main = self.checker.find_declaration("main") else error(fault, "no main")
-        var args = try value.members(value.Kind.list_, arguments.length, none)
-        var i: usize = 0
-        while i < arguments.length:
-            args.items[i] = value.text(arguments[i])
-            i += 1
-        args.count = arguments.length
+        let store = try heap.allocate_collection()
+        for a in arguments:
+            try heap.push(store, value.text(a))
+        let args = value.collection(value.Kind.list_, store)
         var one = try alloc value.Value[1]
         one[0] = args
-        let result = try self.call(main, none, one)
+        let result = self.call(main, none, one) catch failure:
+            heap.release(args)
+            error(failure.code, failure.message)
+        heap.release(args)
         return heap.finish_run(result.i)
 
     ## Run one `test`: fails when the test does.
@@ -93,7 +95,8 @@ pub struct Interp:
     ## `deinit` on an object being destroyed, through the heap's hook: the interpreter's
     ## flow is kept aside, since destruction may happen while a `return` is in flight.
     mutating func run_deinit(o: value.Object*) -> !:
-        let d = self.checker.find_member(o.decl, "deinit") else return
+        let owner = o.decl else return
+        let d = self.checker.find_member(owner, "deinit") else return
         let flow = self.flow
         let label = self.label
         let carried = self.carried
@@ -361,15 +364,34 @@ pub struct Interp:
                         break
                     i += 1
                 return
-            .list_:
-                count = source.count
+            .list_, .set_:
+                # the kernel's protocol: the check, the bound, the element, the step, the body
+                let store = source.obj else error(fault, "no collection")
+                let version = store.version
                 var i: usize = 0
-                while i < count:
-                    if source.count != count:
-                        trap("the list changed while it was iterated")
-                    if try self.iteration(s, binding, body, source.items[i]):
+                while true:
+                    heap.check(store, version, "set" if source.kind == value.Kind.set_ else "list")
+                    if i >= store.count:
                         break
+                    let element = store.fields[i]
                     i += 1
+                    if try self.iteration(s, binding, body, element):
+                        break
+                return
+            .map_:
+                let store = source.obj else error(fault, "no map")
+                let version = store.version
+                var i: usize = 0
+                while true:
+                    heap.check(store, version, "map")
+                    if i >= store.count:
+                        break
+                    var pair = try value.members(value.Kind.tuple, 2, none)
+                    pair.items[0] = store.fields[i]
+                    pair.items[1] = store.fields[i + 1]
+                    i += 2
+                    if try self.iteration(s, binding, body, pair):
+                        break
                 return
             .text:
                 let b = source.s.bytes
@@ -559,10 +581,11 @@ pub struct Interp:
             .index:
                 let receiver = e.left else error(fault, "no receiver")
                 let index_expr = e.body else error(fault, "no index")
-                let container = try self.place(receiver)
+                let container = try self.eval(receiver)
+                let store = container.obj else error(fault, "no list")
                 let index = try self.eval(index_expr)
-                let i = try checked_index(index.i, container.count)
-                return &container.items[i]
+                let i = try checked_index(index.i, store.count)
+                return &store.fields[i]
             _: error(fault, "not a place")
 
     ## The `self` parameter of the function whose frame is current.
@@ -591,6 +614,16 @@ pub struct Interp:
             return
         if s.text == "=":
             let v = try self.eval_owned(value_expr)
+            if place_expr.kind == ast.Kind.index:
+                let receiver = place_expr.left else return
+                if self.checker.table.kind(receiver.type_id) == types.Kind.map_:
+                    # `m[key] = v`: an insertion or a replacement, the map's own key and value
+                    let index_expr = place_expr.body else return
+                    let m = try self.eval(receiver)
+                    let store = m.obj else error(fault, "no map")
+                    let key = try self.eval_owned(index_expr)
+                    try heap.map_set(store, key, v)
+                    return
             let cell = try self.place(place_expr)
             let old = *cell
             *cell = v
@@ -660,6 +693,31 @@ pub struct Interp:
                     cursor = m.next
                 return (t, true)
             .unit_: return (value.nothing(), true)
+            .list_lit:
+                let store = try heap.allocate_collection()
+                var cursor = e.body
+                while let item = cursor:
+                    try heap.push(store, try self.eval_owned(item))
+                    cursor = item.next
+                return (value.collection(value.Kind.list_, store), true)
+            .set_lit:
+                let store = try heap.allocate_collection()
+                var cursor = e.body
+                while let item = cursor:
+                    try heap.set_insert(store, try self.eval_owned(item))
+                    cursor = item.next
+                return (value.collection(value.Kind.set_, store), true)
+            .map_lit:
+                let store = try heap.allocate_collection()
+                var cursor = e.body
+                while let entry = cursor:
+                    let k = entry.left else error(fault, "no key")
+                    let v = entry.right else error(fault, "no value")
+                    let key = try self.eval_owned(k)
+                    try heap.map_set(store, key, try self.eval_owned(v))
+                    cursor = entry.next
+                let kind = value.Kind.set_ if self.checker.table.kind(e.type_id) == types.Kind.set_ else value.Kind.map_
+                return (value.collection(kind, store), true)
             .call: return (try self.call_expr(e), true)
             .member: return try self.member(e)
             .index:
@@ -670,8 +728,13 @@ pub struct Interp:
                 if container.kind == value.Kind.blob:
                     let i = try checked_index(index.i, container.b.length)
                     return (value.integer((i64)container.b[i]), true)
-                let i = try checked_index(index.i, container.count)
-                return (try heap.copy(container.items[i]), true)
+                if container.kind == value.Kind.map_:
+                    let items = value.elements(container)
+                    let at = value.find_in(items, index, 2) else return (value.absent(), true)
+                    return (try heap.copy(items[at + 1]), true)
+                let items = value.elements(container)
+                let i = try checked_index(index.i, items.length)
+                return (try heap.copy(items[i]), true)
             .slice: return (try self.slice(e), true)
             .else_:
                 let l = e.left else error(fault, "no value")
@@ -780,18 +843,31 @@ pub struct Interp:
             match b.kind:
                 .text: return value.boolean(strings.contains(b.s, a.s))
                 .range_: return value.boolean(a.i >= b.i and (a.i <= b.hi if b.inclusive else a.i < b.hi))
-                .list_:
-                    var i: usize = 0
-                    while i < b.count:
-                        if value.equal(b.items[i], a):
-                            return value.boolean(true)
-                        i += 1
-                    return value.boolean(false)
+                .list_, .set_:
+                    let store = b.obj else error(fault, "no collection")
+                    return value.boolean(heap.find(store, a) != none)
+                .map_:
+                    return value.boolean(value.find_in(value.elements(b), a, 2) != none)
                 _: error(fault, "`in` over this value")
+        if a.kind == value.Kind.list_:
+            # `a + b`: a new list of both
+            let x = value.elements(a)
+            let y = value.elements(b)
+            let store = try heap.allocate_collection()
+            for item in x:
+                try heap.push(store, try heap.copy(item))
+            for item in y:
+                try heap.push(store, try heap.copy(item))
+            return value.collection(value.Kind.list_, store)
         return try self.arithmetic(op, a, b)
 
     ## `a op b` for the arithmetic operators (§6.2): checked on `int`, IEEE on `float`.
     mutating func arithmetic(op: str, a: value.Value, b: value.Value) -> value.Value!:
+        if a.kind == value.Kind.blob:
+            var joined = try alloc u8[a.b.length + b.b.length]
+            memory.copy(joined, a.b, a.b.length)
+            memory.copy(joined[a.b.length..], b.b, b.b.length)
+            return value.blob(joined[..<a.b.length + b.b.length])
         if a.kind == value.Kind.text:
             let joined = try alloc u8[a.s.length + b.s.length]
             var i: usize = 0
@@ -844,16 +920,12 @@ pub struct Interp:
                 try check_bounds(low, high, n)
                 return value.blob(v.b[(usize)low..<(usize)high])
             .list_:
-                let n = (i64)v.count
+                let store = v.obj else error(fault, "no list")
+                let n = (i64)store.count
                 if e.has(ast.flag_no_high):
                     high = n
                 try check_bounds(low, high, n)
-                var out = try value.members(value.Kind.list_, (usize)(high - low), none)
-                var i: usize = 0
-                while i < (usize)(high - low):
-                    out.items[i] = try heap.copy(v.items[(usize)low + i])
-                    i += 1
-                return out
+                return value.collection(value.Kind.list_, try heap.sliced(store, (usize)low, (usize)high))
             _: error(fault, "cannot slice this value")
 
     ## A member read: a field's value is an owned copy (RUNTIME 4).
@@ -870,12 +942,21 @@ pub struct Interp:
         if rt.kind == types.Kind.tuple:
             let index = try literals.decode_integer(e.text)
             return (try heap.copy(v.items[(usize)index]), true)
-        if e.text == "length" and (v.kind == value.Kind.text or v.kind == value.Kind.blob or v.kind == value.Kind.list_):
+        if e.text == "length" and (v.kind == value.Kind.text or v.kind == value.Kind.blob or v.kind == value.Kind.list_ or v.kind == value.Kind.set_ or v.kind == value.Kind.map_):
             if v.kind == value.Kind.text:
                 return (value.integer((i64)scalar_length(v.s)), true)
             if v.kind == value.Kind.blob:
                 return (value.integer((i64)v.b.length), true)
-            return (value.integer((i64)v.count), true)
+            if v.kind == value.Kind.map_:
+                return (value.integer((i64)(value.elements(v).length // 2)), true)
+            return (value.integer((i64)value.elements(v).length), true)
+        if v.kind == value.Kind.text and e.text == "byte_count":
+            return (value.integer((i64)v.s.length), true)
+        if v.kind == value.Kind.list_ and (e.text == "first" or e.text == "last"):
+            let items = value.elements(v)
+            if items.length == 0:
+                return (value.absent(), true)
+            return (try heap.copy(items[0] if e.text == "first" else items[items.length - 1]), true)
         if v.kind == value.Kind.failure:
             if e.text == "code":
                 return (value.code(v.i), true)
@@ -902,6 +983,13 @@ pub struct Interp:
             return try self.core_call(e, callee.text)
         if callee.kind == ast.Kind.member and callee.text == "package":
             return value.code(try self.package_code(e))
+        if callee.has(ast.flag_builtin):
+            let k = self.checker.table.kind(callee.type_id)
+            if k == types.Kind.map_ or k == types.Kind.set_:
+                return try self.map_method(e, callee, k == types.Kind.map_)
+            if k == types.Kind.str_ or k == types.Kind.bytes_:
+                return try self.text_method(e, callee)
+            return try self.list_method(e, callee)
         if callee.kind == ast.Kind.member and callee.text == "get" and self.checker.table.kind(callee.type_id) == types.Kind.weak_:
             let receiver = callee.left else error(fault, "no receiver")
             let w = try self.eval(receiver)
@@ -944,6 +1032,322 @@ pub struct Interp:
         if f.items.length > 0:
             return try self.call(d, &f.items[0], args[..<n])
         return try self.call(d, none, args[..<n])
+
+    ## A list's own method (§11.1), the same operation as the kernel's.
+    mutating func list_method(e: ast.Node*, callee: ast.Node*) -> value.Value!:
+        let receiver = callee.left else error(fault, "no receiver")
+        let name = callee.text
+        let l = try self.eval(receiver)
+        let store = l.obj else error(fault, "no list")
+        var args = try alloc value.Value[2]
+        var n: usize = 0
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else error(fault, "empty argument")
+            # a stored value is the list's own; a searched one is borrowed
+            args[n] = try self.eval_owned(v) if name == "append" or name == "insert" else try self.eval(v)
+            n += 1
+            cursor = a.next
+        if name == "append":
+            try heap.append(store, args[0])
+            return value.nothing()
+        if name == "insert":
+            let i = args[0].i
+            if i < 0 or i > (i64)store.count:
+                trap("index out of range")
+            try heap.insert(store, (usize)i, args[1])
+            return value.nothing()
+        if name == "remove_at":
+            let i = try checked_index(args[0].i, store.count)
+            return heap.remove_at(store, i)
+        if name == "pop":
+            if store.count == 0:
+                trap("pop of an empty list")
+            return heap.remove_at(store, store.count - 1)
+        if name == "clear":
+            heap.clear(store)
+            return value.nothing()
+        if name == "contains":
+            return value.boolean(heap.find(store, args[0]) != none)
+        if name == "index_of":
+            let at = heap.find(store, args[0]) else return value.absent()
+            return value.integer((i64)at)
+        if name == "sort":
+            heap.sort(store)
+            return value.nothing()
+        if name == "reverse":
+            heap.reverse(store)
+            return value.nothing()
+        if name == "sorted" or name == "reversed" or name == "copy":
+            let out = try heap.sliced(store, 0, store.count)
+            if name == "sorted":
+                heap.sort(out)
+            elif name == "reversed":
+                heap.reverse(out)
+            return value.collection(value.Kind.list_, out)
+        if name == "join":
+            var b = try strings.Builder.create(64)
+            var i: usize = 0
+            while i < store.count:
+                if i > 0:
+                    try b.put(args[0].s)
+                try b.put(store.fields[i].s)
+                i += 1
+            let out = try strings.copy(b.view())
+            b.destroy()
+            return value.text(out)
+        if name == "map" or name == "filter":
+            let f = args[0]
+            let d = f.decl else error(fault, "not a function")
+            let out = try heap.allocate_collection()
+            var i: usize = 0
+            while i < store.count:
+                var one = try alloc value.Value[1]
+                one[0] = store.fields[i]
+                let r = try self.call(d, &f.items[0] if f.items.length > 0 else none, one)
+                if name == "map":
+                    try heap.push(out, r)
+                elif value.truth(r):
+                    try heap.push(out, try heap.copy(store.fields[i]))
+                i += 1
+            return value.collection(value.Kind.list_, out)
+        error(fault, "an unknown list method")
+
+    ## A map's or a set's own method (§11.2), the same operation as the kernel's.
+    mutating func map_method(e: ast.Node*, callee: ast.Node*, is_map: bool) -> value.Value!:
+        let receiver = callee.left else error(fault, "no receiver")
+        let name = callee.text
+        let m = try self.eval(receiver)
+        let store = m.obj else error(fault, "no collection")
+        var arg = value.nothing()
+        if let first = e.body:
+            let v = first.left else error(fault, "empty argument")
+            arg = try self.eval_owned(v) if name == "insert" else try self.eval(v)
+        if name == "clear":
+            heap.clear(store)
+            return value.nothing()
+        if name == "copy":
+            let out = try heap.sliced(store, 0, store.count)
+            return value.collection(m.kind, out)
+        if is_map:
+            if name == "remove":
+                let out = heap.map_remove(store, arg) else return value.absent()
+                return out
+            let out = try heap.allocate_collection()
+            var i: usize = 0
+            while i < store.count:
+                if name == "keys":
+                    try heap.push(out, try heap.copy(store.fields[i]))
+                elif name == "values":
+                    try heap.push(out, try heap.copy(store.fields[i + 1]))
+                else:
+                    var pair = try value.members(value.Kind.tuple, 2, none)
+                    pair.items[0] = try heap.copy(store.fields[i])
+                    pair.items[1] = try heap.copy(store.fields[i + 1])
+                    try heap.push(out, pair)
+                i += 2
+            return value.collection(value.Kind.list_, out)
+        if name == "insert":
+            try heap.set_insert(store, arg)
+            return value.nothing()
+        if name == "remove":
+            return value.boolean(heap.set_remove(store, arg))
+        # union, intersection, difference: a new set
+        let other = arg.obj else error(fault, "no set")
+        let out = try heap.allocate_collection()
+        var i: usize = 0
+        if name == "union":
+            while i < store.count:
+                try heap.push(out, try heap.copy(store.fields[i]))
+                i += 1
+            i = 0
+            while i < other.count:
+                try heap.set_insert(out, try heap.copy(other.fields[i]))
+                i += 1
+        else:
+            while i < store.count:
+                let present = heap.find(other, store.fields[i]) != none
+                if present == (name == "intersection"):
+                    try heap.push(out, try heap.copy(store.fields[i]))
+                i += 1
+        return value.collection(value.Kind.set_, out)
+
+    ## A text's or bytes' own method (§11.3, §11.4), the same operation as the kernel's.
+    mutating func text_method(e: ast.Node*, callee: ast.Node*) -> value.Value!:
+        let receiver = callee.left else error(fault, "no receiver")
+        let name = callee.text
+        let v = try self.eval(receiver)
+        var args = try alloc value.Value[2]
+        var n: usize = 0
+        var cursor = e.body
+        while let a = cursor:
+            let arg = a.left else error(fault, "empty argument")
+            args[n] = try self.eval(arg)
+            n += 1
+            cursor = a.next
+        if v.kind == value.Kind.blob:
+            if name == "text":
+                if not valid_utf8(v.b):
+                    return try self.raise(0, "invalid UTF-8")
+                return value.text(try strings.copy((str)v.b))
+            error(fault, "an unknown bytes method")
+        let text = v.s
+        if name == "contains":
+            return value.boolean(find_bytes(text.bytes, args[0].s.bytes, 0) != none)
+        if name == "starts_with":
+            return value.boolean(args[0].s.length <= text.length and (str)text.bytes[..<args[0].s.length] == args[0].s)
+        if name == "ends_with":
+            return value.boolean(args[0].s.length <= text.length and (str)text.bytes[text.length - args[0].s.length..] == args[0].s)
+        if name == "index_of":
+            let at = find_bytes(text.bytes, args[0].s.bytes, 0) else return value.absent()
+            return value.integer((i64)scalar_length((str)text.bytes[..<at]))
+        if name == "split":
+            let separator = args[0].s
+            if separator.length == 0:
+                trap("split needs a separator")
+            let out = try heap.allocate_collection()
+            var start: usize = 0
+            while true:
+                let at = find_bytes(text.bytes, separator.bytes, start) else break
+                try heap.push(out, value.text(try strings.copy((str)text.bytes[start..<at])))
+                start = at + separator.length
+            try heap.push(out, value.text(try strings.copy((str)text.bytes[start..])))
+            return value.collection(value.Kind.list_, out)
+        if name == "lines":
+            let out = try heap.allocate_collection()
+            let b = text.bytes
+            var start: usize = 0
+            var i: usize = 0
+            while i < b.length:
+                if b[i] == '\n':
+                    var end = i
+                    if end > start and b[end - 1] == '\r':
+                        end -= 1
+                    try heap.push(out, value.text(try strings.copy((str)b[start..<end])))
+                    start = i + 1
+                i += 1
+            if start < b.length:
+                try heap.push(out, value.text(try strings.copy((str)b[start..])))
+            return value.collection(value.Kind.list_, out)
+        if name == "trim":
+            let b = text.bytes
+            var start: usize = 0
+            var end = b.length
+            while start < end and is_space(b[start]):
+                start += 1
+            while end > start and is_space(b[end - 1]):
+                end -= 1
+            return value.text((str)b[start..<end])
+        if name == "upper" or name == "lower":
+            var out = try alloc u8[text.length]
+            var i: usize = 0
+            while i < text.length:
+                let byte = text.bytes[i]
+                if name == "upper":
+                    out[i] = byte - 32 if byte >= 'a' and byte <= 'z' else byte
+                else:
+                    out[i] = byte + 32 if byte >= 'A' and byte <= 'Z' else byte
+                i += 1
+            return value.text((str)out)
+        if name == "replace":
+            let old = args[0].s
+            let new_text = args[1].s
+            if old.length == 0:
+                trap("replace needs a text to replace")
+            var b = try strings.Builder.create(64)
+            var start: usize = 0
+            while true:
+                let at = find_bytes(text.bytes, old.bytes, start) else break
+                try b.put((str)text.bytes[start..<at])
+                try b.put(new_text)
+                start = at + old.length
+            try b.put((str)text.bytes[start..])
+            let out = try strings.copy(b.view())
+            b.destroy()
+            return value.text(out)
+        if name == "repeat":
+            if args[0].i < 0:
+                trap("repeat of a negative count")
+            var b = try strings.Builder.create(64)
+            var i: i64 = 0
+            while i < args[0].i:
+                try b.put(text)
+                i += 1
+            let out = try strings.copy(b.view())
+            b.destroy()
+            return value.text(out)
+        if name == "bytes":
+            return value.blob(text.bytes)
+        error(fault, "an unknown text method")
+
+    ## `hash(x)` (§4.4): FNV-1a over the value's canonical bytes, walked with its static
+    ## type, the same number the runtime computes.
+    mutating func hash_value(h: u64, t: u32, v: value.Value) -> u64:
+        let ty = self.checker.table.get(t)
+        match ty.kind:
+            .int_: return hash_int(h, v.i)
+            .float_:
+                let normal = 0.0 if v.f == 0.0 else v.f
+                return hash_int(h, (i64)normal.bits())
+            .bool_: return hash_byte(h, 1 if v.i != 0 else 0)
+            .str_: return hash_byte(hash_bytes(h, v.s.bytes), 255)
+            .bytes_: return hash_byte(hash_bytes(h, v.b), 255)
+            .unit_: return h
+            .error_code: return hash_int(h, v.i)
+            .range_: return hash_byte(hash_int(hash_int(h, v.i), v.hi), 1 if v.inclusive else 0)
+            .optional:
+                if v.kind == value.Kind.absent:
+                    return hash_byte(h, 0)
+                return self.hash_value(hash_byte(h, 1), ty.elem, v)
+            .tuple:
+                var out = h
+                var i: usize = 0
+                while i < ty.args.length:
+                    out = self.hash_value(out, ty.args[i], v.items[i])
+                    i += 1
+                return out
+            .struct_:
+                let d = ty.decl else return h
+                var out = h
+                var i: usize = 0
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.field:
+                        out = self.hash_value(out, m.type_id, v.items[i])
+                        i += 1
+                    cursor = m.next
+                return out
+            .enum_:
+                var out = hash_int(h, v.i)
+                let case_node = v.case_node else return out
+                var i: usize = 0
+                var cursor = case_node.body
+                while let field = cursor:
+                    out = self.hash_value(out, field.type_id, v.items[i])
+                    i += 1
+                    cursor = field.next
+                return out
+            .list_:
+                var out = h
+                for item in value.elements(v):
+                    out = self.hash_value(out, ty.elem, item)
+                return out
+            .set_:
+                var sum: u64 = 0
+                for item in value.elements(v):
+                    sum = sum +% self.hash_value(hash_offset, ty.elem, item)
+                return hash_int(h, (i64)sum)
+            .map_:
+                var sum: u64 = 0
+                let items = value.elements(v)
+                var i: usize = 0
+                while i < items.length:
+                    let k = self.hash_value(hash_offset, ty.elem, items[i])
+                    let w = self.hash_value(hash_offset, self.checker.table.map_value(t), items[i + 1])
+                    sum = sum +% (k *% 31 +% w)
+                    i += 2
+                return hash_int(h, (i64)sum)
+            _: return h
 
     ## The cell a method's receiver lives in: a place's cell, or a fresh cell holding a
     ## temporary that the statement's pool keeps alive.
@@ -1082,6 +1486,9 @@ pub struct Interp:
             let v = try self.eval(arg)
             let o = v.obj else error(fault, "no object")
             return heap.weak_make(o)
+        if name == "hash":
+            let v = try self.eval(arg)
+            return value.integer((i64)self.hash_value(hash_offset, arg.type_id, v))
         let v = try self.eval(arg)
         if name == "int":
             if v.kind == value.Kind.floating:
@@ -1127,6 +1534,76 @@ pub func attach(me: Interp*):
     heap.finisher_context = (void*)me
 
 # mark: Helpers ================================================================================
+
+func find_bytes(haystack: const u8[], needle: const u8[], start: usize) -> usize?:
+    if needle.length == 0:
+        return start
+    var i = start
+    while i + needle.length <= haystack.length:
+        var k: usize = 0
+        while k < needle.length and haystack[i + k] == needle[k]:
+            k += 1
+        if k == needle.length:
+            return i
+        i += 1
+    return none
+
+func is_space(byte: u8) -> bool:
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r'
+
+## Whether bytes are UTF-8: the kernel's rule (§11.4).
+func valid_utf8(b: const u8[]) -> bool:
+    var i: usize = 0
+    while i < b.length:
+        let lead = b[i]
+        var n: usize = 0
+        if lead < 0x80:
+            n = 0
+        elif lead >= 0xC2 and lead <= 0xDF:
+            n = 1
+        elif lead >= 0xE0 and lead <= 0xEF:
+            n = 2
+        elif lead >= 0xF0 and lead <= 0xF4:
+            n = 3
+        else:
+            return false
+        var k: usize = 1
+        while k <= n:
+            if i + k >= b.length or (b[i + k] & 0xC0) != 0x80:
+                return false
+            k += 1
+        if n == 2 and lead == 0xE0 and b[i + 1] < 0xA0:
+            return false
+        if n == 2 and lead == 0xED and b[i + 1] >= 0xA0:
+            return false
+        if n == 3 and lead == 0xF0 and b[i + 1] < 0x90:
+            return false
+        if n == 3 and lead == 0xF4 and b[i + 1] >= 0x90:
+            return false
+        i += n + 1
+    return true
+
+## FNV-1a over 64 bits (docs/RUNTIME.md), as the kernel computes it.
+let hash_offset: u64 = 14695981039346656037
+
+func hash_byte(h: u64, b: u8) -> u64:
+    return (h ^ (u64)b) *% 1099511628211
+
+func hash_bytes(h: u64, data: const u8[]) -> u64:
+    var out = h
+    for b in data:
+        out = hash_byte(out, b)
+    return out
+
+func hash_int(h: u64, i: i64) -> u64:
+    var out = h
+    var bits = (u64)i
+    var k: u32 = 0
+    while k < 8:
+        out = hash_byte(out, (u8)(bits & 255))
+        bits = bits >> 8
+        k += 1
+    return out
 
 ## A parameter or a field of the list, `self` and methods excluded.
 func counts_as_param(p: ast.Node*, skip_self: bool) -> bool:

@@ -37,6 +37,22 @@ pub struct Emitter:
     ## Types holding references, whose copy, drop, trace and pool functions are emitted
     ## after the program.
     var lifetimes: list.List[u32]
+    ## Types whose `==` and ordering need a function of their own (collections, and what
+    ## holds them), emitted after the program.
+    var equalities: list.List[u32]
+    var orderings: list.List[u32]
+    ## Types hashed (§4.4) and types that are a collection's elements, each with a
+    ## function or an operations table of its own after the program.
+    var hashes: list.List[u32]
+    var ops_types: list.List[u32]
+    ## How many of each list are written out, since writing one set of functions can
+    ## register more; `support_functions` runs until nothing new appears.
+    var shown_done: usize
+    var lifetimes_done: usize
+    var equalities_done: usize
+    var orderings_done: usize
+    var hashes_done: usize
+    var ops_done: usize
     ## Whether the statement being written pooled a temporary, so it needs a drain.
     var pooled: bool
     ## Inside a match statement, where a bound payload is copied at the arm's start and
@@ -48,6 +64,9 @@ pub struct Emitter:
     pub static func over(checker: check.Checker*) -> Emitter!:
         return Emitter(checker = checker, out = try buffer.Buffer.create(65536), indent = 0, temps = 0,
                        shown = try list.List[u32].create(16), lifetimes = try list.List[u32].create(16),
+                       equalities = try list.List[u32].create(16), orderings = try list.List[u32].create(16),
+                       hashes = try list.List[u32].create(16), ops_types = try list.List[u32].create(16),
+                       shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, raw_payloads = false, self_name = "self")
 
     pub func text() -> str:
@@ -133,13 +152,22 @@ pub struct Emitter:
                 .test_: discard(0)
                 _: discard(0)
             cursor = d.next
-        try self.show_functions()
-        try self.lifetime_functions()
+        let args_type = try self.checker.table.list_of(types.str_id)
+        let args_info = try self.lifetime_name("L_info_", args_type)
+        let args_ops = try self.ops_name(types.str_id)
         try self.line("pub func main(arguments: str[]) -> i32:")
-        try self.line("    let status = L_main(kernel.list_from_args(arguments)) catch failure:")
+        try self.begin("    let args = kernel.list_from_args(&")
+        try self.put(args_info)
+        try self.put(", ")
+        try self.put(args_ops)
+        try self.put(", arguments[1..])")
+        try self.end()
+        try self.line("    let status = L_main(args) catch failure:")
         try self.line("        kernel.print_error(failure.message)")
         try self.line("        return 1")
+        try self.line("    heap.release((heap.Object*)args)")
         try self.line("    return heap.finish_run(i32(status))")
+        try self.support_functions()
 
     mutating func constant(d: ast.Node*) -> !:
         let init = d.left else return
@@ -499,9 +527,19 @@ pub struct Emitter:
                     try self.put(" -> ")
                     try self.type_of(t.elem)
             .list_:
-                try self.put("kernel.ListStore[")
+                try self.put("kernel.List[")
                 try self.type_of(t.elem)
                 try self.put("]*")
+            .map_:
+                try self.put("kernel.Map[")
+                try self.type_of(t.elem)
+                try self.put(", ")
+                try self.type_of(self.checker.table.map_value(id))
+                try self.put("]*")
+            .set_:
+                try self.put("kernel.Map[")
+                try self.type_of(t.elem)
+                try self.put(", u8]*")
             .struct_, .enum_:
                 try self.put("L_")
                 try self.put(t.name)
@@ -654,6 +692,39 @@ pub struct Emitter:
                 i += 1
                 cursor = part.next
             return
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.map_:
+                # `m[key] = v`: an insertion or a replacement, the map's own key and value
+                try self.begin("kernel.map_set[")
+                try self.map_types(receiver.type_id)
+                try self.put("](")
+                try self.use(receiver)
+                try self.put(", ")
+                try self.owned(index)
+                try self.put(", ")
+                try self.owned(value)
+                try self.put(")")
+                try self.end()
+                return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.list_:
+                # `values[i] = x`, or `values[i] op= x` as the operation then the store
+                try self.begin("kernel.list_set[")
+                try self.type_of(place.type_id)
+                try self.put("](")
+                try self.use(receiver)
+                try self.put(", ")
+                try self.use(index)
+                try self.put(", ")
+                if s.text == "=":
+                    try self.owned(value)
+                else:
+                    let op = (str)s.text.bytes[..<s.text.length - 1]
+                    try self.arithmetic(op, place.type_id, place, value)
+                try self.put(")")
+                try self.end()
+                return
         if s.text == "=" and self.checker.table.has_references(place.type_id):
             let n = try self.temp("new")
             try self.begin("let ")
@@ -682,6 +753,20 @@ pub struct Emitter:
 
     ## `place = name`, the old value dropped after the store when it held references.
     mutating func store(place: ast.Node*, name: str) -> !:
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            try self.begin("kernel.list_set[")
+            try self.type_of(place.type_id)
+            try self.put("](")
+            try self.use(receiver)
+            try self.put(", ")
+            try self.use(index)
+            try self.put(", ")
+            try self.put(name)
+            try self.put(")")
+            try self.end()
+            return
         if self.checker.table.has_references(place.type_id):
             let old = try self.temp("old")
             try self.begin("let ")
@@ -918,28 +1003,164 @@ pub struct Emitter:
                 try self.block(body)
                 self.indent -= 1
             .list_:
+                # the runtime's protocol: the check, the bound, the element, the step, the body
                 let store = try self.temp("store")
+                let version = try self.temp("version")
+                let i = try self.temp("i")
                 try self.begin("let ")
                 try self.put(store)
                 try self.put(" = ")
-                try self.expr(seq)
+                try self.use(seq)
+                try self.end()
+                try self.begin("let ")
+                try self.put(version)
+                try self.put(" = ")
+                try self.put(store)
+                try self.put(".version")
+                try self.end()
+                try self.begin("var ")
+                try self.put(i)
+                try self.put(": usize = 0")
                 try self.end()
                 try self.begin("")
                 if label.length > 0:
                     try self.put(label)
                     try self.put(": ")
-                try self.put("for L_")
-                try self.put(binding.text)
-                try self.put(" in ")
-                try self.put(store)
-                try self.put(".items[..<")
-                try self.put(store)
-                try self.put(".count]:")
+                try self.put("while true:")
                 try self.end()
                 self.indent += 1
+                try self.begin("kernel.list_check[")
+                try self.type_of(st.elem)
+                try self.put("](")
+                try self.put(store)
+                try self.put(", ")
+                try self.put(version)
+                try self.put(")")
+                try self.end()
+                try self.begin("if ")
+                try self.put(i)
+                try self.put(" >= ")
+                try self.put(store)
+                try self.put(".count:")
+                try self.end()
+                try self.line("    break")
+                try self.begin("let L_")
+                try self.put(binding.text)
+                try self.put(" = ")
+                if self.checker.table.has_references(st.elem):
+                    try self.put(try self.lifetime_name("L_copy_", st.elem))
+                    try self.put("(")
+                    try self.put(store)
+                    try self.put(".items[")
+                    try self.put(i)
+                    try self.put("])")
+                else:
+                    try self.put(store)
+                    try self.put(".items[")
+                    try self.put(i)
+                    try self.put("]")
+                try self.end()
+                try self.drop_at_exit(binding.text, st.elem)
+                try self.begin("")
+                try self.put(i)
+                try self.put(" += 1")
+                try self.end()
                 try self.block(body)
                 self.indent -= 1
-            _: return try self.fail(seq, "iterating this compiles in the collections slice")
+            .map_, .set_:
+                let store = try self.temp("store")
+                let version = try self.temp("version")
+                let i = try self.temp("i")
+                let is_map = st.kind == types.Kind.map_
+                try self.begin("let ")
+                try self.put(store)
+                try self.put(" = ")
+                try self.use(seq)
+                try self.end()
+                try self.begin("let ")
+                try self.put(version)
+                try self.put(" = ")
+                try self.put(store)
+                try self.put(".version")
+                try self.end()
+                try self.begin("var ")
+                try self.put(i)
+                try self.put(": usize = 0")
+                try self.end()
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("while true:")
+                try self.end()
+                self.indent += 1
+                try self.begin("kernel.map_check[")
+                try self.map_types(seq.type_id)
+                try self.put("](")
+                try self.put(store)
+                try self.put(", ")
+                try self.put(version)
+                try self.put(")")
+                try self.end()
+                try self.begin("if ")
+                try self.put(i)
+                try self.put(" >= ")
+                try self.put(store)
+                try self.put(".count:")
+                try self.end()
+                try self.line("    break")
+                let value_type = self.checker.table.map_value(seq.type_id) if is_map else types.unit_id
+                if is_map and binding.body != none:
+                    # `for (k, v) in m`: each its own copy
+                    var part = binding.body
+                    var which: usize = 0
+                    while let name = part:
+                        if not name.has(ast.flag_wildcard):
+                            try self.begin("let L_")
+                            try self.put(name.text)
+                            try self.put(" = ")
+                            try self.element_copy(st.elem if which == 0 else value_type, store, ".keys[" if which == 0 else ".values[", i)
+                            try self.end()
+                            try self.drop_at_exit(name.text, name.type_id)
+                        which += 1
+                        part = name.next
+                elif is_map:
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = (")
+                    try self.element_copy(st.elem, store, ".keys[", i)
+                    try self.put(", ")
+                    try self.element_copy(value_type, store, ".values[", i)
+                    try self.put(")")
+                    try self.end()
+                    try self.drop_at_exit(binding.text, binding.type_id)
+                else:
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = ")
+                    try self.element_copy(st.elem, store, ".keys[", i)
+                    try self.end()
+                    try self.drop_at_exit(binding.text, st.elem)
+                try self.begin("")
+                try self.put(i)
+                try self.put(" += 1")
+                try self.end()
+                try self.block(body)
+                self.indent -= 1
+            _: return try self.fail(seq, "iterating this compiles in a later slice")
+
+    ## `store.keys[i]` or the like, copied when the element holds references.
+    mutating func element_copy(t: u32, store: str, member: str, i: str) -> !:
+        let holds = self.checker.table.has_references(t)
+        if holds:
+            try self.put(try self.lifetime_name("L_copy_", t))
+            try self.put("(")
+        try self.put(store)
+        try self.put(member)
+        try self.put(i)
+        try self.put("]")
+        if holds:
+            try self.put(")")
 
     # -- match ----------------------------------------------------------------------------
 
@@ -1285,6 +1506,87 @@ pub struct Emitter:
                     try self.put(",")
                 try self.put(")")
             .unit_: try self.put("()")
+            .list_lit:
+                let t = self.checker.table.get(e.type_id)
+                if e.body == none:
+                    try self.put("kernel.list_new[")
+                    try self.type_of(t.elem)
+                    try self.put("](&")
+                else:
+                    try self.put("kernel.list_of[")
+                    try self.type_of(t.elem)
+                    try self.put("](&")
+                try self.put(try self.lifetime_name("L_info_", e.type_id))
+                try self.put(", ")
+                try self.put(try self.ops_name(t.elem))
+                if e.body != none:
+                    try self.put(", [")
+                    var cursor = e.body
+                    var first = true
+                    while let item = cursor:
+                        if not first:
+                            try self.put(", ")
+                        first = false
+                        try self.owned(item)
+                        cursor = item.next
+                    try self.put("]")
+                try self.put(")")
+            .set_lit, .map_lit:
+                let t = self.checker.table.get(e.type_id)
+                if t.kind == types.Kind.set_:
+                    try self.put("kernel.set_of[" if e.body != none else "kernel.set_new[")
+                    try self.type_of(t.elem)
+                    try self.put("](&")
+                    try self.put(try self.lifetime_name("L_info_", e.type_id))
+                    try self.put(", ")
+                    try self.put(try self.ops_name(t.elem))
+                    if e.body != none:
+                        try self.put(", [")
+                        var cursor = e.body
+                        var first = true
+                        while let item = cursor:
+                            if not first:
+                                try self.put(", ")
+                            first = false
+                            try self.owned(item)
+                            cursor = item.next
+                        try self.put("]")
+                    try self.put(")")
+                else:
+                    let value_type = self.checker.table.map_value(e.type_id)
+                    try self.put("kernel.map_of[" if e.body != none else "kernel.map_new[")
+                    try self.type_of(t.elem)
+                    try self.put(", ")
+                    try self.type_of(value_type)
+                    try self.put("](&")
+                    try self.put(try self.lifetime_name("L_info_", e.type_id))
+                    try self.put(", ")
+                    try self.put(try self.ops_name(t.elem))
+                    try self.put(", ")
+                    try self.put(try self.ops_name(value_type))
+                    if e.body != none:
+                        try self.put(", [")
+                        var cursor = e.body
+                        var first = true
+                        while let entry = cursor:
+                            let k = entry.left else return
+                            if not first:
+                                try self.put(", ")
+                            first = false
+                            try self.owned(k)
+                            cursor = entry.next
+                        try self.put("], [")
+                        cursor = e.body
+                        first = true
+                        while let entry = cursor:
+                            let v = entry.right else return
+                            if not first:
+                                try self.put(", ")
+                            first = false
+                            try self.owned(v)
+                            cursor = entry.next
+                        try self.put("]")
+                    try self.put(")")
             .call: try self.call(e)
             .member: try self.member(e)
             .index:
@@ -1308,6 +1610,14 @@ pub struct Emitter:
                     try self.put(", ")
                     try self.use(index)
                     try self.put(")")
+                elif rt.kind == types.Kind.map_:
+                    try self.put("kernel.map_get[")
+                    try self.map_types(receiver.type_id)
+                    try self.put("](")
+                    try self.use(receiver)
+                    try self.put(", ")
+                    try self.use(index)
+                    try self.put(")")
                 else:
                     return try self.fail(e, "indexing this compiles in the collections slice")
             .slice:
@@ -1318,8 +1628,10 @@ pub struct Emitter:
                 elif rt.kind == types.Kind.bytes_:
                     try self.put("kernel.slice_bytes(")
                 else:
-                    return try self.fail(e, "slicing a list compiles in the collections slice")
-                try self.expr(receiver)
+                    try self.put("kernel.list_slice[")
+                    try self.type_of(rt.elem)
+                    try self.put("](")
+                try self.use(receiver)
                 try self.put(", ")
                 if let low = e.body:
                     try self.expr(low)
@@ -1473,9 +1785,38 @@ pub struct Emitter:
                 try self.expr(r)
                 try self.put(")")
                 return
-            return try self.fail(e, "`in` over a collection compiles in the collections slice")
+            if rt.kind == types.Kind.list_:
+                try self.put("kernel.list_contains[")
+                try self.type_of(rt.elem)
+                try self.put("](")
+                try self.use(r)
+                try self.put(", ")
+                try self.use(l)
+                try self.put(")")
+                return
+            if rt.kind == types.Kind.map_ or rt.kind == types.Kind.set_:
+                try self.put("kernel.map_contains[")
+                try self.map_types(r.type_id)
+                try self.put("](")
+                try self.use(r)
+                try self.put(", ")
+                try self.use(l)
+                try self.put(")")
+                return
+            return try self.fail(e, "`in` over this compiles in a later slice")
         if op == "==" or op == "!=" or op == "<" or op == "<=" or op == ">" or op == ">=":
             let lt = l.type_id
+            if (op == "==" or op == "!=") and self.needs_equality(lt):
+                # a collection compares by contents (§4.4), so does what holds one
+                if op == "!=":
+                    try self.put("not ")
+                try self.put(try self.equality_name(lt))
+                try self.put("(")
+                try self.use(l)
+                try self.put(", ")
+                try self.use(r)
+                try self.put(")")
+                return
             if (op != "==" and op != "!=") and (lt == types.str_id or lt == types.bytes_id or self.checker.table.kind(lt) == types.Kind.tuple):
                 try self.compare_by_call(op, l, r)
                 return
@@ -1554,6 +1895,22 @@ pub struct Emitter:
             try self.expr(r)
             try self.put(")")
             return
+        if t == types.bytes_id and op == "+":
+            try self.put("kernel.concat_bytes(")
+            try self.use(l)
+            try self.put(", ")
+            try self.use(r)
+            try self.put(")")
+            return
+        if self.checker.table.kind(t) == types.Kind.list_ and op == "+":
+            try self.put("kernel.list_concat[")
+            try self.type_of(self.checker.table.get(t).elem)
+            try self.put("](")
+            try self.use(l)
+            try self.put(", ")
+            try self.use(r)
+            try self.put(")")
+            return
         if t == types.int_id:
             if op == "/":
                 try self.put("(f64(")
@@ -1612,6 +1969,18 @@ pub struct Emitter:
             if copies:
                 try self.put(")")
             return
+        if e.text == "byte_count" and rt.kind == types.Kind.str_:
+            try self.put("(i64)(")
+            try self.use(receiver)
+            try self.put(").length")
+            return
+        if e.text == "length" and (rt.kind == types.Kind.map_ or rt.kind == types.Kind.set_):
+            try self.put("kernel.map_length[")
+            try self.map_types(receiver.type_id)
+            try self.put("](")
+            try self.use(receiver)
+            try self.put(")")
+            return
         if e.text == "length" and (rt.kind == types.Kind.str_ or rt.kind == types.Kind.bytes_ or rt.kind == types.Kind.list_):
             if rt.kind == types.Kind.str_:
                 try self.put("kernel.scalar_length(")
@@ -1625,8 +1994,15 @@ pub struct Emitter:
                 try self.put("kernel.list_length[")
                 try self.type_of(rt.elem)
                 try self.put("](")
-                try self.expr(receiver)
+                try self.use(receiver)
                 try self.put(")")
+            return
+        if rt.kind == types.Kind.list_ and e.has(ast.flag_builtin):
+            try self.put("kernel.list_first[" if e.text == "first" else "kernel.list_last[")
+            try self.type_of(rt.elem)
+            try self.put("](")
+            try self.use(receiver)
+            try self.put(")")
             return
         if rt.kind == types.Kind.error_value:
             try self.expr(receiver)
@@ -1665,6 +2041,15 @@ pub struct Emitter:
             return
         if callee.kind == ast.Kind.case_value:
             try self.case_value(callee, e.body)
+            return
+        if callee.has(ast.flag_builtin):
+            let k = self.checker.table.kind(callee.type_id)
+            if k == types.Kind.map_ or k == types.Kind.set_:
+                try self.map_method(e, callee, k == types.Kind.map_)
+            elif k == types.Kind.str_ or k == types.Kind.bytes_:
+                try self.text_method(e, callee)
+            else:
+                try self.list_method(e, callee)
             return
         if callee.kind == ast.Kind.member and callee.text == "get" and self.checker.table.kind(callee.type_id) == types.Kind.weak_:
             # `weak.get()`: the object with a reference of its own, or none (§10.4)
@@ -1727,6 +2112,122 @@ pub struct Emitter:
                     try self.put(d.text)
                 try self.arguments(e, d.right, true, false)
             _: return try self.fail(e, "a call this slice does not compile")
+
+    ## A list's own method (§11.1), one kernel call each.
+    mutating func list_method(e: ast.Node*, callee: ast.Node*) -> !:
+        let receiver = callee.left else return
+        let lt = self.checker.table.get(callee.type_id)
+        let name = callee.text
+        if name == "join":
+            try self.put("kernel.list_join(")
+        elif name == "map":
+            try self.put("kernel.list_map[")
+            try self.type_of(lt.elem)
+            try self.put(", ")
+            try self.type_of(self.checker.table.get(e.type_id).elem)
+            try self.put("](")
+        else:
+            try self.put("kernel.list_")
+            try self.put(name)
+            try self.put("[")
+            try self.type_of(lt.elem)
+            try self.put("](")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            # a stored value is the list's own; anything else is borrowed for the call
+            if name == "append" or name == "insert":
+                try self.owned(v)
+            else:
+                try self.use(v)
+            cursor = a.next
+        if name == "map":
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(self.checker.table.get(e.type_id).elem))
+        try self.put(")")
+
+    ## A text's or bytes' own method (§11.3, §11.4), one kernel call each.
+    mutating func text_method(e: ast.Node*, callee: ast.Node*) -> !:
+        let receiver = callee.left else return
+        let name = callee.text
+        if callee.type_id == types.bytes_id:
+            try self.put("kernel.decode_text(")
+            try self.use(receiver)
+            try self.put(")")
+            return
+        if name == "contains":
+            try self.put("kernel.contains(")
+        elif name == "bytes":
+            try self.put("(")
+            try self.use(receiver)
+            try self.put(").bytes")
+            return
+        else:
+            try self.put("kernel.")
+            try self.put(name)
+            try self.put("(")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            try self.use(v)
+            cursor = a.next
+        if name == "split" or name == "lines":
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(types.str_id))
+        try self.put(")")
+
+    ## `K, V` of a map, or `T, unit` of a set, as type arguments.
+    mutating func map_types(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.type_of(t.elem)
+        try self.put(", ")
+        if t.kind == types.Kind.map_:
+            try self.type_of(self.checker.table.map_value(id))
+        else:
+            try self.put("u8")
+
+    ## A map's or a set's own method (§11.2), one kernel call each.
+    mutating func map_method(e: ast.Node*, callee: ast.Node*, is_map: bool) -> !:
+        let receiver = callee.left else return
+        let name = callee.text
+        if is_map or name == "clear" or name == "copy":
+            try self.put("kernel.map_")
+            try self.put(name)
+        else:
+            try self.put("kernel.set_")
+            try self.put(name)
+        try self.put("[")
+        if is_map or name == "clear" or name == "copy":
+            try self.map_types(callee.type_id)
+        else:
+            try self.type_of(self.checker.table.get(callee.type_id).elem)
+        try self.put("](")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            if name == "insert":
+                try self.owned(v)
+            else:
+                try self.use(v)
+            cursor = a.next
+        if name == "keys" or name == "values" or name == "items":
+            # a new list: its descriptor and its element operations
+            let result = self.checker.table.get(e.type_id)
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(result.elem))
+        try self.put(")")
 
     ## A call through a function value: Base's function pointer, positional arguments.
     mutating func call_value(e: ast.Node*, callee: ast.Node*) -> !:
@@ -1867,6 +2368,13 @@ pub struct Emitter:
             try self.use(arg)
             try self.put(")")
             return
+        if name == "hash":
+            try self.put("(i64)")
+            try self.put(try self.hash_name(arg.type_id))
+            try self.put("(")
+            try self.use(arg)
+            try self.put(")")
+            return
         let t = arg.type_id
         if name == "int":
             try self.put("kernel.to_int(" if t == types.float_id else "kernel.parse_int(")
@@ -1934,14 +2442,27 @@ pub struct Emitter:
         let half = self.checker.scratch.length // 2
         return try copy_name(try format(self.checker.scratch[half..], f"{prefix}{t}"))
 
+    ## Every function and table the program's types need, each written once; writing one
+    ## can register more, so the sets are walked until nothing new appears.
+    mutating func support_functions() -> !:
+        while true:
+            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count
+            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done
+            if before == done:
+                return
+            try self.show_functions()
+            try self.lifetime_functions()
+            try self.comparison_functions()
+            try self.hash_functions()
+            try self.ops_tables()
+
     ## The functions of every type holding references the program used, and of the types
     ## those reach; the list grows while it is walked.
     mutating func lifetime_functions() -> !:
-        var i: usize = 0
-        while i < self.lifetimes.count:
-            let t = self.lifetimes.get(i)
+        while self.lifetimes_done < self.lifetimes.count:
+            let t = self.lifetimes.get(self.lifetimes_done)
+            self.lifetimes_done += 1
             try self.lifetime_function_set(t)
-            i += 1
 
     mutating func lifetime_function_set(id: u32) -> !:
         let t = self.checker.table.get(id)
@@ -1949,7 +2470,7 @@ pub struct Emitter:
         try self.lifetime_head("L_copy_", id, ") -> ", id)
         self.indent += 1
         match t.kind:
-            .class_:
+            .class_, .list_, .map_, .set_:
                 try self.begin("return (")
                 try self.type_of(id)
                 try self.put(")heap.retain((heap.Object*)v)")
@@ -2054,7 +2575,7 @@ pub struct Emitter:
         # pool: a temporary of the statement, and the drop through a pointer it needs
         try self.lifetime_head("L_pool_", id, ") -> ", id)
         self.indent += 1
-        if t.kind == types.Kind.class_:
+        if self.is_object_kind(t.kind):
             try self.begin("return (")
             try self.type_of(id)
             try self.put(")heap.pool_object((heap.Object*)v)")
@@ -2068,7 +2589,7 @@ pub struct Emitter:
             try self.end()
         self.indent -= 1
         try self.line("")
-        if t.kind != types.Kind.class_:
+        if not self.is_object_kind(t.kind):
             try self.begin("func ")
             try self.put(try self.lifetime_name("L_dropp_", id))
             try self.put("(p: void*):")
@@ -2081,9 +2602,10 @@ pub struct Emitter:
             try self.end()
             try self.line("")
         # identity, and a weak reference's get, for a class and its optional
-        if t.kind == types.Kind.class_ or (t.kind == types.Kind.optional and self.checker.table.kind(t.elem) == types.Kind.class_):
+        let inner = self.checker.table.kind(t.elem) if t.kind == types.Kind.optional else t.kind
+        if self.is_object_kind(t.kind) or (t.kind == types.Kind.optional and self.is_object_kind(inner)):
             try self.lifetime_head("L_id_", id, ") -> usize:", types.none_id)
-            if t.kind == types.Kind.class_:
+            if t.kind != types.Kind.optional:
                 try self.line("    return (usize)v")
             else:
                 try self.line("    if let o = v:")
@@ -2104,6 +2626,486 @@ pub struct Emitter:
             try self.end()
             try self.line("    return none")
             try self.line("")
+        if self.is_object_kind(t.kind) and t.kind != types.Kind.class_:
+            try self.collection_support(id, t)
+
+    func is_object_kind(k: types.Kind) -> bool:
+        return k == types.Kind.class_ or k == types.Kind.list_ or k == types.Kind.map_ or k == types.Kind.set_
+
+    ## What a collection needs beside its lifetime functions: the runtime's descriptor and
+    ## the drop and trace it calls; the element operations come per element type.
+    mutating func collection_support(id: u32, t: types.Type) -> !:
+        let drop = try self.lifetime_name("L_colldrop_", id)
+        let trace = try self.lifetime_name("L_colltrace_", id)
+        let is_list = t.kind == types.Kind.list_
+        try self.begin("func ")
+        try self.put(drop)
+        try self.put("(o: heap.Object*):")
+        try self.end()
+        try self.begin("    kernel.list_drop[" if is_list else "    kernel.map_drop[")
+        if is_list:
+            try self.type_of(t.elem)
+        else:
+            try self.map_types(id)
+        try self.put("](o)")
+        try self.end()
+        try self.line("")
+        try self.begin("func ")
+        try self.put(trace)
+        try self.put("(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):")
+        try self.end()
+        try self.begin("    kernel.list_trace[" if is_list else "    kernel.map_trace[")
+        if is_list:
+            try self.type_of(t.elem)
+        else:
+            try self.map_types(id)
+        try self.put("](o, visit, context)")
+        try self.end()
+        try self.line("")
+        try self.begin("var ")
+        try self.put(try self.lifetime_name("L_info_", id))
+        try self.put(": heap.Info = heap.Info(name = \"")
+        try self.put("list" if is_list else "map" if t.kind == types.Kind.map_ else "set")
+        try self.put("\", size = sizeof(")
+        try self.type_of_object(id)
+        try self.put("), finish = none, drop = ")
+        try self.put(drop)
+        try self.put(", trace = ")
+        try self.put(trace)
+        try self.put(")")
+        try self.end()
+        try self.line("")
+        discard(try self.ops_name(t.elem))
+        if t.kind == types.Kind.map_:
+            discard(try self.ops_name(self.checker.table.map_value(id)))
+
+    ## The collection's Base struct, `kernel.List[T]` without the star.
+    mutating func type_of_object(id: u32) -> !:
+        let start = self.out.used
+        try self.type_of(id)
+        let text = try self.capture(start)
+        try self.put((str)text.bytes[..<text.length - 1])
+
+    ## The operations table of an element type, emitted after the program.
+    mutating func ops_name(t: u32) -> str!:
+        try self.remember(&self.ops_types, t)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_ops_{t}"))
+
+    mutating func ops_tables() -> !:
+        while self.ops_done < self.ops_types.count:
+            let elem = self.ops_types.get(self.ops_done)
+            self.ops_done += 1
+            try self.begin("var ")
+            try self.put(try self.ops_name(elem))
+            try self.put(": kernel.Ops[")
+            try self.type_of(elem)
+            try self.put("] = kernel.Ops[")
+            try self.type_of(elem)
+            try self.put("](copy = ")
+            let holds = self.checker.table.has_references(elem)
+            try self.put(try self.lifetime_name("L_copy_", elem) if holds else "none")
+            try self.put(", drop = ")
+            try self.put(try self.lifetime_name("L_drop_", elem) if holds else "none")
+            try self.put(", trace = ")
+            try self.put(try self.lifetime_name("L_trace_", elem) if holds else "none")
+            try self.put(", equal = ")
+            let equatable = bodies.equatable(self.checker, elem)
+            try self.put(try self.equality_name(elem) if equatable else "none")
+            try self.put(", compare = ")
+            try self.put(try self.ordering_name(elem) if bodies.orderable(self.checker, elem) else "none")
+            try self.put(", hashed = ")
+            try self.put(try self.hash_name(elem) if equatable else "none")
+            try self.put(")")
+            try self.end()
+
+    # -- hashing ------------------------------------------------------------------------
+
+    ## The function hashing a value of the type from the runtime's offset, and the one
+    ## folding it into a hash so far (docs/RUNTIME.md).
+    mutating func hash_name(t: u32) -> str!:
+        try self.remember(&self.hashes, t)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_hash_{t}"))
+
+    mutating func hash_in_name(t: u32) -> str!:
+        try self.remember(&self.hashes, t)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_hashin_{t}"))
+
+    mutating func hash_functions() -> !:
+        while self.hashes_done < self.hashes.count:
+            let t = self.hashes.get(self.hashes_done)
+            self.hashes_done += 1
+            try self.hash_function(t)
+
+    mutating func hash_function(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.begin("func ")
+        try self.put(try self.hash_name(id))
+        try self.put("(v: ")
+        try self.type_of(id)
+        try self.put(") -> u64:")
+        try self.end()
+        try self.begin("    return ")
+        try self.put(try self.hash_in_name(id))
+        try self.put("(kernel.hash_offset, v)")
+        try self.end()
+        try self.line("")
+        try self.begin("func ")
+        try self.put(try self.hash_in_name(id))
+        try self.put("(h: u64, v: ")
+        try self.type_of(id)
+        try self.put(") -> u64:")
+        try self.end()
+        self.indent += 1
+        match t.kind:
+            .int_: try self.line("return kernel.hash_int(h, v)")
+            .float_: try self.line("return kernel.hash_float(h, v)")
+            .bool_: try self.line("return kernel.hash_bool(h, v)")
+            .str_: try self.line("return kernel.hash_text(h, v)")
+            .bytes_: try self.line("return kernel.hash_blob(h, v)")
+            .unit_: try self.line("return h")
+            .error_code: try self.line("return kernel.hash_int(h, (i64)v)")
+            .range_: try self.line("return kernel.hash_range(h, v)")
+            .optional:
+                try self.line("if let inner = v:")
+                try self.begin("    return ")
+                try self.put(try self.hash_in_name(t.elem))
+                try self.put("(kernel.hash_byte(h, 1), inner)")
+                try self.end()
+                try self.line("return kernel.hash_byte(h, 0)")
+            .tuple:
+                try self.line("var out = h")
+                var i: usize = 0
+                while i < t.args.length:
+                    try self.begin("out = ")
+                    try self.put(try self.hash_in_name(t.args[i]))
+                    try self.put("(out, v.")
+                    try self.put_u64((u64)i)
+                    try self.put(")")
+                    try self.end()
+                    i += 1
+                try self.line("return out")
+            .struct_:
+                let d = t.decl else return
+                try self.line("var out = h")
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.field:
+                        try self.begin("out = ")
+                        try self.put(try self.hash_in_name(m.type_id))
+                        try self.put("(out, v.L_")
+                        try self.put(m.text)
+                        try self.put(")")
+                        try self.end()
+                    cursor = m.next
+                try self.line("return out")
+            .enum_:
+                let d = t.decl else return
+                try self.line("match v:")
+                self.indent += 1
+                var index: i64 = 0
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.enum_case:
+                        try self.begin(".L_")
+                        try self.put(m.text)
+                        if m.body != none:
+                            try self.put("(")
+                            var p = m.body
+                            var first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(", ")
+                                first = false
+                                try self.put("L_")
+                                try self.put(field.text)
+                                p = field.next
+                            try self.put(")")
+                        try self.put(":")
+                        try self.end()
+                        self.indent += 1
+                        try self.begin("var out = kernel.hash_int(h, ")
+                        try self.put_u64((u64)index)
+                        try self.put(")")
+                        try self.end()
+                        var p = m.body
+                        while let field = p:
+                            try self.begin("out = ")
+                            try self.put(try self.hash_in_name(field.type_id))
+                            try self.put("(out, L_")
+                            try self.put(field.text)
+                            try self.put(")")
+                            try self.end()
+                            p = field.next
+                        try self.line("return out")
+                        self.indent -= 1
+                        index += 1
+                    cursor = m.next
+                self.indent -= 1
+            .list_:
+                try self.line("var out = h")
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    out = ")
+                try self.put(try self.hash_in_name(t.elem))
+                try self.put("(out, v.items[i])")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return out")
+            .set_:
+                try self.begin("return kernel.hash_int(h, (i64)kernel.set_hash[")
+                try self.type_of(t.elem)
+                try self.put("](v))")
+                try self.end()
+            .map_:
+                try self.begin("return kernel.hash_int(h, (i64)kernel.map_hash[")
+                try self.map_types(id)
+                try self.put("](v))")
+                try self.end()
+            _: return try self.fail(t.decl else self.checker.tree(), "a type the emitter cannot hash")
+        self.indent -= 1
+        try self.line("")
+
+    # -- equality and ordering functions ------------------------------------------------
+
+    ## Whether `==` on the type is a call: a collection, or a value holding one, since Base's
+    ## own `==` on the pointer would compare identity.
+    func needs_equality(id: u32) -> bool:
+        let t = self.checker.table.get(id)
+        match t.kind:
+            .list_, .map_, .set_, .bytes_: return true
+            .optional: return self.needs_equality(t.elem)
+            .tuple:
+                for m in t.args:
+                    if self.needs_equality(m):
+                        return true
+                return false
+            .struct_, .enum_:
+                let d = t.decl else return false
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.field and self.needs_equality(m.type_id):
+                        return true
+                    if m.kind == ast.Kind.enum_case:
+                        var p = m.body
+                        while let field = p:
+                            if self.needs_equality(field.type_id):
+                                return true
+                            p = field.next
+                    cursor = m.next
+                return false
+            _: return false
+
+    ## The function comparing two values of the type for equality, emitted after the
+    ## program.
+    mutating func equality_name(t: u32) -> str!:
+        try self.remember(&self.equalities, t)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_eq_{t}"))
+
+    ## The function ordering two values of the type: -1, 0, 1.
+    mutating func ordering_name(t: u32) -> str!:
+        try self.remember(&self.orderings, t)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"L_cmp_{t}"))
+
+    mutating func remember(where: list.List[u32]*, t: u32) -> !:
+        var i: usize = 0
+        while i < where.count:
+            if where.get(i) == t:
+                return
+            i += 1
+        try where.push(t)
+
+    mutating func comparison_functions() -> !:
+        while self.equalities_done < self.equalities.count:
+            let t = self.equalities.get(self.equalities_done)
+            self.equalities_done += 1
+            try self.equality_function(t)
+        while self.orderings_done < self.orderings.count:
+            let t = self.orderings.get(self.orderings_done)
+            self.orderings_done += 1
+            try self.ordering_function(t)
+
+    mutating func equality_function(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.begin("func ")
+        try self.put(try self.equality_name(id))
+        try self.put("(a: ")
+        try self.type_of(id)
+        try self.put(", b: ")
+        try self.type_of(id)
+        try self.put(") -> bool:")
+        try self.end()
+        self.indent += 1
+        match t.kind:
+            .list_:
+                try self.begin("return kernel.list_equal[")
+                try self.type_of(t.elem)
+                try self.put("](a, b)")
+                try self.end()
+            .map_:
+                try self.begin("return kernel.map_equal[")
+                try self.map_types(id)
+                try self.put("](a, b)")
+                try self.end()
+            .set_:
+                try self.begin("return kernel.set_equal[")
+                try self.type_of(t.elem)
+                try self.put("](a, b)")
+                try self.end()
+            .bytes_: try self.line("return kernel.compare_bytes(a, b) == 0")
+            .optional:
+                try self.line("if let x = a:")
+                try self.line("    if let y = b:")
+                try self.begin("        return ")
+                try self.put(try self.member_equality(t.elem, "x", "y"))
+                try self.end()
+                try self.line("    return false")
+                try self.line("return b == none")
+            .tuple:
+                try self.begin("return ")
+                var i: usize = 0
+                while i < t.args.length:
+                    if i > 0:
+                        try self.put(" and ")
+                    let half = self.checker.scratch.length // 2
+                    let x = try copy_name(try format(self.checker.scratch[half..], f"a.{i}"))
+                    let y = try copy_name(try format(self.checker.scratch[half..], f"b.{i}"))
+                    try self.put(try self.member_equality(t.args[i], x, y))
+                    i += 1
+                try self.end()
+            .struct_:
+                let d = t.decl else return
+                try self.begin("return ")
+                var cursor = d.body
+                var first = true
+                while let m = cursor:
+                    if m.kind == ast.Kind.field:
+                        if not first:
+                            try self.put(" and ")
+                        first = false
+                        let half = self.checker.scratch.length // 2
+                        let x = try copy_name(try format(self.checker.scratch[half..], f"a.L_{m.text}"))
+                        let y = try copy_name(try format(self.checker.scratch[half..], f"b.L_{m.text}"))
+                        try self.put(try self.member_equality(m.type_id, x, y))
+                    cursor = m.next
+                if first:
+                    try self.put("true")
+                try self.end()
+            .enum_:
+                let d = t.decl else return
+                try self.line("match a:")
+                self.indent += 1
+                var cursor = d.body
+                while let m = cursor:
+                    if m.kind == ast.Kind.enum_case:
+                        try self.begin(".L_")
+                        try self.put(m.text)
+                        if m.body != none:
+                            try self.put("(")
+                            var p = m.body
+                            var first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(", ")
+                                first = false
+                                try self.put("x_")
+                                try self.put(field.text)
+                                p = field.next
+                            try self.put(")")
+                        try self.put(":")
+                        try self.end()
+                        self.indent += 1
+                        try self.line("match b:")
+                        try self.begin("    .L_")
+                        try self.put(m.text)
+                        if m.body != none:
+                            try self.put("(")
+                            var p = m.body
+                            var first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(", ")
+                                first = false
+                                try self.put("y_")
+                                try self.put(field.text)
+                                p = field.next
+                            try self.put("): return ")
+                            p = m.body
+                            first = true
+                            while let field = p:
+                                if not first:
+                                    try self.put(" and ")
+                                first = false
+                                let half = self.checker.scratch.length // 2
+                                let x = try copy_name(try format(self.checker.scratch[half..], f"x_{field.text}"))
+                                let y = try copy_name(try format(self.checker.scratch[half..], f"y_{field.text}"))
+                                try self.put(try self.member_equality(field.type_id, x, y))
+                                p = field.next
+                        else:
+                            try self.put(": return true")
+                        try self.end()
+                        try self.line("    _: return false")
+                        self.indent -= 1
+                    cursor = m.next
+                self.indent -= 1
+            _: try self.line("return a == b")
+        self.indent -= 1
+        try self.line("")
+
+    ## `x == y` as text, through the type's function where it needs one.
+    mutating func member_equality(t: u32, x: str, y: str) -> str!:
+        let half = self.checker.scratch.length // 2
+        if self.needs_equality(t):
+            return try copy_name(try format(self.checker.scratch[half..], f"{try self.equality_name(t)}({x}, {y})"))
+        if t == types.bytes_id:
+            return try copy_name(try format(self.checker.scratch[half..], f"(kernel.compare_bytes({x}, {y}) == 0)"))
+        return try copy_name(try format(self.checker.scratch[half..], f"({x} == {y})"))
+
+    mutating func ordering_function(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.begin("func ")
+        try self.put(try self.ordering_name(id))
+        try self.put("(a: ")
+        try self.type_of(id)
+        try self.put(", b: ")
+        try self.type_of(id)
+        try self.put(") -> i64:")
+        try self.end()
+        self.indent += 1
+        match t.kind:
+            .int_, .float_, .bool_: try self.line("return -1 if a < b else 1 if a > b else 0")
+            .str_: try self.line("return kernel.compare_text(a, b)")
+            .bytes_: try self.line("return kernel.compare_bytes(a, b)")
+            .tuple:
+                var i: usize = 0
+                while i < t.args.length:
+                    let c = try self.temp("c")
+                    try self.begin("let ")
+                    try self.put(c)
+                    try self.put(" = ")
+                    try self.put(try self.ordering_name(t.args[i]))
+                    try self.put("(a.")
+                    try self.put_u64((u64)i)
+                    try self.put(", b.")
+                    try self.put_u64((u64)i)
+                    try self.put(")")
+                    try self.end()
+                    try self.begin("if ")
+                    try self.put(c)
+                    try self.put(" != 0:")
+                    try self.end()
+                    try self.begin("    return ")
+                    try self.put(c)
+                    try self.end()
+                    i += 1
+                try self.line("return 0")
+            _: return try self.fail(self.checker.tree(), "a type the emitter cannot order")
+        self.indent -= 1
+        try self.line("")
 
     ## `func NAME(v: T` and what follows; a result type when `result` is given.
     mutating func lifetime_head(prefix: str, id: u32, tail: str, result: u32) -> !:
@@ -2133,7 +3135,7 @@ pub struct Emitter:
     ## `extra` appended to the arguments.
     mutating func walk_references(t: types.Type, id: u32, prefix: str, extra: str) -> !:
         match t.kind:
-            .class_:
+            .class_, .list_, .map_, .set_:
                 try self.line("if (usize)v != 0:")
                 if prefix == "L_drop_":
                     try self.line("    heap.release((heap.Object*)v)")
@@ -2235,11 +3237,10 @@ pub struct Emitter:
             _: return try self.fail(t.decl else self.checker.tree(), "a type whose references the emitter cannot walk")
 
     mutating func show_functions() -> !:
-        var i: usize = 0
-        while i < self.shown.count:
-            let t = self.shown.get(i)
+        while self.shown_done < self.shown.count:
+            let t = self.shown.get(self.shown_done)
+            self.shown_done += 1
             try self.show_function(t)
-            i += 1
 
     mutating func show_function(id: u32) -> !:
         let t = self.checker.table.get(id)
@@ -2252,6 +3253,38 @@ pub struct Emitter:
         try self.end()
         self.indent += 1
         match t.kind:
+            .list_:
+                try self.line("var parts = kernel.parts()")
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.add_part(&parts, ")
+                try self.put(try self.show_name(t.elem))
+                try self.put("(v.items[i]))")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return kernel.bracketed(parts, \"[\", \"]\")")
+            .set_:
+                try self.line("var parts = kernel.parts()")
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.add_part(&parts, ")
+                try self.put(try self.show_name(t.elem))
+                try self.put("(v.keys[i]))")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return kernel.bracketed(parts, \"{\", \"}\")")
+            .map_:
+                try self.line("var parts = kernel.parts()")
+                try self.line("var i: usize = 0")
+                try self.line("while i < v.count:")
+                try self.begin("    kernel.add_part(&parts, kernel.join([")
+                try self.put(try self.show_name(t.elem))
+                try self.put("(v.keys[i]), \": \", ")
+                try self.put(try self.show_name(self.checker.table.map_value(id)))
+                try self.put("(v.values[i])]))")
+                try self.end()
+                try self.line("    i += 1")
+                try self.line("return kernel.bracketed(parts, \"{\", \"}\")")
             .unit_: try self.line("return \"()\"")
             .error_code: try self.line("return kernel.join([\"ErrorCode(\", kernel.show_int((i64)v), \")\"])")
             .error_value: try self.line("return v.message")
