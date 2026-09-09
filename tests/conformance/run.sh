@@ -7,12 +7,14 @@
 set -eu
 cd "$(dirname "$0")/../.."
 export LUCE_BASE=${LUCE_BASE:-$PWD/build/luce-base/build/luce-base}
+run() { python3 tools/run_case.py -- "$@"; }
+reject() { python3 tools/run_case.py --expected 1 -- "$@"; }
 programs=0
 rejections=0
 parsed=0
 # every program the suite holds parses, whatever slice runs it
 for f in $(find tests/conformance tests/programs -name '*.luc' -not -path '*/errors/*' | sort); do
-    ./build/luce parse "$f" > /dev/null
+    run ./build/luce parse "$f" > /dev/null
     parsed=$((parsed + 1))
 done
 # a program is a file beside its `.expect`, or a directory of modules whose entry is
@@ -25,18 +27,21 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         echo "== $src"
         if ls "$(dirname "$src")"/*.lucb > /dev/null 2>&1; then
             # a program importing a Base module is built, never run in the interpreter (§16)
-            if ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
+            if reject ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
                 echo "FAIL $src: the interpreter ran a program that imports a Base module"; exit 1
+            else
+                rc=$?
+                [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
             fi
             grep -q "the interpreter runs Luce alone" build/conformance.err || { echo "FAIL $src: [$(cat build/conformance.err)]"; exit 1; }
         else
-            ./build/luce run "$src" > build/conformance.out
+            run ./build/luce run "$src" > build/conformance.out
             cmp build/conformance.out "$f"
         fi
         # the emitted Base through every generator luce-base has
         for flags in "" "--release" "--native"; do
-            ./build/luce build "$src" -o build/conformance $flags
-            ./build/conformance > build/conformance.out
+            run ./build/luce build "$src" -o build/conformance $flags
+            run ./build/conformance > build/conformance.out
             cmp build/conformance.out "$f"
         done
         programs=$((programs + 1))
@@ -49,7 +54,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         echo "== $src (tests)"
         if grep -q ' failed$' "$f"; then want_status=1; else want_status=0; fi
         for flags in "" "--build" "--build --native"; do
-            ./build/luce test "$src" $flags > build/conformance.out 2>&1 && status=0 || status=$?
+            python3 tools/run_case.py --expected "$want_status" -- ./build/luce test "$src" $flags > build/conformance.out 2>&1 && status=0 || status=$?
             [ "$status" -eq "$want_status" ] || { echo "FAIL $src ($flags): status $status, expected $want_status: [$(cat build/conformance.out)]"; exit 1; }
             cmp build/conformance.out "$f"
         done
@@ -60,7 +65,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         [ -e "$f" ] || continue
         src="${f%.doc}.luc"
         echo "== $src (doc)"
-        ./build/luce doc "$src" > build/conformance.out
+        run ./build/luce doc "$src" > build/conformance.out
         cmp build/conformance.out "$f"
         programs=$((programs + 1))
     done
@@ -71,7 +76,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         src="${f%.explain}.luc"
         echo "== $src (explain)"
         while IFS='|' read -r place want; do
-            got=$(./build/luce explain "$src:$place" 2>&1) || { echo "FAIL $src:$place: [$got]"; exit 1; }
+            got=$(run ./build/luce explain "$src:$place" 2>&1) || { echo "FAIL $src:$place: [$got]"; exit 1; }
             [ "$got" = "$want" ] || { echo "FAIL $src:$place: expected [$want], got [$got]"; exit 1; }
         done < "$f"
         programs=$((programs + 1))
@@ -82,14 +87,20 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         src="${f%.trap}.luc"
         want=$(cat "$f")
         echo "== $src (traps)"
-        if ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
+        if reject ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
             echo "FAIL $src: expected a trap, the program finished"; exit 1
+        else
+            rc=$?
+            [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
         fi
         grep -q "$want" build/conformance.err || { echo "FAIL $src: expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
-        for flags in "" "--native"; do
-            ./build/luce build "$src" -o build/conformance $flags
-            if ./build/conformance > build/conformance.out 2> build/conformance.err; then
+        for flags in "" "--release" "--native"; do
+            run ./build/luce build "$src" -o build/conformance $flags
+            if reject ./build/conformance > build/conformance.out 2> build/conformance.err; then
                 echo "FAIL $src ($flags): expected a trap, the compiled program finished"; exit 1
+            else
+                rc=$?
+                [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
             fi
             grep -q "$want" build/conformance.err || { echo "FAIL $src ($flags): expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
         done
@@ -99,7 +110,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         [ -e "$f" ] || continue
         want=$(LC_ALL=C sed -n 's/^# error: //p' "$f")
         [ -n "$want" ] || continue
-        got=$(./build/luce check "$f" 2>&1) && rc=0 || rc=$?
+        got=$(reject ./build/luce check "$f" 2>&1) && rc=0 || rc=$?
         if [ "$rc" -eq 0 ]; then echo "FAIL $f: accepted"; exit 1; fi
         if [ "$rc" -ne 1 ]; then echo "FAIL $f: status $rc: [$got]"; exit 1; fi
         case "$got" in

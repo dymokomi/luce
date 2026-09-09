@@ -3,6 +3,7 @@
 set -eu
 cd "$(dirname "$0")"
 ./build.sh
+python3 tools/test_run_case.py
 base=build/luce-base/build/luce-base
 export LUCE_BASE=$PWD/$base
 python3 tools/embed_version.py --check
