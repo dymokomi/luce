@@ -241,11 +241,17 @@ pub struct Emitter:
                 try self.end()
             k += 1
         try self.line("")
+        # the literal objects come before the declarations: a constant of the program
+        # holds the address of one, and the C backend defines globals in order
+        let start = self.out.used
         k = 0
         while k < self.checker.order.count:
             let tree = self.checker.modules.get((usize)self.checker.order.get(k)).tree
             k += 1
             try self.declarations(tree)
+        let body = try self.capture(start)
+        try self.text_objects()
+        try self.put(body)
         try self.program_tail()
 
     ## The declarations of one module, in order.
@@ -2292,14 +2298,19 @@ pub struct Emitter:
                     try self.put(")")
                     try self.end()
                     return
-        if s.text == "=" and self.checker.table.has_references(place.type_id):
+        if self.checker.table.has_references(place.type_id):
+            # `s = v` and `s += v` on a reference: the new value made, stored, the old dropped
             let n = try self.temp("new")
             try self.begin("let ")
             try self.put(n)
             try self.put(": ")
             try self.type_of(place.type_id)
             try self.put(" = ")
-            try self.owned(value)
+            if s.text == "=":
+                try self.owned(value)
+            else:
+                let op = (str)s.text.bytes[..<s.text.length - 1]
+                try self.arithmetic(op, place.type_id, place, value)
             try self.end()
             try self.store(place, n)
             return
@@ -2533,13 +2544,30 @@ pub struct Emitter:
             try self.put("while true:")
             try self.end()
             self.indent += 1
-            try self.begin("let L_")
-            try self.put(binding.text)
-            try self.put(" = ")
-            try self.method_on(iterator_type, next, it)
-            try self.put(") else break")
-            try self.end()
-            try self.drop_at_exit(binding.text, binding.type_id)
+            if binding.body != none:
+                let elem = try self.temp("elem")
+                try self.begin("let ")
+                try self.put(elem)
+                try self.put(" = ")
+                try self.method_on(iterator_type, next, it)
+                try self.put(") else break")
+                try self.end()
+                if self.checker.table.has_references(binding.type_id):
+                    try self.begin("defer ")
+                    try self.put(try self.lifetime_name("L_drop_", binding.type_id))
+                    try self.put("(")
+                    try self.put(elem)
+                    try self.put(")")
+                    try self.end()
+                try self.bind_parts(binding, elem)
+            else:
+                try self.begin("let L_")
+                try self.put(binding.text)
+                try self.put(" = ")
+                try self.method_on(iterator_type, next, it)
+                try self.put(") else break")
+                try self.end()
+                try self.drop_at_exit(binding.text, binding.type_id)
             try self.block(body)
             self.indent -= 1
             return
@@ -2656,23 +2684,29 @@ pub struct Emitter:
                 try self.put(".count:")
                 try self.end()
                 try self.line("    break")
-                try self.begin("let L_")
-                try self.put(binding.text)
-                try self.put(" = ")
-                if self.checker.table.has_references(st.elem):
-                    try self.put(try self.lifetime_name("L_copy_", st.elem))
-                    try self.put("(")
-                    try self.put(store)
-                    try self.put(".items[")
-                    try self.put(i)
-                    try self.put("])")
+                if binding.body != none:
+                    # `for (a, b) in items`: the parts copied out of the element in place
+                    let half = self.checker.scratch.length // 2
+                    let element = try copy_name(try format(self.checker.scratch[half..], f"{store}.items[{i}]"))
+                    try self.bind_parts(binding, element)
                 else:
-                    try self.put(store)
-                    try self.put(".items[")
-                    try self.put(i)
-                    try self.put("]")
-                try self.end()
-                try self.drop_at_exit(binding.text, st.elem)
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = ")
+                    if self.checker.table.has_references(st.elem):
+                        try self.put(try self.lifetime_name("L_copy_", st.elem))
+                        try self.put("(")
+                        try self.put(store)
+                        try self.put(".items[")
+                        try self.put(i)
+                        try self.put("])")
+                    else:
+                        try self.put(store)
+                        try self.put(".items[")
+                        try self.put(i)
+                        try self.put("]")
+                    try self.end()
+                    try self.drop_at_exit(binding.text, st.elem)
                 try self.begin("")
                 try self.put(i)
                 try self.put(" += 1")
@@ -2746,6 +2780,10 @@ pub struct Emitter:
                     try self.put(")")
                     try self.end()
                     try self.drop_at_exit(binding.text, binding.type_id)
+                elif binding.body != none:
+                    let half = self.checker.scratch.length // 2
+                    let element = try copy_name(try format(self.checker.scratch[half..], f"{store}.keys[{i}]"))
+                    try self.bind_parts(binding, element)
                 else:
                     try self.begin("let L_")
                     try self.put(binding.text)
@@ -2760,6 +2798,31 @@ pub struct Emitter:
                 try self.block(body)
                 self.indent -= 1
             _: return try self.fail(seq, "iterating this compiles in a later slice")
+
+    ## `for (a, b) in items` over a tuple element read at `source`: each named part its own
+    ## copy, dropped when its pass ends; `_` takes nothing.
+    mutating func bind_parts(binding: ast.Node*, source: str) -> !:
+        let members = self.checker.table.get(binding.type_id).args
+        var part = binding.body
+        var which: usize = 0
+        while let name = part:
+            if not name.has(ast.flag_wildcard) and which < members.length:
+                let half = self.checker.scratch.length // 2
+                let member = try copy_name(try format(self.checker.scratch[half..], f"{source}.{which}"))
+                try self.begin("let L_")
+                try self.put(name.text)
+                try self.put(" = ")
+                if self.checker.table.has_references(members[which]):
+                    try self.put(try self.lifetime_name("L_copy_", members[which]))
+                    try self.put("(")
+                    try self.put(member)
+                    try self.put(")")
+                else:
+                    try self.put(member)
+                try self.end()
+                try self.drop_at_exit(name.text, members[which])
+            which += 1
+            part = name.next
 
     ## `store.keys[i]` or the like, copied when the element holds references.
     mutating func element_copy(t: u32, store: str, member: str, i: str) -> !:
