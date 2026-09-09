@@ -74,8 +74,8 @@ A statement suite after `:` is either one simple statement on the same line or a
 followed by a block indented by exactly four spaces. Type and interface bodies always use
 the indented form. Tabs are rejected. A same-line suite holds no compound statement and no
 second statement. Inside brackets, newlines and indentation do not count. A file may nest
-suites and brackets to a fixed depth the compiler states; deeper nesting is a diagnostic,
-never a crash.
+suites, brackets and operators a hundred levels deep, and a chain of calls or operators
+may be three hundred links long; deeper nesting is a diagnostic, never a crash.
 
 ```luce
 if cached: return result

@@ -45,6 +45,11 @@ pub struct Emitter:
     ## function or an operations table of its own after the program.
     var hashes: list.List[u32]
     var ops_types: list.List[u32]
+    ## Text and bytes literals, each an immortal object declared after the program; the
+    ## text, and whether it is bytes.
+    var texts: list.List[str]
+    var texts_are_bytes: list.List[bool]
+    var texts_done: usize
     ## How many of each list are written out, since writing one set of functions can
     ## register more; `support_functions` runs until nothing new appears.
     var shown_done: usize
@@ -55,6 +60,9 @@ pub struct Emitter:
     var ops_done: usize
     ## Whether the statement being written pooled a temporary, so it needs a drain.
     var pooled: bool
+    ## Whether the function being written can fail, so that a drain on the failing path
+    ## (`errdefer`) is possible and needed.
+    var fallible: bool
     ## Inside a match statement, where a bound payload is copied at the arm's start and
     ## the pattern writes its raw name; a match expression borrows the payload as is.
     var raw_payloads: bool
@@ -66,8 +74,9 @@ pub struct Emitter:
                        shown = try list.List[u32].create(16), lifetimes = try list.List[u32].create(16),
                        equalities = try list.List[u32].create(16), orderings = try list.List[u32].create(16),
                        hashes = try list.List[u32].create(16), ops_types = try list.List[u32].create(16),
+                       texts = try list.List[str].create(64), texts_are_bytes = try list.List[bool].create(64), texts_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
-                       pooled = false, raw_payloads = false, self_name = "self")
+                       pooled = false, fallible = false, raw_payloads = false, self_name = "self")
 
     pub func text() -> str:
         return self.out.view()
@@ -101,7 +110,8 @@ pub struct Emitter:
     mutating func temp(prefix: str) -> str!:
         self.temps += 1
         let half = self.checker.scratch.length // 2
-        let name = try format(self.checker.scratch[half..], f"{prefix}{self.temps}")
+        # an underscore keeps `i16` and the like from becoming Base's type names
+        let name = try format(self.checker.scratch[half..], f"{prefix}_{self.temps}")
         return try copy_name(name)
 
     ## The text written since `start`, taken back out of the output.
@@ -119,10 +129,11 @@ pub struct Emitter:
             try self.put(m)
             try self.put(" = heap.mark()")
             try self.end()
-            try self.begin("errdefer heap.drain(")
-            try self.put(m)
-            try self.put(")")
-            try self.end()
+            if self.fallible:
+                try self.begin("errdefer heap.drain(")
+                try self.put(m)
+                try self.put(")")
+                try self.end()
             try self.put(text)
             try self.begin("heap.drain(")
             try self.put(m)
@@ -156,6 +167,7 @@ pub struct Emitter:
         let args_info = try self.lifetime_name("L_info_", args_type)
         let args_ops = try self.ops_name(types.str_id)
         try self.line("pub func main(arguments: str[]) -> i32:")
+        try self.line("    kernel.startup()")
         try self.begin("    let args = kernel.list_from_args(&")
         try self.put(args_info)
         try self.put(", ")
@@ -354,6 +366,7 @@ pub struct Emitter:
         try self.put("*!:" if fallible else "*:")
         try self.end()
         self.indent += 1
+        self.fallible = fallible
         try self.begin("let L_self = (L_")
         try self.put(name)
         try self.put("*)heap.allocate(&L_")
@@ -432,6 +445,7 @@ pub struct Emitter:
     ## `owner` is "" for a free function, "method" for a struct's, an enum's name for its.
     mutating func function(f: ast.Node*, owner: str) -> !:
         let t = self.checker.table.get(f.type_id)
+        self.fallible = self.checker.table.kind(t.elem) == types.Kind.fallible
         var prefix = "func L_"
         if owner == "method":
             if not check.has_self(f):
@@ -489,8 +503,8 @@ pub struct Emitter:
             .int_: try self.put("i64")
             .float_: try self.put("f64")
             .bool_: try self.put("bool")
-            .str_: try self.put("str")
-            .bytes_: try self.put("const u8[]")
+            .str_: try self.put("kernel.Text*")
+            .bytes_: try self.put("kernel.Bytes*")
             .unit_: try self.put("unit")
             .never_: try self.put("never")
             .error_code: try self.put("ErrorCode")
@@ -966,7 +980,7 @@ pub struct Emitter:
                 try self.begin("var ")
                 try self.put(it)
                 try self.put(" = kernel.Scalars.over(")
-                try self.expr(seq)
+                try self.use(seq)
                 try self.put(")")
                 try self.end()
                 try self.begin("")
@@ -980,6 +994,7 @@ pub struct Emitter:
                 try self.put(".next():")
                 try self.end()
                 self.indent += 1
+                try self.drop_at_exit(binding.text, types.str_id)
                 try self.block(body)
                 self.indent -= 1
             .bytes_:
@@ -990,9 +1005,9 @@ pub struct Emitter:
                     try self.put(": ")
                 try self.put("for ")
                 try self.put(raw)
-                try self.put(" in ")
-                try self.expr(seq)
-                try self.put(":")
+                try self.put(" in (")
+                try self.use(seq)
+                try self.put(").data:")
                 try self.end()
                 self.indent += 1
                 try self.begin("let L_")
@@ -1173,8 +1188,8 @@ pub struct Emitter:
         try self.put(" = ")
         try self.use(subject)
         try self.end()
-        if st.kind == types.Kind.tuple:
-            return try self.match_by_tests(s, m, false)
+        if st.kind == types.Kind.tuple or st.kind == types.Kind.str_ or st.kind == types.Kind.bytes_:
+            return try self.match_by_tests(s, m, subject.type_id)
         try self.begin("match ")
         try self.put(m)
         try self.put(":")
@@ -1311,7 +1326,7 @@ pub struct Emitter:
     ## A match over a tuple: one `if` per arm over member tests, a flag saying an arm
     ## applied so a failed guard falls through to the next, and a trap after the chain when
     ## every arm leaves the function, so Base sees the return the checker proved.
-    mutating func match_by_tests(s: ast.Node*, m: str, is_expr: bool) -> !:
+    mutating func match_by_tests(s: ast.Node*, m: str, st: u32) -> !:
         let done = try self.temp("matched")
         try self.begin("var ")
         try self.put(done)
@@ -1330,7 +1345,7 @@ pub struct Emitter:
                         try self.put(" or ")
                     first = false
                     try self.put("(")
-                    try self.tuple_test(pattern, m)
+                    try self.tuple_test(pattern, m, st)
                     try self.put(")")
                     p = pattern.next
                 try self.put(")")
@@ -1358,11 +1373,12 @@ pub struct Emitter:
         if s.has(ast.flag_all_exit):
             try self.line("trap(\"no arm of the match applied\")")
 
-    mutating func tuple_test(p: ast.Node*, m: str) -> !:
+    mutating func tuple_test(p: ast.Node*, m: str, t: u32) -> !:
         if p.has(ast.flag_wildcard) or p.text == "bind":
             try self.put("true")
             return
         if p.text == "tuple":
+            let members = self.checker.table.get(t).args
             var i: usize = 0
             var cursor = p.body
             var first = true
@@ -1372,20 +1388,28 @@ pub struct Emitter:
                 first = false
                 let half = self.checker.scratch.length // 2
                 let member = try format(self.checker.scratch[half..], f"{m}.{i}")
-                try self.tuple_test_member(sub, try copy_name(member))
+                try self.tuple_test_member(sub, try copy_name(member), members[i])
                 i += 1
                 cursor = sub.next
             if first:
                 try self.put("true")
             return
         let v = p.left else return
+        if self.needs_equality(t):
+            try self.put(try self.equality_name(t))
+            try self.put("(")
+            try self.put(m)
+            try self.put(", ")
+            try self.use(v)
+            try self.put(")")
+            return
         try self.put(m)
         try self.put(" == ")
         try self.expr(v)
 
-    mutating func tuple_test_member(p: ast.Node*, member: str) -> !:
+    mutating func tuple_test_member(p: ast.Node*, member: str, t: u32) -> !:
         try self.put("(")
-        try self.tuple_test(p, member)
+        try self.tuple_test(p, member, t)
         try self.put(")")
 
     mutating func tuple_bindings(p: ast.Node*, m: str) -> !:
@@ -1423,6 +1447,10 @@ pub struct Emitter:
                 let d = e.resolved else return false
                 return d.kind != ast.Kind.func_ and d.kind != ast.Kind.constant
             .self_: return true
+            .literal:
+                # a text literal is an immortal object: read, never released
+                let b = e.text.bytes
+                return b.length > 0 and (b[0] == '"' or b[0] == 'r' or b[0] == 'b') and e.text != "b" and e.text != "r"
             .group:
                 let inner = e.left else return false
                 return self.borrowed(inner)
@@ -1594,14 +1622,11 @@ pub struct Emitter:
                 let index = e.body else return
                 let rt = self.checker.table.get(receiver.type_id)
                 if rt.kind == types.Kind.bytes_:
-                    let t = try self.temp_less_receiver(receiver)
-                    try self.put("(i64)")
-                    try self.put(t)
-                    try self.put("[kernel.index(")
-                    try self.expr(index)
+                    try self.put("kernel.byte_at(")
+                    try self.use(receiver)
                     try self.put(", ")
-                    try self.put(t)
-                    try self.put(".length)]")
+                    try self.use(index)
+                    try self.put(")")
                 elif rt.kind == types.Kind.list_:
                     try self.put("kernel.list_get[")
                     try self.type_of(rt.elem)
@@ -1699,10 +1724,10 @@ pub struct Emitter:
             try self.put(e.text)
             return
         if b[0] == '"' or (b[0] == 'r' and b.length > 1 and b[1] == '"'):
-            try self.text_literal(try literals.decode_text(e.text), false)
+            try self.put(try self.text_ref(try literals.decode_text(e.text), false))
             return
         if b[0] == 'b' and b.length > 1 and b[1] == '"':
-            try self.text_literal(try literals.decode_text(e.text), true)
+            try self.put(try self.text_ref((str)(try literals.decode_text(e.text)).bytes, true))
             return
         if literals.is_float_text(e.text):
             try self.put(e.text)
@@ -1773,9 +1798,9 @@ pub struct Emitter:
             let rt = self.checker.table.get(r.type_id)
             if rt.kind == types.Kind.str_:
                 try self.put("kernel.contains(")
-                try self.expr(r)
+                try self.use(r)
                 try self.put(", ")
-                try self.expr(l)
+                try self.use(l)
                 try self.put(")")
                 return
             if rt.kind == types.Kind.range_:
@@ -1852,17 +1877,17 @@ pub struct Emitter:
                 i += 1
             try self.put(")")
             return
-        try self.put("(kernel.compare_bytes(" if lt.kind == types.Kind.bytes_ else "(kernel.compare_text(")
-        try self.expr(l)
+        try self.put("(kernel.compare_blobs(" if lt.kind == types.Kind.bytes_ else "(kernel.compare_text(")
+        try self.use(l)
         try self.put(", ")
-        try self.expr(r)
+        try self.use(r)
         try self.put(") ")
         try self.put(op)
         try self.put(" 0)")
 
     mutating func member_compare(op: str, l: ast.Node*, r: ast.Node*, t: u32, i: usize) -> !:
-        if t == types.str_id:
-            try self.put("(kernel.compare_text(")
+        if t == types.str_id or t == types.bytes_id:
+            try self.put("(kernel.compare_blobs(" if t == types.bytes_id else "(kernel.compare_text(")
             try self.expr(l)
             try self.put(".")
             try self.put_u64((u64)i)
@@ -1890,9 +1915,9 @@ pub struct Emitter:
     mutating func arithmetic(op: str, t: u32, l: ast.Node*, r: ast.Node*) -> !:
         if t == types.str_id and op == "+":
             try self.put("kernel.concat(")
-            try self.expr(l)
+            try self.use(l)
             try self.put(", ")
-            try self.expr(r)
+            try self.use(r)
             try self.put(")")
             return
         if t == types.bytes_id and op == "+":
@@ -1972,7 +1997,7 @@ pub struct Emitter:
         if e.text == "byte_count" and rt.kind == types.Kind.str_:
             try self.put("(i64)(")
             try self.use(receiver)
-            try self.put(").length")
+            try self.put(").data.length")
             return
         if e.text == "length" and (rt.kind == types.Kind.map_ or rt.kind == types.Kind.set_):
             try self.put("kernel.map_length[")
@@ -1984,12 +2009,12 @@ pub struct Emitter:
         if e.text == "length" and (rt.kind == types.Kind.str_ or rt.kind == types.Kind.bytes_ or rt.kind == types.Kind.list_):
             if rt.kind == types.Kind.str_:
                 try self.put("kernel.scalar_length(")
-                try self.expr(receiver)
+                try self.use(receiver)
                 try self.put(")")
             elif rt.kind == types.Kind.bytes_:
-                try self.put("(i64)")
-                try self.expr(receiver)
-                try self.put(".length")
+                try self.put("kernel.bytes_length(")
+                try self.use(receiver)
+                try self.put(")")
             else:
                 try self.put("kernel.list_length[")
                 try self.type_of(rt.elem)
@@ -2005,6 +2030,12 @@ pub struct Emitter:
             try self.put(")")
             return
         if rt.kind == types.Kind.error_value:
+            if e.text == "message":
+                # a text of its own, copied out of the `Error`'s view
+                try self.put("kernel.text_of(")
+                try self.expr(receiver)
+                try self.put(".message)")
+                return
             try self.expr(receiver)
             try self.put(".")
             try self.put(e.text)
@@ -2162,9 +2193,9 @@ pub struct Emitter:
         if name == "contains":
             try self.put("kernel.contains(")
         elif name == "bytes":
-            try self.put("(")
+            try self.put("kernel.text_to_bytes(")
             try self.use(receiver)
-            try self.put(").bytes")
+            try self.put(")")
             return
         else:
             try self.put("kernel.")
@@ -2313,19 +2344,24 @@ pub struct Emitter:
                 let v = first.left else return
                 try self.show(v)
             else:
-                try self.put("kernel.join([")
+                # the joined line is a fresh text of the statement's
+                try self.put(try self.lifetime_name("L_pool_", types.str_id))
+                try self.put("(kernel.join([")
+                self.pooled = true
                 var cursor = e.body
                 var first = true
                 while let a = cursor:
                     if not first:
-                        try self.put(", \" \", ")
+                        try self.put(", ")
+                        try self.put(try self.text_ref(" ", false))
+                        try self.put(", ")
                     first = false
                     let v = a.left else return
                     try self.show(v)
                     cursor = a.next
                 if n == 0:
-                    try self.put("\"\"")
-                try self.put("])")
+                    try self.put(try self.text_ref("", false))
+                try self.put("]))")
             try self.put(")")
             return
         let first = e.body else return
@@ -2333,30 +2369,33 @@ pub struct Emitter:
         if name == "assert":
             # `if not c: trap("assert failed: m")`, the trap the interpreter reports
             try self.put("if not (")
-            try self.expr(arg)
+            try self.use(arg)
             try self.put("): trap(")
             if let second = first.next:
                 let m = second.left else return
-                try self.put("kernel.concat(\"assert failed: \", ")
-                try self.expr(m)
-                try self.put(")")
+                try self.put("kernel.concat(")
+                try self.put(try self.text_ref("assert failed: ", false))
+                try self.put(", ")
+                try self.use(m)
+                try self.put(").data")
             else:
                 try self.put("\"assert failed\"")
             try self.put(")")
             return
         if name == "trap":
-            try self.put("trap(")
-            try self.expr(arg)
-            try self.put(")")
+            try self.put("trap((")
+            try self.use(arg)
+            try self.put(").data)")
             return
         if name == "error":
+            # the `Error` views its message: the text lives to the end of the run (RUNTIME)
             let second = first.next else return
             let m = second.left else return
             try self.put("error(")
-            try self.expr(arg)
-            try self.put(", ")
-            try self.expr(m)
-            try self.put(")")
+            try self.use(arg)
+            try self.put(", kernel.message_of(")
+            try self.use(m)
+            try self.put("))")
             return
         if name == "discard":
             try self.put("discard(")
@@ -2378,29 +2417,42 @@ pub struct Emitter:
         let t = arg.type_id
         if name == "int":
             try self.put("kernel.to_int(" if t == types.float_id else "kernel.parse_int(")
-            try self.expr(arg)
+            try self.use(arg)
             try self.put(")")
             return
         if name == "float":
             try self.put("f64(" if t == types.int_id else "kernel.parse_float(")
-            try self.expr(arg)
+            try self.use(arg)
             try self.put(")")
             return
         if name == "bool":
             try self.put("kernel.parse_bool(")
-            try self.expr(arg)
+            try self.use(arg)
             try self.put(")")
             return
         if name == "str":
-            try self.show(arg)
+            try self.shown_value(arg)
             return
         return try self.fail(e, "a core call this slice does not compile")
 
-    ## The display of a value as an expression of type `str`.
+    ## The display of a value as a piece of a line or a formatted text: a fresh text pooled
+    ## until the statement ends, or the value itself when it is one.
     mutating func show(v: ast.Node*) -> !:
         let t = v.type_id
         if t == types.str_id:
             try self.use(v)
+            return
+        try self.put(try self.lifetime_name("L_pool_", types.str_id))
+        try self.put("(")
+        try self.shown_value(v)
+        try self.put(")")
+        self.pooled = true
+
+    ## The display of a value as an owned text: `str(x)`.
+    mutating func shown_value(v: ast.Node*) -> !:
+        let t = v.type_id
+        if t == types.str_id:
+            try self.owned(v)
             return
         try self.put(try self.show_name(t))
         try self.put("(")
@@ -2446,8 +2498,8 @@ pub struct Emitter:
     ## can register more, so the sets are walked until nothing new appears.
     mutating func support_functions() -> !:
         while true:
-            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count
-            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done
+            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count
+            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done
             if before == done:
                 return
             try self.show_functions()
@@ -2455,6 +2507,37 @@ pub struct Emitter:
             try self.comparison_functions()
             try self.hash_functions()
             try self.ops_tables()
+            try self.text_objects()
+
+    ## `&L_text_N`: the immortal object of a literal, one per distinct text (RUNTIME).
+    mutating func text_ref(text: str, as_bytes: bool) -> str!:
+        var i: usize = 0
+        var at = self.texts.count
+        while i < self.texts.count:
+            if self.texts.get(i) == text and self.texts_are_bytes.get(i) == as_bytes:
+                at = i
+                break
+            i += 1
+        if at == self.texts.count:
+            try self.texts.push(try copy_name(text))
+            try self.texts_are_bytes.push(as_bytes)
+        let half = self.checker.scratch.length // 2
+        return try copy_name(try format(self.checker.scratch[half..], f"&L_text_{at}"))
+
+    mutating func text_objects() -> !:
+        while self.texts_done < self.texts.count:
+            let i = self.texts_done
+            self.texts_done += 1
+            let as_bytes = self.texts_are_bytes.get(i)
+            try self.begin("var L_text_")
+            try self.put_u64((u64)i)
+            try self.put(": kernel.Bytes = kernel.Bytes(" if as_bytes else ": kernel.Text = kernel.Text(")
+            try self.put("header = heap.Object(strong = 1073741824, weak = 0, flags = heap.immortal, info = &kernel.")
+            try self.put("bytes_info" if as_bytes else "text_info")
+            try self.put("), data = ")
+            try self.text_literal(self.texts.get(i), as_bytes)
+            try self.put(")")
+            try self.end()
 
     ## The functions of every type holding references the program used, and of the types
     ## those reach; the list grows while it is walked.
@@ -2470,7 +2553,7 @@ pub struct Emitter:
         try self.lifetime_head("L_copy_", id, ") -> ", id)
         self.indent += 1
         match t.kind:
-            .class_, .list_, .map_, .set_:
+            .class_, .list_, .map_, .set_, .str_, .bytes_:
                 try self.begin("return (")
                 try self.type_of(id)
                 try self.put(")heap.retain((heap.Object*)v)")
@@ -2603,7 +2686,8 @@ pub struct Emitter:
             try self.line("")
         # identity, and a weak reference's get, for a class and its optional
         let inner = self.checker.table.kind(t.elem) if t.kind == types.Kind.optional else t.kind
-        if self.is_object_kind(t.kind) or (t.kind == types.Kind.optional and self.is_object_kind(inner)):
+        let identity_kinds = (self.is_object_kind(t.kind) and t.kind != types.Kind.str_ and t.kind != types.Kind.bytes_) or (t.kind == types.Kind.optional and self.is_object_kind(inner) and inner != types.Kind.str_ and inner != types.Kind.bytes_)
+        if identity_kinds:
             try self.lifetime_head("L_id_", id, ") -> usize:", types.none_id)
             if t.kind != types.Kind.optional:
                 try self.line("    return (usize)v")
@@ -2626,11 +2710,11 @@ pub struct Emitter:
             try self.end()
             try self.line("    return none")
             try self.line("")
-        if self.is_object_kind(t.kind) and t.kind != types.Kind.class_:
+        if t.kind == types.Kind.list_ or t.kind == types.Kind.map_ or t.kind == types.Kind.set_:
             try self.collection_support(id, t)
 
     func is_object_kind(k: types.Kind) -> bool:
-        return k == types.Kind.class_ or k == types.Kind.list_ or k == types.Kind.map_ or k == types.Kind.set_
+        return k == types.Kind.class_ or k == types.Kind.list_ or k == types.Kind.map_ or k == types.Kind.set_ or k == types.Kind.str_ or k == types.Kind.bytes_
 
     ## What a collection needs beside its lifetime functions: the runtime's descriptor and
     ## the drop and trace it calls; the element operations come per element type.
@@ -2875,7 +2959,7 @@ pub struct Emitter:
     func needs_equality(id: u32) -> bool:
         let t = self.checker.table.get(id)
         match t.kind:
-            .list_, .map_, .set_, .bytes_: return true
+            .list_, .map_, .set_, .bytes_, .str_: return true
             .optional: return self.needs_equality(t.elem)
             .tuple:
                 for m in t.args:
@@ -2956,7 +3040,8 @@ pub struct Emitter:
                 try self.type_of(t.elem)
                 try self.put("](a, b)")
                 try self.end()
-            .bytes_: try self.line("return kernel.compare_bytes(a, b) == 0")
+            .bytes_: try self.line("return kernel.bytes_equal(a, b)")
+            .str_: try self.line("return kernel.text_equal(a, b)")
             .optional:
                 try self.line("if let x = a:")
                 try self.line("    if let y = b:")
@@ -3061,8 +3146,6 @@ pub struct Emitter:
         let half = self.checker.scratch.length // 2
         if self.needs_equality(t):
             return try copy_name(try format(self.checker.scratch[half..], f"{try self.equality_name(t)}({x}, {y})"))
-        if t == types.bytes_id:
-            return try copy_name(try format(self.checker.scratch[half..], f"(kernel.compare_bytes({x}, {y}) == 0)"))
         return try copy_name(try format(self.checker.scratch[half..], f"({x} == {y})"))
 
     mutating func ordering_function(id: u32) -> !:
@@ -3079,7 +3162,7 @@ pub struct Emitter:
         match t.kind:
             .int_, .float_, .bool_: try self.line("return -1 if a < b else 1 if a > b else 0")
             .str_: try self.line("return kernel.compare_text(a, b)")
-            .bytes_: try self.line("return kernel.compare_bytes(a, b)")
+            .bytes_: try self.line("return kernel.compare_blobs(a, b)")
             .tuple:
                 var i: usize = 0
                 while i < t.args.length:
@@ -3135,6 +3218,13 @@ pub struct Emitter:
     ## `extra` appended to the arguments.
     mutating func walk_references(t: types.Type, id: u32, prefix: str, extra: str) -> !:
         match t.kind:
+            .str_, .bytes_:
+                # a text holds no references: released, never traced
+                if prefix == "L_drop_":
+                    try self.line("if (usize)v != 0:")
+                    try self.line("    heap.release((heap.Object*)v)")
+                else:
+                    try self.line("discard(v)")
             .class_, .list_, .map_, .set_:
                 try self.line("if (usize)v != 0:")
                 if prefix == "L_drop_":
@@ -3249,7 +3339,7 @@ pub struct Emitter:
         try self.put(name)
         try self.put("(v: ")
         try self.type_of(id)
-        try self.put(") -> str:")
+        try self.put(") -> kernel.Text*:")
         try self.end()
         self.indent += 1
         match t.kind:
@@ -3277,60 +3367,79 @@ pub struct Emitter:
                 try self.line("var parts = kernel.parts()")
                 try self.line("var i: usize = 0")
                 try self.line("while i < v.count:")
-                try self.begin("    kernel.add_part(&parts, kernel.join([")
+                try self.begin("    kernel.pair_part(&parts, ")
                 try self.put(try self.show_name(t.elem))
-                try self.put("(v.keys[i]), \": \", ")
+                try self.put("(v.keys[i]), ")
                 try self.put(try self.show_name(self.checker.table.map_value(id)))
-                try self.put("(v.values[i])]))")
+                try self.put("(v.values[i]))")
                 try self.end()
                 try self.line("    i += 1")
                 try self.line("return kernel.bracketed(parts, \"{\", \"}\")")
-            .unit_: try self.line("return \"()\"")
-            .error_code: try self.line("return kernel.join([\"ErrorCode(\", kernel.show_int((i64)v), \")\"])")
-            .error_value: try self.line("return v.message")
+            .unit_:
+                try self.begin("return ")
+                try self.put(try self.text_ref("()", false))
+                try self.end()
+            .error_code:
+                try self.begin("return kernel.join_owned([")
+                try self.put(try self.text_ref("ErrorCode(", false))
+                try self.put(", kernel.show_int((i64)v), ")
+                try self.put(try self.text_ref(")", false))
+                try self.put("])")
+                try self.end()
+            .error_value: try self.line("return kernel.text_of(v.message)")
             .optional:
                 try self.line("if let inner = v:")
                 try self.begin("    return ")
                 try self.put(try self.show_name(t.elem))
                 try self.put("(inner)")
                 try self.end()
-                try self.line("return \"none\"")
+                try self.begin("return ")
+                try self.put(try self.text_ref("none", false))
+                try self.end()
             .tuple:
-                try self.begin("return kernel.join([\"(\", ")
+                try self.begin("return kernel.join_owned([")
+                try self.put(try self.text_ref("(", false))
+                try self.put(", ")
                 var i: usize = 0
                 while i < t.args.length:
                     if i > 0:
-                        try self.put(", \", \", ")
+                        try self.put(", ")
+                        try self.put(try self.text_ref(", ", false))
+                        try self.put(", ")
                     try self.put(try self.show_name(t.args[i]))
                     try self.put("(v.")
                     try self.put_u64((u64)i)
                     try self.put(")")
                     i += 1
                 if t.args.length == 1:
-                    try self.put(", \",\"")
-                try self.put(", \")\"])")
+                    try self.put(", ")
+                    try self.put(try self.text_ref(",", false))
+                try self.put(", ")
+                try self.put(try self.text_ref(")", false))
+                try self.put("])")
                 try self.end()
             .struct_:
                 let d = t.decl else return
-                try self.begin("return kernel.join([\"")
-                try self.put(d.text)
-                try self.put("(\"")
+                try self.begin("return kernel.join_owned([")
+                let half = self.checker.scratch.length // 2
+                try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{d.text}(")), false))
                 var cursor = d.body
                 var first = true
                 while let m = cursor:
                     if m.kind == ast.Kind.field:
-                        try self.put(", \"")
-                        if not first:
-                            try self.put(", ")
+                        try self.put(", ")
+                        let label = try copy_name(try format(self.checker.scratch[half..], f"{", " if not first else ""}{m.text} = "))
                         first = false
-                        try self.put(m.text)
-                        try self.put(" = \", ")
+                        try self.put(try self.text_ref(label, false))
+                        try self.put(", ")
                         try self.put(try self.show_name(m.type_id))
                         try self.put("(v.L_")
                         try self.put(m.text)
                         try self.put(")")
                     cursor = m.next
-                try self.put(", \")\"])")
+                try self.put(", ")
+                try self.put(try self.text_ref(")", false))
+                try self.put("])")
                 try self.end()
             .enum_:
                 let d = t.decl else return
@@ -3355,29 +3464,29 @@ pub struct Emitter:
                             try self.put(")")
                         try self.put(":")
                         try self.end()
-                        try self.begin("    return kernel.join([\"")
-                        try self.put(d.text)
-                        try self.put(".")
-                        try self.put(m.text)
+                        let half = self.checker.scratch.length // 2
+                        try self.begin("    return kernel.join_owned([")
                         if m.body != none:
-                            try self.put("(\"")
+                            try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{d.text}.{m.text}(")), false))
                             var p = m.body
                             var first = true
                             while let field = p:
-                                try self.put(", \"")
-                                if not first:
-                                    try self.put(", ")
+                                try self.put(", ")
+                                let label = try copy_name(try format(self.checker.scratch[half..], f"{", " if not first else ""}{field.text} = "))
                                 first = false
-                                try self.put(field.text)
-                                try self.put(" = \", ")
+                                try self.put(try self.text_ref(label, false))
+                                try self.put(", ")
                                 try self.put(try self.show_name(field.type_id))
                                 try self.put("(L_")
                                 try self.put(field.text)
                                 try self.put(")")
                                 p = field.next
-                            try self.put(", \")\"])")
+                            try self.put(", ")
+                            try self.put(try self.text_ref(")", false))
+                            try self.put("])")
                         else:
-                            try self.put("\"])")
+                            try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{d.text}.{m.text}")), false))
+                            try self.put("])")
                         try self.end()
                     cursor = m.next
                 self.indent -= 1
@@ -3395,20 +3504,20 @@ pub struct Emitter:
                 try self.put(", ")
             first = false
             if part.kind == ast.Kind.format_text:
-                try self.text_literal(try unescape_format(part.text), false)
+                try self.put(try self.text_ref(try unescape_format(part.text), false))
             else:
                 let v = part.left else return
                 try self.show(v)
             cursor = part.next
         if first:
-            try self.put("\"\"")
+            try self.put(try self.text_ref("", false))
         try self.put("])")
 
     mutating func match_expr(e: ast.Node*) -> !:
         let subject = e.left else return
         let st = self.checker.table.get(subject.type_id)
-        if st.kind == types.Kind.tuple:
-            return try self.fail(e, "a match expression over a tuple compiles in a later slice; use the statement form")
+        if st.kind == types.Kind.tuple or st.kind == types.Kind.str_ or st.kind == types.Kind.bytes_:
+            return try self.fail(e, "a match expression over a tuple or a text compiles in a later slice; use the statement form")
         try self.put("match ")
         try self.use(subject)
         try self.put(":")
