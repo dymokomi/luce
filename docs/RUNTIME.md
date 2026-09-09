@@ -202,3 +202,20 @@ After `main` returns and the collector has run, no object may be alive: the lang
 global mutable state. Both executions count live objects and, when the count is not zero,
 print `luce: N objects alive at exit` to standard error and exit with status 3. The
 conformance suite therefore proves, for every program, that everything was released.
+
+## Error message ownership
+
+A caught `Error` owns a counted text. Copying the error retains that text; dropping the
+last copy releases it. Errors saved in collections or returned from a catch follow the
+same ownership rules as other values containing references.
+
+While Base propagates its borrowed error view, a thread-local chain holds a reference
+to each raised Luce message. A catch takes that reference and removes the chain entry;
+a Base or builtin failure supplies a copied text. Nested catches during cleanup cannot
+replace a message still propagating. No dynamic text becomes immortal or leaves the
+heap's live-object accounting.
+
+A worker keeps its failure until the waiter copies the text to its own heap. The worker
+then releases it, including when a task is abandoned. Sending an `Error` as an ordinary
+argument or result also copies its text. Unhandled main and test failures release their
+messages before the final heap check.
