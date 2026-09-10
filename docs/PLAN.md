@@ -32,3 +32,14 @@ and the standing rules below hold for whatever comes next.
 Native compilation is the production path and the main hardening target. Prioritize
 native ABI/optimizer checks and ARC/worker lifetime stress. Base C-backend comparisons
 and sanitizer checks are supplemental evidence, not substitutes for native validation.
+
+## Interpreter stack budget
+
+The server's JSON regression on 2026-09-10 exposed a native-built interpreter stack
+overflow at 65 nested arrays, before the JSON parser could report its configured
+64-level limit. The compiled Luce program accepts depth 64 and rejects depth 65 as
+expected. LLDB stops at `Interp.member`'s frame prologue on the default macOS stack;
+that function alone reserves 12,656 bytes. The interpreter's current logical call
+limit of 4,000 does not protect its physical stack. Reduce interpreter frame pressure
+and make exhaustion diagnostic; retain the server nesting case as a regression.
+This does not block the native HTTP server or reduce its JSON depth contract.
