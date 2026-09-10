@@ -29,4 +29,5 @@ for path in paths:
 pins = {str(p): p.read_text().strip() for p in (Path("bootstrap/SEED"), Path("bootstrap/BASE")) if p.exists()}
 print(json.dumps(dict(host=host, os=platform.platform(), cc=command(["cc", "--version"]),
                      python=platform.python_version(), cmake=command(["cmake", "--version"]),
-                     pins=pins, repositories=repos), indent=2))
+                     pins=pins, repositories=repos,
+                     base_compiler_override=os.environ.get("LUCE_BASE_COMPILER")), indent=2))

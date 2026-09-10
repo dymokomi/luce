@@ -26,3 +26,11 @@ through Base’s retained C backend. Native compilation is the production path.
 
 The conformance gate executes native builds at optimization levels 0–3, alongside
 the interpreter where applicable and both Base C comparison modes.
+
+
+For dependency development, `LUCE_BASE_COMPILER=/absolute/path/to/luce-base ./test.sh`
+builds and tests Luce with that exact native Base executable. Omitting the override
+uses `bootstrap/BASE`. The manually dispatched correctness workflow accepts a full
+Base commit SHA for the same purpose and records the checkout and explicit compiler
+selection in its provenance artifacts. This permits cross-host validation before
+publishing a Base release.
