@@ -8,8 +8,13 @@ and generics, modules and packages, the Base boundary, workers, the tooling, and
 name their statement, over the runtime of `docs/RUNTIME.md`, with four executions agreeing
 on every conformance program and every run proving it left nothing alive.
 
-The table is empty: every slice of the plan closed, and the next work is decided with the
-language's author rather than listed here. What stands ready for it: `tests/programs/`
+The active ecosystem order is **Base standard library → luce-tls → luce-server →
+luce-pkg**. The canonical [ecosystem roadmap](https://github.com/dymokomi/luce-base/blob/main/docs/ECOSYSTEM.md)
+defines each stage's completion gate. The server is written in Luce. The package-manager
+stage adds `luce install` and `luce-base install`, a shared `luce.yaml` manifest with
+explicit migration from `luce.toml`, and deployment to `pkg.luciaos.com`.
+Later packages wait for the preceding stage; compiler/runtime changes are made as
+needed to support the active stage. What stands ready for it: `tests/programs/`
 holds the proving programs, `tools/fuzz.py --minutes 60` runs the generator for an hour,
 and the standing rules below hold for whatever comes next.
 
