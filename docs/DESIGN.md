@@ -90,7 +90,7 @@ order.
 Every diagnostic is `file:line:column: message`. A rejection is exit status 1; a crash, a
 hang or a bare message is a defect. Nesting has a stated bound, identifiers have a stated
 length, every literal is checked where it sits, a file's name is an identifier, and the
-fuzzer's mutate mode enforces all of it from slice 1.
+fuzzer's mutate mode enforces all of it.
 
 ## The harness
 
