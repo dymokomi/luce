@@ -99,3 +99,26 @@ both executions; one beside a `.trap` must trap with that text on both; one unde
 must be rejected with the diagnostic its `# error:` line names, at a position. `test.sh` is
 the gate and the only truth: it builds, runs every module's tests, the conformance suite, the
 proving programs, and the fuzzer's short pass, and it is green or the tree does not move.
+
+
+## Packaging Base dependencies
+
+Before writing an emitted package, Luce asks the pinned Base compiler for each
+imported module's resolved source dependency closure. The versioned, NUL-delimited
+`dependencies` response preserves path bytes and uses Base's parser and resolver.
+`back.sources` owns and deduplicates the collected source bytes; different contents
+under the same module name are diagnosed before output is created. The source set
+is released after emission, including acquisition and protocol failures.
+
+`back.package` writes the complete set under its original dotted module paths.
+Private dependencies remain byte-for-byte unchanged. The emitter gives every direct
+Base import an explicit alias based on its checker module index, so dotted paths and
+identical leaf names do not become ambiguous Base references.
+
+Generated entry and runtime names are chosen after collecting those paths. The usual
+layout is `main.lucb` and `rt/`; when imported source owns those names, generation
+selects unused names and updates only generated runtime imports. `--emit=base` prints
+the actual generated entry path. Executables and built test runners use the same
+collection and naming rules, and emitted packages rebuild after relocation without
+the original Base source tree. This source query does not resolve native libraries
+or implement package-manager dependency selection.
