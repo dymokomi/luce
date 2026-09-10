@@ -10,7 +10,9 @@ on every conformance program and every run proving it left nothing alive.
 
 The active ecosystem order is **Base standard library → luce-tls → luce-server →
 luce-pkg**. The canonical [ecosystem roadmap](https://github.com/dymokomi/luce-base/blob/main/docs/ECOSYSTEM.md)
-defines each stage's completion gate. The server is written in Luce. The package-manager
+defines each stage's completion gate. Standard-library work stays in `luce-base`;
+`luce-tls`, `luce-server` and `luce-pkg` are three separate new repositories,
+created in stage order. The server is written in Luce. The package-manager
 stage adds `luce install` and `luce-base install`, a shared `luce.yaml` manifest with
 explicit migration from `luce.toml`, and deployment to `pkg.luciaos.com`.
 Later packages wait for the preceding stage; compiler/runtime changes are made as
