@@ -24,6 +24,10 @@ Compiled Luce programs and `luce test --build` use Base’s native backend by de
 Luce emits Base; it does not emit C. `--backend=c` is an explicit diagnostic comparison
 through Base’s retained C backend. Native compilation is the production path.
 
+Normal builds and compiled tests remove their temporary generated Base packages,
+including failed compilations. The output directory contains the requested build
+products. Use `--emit=base` explicitly to keep an inspectable package at `OUT.base`.
+
 The conformance gate executes native builds at optimization levels 0–3, alongside
 the interpreter where applicable and both Base C comparison modes.
 

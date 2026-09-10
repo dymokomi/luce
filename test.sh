@@ -8,6 +8,7 @@ base=${LUCE_BASE_COMPILER:-build/luce-base/build/luce-base}
 case "$base" in /*) ;; *) base=$PWD/$base ;; esac
 export LUCE_BASE=$base
 python3 tools/test_native_default.py
+python3 tools/test_build_cleanup.py
 python3 tools/test_base_packages.py
 python3 tools/test_base_fields.py
 python3 tools/test_worker_heap.py

@@ -79,6 +79,7 @@ with tempfile.TemporaryDirectory(prefix="luce-base-packages-") as temporary:
         original = {str(path.relative_to(source)): path.read_bytes() for path in source.rglob("*.lucb")}
         for flags in FLAGS:
             run([COMPILER, "build", entry, *flags, "-o", output])
+            assert not Path(str(output) + ".base").exists(), "normal builds retained generated Base"
             assert run([output]).stdout == b"42\n"
             report = run([COMPILER, "test", entry, "--build", *flags])
             assert b"1 passed" in report.stdout

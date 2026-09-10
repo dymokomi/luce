@@ -122,3 +122,10 @@ the actual generated entry path. Executables and built test runners use the same
 collection and naming rules, and emitted packages rebuild after relocation without
 the original Base source tree. This source query does not resolve native libraries
 or implement package-manager dependency selection.
+
+Normal builds and compiled test runners use `back.workspace`: one uniquely
+created directory beneath `TMPDIR` (or `/tmp`). The owner removes generated Base,
+runtime modules, copied dependencies, and partial tool output on success or
+failure. Cleanup never adopts an existing `OUT.base` directory and does not follow
+symlinks into other source trees. `--emit=base` explicitly writes a persistent
+package at `OUT.base` instead. The final executable stays at the requested path.
