@@ -59,7 +59,14 @@ with tempfile.TemporaryDirectory(prefix='luce-worker-heap-') as temporary:
         result = subprocess.run([executable], capture_output=True, timeout=30)
         assert result.returncode == 0 and not result.stdout and not result.stderr, (result.returncode, result.stdout, result.stderr)
         if arguments.heap:
-            result = subprocess.run(['/usr/bin/leaks', '--quiet', '--noContent',
-                '--atExit', '--', executable], capture_output=True, timeout=30)
+            # Wait for the checker itself; diagnostic helpers may retain an
+            # inherited output pipe after their parent has finished.
+            with tempfile.TemporaryFile() as standard, tempfile.TemporaryFile() as diagnostic:
+                result = subprocess.run(['/usr/bin/leaks', '--quiet', '--noContent',
+                    '--atExit', '--', executable], stdout=standard, stderr=diagnostic, timeout=30)
+                standard.seek(0)
+                diagnostic.seek(0)
+                result.stdout = standard.read()
+                result.stderr = diagnostic.read()
             assert result.returncode == 0 and b'0 leaks for 0 total leaked bytes' in result.stdout and not result.stderr, (result.returncode, result.stdout, result.stderr)
         print(f'PASS worker heap: {" ".join(flags)}; 64 tasks, cycles, results and failures', flush=True)
