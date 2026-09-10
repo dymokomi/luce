@@ -21,6 +21,18 @@ needed to support the active stage. What stands ready for it: `tests/programs/`
 holds the proving programs, `tools/fuzz.py --minutes 60` runs the generator for an hour,
 and the standing rules below hold for whatever comes next.
 
+## Package prerequisite for TLS
+
+A Luce build copies directly imported Base modules into its emitted package, but
+omits their private Base dependencies. For `main.luc → boundary.lucb → implementation.lucb`,
+`-o` outside the source tree fails because Base cannot find `implementation.lucb`.
+An output beside the original sources can succeed only because Base searches parent
+directories. Before packaging the TLS library, preserve the resolved Base dependency
+closure in the emitted package. Gate: native optimization levels 0–3 and both Base
+comparison modes build an output outside the source tree; the emitted package also
+rebuilds after relocation without the original sources. Obtain dependency paths from
+Base's module loader rather than approximating its syntax with text matching.
+
 ## Standing rules
 
 - Two executions agree or the feature is not done.
