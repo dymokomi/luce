@@ -4,8 +4,9 @@ set -eu
 cd "$(dirname "$0")"
 ./build.sh
 python3 tools/test_run_case.py
-base=build/luce-base/build/luce-base
-export LUCE_BASE=$PWD/$base
+base=${LUCE_BASE_COMPILER:-build/luce-base/build/luce-base}
+case "$base" in /*) ;; *) base=$PWD/$base ;; esac
+export LUCE_BASE=$base
 python3 tools/test_native_default.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
