@@ -23,3 +23,6 @@ Licensed under MIT or Apache-2.0, at your option.
 Compiled Luce programs and `luce test --build` use Base’s native backend by default.
 Luce emits Base; it does not emit C. `--backend=c` is an explicit diagnostic comparison
 through Base’s retained C backend. Native compilation is the production path.
+
+The conformance gate executes native builds at optimization levels 0–3, alongside
+the interpreter where applicable and both Base C comparison modes.

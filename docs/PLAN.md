@@ -5,8 +5,9 @@ programs in, and nothing is written here about what was done: the tree and the s
 record. The compiler today lexes, parses, checks, interprets and compiles the whole of
 `docs/luce.md`: the value language, classes, collections and text, closures, interfaces
 and generics, modules and packages, the Base boundary, workers, the tooling, and traps that
-name their statement, over the runtime of `docs/RUNTIME.md`, with four executions agreeing
-on every conformance program and every run proving it left nothing alive.
+name their statement, over the runtime of `docs/RUNTIME.md`. The conformance gate
+checks native optimization levels 0–3, both Base C comparison modes, and the interpreter
+where applicable; every runtime execution checks that it left nothing alive.
 
 The active ecosystem order is **Base standard library → luce-tls → luce-server →
 luce-pkg**. The canonical [ecosystem roadmap](https://github.com/dymokomi/luce-base/blob/main/docs/ECOSYSTEM.md)
