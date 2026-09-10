@@ -149,7 +149,11 @@ code and message, and signals. `wait` copies the result onto the waiter's heap, 
 the failure, and lets the worker release its copies and end; a worker that leaves objects
 alive stops the program with `luce: N objects alive when a task ended`. A task is waited
 once; a second `wait` traps. Releasing a task not yet waited waits for it and discards the
-result. The interpreter runs the call at `spawn`, with copies in and out the same way.
+result. After draining temporaries and collecting cycles, a finished worker also frees
+the backing arrays for temporaries, candidate roots, and white objects. Empty object
+counts alone do not account for that native storage; retaining those arrays would
+leak when thread-local roots disappear. A successful `main` cleanup releases its
+arrays as well. The interpreter runs the call at `spawn`, with copies in and out the same way.
 
 ## Handles
 
