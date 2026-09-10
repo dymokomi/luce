@@ -54,7 +54,7 @@ pub func main(arguments: list[str]) -> int!:
         if supports_mutability:
             run([root / 'app'])
         else:
-            assert b'immutable' in result.stderr or b'var' in result.stderr, result.stderr
+            assert b'the field `port` is a `let`' in result.stderr, result.stderr
     for declaration, assignment in [('var', 'version = 2'), ('let', 'port = 8080')]:
         entry.write_text(f'''import boundary
 pub func main(arguments: list[str]) -> int!:
@@ -63,6 +63,10 @@ pub func main(arguments: list[str]) -> int!:
     return 0
 ''')
         result = run([COMPILER, 'check', entry], False)
-        assert b'immutable' in result.stderr or b'var' in result.stderr, result.stderr
+        expected = b'the field `version` is a `let`' if declaration == 'var' else b'a field of a `let` value cannot change'
+        # Older Base descriptors reject the field before reaching its receiver.
+        if declaration == 'let' and not supports_mutability:
+            expected = b'the field `port` is a `let`'
+        assert expected in result.stderr, result.stderr
     print('PASS Base fields: mutable copies, immutable fields/bindings, all six modes'
           if supports_mutability else 'PASS legacy Base fields remain read-only, all six modes')
