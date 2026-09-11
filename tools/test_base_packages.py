@@ -122,8 +122,8 @@ with tempfile.TemporaryDirectory(prefix="luce-base-packages-") as temporary:
     wrapper.chmod(0o755)
     responses = [
         (b"wrong-version\0", b"unsupported dependency format"),
-        (b"luce-base-dependencies-v1\0shared\0unterminated", b"truncated dependency record"),
-        (b"luce-base-dependencies-v1\0../invalid\0unused\0", b"invalid source dependency"),
+        (b"luce-base-dependencies-v2\0source\0shared\0unterminated", b"truncated dependency record"),
+        (b"luce-base-dependencies-v2\0source\0../invalid\0unused\0", b"invalid source dependency"),
     ]
     for response, message in responses:
         environment = dict(os.environ, LUCE_BASE=str(wrapper), REAL_BASE=str(BASE),

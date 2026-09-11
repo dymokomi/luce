@@ -10,6 +10,7 @@ export LUCE_BASE=$base
 python3 tools/test_native_default.py
 python3 tools/test_build_cleanup.py
 python3 tools/test_base_packages.py
+python3 tools/test_public_imports.py
 python3 tools/test_native_manifest.py
 python3 tools/test_base_fields.py
 python3 tools/test_base_description.py

@@ -878,6 +878,16 @@ source = "src"
 `name` is the package's identity (§12.3); `source` is the root the modules are named
 from, `src` unless written. The nearest manifest above the entry module is the program's.
 
+`[dependencies]` maps a dependency's package name to its local directory, relative
+to this manifest. The dependency's `[exports]` maps public import names to modules
+under its source root. For example, `ui = "luce_ui.ui"` exposes
+`src/luce_ui/ui.lucb` as `from ui import Button`; construction is `Button("pause")`.
+Aliases retain the canonical type identity. Conflicting exports are errors.
+Base owns module resolution; Luce invokes the compiler selected by `LUCE_BASE`
+(otherwise `luce-base`). Standard imports such as `math` use its embedded modules.
+See [the package import contract](../../luce-base/docs/PACKAGE-IMPORTS.md) for complete
+examples and source-bundle relocation. Builds do not fetch dependencies.
+
 ## 16. The Base boundary
 
 ### 16.1 What a Luce module sees of a Base module
