@@ -892,17 +892,29 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
-The current description begins with `description 3`; a mismatched compiler is
+The current description begins with `description 4`; a mismatched compiler is
 rejected before declarations are read. There is one current format. Field
 mutability and default availability are explicit in the records. Named arguments
 keep their parameter association. Omitted defaults are evaluated by Base in their
 original module; supported caller facts name the Luce call site. Nested tuples and
-optionals preserve declaring-module identity and native scalar conversions. A record with private native storage
-or a private custom initializer is currently unavailable, including declarations
-depending on it, rather than being reconstructed from its public fields alone.
-Constructor, method and interface metadata is now read; their native execution
-adapters are tracked in Base's `docs/PACKAGE-REWRITE-TODO.md` and are not yet a
-completed language boundary.
+optionals preserve declaring-module identity and native scalar conversions.
+
+Imported structs use `Type(args)` to call the actual Base initializer. Aliases keep
+that constructor and the canonical type identity. Instance and static methods are
+callable directly or as function values. Mutating value methods require a `var`;
+a bound value method keeps its own copy, including private state. A mutation made
+before a recoverable error is preserved.
+
+A native value retains its complete representation and owns copies of supported
+public text/data fields. Before a native call, those fields are rebased into a
+fresh native copy. Private scalar state survives copying, equality and worker
+transfer. A hidden borrow requires an explicit ownership contract and is unavailable
+as a copied value. A private initializer prevents construction but allows returned
+values and their public methods. Unsupported methods are unavailable individually;
+an unsupported initializer cannot become an implicit memberwise constructor.
+
+Owned objects and interface execution follow the separate lifetime work tracked
+in Base's `docs/PACKAGE-REWRITE-TODO.md`.
 
 ### 16.2 Crossable types
 
@@ -914,7 +926,8 @@ completed language boundary.
 | `str` | `str` | lent as Base's view of the bytes; a Base result is copied into an owned `str` |
 | `bytes` | `const u8[]` | lent; a Base result is copied |
 | `list[T]` of `int`, `float`, `bool`, `str` or handles | `const T[]` | lent for the call; texts and handles use temporary converted arrays. Base must retain individual resources it keeps; a Base span never crosses back |
-| struct of crossable fields | the same struct, declared in Base | by value |
+| struct with copyable native storage | the same struct, declared in Base | complete native value plus owned public text/data |
+| `(T, U)` | `(T, U)` | each member crosses recursively |
 | integer-backed `enum` declared in Base | that enum | by value |
 | `T?` | `T?` | by value |
 | `T!` | `T!` | the code and the message |
@@ -963,9 +976,8 @@ with identity, no fields, and a `close()` that calls `destroy` once; the runtime
 the last reference if the program did not. Calling the declared destroy function from
 Luce is another spelling of `close()`: it shares the same closed state, including through
 aliases of the handle, and repeated calls do nothing. A handle is never constructed in Luce, only
-answered by the module's functions; a closed handle handed back to Base traps. Every
-file, socket, window, texture and device is a handle behind a Base package, and this one
-form is all Luce knows about resources.
+answered by the module's functions; a closed handle handed back to Base traps. Opaque APIs may use this form; ordinary Base value APIs use their structs,
+constructors and methods.
 
 ### 16.5 What Base sees of Luce
 

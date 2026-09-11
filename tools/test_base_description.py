@@ -88,8 +88,7 @@ pub func main(arguments: list[str]) -> int!:
     assert(hidden.read(value) == 99)
     return 0
 ''')
-    # Until the native storage adapter exists, reject this at the Luce boundary;
-    # the old reconstruction silently returned zero for the private value.
-    failure = run([COMPILER, "check", entry], expected=1)
-    assert "make" in failure.stderr, failure.stderr
-    print("PASS foreign records/enums/aliases and nested copies, six modes; private storage rejected")
+    for flags in FLAGS:
+        run([COMPILER, "build", entry, *flags, "-o", root / "consumer"])
+        run([root / "consumer"])
+    print("PASS foreign records/enums/aliases, nested copies and private native state; six modes")

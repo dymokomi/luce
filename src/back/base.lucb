@@ -446,6 +446,13 @@ pub struct Emitter:
         self.indent += 1
         var cursor = d.body
         var fields: u32 = 0
+        if d.has(ast.flag_native_value):
+            try self.begin("pub var native: ")
+            try self.write_base_alias(d.module)
+            try self.put(".")
+            try self.put(d.text)
+            try self.end()
+            fields += 1
         while let m = cursor:
             if m.kind == ast.Kind.field:
                 try self.begin("pub var L_")
@@ -460,9 +467,15 @@ pub struct Emitter:
         cursor = d.body
         while let m = cursor:
             if m.kind == ast.Kind.func_:
-                try self.line("")
-                try self.function(m, "method")
+                if m.has(ast.flag_base):
+                    if m.text != "init":
+                        try self.native_method(m, d)
+                else:
+                    try self.line("")
+                    try self.function(m, "method")
             cursor = m.next
+        if d.has(ast.flag_native_value):
+            try self.native_writeback(d)
         self.indent -= 1
         try self.line("")
 
@@ -1132,12 +1145,18 @@ pub struct Emitter:
                 try self.put(t.name)
                 try self.put("(")
                 var first = true
+                if d.has(ast.flag_native_value):
+                    try self.put("native = v.native")
+                    first = false
                 var cursor = d.body
                 while let f = cursor:
                     if f.kind == ast.Kind.field:
                         if not first:
                             try self.put(", ")
                         first = false
+                        try self.put("L_")
+                        try self.put(f.text)
+                        try self.put(" = ")
                         let member = try copy_name(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
                         try self.send_of(f.type_id, member)
                     cursor = f.next
@@ -1327,11 +1346,218 @@ pub struct Emitter:
         let half = self.checker.scratch.length // 2
         return try copy_name(try format(self.checker.scratch[half..], f"L_native_call_{i}"))
 
+    ## Construct the actual Base value; an initializer is never translated into
+    ## assignments to a public-field snapshot. Failed construction publishes nothing.
+    mutating func native_constructor(call: ast.Node*, declaration: ast.Node*) -> !:
+        let owner = (declaration.resolved else return try self.fail(call, "a native initializer has no owner")) if declaration.kind == ast.Kind.func_ else declaration
+        try self.begin("func ")
+        try self.put(try self.native_call_name(call))
+        try self.put("(")
+        var cursor = call.body
+        var first = true
+        while let argument = cursor:
+            let parameter = argument.resolved else return
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put("L_")
+            try self.put(parameter.text)
+            try self.put(": ")
+            let t = parameter.ty else return
+            if t.has(ast.flag_func_type):
+                try self.base_type(t, owner)
+            else:
+                try self.type_of(parameter.type_id)
+            cursor = argument.next
+        try self.put(")")
+        try self.result_type(call.type_id)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        self.fallible = self.checker.table.kind(call.type_id) == types.Kind.fallible
+        try self.position_lines(call)
+        try self.line("let mark = heap.mark()")
+        try self.line("defer heap.drain(mark)")
+        try self.begin("let native = ")
+        try self.write_base_alias(owner.module)
+        try self.put(".")
+        try self.put(owner.text)
+        try self.put("(")
+        cursor = call.body
+        first = true
+        while let argument = cursor:
+            let parameter = argument.resolved else return
+            if not first:
+                try self.put(", ")
+            first = false
+            try self.put(parameter.text)
+            try self.put(" = ")
+            let t = parameter.ty else return
+            let half = self.checker.scratch.length // 2
+            let name = try copy_name(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
+            try self.to_base(t, name, owner)
+            cursor = argument.next
+        try self.put(")")
+        if self.fallible:
+            try self.native_failure()
+        else:
+            try self.end()
+        let t = try native_node(owner)
+        try self.begin("return ")
+        try self.from_base(t, "native", owner)
+        try self.end()
+        self.indent -= 1
+        try self.line("")
+
+    ## The public projection owns its references. Rebase a fresh native copy on
+    ## entry; after mutation convert the complete value before releasing the old
+    ## projection. Deferred writeback also preserves mutations made before an error.
+    mutating func native_writeback(owner: ast.Node*) -> !:
+        let t = try native_node(owner)
+        try self.begin("static func writeback(target: L_")
+        try self.put(self.type_name(owner))
+        try self.put("*, native: ")
+        try self.base_type(t, owner)
+        try self.put("*):")
+        try self.end()
+        self.indent += 1
+        try self.begin("let updated = ")
+        try self.from_base(t, "*native", owner)
+        try self.end()
+        if self.checker.table.has_references(owner.type_id):
+            try self.begin("")
+            try self.put(try self.lifetime_name("L_drop_", owner.type_id))
+            try self.put("(*target)")
+            try self.end()
+        try self.line("*target = updated")
+        self.indent -= 1
+        try self.line("")
+
+    ## A full method serves bound values and interface dispatch. Direct calls use
+    ## their own argument shape so Base, including its initializer scope, owns defaults.
+    mutating func native_method(method: ast.Node*, owner: ast.Node*, call: ast.Node*? = none) -> !:
+        let instance = check.has_self(method)
+        let mutates = method.has(ast.flag_mutating)
+        let ft = self.checker.table.get(method.type_id)
+        self.fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        var result = self.checker.table.get(ft.elem).elem if self.fallible else ft.elem
+        if let site = call:
+            try self.begin("func ")
+            try self.put(try self.native_call_name(site))
+        else:
+            try self.begin("pub ")
+            try self.put("mutating " if mutates else ("" if instance else "static "))
+            try self.put("func L_")
+            try self.put(method.text)
+        try self.put("(")
+        var first = true
+        if call != none and instance:
+            try self.put("L_self: ")
+            try self.type_of(owner.type_id)
+            if mutates:
+                try self.put("*")
+            first = false
+        var cursor = method.right
+        while let parameter = cursor:
+            if parameter.text != "self" and supplied(call, parameter):
+                if not first:
+                    try self.put(", ")
+                first = false
+                try self.put("L_")
+                try self.put(parameter.text)
+                try self.put(": ")
+                let t = parameter.ty else return
+                if call != none and t.has(ast.flag_func_type):
+                    try self.base_type(t, owner)
+                else:
+                    try self.type_of(parameter.type_id)
+            cursor = parameter.next
+        try self.put(")")
+        try self.result_type(ft.elem)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        try self.line("let mark = heap.mark()")
+        try self.line("defer heap.drain(mark)")
+        if instance:
+            let t = try native_node(owner)
+            try self.begin("var native = " if mutates else "let native = ")
+            try self.to_base(t, "self" if call == none else ("*L_self" if mutates else "L_self"), owner)
+            try self.end()
+            if mutates:
+                try self.begin("defer L_")
+                try self.put(self.type_name(owner))
+                try self.put(".writeback(")
+                try self.put("&self" if call == none else "L_self")
+                try self.put(", &native)")
+                try self.end()
+        try self.begin("let answer = " if result != types.unit_id else "")
+        if instance:
+            try self.put("native.")
+        else:
+            try self.write_base_alias(owner.module)
+            try self.put(".")
+            try self.put(owner.text)
+            try self.put(".")
+        try self.put(method.text)
+        try self.put("(")
+        first = true
+        cursor = method.right
+        while let parameter = cursor:
+            if parameter.text != "self" and supplied(call, parameter):
+                if not first:
+                    try self.put(", ")
+                first = false
+                try self.put(parameter.text)
+                try self.put(" = ")
+                let t = parameter.ty else return
+                let half = self.checker.scratch.length // 2
+                let name = try copy_name(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
+                if call == none and t.has(ast.flag_func_type):
+                    try self.put("(")
+                    try self.base_type(t, owner)
+                    try self.put(")kernel.callback_code(")
+                    try self.put(name)
+                    try self.put(")")
+                else:
+                    try self.to_base(t, name, owner)
+            cursor = parameter.next
+        try self.put(")")
+        if self.fallible:
+            try self.native_failure()
+        else:
+            try self.end()
+        if result != types.unit_id:
+            let written = method.left else return
+            let t = (written.left else return) if written.has(ast.flag_fallible) else written
+            try self.begin("return ")
+            try self.from_base(t, "answer", owner)
+            try self.end()
+        self.indent -= 1
+        try self.line("")
+
+    ## Native failures may borrow receiver storage. Own the message before any
+    ## deferred writeback releases the old projection, then use Luce's error chain.
+    mutating func native_failure() -> !:
+        try self.put(" catch failure:")
+        try self.end()
+        try self.line("    let saved = kernel.catch_failure(failure.code, failure.message)")
+        try self.line("    defer kernel.drop_failure(saved)")
+        try self.line("    error(saved.code, kernel.message_of(saved.message))")
+
     ## The arguments of a call into Base: a function-typed parameter gets the thunk of the
     ## named function given (§16.2), every other its value as any call would pass it.
     mutating func base_arguments(e: ast.Node*, d: ast.Node*) -> !:
         try self.put("(")
         var first = true
+        if d.text != "init" and check.has_self(d):
+            let callee = e.left else return
+            let receiver = callee.left else return
+            try self.put("L_self = ")
+            if d.has(ast.flag_mutating):
+                try self.put("&")
+            try self.use(receiver)
+            first = false
         var a = e.body
         while let arg = a:
             if not first:
@@ -1550,7 +1776,12 @@ pub struct Emitter:
             let call = self.native_calls.get(self.native_calls_done)
             self.native_calls_done += 1
             let declaration = call.resolved else return try self.fail(call, "a native call has no declaration")
-            try self.shim(declaration, call)
+            if declaration.kind == ast.Kind.struct_ or declaration.text == "init":
+                try self.native_constructor(call, declaration)
+            elif let owner = declaration.resolved:
+                try self.native_method(declaration, owner, call)
+            else:
+                try self.shim(declaration, call)
         while self.crossings_done < self.crossings.count:
             let t = self.crossings.get(self.crossings_done)
             let owner = self.crossing_owners.get(self.crossings_done)
@@ -1593,26 +1824,24 @@ pub struct Emitter:
         elif t.has(ast.flag_tuple_type):
             try self.crossing_tuple(t, module_decl, true)
         elif module_decl.kind == ast.Kind.struct_:
-            try self.begin("return ")
-            try self.write_base_alias(module_decl.module)
-            try self.put(".")
-            try self.put(module_decl.text)
-            try self.put("(")
-            var first = true
+            try self.line("var native = v.native")
             var cursor = module_decl.body
-            while let f = cursor:
-                if f.kind == ast.Kind.field:
-                    if not first:
-                        try self.put(", ")
-                    first = false
-                    try self.put(f.text)
+            while let field = cursor:
+                if field.kind == ast.Kind.field:
+                    let ft = field.ty else return
+                    # Rebase public fields in this new native copy, including let
+                    # fields whose borrowed view must point into the owned projection.
+                    # The caller's native object is never modified through this cast.
+                    try self.begin("*(")
+                    try self.base_type(ft, module_decl)
+                    try self.put("*)&native.")
+                    try self.put(field.text)
                     try self.put(" = ")
-                    let ft = f.ty else return
-                    let field = try copy_name(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
-                    try self.to_base(ft, field, module_decl)
-                cursor = f.next
-            try self.put(")")
-            try self.end()
+                    let projection = try copy_name(try format(self.checker.scratch[half..], f"v.L_{field.text}"))
+                    try self.to_base(ft, projection, module_decl)
+                    try self.end()
+                cursor = field.next
+            try self.line("return native")
         else:
             try self.line("match v:")
             var cursor = module_decl.body
@@ -1652,14 +1881,17 @@ pub struct Emitter:
         elif module_decl.kind == ast.Kind.struct_:
             try self.begin("return L_")
             try self.put(self.checker.table.get(module_decl.type_id).name)
-            try self.put("(")
-            var first = true
+            try self.put("(native = v")
+            var first = false
             var cursor = module_decl.body
             while let f = cursor:
                 if f.kind == ast.Kind.field:
                     if not first:
                         try self.put(", ")
                     first = false
+                    try self.put("L_")
+                    try self.put(f.text)
+                    try self.put(" = ")
                     let ft = f.ty else return
                     let field = try copy_name(try format(self.checker.scratch[half..], f"v.{f.text}"))
                     try self.from_base(ft, field, module_decl)
@@ -1769,7 +2001,13 @@ pub struct Emitter:
         if ft.elem != types.unit_id:
             try self.put("let answer = ")
         try self.put("L_")
-        try self.put(try self.decl_name(f))
+        if f.has(ast.flag_base) and f.resolved != none:
+            let owner = f.resolved else return
+            try self.put(self.type_name(owner))
+            try self.put(".L_")
+            try self.put(f.text)
+        else:
+            try self.put(try self.decl_name(f))
         try self.put("(")
         first = true
         i = 0
@@ -2126,12 +2364,19 @@ pub struct Emitter:
                     try self.put(")")
                 try self.end()
             cursor = m.next
+        if d.has(ast.flag_base):
+            cursor = d.body
+            while let method = cursor:
+                if method.kind == ast.Kind.func_:
+                    try self.native_method(method, d)
+                cursor = method.next
+            try self.native_writeback(d)
         self.indent -= 1
         try self.line("")
         # an enum's methods are free functions over it, `self` an ordinary parameter
         cursor = d.body
         while let m = cursor:
-            if m.kind == ast.Kind.func_:
+            if m.kind == ast.Kind.func_ and not m.has(ast.flag_base):
                 try self.function(m, self.type_name(d))
             cursor = m.next
 
@@ -4180,6 +4425,10 @@ pub struct Emitter:
         if rt.kind == types.Kind.type_name:
             let m = e.resolved else return
             let d = rt.decl else return
+            if m.kind == ast.Kind.func_ and m.has(ast.flag_base):
+                try self.put("&")
+                try self.put(try self.thunk_name(m, "L_fn_"))
+                return
             if m.kind == ast.Kind.enum_case:
                 try self.put("L_")
                 try self.put(self.type_name(d))
@@ -4317,9 +4566,13 @@ pub struct Emitter:
                 try self.put(d.text)
                 try self.arguments(e, d.body, false, true)
             .struct_:
-                try self.put("L_")
-                try self.put(self.type_name(d))
-                try self.arguments(e, d.body, false, true)
+                if d.has(ast.flag_base):
+                    try self.put(try self.native_call_name(e))
+                    try self.base_arguments(e, d)
+                else:
+                    try self.put("L_")
+                    try self.put(self.type_name(d))
+                    try self.arguments(e, d.body, false, true)
             .class_:
                 # a class with defaults for every field and no `init`
                 try self.put("L_")
@@ -4327,11 +4580,19 @@ pub struct Emitter:
                 try self.put("__new()")
             .func_:
                 if d.text == "init":
+                    if d.has(ast.flag_base):
+                        try self.put(try self.native_call_name(e))
+                        try self.base_arguments(e, d)
+                        return
                     let owner = callee.resolved else return try self.fail(e, "no class")
                     try self.put("L_")
                     try self.put(self.type_name(owner))
                     try self.put("__new")
                     try self.arguments(e, d.right, true, false)
+                    return
+                if d.has(ast.flag_base) and d.resolved != none:
+                    try self.put(try self.native_call_name(e))
+                    try self.base_arguments(e, d)
                     return
                 if check.has_self(d):
                     let receiver = callee.left else return
@@ -5243,8 +5504,15 @@ pub struct Emitter:
             try self.put("return ")
         if fallible:
             try self.put("try ")
-        try self.put("L_")
-        try self.put(try self.decl_name(d))
+        if d.has(ast.flag_base) and d.resolved != none:
+            let owner = d.resolved else return
+            try self.put("L_")
+            try self.put(self.type_name(owner))
+            try self.put(".L_")
+            try self.put(d.text)
+        else:
+            try self.put("L_")
+            try self.put(try self.decl_name(d))
         try self.put("(")
         cursor = d.right
         var first = true
@@ -5252,7 +5520,7 @@ pub struct Emitter:
             if not first:
                 try self.put(", ")
             first = false
-            if d.has(ast.flag_base) and self.checker.table.kind(p.type_id) == types.Kind.func_:
+            if d.has(ast.flag_base) and d.resolved == none and self.checker.table.kind(p.type_id) == types.Kind.func_:
                 try self.put("(")
                 let callback_type = p.ty else return
                 try self.base_type(callback_type, d)
@@ -5350,9 +5618,13 @@ pub struct Emitter:
         try self.put(":")
         try self.end()
         try self.begin("    ")
-        if ft.elem != types.unit_id:
+        let fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        let payload = self.checker.table.get(ft.elem).elem if fallible else ft.elem
+        if payload != types.unit_id:
             try self.put("return ")
-        if owner.kind == types.Kind.class_ or owner.kind == types.Kind.enum_ or owner.kind == types.Kind.interface_:
+        if fallible:
+            try self.put("try ")
+        if owner.kind == types.Kind.class_ or (owner.kind == types.Kind.enum_ and not m.has(ast.flag_base)) or owner.kind == types.Kind.interface_:
             try self.put("L_")
             try self.put(owner.name)
             try self.put("__L_")
@@ -5854,6 +6126,8 @@ pub struct Emitter:
                 return false
             .struct_, .enum_:
                 let d = t.decl else return false
+                if d.has(ast.flag_native_value):
+                    return true
                 var cursor = d.body
                 while let m = cursor:
                     if m.kind == ast.Kind.field and self.equality_at(m.type_id, depth + 1):
@@ -5918,6 +6192,17 @@ pub struct Emitter:
             self.indent -= 1
             try self.line("")
             return
+        if let declaration = t.decl:
+            if declaration.has(ast.flag_native_value):
+                let native = try native_node(declaration)
+                try self.begin("return ")
+                try self.to_base(native, "a", declaration)
+                try self.put(" == ")
+                try self.to_base(native, "b", declaration)
+                try self.end()
+                self.indent -= 1
+                try self.line("")
+                return
         match t.kind:
             .list_:
                 try self.begin("return kernel.list_equal[")
@@ -6583,3 +6868,9 @@ func same_native_child(a: ast.Node*?, b: ast.Node*?) -> bool:
     let left = a else return b == none
     let right = b else return false
     return same_native_type(left, right)
+
+func native_node(declaration: ast.Node*) -> ast.Node*!:
+    let t = try ast.Node.make(ast.Kind.type_, declaration.text, declaration.start, declaration.line)
+    t.type_id = declaration.type_id
+    t.module = declaration.module
+    return t

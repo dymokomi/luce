@@ -53,6 +53,23 @@ and the interpreter follows in its evaluator:
    A pattern binding in a `match` statement and the binding of an `if let` or `while let`
    own a copy of what they bind.
 
+## Imported native values
+
+A copied Base struct contains its complete native representation and a public
+projection whose text/data references belong to Luce. Native entry starts from the
+complete representation and rebases public fields onto that projection. Rebasing
+also initializes immutable field storage in this new copy; it does not mutate the
+caller's value or bypass its initializer. A private borrowed field is not eligible
+for this representation.
+
+Mutating native methods defer writeback of the complete value on success and
+failure. Writeback copies new public references before releasing the old ones.
+Errors are given owned text before that cleanup can invalidate a native message
+borrow. Bound methods retain an independent value copy. Equality compares rebased
+native values, so private fields participate and stale projections do not. Worker
+transfer preserves private scalar storage and creates new public text/data owners
+on the destination thread.
+
 ## Destruction
 
 When an object's strong count reaches zero it is destroyed: `deinit` runs if declared, the

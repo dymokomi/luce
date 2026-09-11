@@ -13,6 +13,8 @@ python3 tools/test_base_packages.py
 python3 tools/test_native_manifest.py
 python3 tools/test_base_fields.py
 python3 tools/test_base_description.py
+python3 tools/test_base_defaults.py
+python3 tools/test_base_values.py
 python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
