@@ -892,7 +892,7 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
-The current description begins with `description 6`; a mismatched compiler is
+The current description begins with `description 7`; a mismatched compiler is
 rejected before declarations are read. There is one current format. Field
 mutability and default availability are explicit in the records. Named arguments
 keep their parameter association. Omitted defaults are evaluated by Base in their
@@ -924,8 +924,22 @@ lease. Retaining a view, binding a method or capturing it keeps validity checks
 alive without extending the valid period. After the Base owner ends the lease or
 closes, access fails; `is_valid()` still reports the state. Returned text is copied
 into an owned Luce string and can outlive the view. Native owners and views cannot
-be transferred to workers. Interface execution remains tracked in Base's
-`docs/PACKAGE-REWRITE-TODO.md`.
+be transferred to workers.
+
+Native interfaces dispatch to Base or Luce implementations with shared ownership.
+Base uses `interop.Interface[I]` to retain an actual native witness. A Luce class
+can implement that interface and be retained in a Base container. Native conformers
+keep their real witness and complete native storage. Class-backed interface values
+preserve the concrete object's identity, including comparisons through another
+interface or the concrete class. Value-backed interfaces own a copied value.
+
+A native `interop.Owned[T]` result appears as `T`; `interop.Outcome[T]` appears as
+`T!`. These carriers retain borrowed result storage and dynamic failure text until
+the receiver consumes/releases them. Luce implementers require these contracts for
+borrowed or fallible native results. This lets Base handle a managed failure without
+leaving a pending Luce error allocation. Retained interfaces trace their owners,
+so mixed native/managed cycles can be collected. Interface views keep their source
+lease and reject access after expiry.
 
 ### 16.2 Crossable types
 
@@ -940,6 +954,8 @@ be transferred to workers. Interface execution remains tracked in Base's
 | struct with copyable native storage | the same struct, declared in Base | complete native value plus owned public text/data |
 | declared owned object | `interop.Reference[T]` | shared native owner; parameter borrows and result transfers a reference |
 | declared borrowed view | `interop.View[T]` | shared checked lease; no public construction |
+| native interface | `interop.Interface[I]` | witness and explicit owner/lease; both implementation directions |
+| `T`, `T!` | `interop.Owned[T]`, `interop.Outcome[T]` | explicit backing storage and owned failures |
 | `(T, U)` | `(T, U)` | each member crosses recursively |
 | integer-backed `enum` declared in Base | that enum | by value |
 | `T?` | `T?` | by value |

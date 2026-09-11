@@ -18,6 +18,7 @@
 #==============================================================================================
 
 import back.native_objects
+import back.native_interfaces
 import front.ast
 import sema.check
 import sema.bodies
@@ -299,6 +300,9 @@ pub struct Emitter:
                                 member = method.next
                         else:
                             try self.handle_decl(d)
+                    .interface_:
+                        try self.interface_decl(d)
+                        try self.native_interface(d)
                     .struct_: try self.struct_decl(d)
                     .enum_: try self.enum_decl(d)
                     _: discard(0)
@@ -552,6 +556,170 @@ pub struct Emitter:
                 try self.line("")
             cursor = m.next
 
+    ## Assemble typed conversions; the interface module owns adapter storage/tables.
+    mutating func native_interface(d: ast.Node*) -> !:
+        var methods = try list.List[native_interfaces.Method].create(8)
+        var cursor = d.body
+        var reverse = true
+        while let method = cursor:
+            if method.kind == ast.Kind.func_:
+                reverse = reverse and self.checker.native_result_owned(method.left)
+            cursor = method.next
+        let start = self.out.used
+        try self.write_base_alias(d.module)
+        try self.put(".")
+        try self.put(d.text)
+        let native = try self.take_output(start)
+        cursor = d.body
+        while let method = cursor:
+            cursor = method.next
+            if method.kind != ast.Kind.func_:
+                continue
+            let ft = self.checker.table.get(method.type_id)
+            try self.shim_parameters(method, true)
+            let luce_parameters = try self.take_output(start)
+            var parameters = method.right
+            var first = true
+            while let parameter = parameters:
+                if parameter.text != "self":
+                    if not first:
+                        try self.put(", ")
+                    first = false
+                    try self.put("n_")
+                    try self.put(parameter.text)
+                    try self.put(": ")
+                    try self.base_type((parameter.ty else return), d)
+                parameters = parameter.next
+            let native_parameters = try self.take_output(start)
+            try self.result_type(ft.elem)
+            let luce_result = try self.take_output(start)
+            if let result = method.left:
+                try self.put(" -> ")
+                try self.base_type(result, d)
+            let native_result = try self.take_output(start)
+            let saved_indent = self.indent
+            self.indent = 1
+            try self.interface_from_native(method, d)
+            let luce_body = try self.take_output(start)
+            self.indent = 2
+            if reverse:
+                try self.interface_to_native(method, d)
+            let native_body = try self.take_output(start)
+            self.indent = saved_indent
+            try methods.push(native_interfaces.Method(method.text, native_parameters, luce_parameters,
+                native_result, luce_result, native_body, luce_body, method.has(ast.flag_mutating)))
+        try native_interfaces.declaration(&self.out, self.type_name(d), native, methods.span(), reverse)
+
+    mutating func interface_from_native(method: ast.Node*, owner: ast.Node*) -> !:
+        let ft = self.checker.table.get(method.type_id)
+        let fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        let result = self.checker.table.get(ft.elem).elem if fallible else ft.elem
+        let written = method.left
+        let outcome = (written else return).has(ast.flag_native_outcome) if fallible else false
+        try self.line("try reference.enter()" if fallible else "reference.enter() catch failure: trap(failure.message)")
+        try self.line("defer reference.leave()")
+        try self.line("var native = reference.value()" if method.has(ast.flag_mutating) else "let native = reference.value()")
+        try self.begin("let outcome = " if outcome else ("let answer = " if result != types.unit_id else ""))
+        try self.put("native.")
+        try self.put(method.text)
+        try self.put("(")
+        var cursor = method.right
+        var first = true
+        while let parameter = cursor:
+            if parameter.text != "self":
+                if not first:
+                    try self.put(", ")
+                first = false
+                let start = self.out.used
+                try self.put("L_")
+                try self.put(parameter.text)
+                let name = try self.take_output(start)
+                try self.to_base((parameter.ty else return), name, owner)
+            cursor = parameter.next
+        try self.put(")")
+        if fallible and not outcome:
+            try self.native_failure()
+        else:
+            try self.end()
+        if outcome:
+            try self.line("defer outcome.release()")
+            try self.begin("let answer = " if result != types.unit_id else "")
+            try self.put("outcome.get()")
+            try self.native_failure()
+        if result != types.unit_id:
+            let result_node = written else return
+            let inner = (result_node.left else return) if fallible else result_node
+            try self.begin("return ")
+            if outcome:
+                try self.borrow_from_base(inner, "answer", owner)
+            else:
+                try self.from_base(inner, "answer", owner)
+            try self.end()
+
+    mutating func interface_to_native(method: ast.Node*, owner: ast.Node*) -> !:
+        var cursor = method.right
+        while let parameter = cursor:
+            if parameter.text != "self":
+                let start = self.out.used
+                try self.put("n_")
+                try self.put(parameter.text)
+                let name = try self.take_output(start)
+                try self.begin("let L_")
+                try self.put(parameter.text)
+                try self.put(" = ")
+                try self.borrow_from_base((parameter.ty else return), name, owner)
+                try self.end()
+                if self.checker.table.has_references(parameter.type_id):
+                    try self.begin("defer ")
+                    try self.put(try self.lifetime_name("L_drop_", parameter.type_id))
+                    try self.put("(L_")
+                    try self.put(parameter.text)
+                    try self.put(")")
+                    try self.end()
+            cursor = parameter.next
+        let ft = self.checker.table.get(method.type_id)
+        let fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
+        let result = self.checker.table.get(ft.elem).elem if fallible else ft.elem
+        try self.begin("let answer = " if result != types.unit_id else "")
+        try self.put("L_")
+        try self.put(self.type_name(owner))
+        try self.put("__L_")
+        try self.put(method.text)
+        try self.put("(self.source")
+        try self.shim_parameters(method, false)
+        try self.put(")")
+        if fallible:
+            try self.put(" catch failure:")
+            try self.end()
+            try self.begin("    return kernel.native_failure[")
+            let written = method.left else return
+            try self.base_type((written.left else return), owner)
+            try self.put("](failure.code, failure.message)")
+            try self.end()
+        else:
+            try self.end()
+        if result != types.unit_id and self.checker.table.has_references(result):
+            try self.begin("defer ")
+            try self.put(try self.lifetime_name("L_drop_", result))
+            try self.put("(answer)")
+            try self.end()
+        if fallible:
+            let written = method.left else return
+            let inner = written.left else return
+            try self.begin("return interop.Outcome[")
+            try self.base_type(inner, owner)
+            try self.put("].success(")
+            let owned = try plain_native_node(inner)
+            owned.flags |= ast.flag_native_owned
+            try self.to_base(owned, "()" if result == types.unit_id else "answer", owner)
+            try self.put(".clone())")
+            try self.end()
+        elif result != types.unit_id:
+            let written = method.left else return
+            try self.begin("return ")
+            try self.owned_to_base(written, "answer", owner)
+            try self.end()
+
     ## What precedes a shim's call of the method: `return` for a value, `return try` for
     ## a fallible value, `try` for a fallible `unit`, nothing for `unit`.
     mutating func shim_return(result: u32) -> !:
@@ -614,6 +782,53 @@ pub struct Emitter:
         let ct = self.checker.table.get(concrete)
         return try copy_name(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}__box"))
 
+    ## A Base conformer keeps its actual native witness. This also supports
+    ## interfaces whose borrowed result cannot be produced by a managed method.
+    mutating func native_conformer_box(iface: ast.Node*, concrete: ast.Node*, name: str) -> !:
+        let start = self.out.used
+        try self.write_base_alias(iface.module)
+        try self.put(".")
+        try self.put(iface.text)
+        let native_interface = try self.take_output(start)
+        try self.type_of(concrete.type_id)
+        let luce = try self.take_output(start)
+        let iface_name = self.type_name(iface)
+        let concrete_name = self.type_name(concrete)
+        if concrete.native_object == none:
+            try self.write_base_alias(concrete.module)
+            try self.put(".")
+            try self.put(concrete.text)
+            let native_type = try self.take_output(start)
+            try self.out.write(f"struct {name}__storage:\n    var header: heap.Object\n    var value: {luce}\n    var native: {native_type}\n")
+            try self.out.write(f"func {name}__drop(o: heap.Object*):\n")
+            if self.checker.table.has_references(concrete.type_id):
+                try self.put("    ")
+                try self.put(try self.lifetime_name("L_drop_", concrete.type_id))
+                try self.out.write(f"((({name}__storage*)o).value)\n")
+            else:
+                try self.put("    discard(o)\n")
+            try self.out.write(f"func {name}__trace(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):\n")
+            if self.checker.table.has_references(concrete.type_id):
+                try self.put("    ")
+                try self.put(try self.lifetime_name("L_trace_", concrete.type_id))
+                try self.out.write(f"((({name}__storage*)o).value, visit, context)\n")
+            else:
+                try self.put("    discard(o)\n")
+            try self.out.write(f"var {name}__info: heap.Info = heap.Info(name = \"{concrete_name} interface value\", size = sizeof({name}__storage), finish = none, drop = {name}__drop, trace = {name}__trace)\n")
+        try self.out.write(f"func {name}__box(value: {luce}) -> L_{iface_name}*:\n")
+        if let object = concrete.native_object:
+            let access = "value_mut" if object.view and object.mutable else "value"
+            try self.out.write(f"    let reference = L_{concrete_name}__value(value)\n    let carried = reference.as_interface[{native_interface}](reference.{access}())\n")
+            try self.put("    ")
+            try self.put(try self.lifetime_name("L_drop_", concrete.type_id))
+            try self.put("(value)\n")
+            try self.out.write(f"    return L_{iface_name}__frombase(carried)\n\n")
+        else:
+            try self.out.write(f"    let storage = ({name}__storage*)heap.allocate(&{name}__info)\n    storage.value = value\n    storage.native = ")
+            let t = try native_node(concrete)
+            try self.to_base(t, "storage.value", concrete)
+            try self.out.write(f"\n    return L_{iface_name}__frombase(interop.Interface[{native_interface}](&storage.header, &storage.native))\n\n")
+
     ## The box of one interface and one conforming type: the object, a shim per method
     ## calling the type's own, the table of shims, the descriptor, and the constructor.
     mutating func box_support() -> !:
@@ -626,6 +841,10 @@ pub struct Emitter:
             let d = it.decl else return try self.fail(self.checker.tree(), "an interface without a declaration")
             let half = self.checker.scratch.length // 2
             let name = try copy_name(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}"))
+            let concrete_decl = ct.decl else return try self.fail(d, "an interface payload has no declaration")
+            if d.has(ast.flag_base) and concrete_decl.has(ast.flag_base) and (concrete_decl.native_object != none or concrete_decl.kind == ast.Kind.struct_):
+                try self.native_conformer_box(d, concrete_decl, name)
+                continue
             try self.begin("struct ")
             try self.put(name)
             try self.put(":")
@@ -726,6 +945,8 @@ pub struct Emitter:
                 try self.put("nothing = 0")
             try self.put(")")
             try self.end()
+            if ct.kind == types.Kind.class_ or ct.kind == types.Kind.interface_:
+                try self.out.write(f"func {name}__identity(o: heap.Object*) -> u64:\n    return heap.identity((heap.Object*)(({name}*)o).value)\n")
             try self.begin("var ")
             try self.put(name)
             try self.put("__info: heap.Info = heap.Info(name = \"")
@@ -736,7 +957,10 @@ pub struct Emitter:
             try self.put(name)
             try self.put("__drop, trace = ")
             try self.put(name)
-            try self.put("__trace)")
+            try self.put("__trace")
+            if ct.kind == types.Kind.class_ or ct.kind == types.Kind.interface_:
+                try self.out.write(f", identity = {name}__identity")
+            try self.put(")")
             try self.end()
             try self.begin("func ")
             try self.put(name)
@@ -1288,7 +1512,8 @@ pub struct Emitter:
             self.indent -= 1
             try self.line("")
             return
-        var pools = false
+        let outcome = d.left != none and (d.left else return).has(ast.flag_native_outcome)
+        var pools = true
         cursor = d.right
         while let p = cursor:
             let t = p.ty else break
@@ -1299,18 +1524,17 @@ pub struct Emitter:
             cursor = p.next
         if pools:
             try self.line("let mark = heap.mark()")
-            if self.fallible:
-                try self.line("errdefer heap.drain(mark)")
+            try self.line("defer heap.drain(mark)")
         var result = ft.elem
         if self.checker.table.kind(result) == types.Kind.fallible:
             result = self.checker.table.get(result).elem
         if let site = call:
             try self.position_lines(site)
         try self.begin("")
-        if result != types.unit_id:
+        if outcome:
+            try self.put("let outcome = ")
+        elif result != types.unit_id:
             try self.put("let answer = ")
-        if self.fallible:
-            try self.put("try ")
         try self.write_base_alias(d.module)
         try self.put(".")
         try self.put(d.text)
@@ -1332,10 +1556,13 @@ pub struct Emitter:
             try self.to_base(t, name, d)
             cursor = p.next
         try self.put(")")
-        try self.end()
-        if pools:
-            try self.line("heap.drain(mark)")
-        if result != types.unit_id:
+        if self.fallible and not outcome:
+            try self.native_failure()
+        else:
+            try self.end()
+        if outcome:
+            try self.outcome_return((d.left else return), d)
+        elif result != types.unit_id:
             let r = d.left else return try self.fail(d, "a Base result without a type")
             var inner = r
             if r.has(ast.flag_fallible):
@@ -1489,16 +1716,7 @@ pub struct Emitter:
         try self.put(field.text)
         try self.end()
         try self.begin("return ")
-        var id = field.type_id
-        while self.checker.table.kind(id) == types.Kind.optional:
-            id = self.checker.table.get(id).elem
-        let acquires = self.checker.table.kind(id) == types.Kind.class_
-        if acquires:
-            try self.put(try self.lifetime_name("L_copy_", field.type_id))
-            try self.put("(")
-        try self.from_base(t, "value", owner)
-        if acquires:
-            try self.put(")")
+        try self.borrow_from_base(t, "value", owner)
         try self.end()
         self.indent -= 1
         try self.line("")
@@ -1529,6 +1747,7 @@ pub struct Emitter:
         let instance = check.has_self(method)
         let owned = owner.native_object != none
         let mutates = method.has(ast.flag_mutating) and not owned
+        let outcome = method.left != none and (method.left else return).has(ast.flag_native_outcome)
         let ft = self.checker.table.get(method.type_id)
         self.fallible = self.checker.table.kind(ft.elem) == types.Kind.fallible
         var result = self.checker.table.get(ft.elem).elem if self.fallible else ft.elem
@@ -1614,7 +1833,7 @@ pub struct Emitter:
                 try self.put("&self" if call == none else "L_self")
                 try self.put(", &native)")
                 try self.end()
-        try self.begin("let answer = " if result != types.unit_id else "")
+        try self.begin("let outcome = " if outcome else ("let answer = " if result != types.unit_id else ""))
         if instance:
             try self.put("native.")
         else:
@@ -1646,11 +1865,13 @@ pub struct Emitter:
                     try self.to_base(t, name, owner)
             cursor = parameter.next
         try self.put(")")
-        if self.fallible:
+        if self.fallible and not outcome:
             try self.native_failure()
         else:
             try self.end()
-        if result != types.unit_id:
+        if outcome:
+            try self.outcome_return((method.left else return), owner)
+        elif result != types.unit_id:
             let written = method.left else return
             let t = (written.left else return) if written.has(ast.flag_fallible) else written
             try self.begin("return ")
@@ -1658,6 +1879,17 @@ pub struct Emitter:
             try self.end()
         self.indent -= 1
         try self.line("")
+
+    mutating func outcome_return(written: ast.Node*, owner: ast.Node*) -> !:
+        let inner = written.left else return
+        try self.line("defer outcome.release()")
+        try self.begin("let answer = " if inner.type_id != types.unit_id else "")
+        try self.put("outcome.get()")
+        try self.native_failure()
+        if inner.type_id != types.unit_id:
+            try self.begin("return ")
+            try self.borrow_from_base(inner, "answer", owner)
+            try self.end()
 
     ## Native failures may borrow receiver storage. Own the message before any
     ## deferred writeback releases the old projection, then use Luce's error chain.
@@ -1712,6 +1944,17 @@ pub struct Emitter:
 
     ## The Base spelling of a type read from a description, `mod.Name` for the module's own.
     mutating func base_type(t: ast.Node*, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.put("interop.Owned[")
+            let plain = try plain_native_node(t)
+            try self.base_type(plain, owner)
+            try self.put("]")
+            return
+        if t.has(ast.flag_native_outcome):
+            try self.put("interop.Outcome[")
+            try self.base_type((t.left else return), owner)
+            try self.put("]")
+            return
         if t.has(ast.flag_fallible):
             let inner = t.left else return
             if not inner.has(ast.flag_tuple_type) or inner.body != none:
@@ -1772,16 +2015,24 @@ pub struct Emitter:
             try self.put("[]")
         else:
             let declaration = self.checker.table.get(t.type_id).decl else return try self.fail(t, "a Base nominal type has no resolved declaration")
-            if let native = declaration.native_object:
+            if declaration.kind == ast.Kind.interface_:
+                try self.put("interop.Interface[")
+            elif let native = declaration.native_object:
                 try self.put("interop.View[" if native.view else "interop.Reference[")
             try self.write_base_alias(declaration.module)
             try self.put(".")
             try self.put(declaration.text)
-            if declaration.native_object != none:
+            if declaration.native_object != none or declaration.kind == ast.Kind.interface_:
                 try self.put("]")
 
     ## A Luce value named `v` as Base takes it (§16.2): lent, converted, or unwrapped.
     mutating func to_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.put(try self.crossing_name(t, "L_tobase_", owner))
+            try self.put("(")
+            try self.put(v)
+            try self.put(")")
+            return
         if t.has(ast.flag_optional) or t.has(ast.flag_func_type) or t.has(ast.flag_tuple_type):
             if t.has(ast.flag_func_type):
                 try self.put(v)
@@ -1812,7 +2063,7 @@ pub struct Emitter:
             let e = t.body else return
             if e.text == "str":
                 try self.put("kernel.str_views(")
-            elif self.checker.table.kind(e.type_id) == types.Kind.class_:
+            elif self.checker.table.kind(e.type_id) == types.Kind.class_ or self.checker.table.kind(e.type_id) == types.Kind.interface_:
                 try self.put(try self.crossing_name(t, "L_tobase_", owner))
                 try self.put("(")
             else:
@@ -1823,7 +2074,13 @@ pub struct Emitter:
             try self.put(")")
         else:
             let kind = self.checker.table.kind(t.type_id)
-            if kind == types.Kind.class_:
+            if kind == types.Kind.interface_:
+                try self.put("L_")
+                try self.put(self.checker.table.get(t.type_id).name)
+                try self.put("__tobase(")
+                try self.put(v)
+                try self.put(")")
+            elif kind == types.Kind.class_:
                 try self.put("L_")
                 try self.put(self.checker.table.get(t.type_id).name)
                 try self.put("__value(")
@@ -1837,6 +2094,12 @@ pub struct Emitter:
 
     ## A Base value named `v` as Luce keeps it: copied, converted, or wrapped.
     mutating func from_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.put(try self.crossing_name(t, "L_frombase_", owner))
+            try self.put("(")
+            try self.put(v)
+            try self.put(")")
+            return
         if t.has(ast.flag_optional):
             try self.put(try self.crossing_name(t, "L_frombase_", owner))
             try self.put("(")
@@ -1862,7 +2125,13 @@ pub struct Emitter:
             try self.put(")")
         else:
             let kind = self.checker.table.kind(t.type_id)
-            if kind == types.Kind.class_:
+            if kind == types.Kind.interface_:
+                try self.put("L_")
+                try self.put(self.checker.table.get(t.type_id).name)
+                try self.put("__frombase(")
+                try self.put(v)
+                try self.put(")")
+            elif kind == types.Kind.class_:
                 try self.put("L_")
                 try self.put(self.checker.table.get(t.type_id).name)
                 try self.put("__wrap(")
@@ -1922,7 +2191,149 @@ pub struct Emitter:
             self.callbacks_done += 1
             try self.callback_thunk(f, self.callbacks_done - 1)
 
+    ## Render a small adapter fragment without keeping it in the output stream.
+    mutating func take_output(start: usize) -> str!:
+        let text = try copy_name((str)self.out.bytes()[start..])
+        self.out.used = start
+        return text
+
+    func can_borrow_native(t: ast.Node*) -> bool:
+        if t.has(ast.flag_optional):
+            return self.can_borrow_native((t.left else return false))
+        if t.has(ast.flag_tuple_type):
+            var cursor = t.body
+            while let member = cursor:
+                if not self.can_borrow_native(member):
+                    return false
+                cursor = member.next
+            return true
+        let kind = self.checker.table.kind(t.type_id)
+        if kind == types.Kind.class_:
+            return (self.checker.table.get(t.type_id).decl else return false).native_object != none
+        return kind != types.Kind.func_
+
+    ## Transfer explicit native references in a result, recursively through tuples
+    ## and optionals. The managed result is released after this ownership is acquired.
+    mutating func owned_to_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
+        if not t.has(ast.flag_native_owned) and (t.has(ast.flag_optional) or t.has(ast.flag_tuple_type)):
+            try self.put(try self.crossing_name(t, "L_retainbase_", owner))
+            try self.put("(")
+            try self.put(value)
+            try self.put(")")
+        else:
+            try self.to_base(t, value, owner)
+            if t.has(ast.flag_native_owned) or self.checker.table.kind(t.type_id) == types.Kind.class_ or self.checker.table.kind(t.type_id) == types.Kind.interface_:
+                try self.put(".clone()")
+
+    mutating func borrow_from_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned) or (not t.has(ast.flag_optional) and not t.has(ast.flag_tuple_type) and (self.checker.table.kind(t.type_id) == types.Kind.class_ or self.checker.table.kind(t.type_id) == types.Kind.interface_)):
+            let start = self.out.used
+            try self.put(value)
+            try self.put(".clone()")
+            let retained = try self.take_output(start)
+            try self.from_base(t, retained, owner)
+        elif t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
+            try self.put(try self.crossing_name(t, "L_borrowbase_", owner))
+            try self.put("(")
+            try self.put(value)
+            try self.put(")")
+        else:
+            try self.from_base(t, value, owner)
+
+    ## An explicit result carrier lends its payload until the carrier is released.
+    mutating func owned_crossing(t: ast.Node*, owner: ast.Node*) -> !:
+        let plain = try plain_native_node(t)
+        let toward = try self.crossing_name(t, "L_tobase_", owner)
+        let back = try self.crossing_name(t, "L_frombase_", owner)
+        let start = self.out.used
+        try self.type_of(t.type_id)
+        let luce = try self.take_output(start)
+        try self.base_type(plain, owner)
+        let native = try self.take_output(start)
+        let references = self.checker.table.has_references(t.type_id)
+        if references:
+            try self.out.write(f"struct {toward}__holder:\n    var header: heap.Object\n    var value: {luce}\n")
+            try self.out.write(f"func {toward}__drop(o: heap.Object*):\n    ")
+            try self.put(try self.lifetime_name("L_drop_", t.type_id))
+            try self.out.write(f"((({toward}__holder*)o).value)\n")
+            try self.out.write(f"func {toward}__trace(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):\n    ")
+            try self.put(try self.lifetime_name("L_trace_", t.type_id))
+            try self.out.write(f"((({toward}__holder*)o).value, visit, context)\n")
+            try self.out.write(f"var {toward}__info: heap.Info = heap.Info(name = \"owned native result\", size = sizeof({toward}__holder), finish = none, drop = {toward}__drop, trace = {toward}__trace)\n")
+        try self.out.write(f"func {toward}(v: {luce}) -> interop.Owned[{native}]:\n")
+        self.indent += 1
+        if references:
+            try self.out.write(f"    let holder = ({toward}__holder*)heap.allocate(&{toward}__info)\n")
+            try self.begin("holder.value = ")
+            try self.put(try self.lifetime_name("L_copy_", t.type_id))
+            try self.put("(v)")
+            try self.end()
+            try self.line("discard(heap.pool_object(&holder.header))")
+        try self.begin("return interop.Owned[")
+        try self.put(native)
+        try self.put("](")
+        try self.to_base(plain, "holder.value" if references else "v", owner)
+        try self.put(", &holder.header)" if references else ")")
+        try self.end()
+        self.indent -= 1
+        try self.out.write(f"func {back}(v: interop.Owned[{native}]) -> {luce}:\n")
+        self.indent += 1
+        try self.line("defer v.release()")
+        try self.begin("return ")
+        try self.borrow_from_base(plain, "v.value", owner)
+        try self.end()
+        self.indent -= 1
+        try self.line("")
+
+    mutating func borrowed_crossing(t: ast.Node*, owner: ast.Node*, toward: bool = false) -> !:
+        try self.begin("func ")
+        try self.put(try self.crossing_name(t, "L_retainbase_" if toward else "L_borrowbase_", owner))
+        try self.put("(v: ")
+        if toward:
+            try self.type_of(t.type_id)
+        else:
+            try self.base_type(t, owner)
+        try self.put(") -> ")
+        if toward:
+            try self.base_type(t, owner)
+        else:
+            try self.type_of(t.type_id)
+        try self.put(":")
+        try self.end()
+        self.indent += 1
+        if t.has(ast.flag_optional):
+            try self.line("if let value = v:")
+            try self.begin("    return ")
+            if toward:
+                try self.owned_to_base((t.left else return), "value", owner)
+            else:
+                try self.borrow_from_base((t.left else return), "value", owner)
+            try self.end()
+            try self.line("return none")
+        else:
+            try self.begin("return (")
+            var cursor = t.body
+            var index: usize = 0
+            while let item = cursor:
+                if index > 0:
+                    try self.put(", ")
+                let half = self.checker.scratch.length // 2
+                let value = try copy_name(try format(self.checker.scratch[half..], f"v.{index}"))
+                if toward:
+                    try self.owned_to_base(item, value, owner)
+                else:
+                    try self.borrow_from_base(item, value, owner)
+                cursor = item.next
+                index += 1
+            try self.put(")")
+            try self.end()
+        self.indent -= 1
+        try self.line("")
+
     mutating func crossing_functions(t: ast.Node*, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.owned_crossing(t, owner)
+            return
         if t.text == "list":
             try self.handle_span_crossing(t, owner)
             return
@@ -2045,6 +2456,11 @@ pub struct Emitter:
             try self.line("    _: trap(\"a Base enum value that is no declared case crossed into Luce\")")
         self.indent -= 1
         try self.line("")
+        if t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
+            if self.can_borrow_native(t):
+                try self.borrowed_crossing(t, owner)
+            if self.checker.native_result_owned(t):
+                try self.borrowed_crossing(t, owner, true)
 
     mutating func crossing_tuple(t: ast.Node*, owner: ast.Node*, toward: bool) -> !:
         try self.begin("return (")
@@ -5407,12 +5823,12 @@ pub struct Emitter:
         let inner = self.checker.table.kind(t.elem) if t.kind == types.Kind.optional else t.kind
         let identity_kinds = (self.is_object_kind(t.kind) and t.kind != types.Kind.str_ and t.kind != types.Kind.bytes_ and t.kind != types.Kind.func_) or (t.kind == types.Kind.optional and self.is_object_kind(inner) and inner != types.Kind.str_ and inner != types.Kind.bytes_ and inner != types.Kind.func_)
         if identity_kinds:
-            try self.lifetime_head("L_id_", id, ") -> usize:", types.none_id)
+            try self.lifetime_head("L_id_", id, ") -> u64:", types.none_id)
             if t.kind != types.Kind.optional:
-                try self.line("    return (usize)v")
+                try self.line("    return heap.identity((heap.Object*)v)")
             else:
                 try self.line("    if let o = v:")
-                try self.line("        return (usize)o")
+                try self.line("        return heap.identity((heap.Object*)o)")
                 try self.line("    return 0")
             try self.line("")
         if t.kind == types.Kind.class_:
@@ -7066,7 +7482,7 @@ func supplied(call: ast.Node*?, parameter: ast.Node*) -> bool:
 ## Luce maps both i64 and usize to int, but their native adapters differ even
 ## inside tuples and optionals. Native signature identity includes that spelling.
 func same_native_type(a: ast.Node*, b: ast.Node*) -> bool:
-    let mask = ast.flag_optional | ast.flag_fallible | ast.flag_func_type | ast.flag_tuple_type | ast.flag_usize
+    let mask = ast.flag_optional | ast.flag_fallible | ast.flag_func_type | ast.flag_tuple_type | ast.flag_usize | ast.flag_native_owned | ast.flag_native_outcome
     if a.type_id != b.type_id or (a.flags & mask) != (b.flags & mask):
         return false
     if not same_native_child(a.left, b.left) or not same_native_child(a.right, b.right):
@@ -7091,3 +7507,10 @@ func native_node(declaration: ast.Node*) -> ast.Node*!:
     t.type_id = declaration.type_id
     t.module = declaration.module
     return t
+
+## Keep resolved nominal identity while inspecting a carrier's underlying value.
+func plain_native_node(node: ast.Node*) -> ast.Node*!:
+    let result = try ast.Node.make(node.kind, node.text, node.start, node.line)
+    *result = *node
+    result.flags &= ~ast.flag_native_owned
+    return result
