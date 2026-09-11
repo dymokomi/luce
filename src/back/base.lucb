@@ -17,6 +17,9 @@
 #
 #==============================================================================================
 
+import back.crossings
+import back.emission
+import back.native_types
 import back.native_objects
 import back.native_interfaces
 import front.ast
@@ -26,8 +29,6 @@ import sema.types
 import support.buffer
 import support.list
 import support.literals
-
-pub let unsupported: ErrorCode = ErrorCode.package(15)
 
 pub struct Emitter:
     ## Chosen after collecting Base sources, to avoid a user module namespace.
@@ -76,9 +77,7 @@ pub struct Emitter:
     ## The Base boundary (§16): types converted at a crossing, each with a pair of
     ## functions after the program; named functions handed to Base as callbacks, each
     ## with a thunk over Base's types.
-    var crossings: list.List[ast.Node*]
-    var crossing_owners: list.List[ast.Node*]
-    var crossings_done: usize
+    var crossing_work: crossings.Work
     var callbacks: list.List[ast.Node*]
     var callbacks_done: usize
     ## Used argument shapes leave native defaults to Base, without copying expressions.
@@ -136,7 +135,7 @@ pub struct Emitter:
                        bounds = try list.List[ast.Node*].create(16), bounds_done = 0, calls = try list.List[u32].create(16), calls_done = 0,
                        cells = try list.List[u32].create(16), cells_done = 0, lambda = none,
                        box_interfaces = try list.List[u32].create(16), box_types = try list.List[u32].create(16), boxes_done = 0,
-                       crossings = try list.List[ast.Node*].create(16), crossing_owners = try list.List[ast.Node*].create(16), crossings_done = 0,
+                       crossing_work = try crossings.Work.create(),
                        spawns = try list.List[ast.Node*].create(8), spawns_done = 0, waits = try list.List[u32].create(8), waits_done = 0, sends = try list.List[u32].create(16), sends_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0, native_calls = try list.List[ast.Node*].create(16), native_calls_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self",
@@ -146,28 +145,25 @@ pub struct Emitter:
     pub func text() -> str:
         return self.out.view()
 
+    mutating func writer() -> emission.Writer:
+        return emission.Writer(self.checker, &self.out, &self.indent, &self.lifetimes)
+
+    mutating func boundary() -> crossings.Emitter:
+        return crossings.Emitter(self.writer(), &self.crossing_work)
+
     # -- writing --------------------------------------------------------------------------
 
     mutating func put(text: str) -> !:
-        try self.out.put(text)
+        try self.writer().put(text)
 
     mutating func line(text: str) -> !:
-        var i: u32 = 0
-        while i < self.indent:
-            try self.out.put("    ")
-            i += 1
-        try self.out.put(text)
-        try self.out.put("\n")
+        try self.writer().line(text)
 
     mutating func begin(text: str) -> !:
-        var i: u32 = 0
-        while i < self.indent:
-            try self.out.put("    ")
-            i += 1
-        try self.out.put(text)
+        try self.writer().begin(text)
 
     mutating func end() -> !:
-        try self.out.put("\n")
+        try self.writer().end()
 
     func fail(node: ast.Node*, what: str) -> never!:
         return try self.checker.fail(node, what)
@@ -177,11 +173,11 @@ pub struct Emitter:
         let half = self.checker.scratch.length // 2
         # an underscore keeps `i16` and the like from becoming Base's type names
         let name = try format(self.checker.scratch[half..], f"{prefix}_{self.temps}")
-        return try copy_name(name)
+        return try emission.copy_text(name)
 
     ## The text written since `start`, taken back out of the output.
     mutating func capture(start: usize) -> str!:
-        let text = try copy_name((str)self.out.bytes()[start..])
+        let text = try emission.copy_text((str)self.out.bytes()[start..])
         self.out.used = start
         return text
 
@@ -335,7 +331,7 @@ pub struct Emitter:
     ## A test as a fallible function of nothing (§17.3).
     mutating func test_function(d: ast.Node*) -> !:
         let index = self.test_names.count
-        try self.test_names.push(try copy_name(try literals.decode_text(d.text)))
+        try self.test_names.push(try emission.copy_text(try literals.decode_text(d.text)))
         self.fallible = true
         try self.begin("func L_test_")
         try self.put_u64((u64)index)
@@ -365,7 +361,7 @@ pub struct Emitter:
         try self.put(args_ops)
         try self.put(", arguments[1..])")
         try self.end()
-        let main = self.checker.find_declaration("main") else error(unsupported, "the entry function is missing")
+        let main = self.checker.find_declaration("main") else error(emission.unsupported, "the entry function is missing")
         try self.begin("    let status = L_")
         try self.put(try self.decl_name(main))
         try self.put("(args) catch failure:")
@@ -439,7 +435,7 @@ pub struct Emitter:
                     if seen == index:
                         let (line, column) = m.src.position(d.start)
                         let half = self.checker.scratch.length // 2
-                        return try copy_name(try format(self.checker.scratch[half..], f"{m.src.path}:{line}:{column}"))
+                        return try emission.copy_text(try format(self.checker.scratch[half..], f"{m.src.path}:{line}:{column}"))
                     seen += 1
                 cursor = d.next
         return "?"
@@ -563,7 +559,7 @@ pub struct Emitter:
         var reverse = true
         while let method = cursor:
             if method.kind == ast.Kind.func_:
-                reverse = reverse and self.checker.native_result_owned(method.left)
+                reverse = reverse and self.checker.native_result_owned(method.left) and self.checker.native_parameters_borrowable(method)
             cursor = method.next
         let start = self.out.used
         try self.write_base_alias(d.module)
@@ -588,14 +584,14 @@ pub struct Emitter:
                     try self.put("n_")
                     try self.put(parameter.text)
                     try self.put(": ")
-                    try self.base_type((parameter.ty else return), d)
+                    try self.boundary().base_type((parameter.ty else return), d)
                 parameters = parameter.next
             let native_parameters = try self.take_output(start)
             try self.result_type(ft.elem)
             let luce_result = try self.take_output(start)
             if let result = method.left:
                 try self.put(" -> ")
-                try self.base_type(result, d)
+                try self.boundary().base_type(result, d)
             let native_result = try self.take_output(start)
             let saved_indent = self.indent
             self.indent = 1
@@ -634,7 +630,7 @@ pub struct Emitter:
                 try self.put("L_")
                 try self.put(parameter.text)
                 let name = try self.take_output(start)
-                try self.to_base((parameter.ty else return), name, owner)
+                try self.boundary().to_base((parameter.ty else return), name, owner)
             cursor = parameter.next
         try self.put(")")
         if fallible and not outcome:
@@ -651,9 +647,9 @@ pub struct Emitter:
             let inner = (result_node.left else return) if fallible else result_node
             try self.begin("return ")
             if outcome:
-                try self.borrow_from_base(inner, "answer", owner)
+                try self.boundary().borrow_from_base(inner, "answer", owner)
             else:
-                try self.from_base(inner, "answer", owner)
+                try self.boundary().from_base(inner, "answer", owner)
             try self.end()
 
     mutating func interface_to_native(method: ast.Node*, owner: ast.Node*) -> !:
@@ -667,7 +663,7 @@ pub struct Emitter:
                 try self.begin("let L_")
                 try self.put(parameter.text)
                 try self.put(" = ")
-                try self.borrow_from_base((parameter.ty else return), name, owner)
+                try self.boundary().borrow_from_base((parameter.ty else return), name, owner)
                 try self.end()
                 if self.checker.table.has_references(parameter.type_id):
                     try self.begin("defer ")
@@ -693,7 +689,7 @@ pub struct Emitter:
             try self.end()
             try self.begin("    return kernel.native_failure[")
             let written = method.left else return
-            try self.base_type((written.left else return), owner)
+            try self.boundary().base_type((written.left else return), owner)
             try self.put("](failure.code, failure.message)")
             try self.end()
         else:
@@ -707,17 +703,17 @@ pub struct Emitter:
             let written = method.left else return
             let inner = written.left else return
             try self.begin("return interop.Outcome[")
-            try self.base_type(inner, owner)
+            try self.boundary().base_type(inner, owner)
             try self.put("].success(")
-            let owned = try plain_native_node(inner)
+            let owned = try native_types.plain_native_node(inner)
             owned.flags |= ast.flag_native_owned
-            try self.to_base(owned, "()" if result == types.unit_id else "answer", owner)
+            try self.boundary().to_base(owned, "()" if result == types.unit_id else "answer", owner)
             try self.put(".clone())")
             try self.end()
         elif result != types.unit_id:
             let written = method.left else return
             try self.begin("return ")
-            try self.owned_to_base(written, "answer", owner)
+            try self.boundary().owned_to_base(written, "answer", owner)
             try self.end()
 
     ## What precedes a shim's call of the method: `return` for a value, `return try` for
@@ -780,7 +776,7 @@ pub struct Emitter:
         let half = self.checker.scratch.length // 2
         let it = self.checker.table.get(iface)
         let ct = self.checker.table.get(concrete)
-        return try copy_name(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}__box"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}__box"))
 
     ## A Base conformer keeps its actual native witness. This also supports
     ## interfaces whose borrowed result cannot be produced by a managed method.
@@ -825,8 +821,8 @@ pub struct Emitter:
             try self.out.write(f"    return L_{iface_name}__frombase(carried)\n\n")
         else:
             try self.out.write(f"    let storage = ({name}__storage*)heap.allocate(&{name}__info)\n    storage.value = value\n    storage.native = ")
-            let t = try native_node(concrete)
-            try self.to_base(t, "storage.value", concrete)
+            let t = try native_types.native_node(concrete)
+            try self.boundary().to_base(t, "storage.value", concrete)
             try self.out.write(f"\n    return L_{iface_name}__frombase(interop.Interface[{native_interface}](&storage.header, &storage.native))\n\n")
 
     ## The box of one interface and one conforming type: the object, a shim per method
@@ -840,7 +836,7 @@ pub struct Emitter:
             let ct = self.checker.table.get(concrete)
             let d = it.decl else return try self.fail(self.checker.tree(), "an interface without a declaration")
             let half = self.checker.scratch.length // 2
-            let name = try copy_name(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}"))
+            let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{it.name}__{ct.name}"))
             let concrete_decl = ct.decl else return try self.fail(d, "an interface payload has no declaration")
             if d.has(ast.flag_base) and concrete_decl.has(ast.flag_base) and (concrete_decl.native_object != none or concrete_decl.kind == ast.Kind.struct_):
                 try self.native_conformer_box(d, concrete_decl, name)
@@ -877,7 +873,7 @@ pub struct Emitter:
                     try self.end()
                     try self.begin("    ")
                     try self.shim_return(ft.elem)
-                    let receiver = try copy_name(try format(self.checker.scratch[half..], f"(({name}*)L_self).value"))
+                    let receiver = try emission.copy_text(try format(self.checker.scratch[half..], f"(({name}*)L_self).value"))
                     try self.method_on(concrete, own, receiver)
                     # a struct's method took the receiver before the parenthesis
                     var pc = m.right
@@ -1006,7 +1002,7 @@ pub struct Emitter:
         if at == self.spawns.count:
             try self.spawns.push(e)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_task_{at}__spawn"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_task_{at}__spawn"))
 
     mutating func wait_name(task_type: u32) -> str!:
         var i: usize = 0
@@ -1018,7 +1014,7 @@ pub struct Emitter:
         if not seen:
             try self.waits.push(task_type)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_wait_{task_type}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_wait_{task_type}"))
 
     ## `L_send_N(v)` for a type whose values are copied to share nothing, or `v` itself for
     ## a scalar, which is its own copy.
@@ -1067,7 +1063,7 @@ pub struct Emitter:
         let payload = self.task_payload(e.type_id)
         let has_result = payload != types.bool_id or (ft.elem != types.unit_id and not (fallible and self.checker.table.get(ft.elem).elem == types.unit_id))
         let half = self.checker.scratch.length // 2
-        let name = try copy_name(try format(self.checker.scratch[half..], f"L_task_{index}"))
+        let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_task_{index}"))
         try self.begin("struct ")
         try self.put(name)
         try self.put(":")
@@ -1104,7 +1100,7 @@ pub struct Emitter:
             try self.begin("    o.W_")
             try self.put(p.text)
             try self.put(" = ")
-            let source = try copy_name(try format(self.checker.scratch[half..], f"o.L_{p.text}"))
+            let source = try emission.copy_text(try format(self.checker.scratch[half..], f"o.L_{p.text}"))
             try self.send_of(p.type_id, source)
             try self.end()
             cursor = p.next
@@ -1369,7 +1365,7 @@ pub struct Emitter:
                 while i < t.args.length:
                     if i > 0:
                         try self.put(", ")
-                    let member = try copy_name(try format(self.checker.scratch[half..], f"v.{i}"))
+                    let member = try emission.copy_text(try format(self.checker.scratch[half..], f"v.{i}"))
                     try self.send_of(t.args[i], member)
                     i += 1
                 if t.args.length == 1:
@@ -1394,7 +1390,7 @@ pub struct Emitter:
                         try self.put("L_")
                         try self.put(f.text)
                         try self.put(" = ")
-                        let member = try copy_name(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
+                        let member = try emission.copy_text(try format(self.checker.scratch[half..], f"v.L_{f.text}"))
                         try self.send_of(f.type_id, member)
                     cursor = f.next
                 try self.put(")")
@@ -1431,7 +1427,7 @@ pub struct Emitter:
                                 if not first:
                                     try self.put(", ")
                                 first = false
-                                let member = try copy_name(try format(self.checker.scratch[half..], f"L_{field.text}"))
+                                let member = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{field.text}"))
                                 try self.send_of(field.type_id, member)
                                 p = field.next
                             try self.put(")")
@@ -1447,8 +1443,7 @@ pub struct Emitter:
     ## Explicit aliases handle dotted imports and equal leaf names without extra
     ## allocated names. The checker module index is stable throughout emission.
     mutating func write_base_alias(module: u32) -> !:
-        try self.put("__luce_base_")
-        try self.out.put_u64((u64)module)
+        try self.writer().write_base_alias(module)
 
     ## A handle's public destroy function is also a Luce entry to close, not a raw call
     ## that can leave its wrapper open. Base checks the one-handle, unit-return signature.
@@ -1492,7 +1487,7 @@ pub struct Emitter:
             try self.put(": ")
             let t = p.ty else return try self.fail(d, "a Base parameter without a type")
             if t.has(ast.flag_func_type):
-                try self.base_type(t, d)
+                try self.boundary().base_type(t, d)
             else:
                 try self.type_of(p.type_id)
             cursor = p.next
@@ -1552,8 +1547,8 @@ pub struct Emitter:
             try self.put(" = ")
             let t = p.ty else break
             let half = self.checker.scratch.length // 2
-            let name = try copy_name(try format(self.checker.scratch[half..], f"L_{p.text}"))
-            try self.to_base(t, name, d)
+            let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{p.text}"))
+            try self.boundary().to_base(t, name, d)
             cursor = p.next
         try self.put(")")
         if self.fallible and not outcome:
@@ -1568,7 +1563,7 @@ pub struct Emitter:
             if r.has(ast.flag_fallible):
                 inner = r.left else return try self.fail(d, "a result without a type")
             try self.begin("return ")
-            try self.from_base(inner, "answer", d)
+            try self.boundary().from_base(inner, "answer", d)
             try self.end()
         self.indent -= 1
         try self.line("")
@@ -1584,7 +1579,7 @@ pub struct Emitter:
         if i == self.native_calls.count:
             try self.native_calls.push(call)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_native_call_{i}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_native_call_{i}"))
 
     ## Construct the actual Base value; an initializer is never translated into
     ## assignments to a public-field snapshot. Failed construction publishes nothing.
@@ -1605,7 +1600,7 @@ pub struct Emitter:
             try self.put(": ")
             let t = parameter.ty else return
             if t.has(ast.flag_func_type):
-                try self.base_type(t, owner)
+                try self.boundary().base_type(t, owner)
             else:
                 try self.type_of(parameter.type_id)
             cursor = argument.next
@@ -1648,8 +1643,8 @@ pub struct Emitter:
             try self.put(" = ")
             let t = parameter.ty else return
             let half = self.checker.scratch.length // 2
-            let name = try copy_name(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
-            try self.to_base(t, name, owner)
+            let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
+            try self.boundary().to_base(t, name, owner)
             cursor = argument.next
         try self.put(")")
         if owner.native_object != none:
@@ -1664,9 +1659,9 @@ pub struct Emitter:
         if owner.native_object != none:
             try self.line("return reservation.publish(native, memory.heap).owner")
         else:
-            let t = try native_node(owner)
+            let t = try native_types.native_node(owner)
             try self.begin("return ")
-            try self.from_base(t, "native", owner)
+            try self.boundary().from_base(t, "native", owner)
             try self.end()
         self.indent -= 1
         try self.line("")
@@ -1675,16 +1670,16 @@ pub struct Emitter:
     ## entry; after mutation convert the complete value before releasing the old
     ## projection. Deferred writeback also preserves mutations made before an error.
     mutating func native_writeback(owner: ast.Node*) -> !:
-        let t = try native_node(owner)
+        let t = try native_types.native_node(owner)
         try self.begin("static func writeback(target: L_")
         try self.put(self.type_name(owner))
         try self.put("*, native: ")
-        try self.base_type(t, owner)
+        try self.boundary().base_type(t, owner)
         try self.put("*):")
         try self.end()
         self.indent += 1
         try self.begin("let updated = ")
-        try self.from_base(t, "*native", owner)
+        try self.boundary().from_base(t, "*native", owner)
         try self.end()
         if self.checker.table.has_references(owner.type_id):
             try self.begin("")
@@ -1716,7 +1711,7 @@ pub struct Emitter:
         try self.put(field.text)
         try self.end()
         try self.begin("return ")
-        try self.borrow_from_base(t, "value", owner)
+        try self.boundary().borrow_from_base(t, "value", owner)
         try self.end()
         self.indent -= 1
         try self.line("")
@@ -1783,7 +1778,7 @@ pub struct Emitter:
                 try self.put(": ")
                 let t = parameter.ty else return
                 if call != none and t.has(ast.flag_func_type):
-                    try self.base_type(t, owner)
+                    try self.boundary().base_type(t, owner)
                 else:
                     try self.type_of(parameter.type_id)
             cursor = parameter.next
@@ -1822,9 +1817,9 @@ pub struct Emitter:
             else:
                 try self.line("let native = reference.value_mut()" if mutating_view else "let native = reference.value()")
         elif instance:
-            let t = try native_node(owner)
+            let t = try native_types.native_node(owner)
             try self.begin("var native = " if mutates else "let native = ")
-            try self.to_base(t, "self" if call == none else ("*L_self" if mutates else "L_self"), owner)
+            try self.boundary().to_base(t, "self" if call == none else ("*L_self" if mutates else "L_self"), owner)
             try self.end()
             if mutates:
                 try self.begin("defer L_")
@@ -1854,15 +1849,15 @@ pub struct Emitter:
                 try self.put(" = ")
                 let t = parameter.ty else return
                 let half = self.checker.scratch.length // 2
-                let name = try copy_name(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
+                let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{parameter.text}"))
                 if call == none and t.has(ast.flag_func_type):
                     try self.put("(")
-                    try self.base_type(t, owner)
+                    try self.boundary().base_type(t, owner)
                     try self.put(")kernel.callback_code(")
                     try self.put(name)
                     try self.put(")")
                 else:
-                    try self.to_base(t, name, owner)
+                    try self.boundary().to_base(t, name, owner)
             cursor = parameter.next
         try self.put(")")
         if self.fallible and not outcome:
@@ -1875,7 +1870,7 @@ pub struct Emitter:
             let written = method.left else return
             let t = (written.left else return) if written.has(ast.flag_fallible) else written
             try self.begin("return ")
-            try self.from_base(t, "answer", owner)
+            try self.boundary().from_base(t, "answer", owner)
             try self.end()
         self.indent -= 1
         try self.line("")
@@ -1888,7 +1883,7 @@ pub struct Emitter:
         try self.native_failure()
         if inner.type_id != types.unit_id:
             try self.begin("return ")
-            try self.borrow_from_base(inner, "answer", owner)
+            try self.boundary().borrow_from_base(inner, "answer", owner)
             try self.end()
 
     ## Native failures may borrow receiver storage. Own the message before any
@@ -1939,222 +1934,8 @@ pub struct Emitter:
     mutating func base_constant(d: ast.Node*) -> !:
         let t = d.ty else return try self.fail(d, "a Base constant without a type")
         let half = self.checker.scratch.length // 2
-        let spelled = try copy_name(try format(self.checker.scratch[half..], f"__luce_base_{d.module}.{d.text}"))
-        try self.from_base(t, spelled, d)
-
-    ## The Base spelling of a type read from a description, `mod.Name` for the module's own.
-    mutating func base_type(t: ast.Node*, owner: ast.Node*) -> !:
-        if t.has(ast.flag_native_owned):
-            try self.put("interop.Owned[")
-            let plain = try plain_native_node(t)
-            try self.base_type(plain, owner)
-            try self.put("]")
-            return
-        if t.has(ast.flag_native_outcome):
-            try self.put("interop.Outcome[")
-            try self.base_type((t.left else return), owner)
-            try self.put("]")
-            return
-        if t.has(ast.flag_fallible):
-            let inner = t.left else return
-            if not inner.has(ast.flag_tuple_type) or inner.body != none:
-                try self.base_type(inner, owner)
-            try self.put("!")
-            return
-        if t.has(ast.flag_optional):
-            let inner = t.left else return
-            try self.base_type(inner, owner)
-            try self.put("?")
-            return
-        if t.has(ast.flag_func_type):
-            try self.put("func(")
-            var first = true
-            var cursor = t.body
-            while let a = cursor:
-                if not first:
-                    try self.put(", ")
-                first = false
-                try self.base_type(a, owner)
-                cursor = a.next
-            try self.put(")")
-            if let r = t.right:
-                try self.put(" -> ")
-                try self.base_type(r, owner)
-            else:
-                try self.put(" -> unit")
-            return
-        if t.has(ast.flag_tuple_type):
-            if t.body == none:
-                try self.put("unit")
-                return
-            try self.put("(")
-            var cursor = t.body
-            var first = true
-            while let member = cursor:
-                if not first:
-                    try self.put(", ")
-                first = false
-                try self.base_type(member, owner)
-                cursor = member.next
-            try self.put(")")
-            return
-        if t.text == "int":
-            try self.put("usize" if t.has(ast.flag_usize) else "i64")
-        elif t.text == "float":
-            try self.put("f64")
-        elif t.text == "bool":
-            try self.put("bool")
-        elif t.text == "str":
-            try self.put("str")
-        elif t.text == "bytes":
-            try self.put("const u8[]")
-        elif t.text == "list":
-            try self.put("const ")
-            let e = t.body else return
-            try self.base_type(e, owner)
-            try self.put("[]")
-        else:
-            let declaration = self.checker.table.get(t.type_id).decl else return try self.fail(t, "a Base nominal type has no resolved declaration")
-            if declaration.kind == ast.Kind.interface_:
-                try self.put("interop.Interface[")
-            elif let native = declaration.native_object:
-                try self.put("interop.View[" if native.view else "interop.Reference[")
-            try self.write_base_alias(declaration.module)
-            try self.put(".")
-            try self.put(declaration.text)
-            if declaration.native_object != none or declaration.kind == ast.Kind.interface_:
-                try self.put("]")
-
-    ## A Luce value named `v` as Base takes it (§16.2): lent, converted, or unwrapped.
-    mutating func to_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
-        if t.has(ast.flag_native_owned):
-            try self.put(try self.crossing_name(t, "L_tobase_", owner))
-            try self.put("(")
-            try self.put(v)
-            try self.put(")")
-            return
-        if t.has(ast.flag_optional) or t.has(ast.flag_func_type) or t.has(ast.flag_tuple_type):
-            if t.has(ast.flag_func_type):
-                try self.put(v)
-                return
-            try self.put(try self.crossing_name(t, "L_tobase_", owner))
-            try self.put("(")
-            try self.put(v)
-            try self.put(")")
-            return
-        if t.text == "int":
-            if t.has(ast.flag_usize):
-                try self.put("kernel.usize_of_int(")
-                try self.put(v)
-                try self.put(")")
-            else:
-                try self.put(v)
-        elif t.text == "float" or t.text == "bool":
-            try self.put(v)
-        elif t.text == "str":
-            try self.put("kernel.text_view(")
-            try self.put(v)
-            try self.put(")")
-        elif t.text == "bytes":
-            try self.put("kernel.bytes_view(")
-            try self.put(v)
-            try self.put(")")
-        elif t.text == "list":
-            let e = t.body else return
-            if e.text == "str":
-                try self.put("kernel.str_views(")
-            elif self.checker.table.kind(e.type_id) == types.Kind.class_ or self.checker.table.kind(e.type_id) == types.Kind.interface_:
-                try self.put(try self.crossing_name(t, "L_tobase_", owner))
-                try self.put("(")
-            else:
-                try self.put("kernel.list_span[")
-                try self.type_of(e.type_id)
-                try self.put("](")
-            try self.put(v)
-            try self.put(")")
-        else:
-            let kind = self.checker.table.kind(t.type_id)
-            if kind == types.Kind.interface_:
-                try self.put("L_")
-                try self.put(self.checker.table.get(t.type_id).name)
-                try self.put("__tobase(")
-                try self.put(v)
-                try self.put(")")
-            elif kind == types.Kind.class_:
-                try self.put("L_")
-                try self.put(self.checker.table.get(t.type_id).name)
-                try self.put("__value(")
-                try self.put(v)
-                try self.put(")")
-            else:
-                try self.put(try self.crossing_name(t, "L_tobase_", owner))
-                try self.put("(")
-                try self.put(v)
-                try self.put(")")
-
-    ## A Base value named `v` as Luce keeps it: copied, converted, or wrapped.
-    mutating func from_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
-        if t.has(ast.flag_native_owned):
-            try self.put(try self.crossing_name(t, "L_frombase_", owner))
-            try self.put("(")
-            try self.put(v)
-            try self.put(")")
-            return
-        if t.has(ast.flag_optional):
-            try self.put(try self.crossing_name(t, "L_frombase_", owner))
-            try self.put("(")
-            try self.put(v)
-            try self.put(")")
-            return
-        if t.text == "int":
-            if t.has(ast.flag_usize):
-                try self.put("kernel.int_of_usize(")
-                try self.put(v)
-                try self.put(")")
-            else:
-                try self.put(v)
-        elif t.text == "float" or t.text == "bool" or t.text == "ErrorCode":
-            try self.put(v)
-        elif t.text == "str":
-            try self.put("kernel.text_of(")
-            try self.put(v)
-            try self.put(")")
-        elif t.text == "bytes":
-            try self.put("kernel.bytes_of(")
-            try self.put(v)
-            try self.put(")")
-        else:
-            let kind = self.checker.table.kind(t.type_id)
-            if kind == types.Kind.interface_:
-                try self.put("L_")
-                try self.put(self.checker.table.get(t.type_id).name)
-                try self.put("__frombase(")
-                try self.put(v)
-                try self.put(")")
-            elif kind == types.Kind.class_:
-                try self.put("L_")
-                try self.put(self.checker.table.get(t.type_id).name)
-                try self.put("__wrap(")
-                try self.put(v)
-                try self.put(")")
-            else:
-                try self.put(try self.crossing_name(t, "L_frombase_", owner))
-                try self.put("(")
-                try self.put(v)
-                try self.put(")")
-
-    ## `L_tobase_N` or `L_frombase_N` for a type node, registered for the support pass.
-    mutating func crossing_name(t: ast.Node*, prefix: str, owner: ast.Node*) -> str!:
-        var i: usize = 0
-        while i < self.crossings.count:
-            if same_native_type(self.crossings.get(i), t):
-                break
-            i += 1
-        if i == self.crossings.count:
-            try self.crossings.push(t)
-            try self.crossing_owners.push(owner)
-        let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"{prefix}{i}"))
+        let spelled = try emission.copy_text(try format(self.checker.scratch[half..], f"__luce_base_{d.module}.{d.text}"))
+        try self.boundary().from_base(t, spelled, d)
 
     ## `L_callback_N`: the thunk over Base's types that calls a named Luce function.
     mutating func callback_name(f: ast.Node*) -> str!:
@@ -2167,7 +1948,7 @@ pub struct Emitter:
         if at == self.callbacks.count:
             try self.callbacks.push(f)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_callback_{at}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_callback_{at}"))
 
     ## The pair of functions for every crossing type, and the thunk for every callback.
     mutating func boundary_support() -> !:
@@ -2181,11 +1962,7 @@ pub struct Emitter:
                 try self.native_method(declaration, owner, call)
             else:
                 try self.shim(declaration, call)
-        while self.crossings_done < self.crossings.count:
-            let t = self.crossings.get(self.crossings_done)
-            let owner = self.crossing_owners.get(self.crossings_done)
-            self.crossings_done += 1
-            try self.crossing_functions(t, owner)
+        try self.boundary().emit_pending()
         while self.callbacks_done < self.callbacks.count:
             let f = self.callbacks.get(self.callbacks_done)
             self.callbacks_done += 1
@@ -2193,318 +1970,7 @@ pub struct Emitter:
 
     ## Render a small adapter fragment without keeping it in the output stream.
     mutating func take_output(start: usize) -> str!:
-        let text = try copy_name((str)self.out.bytes()[start..])
-        self.out.used = start
-        return text
-
-    func can_borrow_native(t: ast.Node*) -> bool:
-        if t.has(ast.flag_optional):
-            return self.can_borrow_native((t.left else return false))
-        if t.has(ast.flag_tuple_type):
-            var cursor = t.body
-            while let member = cursor:
-                if not self.can_borrow_native(member):
-                    return false
-                cursor = member.next
-            return true
-        let kind = self.checker.table.kind(t.type_id)
-        if kind == types.Kind.class_:
-            return (self.checker.table.get(t.type_id).decl else return false).native_object != none
-        return kind != types.Kind.func_
-
-    ## Transfer explicit native references in a result, recursively through tuples
-    ## and optionals. The managed result is released after this ownership is acquired.
-    mutating func owned_to_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
-        if not t.has(ast.flag_native_owned) and (t.has(ast.flag_optional) or t.has(ast.flag_tuple_type)):
-            try self.put(try self.crossing_name(t, "L_retainbase_", owner))
-            try self.put("(")
-            try self.put(value)
-            try self.put(")")
-        else:
-            try self.to_base(t, value, owner)
-            if t.has(ast.flag_native_owned) or self.checker.table.kind(t.type_id) == types.Kind.class_ or self.checker.table.kind(t.type_id) == types.Kind.interface_:
-                try self.put(".clone()")
-
-    mutating func borrow_from_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
-        if t.has(ast.flag_native_owned) or (not t.has(ast.flag_optional) and not t.has(ast.flag_tuple_type) and (self.checker.table.kind(t.type_id) == types.Kind.class_ or self.checker.table.kind(t.type_id) == types.Kind.interface_)):
-            let start = self.out.used
-            try self.put(value)
-            try self.put(".clone()")
-            let retained = try self.take_output(start)
-            try self.from_base(t, retained, owner)
-        elif t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
-            try self.put(try self.crossing_name(t, "L_borrowbase_", owner))
-            try self.put("(")
-            try self.put(value)
-            try self.put(")")
-        else:
-            try self.from_base(t, value, owner)
-
-    ## An explicit result carrier lends its payload until the carrier is released.
-    mutating func owned_crossing(t: ast.Node*, owner: ast.Node*) -> !:
-        let plain = try plain_native_node(t)
-        let toward = try self.crossing_name(t, "L_tobase_", owner)
-        let back = try self.crossing_name(t, "L_frombase_", owner)
-        let start = self.out.used
-        try self.type_of(t.type_id)
-        let luce = try self.take_output(start)
-        try self.base_type(plain, owner)
-        let native = try self.take_output(start)
-        let references = self.checker.table.has_references(t.type_id)
-        if references:
-            try self.out.write(f"struct {toward}__holder:\n    var header: heap.Object\n    var value: {luce}\n")
-            try self.out.write(f"func {toward}__drop(o: heap.Object*):\n    ")
-            try self.put(try self.lifetime_name("L_drop_", t.type_id))
-            try self.out.write(f"((({toward}__holder*)o).value)\n")
-            try self.out.write(f"func {toward}__trace(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):\n    ")
-            try self.put(try self.lifetime_name("L_trace_", t.type_id))
-            try self.out.write(f"((({toward}__holder*)o).value, visit, context)\n")
-            try self.out.write(f"var {toward}__info: heap.Info = heap.Info(name = \"owned native result\", size = sizeof({toward}__holder), finish = none, drop = {toward}__drop, trace = {toward}__trace)\n")
-        try self.out.write(f"func {toward}(v: {luce}) -> interop.Owned[{native}]:\n")
-        self.indent += 1
-        if references:
-            try self.out.write(f"    let holder = ({toward}__holder*)heap.allocate(&{toward}__info)\n")
-            try self.begin("holder.value = ")
-            try self.put(try self.lifetime_name("L_copy_", t.type_id))
-            try self.put("(v)")
-            try self.end()
-            try self.line("discard(heap.pool_object(&holder.header))")
-        try self.begin("return interop.Owned[")
-        try self.put(native)
-        try self.put("](")
-        try self.to_base(plain, "holder.value" if references else "v", owner)
-        try self.put(", &holder.header)" if references else ")")
-        try self.end()
-        self.indent -= 1
-        try self.out.write(f"func {back}(v: interop.Owned[{native}]) -> {luce}:\n")
-        self.indent += 1
-        try self.line("defer v.release()")
-        try self.begin("return ")
-        try self.borrow_from_base(plain, "v.value", owner)
-        try self.end()
-        self.indent -= 1
-        try self.line("")
-
-    mutating func borrowed_crossing(t: ast.Node*, owner: ast.Node*, toward: bool = false) -> !:
-        try self.begin("func ")
-        try self.put(try self.crossing_name(t, "L_retainbase_" if toward else "L_borrowbase_", owner))
-        try self.put("(v: ")
-        if toward:
-            try self.type_of(t.type_id)
-        else:
-            try self.base_type(t, owner)
-        try self.put(") -> ")
-        if toward:
-            try self.base_type(t, owner)
-        else:
-            try self.type_of(t.type_id)
-        try self.put(":")
-        try self.end()
-        self.indent += 1
-        if t.has(ast.flag_optional):
-            try self.line("if let value = v:")
-            try self.begin("    return ")
-            if toward:
-                try self.owned_to_base((t.left else return), "value", owner)
-            else:
-                try self.borrow_from_base((t.left else return), "value", owner)
-            try self.end()
-            try self.line("return none")
-        else:
-            try self.begin("return (")
-            var cursor = t.body
-            var index: usize = 0
-            while let item = cursor:
-                if index > 0:
-                    try self.put(", ")
-                let half = self.checker.scratch.length // 2
-                let value = try copy_name(try format(self.checker.scratch[half..], f"v.{index}"))
-                if toward:
-                    try self.owned_to_base(item, value, owner)
-                else:
-                    try self.borrow_from_base(item, value, owner)
-                cursor = item.next
-                index += 1
-            try self.put(")")
-            try self.end()
-        self.indent -= 1
-        try self.line("")
-
-    mutating func crossing_functions(t: ast.Node*, owner: ast.Node*) -> !:
-        if t.has(ast.flag_native_owned):
-            try self.owned_crossing(t, owner)
-            return
-        if t.text == "list":
-            try self.handle_span_crossing(t, owner)
-            return
-        # the module's own struct or enum being converted, or the owner for an optional of
-        # anything, which only needs the module's name
-        var module_decl = owner
-        if not t.has(ast.flag_optional) and not t.has(ast.flag_tuple_type):
-            module_decl = self.checker.table.get(t.type_id).decl else return try self.fail(t, "a crossing type without a declaration")
-        let half = self.checker.scratch.length // 2
-        let toward = try self.crossing_name(t, "L_tobase_", owner)
-        let back = try self.crossing_name(t, "L_frombase_", owner)
-        # to Base
-        try self.begin("func ")
-        try self.put(toward)
-        try self.put("(v: ")
-        try self.type_of(t.type_id)
-        try self.put(") -> ")
-        try self.base_type(t, module_decl)
-        try self.put(":")
-        try self.end()
-        self.indent += 1
-        if t.has(ast.flag_optional):
-            let inner = t.left else return
-            try self.line("if let x = v:")
-            try self.begin("    return ")
-            try self.to_base(inner, "x", module_decl)
-            try self.end()
-            try self.line("return none")
-        elif t.has(ast.flag_tuple_type):
-            try self.crossing_tuple(t, module_decl, true)
-        elif module_decl.kind == ast.Kind.struct_:
-            try self.line("var native = v.native")
-            var cursor = module_decl.body
-            while let field = cursor:
-                if field.kind == ast.Kind.field:
-                    let ft = field.ty else return
-                    # Rebase public fields in this new native copy, including let
-                    # fields whose borrowed view must point into the owned projection.
-                    # The caller's native object is never modified through this cast.
-                    try self.begin("kernel.rebase_field(&native.")
-                    try self.put(field.text)
-                    try self.put(", ")
-                    let projection = try copy_name(try format(self.checker.scratch[half..], f"v.L_{field.text}"))
-                    try self.to_base(ft, projection, module_decl)
-                    try self.put(")")
-                    try self.end()
-                cursor = field.next
-            try self.line("return native")
-        else:
-            try self.line("match v:")
-            var cursor = module_decl.body
-            while let c = cursor:
-                if c.kind == ast.Kind.enum_case:
-                    try self.begin("    .L_")
-                    try self.put(c.text)
-                    try self.put(": return ")
-                    try self.write_base_alias(module_decl.module)
-                    try self.put(".")
-                    try self.put(module_decl.text)
-                    try self.put(".")
-                    try self.put(c.text)
-                    try self.end()
-                cursor = c.next
-        self.indent -= 1
-        try self.line("")
-        # from Base
-        try self.begin("func ")
-        try self.put(back)
-        try self.put("(v: ")
-        try self.base_type(t, module_decl)
-        try self.put(") -> ")
-        try self.type_of(t.type_id)
-        try self.put(":")
-        try self.end()
-        self.indent += 1
-        if t.has(ast.flag_optional):
-            let inner = t.left else return
-            try self.line("if let x = v:")
-            try self.begin("    return ")
-            try self.from_base(inner, "x", module_decl)
-            try self.end()
-            try self.line("return none")
-        elif t.has(ast.flag_tuple_type):
-            try self.crossing_tuple(t, module_decl, false)
-        elif module_decl.kind == ast.Kind.struct_:
-            try self.begin("return L_")
-            try self.put(self.checker.table.get(module_decl.type_id).name)
-            try self.put("(native = v")
-            var first = false
-            var cursor = module_decl.body
-            while let f = cursor:
-                if f.kind == ast.Kind.field:
-                    if not first:
-                        try self.put(", ")
-                    first = false
-                    try self.put("L_")
-                    try self.put(f.text)
-                    try self.put(" = ")
-                    let ft = f.ty else return
-                    let field = try copy_name(try format(self.checker.scratch[half..], f"v.{f.text}"))
-                    try self.from_base(ft, field, module_decl)
-                cursor = f.next
-            try self.put(")")
-            try self.end()
-        else:
-            try self.line("match v:")
-            var cursor = module_decl.body
-            while let c = cursor:
-                if c.kind == ast.Kind.enum_case:
-                    try self.begin("    .")
-                    try self.put(c.text)
-                    try self.put(": return L_")
-                    try self.put(self.checker.table.get(module_decl.type_id).name)
-                    try self.put(".L_")
-                    try self.put(c.text)
-                    try self.end()
-                cursor = c.next
-            # an integer-backed enum from Base may hold a combination no case names
-            try self.line("    _: trap(\"a Base enum value that is no declared case crossed into Luce\")")
-        self.indent -= 1
-        try self.line("")
-        if t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
-            if self.can_borrow_native(t):
-                try self.borrowed_crossing(t, owner)
-            if self.checker.native_result_owned(t):
-                try self.borrowed_crossing(t, owner, true)
-
-    mutating func crossing_tuple(t: ast.Node*, owner: ast.Node*, toward: bool) -> !:
-        try self.begin("return (")
-        var cursor = t.body
-        var index: usize = 0
-        while let member = cursor:
-            if index > 0:
-                try self.put(", ")
-            let half = self.checker.scratch.length // 2
-            let field = try copy_name(try format(self.checker.scratch[half..], f"v.{index}"))
-            if toward:
-                try self.to_base(member, field, owner)
-            else:
-                try self.from_base(member, field, owner)
-            index += 1
-            cursor = member.next
-        try self.put(")")
-        try self.end()
-
-    ## The wrapper list keeps each owner alive during the call. The temporary
-    ## Base array has only borrowed values and is drained on success or failure.
-    mutating func handle_span_crossing(t: ast.Node*, owner: ast.Node*) -> !:
-        let element = t.body else return
-        try self.begin("func ")
-        try self.put(try self.crossing_name(t, "L_tobase_", owner))
-        try self.put("(v: ")
-        try self.type_of(t.type_id)
-        try self.put(") -> ")
-        try self.base_type(t, owner)
-        try self.put(":")
-        try self.end()
-        self.indent += 1
-        try self.begin("let items = kernel.boundary_span[")
-        try self.base_type(element, owner)
-        try self.put("](v.count)")
-        try self.end()
-        try self.line("var i: usize = 0")
-        try self.line("while i < v.count:")
-        try self.begin("    items[i] = ")
-        try self.to_base(element, "v.items[i]", owner)
-        try self.end()
-        try self.line("    i += 1")
-        try self.line("return items")
-        self.indent -= 1
-        try self.line("")
+        return try self.writer().take_output(start)
 
     ## A callback's thunk: Base's arguments made into Luce values for the call, released
     ## after it; the answer a scalar (the description admits no other).
@@ -2554,7 +2020,7 @@ pub struct Emitter:
                 try self.put(", ")
             first = false
             let half = self.checker.scratch.length // 2
-            let name = try copy_name(try format(self.checker.scratch[half..], f"a{i}"))
+            let name = try emission.copy_text(try format(self.checker.scratch[half..], f"a{i}"))
             try self.luce_from_base_value(p.type_id, name)
             i += 1
             cursor = p.next
@@ -2978,67 +2444,7 @@ pub struct Emitter:
     # -- types ----------------------------------------------------------------------------
 
     pub mutating func type_of(id: u32) -> !:
-        let t = self.checker.table.get(id)
-        match t.kind:
-            .int_: try self.put("i64")
-            .float_: try self.put("f64")
-            .bool_: try self.put("bool")
-            .str_: try self.put("kernel.Text*")
-            .bytes_: try self.put("kernel.Bytes*")
-            .unit_: try self.put("unit")
-            .never_: try self.put("never")
-            .error_code: try self.put("ErrorCode")
-            .error_value: try self.put("kernel.Failure")
-            .range_: try self.put("kernel.Range")
-            .optional:
-                try self.type_of(t.elem)
-                try self.put("?")
-            .fallible:
-                if t.elem == types.unit_id:
-                    try self.put("!")
-                else:
-                    try self.type_of(t.elem)
-                    try self.put("!")
-            .tuple:
-                try self.put("(")
-                var i: usize = 0
-                while i < t.args.length:
-                    if i > 0:
-                        try self.put(", ")
-                    try self.type_of(t.args[i])
-                    i += 1
-                try self.put(")")
-            .func_:
-                try self.put("kernel.Closure*")
-            .list_:
-                try self.put("kernel.List[")
-                try self.type_of(t.elem)
-                try self.put("]*")
-            .map_:
-                try self.put("kernel.Map[")
-                try self.type_of(t.elem)
-                try self.put(", ")
-                try self.type_of(self.checker.table.map_value(id))
-                try self.put("]*")
-            .set_:
-                try self.put("kernel.Map[")
-                try self.type_of(t.elem)
-                try self.put(", u8]*")
-            .struct_, .enum_:
-                try self.put("L_")
-                try self.put(t.name)
-            .class_, .interface_:
-                try self.put("L_")
-                try self.put(t.name)
-                try self.put("*")
-            .weak_:
-                try self.put("heap.Weak")
-            .task_:
-                try self.put("kernel.TaskOf[")
-                try self.type_of(self.task_payload(id))
-                try self.put("]*")
-            _:
-                error(unsupported, "a type this slice does not compile")
+        try self.writer().type_of(id)
 
     # -- statements -----------------------------------------------------------------------
 
@@ -3255,7 +2661,7 @@ pub struct Emitter:
             var cursor = place.body
             while let part = cursor:
                 let half = self.checker.scratch.length // 2
-                let member = try copy_name(try format(self.checker.scratch[half..], f"{t}.{i}"))
+                let member = try emission.copy_text(try format(self.checker.scratch[half..], f"{t}.{i}"))
                 try self.store(part, member)
                 i += 1
                 cursor = part.next
@@ -3453,7 +2859,7 @@ pub struct Emitter:
             _: return try self.fail(e, "this is not a place the emitter knows")
 
     mutating func put_u64(n: u64) -> !:
-        try self.out.put_u64(n)
+        try self.writer().put_u64(n)
 
     ## The condition of an `if` or `while`, hoisted into a binding when it pooled a
     ## temporary, so that the temporary dies before the body runs (RUNTIME 5). The name
@@ -3572,8 +2978,6 @@ pub struct Emitter:
             cursor = item.next
         try self.block(body)
         self.indent -= 1
-
-
 
     mutating func for_statement(s: ast.Node*) -> !:
         let binding = s.left else return
@@ -3746,7 +3150,7 @@ pub struct Emitter:
                 if binding.body != none:
                     # `for (a, b) in items`: the parts copied out of the element in place
                     let half = self.checker.scratch.length // 2
-                    let element = try copy_name(try format(self.checker.scratch[half..], f"{store}.items[{i}]"))
+                    let element = try emission.copy_text(try format(self.checker.scratch[half..], f"{store}.items[{i}]"))
                     try self.bind_parts(binding, element)
                 else:
                     try self.begin("let L_")
@@ -3841,7 +3245,7 @@ pub struct Emitter:
                     try self.drop_at_exit(binding.text, binding.type_id)
                 elif binding.body != none:
                     let half = self.checker.scratch.length // 2
-                    let element = try copy_name(try format(self.checker.scratch[half..], f"{store}.keys[{i}]"))
+                    let element = try emission.copy_text(try format(self.checker.scratch[half..], f"{store}.keys[{i}]"))
                     try self.bind_parts(binding, element)
                 else:
                     try self.begin("let L_")
@@ -3867,7 +3271,7 @@ pub struct Emitter:
         while let name = part:
             if not name.has(ast.flag_wildcard) and which < members.length:
                 let half = self.checker.scratch.length // 2
-                let member = try copy_name(try format(self.checker.scratch[half..], f"{source}.{which}"))
+                let member = try emission.copy_text(try format(self.checker.scratch[half..], f"{source}.{which}"))
                 try self.begin("let L_")
                 try self.put(name.text)
                 try self.put(" = ")
@@ -4182,7 +3586,7 @@ pub struct Emitter:
                 first = false
                 let half = self.checker.scratch.length // 2
                 let member = try format(self.checker.scratch[half..], f"{m}.{i}")
-                try self.tuple_test_member(sub, try copy_name(member), members[i])
+                try self.tuple_test_member(sub, try emission.copy_text(member), members[i])
                 i += 1
                 cursor = sub.next
             if first:
@@ -4228,7 +3632,7 @@ pub struct Emitter:
             while let sub = cursor:
                 let half = self.checker.scratch.length // 2
                 let member = try format(self.checker.scratch[half..], f"{m}.{i}")
-                try self.tuple_bindings(sub, try copy_name(member))
+                try self.tuple_bindings(sub, try emission.copy_text(member))
                 i += 1
                 cursor = sub.next
 
@@ -4285,7 +3689,7 @@ pub struct Emitter:
         if let already = self.hoisted_name(e):
             if owned and self.checker.table.has_references(e.type_id):
                 let half = self.checker.scratch.length // 2
-                return try copy_name(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({already})"))
+                return try emission.copy_text(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({already})"))
             return already
         let name = try self.temp("arg")
         let start = self.out.used
@@ -4314,7 +3718,7 @@ pub struct Emitter:
         self.pooled = true
         if owned and refs:
             let half = self.checker.scratch.length // 2
-            return try copy_name(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({name})"))
+            return try emission.copy_text(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({name})"))
         try self.hoisted_nodes.push(e)
         try self.hoisted_names.push(name)
         return name
@@ -4716,7 +4120,7 @@ pub struct Emitter:
                 let body = e.body else return
                 try self.owned(l)
                 let raw = try self.temp("failure")
-                let caught = try self.temp("caught") if e.text.length == 0 else try copy_name(try format(self.checker.scratch[self.checker.scratch.length // 2..], f"L_{e.text}"))
+                let caught = try self.temp("caught") if e.text.length == 0 else try emission.copy_text(try format(self.checker.scratch[self.checker.scratch.length // 2..], f"L_{e.text}"))
                 try self.put(" catch ")
                 try self.put(raw)
                 try self.put(":")
@@ -4749,7 +4153,7 @@ pub struct Emitter:
             let half = self.checker.scratch.length // 2
             if receiver.kind == ast.Kind.self_:
                 return self.self_name
-            return try copy_name(try format(self.checker.scratch[half..], f"L_{receiver.text}"))
+            return try emission.copy_text(try format(self.checker.scratch[half..], f"L_{receiver.text}"))
         return try self.fail(receiver, "index a bound name; binding the value first")
 
     mutating func literal(e: ast.Node*) -> !:
@@ -5607,28 +5011,19 @@ pub struct Emitter:
         if not seen:
             try self.shown.push(t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"show_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"show_{t}"))
 
     ## The name of the copy, drop, trace, pool, identity or weak-get function of a type,
     ## which is emitted after the program.
     mutating func lifetime_name(prefix: str, t: u32) -> str!:
-        var i: usize = 0
-        var seen = false
-        while i < self.lifetimes.count:
-            if self.lifetimes.get(i) == t:
-                seen = true
-            i += 1
-        if not seen:
-            try self.lifetimes.push(t)
-        let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"{prefix}{t}"))
+        return try self.writer().lifetime_name(prefix, t)
 
     ## Every function and table the program's types need, each written once; writing one
     ## can register more, so the sets are walked until nothing new appears.
     mutating func support_functions() -> !:
         while true:
-            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count + self.crossings.count + self.callbacks.count + self.spawns.count + self.waits.count + self.sends.count + self.native_calls.count
-            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done + self.crossings_done + self.callbacks_done + self.spawns_done + self.waits_done + self.sends_done + self.native_calls_done
+            let before = self.shown.count + self.lifetimes.count + self.equalities.count + self.orderings.count + self.hashes.count + self.ops_types.count + self.texts.count + self.lambdas.count + self.thunks.count + self.bounds.count + self.calls.count + self.cells.count + self.box_interfaces.count + self.crossing_work.types.count + self.callbacks.count + self.spawns.count + self.waits.count + self.sends.count + self.native_calls.count
+            let done = self.shown_done + self.lifetimes_done + self.equalities_done + self.orderings_done + self.hashes_done + self.ops_done + self.texts_done + self.lambdas_done + self.thunks_done + self.bounds_done + self.calls_done + self.cells_done + self.boxes_done + self.crossing_work.done + self.callbacks_done + self.spawns_done + self.waits_done + self.sends_done + self.native_calls_done
             if before == done:
                 return
             try self.show_functions()
@@ -5652,10 +5047,10 @@ pub struct Emitter:
                 break
             i += 1
         if at == self.texts.count:
-            try self.texts.push(try copy_name(text))
+            try self.texts.push(try emission.copy_text(text))
             try self.texts_are_bytes.push(as_bytes)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"&L_text_{at}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"&L_text_{at}"))
 
     mutating func text_objects() -> !:
         while self.texts_done < self.texts.count:
@@ -5908,7 +5303,7 @@ pub struct Emitter:
     mutating func ops_name(t: u32) -> str!:
         try self.remember(&self.ops_types, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_ops_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_ops_{t}"))
 
     mutating func ops_tables() -> !:
         while self.ops_done < self.ops_types.count:
@@ -5949,7 +5344,7 @@ pub struct Emitter:
         if at == self.lambdas.count:
             try self.lambdas.push(e)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_lambda_{at}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_lambda_{at}"))
 
     mutating func thunk_name(d: ast.Node*, prefix: str) -> str!:
         var i: usize = 0
@@ -5961,7 +5356,7 @@ pub struct Emitter:
         if at == self.thunks.count:
             try self.thunks.push(d)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"{prefix}{at}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"{prefix}{at}"))
 
     mutating func bound_name(e: ast.Node*) -> str!:
         var i: usize = 0
@@ -5973,17 +5368,17 @@ pub struct Emitter:
         if at == self.bounds.count:
             try self.bounds.push(e)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_bound_{at}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_bound_{at}"))
 
     mutating func call_name(t: u32) -> str!:
         try self.remember(&self.calls, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_call_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_call_{t}"))
 
     mutating func cell_info_name(t: u32) -> str!:
         try self.remember(&self.cells, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_cellinfo_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_cellinfo_{t}"))
 
     mutating func closure_support() -> !:
         while self.calls_done < self.calls.count:
@@ -6155,7 +5550,7 @@ pub struct Emitter:
             if d.has(ast.flag_base) and d.resolved == none and self.checker.table.kind(p.type_id) == types.Kind.func_:
                 try self.put("(")
                 let callback_type = p.ty else return
-                try self.base_type(callback_type, d)
+                try self.boundary().base_type(callback_type, d)
                 try self.put(")kernel.callback_code(L_")
                 try self.put(p.text)
                 try self.put(")")
@@ -6522,12 +5917,12 @@ pub struct Emitter:
     mutating func hash_name(t: u32) -> str!:
         try self.remember(&self.hashes, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_hash_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_hash_{t}"))
 
     mutating func hash_in_name(t: u32) -> str!:
         try self.remember(&self.hashes, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_hashin_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_hashin_{t}"))
 
     mutating func hash_functions() -> !:
         while self.hashes_done < self.hashes.count:
@@ -6700,7 +6095,7 @@ pub struct Emitter:
     func decl_name(d: ast.Node*) -> str!:
         let name = try self.checker.emitted_name(d)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"0_{d.module}_{name}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"0_{d.module}_{name}"))
 
     ## The expression written out as a value used and let go of, as text.
     mutating func used(e: ast.Node*) -> str!:
@@ -6779,13 +6174,13 @@ pub struct Emitter:
     mutating func equality_name(t: u32) -> str!:
         try self.remember(&self.equalities, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_eq_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_eq_{t}"))
 
     ## The function ordering two values of the type: -1, 0, 1.
     mutating func ordering_name(t: u32) -> str!:
         try self.remember(&self.orderings, t)
         let half = self.checker.scratch.length // 2
-        return try copy_name(try format(self.checker.scratch[half..], f"L_cmp_{t}"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_cmp_{t}"))
 
     mutating func remember(where: list.List[u32]*, t: u32) -> !:
         var i: usize = 0
@@ -6826,11 +6221,11 @@ pub struct Emitter:
             return
         if let declaration = t.decl:
             if declaration.has(ast.flag_native_value):
-                let native = try native_node(declaration)
+                let native = try native_types.native_node(declaration)
                 try self.begin("return ")
-                try self.to_base(native, "a", declaration)
+                try self.boundary().to_base(native, "a", declaration)
                 try self.put(" == ")
-                try self.to_base(native, "b", declaration)
+                try self.boundary().to_base(native, "b", declaration)
                 try self.end()
                 self.indent -= 1
                 try self.line("")
@@ -6868,8 +6263,8 @@ pub struct Emitter:
                     if i > 0:
                         try self.put(" and ")
                     let half = self.checker.scratch.length // 2
-                    let x = try copy_name(try format(self.checker.scratch[half..], f"a.{i}"))
-                    let y = try copy_name(try format(self.checker.scratch[half..], f"b.{i}"))
+                    let x = try emission.copy_text(try format(self.checker.scratch[half..], f"a.{i}"))
+                    let y = try emission.copy_text(try format(self.checker.scratch[half..], f"b.{i}"))
                     try self.put(try self.member_equality(t.args[i], x, y))
                     i += 1
                 try self.end()
@@ -6884,8 +6279,8 @@ pub struct Emitter:
                             try self.put(" and ")
                         first = false
                         let half = self.checker.scratch.length // 2
-                        let x = try copy_name(try format(self.checker.scratch[half..], f"a.L_{m.text}"))
-                        let y = try copy_name(try format(self.checker.scratch[half..], f"b.L_{m.text}"))
+                        let x = try emission.copy_text(try format(self.checker.scratch[half..], f"a.L_{m.text}"))
+                        let y = try emission.copy_text(try format(self.checker.scratch[half..], f"b.L_{m.text}"))
                         try self.put(try self.member_equality(m.type_id, x, y))
                     cursor = m.next
                 if first:
@@ -6937,8 +6332,8 @@ pub struct Emitter:
                                     try self.put(" and ")
                                 first = false
                                 let half = self.checker.scratch.length // 2
-                                let x = try copy_name(try format(self.checker.scratch[half..], f"x_{field.text}"))
-                                let y = try copy_name(try format(self.checker.scratch[half..], f"y_{field.text}"))
+                                let x = try emission.copy_text(try format(self.checker.scratch[half..], f"x_{field.text}"))
+                                let y = try emission.copy_text(try format(self.checker.scratch[half..], f"y_{field.text}"))
                                 try self.put(try self.member_equality(field.type_id, x, y))
                                 p = field.next
                         else:
@@ -6956,8 +6351,8 @@ pub struct Emitter:
     mutating func member_equality(t: u32, x: str, y: str) -> str!:
         let half = self.checker.scratch.length // 2
         if self.needs_equality(t):
-            return try copy_name(try format(self.checker.scratch[half..], f"{try self.equality_name(t)}({x}, {y})"))
-        return try copy_name(try format(self.checker.scratch[half..], f"({x} == {y})"))
+            return try emission.copy_text(try format(self.checker.scratch[half..], f"{try self.equality_name(t)}({x}, {y})"))
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"({x} == {y})"))
 
     mutating func ordering_function(id: u32) -> !:
         let t = self.checker.table.get(id)
@@ -7251,13 +6646,13 @@ pub struct Emitter:
                 let d = t.decl else return
                 try self.begin("return kernel.join_owned([")
                 let half = self.checker.scratch.length // 2
-                try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{self.checker.display_name(d)}(")), false))
+                try self.put(try self.text_ref(try emission.copy_text(try format(self.checker.scratch[half..], f"{self.checker.display_name(d)}(")), false))
                 var cursor = d.body
                 var first = true
                 while let m = cursor:
                     if m.kind == ast.Kind.field:
                         try self.put(", ")
-                        let label = try copy_name(try format(self.checker.scratch[half..], f"{", " if not first else ""}{m.text} = "))
+                        let label = try emission.copy_text(try format(self.checker.scratch[half..], f"{", " if not first else ""}{m.text} = "))
                         first = false
                         try self.put(try self.text_ref(label, false))
                         try self.put(", ")
@@ -7296,12 +6691,12 @@ pub struct Emitter:
                         let half = self.checker.scratch.length // 2
                         try self.begin("    return kernel.join_owned([")
                         if m.body != none:
-                            try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{self.checker.display_name(d)}.{m.text}(")), false))
+                            try self.put(try self.text_ref(try emission.copy_text(try format(self.checker.scratch[half..], f"{self.checker.display_name(d)}.{m.text}(")), false))
                             var p = m.body
                             var first = true
                             while let field = p:
                                 try self.put(", ")
-                                let label = try copy_name(try format(self.checker.scratch[half..], f"{", " if not first else ""}{field.text} = "))
+                                let label = try emission.copy_text(try format(self.checker.scratch[half..], f"{", " if not first else ""}{field.text} = "))
                                 first = false
                                 try self.put(try self.text_ref(label, false))
                                 try self.put(", ")
@@ -7314,7 +6709,7 @@ pub struct Emitter:
                             try self.put(try self.text_ref(")", false))
                             try self.put("])")
                         else:
-                            try self.put(try self.text_ref(try copy_name(try format(self.checker.scratch[half..], f"{d.text}.{m.text}")), false))
+                            try self.put(try self.text_ref(try emission.copy_text(try format(self.checker.scratch[half..], f"{d.text}.{m.text}")), false))
                             try self.put("])")
                         try self.end()
                     cursor = m.next
@@ -7459,15 +6854,6 @@ func unescape_format(text: str) -> str!:
 func hex_digit(n: u8) -> u8:
     return '0' + n if n < 10 else 'a' + (n - 10)
 
-## A name kept on the heap, since the scratch it was formatted in is reused.
-func copy_name(text: str) -> str!:
-    var out = try alloc u8[text.length]
-    var i: usize = 0
-    while i < text.length:
-        out[i] = text.bytes[i]
-        i += 1
-    return (str)out
-
 ## A specialized native adapter accepts exactly the arguments written at its call.
 func supplied(call: ast.Node*?, parameter: ast.Node*) -> bool:
     let site = call else return true
@@ -7477,39 +6863,3 @@ func supplied(call: ast.Node*?, parameter: ast.Node*) -> bool:
             return true
         cursor = argument.next
     return false
-
-## Luce maps both i64 and usize to int, but their native adapters differ even
-## inside tuples and optionals. Native signature identity includes that spelling.
-func same_native_type(a: ast.Node*, b: ast.Node*) -> bool:
-    let mask = ast.flag_optional | ast.flag_fallible | ast.flag_func_type | ast.flag_tuple_type | ast.flag_usize | ast.flag_native_owned | ast.flag_native_outcome
-    if a.type_id != b.type_id or (a.flags & mask) != (b.flags & mask):
-        return false
-    if not same_native_child(a.left, b.left) or not same_native_child(a.right, b.right):
-        return false
-    var left = a.body
-    var right = b.body
-    while let member = left:
-        let other = right else return false
-        if not same_native_type(member, other):
-            return false
-        left = member.next
-        right = other.next
-    return right == none
-
-func same_native_child(a: ast.Node*?, b: ast.Node*?) -> bool:
-    let left = a else return b == none
-    let right = b else return false
-    return same_native_type(left, right)
-
-func native_node(declaration: ast.Node*) -> ast.Node*!:
-    let t = try ast.Node.make(ast.Kind.type_, declaration.text, declaration.start, declaration.line)
-    t.type_id = declaration.type_id
-    t.module = declaration.module
-    return t
-
-## Keep resolved nominal identity while inspecting a carrier's underlying value.
-func plain_native_node(node: ast.Node*) -> ast.Node*!:
-    let result = try ast.Node.make(node.kind, node.text, node.start, node.line)
-    *result = *node
-    result.flags &= ~ast.flag_native_owned
-    return result

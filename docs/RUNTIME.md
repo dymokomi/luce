@@ -272,3 +272,17 @@ interop error, while infallible access traps. Weak references keep only the shel
 Public field reads copy text/data or acquire child references. Direct field writes
 are limited to native `i64`, `f64` and `bool`; replacing owned/borrowed native storage
 requires a package method. Native owner objects cannot cross to workers.
+
+The boundary emitter keeps native conversions in `back.crossings`. It shares an
+output writer and lifetime registrations with the expression emitter, but never
+evaluates application expressions itself. Native signature keys include carrier
+ownership and scalar spelling, including `usize` versus `i64` inside nested types.
+
+Reference spans are temporary arrays backed by the call's pool. The source list
+keeps its elements alive, and a Base callee clones any reference it retains. This
+applies to explicit owners, checked views, interfaces and opaque handle arguments.
+Opaque handles have no general clone operation: their direct results transfer one
+destruction obligation, and they cannot be exposed as borrowed fields or payloads
+of retained result carriers. A reverse interface call requires parameters whose
+borrowed values can be copied or cloned into Luce. Raw handles, raw callbacks and
+spans lack that reverse adapter and are rejected for managed implementations.

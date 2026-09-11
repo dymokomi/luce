@@ -69,6 +69,11 @@ admits and demands the same agreement, from the first slice.
 | `front.ast`, `front.parser` | the tree and the grammar of §19 |
 | `sema.types` | the type table: interned ids, spellings, structural facts |
 | `sema.check` | declarations, imports, visibility, cycles, resolution |
+| `sema.boundary`, `sema.native_availability` | public Base descriptions and availability across imported declarations |
+| `back.crossings` | native conversions, borrowed spans, owning result carriers and their queued support functions |
+| `back.native_types` | native signature identity and type-node construction |
+| `back.emission` | shared output, type spelling and lifetime-function registration |
+| `back.native_objects`, `back.native_interfaces` | canonical owner layouts and interface witness storage |
 | `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture |
 | `sema.base` | what a Base module offers, read from luce-base's description of it |
 | `hir.value`, `hir.interp` | the interpreter |

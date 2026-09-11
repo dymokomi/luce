@@ -1,0 +1,534 @@
+## Native value conversions and ownership carriers. Inputs borrow for a call;
+## results copy borrowed projections or transfer explicit ownership. Work is queued
+## by native signature, then emitted until all nested conversions are complete.
+import back.emission
+import back.native_types
+import front.ast
+import sema.types
+import support.list
+
+pub struct Work:
+    pub var types: list.List[ast.Node*]
+    pub var owners: list.List[ast.Node*]
+    pub var done: usize
+
+    pub static func create() -> Work!:
+        return Work(try list.List[ast.Node*].create(16), try list.List[ast.Node*].create(16), 0)
+
+pub struct Emitter:
+    pub let code: emission.Writer
+    pub let work: Work*
+
+    ## Nested conversions can register further work while this queue is drained.
+    pub func emit_pending() -> !:
+        while self.work.done < self.work.types.count:
+            let t = self.work.types.get(self.work.done)
+            let owner = self.work.owners.get(self.work.done)
+            self.work.done += 1
+            try self.crossing_functions(t, owner)
+
+    ## Write the native signature, retaining explicit ownership carriers.
+    pub func base_type(t: ast.Node*, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.code.put("interop.Owned[")
+            let plain = try native_types.plain_native_node(t)
+            try self.base_type(plain, owner)
+            try self.code.put("]")
+            return
+        if t.has(ast.flag_native_outcome):
+            try self.code.put("interop.Outcome[")
+            try self.base_type((t.left else return), owner)
+            try self.code.put("]")
+            return
+        if t.has(ast.flag_fallible):
+            let inner = t.left else return
+            if not inner.has(ast.flag_tuple_type) or inner.body != none:
+                try self.base_type(inner, owner)
+            try self.code.put("!")
+            return
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.base_type(inner, owner)
+            try self.code.put("?")
+            return
+        if t.has(ast.flag_func_type):
+            try self.code.put("func(")
+            var first = true
+            var cursor = t.body
+            while let a = cursor:
+                if not first:
+                    try self.code.put(", ")
+                first = false
+                try self.base_type(a, owner)
+                cursor = a.next
+            try self.code.put(")")
+            if let r = t.right:
+                try self.code.put(" -> ")
+                try self.base_type(r, owner)
+            else:
+                try self.code.put(" -> unit")
+            return
+        if t.has(ast.flag_tuple_type):
+            if t.body == none:
+                try self.code.put("unit")
+                return
+            try self.code.put("(")
+            var cursor = t.body
+            var first = true
+            while let member = cursor:
+                if not first:
+                    try self.code.put(", ")
+                first = false
+                try self.base_type(member, owner)
+                cursor = member.next
+            try self.code.put(")")
+            return
+        if t.text == "int":
+            try self.code.put("usize" if t.has(ast.flag_usize) else "i64")
+        elif t.text == "float":
+            try self.code.put("f64")
+        elif t.text == "bool":
+            try self.code.put("bool")
+        elif t.text == "str":
+            try self.code.put("str")
+        elif t.text == "bytes":
+            try self.code.put("const u8[]")
+        elif t.text == "list":
+            try self.code.put("const ")
+            let e = t.body else return
+            try self.base_type(e, owner)
+            try self.code.put("[]")
+        else:
+            let declaration = self.code.checker.table.get(t.type_id).decl else return try self.code.fail(t, "a Base nominal type has no resolved declaration")
+            if declaration.kind == ast.Kind.interface_:
+                try self.code.put("interop.Interface[")
+            elif let native = declaration.native_object:
+                try self.code.put("interop.View[" if native.view else "interop.Reference[")
+            try self.code.write_base_alias(declaration.module)
+            try self.code.put(".")
+            try self.code.put(declaration.text)
+            if declaration.native_object != none or declaration.kind == ast.Kind.interface_:
+                try self.code.put("]")
+
+    ## Borrow a named Luce operand for the native call's duration.
+    pub func to_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.code.put(try self.crossing_name(t, "L_tobase_", owner))
+            try self.code.put("(")
+            try self.code.put(v)
+            try self.code.put(")")
+            return
+        if t.has(ast.flag_optional) or t.has(ast.flag_func_type) or t.has(ast.flag_tuple_type):
+            if t.has(ast.flag_func_type):
+                try self.code.put(v)
+                return
+            try self.code.put(try self.crossing_name(t, "L_tobase_", owner))
+            try self.code.put("(")
+            try self.code.put(v)
+            try self.code.put(")")
+            return
+        if t.text == "int":
+            if t.has(ast.flag_usize):
+                try self.code.put("kernel.usize_of_int(")
+                try self.code.put(v)
+                try self.code.put(")")
+            else:
+                try self.code.put(v)
+        elif t.text == "float" or t.text == "bool":
+            try self.code.put(v)
+        elif t.text == "str":
+            try self.code.put("kernel.text_view(")
+            try self.code.put(v)
+            try self.code.put(")")
+        elif t.text == "bytes":
+            try self.code.put("kernel.bytes_view(")
+            try self.code.put(v)
+            try self.code.put(")")
+        elif t.text == "list":
+            let e = t.body else return
+            if e.text == "str":
+                try self.code.put("kernel.str_views(")
+            elif self.code.checker.table.kind(e.type_id) == types.Kind.class_ or self.code.checker.table.kind(e.type_id) == types.Kind.interface_:
+                try self.code.put(try self.crossing_name(t, "L_tobase_", owner))
+                try self.code.put("(")
+            else:
+                try self.code.put("kernel.list_span[")
+                try self.code.type_of(e.type_id)
+                try self.code.put("](")
+            try self.code.put(v)
+            try self.code.put(")")
+        else:
+            let kind = self.code.checker.table.kind(t.type_id)
+            if kind == types.Kind.interface_:
+                try self.code.put("L_")
+                try self.code.put(self.code.checker.table.get(t.type_id).name)
+                try self.code.put("__tobase(")
+                try self.code.put(v)
+                try self.code.put(")")
+            elif kind == types.Kind.class_:
+                try self.code.put("L_")
+                try self.code.put(self.code.checker.table.get(t.type_id).name)
+                try self.code.put("__value(")
+                try self.code.put(v)
+                try self.code.put(")")
+            else:
+                try self.code.put(try self.crossing_name(t, "L_tobase_", owner))
+                try self.code.put("(")
+                try self.code.put(v)
+                try self.code.put(")")
+
+    ## Copy borrowed text/value projections; consume explicit owning references.
+    pub func from_base(t: ast.Node*, v: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.code.put(try self.crossing_name(t, "L_frombase_", owner))
+            try self.code.put("(")
+            try self.code.put(v)
+            try self.code.put(")")
+            return
+        if t.has(ast.flag_optional):
+            try self.code.put(try self.crossing_name(t, "L_frombase_", owner))
+            try self.code.put("(")
+            try self.code.put(v)
+            try self.code.put(")")
+            return
+        if t.text == "int":
+            if t.has(ast.flag_usize):
+                try self.code.put("kernel.int_of_usize(")
+                try self.code.put(v)
+                try self.code.put(")")
+            else:
+                try self.code.put(v)
+        elif t.text == "float" or t.text == "bool" or t.text == "ErrorCode":
+            try self.code.put(v)
+        elif t.text == "str":
+            try self.code.put("kernel.text_of(")
+            try self.code.put(v)
+            try self.code.put(")")
+        elif t.text == "bytes":
+            try self.code.put("kernel.bytes_of(")
+            try self.code.put(v)
+            try self.code.put(")")
+        else:
+            let kind = self.code.checker.table.kind(t.type_id)
+            if kind == types.Kind.interface_:
+                try self.code.put("L_")
+                try self.code.put(self.code.checker.table.get(t.type_id).name)
+                try self.code.put("__frombase(")
+                try self.code.put(v)
+                try self.code.put(")")
+            elif kind == types.Kind.class_:
+                try self.code.put("L_")
+                try self.code.put(self.code.checker.table.get(t.type_id).name)
+                try self.code.put("__wrap(")
+                try self.code.put(v)
+                try self.code.put(")")
+            else:
+                try self.code.put(try self.crossing_name(t, "L_frombase_", owner))
+                try self.code.put("(")
+                try self.code.put(v)
+                try self.code.put(")")
+
+    pub func crossing_name(t: ast.Node*, prefix: str, owner: ast.Node*) -> str!:
+        var i: usize = 0
+        while i < self.work.types.count:
+            if native_types.same_native_type(self.work.types.get(i), t):
+                break
+            i += 1
+        if i == self.work.types.count:
+            try self.work.types.push(t)
+            try self.work.owners.push(owner)
+        let half = self.code.checker.scratch.length // 2
+        return try emission.copy_text(try format(self.code.checker.scratch[half..], f"{prefix}{i}"))
+
+    pub func owned_to_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
+        if not t.has(ast.flag_native_owned) and (t.has(ast.flag_optional) or t.has(ast.flag_tuple_type)):
+            try self.code.put(try self.crossing_name(t, "L_retainbase_", owner))
+            try self.code.put("(")
+            try self.code.put(value)
+            try self.code.put(")")
+        else:
+            try self.to_base(t, value, owner)
+            if t.has(ast.flag_native_owned) or self.code.checker.table.kind(t.type_id) == types.Kind.class_ or self.code.checker.table.kind(t.type_id) == types.Kind.interface_:
+                try self.code.put(".clone()")
+
+    pub func borrow_from_base(t: ast.Node*, value: str, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned) or (not t.has(ast.flag_optional) and not t.has(ast.flag_tuple_type) and (self.code.checker.table.kind(t.type_id) == types.Kind.class_ or self.code.checker.table.kind(t.type_id) == types.Kind.interface_)):
+            let start = self.code.out.used
+            try self.code.put(value)
+            try self.code.put(".clone()")
+            let retained = try self.code.take_output(start)
+            try self.from_base(t, retained, owner)
+        elif t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
+            try self.code.put(try self.crossing_name(t, "L_borrowbase_", owner))
+            try self.code.put("(")
+            try self.code.put(value)
+            try self.code.put(")")
+        else:
+            try self.from_base(t, value, owner)
+
+    ## A traced holder backs the result until Base releases its explicit carrier.
+    func owned_crossing(t: ast.Node*, owner: ast.Node*) -> !:
+        let plain = try native_types.plain_native_node(t)
+        let toward = try self.crossing_name(t, "L_tobase_", owner)
+        let back = try self.crossing_name(t, "L_frombase_", owner)
+        let start = self.code.out.used
+        try self.code.type_of(t.type_id)
+        let luce = try self.code.take_output(start)
+        try self.base_type(plain, owner)
+        let native = try self.code.take_output(start)
+        let references = self.code.checker.table.has_references(t.type_id)
+        if references:
+            try self.code.out.write(f"struct {toward}__holder:\n    var header: heap.Object\n    var value: {luce}\n")
+            try self.code.out.write(f"func {toward}__drop(o: heap.Object*):\n    ")
+            try self.code.put(try self.code.lifetime_name("L_drop_", t.type_id))
+            try self.code.out.write(f"((({toward}__holder*)o).value)\n")
+            try self.code.out.write(f"func {toward}__trace(o: heap.Object*, visit: func(heap.Object*, void*) -> unit, context: void*):\n    ")
+            try self.code.put(try self.code.lifetime_name("L_trace_", t.type_id))
+            try self.code.out.write(f"((({toward}__holder*)o).value, visit, context)\n")
+            try self.code.out.write(f"var {toward}__info: heap.Info = heap.Info(name = \"owned native result\", size = sizeof({toward}__holder), finish = none, drop = {toward}__drop, trace = {toward}__trace)\n")
+        try self.code.out.write(f"func {toward}(v: {luce}) -> interop.Owned[{native}]:\n")
+        (*self.code.indent) += 1
+        if references:
+            try self.code.out.write(f"    let holder = ({toward}__holder*)heap.allocate(&{toward}__info)\n")
+            try self.code.begin("holder.value = ")
+            try self.code.put(try self.code.lifetime_name("L_copy_", t.type_id))
+            try self.code.put("(v)")
+            try self.code.end()
+            try self.code.line("discard(heap.pool_object(&holder.header))")
+        try self.code.begin("return interop.Owned[")
+        try self.code.put(native)
+        try self.code.put("](")
+        try self.to_base(plain, "holder.value" if references else "v", owner)
+        try self.code.put(", &holder.header)" if references else ")")
+        try self.code.end()
+        (*self.code.indent) -= 1
+        try self.code.out.write(f"func {back}(v: interop.Owned[{native}]) -> {luce}:\n")
+        (*self.code.indent) += 1
+        try self.code.line("defer v.release()")
+        try self.code.begin("return ")
+        try self.borrow_from_base(plain, "v.value", owner)
+        try self.code.end()
+        (*self.code.indent) -= 1
+        try self.code.line("")
+
+    func borrowed_crossing(t: ast.Node*, owner: ast.Node*, toward: bool = false) -> !:
+        try self.code.begin("func ")
+        try self.code.put(try self.crossing_name(t, "L_retainbase_" if toward else "L_borrowbase_", owner))
+        try self.code.put("(v: ")
+        if toward:
+            try self.code.type_of(t.type_id)
+        else:
+            try self.base_type(t, owner)
+        try self.code.put(") -> ")
+        if toward:
+            try self.base_type(t, owner)
+        else:
+            try self.code.type_of(t.type_id)
+        try self.code.put(":")
+        try self.code.end()
+        (*self.code.indent) += 1
+        if t.has(ast.flag_optional):
+            try self.code.line("if let value = v:")
+            try self.code.begin("    return ")
+            if toward:
+                try self.owned_to_base((t.left else return), "value", owner)
+            else:
+                try self.borrow_from_base((t.left else return), "value", owner)
+            try self.code.end()
+            try self.code.line("return none")
+        else:
+            try self.code.begin("return (")
+            var cursor = t.body
+            var index: usize = 0
+            while let item = cursor:
+                if index > 0:
+                    try self.code.put(", ")
+                let half = self.code.checker.scratch.length // 2
+                let value = try emission.copy_text(try format(self.code.checker.scratch[half..], f"v.{index}"))
+                if toward:
+                    try self.owned_to_base(item, value, owner)
+                else:
+                    try self.borrow_from_base(item, value, owner)
+                cursor = item.next
+                index += 1
+            try self.code.put(")")
+            try self.code.end()
+        (*self.code.indent) -= 1
+        try self.code.line("")
+
+    func crossing_functions(t: ast.Node*, owner: ast.Node*) -> !:
+        if t.has(ast.flag_native_owned):
+            try self.owned_crossing(t, owner)
+            return
+        if t.text == "list":
+            try self.reference_span_crossing(t, owner)
+            return
+        # the module's own struct or enum being converted, or the owner for an optional of
+        # anything, which only needs the module's name
+        var module_decl = owner
+        if not t.has(ast.flag_optional) and not t.has(ast.flag_tuple_type):
+            module_decl = self.code.checker.table.get(t.type_id).decl else return try self.code.fail(t, "a crossing type without a declaration")
+        let half = self.code.checker.scratch.length // 2
+        let toward = try self.crossing_name(t, "L_tobase_", owner)
+        let back = try self.crossing_name(t, "L_frombase_", owner)
+        # to Base
+        try self.code.begin("func ")
+        try self.code.put(toward)
+        try self.code.put("(v: ")
+        try self.code.type_of(t.type_id)
+        try self.code.put(") -> ")
+        try self.base_type(t, module_decl)
+        try self.code.put(":")
+        try self.code.end()
+        (*self.code.indent) += 1
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.code.line("if let x = v:")
+            try self.code.begin("    return ")
+            try self.to_base(inner, "x", module_decl)
+            try self.code.end()
+            try self.code.line("return none")
+        elif t.has(ast.flag_tuple_type):
+            try self.crossing_tuple(t, module_decl, true)
+        elif module_decl.kind == ast.Kind.struct_:
+            try self.code.line("var native = v.native")
+            var cursor = module_decl.body
+            while let field = cursor:
+                if field.kind == ast.Kind.field:
+                    let ft = field.ty else return
+                    # Rebase public fields in this new native copy, including let
+                    # fields whose borrowed view must point into the owned projection.
+                    # The caller's native object is never modified through this cast.
+                    try self.code.begin("kernel.rebase_field(&native.")
+                    try self.code.put(field.text)
+                    try self.code.put(", ")
+                    let projection = try emission.copy_text(try format(self.code.checker.scratch[half..], f"v.L_{field.text}"))
+                    try self.to_base(ft, projection, module_decl)
+                    try self.code.put(")")
+                    try self.code.end()
+                cursor = field.next
+            try self.code.line("return native")
+        else:
+            try self.code.line("match v:")
+            var cursor = module_decl.body
+            while let c = cursor:
+                if c.kind == ast.Kind.enum_case:
+                    try self.code.begin("    .L_")
+                    try self.code.put(c.text)
+                    try self.code.put(": return ")
+                    try self.code.write_base_alias(module_decl.module)
+                    try self.code.put(".")
+                    try self.code.put(module_decl.text)
+                    try self.code.put(".")
+                    try self.code.put(c.text)
+                    try self.code.end()
+                cursor = c.next
+        (*self.code.indent) -= 1
+        try self.code.line("")
+        # from Base
+        try self.code.begin("func ")
+        try self.code.put(back)
+        try self.code.put("(v: ")
+        try self.base_type(t, module_decl)
+        try self.code.put(") -> ")
+        try self.code.type_of(t.type_id)
+        try self.code.put(":")
+        try self.code.end()
+        (*self.code.indent) += 1
+        if t.has(ast.flag_optional):
+            let inner = t.left else return
+            try self.code.line("if let x = v:")
+            try self.code.begin("    return ")
+            try self.from_base(inner, "x", module_decl)
+            try self.code.end()
+            try self.code.line("return none")
+        elif t.has(ast.flag_tuple_type):
+            try self.crossing_tuple(t, module_decl, false)
+        elif module_decl.kind == ast.Kind.struct_:
+            try self.code.begin("return L_")
+            try self.code.put(self.code.checker.table.get(module_decl.type_id).name)
+            try self.code.put("(native = v")
+            var first = false
+            var cursor = module_decl.body
+            while let f = cursor:
+                if f.kind == ast.Kind.field:
+                    if not first:
+                        try self.code.put(", ")
+                    first = false
+                    try self.code.put("L_")
+                    try self.code.put(f.text)
+                    try self.code.put(" = ")
+                    let ft = f.ty else return
+                    let field = try emission.copy_text(try format(self.code.checker.scratch[half..], f"v.{f.text}"))
+                    try self.from_base(ft, field, module_decl)
+                cursor = f.next
+            try self.code.put(")")
+            try self.code.end()
+        else:
+            try self.code.line("match v:")
+            var cursor = module_decl.body
+            while let c = cursor:
+                if c.kind == ast.Kind.enum_case:
+                    try self.code.begin("    .")
+                    try self.code.put(c.text)
+                    try self.code.put(": return L_")
+                    try self.code.put(self.code.checker.table.get(module_decl.type_id).name)
+                    try self.code.put(".L_")
+                    try self.code.put(c.text)
+                    try self.code.end()
+                cursor = c.next
+            # an integer-backed enum from Base may hold a combination no case names
+            try self.code.line("    _: trap(\"a Base enum value that is no declared case crossed into Luce\")")
+        (*self.code.indent) -= 1
+        try self.code.line("")
+        if t.has(ast.flag_optional) or t.has(ast.flag_tuple_type):
+            if self.code.checker.native_borrowable(t):
+                try self.borrowed_crossing(t, owner)
+            if self.code.checker.native_result_owned(t):
+                try self.borrowed_crossing(t, owner, true)
+
+    func crossing_tuple(t: ast.Node*, owner: ast.Node*, toward: bool) -> !:
+        try self.code.begin("return (")
+        var cursor = t.body
+        var index: usize = 0
+        while let member = cursor:
+            if index > 0:
+                try self.code.put(", ")
+            let half = self.code.checker.scratch.length // 2
+            let field = try emission.copy_text(try format(self.code.checker.scratch[half..], f"v.{index}"))
+            if toward:
+                try self.to_base(member, field, owner)
+            else:
+                try self.from_base(member, field, owner)
+            index += 1
+            cursor = member.next
+        try self.code.put(")")
+        try self.code.end()
+
+    ## The source list retains its elements. This call-local array contains only
+    ## borrowed references; Base must clone an element before retaining it.
+    func reference_span_crossing(t: ast.Node*, owner: ast.Node*) -> !:
+        let element = t.body else return
+        try self.code.begin("func ")
+        try self.code.put(try self.crossing_name(t, "L_tobase_", owner))
+        try self.code.put("(v: ")
+        try self.code.type_of(t.type_id)
+        try self.code.put(") -> ")
+        try self.base_type(t, owner)
+        try self.code.put(":")
+        try self.code.end()
+        (*self.code.indent) += 1
+        try self.code.begin("let items = kernel.boundary_span[")
+        try self.base_type(element, owner)
+        try self.code.put("](v.count)")
+        try self.code.end()
+        try self.code.line("var i: usize = 0")
+        try self.code.line("while i < v.count:")
+        try self.code.begin("    items[i] = ")
+        try self.to_base(element, "v.items[i]", owner)
+        try self.code.end()
+        try self.code.line("    i += 1")
+        try self.code.line("return items")
+        (*self.code.indent) -= 1
+        try self.code.line("")
+
