@@ -1,6 +1,8 @@
 # The runtime
 
-`rt/kernel.lucb` is the Base package every compiled Luce program is linked with. The
+`rt/kernel.lucb` supplies Luce's managed values. Base's standard `ownership` module
+supplies their shared intrusive lifetime protocol, also available to Base libraries
+with explicit retain/release. Every compiled Luce program links these modules. The
 interpreter (`luce run`) follows the same contract with its own data structures, and the
 conformance suite holds the two to it: the order in which objects die is observable through
 `deinit`, so it is specified here rather than left to either implementation.
@@ -15,6 +17,8 @@ A class instance is a heap block: a header, then the fields in declaration order
 | `weak` | `Weak` references; the storage stays while any remain |
 | `flags` | the collector's colour, whether the object is in the root buffer, whether it is dead |
 | `info` | the class's descriptor: its name, size, `deinit`, field release, field trace |
+| `generation`, `context` | unique allocation and runtime-thread identities |
+| `allocation_size`, `allocator` | the actual block and its recorded allocation owner |
 
 The descriptor's `drop` releases the fields in reverse declaration order and tolerates a
 field that was never assigned (an `init` that failed). Its `trace` visits every strong

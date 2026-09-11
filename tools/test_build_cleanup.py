@@ -47,7 +47,8 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cleanup-") as temporary:
     emitted = Path(str(output) + ".base")
     run([COMPILER, "build", source, "--emit=base", "-o", output])
     original = {p.relative_to(emitted): p.read_bytes() for p in emitted.rglob("*") if p.is_file()}
-    assert Path("main.lucb") in original and Path("rt/heap.lucb") in original
+    assert Path("main.lucb") in original and Path("rt/kernel.lucb") in original
+    assert Path("rt/heap.lucb") not in original
     run([COMPILER, "build", source, "-o", output])
     assert original == {p.relative_to(emitted): p.read_bytes() for p in emitted.rglob("*") if p.is_file()}
     clean()
