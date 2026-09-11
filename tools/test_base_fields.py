@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check Base record field ownership, mutability, and older descriptor compatibility."""
+"""Check copied Base record ownership and field/receiver mutability."""
 import os
 from pathlib import Path
 import subprocess
@@ -34,7 +34,9 @@ pub func defaults() -> Settings:
 pub func describe(value: Settings) -> str:
     return value.label
 ''')
-    supports_mutability = b'    mutable port\n' in run([BASE, 'describe', boundary]).stdout
+    description = run([BASE, 'describe', boundary]).stdout
+    assert description.startswith(b'description 2\n'), description
+    assert b'    field var port: i64\n' in description, description
     entry = root / 'main.luc'
     entry.write_text('''import boundary
 pub func main(arguments: list[str]) -> int!:
@@ -50,11 +52,8 @@ pub func main(arguments: list[str]) -> int!:
     return 0
 ''')
     for flags in FLAGS:
-        result = run([COMPILER, 'build', entry, *flags, '-o', root / 'app'], supports_mutability)
-        if supports_mutability:
-            run([root / 'app'])
-        else:
-            assert b'the field `port` is a `let`' in result.stderr, result.stderr
+        run([COMPILER, 'build', entry, *flags, '-o', root / 'app'])
+        run([root / 'app'])
     for declaration, assignment in [('var', 'version = 2'), ('let', 'port = 8080')]:
         entry.write_text(f'''import boundary
 pub func main(arguments: list[str]) -> int!:
@@ -64,9 +63,5 @@ pub func main(arguments: list[str]) -> int!:
 ''')
         result = run([COMPILER, 'check', entry], False)
         expected = b'the field `version` is a `let`' if declaration == 'var' else b'a field of a `let` value cannot change'
-        # Older Base descriptors reject the field before reaching its receiver.
-        if declaration == 'let' and not supports_mutability:
-            expected = b'the field `port` is a `let`'
         assert expected in result.stderr, result.stderr
-    print('PASS Base fields: mutable copies, immutable fields/bindings, all six modes'
-          if supports_mutability else 'PASS legacy Base fields remain read-only, all six modes')
+    print('PASS Base fields: mutable copies, immutable fields/bindings, all six modes')

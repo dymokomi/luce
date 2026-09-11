@@ -7,8 +7,12 @@
 import front.ast
 import support.list
 
+pub let invalid_description: ErrorCode = ErrorCode.package(27)
+
 ## The declarations read from a description, as a module's tree.
 pub func read(text: str, name: str) -> ast.Node*!:
+    if not starts_with(text, "description 2\nmodule "):
+        error(invalid_description, "the Base description format does not match Luce; rebuild both compilers together")
     let tree = try ast.Node.make(ast.Kind.module, name, 0, 1)
     var reader = Reader(text = text, at = 0, line = 0, tree = tree, tail = none, names = try list.List[str].create(16), kinds = try list.List[u8].create(16))
     try reader.read_all()
@@ -42,7 +46,15 @@ func mentions_dropped(reader: Reader*, d: ast.Node*) -> bool:
     while let m = cursor:
         if type_mentions_dropped(reader, m.ty):
             return true
+        if m.kind == ast.Kind.func_ and mentions_dropped(reader, m):
+            return true
         cursor = m.next
+    if d.kind == ast.Kind.struct_ or d.kind == ast.Kind.enum_:
+        cursor = d.right
+        while let conformance = cursor:
+            if type_mentions_dropped(reader, conformance):
+                return true
+            cursor = conformance.next
     return false
 
 func type_mentions_dropped(reader: Reader*, t: ast.Node*?) -> bool:
@@ -65,6 +77,7 @@ let kind_enum: u8 = 2
 let kind_handle: u8 = 3
 let kind_alias: u8 = 4
 let kind_opaque: u8 = 5
+let kind_interface: u8 = 6
 
 struct Reader:
     var text: str
@@ -99,6 +112,12 @@ struct Reader:
             let raw = self.next_line()
             if starts_with(raw, "struct "):
                 try self.remember((str)raw.bytes[7..], kind_struct)
+            elif starts_with(raw, "interface "):
+                try self.remember((str)raw.bytes[10..], kind_interface)
+            elif starts_with(raw, "unavailable "):
+                let rest = (str)raw.bytes[12..]
+                let space = index_of(rest, ' ') else continue
+                try self.remember((str)rest.bytes[..<space], kind_opaque)
             elif starts_with(raw, "enum "):
                 let rest = (str)raw.bytes[5..]
                 let space = index_of(rest, ' ') else return
@@ -111,6 +130,32 @@ struct Reader:
                 let rest = (str)raw.bytes[5..]
                 let space = index_of(rest, ' ') else return
                 try self.remember((str)rest.bytes[..<space], kind_alias)
+            elif starts_with(raw, "foreign "):
+                let rest = (str)raw.bytes[8..]
+                let space = index_of(rest, ' ') else return
+                let name = (str)rest.bytes[..<space]
+                let spelling = (str)rest.bytes[space + 1..]
+                var kind = kind_opaque
+                if spelling == "handle":
+                    kind = kind_handle
+                elif spelling == "struct":
+                    kind = kind_struct
+                elif spelling == "enum":
+                    kind = kind_enum
+                elif spelling == "interface":
+                    kind = kind_interface
+                if let dot = index_of(name, '.'):
+                    if self.declared((str)name.bytes[..<dot]):
+                        kind = kind_opaque
+                try self.remember(name, kind)
+            elif starts_with(raw, "standard "):
+                let rest = (str)raw.bytes[9..]
+                let space = index_of(rest, ' ') else return
+                let after = (str)rest.bytes[space..]
+                if starts_with(after, " as "):
+                    # Standard type imports need their own module-loading path.
+                    # Until I09 supplies it, retain them as explicitly unavailable.
+                    try self.remember((str)after.bytes[4..], kind_opaque)
 
     mutating func remember(name: str, kind: u8) -> !:
         try self.names.push(name)
@@ -151,10 +196,24 @@ struct Reader:
 
     ## One declaration line; `none` when it is Base's own.
     mutating func declaration(raw: str) -> ast.Node*?!:
+        if starts_with(raw, "import "):
+            let rest = (str)raw.bytes[7..]
+            let space = index_of(rest, ' ') else return none
+            let after = (str)rest.bytes[space..]
+            if not starts_with(after, " as "):
+                return none
+            let d = try self.node(ast.Kind.import_, (str)rest.bytes[..<space])
+            d.left = try self.node(ast.Kind.name, (str)after.bytes[4..])
+            try self.append(d)
+            return none
         if starts_with(raw, "module "):
             return none
+        if raw == "description 2" or starts_with(raw, "foreign ") or starts_with(raw, "standard ") or starts_with(raw, "unavailable "):
+            return none
         if starts_with(raw, "func "):
-            return try self.function((str)raw.bytes[5..])
+            if let function = try self.function((str)raw.bytes[5..]):
+                try self.append(function)
+            return none
         if starts_with(raw, "let "):
             let rest = (str)raw.bytes[4..]
             let colon = index_of(rest, ':') else return none
@@ -168,6 +227,10 @@ struct Reader:
             return none
         if starts_with(raw, "struct "):
             let d = try self.node(ast.Kind.struct_, (str)raw.bytes[7..])
+            try self.append(d)
+            return d
+        if starts_with(raw, "interface "):
+            let d = try self.node(ast.Kind.interface_, (str)raw.bytes[10..])
             try self.append(d)
             return d
         if starts_with(raw, "enum "):
@@ -233,27 +296,52 @@ struct Reader:
             if not starts_with(after, "->"):
                 return none
             d.left = try self.type_node(trim((str)after.bytes[2..])) else return none
-        try self.append(d)
-        return none
+            if contains_list(d.left):
+                return none
+        return d
 
-    ## `field name: T` under a struct, `case name = N` under an enum.
+    ## Members use one record per fact: field mutability is part of the field,
+    ## while constructors, methods and conformances preserve their own signatures.
     mutating func member(d: ast.Node*, raw: str) -> !:
-        if d.kind == ast.Kind.struct_ and starts_with(raw, "mutable "):
-            let name = trim((str)raw.bytes[8..])
-            var cursor = d.body
-            while let field = cursor:
-                if field.text == name:
-                    field.flags |= ast.flag_var_field
-                    return
-                cursor = field.next
+        if raw == "representation private" or raw == "constructor private":
+            # Until the native storage adapter is implemented, this type cannot
+            # cross. Dropping it prevents silent loss of its private state.
+            try self.drop(d)
+            return
+        if raw == "representation complete" or raw == "constructor memberwise" or starts_with(raw, "unavailable "):
+            return
+        if starts_with(raw, "conforms "):
+            let conformance = try self.type_node((str)raw.bytes[9..]) else return try self.drop(d)
+            append_member(&d.right, conformance)
+            return
+        let constructor = starts_with(raw, "constructor init(")
+        let receiver_mutates = starts_with(raw, "mutating method ")
+        let static_method = starts_with(raw, "static method ")
+        if constructor or receiver_mutates or static_method or starts_with(raw, "method "):
+            let offset: usize = 12 if constructor else (16 if receiver_mutates else (14 if static_method else 7))
+            let method = try self.function((str)raw.bytes[offset..]) else return try self.drop(d)
+            if not static_method:
+                let receiver = try self.node(ast.Kind.param, "self")
+                receiver.next = method.right
+                method.right = receiver
+            if receiver_mutates or constructor:
+                method.flags |= ast.flag_mutating
+            append_member(&d.body, method)
             return
         if d.kind == ast.Kind.struct_ and starts_with(raw, "field "):
-            let rest = (str)raw.bytes[6..]
+            let mutable = starts_with(raw, "field var ")
+            if not mutable and not starts_with(raw, "field let "):
+                error(invalid_description, "a Base field description needs `var` or `let`")
+            let rest = (str)raw.bytes[10..]
             let colon = index_of(rest, ':') else return
             let t = try self.type_node(trim((str)rest.bytes[colon + 1..])) else return try self.drop(d)
+            if self.contains_handle_list(t):
+                return try self.drop(d)
             let f = try self.node(ast.Kind.field, (str)rest.bytes[..<colon])
             f.ty = t
             f.flags |= ast.flag_pub
+            if mutable:
+                f.flags |= ast.flag_var_field
             var tail = d.body
             while let m = tail:
                 if m.next == none:
@@ -286,6 +374,14 @@ struct Reader:
             if self.names.get(i) == d.text:
                 self.kinds.set(i, kind_opaque)
             i += 1
+
+    func contains_handle_list(t: ast.Node*) -> bool:
+        if t.text == "list":
+            let element = t.body else return false
+            return self.kind_of(element.text) == kind_handle
+        if let inner = t.left:
+            return self.contains_handle_list(inner)
+        return false
 
     mutating func node(kind: ast.Kind, text: str) -> ast.Node*!:
         let n = try ast.Node.make(kind, text, 0, self.line)
@@ -338,6 +434,8 @@ struct Reader:
                     let piece = trim((str)inside.bytes[start..<i])
                     if piece.length > 0:
                         let a = try self.type_node(piece) else return none
+                        if not (a.text == "int" or a.text == "float" or a.text == "bool" or a.text == "str" or a.text == "bytes"):
+                            return none
                         ast.append(&t.body, &tail, a)
                     start = i + 1
                 i += 1
@@ -357,9 +455,9 @@ struct Reader:
                 return try self.node(ast.Kind.type_, "bytes")
             let t = try self.node(ast.Kind.type_, "list")
             let e = try self.type_node(elem) else return none
-            # the elements are lent as they are: scalars and texts; anything converted
-            # per element would be a copy Base could keep
-            let plain = (e.text == "int" and not e.has(ast.flag_usize)) or e.text == "float" or e.text == "bool" or e.text == "str"
+            # Handle lists use a temporary array of unwrapped Base handles. As with
+            # text spans, the callee must copy/retain anything it keeps after return.
+            let plain = (e.text == "int" and not e.has(ast.flag_usize)) or e.text == "float" or e.text == "bool" or e.text == "str" or self.kind_of(e.text) == kind_handle
             if not plain:
                 return none
             t.body = e
@@ -376,21 +474,27 @@ struct Reader:
             return try self.node(ast.Kind.type_, "bool")
         if s == "str":
             return try self.node(ast.Kind.type_, "str")
-        # a name the module declares: its struct, enum, handle, or an alias that crosses
-        var i: usize = 0
-        while i < s.length:
-            let b = s.bytes[i]
-            let word = (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_'
-            if not word:
-                return none
-            i += 1
-        let kind = self.kind_of(s)
-        if kind == kind_struct or kind == kind_enum or kind == kind_handle or kind == kind_alias:
+        # A qualified public type has the identity of its imported declaration;
+        # that module's complete description determines whether it can cross.
+        let named = self.kind_of(s)
+        if named == kind_struct or named == kind_enum or named == kind_handle or named == kind_alias or named == kind_interface:
             return try self.node(ast.Kind.type_, s)
         return none
 
 ## A struct left out for a field of Base's own; the checker never sees it.
 pub let flag_dropped: u32 = 4194304
+
+func append_member(first: ast.Node*?*, member: ast.Node*):
+    var tail = *first
+    while let item = tail:
+        if item.next == none:
+            break
+        tail = item.next
+    ast.append(first, &tail, member)
+
+func contains_list(t: ast.Node*?) -> bool:
+    let node = t else return false
+    return node.text == "list" or contains_list(node.left)
 
 func starts_with(text: str, prefix: str) -> bool:
     if text.length < prefix.length:
@@ -423,7 +527,7 @@ func last_index_of(text: str, byte: u8) -> usize?:
     return none
 
 test "a description reads into declarations that cross":
-    let tree = try read("module counters\nhandle Counter destroy release\nstruct Counted\n    field count: i64\nenum Mode as u32\n    case read = 0\n    case write = 1\nlet limit: i64\nfunc open(start: i64) -> Counter!\nfunc bump(counter: Counter, by: usize) -> i64\nfunc release(counter: Counter)\nfunc raw(p: i32*) -> i64\nfunc names(items: const str[]) -> str?\n", "counters")
+    let tree = try read("description 2\nmodule counters\nhandle Counter destroy release\nstruct Counted\n    representation complete\n    constructor memberwise\n    field var count: i64\nenum Mode as u32\n    case read = 0\n    case write = 1\nlet limit: i64\nfunc open(start: i64) -> Counter!\nfunc bump(counter: Counter, by: usize) -> i64\nfunc release(counter: Counter)\nfunc raw(p: i32*) -> i64\nfunc names(items: const str[]) -> str?\n", "counters")
     var count: usize = 0
     var cursor = tree.body
     var last = ""
@@ -433,3 +537,43 @@ test "a description reads into declarations that cross":
         cursor = d.next
     assert(count == 8)
     assert(last == "names")
+
+test "description format mismatches are rejected before declarations":
+    let invalid = ["module old\n", "description 1\nmodule old\n", "description 3\nmodule future\n", "description 2\n"]
+    for text in invalid:
+        let tree = read(text, "wrong") catch failure:
+            assert(failure.code == invalid_description)
+            continue
+        discard(tree)
+        assert(false)
+
+test "described constructors and methods preserve receiver and effect":
+    let tree = try read("description 2\nmodule api\ninterface Gauge\n    method value() -> i64\nstruct Counter\n    representation complete\n    constructor init(start: i64) -> !\n    field var count: i64\n    method value() -> i64\n    mutating method increase(amount: i64) -> !\n    static method zero() -> Counter\n    conforms Gauge\n", "api")
+    let gauge = tree.body else trap("missing described node")
+    assert(gauge.kind == ast.Kind.interface_)
+    let requirement = gauge.body else trap("missing described node")
+    assert(requirement.text == "value")
+    assert((requirement.right else trap("missing described node")).text == "self")
+    let counter = gauge.next else trap("missing described node")
+    let init = counter.body else trap("missing described node")
+    assert(init.text == "init" and init.has(ast.flag_mutating))
+    assert((init.left else trap("missing described node")).has(ast.flag_fallible))
+    assert(((init.right else trap("missing described node")).next else trap("missing described node")).text == "start")
+    let field = init.next else trap("missing described node")
+    assert(field.kind == ast.Kind.field and field.has(ast.flag_var_field))
+    let value = field.next else trap("missing described node")
+    assert(value.text == "value" and not value.has(ast.flag_mutating))
+    let increase = value.next else trap("missing described node")
+    assert(increase.has(ast.flag_mutating))
+    let zero = increase.next else trap("missing described node")
+    assert(zero.text == "zero" and zero.right == none)
+    assert((counter.right else trap("missing described node")).text == "Gauge")
+
+test "incomplete native storage cannot degrade to public field copies":
+    let tree = try read("description 2\nmodule api\nstruct Hidden\n    representation private\n    constructor memberwise\n    field var shown: i64\nfunc roundtrip(value: Hidden) -> Hidden\nstruct Nested\n    representation complete\n    constructor memberwise\n    field var child: Hidden\nfunc nested(value: Nested) -> Nested\nlet visible: i64\n", "api")
+    let visible = tree.body else trap("missing described node")
+    assert(visible.text == "visible" and visible.next == none)
+
+test "private initializers cannot become public memberwise constructors":
+    let tree = try read("description 2\nmodule api\nstruct Locked\n    representation complete\n    constructor private\n    field var marker: i64\nfunc make() -> Locked\n", "api")
+    assert(tree.body == none)

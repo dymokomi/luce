@@ -892,6 +892,15 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
+The current description begins with `description 2`; a mismatched compiler is
+rejected before declarations are read. There is one current format. Field
+mutability is explicit in each field record. A record with private native storage
+or a private custom initializer is currently unavailable, including declarations
+depending on it, rather than being reconstructed from its public fields alone.
+Constructor, method and interface metadata is now read; their native execution
+adapters are tracked in Base's `docs/PACKAGE-REWRITE-TODO.md` and are not yet a
+completed language boundary.
+
 ### 16.2 Crossable types
 
 | Luce | Base | Crossing |
@@ -901,7 +910,7 @@ interpreter runs Luce alone and refuses it (§17.1).
 | `bool` | `bool` | by value |
 | `str` | `str` | lent as Base's view of the bytes; a Base result is copied into an owned `str` |
 | `bytes` | `const u8[]` | lent; a Base result is copied |
-| `list[T]` of `int`, `float`, `bool` or `str` | `const T[]` | lent as a span over the elements (texts as views that live to the end of the statement), never kept by Base; a Base span never crosses back |
+| `list[T]` of `int`, `float`, `bool`, `str` or handles | `const T[]` | lent for the call; texts and handles use temporary converted arrays. Base must retain individual resources it keeps; a Base span never crosses back |
 | struct of crossable fields | the same struct, declared in Base | by value |
 | integer-backed `enum` declared in Base | that enum | by value |
 | `T?` | `T?` | by value |
@@ -912,6 +921,15 @@ interpreter runs Luce alone and refuses it (§17.1).
 Nothing else crosses in either direction. A `usize` in Base is an `int` in Luce and a
 negative or oversized value traps at the crossing. A Base enum value that names no
 declared case traps as it crosses.
+
+Public handles retain their declaring module's identity when another Base module
+uses them in a signature or exports a type alias. Lists of handles are supported
+as function arguments, not aggregate fields or callback parameters. Closed handles
+are checked while unwrapping each element, just as for an individual argument.
+
+The project's `[native]` libraries, frameworks, and pkg_config requirements are
+preserved in compiled and explicitly emitted Base workspaces. Native source and
+search paths currently require a Base build and are rejected explicitly by Luce.
 
 ### 16.3 Errors and traps
 
