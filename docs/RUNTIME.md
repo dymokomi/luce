@@ -253,6 +253,27 @@ it. Capturing closures and bound methods have no such entry and trap if an indir
 Base call attempts to pass them as callbacks. Direct calls retain the named-function
 check in the checker.
 
+## Retained native callbacks
+
+`interop.Callback[A, R]` crosses as a captured `func(A) -> R!`; a `unit` argument
+means no arguments. The native carrier retains the closure's existing owner and
+traces its captures. Returned native callbacks have a traced closure wrapper;
+round trips unwrap the original carrier/closure. The source thread is checked
+even for a named function with immortal storage. Raw native function pointers keep
+their capture-free contract.
+
+Invocations return `Outcome[R]`. Reverse calls place managed results in traced
+`Owned` storage, and transfer dynamic failures out of Luce's pending-error chain.
+Native callers can handle and release them directly. Captured checked views retain
+their lease and still expire at the original scope boundary.
+
+`interop.Signal[A]` owns retained callbacks and returns standard `Connection`
+owners. Each emission snapshots registration order, skips removed connections and
+defers additions to the next emission. The active callback stays retained through
+return. Closing the signal skips remaining delivery; failure stops the emission
+with an owned error. Connections and callback captures participate in the shared
+cycle graph. See [the lifecycle contract](../../luce-base/docs/CALLBACKS-WORKERS.md).
+
 ## Declared native objects
 
 An imported `interop.Type[T]` declaration makes its Base struct an owned Luce
