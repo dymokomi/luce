@@ -104,6 +104,9 @@ pub struct Emitter:
     ## Operands hoisted before the statement (RUNTIME 5): `let` lines, written ahead of the
     ## statement when it is wrapped.
     var prelude: buffer.Buffer
+    ## Nested catch/block statements drain only operands produced in their scope.
+    var prelude_floor: usize
+    var hoisted_floor: usize
     ## The operands hoisted for the statement being written, and their names: a node
     ## written again in the statement is written by its name, so a call runs once.
     var hoisted_nodes: list.List[ast.Node*]
@@ -136,7 +139,7 @@ pub struct Emitter:
                        spawns = try list.List[ast.Node*].create(8), spawns_done = 0, waits = try list.List[u32].create(8), waits_done = 0, sends = try list.List[u32].create(16), sends_done = 0, callbacks = try list.List[ast.Node*].create(8), callbacks_done = 0, native_calls = try list.List[ast.Node*].create(16), native_calls_done = 0,
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self",
-                       tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024),
+                       tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024), prelude_floor = 0, hoisted_floor = 0,
                        hoisted_nodes = try list.List[ast.Node*].create(8), hoisted_names = try list.List[str].create(8))
 
     pub func text() -> str:
@@ -201,17 +204,17 @@ pub struct Emitter:
                 try self.put(m)
                 try self.put(")")
                 try self.end()
-            if self.prelude.used > 0:
-                try self.put(self.prelude.view())
-                self.prelude.used = 0
+            if self.prelude.used > self.prelude_floor:
+                try self.put((str)self.prelude.bytes()[self.prelude_floor..])
+                self.prelude.used = self.prelude_floor
             try self.put(text)
             if not terminal:
                 try self.begin("heap.drain(")
                 try self.put(m)
                 try self.put(")")
                 try self.end()
-        self.hoisted_nodes.count = 0
-        self.hoisted_names.count = 0
+        self.hoisted_nodes.count = self.hoisted_floor
+        self.hoisted_names.count = self.hoisted_floor
         self.pooled = pooled_before
 
     ## Whether every path through the statement leaves the function, as the checker
@@ -286,7 +289,7 @@ pub struct Emitter:
                     .func_: try self.shim(d)
                     .class_:
                         if d.native_object != none:
-                            try native_objects.declaration(&self.out, self.type_name(d), d.module, d.text)
+                            try native_objects.declaration(&self.out, self.type_name(d), d.module, d.text, (d.native_object else return).view)
                             var member = d.body
                             while let method = member:
                                 if method.kind == ast.Kind.func_ and method.text != "init":
@@ -1500,6 +1503,26 @@ pub struct Emitter:
         self.indent -= 1
         try self.line("")
 
+        if field.has(ast.flag_var_field):
+            try self.begin("func L_")
+            try self.put(self.type_name(owner))
+            try self.put("__set_")
+            try self.put(field.text)
+            try self.put("(L_self: ")
+            try self.type_of(owner.type_id)
+            try self.put(", value: ")
+            try self.type_of(field.type_id)
+            try self.put("):")
+            try self.end()
+            try self.begin("    L_")
+            try self.put(self.type_name(owner))
+            let native = owner.native_object else return
+            try self.put("__value(L_self).value_mut()." if native.view else "__value(L_self).value().")
+            try self.put(field.text)
+            try self.put(" = value")
+            try self.end()
+            try self.line("")
+
     ## A full method serves bound values and interface dispatch. Direct calls use
     ## their own argument shape so Base, including its initializer scope, owns defaults.
     mutating func native_method(method: ast.Node*, owner: ast.Node*, call: ast.Node*? = none) -> !:
@@ -1553,19 +1576,32 @@ pub struct Emitter:
         try self.line("let mark = heap.mark()")
         try self.line("defer heap.drain(mark)")
         if owned and instance:
-            try self.line("discard(heap.retain(&L_self.header))")
-            try self.line("defer heap.release(&L_self.header)")
             try self.begin("let reference = L_")
             try self.put(self.type_name(owner))
             try self.put("__value(L_self)")
             try self.end()
             let native = owner.native_object else return
-            if method.text == "is_closed" or method.text == native.close:
-                try self.line("return reference.is_closed()" if method.text == "is_closed" else "reference.close()")
+            let query = "is_valid" if native.view else "is_closed"
+            if method.text == query:
+                try self.line("return reference.is_valid()" if native.view else "return reference.is_closed()")
                 self.indent -= 1
                 try self.line("")
                 return
-            try self.line("let native = try reference.get()" if self.fallible else "let native = reference.value()")
+            if native.view:
+                try self.line("try reference.enter()" if self.fallible else "reference.enter() catch failure: trap(failure.message)")
+            else:
+                try self.line("reference.enter()")
+            try self.line("defer reference.leave()")
+            if method.text == native.close:
+                try self.line("reference.close()")
+                self.indent -= 1
+                try self.line("")
+                return
+            let mutating_view = native.view and method.has(ast.flag_mutating)
+            if self.fallible:
+                try self.line("let native = try reference.get_mut()" if mutating_view else "let native = try reference.get()")
+            else:
+                try self.line("let native = reference.value_mut()" if mutating_view else "let native = reference.value()")
         elif instance:
             let t = try native_node(owner)
             try self.begin("var native = " if mutates else "let native = ")
@@ -1643,7 +1679,10 @@ pub struct Emitter:
             try self.put("L_self = ")
             if d.has(ast.flag_mutating) and self.checker.table.is_value(receiver.type_id):
                 try self.put("&")
-            try self.use(receiver)
+            if d.has(ast.flag_mutating) and self.checker.table.is_value(receiver.type_id):
+                try self.use(receiver)
+            else:
+                try self.borrow_for_call(receiver)
             first = false
         var a = e.body
         while let arg = a:
@@ -1659,7 +1698,7 @@ pub struct Emitter:
                 let f = v.resolved else return try self.fail(v, "a callback that is not a named function")
                 try self.put(try self.callback_name(f))
             else:
-                try self.use(v)
+                try self.borrow_for_call(v)
             a = arg.next
         try self.put(")")
 
@@ -1733,8 +1772,8 @@ pub struct Emitter:
             try self.put("[]")
         else:
             let declaration = self.checker.table.get(t.type_id).decl else return try self.fail(t, "a Base nominal type has no resolved declaration")
-            if declaration.native_object != none:
-                try self.put("interop.Reference[")
+            if let native = declaration.native_object:
+                try self.put("interop.View[" if native.view else "interop.Reference[")
             try self.write_base_alias(declaration.module)
             try self.put(".")
             try self.put(declaration.text)
@@ -2625,7 +2664,16 @@ pub struct Emitter:
         try self.put(")")
         try self.end()
 
+    mutating func restore_operand_scope(prelude_floor: usize, hoisted_floor: usize):
+        self.prelude_floor = prelude_floor
+        self.hoisted_floor = hoisted_floor
+
     mutating func statement(s: ast.Node*) -> !:
+        let saved_prelude_floor = self.prelude_floor
+        let saved_hoisted_floor = self.hoisted_floor
+        self.prelude_floor = self.prelude.used
+        self.hoisted_floor = self.hoisted_nodes.count
+        defer self.restore_operand_scope(saved_prelude_floor, saved_hoisted_floor)
         try self.position_lines(s)
         let start = self.out.used
         let pooled_before = self.pooled
@@ -2757,6 +2805,25 @@ pub struct Emitter:
     mutating func assign(s: ast.Node*) -> !:
         let place = s.left else return
         let value = s.right else return
+        if place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if let owner = self.checker.table.get(receiver.type_id).decl:
+                if owner.native_object != none:
+                    try self.hold_operand(receiver)
+                    try self.begin("L_")
+                    try self.put(self.type_name(owner))
+                    try self.put("__set_")
+                    try self.put(place.text)
+                    try self.put("(")
+                    try self.use(receiver)
+                    try self.put(", ")
+                    if s.text == "=":
+                        try self.use(value)
+                    else:
+                        try self.arithmetic((str)s.text.bytes[..<s.text.length - 1], place.type_id, place, value)
+                    try self.put(")")
+                    try self.end()
+                    return
         if place.kind == ast.Kind.tuple:
             # the places' receivers and indexes come first (§5.3), then the tuple, then the stores
             var ahead = place.body
@@ -2885,6 +2952,10 @@ pub struct Emitter:
                 discard(try self.hoist(index, is_map))
         elif place.kind == ast.Kind.member:
             let receiver = place.left else return
+            if let owner = self.checker.table.get(receiver.type_id).decl:
+                if owner.native_object != none:
+                    try self.hold_operand(receiver)
+                    return
             if self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
                 discard(try self.hoist(receiver, false))
 
@@ -2953,7 +3024,8 @@ pub struct Emitter:
                         try self.put(self.type_name(owner))
                         try self.put("__value(")
                         try self.use(receiver)
-                        try self.put(").value().")
+                        let native = owner.native_object else return
+                        try self.put(").value_mut()." if native.view else ").value().")
                         try self.put(e.text)
                         return
                 if self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
@@ -3841,6 +3913,33 @@ pub struct Emitter:
             i += 1
         return none
 
+    ## Preserve an operand across later argument evaluation. A later callback can
+    ## replace a captured binding, so a pointer snapshot must also own its value.
+    mutating func hold_operand(e: ast.Node*) -> !:
+        if self.hoisted_name(e) != none:
+            return
+        if not self.checker.table.has_references(e.type_id):
+            discard(try self.hoist(e, false))
+            return
+        let name = try self.temp("held")
+        let start = self.out.used
+        try self.owned(e)
+        let value = try self.capture(start)
+        var i: u32 = 0
+        while i < self.indent:
+            try self.prelude.put("    ")
+            i += 1
+        try self.prelude.put("let ")
+        try self.prelude.put(name)
+        try self.prelude.put(" = ")
+        try self.prelude.put(try self.lifetime_name("L_pool_", e.type_id))
+        try self.prelude.put("(")
+        try self.prelude.put(value)
+        try self.prelude.put(")\n")
+        try self.hoisted_nodes.push(e)
+        try self.hoisted_names.push(name)
+        self.pooled = true
+
     ## Whether a call appears anywhere in the expression: evaluating it may have an effect.
     func has_call(n: ast.Node*?) -> bool:
         let node = n else return false
@@ -3886,6 +3985,18 @@ pub struct Emitter:
                 try self.owned(item)
             i += 1
             cursor = item.next
+
+    ## Native parameters borrow for the complete call, including reentrant callbacks.
+    ## Pin inline so lazy branches and source argument order remain unchanged.
+    mutating func borrow_for_call(e: ast.Node*) -> !:
+        if self.checker.table.has_references(e.type_id) and (self.borrowed(e) or self.hoisted_name(e) != none):
+            try self.put(try self.lifetime_name("L_pool_", e.type_id))
+            try self.put("(")
+            try self.owned(e)
+            try self.put(")")
+            self.pooled = true
+        else:
+            try self.use(e)
 
     ## The expression as a value used and let go of: an owned one becomes a temporary of
     ## the statement, pooled until the drain.

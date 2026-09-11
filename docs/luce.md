@@ -892,7 +892,7 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
-The current description begins with `description 5`; a mismatched compiler is
+The current description begins with `description 6`; a mismatched compiler is
 rejected before declarations are read. There is one current format. Field
 mutability and default availability are explicit in the records. Named arguments
 keep their parameter association. Omitted defaults are evaluated by Base in their
@@ -913,8 +913,19 @@ as a copied value. A private initializer prevents construction but allows return
 values and their public methods. Unsupported methods are unavailable individually;
 an unsupported initializer cannot become an implicit memberwise constructor.
 
-Owned objects and interface execution follow the separate lifetime work tracked
-in Base's `docs/PACKAGE-REWRITE-TODO.md`.
+Base structs declared with `interop.Type[T]` import as owning Luce objects.
+Aliases and bound methods share one native owner. Real initializers run in stable
+allocated storage; failed construction releases that storage. Explicit close is
+visible through every alias, while active native calls finish before disposal.
+Other methods and public fields reject closed access.
+
+`interop.ViewType[T]` imports a nonconstructible borrowed reference with a checked
+lease. Retaining a view, binding a method or capturing it keeps validity checks
+alive without extending the valid period. After the Base owner ends the lease or
+closes, access fails; `is_valid()` still reports the state. Returned text is copied
+into an owned Luce string and can outlive the view. Native owners and views cannot
+be transferred to workers. Interface execution remains tracked in Base's
+`docs/PACKAGE-REWRITE-TODO.md`.
 
 ### 16.2 Crossable types
 
@@ -927,6 +938,8 @@ in Base's `docs/PACKAGE-REWRITE-TODO.md`.
 | `bytes` | `const u8[]` | lent; a Base result is copied |
 | `list[T]` of `int`, `float`, `bool`, `str` or handles | `const T[]` | lent for the call; texts and handles use temporary converted arrays. Base must retain individual resources it keeps; a Base span never crosses back |
 | struct with copyable native storage | the same struct, declared in Base | complete native value plus owned public text/data |
+| declared owned object | `interop.Reference[T]` | shared native owner; parameter borrows and result transfers a reference |
+| declared borrowed view | `interop.View[T]` | shared checked lease; no public construction |
 | `(T, U)` | `(T, U)` | each member crosses recursively |
 | integer-backed `enum` declared in Base | that enum | by value |
 | `T?` | `T?` | by value |
