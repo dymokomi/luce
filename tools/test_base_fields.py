@@ -35,7 +35,7 @@ pub func describe(value: Settings) -> str:
     return value.label
 ''')
     description = run([BASE, 'describe', boundary]).stdout
-    assert description.startswith(b'description 4\n'), description
+    assert description.startswith(b'description 5\n'), description
     assert b'    field var port: i64 = default\n' in description, description
     entry = root / 'main.luc'
     entry.write_text('''import boundary

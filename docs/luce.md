@@ -892,7 +892,7 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
-The current description begins with `description 4`; a mismatched compiler is
+The current description begins with `description 5`; a mismatched compiler is
 rejected before declarations are read. There is one current format. Field
 mutability and default availability are explicit in the records. Named arguments
 keep their parameter association. Omitted defaults are evaluated by Base in their

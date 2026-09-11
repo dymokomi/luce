@@ -252,3 +252,23 @@ to a Base function taking a callback uses that entry. It remains valid if Base s
 it. Capturing closures and bound methods have no such entry and trap if an indirect
 Base call attempts to pass them as callbacks. Direct calls retain the named-function
 check in the checker.
+
+## Declared native objects
+
+An imported `interop.Type[T]` declaration makes its Base struct an owned Luce
+class. Generated class types alias `interop.Owner[T]`; there is no second wrapper
+or independent count. `Reference[T]` parameters borrow that owner and returned
+carriers transfer one reference. Native containers clone retained edges and expose
+them to the shared tracer. Bound methods hold the same owner; value-bound methods
+continue to hold independent copies.
+
+Constructors reserve an unpublished owner, initialize the actual native allocation
+and publish only after success. Initializer failure frees its allocation and the
+unpublished owner without running successful-object disposal. Close publishes the
+terminal state before cleanup; every alias sees it. An active method retains its
+receiver until return. Fallible access to a closed object returns the standard
+interop error, while infallible access traps. Weak references keep only the shell.
+
+Public field reads copy text/data or acquire child references. Direct field writes
+are limited to native `i64`, `f64` and `bool`; replacing owned/borrowed native storage
+requires a package method. Native owner objects cannot cross to workers.
