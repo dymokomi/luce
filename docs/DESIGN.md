@@ -75,6 +75,7 @@ admits and demands the same agreement, from the first slice.
 | `back.emission` | shared output, type spelling and lifetime-function registration |
 | `back.native_objects`, `back.native_interfaces` | canonical owner layouts and interface witness storage |
 | `back.native_callbacks` | retained callable layouts, tracing and callback round trips |
+| `sema.transfer` | shared task/worker transfer rules and native worker payload validation |
 | `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture |
 | `sema.base` | what a Base module offers, read from luce-base's description of it |
 | `hir.value`, `hir.interp` | the interpreter |

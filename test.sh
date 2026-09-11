@@ -20,6 +20,7 @@ python3 tools/test_base_objects.py
 python3 tools/test_base_views.py
 python3 tools/test_base_interfaces.py
 python3 tools/test_base_callbacks.py
+python3 tools/test_base_workers.py
 python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check

@@ -248,7 +248,7 @@ messages before the final heap check.
 A module function used as a Luce value is an immortal closure over its existing call
 adapter. Fallible closure calls propagate Base failures explicitly. Named functions
 with callback-compatible signatures also carry a static Base entry; an indirect call
-to a Base function taking a callback uses that entry. It remains valid if Base stores
+to a Base function taking a raw function pointer uses that entry. It remains valid if Base stores
 it. Capturing closures and bound methods have no such entry and trap if an indirect
 Base call attempts to pass them as callbacks. Direct calls retain the named-function
 check in the checker.
@@ -273,6 +273,32 @@ defers additions to the next emission. The active callback stays retained throug
 return. Closing the signal skips remaining delivery; failure stops the emission
 with an owned error. Connections and callback captures participate in the shared
 cycle graph. See [the lifecycle contract](../../luce-base/docs/CALLBACKS-WORKERS.md).
+
+## Native application workers
+
+A Base library takes `interop.WorkerEntry[C, M, R]` where Luce supplies a named
+factory returning its local `Callback[M, R]` handler. The descriptor contains code
+and runtime entry/exit hooks, with no retained source-thread graph. The generated
+factory adapter runs after the worker enters its runtime, copies configuration
+into that graph and returns an owned handler. A `unit` configuration or message
+maps to a factory or handler with no arguments.
+
+The standard worker owns bounded input/reply queues. Transfer policies copy native
+payloads into neutral packets before publication, and copy replies before releasing
+the worker's local Outcome. Package methods convert received packets into owned
+results on the receiving thread. `sema.transfer` applies the same recursive rule to
+language tasks and native workers, and rejects thread-bound payloads even if an
+ordinary function value later erases the native signature. Direct calls reject
+captured factories statically; indirect adapters check their capture-free immutable
+representation before thread creation.
+
+Cancellation wakes blocked queue operations and rejects late dispatch. The current
+handler may finish; queued work and replies are discarded. Native blocking package
+operations use the worker's cancellation signal. Shutdown releases application
+state and collects local cycles on the worker, verifies zero live owners, and joins
+before freeing queues. Startup failure follows the same joined cleanup and copies
+its diagnostic to the creator's scoped temporary pool. The Base lifecycle contract
+specifies manual ownership, queue backpressure and concurrent caller responsibilities.
 
 ## Declared native objects
 

@@ -1,0 +1,102 @@
+## One recursive transfer policy for language tasks and native application workers.
+import front.ast
+import sema.check
+import sema.types
+
+## Whether values of the type cross to a worker (§14): by copy, sharing nothing.
+pub func sendable(c: check.Checker*, id: u32) -> bool:
+    return sendable_at(c, id, 0)
+
+## Recursion is accepted only when revisiting the same nominal type. Reaching
+## the depth limit without that proof rejects the transfer; depth cannot hide an owner.
+func sendable_at(c: check.Checker*, id: u32, depth: u32) -> bool:
+    if depth > 32:
+        return false
+    let t_kind = c.table.kind(id)
+    if t_kind == types.Kind.struct_ or t_kind == types.Kind.enum_:
+        let fresh = c.entering(id) catch failure: recover false
+        if not fresh:
+            return true
+        let answer = sendable_walk(c, id, depth)
+        c.leave_walk()
+        return answer
+    return sendable_walk(c, id, depth)
+
+func sendable_walk(c: check.Checker*, id: u32, depth: u32) -> bool:
+    let t = c.table.get(id)
+    match t.kind:
+        .int_, .float_, .bool_, .str_, .bytes_, .unit_, .error_code, .error_value, .range_: return true
+        .optional, .fallible: return sendable_at(c, t.elem, depth + 1)
+        .tuple:
+            for m in t.args:
+                if not sendable_at(c, m, depth + 1):
+                    return false
+            return true
+        .struct_, .enum_:
+            let d = t.decl else return false
+            var cursor = d.body
+            while let m = cursor:
+                if m.kind == ast.Kind.field and not sendable_at(c, m.type_id, depth + 1):
+                    return false
+                if m.kind == ast.Kind.enum_case:
+                    var p = m.body
+                    while let field = p:
+                        if not sendable_at(c, field.type_id, depth + 1):
+                            return false
+                        p = field.next
+                cursor = m.next
+            return true
+        .list_, .set_: return sendable_at(c, t.elem, depth + 1)
+        .map_: return sendable_at(c, t.elem, depth + 1) and sendable_at(c, c.table.map_value(id), depth + 1)
+        _: return false
+
+## Validate every imported worker signature before function-value erasure can
+## hide its native parameter metadata. Only the returned handler remains local;
+## configuration, messages and successful replies must all be sendable values.
+pub func validate_workers(c: check.Checker*, nodes: ast.Node*?) -> !:
+    var cursor = nodes
+    while let node = cursor:
+        cursor = node.next
+        if node.has(ast.flag_worker_entry):
+            let returned = node.right else return
+            let handler = returned.left else return
+            if let configuration = node.body:
+                try validate_payload(c, configuration, 0)
+                if not sendable(c, configuration.type_id):
+                    return try c.fail(node, "worker configuration must be transferable; owners, views, interfaces and callbacks stay on their thread")
+            if let message = handler.body:
+                try validate_payload(c, message, 0)
+                if not sendable(c, message.type_id):
+                    return try c.fail(node, "worker messages must be transferable; owners, views, interfaces and callbacks stay on their thread")
+            let result = handler.right else return
+            try validate_payload(c, (result.left else return), 0)
+            if not sendable(c, result.type_id):
+                return try c.fail(node, "worker results must be transferable; owners, views, interfaces and callbacks stay on their thread")
+            continue
+        try validate_workers(c, node.ty)
+        try validate_workers(c, node.left)
+        try validate_workers(c, node.right)
+        try validate_workers(c, node.body)
+
+## An Owned[T] may look like a sendable T after lowering, but its native owner is
+## thread-bound. A transfer policy returns neutral packet storage, never ARC edges.
+func validate_payload(c: check.Checker*, node: ast.Node*, depth: u32) -> !:
+    if depth > 32:
+        return try c.fail(node, "worker transfer payloads are nested too deeply")
+    if node.has(ast.flag_native_owned) or node.has(ast.flag_native_outcome):
+        return try c.fail(node, "worker transfer payloads cannot contain native ownership carriers")
+    if let left = node.left:
+        try validate_payload(c, left, depth + 1)
+    var cursor = node.body
+    while let member = cursor:
+        try validate_payload(c, member, depth + 1)
+        cursor = member.next
+    let kind = c.table.kind(node.type_id)
+    if kind == types.Kind.struct_ or kind == types.Kind.enum_:
+        if let declaration = c.table.get(node.type_id).decl:
+            cursor = declaration.body
+            while let field = cursor:
+                if field.kind == ast.Kind.field:
+                    if let written = field.ty:
+                        try validate_payload(c, written, depth + 1)
+                cursor = field.next
