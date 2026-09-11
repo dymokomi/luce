@@ -5,9 +5,10 @@ from pathlib import Path
 import platform
 import subprocess
 import tempfile
+import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPILER = ROOT / "build/luce"
+COMPILER = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / "build/luce"
 
 
 def run(arguments):
@@ -39,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix="luce-native-manifest-") as temporary:
     assert b"1 passed" in run([COMPILER, "test", entry, "--build"])
     run([COMPILER, "build", entry, "--emit=base", "-o", output])
     kept = Path(str(output) + ".base")
-    assert native in (kept / "luce.toml").read_text()
+    assert ('frameworks = ["Foundation"]' if mac else 'libraries = ["m"]') in (kept / "luce.toml").read_text()
     run([os.environ["LUCE_BASE"], "build", kept / "main.lucb", "--native", "-o", output])
     assert run([output]) == b"42\n"
 print("PASS native manifest linkage and emitted configuration")

@@ -12,6 +12,7 @@ python3 tools/test_build_cleanup.py
 python3 tools/test_base_packages.py
 python3 tools/test_public_imports.py
 python3 tools/test_native_manifest.py
+python3 tools/test_native_packages.py
 python3 tools/test_base_fields.py
 python3 tools/test_base_description.py
 python3 tools/test_base_defaults.py
@@ -21,6 +22,7 @@ python3 tools/test_base_views.py
 python3 tools/test_base_interfaces.py
 python3 tools/test_base_callbacks.py
 python3 tools/test_base_workers.py
+python3 tools/test_gpu_frames.py
 python3 tools/test_standard_json.py
 python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check

@@ -71,6 +71,8 @@ import os
 from pathlib import Path
 import sys
 import time
+if sys.argv[1] != "build":
+    os.execv(os.environ["REAL_BASE"], [os.environ["REAL_BASE"], *sys.argv[1:]])
 assert sys.argv[1] == "build", sys.argv
 workspace = Path(sys.argv[2]).parent
 assert workspace.parent == Path(os.environ["TMPDIR"])
