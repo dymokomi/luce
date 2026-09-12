@@ -158,6 +158,8 @@ func check_function(c: check.Checker*, f: ast.Node*, owner: u32) -> !:
     c.result_type = result
     c.loop_depth = 0
     c.label_count = 0
+    c.handled_effect = false
+    c.in_catch = false
     c.push_scope()
     var cursor = f.right
     while let p = cursor:
@@ -246,12 +248,25 @@ func check_statement(c: check.Checker*, s: ast.Node*) -> bool!:
                 return try c.fail(s, "`break` and `continue` belong inside a loop")
             if s.text.length > 0 and not has_label(c, s.text):
                 return try c.fail(s, try c.named("no enclosing loop is labelled ", s.text, ""))
+            if s.text.length == 0:
+                s.resolved = c.loop_nodes.get(c.loop_nodes.count - 1)
+            else:
+                var at = c.loop_nodes.count
+                while at > 0:
+                    at -= 1
+                    let loop = c.loop_nodes.get(at)
+                    if loop.text == s.text:
+                        s.resolved = loop
+                        break
             return true
         .recover_:
             if not c.in_catch:
                 return try c.fail(s, "`recover` belongs in a `catch` suite (§12.2)")
             let v = s.left else return try c.fail(s, "`recover` needs a value")
-            discard(try expect(c, v, c.catch_result))
+            if c.catch_result == types.never_id:
+                c.catch_result = try check_expr(c, v, types.none_id)
+            else:
+                discard(try expect(c, v, c.catch_result))
             return true
         .expr_stmt:
             let e = s.left else return try c.fail(s, "empty statement")
@@ -452,6 +467,7 @@ func check_while(c: check.Checker*, s: ast.Node*) -> !:
 
 func enter_loop(c: check.Checker*, s: ast.Node*) -> !:
     c.loop_depth += 1
+    try c.loop_nodes.push(s)
     if s.text.length > 0:
         if has_label(c, s.text):
             return try c.fail(s, "this label is already in use")
@@ -462,6 +478,7 @@ func enter_loop(c: check.Checker*, s: ast.Node*) -> !:
 
 func leave_loop(c: check.Checker*, s: ast.Node*):
     c.loop_depth -= 1
+    c.loop_nodes.count -= 1
     if s.text.length > 0:
         c.label_count -= 1
 
@@ -865,10 +882,29 @@ func bound_member(c: check.Checker*, id: u32, name: str) -> ast.Node*?:
 pub func check_expr(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let id = try expr_type(c, e, hint)
     e.type_id = id
+    if c.table.kind(id) == types.Kind.fallible:
+        if c.at_top_level or (not c.fallible and not c.handled_effect):
+            return try c.fail(e, "this operation can fail; declare `-> T!` or handle it with `catch` (§12.2)")
+        let inner = try ast.Node.make(e.kind, e.text, e.start, e.line)
+        *inner = *e
+        inner.next = none
+        e.kind = ast.Kind.propagate
+        e.text = "try"
+        e.left = inner
+        e.right = none
+        e.body = none
+        e.ty = none
+        e.resolved = none
+        e.type_id = c.table.get(id).elem
+        c.effect_count += 1
+        return e.type_id
     return id
 
 func expr_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     match e.kind:
+        .propagate:
+            c.effect_count += 1
+            return e.type_id
         .literal: return try literal_type(c, e, hint)
         .name: return try name_type(c, e)
         .self_:
@@ -1070,6 +1106,11 @@ func lambda_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     # but captured (RUNTIME)
     let saved_result = c.result_type
     let saved_fallible = c.fallible
+    let saved_effect = c.handled_effect
+    let saved_count = c.effect_count
+    let saved_catch = c.in_catch
+    c.handled_effect = false
+    c.in_catch = false
     let saved_loops = c.loop_depth
     let saved_labels = c.label_count
     let saved_func = c.current_func
@@ -1107,6 +1148,9 @@ func lambda_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     c.lambda_bases.count -= 1
     c.result_type = saved_result
     c.fallible = saved_fallible
+    c.handled_effect = saved_effect
+    c.effect_count = saved_count
+    c.in_catch = saved_catch
     c.loop_depth = saved_loops
     c.label_count = saved_labels
     c.current_func = saved_func
@@ -1115,12 +1159,15 @@ func lambda_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
 func unary_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let inner = e.left else return try c.fail(e, "missing operand")
     if e.text == "try":
-        if not c.fallible:
-            return try c.fail(e, "`try` belongs in a function whose result is `!` (§12.2)")
-        let it = try check_expr(c, inner, try c.table.fallible(hint) if hint != types.none_id else types.none_id)
-        if c.table.kind(it) != types.Kind.fallible:
-            return try c.fail(e, "`try` takes a result, `T!`")
-        return c.table.get(it).elem
+        if not c.fallible and not c.handled_effect:
+            return try c.fail(e, "`try` belongs in a function whose result is `!` or a handled expression (§12.2)")
+        let before = c.effect_count
+        let it = try check_expr(c, inner, hint)
+        if c.effect_count == before:
+            return try c.fail(e, "`try` needs a fallible operation")
+        e.kind = ast.Kind.group
+        e.text = ""
+        return it
     if e.text == "not":
         discard(try expect(c, inner, types.bool_id))
         return types.bool_id
@@ -1890,7 +1937,9 @@ func spawn_type(c: check.Checker*, e: ast.Node*) -> u32!:
             named = owner.kind == ast.Kind.name and c.lookup(owner.text) == none and c.find_module(owner.text) != none
     if not named:
         return try c.fail(callee, "`spawn` starts a call of a named function: a method or a closure would share what a worker may not (§14)")
-    let result = try check_expr(c, call, types.none_id)
+    # The worker executes this call later; only its arguments execute here.
+    let result = try call_type(c, call, types.none_id)
+    call.type_id = result
     let d = call.resolved else return try c.fail(callee, "`spawn` starts a call of a named function (§14)")
     if d.kind != ast.Kind.func_ or check.has_self(d) or d.has(ast.flag_base) or d.module == 0:
         return try c.fail(callee, "`spawn` starts a call of a named function of the program (§14)")
@@ -2252,7 +2301,7 @@ func core_call(c: check.Checker*, e: ast.Node*, name: str) -> u32!:
         discard(try expect(c, m, types.str_id))
         return types.never_id
     if name == "error":
-        if not c.fallible:
+        if not c.fallible and not c.handled_effect:
             return try c.fail(e, "`error` belongs in a function whose result is `!` (§12.2)")
         if n != 2:
             return try c.fail(e, "`error(code, message)` takes a code and a text")
@@ -2262,7 +2311,7 @@ func core_call(c: check.Checker*, e: ast.Node*, name: str) -> u32!:
         let message = second.left else return try c.fail(e, "no message")
         discard(try expect(c, code, types.error_code_id))
         discard(try expect(c, message, types.str_id))
-        return types.never_id
+        return try c.table.fallible(types.never_id)
     if name == "discard":
         if n != 1:
             return try c.fail(e, "`discard(value)` takes one value")
@@ -2351,8 +2400,7 @@ func else_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
         discard(try check_return(c, r))
         return payload
     if r.kind == ast.Kind.break_ or r.kind == ast.Kind.continue_:
-        if c.loop_depth == 0:
-            return try c.fail(r, "`break` and `continue` belong inside a loop")
+        discard(try check_statement(c, r))
         return payload
     if r.kind == ast.Kind.call:
         if let callee = r.left:
@@ -2366,10 +2414,16 @@ func else_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
 func catch_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     let l = e.left else return try c.fail(e, "`catch` needs an expression")
     let body = e.body else return try c.fail(e, "`catch` needs a suite")
-    let lt = try check_expr(c, l, try c.table.fallible(hint) if hint != types.none_id else types.none_id)
-    if c.table.kind(lt) != types.Kind.fallible:
-        return try c.fail(l, "`catch` handles a result, `T!`")
-    var payload = c.table.get(lt).elem
+    let saved_effect = c.handled_effect
+    let before = c.effect_count
+    c.handled_effect = true
+    let payload_type = try check_expr(c, l, hint)
+    c.handled_effect = saved_effect
+    if c.effect_count == before:
+        return try c.fail(l, "`catch` needs a fallible operation")
+    var payload = payload_type
+    if payload == types.never_id and hint != types.none_id:
+        payload = hint
     # `let x: T? = f() catch: recover none`: the expression takes the optional it is
     # expected to be, and the suite recovers with it
     if hint != types.none_id and c.table.kind(hint) == types.Kind.optional and c.table.get(hint).elem == payload:
@@ -2382,6 +2436,7 @@ func catch_type(c: check.Checker*, e: ast.Node*, hint: u32) -> u32!:
     c.in_catch = true
     c.catch_result = payload
     let exits = try check_block(c, body)
+    payload = c.catch_result
     c.in_catch = saved_in
     c.catch_result = saved_result
     c.pop_scope()

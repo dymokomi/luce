@@ -162,16 +162,18 @@ func finish() -> int!:
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'consumer')
         run(root / 'consumer')
-    for expression, message in [
-        ('values.Locked(3)', 'private initializer'),
-        ('values.borrow("temporary")', 'has no `borrow`'),
-        ('try Counter("hidden", hidden = 4)', 'no parameter or field named'),
-        ('Counter("unchecked")', 'a result is handled')]:
+    for expression, message, result in [
+        ('values.Locked(3)', 'private initializer', 'int!'),
+        ('values.borrow("temporary")', 'has no `borrow`', 'int!'),
+        ('Counter("hidden", hidden = 4)', 'no parameter or field named', 'int!'),
+        ('Counter("unchecked")', 'this operation can fail', 'int')]:
         entry.write_text(f'''from values import Counter
 import values
-pub func main(arguments: list[str]) -> int!:
+func value_result() -> {result}:
     let value = {expression}
     return 0
+pub func main(arguments: list[str]) -> int!:
+    return value_result()
 ''')
         failure = run(COMPILER, 'check', entry, expected=1)
         assert message in failure.stderr, failure.stderr

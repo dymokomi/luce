@@ -559,7 +559,7 @@ A class is a shared object: assignment and passing share it, and it lives while 
 refers to it. Construction is `Name(args)`, the same spelling as a struct; the declaration,
 not the use, says which is which. A class has one `init(self, ...)`, which assigns every
 field without a default exactly once before it ends and cannot publish `self` before that;
-`init` may be `!` when construction can fail, and then construction is `try Name(args)`. A
+`init` may be `!` when construction can fail. `Name(args)` then propagates in a fallible caller or is handled with `catch`. A
 class without an `init` and with defaults for every field is constructed with no arguments.
 Classes are final: no inheritance, no override, no base class. Alternative construction is a
 type function returning the class, `Document.from_file(path)`.
@@ -687,7 +687,7 @@ func parse(text: str) -> Config!:
         error(bad_input, "empty configuration")
     return Config(...)
 
-let config = try parse(text)
+let config = parse(text)
 let config2 = parse(text) catch failure:
     recover default_config()
 let config3 = parse(text) catch failure:
@@ -696,12 +696,35 @@ let config3 = parse(text) catch failure:
     error(failure.code, f"cannot load: {failure.message}")
 ```
 
-`T!` is a fallible function result, yielding a `T` or an `Error`. It is not a
-storable type: locals, fields, parameters and container elements use `Result[T]`
-when they need to retain an outcome. `try` unwraps in a function whose own result is `!`,
-passing the failure up. `catch failure:` handles it in a suite that must end in `recover
-value`, `return`, or `error`. `error(code, message)` fails the current function, which must
-be `!`. A fallible operation cannot be ignored: it is tried or caught.
+`T!` is a fallible function result, yielding a `T` or an owned `Error`. Inside
+an explicitly fallible function, operations propagate automatically: their success
+values compose normally, and the first failure leaves the expression. A nonfallible
+function must handle each fallible operation with `catch`. This is checked at compile
+time; a failure is never silently discarded. Ignoring a successful non-`unit` value
+still requires `discard(...)`.
+
+`expression catch failure:` protects its whole left expression, including nested
+arguments, receivers and conversions. The nearest handler runs first. Failures in
+its handler body go outward, to an enclosing handled operand or the declared fallible
+function. A handler must `recover value`, return, fail, trap, or leave an enclosing
+loop; a `unit` handler may fall through. `error(code, message)` raises an error to the
+same destination and cannot be caught by the handler that is currently executing it.
+
+An optional `try` marker may cover a whole expression, with the same checked behavior.
+A leading marker includes binary operations, conditional branches and optional fallback,
+stopping before an attached `catch`. In an operator operand it has unary precedence;
+use parentheses to mark a larger operand. It must cover a fallible operation.
+
+Arguments run once, left to right in source order, including named arguments.
+Short-circuit operators, optional fallback, conditional branches and match guards keep
+their usual laziness. Partial owned values are released before their handler starts.
+Propagation does not roll back mutations that already happened. A lambda or callback
+starts a fresh failure context: its declared or expected function type controls what
+its body may propagate, independently of the scope that created it. `spawn` evaluates
+arguments here; the worker's failure is observed by `wait`.
+
+`T!` is not a storable type: locals, fields, parameters and container elements use
+`Result[T]` when they need to retain an outcome.
 
 `Result[T]` is an ordinary owned enum, available in every module, with cases
 `.success(value: T)` and `.failure(reason: Error)`. `Result[T].capture(operation)`
@@ -709,7 +732,7 @@ invokes a `func() -> T!` once and returns its success or retained error; creatin
 the callback does not execute it. Use a closure to supply arguments:
 
 ```luce
-let pending = Result[Config].capture(() => try parse(text))
+let pending = Result[Config].capture(() => parse(text))
 match pending:
     .success(config): use_config(config)
     .failure(failure): print(failure.message)

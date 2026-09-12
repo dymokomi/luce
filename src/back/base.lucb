@@ -122,6 +122,12 @@ pub struct Emitter:
     ## Whether the function being written can fail, so that a drain on the failing path
     ## (`errdefer`) is possible and needed.
     var fallible: bool
+    ## A protected operand stores an owned error and leaves its evaluation scope.
+    var failure_label: str = ""
+    var failure_name: str = ""
+    ## A source recovery assigns its handler's value and leaves that region.
+    var recover_label: str = ""
+    var recover_name: str = ""
     ## Inside a match statement, where a bound payload is copied at the arm's start and
     ## the pattern writes its raw name; a match expression borrows the payload as is.
     var raw_payloads: bool
@@ -166,7 +172,8 @@ pub struct Emitter:
     mutating func begin(text: str) -> !:
         try self.writer().begin(text)
 
-    mutating func end() -> !:
+    mutating func end(text: str = "") -> !:
+        try self.writer().put(text)
         try self.writer().end()
 
     func fail(node: ast.Node*, what: str) -> never!:
@@ -217,6 +224,249 @@ pub struct Emitter:
         self.hoisted_nodes.count = self.hoisted_floor
         self.hoisted_names.count = self.hoisted_floor
         self.pooled = pooled_before
+
+    ## Synthetic handler loops must not intercept source `break` or `continue`.
+    mutating func loop_name(loop: ast.Node*) -> str!:
+        if loop.text.length > 0:
+            return loop.text
+        let half = self.checker.scratch.length // 2
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_loop_{loop.module}_{loop.start}"))
+
+    ## Operand preludes remain in this scope. A defer drains partial values on
+    ## success, failure and loop exits; the destination receives its own value.
+    mutating func scoped_value(e: ast.Node*, destination: str) -> !:
+        let start = self.out.used
+        let saved_prelude = self.prelude_floor
+        let saved_hoisted = self.hoisted_floor
+        let first = self.prelude.used
+        let nodes = self.hoisted_nodes.count
+        let pooled_before = self.pooled
+        self.prelude_floor = first
+        self.hoisted_floor = nodes
+        self.pooled = false
+        try self.begin("")
+        if e.type_id != types.unit_id and e.type_id != types.never_id:
+            try self.put(destination)
+            try self.put(" = ")
+        elif e.type_id == types.unit_id:
+            try self.put("discard(")
+        try self.owned(e)
+        if e.type_id == types.unit_id:
+            try self.put(")")
+        try self.end()
+        let text = try self.capture(start)
+        if self.pooled:
+            let mark = try self.temp("scope")
+            try self.begin("let ")
+            try self.put(mark)
+            try self.end(" = heap.mark()")
+            try self.begin("defer heap.drain(")
+            try self.put(mark)
+            try self.end(")")
+        if self.prelude.used > first:
+            try self.put((str)self.prelude.bytes()[first..])
+            self.prelude.used = first
+        try self.put(text)
+        self.hoisted_nodes.count = nodes
+        self.hoisted_names.count = nodes
+        self.prelude_floor = saved_prelude
+        self.hoisted_floor = saved_hoisted
+        self.pooled = pooled_before
+
+    ## Own an error before leaving its operand scope: draining temporaries must
+    ## not invalidate its message. With no local destination, forward it normally.
+    mutating func propagate(e: ast.Node*) -> !:
+        let inner = e.left else return
+        try self.put("(")
+        if self.failure_label.length == 0:
+            try self.put("try ")
+            try self.expr(inner)
+            try self.put(")")
+            return
+        try self.expr(inner)
+        let raw = try self.temp("raw_failure")
+        try self.put(" catch ")
+        try self.put(raw)
+        try self.end(":")
+        self.indent += 1
+        try self.begin(self.failure_name)
+        try self.put(" = kernel.catch_failure(")
+        try self.put(raw)
+        try self.put(".code, ")
+        try self.put(raw)
+        try self.end(".message)")
+        try self.begin("break ")
+        try self.put(self.failure_label)
+        try self.end()
+        self.indent -= 1
+        try self.begin(")")
+
+    ## A catch evaluates its operand in a separate lexical region. Failure ends
+    ## that region before the handler starts; the handler uses the outer edge.
+    mutating func handled_expression(e: ast.Node*) -> !:
+        let operand = e.left else return
+        let body = e.body else return
+        let result = try self.temp("handled")
+        let done = try self.temp("handler_done")
+        let failed = try self.temp("handler_error")
+        let evaluating = try self.temp("operand_done")
+        let start = self.out.used
+        let has_value = e.type_id != types.unit_id and e.type_id != types.never_id
+        if has_value:
+            try self.begin("var ")
+            try self.put(result)
+            try self.put(": ")
+            try self.type_of(e.type_id)
+            try self.end(" = ---")
+        try self.begin(done)
+        try self.end(": while true:")
+        self.indent += 1
+        try self.begin("var ")
+        try self.put(failed)
+        try self.end(": kernel.Failure? = none")
+        try self.begin(evaluating)
+        try self.end(": while true:")
+        self.indent += 1
+        let saved_failure_label = self.failure_label
+        let saved_failure_name = self.failure_name
+        self.failure_label = evaluating
+        self.failure_name = failed
+        try self.scoped_value(operand, result)
+        self.failure_label = saved_failure_label
+        self.failure_name = saved_failure_name
+        if operand.type_id != types.never_id:
+            try self.begin("break ")
+            try self.put(done)
+            try self.end()
+        self.indent -= 1
+        let caught = try self.temp("caught") if e.text.length == 0 else try emission.copy_text(try format(self.checker.scratch[self.checker.scratch.length // 2..], f"L_{e.text}"))
+        try self.begin("let ")
+        try self.put(caught)
+        try self.put(" = ")
+        try self.put(failed)
+        try self.end(" else trap(\"missing handled failure\")")
+        try self.begin("defer kernel.drop_failure(")
+        try self.put(caught)
+        try self.end(")")
+        let saved_recover_label = self.recover_label
+        let saved_recover_name = self.recover_name
+        self.recover_label = done
+        self.recover_name = result if has_value else ""
+        try self.block(body)
+        self.recover_label = saved_recover_label
+        self.recover_name = saved_recover_name
+        if e.type_id == types.unit_id and not self.exits(body):
+            try self.begin("break ")
+            try self.put(done)
+            try self.end()
+        self.indent -= 1
+        try self.finish_region(start, result, e.type_id)
+
+    ## Register a region's owned result before any later operand runs. Its reader
+    ## receives a copy; the statement drains the region's original on every exit.
+    mutating func finish_region(start: usize, result: str, t: u32) -> !:
+        let refs = self.checker.table.has_references(t)
+        if refs:
+            try self.begin(result)
+            try self.put(" = ")
+            try self.put(try self.lifetime_name("L_pool_", t))
+            try self.put("(")
+            try self.put(result)
+            try self.end(")")
+        let text = try self.capture(start)
+        try self.prelude.put(text)
+        self.pooled = true
+        if refs:
+            try self.put(try self.lifetime_name("L_copy_", t))
+            try self.put("(")
+        if t == types.unit_id:
+            try self.put("discard(0)")
+        elif t == types.never_id:
+            try self.put("trap(\"unreachable expression result\")")
+        else:
+            try self.put(result)
+        if refs:
+            try self.put(")")
+
+    mutating func region_variable(name: str, t: u32) -> !:
+        if t == types.unit_id or t == types.never_id:
+            return
+        try self.begin("var ")
+        try self.put(name)
+        try self.put(": ")
+        try self.type_of(t)
+        try self.end(" = ---")
+
+    ## Branch-local preludes must run only after that branch is selected. Keeping
+    ## them in ordinary Base scopes also gives their temporary owners exact exits.
+    mutating func lazy_expression(e: ast.Node*) -> !:
+        let left = e.left else return
+        let right = e.right else return
+        let result = try self.temp("selected")
+        let start = self.out.used
+        try self.region_variable(result, e.type_id)
+        try self.line("if true:")
+        self.indent += 1
+        if e.kind == ast.Kind.binary:
+            try self.scoped_value(left, result)
+            try self.begin("if " if e.text == "and" else "if not ")
+            try self.put(result)
+            try self.end(":")
+            self.indent += 1
+            try self.scoped_value(right, result)
+            self.indent -= 1
+        elif e.kind == ast.Kind.conditional:
+            let condition = e.ty else return
+            let choice = try self.temp("choice")
+            try self.region_variable(choice, types.bool_id)
+            try self.scoped_value(condition, choice)
+            try self.begin("if ")
+            try self.put(choice)
+            try self.end(":")
+            self.indent += 1
+            try self.scoped_value(left, result)
+            self.indent -= 1
+            try self.line("else:")
+            self.indent += 1
+            try self.scoped_value(right, result)
+            self.indent -= 1
+        else:
+            let optional = try self.temp("optional")
+            let present = try self.temp("present")
+            try self.region_variable(optional, left.type_id)
+            try self.scoped_value(left, optional)
+            let refs = self.checker.table.has_references(e.type_id)
+            if refs:
+                try self.begin("defer ")
+                try self.put(try self.lifetime_name("L_drop_", left.type_id))
+                try self.put("(")
+                try self.put(optional)
+                try self.end(")")
+            try self.begin("if let ")
+            try self.put(present)
+            try self.put(" = ")
+            try self.put(optional)
+            try self.end(":")
+            self.indent += 1
+            try self.begin(result)
+            try self.put(" = ")
+            if refs:
+                try self.put(try self.lifetime_name("L_copy_", e.type_id))
+                try self.put("(")
+            try self.put(present)
+            if refs:
+                try self.put(")")
+            try self.end()
+            self.indent -= 1
+            try self.line("else:")
+            self.indent += 1
+            if right.kind == ast.Kind.return_ or right.kind == ast.Kind.break_ or right.kind == ast.Kind.continue_:
+                try self.statement(right)
+            else:
+                try self.scoped_value(right, result)
+            self.indent -= 1
+        self.indent -= 1
+        try self.finish_region(start, result, e.type_id)
 
     ## Whether every path through the statement leaves the function, as the checker
     ## decided (§7.1): a `return`, a call that never returns, a `match` whose arms all do
@@ -2505,14 +2755,17 @@ pub struct Emitter:
             .return_: try self.return_statement(s)
             .break_, .continue_:
                 try self.begin("break" if s.kind == ast.Kind.break_ else "continue")
-                if s.text.length > 0:
+                if let loop = s.resolved:
                     try self.put(" ")
-                    try self.put(s.text)
+                    try self.put(try self.loop_name(loop))
                 try self.end()
             .recover_:
                 let v = s.left else return
-                try self.begin("recover ")
-                try self.owned(v)
+                if self.recover_label.length == 0:
+                    return try self.fail(s, "a checked recovery has no handler")
+                try self.scoped_value(v, self.recover_name)
+                try self.begin("break ")
+                try self.put(self.recover_label)
                 try self.end()
             .expr_stmt:
                 let e = s.left else return
@@ -2913,10 +3166,8 @@ pub struct Emitter:
         let body = s.body else return
         # the condition is evaluated inside the loop, so it is written there
         try self.begin("")
-        if s.text.length > 0:
-            try self.put(s.text)
-            try self.put(": ")
-        try self.put("while true:")
+        try self.put(try self.loop_name(s))
+        try self.put(": while true:")
         try self.end()
         self.indent += 1
         let value = try self.hoisted_condition(s)
@@ -2979,7 +3230,7 @@ pub struct Emitter:
         let seq = s.right else return
         let body = s.body else return
         let st = self.checker.table.get(seq.type_id)
-        let label = s.text
+        let label = try self.loop_name(s)
         if let iterator_method = s.resolved:
             # `Iterable` (§13.3): the iterator is a temporary of the statement; each element
             # is owned by its pass
@@ -3297,24 +3548,38 @@ pub struct Emitter:
 
     # -- match ----------------------------------------------------------------------------
 
-    mutating func match_statement(s: ast.Node*) -> !:
+    mutating func match_statement(s: ast.Node*, destination: str = "") -> !:
         let subject = s.left else return
         let st = self.checker.table.get(subject.type_id)
         let m = try self.temp("subject")
-        try self.begin("let ")
-        try self.put(m)
-        try self.put(" = ")
-        try self.use(subject)
-        try self.end()
+        try self.region_variable(m, subject.type_id)
+        try self.scoped_value(subject, m)
+        if self.checker.table.has_references(subject.type_id):
+            try self.begin(m)
+            try self.put(" = ")
+            try self.put(try self.lifetime_name("L_pool_", subject.type_id))
+            try self.put("(")
+            try self.put(m)
+            try self.end(")")
+            self.pooled = true
         if st.kind == types.Kind.tuple or st.kind == types.Kind.str_ or st.kind == types.Kind.bytes_:
-            return try self.match_by_tests(s, m, subject.type_id)
-        try self.begin("match ")
-        try self.put(m)
-        try self.put(":")
-        try self.end()
-        self.indent += 1
+            return try self.match_by_tests(s, m, subject.type_id, destination)
+        # Match one arm at a time so a guard's owned operands are evaluated only
+        # after its pattern binds, and a false guard proceeds to the next arm.
+        let done = try self.temp("matched")
+        try self.begin("var ")
+        try self.put(done)
+        try self.line(" = false")
         var cursor = s.body
         while let arm = cursor:
+            try self.begin("if not ")
+            try self.put(done)
+            try self.end(":")
+            self.indent += 1
+            try self.begin("match ")
+            try self.put(m)
+            try self.end(":")
+            self.indent += 1
             try self.begin("")
             var p = arm.left
             var first = true
@@ -3327,37 +3592,62 @@ pub struct Emitter:
                 try self.pattern(pattern, st, m, &bound)
                 p = pattern.next
             self.raw_payloads = false
-            if let guard = arm.right:
-                try self.put(" if ")
-                try self.expr(guard)
-            try self.put(":")
-            try self.end()
+            try self.end(":")
             self.indent += 1
             if let name = bound:
                 try self.begin("let L_")
                 try self.put(name.text)
                 try self.put(" = ")
-                if self.checker.table.has_references(name.type_id):
+                let refs = self.checker.table.has_references(name.type_id)
+                if refs:
                     try self.put(try self.lifetime_name("L_copy_", name.type_id))
                     try self.put("(")
-                    try self.put(m)
+                try self.put(m)
+                if refs:
                     try self.put(")")
-                else:
-                    try self.put(m)
                 try self.end()
                 try self.drop_at_exit(name.text, name.type_id)
-            # a payload bound by the arm is the subject's; the binding takes its own copy
             var q = arm.left
             while let pattern = q:
                 try self.own_payloads(pattern, st)
                 q = pattern.next
-            let body = arm.body else return
-            try self.block(body)
+            try self.match_arm(arm, done, destination)
             self.indent -= 1
+            # An optional name pattern binds only the present payload.
+            let first_pattern = arm.left else return
+            if not irrefutable(arm.left) or (st.kind == types.Kind.optional and not first_pattern.has(ast.flag_wildcard)):
+                try self.line("_: discard(0)")
+            self.indent -= 2
             cursor = arm.next
-        if st.kind != types.Kind.enum_ and st.kind != types.Kind.optional and st.kind != types.Kind.bool_ and not has_wildcard_arm(s):
-            try self.line("_: discard(0)")
-        self.indent -= 1
+        try self.match_unhandled(s, done, destination)
+
+    mutating func match_arm(arm: ast.Node*, done: str, destination: str) -> !:
+        if let guard = arm.right:
+            let condition = try self.temp("guard")
+            try self.region_variable(condition, types.bool_id)
+            try self.scoped_value(guard, condition)
+            try self.begin("if ")
+            try self.put(condition)
+            try self.end(":")
+            self.indent += 1
+        try self.begin(done)
+        try self.end(" = true")
+        let body = arm.body else return
+        if destination.length > 0:
+            try self.scoped_value(body, destination)
+        else:
+            try self.block(body)
+        if arm.right != none:
+            self.indent -= 1
+
+    mutating func match_unhandled(s: ast.Node*, done: str, destination: str) -> !:
+        if s.has(ast.flag_all_exit):
+            try self.line("trap(\"no arm of the match applied\")")
+        elif destination.length > 0:
+            try self.begin("if not ")
+            try self.put(done)
+            try self.end(":")
+            try self.line("    trap(\"no arm of the match applied\")")
 
     ## `let L_x = L_copy(L_x__r)` and its drop for every payload name the pattern bound
     ## whose type holds references; `pattern` wrote the raw name.
@@ -3444,53 +3734,6 @@ pub struct Emitter:
             return
         try self.expr(v)
 
-    ## A match expression over a tuple or bytes: `match true:` with one guarded arm per
-    ## pattern, the tests over the subject as written, which must be stable (a name, a
-    ## literal, a tuple of those), since every arm reads it again; a pattern binding a
-    ## name needs the statement form.
-    mutating func match_expr_by_tests(e: ast.Node*, subject: ast.Node*, st: types.Type) -> !:
-        if not self.stable(subject):
-            return try self.fail(subject, "a match expression over a tuple or bytes reads its subject in every arm; bind it to a name first, or use the statement form")
-        let start = self.out.used
-        try self.expr(subject)
-        let m = try self.capture(start)
-        try self.put("match true:")
-        try self.end()
-        self.indent += 1
-        var cursor = e.body
-        while let arm = cursor:
-            var p = arm.left
-            while let pattern = p:
-                if binds_a_name(pattern):
-                    return try self.fail(pattern, "a pattern binding a name in a match expression over a tuple needs the statement form")
-                p = pattern.next
-            try self.begin("_")
-            if not (arm.right == none and irrefutable(arm.left)):
-                try self.put(" if ")
-                var q = arm.left
-                var first = true
-                while let pattern = q:
-                    if not first:
-                        try self.put(" or ")
-                    first = false
-                    try self.put("(")
-                    try self.tuple_test(pattern, m, subject.type_id)
-                    try self.put(")")
-                    q = pattern.next
-                if let guard = arm.right:
-                    try self.put(" and (")
-                    try self.use(guard)
-                    try self.put(")")
-            try self.put(" => ")
-            let body = arm.body else return
-            try self.owned(body)
-            try self.end()
-            cursor = arm.next
-        if not has_wildcard_arm(e):
-            try self.line("_ => trap(\"no arm applied\")")
-        self.indent -= 1
-        try self.begin("")
-
     ## The value a capture takes: `self` from the method, otherwise the binding's value.
     mutating func captured_source(d: ast.Node*, name: str) -> !:
         if name == "self":
@@ -3519,7 +3762,7 @@ pub struct Emitter:
     ## A match over a tuple: one `if` per arm over member tests, a flag saying an arm
     ## applied so a failed guard falls through to the next, and a trap after the chain when
     ## every arm leaves the function, so Base sees the return the checker proved.
-    mutating func match_by_tests(s: ast.Node*, m: str, st: u32) -> !:
+    mutating func match_by_tests(s: ast.Node*, m: str, st: u32, destination: str) -> !:
         let done = try self.temp("matched")
         try self.begin("var ")
         try self.put(done)
@@ -3547,24 +3790,10 @@ pub struct Emitter:
             self.indent += 1
             if let pattern = arm.left:
                 try self.tuple_bindings(pattern, m)
-            if let guard = arm.right:
-                try self.begin("if ")
-                try self.expr(guard)
-                try self.put(":")
-                try self.end()
-                self.indent += 1
-            try self.begin("")
-            try self.put(done)
-            try self.put(" = true")
-            try self.end()
-            let body = arm.body else return
-            try self.block(body)
-            if arm.right != none:
-                self.indent -= 1
+            try self.match_arm(arm, done, destination)
             self.indent -= 1
             cursor = arm.next
-        if s.has(ast.flag_all_exit):
-            try self.line("trap(\"no arm of the match applied\")")
+        try self.match_unhandled(s, done, destination)
 
     mutating func tuple_test(p: ast.Node*, m: str, t: u32) -> !:
         if p.has(ast.flag_wildcard) or p.text == "bind":
@@ -3681,6 +3910,9 @@ pub struct Emitter:
     ## (RUNTIME 5). The name to write at the site: a copy of the temporary for an owned
     ## reference, the temporary itself otherwise.
     mutating func hoist(e: ast.Node*, owned: bool) -> str!:
+        # `none` is immutable and needs the consuming expression's optional type.
+        if is_none(e):
+            return "none"
         if let already = self.hoisted_name(e):
             if owned and self.checker.table.has_references(e.type_id):
                 let half = self.checker.scratch.length // 2
@@ -3730,7 +3962,7 @@ pub struct Emitter:
     ## Preserve an operand across later argument evaluation. A later callback can
     ## replace a captured binding, so a pointer snapshot must also own its value.
     mutating func hold_operand(e: ast.Node*) -> !:
-        if self.hoisted_name(e) != none:
+        if is_none(e) or self.hoisted_name(e) != none:
             return
         if not self.checker.table.has_references(e.type_id):
             discard(try self.hoist(e, false))
@@ -3766,7 +3998,7 @@ pub struct Emitter:
     ## Whether `try` appears anywhere in the expression: evaluating it may fail.
     func may_fail(n: ast.Node*?) -> bool:
         let node = n else return false
-        if node.kind == ast.Kind.unary and node.text == "try":
+        if node.kind == ast.Kind.propagate or (node.kind == ast.Kind.unary and node.text == "try"):
             return true
         if node.kind == ast.Kind.lambda:
             return false
@@ -3777,7 +4009,7 @@ pub struct Emitter:
         var risky = false
         var cursor = items
         while let item = cursor:
-            if self.may_fail(item):
+            if self.may_fail(item) or self.has_call(item):
                 risky = true
             cursor = item.next
         var names = try list.List[str].create(8)
@@ -3861,18 +4093,10 @@ pub struct Emitter:
             .spawn_:
                 # a task object of this spawn's own shape, given the arguments (§14)
                 let call = e.left else return
+                let function = call.resolved else return
+                try self.sequence_arguments(call.body)
                 try self.put(try self.spawn_name(e))
-                try self.put("(")
-                var first = true
-                var a = call.body
-                while let arg = a:
-                    if not first:
-                        try self.put(", ")
-                    first = false
-                    let v = arg.left else return
-                    try self.owned(v)
-                    a = arg.next
-                try self.put(")")
+                try self.arguments(call, function.right, false, true)
             .wait_:
                 let inner = e.left else return
                 try self.put(try self.wait_name(inner.type_id))
@@ -3895,6 +4119,7 @@ pub struct Emitter:
                 try self.put("(")
                 try self.owned(inner)
                 try self.put(")")
+            .propagate: try self.propagate(e)
             .unary:
                 let inner = e.left else return
                 if e.text == "try":
@@ -3908,17 +4133,7 @@ pub struct Emitter:
                     try self.expr(inner)
                     try self.put(")")
             .binary: try self.binary(e)
-            .conditional:
-                let cond = e.ty else return
-                let l = e.left else return
-                let r = e.right else return
-                try self.put("(")
-                try self.owned(l)
-                try self.put(" if ")
-                try self.use(cond)
-                try self.put(" else ")
-                try self.owned(r)
-                try self.put(")")
+            .conditional: try self.lazy_expression(e)
             .tuple:
                 try self.put("(")
                 try self.owned_items(e.body)
@@ -4047,6 +4262,9 @@ pub struct Emitter:
             .index:
                 let receiver = e.left else return
                 let index = e.body else return
+                if self.has_call(receiver) or self.has_call(index) or self.may_fail(receiver) or self.may_fail(index):
+                    try self.hold_operand(receiver)
+                    try self.hold_operand(index)
                 let rt = self.checker.table.get(receiver.type_id)
                 if rt.kind == types.Kind.bytes_:
                     try self.put("kernel.byte_at(")
@@ -4074,6 +4292,12 @@ pub struct Emitter:
                     return try self.fail(e, "indexing this compiles in the collections slice")
             .slice:
                 let receiver = e.left else return
+                if self.has_call(receiver) or self.has_call(e.body) or self.has_call(e.right) or self.may_fail(e):
+                    try self.hold_operand(receiver)
+                    if let low = e.body:
+                        try self.hold_operand(low)
+                    if let high = e.right:
+                        try self.hold_operand(high)
                 let rt = self.checker.table.get(receiver.type_id)
                 if rt.kind == types.Kind.str_:
                     try self.put("kernel.slice_text(")
@@ -4097,52 +4321,8 @@ pub struct Emitter:
                 try self.put(", ")
                 try self.put("true" if e.has(ast.flag_no_high) else "false")
                 try self.put(")")
-            .else_:
-                let l = e.left else return
-                let r = e.right else return
-                try self.put("(")
-                try self.owned(l)
-                try self.put(" else ")
-                if r.kind == ast.Kind.return_:
-                    try self.put("return")
-                    if let v = r.left:
-                        try self.put(" ")
-                        try self.owned(v)
-                elif r.kind == ast.Kind.break_ or r.kind == ast.Kind.continue_:
-                    try self.put("break" if r.kind == ast.Kind.break_ else "continue")
-                    if r.text.length > 0:
-                        try self.put(" ")
-                        try self.put(r.text)
-                else:
-                    try self.owned(r)
-                try self.put(")")
-            .catch_:
-                let l = e.left else return
-                let body = e.body else return
-                try self.owned(l)
-                let raw = try self.temp("failure")
-                let caught = try self.temp("caught") if e.text.length == 0 else try emission.copy_text(try format(self.checker.scratch[self.checker.scratch.length // 2..], f"L_{e.text}"))
-                try self.put(" catch ")
-                try self.put(raw)
-                try self.put(":")
-                try self.end()
-                self.indent += 1
-                try self.begin("let ")
-                try self.put(caught)
-                try self.put(" = kernel.catch_failure(")
-                try self.put(raw)
-                try self.put(".code, ")
-                try self.put(raw)
-                try self.put(".message)")
-                try self.end()
-                try self.begin("defer kernel.drop_failure(")
-                try self.put(caught)
-                try self.put(")")
-                try self.end()
-                try self.block(body)
-                self.indent -= 1
-                # the caller's line is already ended by the suite
-                try self.begin("")
+            .else_: try self.lazy_expression(e)
+            .catch_: try self.handled_expression(e)
             .case_value: try self.case_value(e, e.body)
             .formatted: try self.formatted(e)
             .match_expr: try self.match_expr(e)
@@ -4208,14 +4388,11 @@ pub struct Emitter:
         let r = e.right else return
         let op = e.text
         if op == "and" or op == "or":
-            try self.put("(")
-            try self.expr(l)
-            try self.put(" ")
-            try self.put(op)
-            try self.put(" ")
-            try self.expr(r)
-            try self.put(")")
+            try self.lazy_expression(e)
             return
+        if self.has_call(l) or self.has_call(r) or self.may_fail(l) or self.may_fail(r):
+            try self.hold_operand(l)
+            try self.hold_operand(r)
         if op == "..<" or op == "..=":
             try self.put("kernel.range(")
             try self.expr(l)
@@ -4552,9 +4729,45 @@ pub struct Emitter:
             return
         return try self.fail(e, "a member this slice does not compile")
 
+    ## A later call can change an earlier read, and can create branch-local
+    ## preludes. Freeze the eager arguments before parameter-order emission.
+    func arguments_call(args: ast.Node*?) -> bool:
+        var cursor = args
+        while let arg = cursor:
+            if self.has_call(arg.left) or self.may_fail(arg.left):
+                return true
+            cursor = arg.next
+        return false
+
+    mutating func sequence_arguments(args: ast.Node*?) -> !:
+        if not self.arguments_call(args):
+            return
+        var cursor = args
+        while let arg = cursor:
+            let value = arg.left else return
+            try self.hold_operand(value)
+            cursor = arg.next
+
+    ## A struct method borrows a location. Keep its owner/indices stable without
+    ## replacing that location with a value copy before a mutating call.
+    mutating func pin_place(place: ast.Node*) -> !:
+        if place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.struct_:
+                try self.pin_place(receiver)
+            else:
+                try self.hold_operand(receiver)
+        elif place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            try self.hold_operand(receiver)
+            try self.hold_operand(index)
+
     mutating func call(e: ast.Node*) -> !:
         let callee = e.left else return
         if callee.kind == ast.Kind.name and callee.resolved == none and self.checker.find_declaration(callee.text) == none:
+            if callee.text != "print" and callee.text != "assert":
+                try self.sequence_arguments(e.body)
             try self.core_call(e, callee.text)
             return
         if callee.kind == ast.Kind.member and callee.text == "package":
@@ -4565,8 +4778,20 @@ pub struct Emitter:
             try self.put(")")
             return
         if callee.kind == ast.Kind.case_value:
+            try self.sequence_arguments(e.body)
             try self.case_value(callee, e.body)
             return
+        if self.arguments_call(e.body):
+            if self.checker.table.kind(callee.type_id) == types.Kind.func_ and e.resolved == none:
+                try self.hold_operand(callee)
+            elif callee.kind == ast.Kind.member:
+                let receiver = callee.left else return
+                let kind = self.checker.table.kind(receiver.type_id)
+                if kind == types.Kind.struct_:
+                    try self.pin_place(receiver)
+                elif kind != types.Kind.module and kind != types.Kind.type_name:
+                    try self.hold_operand(receiver)
+            try self.sequence_arguments(e.body)
         if callee.has(ast.flag_builtin):
             let k = self.checker.table.kind(callee.type_id)
             if k == types.Kind.map_ or k == types.Kind.set_:
@@ -4810,7 +5035,7 @@ pub struct Emitter:
         if own:
             var a = e.body
             while let arg = a:
-                if self.may_fail(arg.left):
+                if self.may_fail(arg.left) or self.has_call(arg.left):
                     hoisted = true
                 a = arg.next
         if hoisted:
@@ -4881,7 +5106,7 @@ pub struct Emitter:
             if n == 1:
                 let first = e.body else return
                 let v = first.left else return
-                try self.show(v)
+                try self.put(try self.shown_operand(v))
             else:
                 # the joined line is a fresh text of the statement's
                 try self.put(try self.lifetime_name("L_pool_", types.str_id))
@@ -4896,7 +5121,7 @@ pub struct Emitter:
                         try self.put(", ")
                     first = false
                     let v = a.left else return
-                    try self.show(v)
+                    try self.put(try self.shown_operand(v))
                     cursor = a.next
                 if n == 0:
                     try self.put(try self.text_ref("", false))
@@ -4906,20 +5131,28 @@ pub struct Emitter:
         let first = e.body else return
         let arg = first.left else return
         if name == "assert":
-            # `if not c: trap("assert failed: m")`, the trap the interpreter reports
-            try self.put("if not (")
-            try self.use(arg)
-            try self.put("): trap(")
+            let start = self.out.used
+            let condition = try self.temp("asserted")
+            try self.region_variable(condition, types.bool_id)
+            try self.scoped_value(arg, condition)
+            try self.begin("if not ")
+            try self.put(condition)
+            try self.end(":")
+            self.indent += 1
             if let second = first.next:
-                let m = second.left else return
-                try self.put("kernel.concat(")
+                let message = second.left else return
+                let text = try self.temp("assert_message")
+                try self.region_variable(text, types.str_id)
+                try self.scoped_value(message, text)
+                try self.begin("trap(kernel.concat(")
                 try self.put(try self.text_ref("assert failed: ", false))
                 try self.put(", ")
-                try self.use(m)
-                try self.put(").data")
+                try self.put(text)
+                try self.end(").data)")
             else:
-                try self.put("\"assert failed\"")
-            try self.put(")")
+                try self.line("trap(\"assert failed\")")
+            self.indent -= 1
+            try self.finish_region(start, "", types.unit_id)
             return
         if name == "trap":
             try self.put("trap((")
@@ -4930,11 +5163,11 @@ pub struct Emitter:
             # Hold the text through Base propagation; the catching Luce value takes ownership.
             let second = first.next else return
             let m = second.left else return
-            try self.put("error(")
+            try self.put("kernel.fail(")
             try self.use(arg)
-            try self.put(", kernel.message_of(")
+            try self.put(", ")
             try self.use(m)
-            try self.put("))")
+            try self.put(")")
             return
         if name == "discard":
             try self.put("discard(")
@@ -4974,18 +5207,25 @@ pub struct Emitter:
             return
         return try self.fail(e, "a core call this slice does not compile")
 
-    ## The display of a value as a piece of a line or a formatted text: a fresh text pooled
-    ## until the statement ends, or the value itself when it is one.
-    mutating func show(v: ast.Node*) -> !:
-        let t = v.type_id
-        if t == types.str_id:
-            try self.use(v)
-            return
-        try self.put(try self.lifetime_name("L_pool_", types.str_id))
-        try self.put("(")
-        try self.shown_value(v)
-        try self.put(")")
+    ## Evaluate and render a field before the next field can mutate its source.
+    mutating func shown_operand(value: ast.Node*) -> str!:
+        let name = try self.temp("shown")
+        let start = self.out.used
+        try self.shown_value(value)
+        let text = try self.capture(start)
+        var i: u32 = 0
+        while i < self.indent:
+            try self.prelude.put("    ")
+            i += 1
+        try self.prelude.put("let ")
+        try self.prelude.put(name)
+        try self.prelude.put(" = ")
+        try self.prelude.put(try self.lifetime_name("L_pool_", types.str_id))
+        try self.prelude.put("(")
+        try self.prelude.put(text)
+        try self.prelude.put(")\n")
         self.pooled = true
+        return name
 
     ## The display of a value as an owned text: `str(x)`.
     mutating func shown_value(v: ast.Node*) -> !:
@@ -6742,53 +6982,21 @@ pub struct Emitter:
                 try self.put(try self.text_ref(try unescape_format(part.text), false))
             else:
                 let v = part.left else return
-                try self.show(v)
+                try self.put(try self.shown_operand(v))
             cursor = part.next
         if first:
             try self.put(try self.text_ref("", false))
         try self.put("])")
 
     mutating func match_expr(e: ast.Node*) -> !:
-        let subject = e.left else return
-        let st = self.checker.table.get(subject.type_id)
-        if st.kind == types.Kind.tuple or st.kind == types.Kind.bytes_:
-            try self.match_expr_by_tests(e, subject, st)
-            return
-        try self.put("match ")
-        try self.use(subject)
-        if st.kind == types.Kind.str_:
-            # Base matches a text's bytes against its literals
-            try self.put(".data")
-        try self.put(":")
-        try self.end()
+        let result = try self.temp("match_value")
+        let start = self.out.used
+        try self.region_variable(result, e.type_id)
+        try self.line("if true:")
         self.indent += 1
-        var cursor = e.body
-        var bound_any = false
-        while let arm = cursor:
-            try self.begin("")
-            var p = arm.left
-            var first = true
-            var bound: ast.Node*? = none
-            while let pattern = p:
-                if not first:
-                    try self.put(", ")
-                first = false
-                try self.pattern(pattern, st, "", &bound)
-                p = pattern.next
-            if bound != none:
-                return try self.fail(arm, "a name pattern in a match expression compiles in a later slice; use the statement form")
-            if let guard = arm.right:
-                try self.put(" if ")
-                try self.expr(guard)
-            try self.put(" => ")
-            let body = arm.body else return
-            try self.owned(body)
-            try self.end()
-            cursor = arm.next
-        if st.kind != types.Kind.enum_ and st.kind != types.Kind.optional and st.kind != types.Kind.bool_ and not has_wildcard_arm(e):
-            try self.line("_ => trap(\"no arm applied\")")
+        try self.match_statement(e, result)
         self.indent -= 1
-        try self.begin("")
+        try self.finish_region(start, result, e.type_id)
 
 ## Whether the expression is the literal `none`.
 func is_none(e: ast.Node*) -> bool:

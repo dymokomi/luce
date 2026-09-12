@@ -131,10 +131,22 @@ assignment. A named function used as a value is an immortal closure holding noth
 method bound to a receiver is a closure holding the receiver. A closure is released like
 any object, and lets its captures go when it goes; the collector traces through them.
 
-When an operand of a construction, a collection literal or a map store sits beside another
-whose `try` may fail (or, in a map literal, beside a call), every operand is evaluated ahead
-of the statement into a temporary, in source order, and the taker gets a copy of it: a
-failure then drains what was made, and nothing is copied for a taker that never took it.
+The checker inserts explicit propagation nodes for every permitted fallible operation
+before ownership-sensitive emission. Source `try` markers are optional in declared
+fallible Luce functions; temporary cleanup does not depend on their presence.
+
+When an operand of a construction, collection literal or map store sits beside an
+operation that can fail, its owned value is held in source order before the taker
+receives a copy. A failure releases partially constructed operands, including nested
+containers and retained receivers.
+
+Handled operands and lazy branches lower into separate lexical regions. Their operand
+preludes stay inside those regions, and each region drains its temporary pool on every
+exit. A handler owns the error before the operand scope is unwound, then runs with the
+outer failure destination. Its successful result receives an independent owner before
+branch-local temporaries are drained. Explicit source loop targets keep generated
+handler control flow from intercepting `break` or `continue`. Base's native result ABI,
+allocation policy and trap behavior remain unchanged.
 
 ## Traps
 
