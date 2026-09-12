@@ -27,6 +27,7 @@ python3 tools/test_standard_json.py
 python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
+python3 tools/embed_prelude.py --check
 for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
     [ -e "$f" ] || continue
     echo "== check $f"

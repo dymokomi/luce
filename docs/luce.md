@@ -383,6 +383,13 @@ shared, and a `var` becomes one cell shared by the scope and every closure that 
 so a captured counter counts. Closures may be stored, returned and passed anywhere a function
 value is expected, and live as long as the last reference to them.
 
+A nonfallible function value converts to a function with identical parameters and
+a fallible result, `func(A) -> T` to `func(A) -> T!`. A retained adapter invokes the
+original callback and returns success; captured cells and receivers keep their
+normal lifetimes. The opposite conversion is rejected. Fallibility of a block
+lambda comes from its own written result; an expression lambda uses its expected
+function type.
+
 ## 8. Control flow
 
 ### 8.1 `if`, `elif`, `else`
@@ -689,10 +696,31 @@ let config3 = parse(text) catch failure:
     error(failure.code, f"cannot load: {failure.message}")
 ```
 
-`T!` holds a `T` or an `Error`. `try` unwraps in a function whose own result is `!`,
+`T!` is a fallible function result, yielding a `T` or an `Error`. It is not a
+storable type: locals, fields, parameters and container elements use `Result[T]`
+when they need to retain an outcome. `try` unwraps in a function whose own result is `!`,
 passing the failure up. `catch failure:` handles it in a suite that must end in `recover
 value`, `return`, or `error`. `error(code, message)` fails the current function, which must
-be `!`. A `T!` cannot be ignored: it is tried, caught, or bound to a `!` variable.
+be `!`. A fallible operation cannot be ignored: it is tried or caught.
+
+`Result[T]` is an ordinary owned enum, available in every module, with cases
+`.success(value: T)` and `.failure(reason: Error)`. `Result[T].capture(operation)`
+invokes a `func() -> T!` once and returns its success or retained error; creating
+the callback does not execute it. Use a closure to supply arguments:
+
+```luce
+let pending = Result[Config].capture(() => try parse(text))
+match pending:
+    .success(config): use_config(config)
+    .failure(failure): print(failure.message)
+```
+
+`pending.get()` returns `T!`, propagating the stored failure without consuming or
+changing `pending`. Copies and containers retain the active payload or error;
+dropping the last reference releases it. Error text survives the capture scope.
+Like any enum, a result can cross a worker boundary exactly when its payload can;
+the error and its text are copied to the worker. `Result[unit]` represents a stored
+operation without a value, and `Result[T?]` distinguishes absence from failure.
 
 ### 12.3 Errors
 

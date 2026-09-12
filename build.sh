@@ -8,6 +8,7 @@ cd "$(dirname "$0")"
 mkdir -p build
 python3 tools/embed_version.py > /dev/null
 python3 tools/embed_runtime.py > /dev/null
+python3 tools/embed_prelude.py
 if [ -n "${LUCE_BASE_COMPILER:-}" ]; then
     case "$LUCE_BASE_COMPILER" in
         /*) base=$LUCE_BASE_COMPILER ;;
