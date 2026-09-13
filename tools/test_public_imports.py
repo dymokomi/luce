@@ -18,7 +18,7 @@ def write(root, name, text):
     return path
 
 def run(*args, expected=0):
-    result = subprocess.run(list(map(str, args)), capture_output=True, text=True, timeout=120)
+    result = subprocess.run(list(map(str, args)), capture_output=True, text=True, encoding='utf-8', timeout=120)
     assert result.returncode == expected, result.stdout + result.stderr
     assert expected != 0 or not result.stderr, result.stderr
     return result

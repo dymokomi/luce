@@ -14,7 +14,7 @@ FLAGS = [['--native', '--opt', str(level)] for level in range(4)] + [
 
 def run(*arguments, expected=0):
     result = subprocess.run(list(map(str, arguments)), cwd=ROOT,
-                            capture_output=True, text=True, timeout=120)
+                            capture_output=True, text=True, encoding='utf-8', timeout=120)
     assert result.returncode == expected, result.stdout + result.stderr
     if expected == 0:
         assert not result.stderr, result.stderr
@@ -93,7 +93,7 @@ pub func main(arguments: list[str]) -> int!:
         assert(failure.code == api.invalid and failure.message == "negative first")
         return 0
     return 1
-'''.replace('FILE', str(entry)))
+'''.replace('FILE', str(entry).replace('\\', '\\\\')))
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'consumer')
         run(root / 'consumer')

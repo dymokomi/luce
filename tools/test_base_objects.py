@@ -15,7 +15,7 @@ FLAGS = [['--native', '--opt', str(level)] for level in range(4)] + [
 
 def run(*arguments, expected=0):
     result = subprocess.run(list(map(str, arguments)), cwd=ROOT,
-                            capture_output=True, text=True, timeout=120)
+                            capture_output=True, text=True, encoding='utf-8', timeout=120)
     assert result.returncode == expected, result.stdout + result.stderr
     if expected == 0:
         assert not result.stderr, result.stderr

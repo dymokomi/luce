@@ -14,9 +14,9 @@ with tempfile.TemporaryDirectory(prefix='luce-gpu-frames-') as temporary:
     binary = Path(temporary) / 'fixture'
     for flags in modes:
         subprocess.run([compiler, 'build', source, *flags, '-o', binary], check=True, timeout=120)
-        result = subprocess.run([binary], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([binary], capture_output=True, text=True, encoding='utf-8', timeout=15)
         assert result.returncode == 0 and result.stdout == 'ok scoped GPU frames\n' and not result.stderr, result
         if platform.system() == 'Darwin':
-            linked = subprocess.check_output(['otool', '-L', binary], text=True)
+            linked = subprocess.check_output(['otool', '-L', binary], text=True, encoding='utf-8')
             assert all(name not in linked for name in ('AppKit', 'Metal', 'QuartzCore', 'libobjc')), linked
 print('PASS standard GPU objects, retained bound methods and expiry from Luce; six modes')

@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='luce-json-') as temporary:
     binary = Path(temporary) / 'fixture'
     for flags in modes:
         subprocess.run([compiler, 'build', source, *flags, '-o', binary], check=True, timeout=120)
-        result = subprocess.run([binary], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([binary], capture_output=True, text=True, encoding='utf-8', timeout=15)
         assert result.returncode == 0 and not result.stderr, result
         assert json.loads(result.stdout) == {'message': 'Hello, café!\n', 'count': 42,
                                             'items': [True, None]}, result.stdout

@@ -38,3 +38,7 @@ uses the exact commit in `bootstrap/BASE`, fetched into an isolated checkout. Th
 Base commit SHA for the same purpose and records the checkout and explicit compiler
 selection in its provenance artifacts. Both compilers advance together; dependency
 pins make builds reproducible without requiring release tags.
+
+## Windows x64
+
+Build sibling `luce-base` and `luce` checkouts with `python tools/build_windows.py` in each compiler repository. Set `LUCE_BASE` to the absolute path of `luce-base/build/luce-base.exe` when using Luce, then run `python tools/test_windows.py` for interpreter, native opt 0–3 and C conformance.

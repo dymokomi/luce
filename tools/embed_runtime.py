@@ -18,13 +18,13 @@ lines.append(f"pub let names: str[{len(files)}] = [" + ", ".join(literal(f.name)
 lines.append(f"pub let sources: str[{len(files)}] = [")
 for i, f in enumerate(files):
     comma = "," if i + 1 < len(files) else ""
-    lines.append("    " + literal(f.read_text()) + comma)
+    lines.append("    " + literal(f.read_text(encoding="utf-8")) + comma)
 lines.append("]")
 text = "\n".join(lines) + "\n"
 if "--check" in sys.argv:
-    if not target.exists() or target.read_text() != text:
+    if not target.exists() or target.read_text(encoding="utf-8") != text:
         print("src/support/runtime.lucb is stale; run tools/embed_runtime.py")
         sys.exit(1)
     sys.exit(0)
-target.write_text(text)
+target.write_text(text, encoding="utf-8", newline="\n")
 print(f"wrote src/support/runtime.lucb ({len(files)} files)")
