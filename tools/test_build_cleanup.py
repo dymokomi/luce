@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cleanup-") as temporary:
     def clean():
         # Host tools may keep their own caches here (macOS xcrun_db). The Luce
         # workspace and every generated Base source must still be gone.
-        assert not list(scratch.glob("luce-build-*")), list(scratch.iterdir())
+        assert not list(scratch.glob(".luce-*")), list(scratch.iterdir())
         assert not list(scratch.rglob("*.lucb")), list(scratch.rglob("*.lucb"))
 
     source = work / "main.luc"

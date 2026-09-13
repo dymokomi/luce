@@ -18,10 +18,10 @@ with tempfile.TemporaryDirectory(prefix='luce-パス-😀-') as directory:
     source = root / 'src'
     source.mkdir()
     (root / 'luce.toml').write_text('[package]\nname = "unicode"\nsource = "src"\n', encoding='utf-8')
-    (source / 'helper.luc').write_text('pub func message() -> str:\n    return "日本語 😀"\n', encoding='utf-8', newline='\r\n')
+    (source / 'helper.luc').write_bytes(('pub func message() -> str:\n    return "日本語 😀"\n').replace('\n', '\r\n').encode('utf-8'))
     entry = source / 'main.luc'
-    entry.write_text('import helper\npub func main(arguments: list[str]) -> int!:\n'
-                     '    print(helper.message())\n    return 0\n', encoding='utf-8', newline='\r\n')
+    entry.write_bytes(('import helper\npub func main(arguments: list[str]) -> int!:\n'
+                     '    print(helper.message())\n    return 0\n').replace('\n', '\r\n').encode('utf-8'))
     environment = dict(os.environ, LUCE_BASE=str(args.base.resolve()), TEMP=str(scratch), TMP=str(scratch))
     for spelling in (str(entry), entry.as_posix()):
         for flags in (['--native'], ['--backend=c']):
