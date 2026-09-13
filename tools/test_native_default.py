@@ -14,12 +14,12 @@ with tempfile.TemporaryDirectory(prefix="luce-native-default-") as tmp:
     source.write_text('test "native default":\n    assert(6 * 7 == 42)\n\npub func main(arguments: list[str]) -> int!:\n    print(42)\n    return 0\n')
     guard = work / "cc"
     guard.write_text("#!/usr/bin/env python3\nimport os, sys\n"
-                     "if any(a.endswith('/gen.c') for a in sys.argv[1:]):\n"
+                     "if any(a.replace('\\\\', '/').split('/')[-1] == 'gen.c' for a in sys.argv[1:]):\n"
                      "    sys.stderr.write('generated C blocked by native-default test\\n')\n"
                      "    sys.exit(97)\n"
                      "os.execv(os.environ['LUCE_REAL_CC'], [os.environ['LUCE_REAL_CC'], *sys.argv[1:]])\n")
     guard.chmod(0o755)
-    env = dict(os.environ, LUCE_REAL_CC=shutil.which("cc"), PATH=f"{work}:{os.environ['PATH']}")
+    env = dict(os.environ, LUCE_REAL_CC=shutil.which("cc"), CC=str(guard), PATH=f"{work}:{os.environ['PATH']}")
 
     def run(*args, expected=0):
         result = subprocess.run([sys.executable, root / "tools/run_case.py", "--expected", str(expected), "--", *map(str, args)],
