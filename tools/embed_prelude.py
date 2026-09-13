@@ -16,4 +16,4 @@ if args.check:
     if not target.exists() or target.read_text(encoding="utf-8") != text:
         raise SystemExit("embedded prelude is stale; run tools/embed_prelude.py")
 else:
-    target.write_text(text, encoding="utf-8", newline="\n")
+    target.write_bytes((text).encode("utf-8"))
