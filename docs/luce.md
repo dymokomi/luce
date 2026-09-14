@@ -1024,8 +1024,9 @@ lease and reject access after expiry.
 | `func(A) -> R` of scalars, `str` and `bytes` answering a scalar or nothing | `func(A) -> R` | a named function, never a closure; Base calls a thunk that copies the texts for the call |
 | handle | `pub handle` | as an object (§16.4) |
 
-Nothing else crosses in either direction. A `usize` in Base is an `int` in Luce and a
-negative or oversized value traps at the crossing. A Base enum value that names no
+Nothing else crosses in either direction. A `usize`, `u32`, or `u64` in Base is an `int` in
+Luce, and a negative or oversized value traps at the crossing; a list of them is copied
+into a converted array for the call. A Base enum value that names no
 declared case traps as it crosses.
 
 Public handles retain their declaring module's identity when another Base module
