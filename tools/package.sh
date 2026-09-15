@@ -1,0 +1,55 @@
+#!/bin/sh
+# Package the built compiler for this host: `tools/package.sh [OUT_DIR]`, OUT_DIR defaulting
+# to build/release. The archive is `luce-VERSION-HOST.tar.gz` with a SHA-256 beside it,
+# holding one tree, `luce-VERSION/`:
+#
+#   bin/luce                          the compiler (luce.exe on Windows)
+#   bin/luce-base                     the Base compiler it emits to, from bootstrap/BASE
+#   lib/luce-base/HOST/libstd.a       Base's standard library, native backend
+#   lib/luce-base/HOST/libstd-c.a     the same through the C backend
+#   share/luce/                       licences, VERSION, the language and runtime documents
+#
+# `luce` finds `luce-base` beside itself and luce-base finds the library beside its `bin`,
+# so the tree runs from wherever it is unpacked; a program it builds links the library
+# statically and needs nothing from the tree at run time. The Base tree is the one
+# build.sh built under build/luce-base/build, or the one `LUCE_BASE_BUILD` names (the
+# Windows build uses ../luce-base/build). Runs on macOS, Linux, and Windows in MSYS2.
+set -eu
+cd "$(dirname "$0")/.."
+export COPYFILE_DISABLE=1
+export LC_ALL=C
+umask 022
+out=${1:-build/release}
+version=$(tr -d '[:space:]' < VERSION)
+host=$(tools/host.sh)
+case "$host" in
+    x86_64-windows) exe=build/luce.exe; name=luce.exe; base_name=luce-base.exe; base_build=${LUCE_BASE_BUILD:-../luce-base/build};;
+    *) exe=build/luce; name=luce; base_name=luce-base; base_build=${LUCE_BASE_BUILD:-build/luce-base/build};;
+esac
+library="$base_build/lib/luce-base/$host"
+for f in "$exe" "$base_build/$base_name" "$library/libstd.a" "$library/libstd-c.a"; do
+    [ -f "$f" ] || { echo "package.sh: $f is missing; build first" >&2; exit 1; }
+done
+[ "$("$exe" --version)" = "luce $version" ] || { echo "package.sh: the built compiler is not version $version" >&2; exit 1; }
+tree="luce-$version"
+work="$out/tree"
+rm -rf "$work"
+mkdir -p "$work/$tree/bin" "$work/$tree/lib/luce-base/$host" "$work/$tree/share/luce/docs"
+cp "$exe" "$work/$tree/bin/$name"
+cp "$base_build/$base_name" "$work/$tree/bin/$base_name"
+chmod 755 "$work/$tree/bin/$name" "$work/$tree/bin/$base_name"
+cp "$library/libstd.a" "$library/libstd-c.a" "$work/$tree/lib/luce-base/$host/"
+cp LICENSE LICENSE-MIT LICENSE-APACHE VERSION "$work/$tree/share/luce/"
+cp docs/luce.md docs/RUNTIME.md "$work/$tree/share/luce/docs/"
+"$base_build/$base_name" --version > "$work/$tree/share/luce/BASE"
+archive="luce-$version-$host.tar.gz"
+mkdir -p "$out"
+rm -f "$out/$archive" "$out/$archive.sha256"
+(cd "$work" && tar -czf "../$archive" "$tree")
+rm -rf "$work"
+if command -v sha256sum > /dev/null 2>&1; then
+    (cd "$out" && sha256sum "$archive" > "$archive.sha256")
+else
+    (cd "$out" && shasum -a 256 "$archive" > "$archive.sha256")
+fi
+echo "packaged $out/$archive ($(wc -c < "$out/$archive" | tr -d ' ') bytes)"

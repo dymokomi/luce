@@ -17,3 +17,10 @@ A failed Linux gate runs `tools/ci_backtrace.sh`, which loads the crashed step u
 and records the faulting frames beside the log.
 
 Runner labels follow [GitHub's runner documentation](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+The `Release` workflow runs on a tag `luce-VERSION` (the tag must name `VERSION`): macOS
+ARM64, Linux x86-64 on the oldest supported runner, and Windows x64 under MSYS2 each build
+`luce` with the Base compiler `bootstrap/BASE` names, package it with that compiler and
+Base's standard library beside it (`tools/package.sh`), prove the archive with
+`tools/install_smoke.sh`, and the three archives become the GitHub release the installers
+at luce.luciaos.com download.

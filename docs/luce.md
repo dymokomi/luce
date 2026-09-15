@@ -934,8 +934,9 @@ to this manifest. The dependency's `[exports]` maps public import names to modul
 under its source root. For example, `ui = "luce_ui.ui"` exposes
 `src/luce_ui/ui.lucb` as `from ui import Button`; construction is `Button("pause")`.
 Aliases retain the canonical type identity. Conflicting exports are errors.
-Base owns module resolution; Luce invokes the compiler selected by `LUCE_BASE`
-(otherwise `luce-base`). Standard imports such as `math` use its embedded modules.
+Base owns module resolution; Luce invokes the compiler `LUCE_BASE` names, else `luce-base`
+beside the `luce` executable, as a release lays them out, else `luce-base` on the path.
+Standard imports such as `math` use its embedded modules.
 See [the package import contract](../../luce-base/docs/PACKAGE-IMPORTS.md) for complete
 examples and source-bundle relocation. Builds do not fetch dependencies.
 

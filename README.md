@@ -11,6 +11,15 @@ written in, and a Luce program compiles to Base, so every backend Base has is Lu
 - `docs/RUNTIME.md` is the contract of the runtime: when objects die, in what order.
 - `docs/PLAN.md` is what remains, in order, each step with the gate that closes it.
 
+A released `luce`, with the Base compiler and its standard library bundled beside it,
+installs in one line from [luce.luciaos.com](https://luce.luciaos.com): `curl -fsSL
+https://luce.luciaos.com/install.sh | sh` on macOS and Linux, `irm
+https://luce.luciaos.com/install.ps1 | iex` in PowerShell on Windows. It needs the host's
+C toolchain, which Base drives to assemble and link; a program it builds links the
+standard library statically and runs on its own. `luce` finds `luce-base` beside itself
+(`support.toolchain`); `LUCE_BASE` names another. The `Release` workflow builds the
+archives, one per host, from a tag `luce-VERSION`.
+
 ```text
 ./build.sh          builds build/luce with the Base compiler bootstrap/BASE names
 ./test.sh           the gate: every execution of every program must agree
