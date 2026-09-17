@@ -37,7 +37,10 @@ thing to read when a program misbehaves.
 
 1. **The interpreter** executes the typed tree directly. It is the definition of behaviour,
    it is `luce run`, and it shares no code with the emitter: it models objects, collections
-   and text as semantic values and never sees an address.
+   and text as semantic values and never sees an address. One Luce call becomes a deep chain
+   of large Base frames, so it walks the program on a wide worker stack (`main.on_wide_stack`);
+   its logical call-depth limit then reports "call depth exceeded" as a clean trap, where the
+   host's default stack would fault first on a program that recurses only into the hundreds.
 2. **The emitted Base**, through every generator luce-base has: C, C under `-O2`, and native.
 
 A feature is implemented when both print the same bytes for its programs and trap for the
