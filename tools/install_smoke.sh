@@ -9,6 +9,7 @@ work=$2
 [ -f "$archive" ] || { echo "install_smoke.sh: $archive is missing" >&2; exit 1; }
 rm -rf "$work"
 mkdir -p "$work"
+work=$(cd "$work" && pwd)   # absolute, so paths survive the cd into a scaffolded project
 directory=$(dirname "$archive")
 name=$(basename "$archive")
 if command -v sha256sum > /dev/null 2>&1; then
@@ -26,4 +27,10 @@ printf 'pub func main(arguments: list[str]) -> int!:\n    print("hello from luce
 [ "$("$compiler" run "$work/hello.luc")" = "hello from luce, 1024" ]
 "$compiler" build "$work/hello.luc" -o "$program"
 [ "$("$program")" = "hello from luce, 1024" ]
-echo "ok install smoke: $tree runs and builds a program with the bundled Base compiler"
+# the bundled project tool builds and runs a scaffolded project with the bundled Base compiler
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) luc="$bin/luc.exe"; base="$bin/luce-base.exe";; *) luc="$bin/luc"; base="$bin/luce-base";; esac
+[ -x "$luc" ] || { echo "install_smoke.sh: the archive has no bin/luc" >&2; exit 1; }
+"$luc" --version
+LUCE_BASE="$base" "$luc" new "$work/demo" > /dev/null
+[ "$(cd "$work/demo" && LUCE_BASE="$base" "$luc" run)" = "hello from demo" ]
+echo "ok install smoke: $tree runs and builds a program with the bundled Base compiler, and luc builds a project"
