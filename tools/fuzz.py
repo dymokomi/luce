@@ -44,7 +44,11 @@ class Findings:
 
 
 def corpus():
-    files = sorted(root.glob("tests/conformance/*/*.luc")) + sorted(root.glob("tests/conformance/*/*/*.luc"))
+    files = []
+    for pattern in ("tests/conformance/*/*.luc", "tests/conformance/*/*/*.luc",
+                    "tests/programs/*/*.luc", "tests/programs/*/*/*.luc",
+                    "tests/interop/*/*.luc", "tests/interop/*.luc"):
+        files += sorted(root.glob(pattern))
     return [f for f in files if f.stat().st_size < 60000]
 
 
