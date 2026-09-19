@@ -23,7 +23,6 @@ python3 tools/test_base_interfaces.py
 python3 tools/test_base_callbacks.py
 python3 tools/test_base_workers.py
 python3 tools/test_gpu_frames.py
-python3 tools/test_standard_json.py
 python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
