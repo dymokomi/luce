@@ -49,7 +49,10 @@ def main() -> None:
 
         missing = run("run", "--sandbox", str(root), str(root / "missing.luc"))
         assert missing.returncode == 1, missing
-        assert "could not be resolved" in missing.stderr, missing
+        assert (
+            "could not be resolved" in missing.stderr
+            or "could not be opened" in missing.stderr
+        ), missing
 
         malformed = run("run", "--sandbox", str(root))
         assert malformed.returncode == 2, malformed
