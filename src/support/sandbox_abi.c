@@ -73,7 +73,8 @@ int luce_sandbox_landlock_create(uint64_t rights) {
 }
 
 int luce_sandbox_open_root(const char *root) {
-    return open(root, O_PATH | O_CLOEXEC);
+    /* Linux O_PATH | O_CLOEXEC; numeric ABI avoids requiring _GNU_SOURCE. */
+    return open(root, 0x280000);
 }
 
 int luce_sandbox_landlock_add(int ruleset, uint64_t rights, int root) {
