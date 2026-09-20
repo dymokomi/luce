@@ -24,6 +24,9 @@ archives, one per host, from a tag `luce-VERSION`.
 ./build.sh          builds build/luce with the Base compiler bootstrap/BASE names
 ./test.sh           the gate: every execution of every program must agree
 build/luce run  program.luc          the interpreter, the definition of behaviour
+build/luce run --sandbox ROOT program.luc -- ARGS
+                                      the interpreter confined to ROOT, for recipes
+build/luce --sandbox-policy           print the lockfile-visible sandbox policy identity
 build/luce build program.luc -o app  Base out, then the Base compiler, native in
 ```
 

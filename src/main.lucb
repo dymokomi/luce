@@ -12,9 +12,12 @@
 import c
 import files
 import io
+import memory
+import os
 import process
 import paths
 import thread
+import time
 import front.ast
 import front.layout
 import front.lexer
@@ -30,9 +33,10 @@ import sema.check
 import sema.types
 import strings
 import support.version
+import support.sandbox
 
 func usage(out: io.Writer*) -> !:
-    try out.write("usage: luce lex FILE\n       luce parse FILE\n       luce check FILE\n       luce run FILE [ARGS]\n       luce build FILE [-o OUT] [--emit=base] [--native] [--backend=c] [--release]\n       luce test FILE [--build] [--native] [--backend=c] [--release]\n       luce doc FILE\n       luce explain FILE:LINE:COLUMN\n       luce fmt FILE [--write | --check]\n       luce --version\n")
+    try out.write("usage: luce lex FILE\n       luce parse FILE\n       luce check FILE\n       luce run FILE [ARGS]\n       luce run --sandbox ROOT FILE [-- ARGS]\n       luce build FILE [-o OUT] [--emit=base] [--native] [--backend=c] [--release]\n       luce test FILE [--build] [--native] [--backend=c] [--release]\n       luce doc FILE\n       luce explain FILE:LINE:COLUMN\n       luce fmt FILE [--write | --check]\n       luce --version\n")
 
 ## A diagnostic for a failure raised while reading `path`: a located message stands as it
 ## is; a bare one, the lexer's, is placed at the byte the lexer stopped on.
@@ -491,9 +495,9 @@ func on_wide_stack(machine: interp.Interp*, arguments: str[], tests: bool) -> In
     return run
 
 ## Parse, check, and run the file in the interpreter; its `main`'s result is the status.
-func run_command(path: c.str, arguments: str[]) -> i32!:
+func run_command(path: c.str, arguments: str[], sandbox_root: str = "") -> i32!:
     var scratch: u8[8192]
-    var checker = try check.Checker.create(scratch)
+    var checker = try check.Checker.create(scratch, sandbox_root)
     checker.load(path) catch failure:
         try report((str)path, none, failure.message)
         return 1
@@ -503,9 +507,13 @@ func run_command(path: c.str, arguments: str[]) -> i32!:
     if checker.imports_base():
         try io.stderr().write(f"luce: {(str)path}: the program imports a Base module; the interpreter runs Luce alone, so build it (§16)\n")
         return 1
-    var machine = try interp.Interp.over(&checker)
+    var machine = try interp.Interp.over(&checker, 128 if sandbox_root.length > 0 else 4000)
     interp.attach(&machine)
-    let run = try on_wide_stack(&machine, arguments, false)
+    var run = Interpretation(machine = &machine, arguments = arguments, tests = false, status = 0, failed = false, luce_failure = false, message = "")
+    if sandbox_root.length > 0:
+        interpret(&run)
+    else:
+        run = try on_wide_stack(&machine, arguments, false)
     if run.failed:
         var err = io.stderr()
         if run.luce_failure:
@@ -514,6 +522,71 @@ func run_command(path: c.str, arguments: str[]) -> i32!:
         try err.write(f"luce: {run.message}\n")
         return 2
     return i32(run.status)
+
+## The private child boundary: limits and kernel policy are installed before the checker reads
+## any untrusted source. It never emits native code or invokes the Base compiler.
+func sandbox_child_command(root: c.str, path: c.str, arguments: str[]) -> i32!:
+    let selected = sandbox.resolve(root, path) catch failure:
+        try io.stderr().write(f"luce: sandbox: {failure.message}\n")
+        return 1
+    sandbox.apply_resource_limits() catch failure:
+        try io.stderr().write(f"luce: sandbox: {failure.message}\n")
+        return 1
+    sandbox.enter((c.str)selected.root) catch failure:
+        try io.stderr().write(f"luce: sandbox: {failure.message}\n")
+        return 1
+    # All parser, checker and interpreter storage comes from this child-owned fixed arena.
+    # FixedBuffer is intentionally monotonic here: the process exits after one recipe, and
+    # every allocation made by untrusted work is therefore covered by one hard byte ceiling.
+    let backing = try alloc u8[sandbox.memory_bytes] in memory.heap
+    var bounded = memory.FixedBuffer.over(backing)
+    memory.allocator = &bounded
+    memory.heap = &bounded
+    return try run_command((c.str)selected.entry, arguments, selected.root)
+
+## Parent supervisor for policy v1: a private process group, 30-second wall deadline and a
+## one-MiB combined output ceiling. A failed child never contributes a recipe result on stdout.
+func sandbox_command(root: c.str, path: c.str, arguments: str[]) -> i32!:
+    let selected = sandbox.resolve(root, path) catch failure:
+        try io.stderr().write(f"luce: sandbox: {failure.message}\n")
+        return 1
+    defer strings.release(selected.root)
+    defer strings.release(selected.entry)
+    let executable = try os.executable()
+    defer strings.release(executable)
+    let child_arguments = try alloc str[arguments.length + 4]
+    defer free(child_arguments)
+    child_arguments[0] = "--sandbox-child"
+    child_arguments[1] = selected.root
+    child_arguments[2] = selected.entry
+    child_arguments[3] = "--"
+    for i in 0..<arguments.length:
+        child_arguments[i + 4] = arguments[i]
+    var command = try process.Command(executable, child_arguments, output_limit = 1048576)
+    defer command.close()
+    let started = time.now()
+    var timed_out = false
+    while not command.is_finished():
+        if time.since(started) > 30000000000:
+            timed_out = true
+            command.cancel()
+        thread.sleep(5)
+    let output = try command.output()
+    defer output.release()
+    if timed_out:
+        try io.stderr().write("luce: sandbox: recipe exceeded the 30-second wall-time limit\n")
+        return 124
+    let code = command.exit_code() else -1
+    if code == 0:
+        discard(try io.stdout().write(output.value.bytes))
+        return 0
+    let management = try command.error_message()
+    defer management.release()
+    if management.value.length > 0:
+        try io.stderr().write(f"luce: sandbox: {management.value}\n")
+    elif output.value.length > 0:
+        discard(try io.stderr().write(output.value.bytes))
+    return i32(code) if code > 0 and code < 256 else 1
 
 ## Resolve the Base side of a checked Luce program before creating generated files.
 ## Failure releases every source already acquired; success transfers that ownership
@@ -611,12 +684,28 @@ pub func main(arguments: str[]) -> i32!:
     if command == "--version":
         try out.write(f"luce {version.text}\n")
         return 0
+    if command == "--sandbox-policy":
+        try out.write(f"{sandbox.policy}\n")
+        return 0
+    if command == "--sandbox-child" and arguments.length >= 4:
+        var first: usize = 4
+        if first < arguments.length and arguments[first] == "--":
+            first += 1
+        return try sandbox_child_command((c.str)arguments[2], (c.str)arguments[3], arguments[first..])
     if command == "lex" and arguments.length == 3:
         return try lex_command((c.str)arguments[2], true)
     if command == "parse" and arguments.length == 3:
         return try parse_command((c.str)arguments[2], true)
     if command == "check" and arguments.length == 3:
         return try check_command((c.str)arguments[2])
+    if command == "run" and arguments.length >= 3 and arguments[2] == "--sandbox":
+        if arguments.length >= 5:
+            var first: usize = 5
+            if first < arguments.length and arguments[first] == "--":
+                first += 1
+            return try sandbox_command((c.str)arguments[3], (c.str)arguments[4], arguments[first..])
+        try usage(&out)
+        return 2
     if command == "run" and arguments.length >= 3:
         return try run_command((c.str)arguments[2], arguments[3..])
     if command == "build" and arguments.length >= 3:

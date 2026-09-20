@@ -1083,6 +1083,8 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | Command | Does |
 | --- | --- |
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
+| `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
+| `luce --sandbox-policy` | prints the stable policy identity recorded by package locks; policy `luce-sandbox/1` uses a supervised child, a 30-second wall limit, 10-second CPU limit, 256 MiB interpreter allocation arena, one-MiB combined output limit, 16 MiB file limit, 64 descriptors, no child threads/processes or network, and rooted Luce-only imports |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package |
 | `luce check program.luc` | checks it and prints every diagnostic |
 | `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, native by default; `--backend=c` explicitly selects Base’s C comparison backend |

@@ -1,0 +1,225 @@
+#==============================================================================================
+#
+#   sandbox - Irreversible host confinement for interpreted Luce recipes
+#
+#   DESCRIPTION:
+#       Canonicalize a requested root and entry file, prove the entry is below the root, then
+#       enter the host kernel's filesystem/process/network sandbox before any untrusted source
+#       is parsed. macOS uses Seatbelt. Linux uses Landlock plus no_new_privs and a seccomp
+#       deny list. Unsupported hosts fail closed.
+#
+#==============================================================================================
+
+import c
+import files
+import platform
+import strings
+
+pub let unavailable: ErrorCode = ErrorCode.package(18)
+pub let policy: str = "luce-sandbox/1"
+pub let memory_bytes: usize = 268435456
+
+extern func close(descriptor: i32) -> i32
+extern func open(path: c.str, flags: i32, ...) -> i32
+extern func prctl(option: i32, ...) -> i32
+extern func syscall(number: i64, ...) -> i64
+extern func setrlimit(resource: i32, limit: const ResourceLimit*) -> i32
+
+extern func sandbox_init_with_parameters as "luce_sandbox_init_with_parameters"(profile: c.str, flags: u64, parameters: (c.str?)*, error_buffer: (c.str?)*) -> i32
+extern func sandbox_free_error as "luce_sandbox_free_error"(message: c.str)
+
+extern struct LandlockRuleset:
+    handled_access_fs: u64
+
+extern struct LandlockPathBeneath:
+    allowed_access: u64
+    parent_fd: i32
+
+extern struct SockFilter:
+    code: u16
+    jt: u8
+    jf: u8
+    value: u32
+
+extern struct SockProgram:
+    length: u16
+    filters: SockFilter*
+
+extern struct ResourceLimit:
+    current: u64
+    maximum: u64
+
+## The canonical root and entry path, owned by the caller for the rest of this process.
+pub struct Paths:
+    pub let root: str
+    pub let entry: str
+
+func contained(path: str, root: str) -> bool:
+    if path == root:
+        return true
+    return path.length > root.length and strings.starts_with(path, root) and path.bytes[root.length] == '/'
+
+## Resolve aliases before confinement and reject an entry outside the selected tree.
+pub func resolve(root: c.str, entry: c.str) -> Paths!:
+    let canonical_root = try files.canonical(root)
+    let canonical_entry = files.canonical(entry) catch failure:
+        strings.release(canonical_root)
+        error(failure.code, failure.message)
+    if not contained(canonical_entry, canonical_root):
+        strings.release(canonical_entry)
+        strings.release(canonical_root)
+        error(unavailable, "the sandbox entry must be inside its root")
+    return Paths(canonical_root, canonical_entry)
+
+## Fixed policy-v1 resource ceilings, installed in the child before untrusted parsing.
+## Wall time and combined output are enforced by the parent process.
+pub func apply_resource_limits() -> !:
+    if not platform.posix:
+        return
+    if not set_limit(0, 10): error(unavailable, "the sandbox CPU limit could not be installed")
+    if not set_limit(1, 16777216): error(unavailable, "the sandbox file-size limit could not be installed")
+    if not set_limit(4, 0): error(unavailable, "the sandbox core-dump limit could not be installed")
+    if not set_limit(8 if platform.macos else 7, 64): error(unavailable, "the sandbox descriptor limit could not be installed")
+    if not set_limit(7 if platform.macos else 6, 1): error(unavailable, "the sandbox process/thread limit could not be installed")
+    if platform.linux and not set_limit(9, 805306368): error(unavailable, "the sandbox address-space limit could not be installed")
+
+func set_limit(resource: i32, value: u64) -> bool:
+    var limit = ResourceLimit(value, value)
+    return setrlimit(resource, &limit) == 0
+
+# mark: macOS Seatbelt ========================================================================
+
+let macos_profile: c.str = """
+(version 1)
+(deny default)
+(allow file-read* file-write* (subpath (param "ROOT")))
+;; realpath must traverse root ancestors; content remains restricted to ROOT.
+(allow file-read-metadata)
+(allow file-write-data (subpath "/dev"))
+(allow process-info*)
+(allow signal (target self))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow ipc-posix*)
+"""
+
+func enter_macos(root: c.str) -> !:
+    var parameters: (c.str?)[3] = ["ROOT", root, none]
+    var detail: c.str?
+    if sandbox_init_with_parameters(macos_profile, 0, &parameters[0], &detail) != 0:
+        if let message = detail:
+            let owned = try strings.copy((str)message)
+            sandbox_free_error(message)
+            error(unavailable, owned)
+        error(unavailable, "macOS refused the sandbox profile")
+
+# mark: Linux Landlock ========================================================================
+
+let landlock_create_ruleset: i64 = 444
+let landlock_add_rule: i64 = 445
+let landlock_restrict_self: i64 = 446
+let landlock_create_version: u32 = 1
+let landlock_rule_path_beneath: i32 = 1
+
+let access_execute: u64 = 1 << 0
+let access_write_file: u64 = 1 << 1
+let access_read_file: u64 = 1 << 2
+let access_read_dir: u64 = 1 << 3
+let access_remove_dir: u64 = 1 << 4
+let access_remove_file: u64 = 1 << 5
+let access_make_char: u64 = 1 << 6
+let access_make_dir: u64 = 1 << 7
+let access_make_reg: u64 = 1 << 8
+let access_make_sock: u64 = 1 << 9
+let access_make_fifo: u64 = 1 << 10
+let access_make_block: u64 = 1 << 11
+let access_make_sym: u64 = 1 << 12
+let access_refer: u64 = 1 << 13
+let access_truncate: u64 = 1 << 14
+let access_ioctl_dev: u64 = 1 << 15
+
+func landlock_rights(version: i64) -> u64:
+    var rights = access_execute | access_write_file | access_read_file | access_read_dir | access_remove_dir | access_remove_file | access_make_char | access_make_dir | access_make_reg | access_make_sock | access_make_fifo | access_make_block | access_make_sym
+    if version >= 2:
+        rights |= access_refer
+    if version >= 3:
+        rights |= access_truncate
+    if version >= 5:
+        rights |= access_ioctl_dev
+    return rights
+
+func enter_landlock(root: c.str) -> !:
+    let version = syscall(landlock_create_ruleset, (void*)0, 0usize, landlock_create_version)
+    if version < 1:
+        error(unavailable, "Linux Landlock is unavailable")
+    let rights = landlock_rights(version)
+    var ruleset = LandlockRuleset(rights)
+    let descriptor = (i32)syscall(landlock_create_ruleset, &ruleset, sizeof(LandlockRuleset), 0u32)
+    if descriptor < 0:
+        error(unavailable, "Linux could not create a Landlock ruleset")
+    defer discard(close(descriptor))
+    let root_descriptor = open(root, 0x280000)
+    if root_descriptor < 0:
+        error(unavailable, "Linux could not open the sandbox root")
+    defer discard(close(root_descriptor))
+    var below = LandlockPathBeneath(rights, root_descriptor)
+    if syscall(landlock_add_rule, descriptor, landlock_rule_path_beneath, &below, 0u32) != 0:
+        error(unavailable, "Linux could not add the sandbox root")
+    if prctl(38, 1, 0, 0, 0) != 0:
+        error(unavailable, "Linux could not enable no_new_privs")
+    if syscall(landlock_restrict_self, descriptor, 0u32) != 0:
+        error(unavailable, "Linux could not enter the Landlock ruleset")
+
+# mark: Linux seccomp =========================================================================
+
+func statement(code: u16, jt: u8, jf: u8, value: u32) -> SockFilter:
+    return SockFilter(code, jt, jf, value)
+
+func deny_syscall(filters: SockFilter[], used: usize*, number: u32):
+    filters[*used] = statement(0x15, 0, 1, number)
+    filters[*used + 1] = statement(0x06, 0, 0, 0x00050001)
+    *used += 2
+
+func enter_seccomp() -> !:
+    var filters: SockFilter[80]
+    var used: usize = 0
+    # seccomp_data.arch, then kill a process whose architecture is not the compiled one.
+    filters[used] = statement(0x20, 0, 0, 4)
+    used += 1
+    filters[used] = statement(0x15, 1, 0, 0xc00000b7 if platform.arm64 else 0xc000003e)
+    used += 1
+    filters[used] = statement(0x06, 0, 0, 0x80000000)
+    used += 1
+    # seccomp_data.nr. Network creation/use, execution, namespace/kernel mutation and
+    # privileged observation return EPERM. clone/clone3 are denied too: sandboxed recipes
+    # are deliberately single-threaded.
+    filters[used] = statement(0x20, 0, 0, 0)
+    used += 1
+    if platform.arm64:
+        let denied: u32[31] = [198, 199, 200, 201, 202, 203, 206, 207, 221, 281,
+            117, 40, 39, 41, 51, 268, 97, 280, 282, 219, 217, 218,
+            241, 142, 104, 273, 105, 106, 425, 220, 435]
+        for number in denied:
+            deny_syscall(filters, &used, number)
+    else:
+        let denied: u32[34] = [41, 42, 43, 44, 45, 49, 50, 53, 288, 59, 322, 57, 58,
+            101, 165, 166, 155, 161, 308, 272, 321, 323, 250, 248,
+            249, 298, 169, 246, 313, 175, 176, 425, 56, 435]
+        for number in denied:
+            deny_syscall(filters, &used, number)
+    filters[used] = statement(0x06, 0, 0, 0x7fff0000)
+    used += 1
+    var program = SockProgram((u16)used, &filters[0])
+    if prctl(22, 2, &program) != 0:
+        error(unavailable, "Linux could not install the seccomp filter")
+
+## Irreversibly confine this process. This is called only after resolve and before parsing.
+pub func enter(root: c.str) -> !:
+    if platform.macos:
+        try enter_macos(root)
+        return
+    if platform.linux:
+        try enter_landlock(root)
+        try enter_seccomp()
+        return
+    error(unavailable, "luce sandboxing is not available on this host")
