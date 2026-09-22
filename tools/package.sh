@@ -43,7 +43,8 @@ chmod 755 "$work/$tree/bin/$name" "$work/$tree/bin/$base_name"
 luc_source=${LUCE_LUC_SOURCE:-../luce-luc}
 if [ -f "$luc_source/build.sh" ]; then
     case "$host" in x86_64-windows) luc_name=luc.exe;; *) luc_name=luc;; esac
-    LUCE_BASE_COMPILER="$PWD/$base_build/$base_name" "$luc_source/build.sh" > /dev/null
+    # luc's build.sh reports its failures on stdout; keep them visible in a release log.
+    LUCE_BASE_COMPILER="$PWD/$base_build/$base_name" "$luc_source/build.sh" >&2
     cp "$luc_source/build/$luc_name" "$work/$tree/bin/$luc_name"
     chmod 755 "$work/$tree/bin/$luc_name"
     echo "package.sh: bundled $("$work/$tree/bin/$luc_name" --version)"
