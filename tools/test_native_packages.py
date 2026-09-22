@@ -33,16 +33,16 @@ with tempfile.TemporaryDirectory(prefix='native-package-inputs-') as temporary:
     archive = leaf / 'native/libpackage_bonus.a'
     run('cc', '-c', archive_source, '-o', leaf / 'native/bonus.o')
     run('ar', 'rcs', archive, leaf / 'native/bonus.o')
-    write(leaf, 'luce.toml', '[package]\nname = "leaf"\nsource = "src"\n[exports]\nnative_core = "leaf.core"\n'
-          '[native]\nsources = ["native/source,one.c"]\nlink_search = ["native"]\nlibraries = ["package_bonus"]\n')
+    write(leaf, 'package.prisma', '#prisma 4.0\ndef package "leaf" {\n    str source = "src"\n    def export "native_core" {\n        str module = "leaf.core"\n    }\n'
+          '    def native "inputs" {\n        str[] sources = ["native/source,one.c"]\n        str[] link_search = ["native"]\n        str[] libraries = ["package_bonus"]\n    }\n}\n')
     write(leaf, 'src/leaf/core.lucb', 'extern func package_value() -> i64\nextern func package_bonus() -> i64\n'
           'pub func answer() -> i64:\n    return package_value() + package_bonus()\n')
     middle = root / 'middle'
-    write(middle, 'luce.toml', '[package]\nname = "middle"\nsource = "src"\n[dependencies]\nleaf = "../leaf"\n[exports]\napi = "middle.api"\n')
+    write(middle, 'package.prisma', '#prisma 4.0\ndef package "middle" {\n    str source = "src"\n    def dependency "leaf" {\n        str path = "../leaf"\n    }\n    def export "api" {\n        str module = "middle.api"\n    }\n}\n')
     write(middle, 'src/middle/api.lucb', 'from native_core import answer\npub func number() -> i64:\n    return answer()\n')
     app = root / 'app'
-    write(app, 'luce.toml', '[package]\nname = "consumer"\nsource = "src"\n[dependencies]\nmiddle = "../middle"\n'
-          '[native]\nsources = ["native/root.c"]\n')
+    write(app, 'package.prisma', '#prisma 4.0\ndef package "consumer" {\n    str source = "src"\n    def dependency "middle" {\n        str path = "../middle"\n    }\n'
+          '    def native "inputs" {\n        str[] sources = ["native/root.c"]\n    }\n}\n')
     write(app, 'native/root.c', '#include <stdint.h>\nint64_t root_value(void) { return 1; }\n')
     write(app, 'src/own.lucb', 'extern func root_value() -> i64\npub func value() -> i64:\n    return root_value()\n')
     entry = write(app, 'src/main.lucb', 'from api import number\nimport own\npub func main(arguments: str[]) -> i32:\n'
@@ -60,8 +60,8 @@ with tempfile.TemporaryDirectory(prefix='native-package-inputs-') as temporary:
     if luce:
         run(luce, 'build', entry, '--emit=base', '-o', binary)
         staged = Path(str(binary) + '.base')
-        manifest = (staged / 'luce.toml').read_text()
-        assert manifest.count('[native]') == 1, manifest
+        manifest = (staged / 'package.prisma').read_text()
+        assert manifest.count('def native') == 1, manifest
         assert manifest.count('source,one.c') == 1, manifest
         assert json.dumps(str(native)) in manifest, manifest
         run(base, 'build', staged / 'main.lucb', '-o', binary)

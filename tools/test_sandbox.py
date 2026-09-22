@@ -107,18 +107,18 @@ def main() -> None:
 
             dependency = parent / "dependency"
             dependency.mkdir()
-            (dependency / "luce.toml").write_text(
-                '[package]\nname = "dependency"\nsource = "src"\n\n'
-                '[exports]\nsecret = "secret"\n',
+            (dependency / "package.prisma").write_text(
+                '#prisma 4.0\ndef package "dependency" {\n    str source = "src"\n'
+                '    def export "secret" {\n        str module = "secret"\n    }\n}\n',
                 encoding="utf-8",
             )
             (dependency / "src").mkdir()
             (dependency / "src" / "secret.luc").write_text(
                 "pub func value() -> int:\n    return 99\n", encoding="utf-8"
             )
-            (root / "luce.toml").write_text(
-                '[package]\nname = "root"\nsource = "."\n\n'
-                '[dependencies]\ndependency = "../dependency"\n',
+            (root / "package.prisma").write_text(
+                '#prisma 4.0\ndef package "root" {\n    str source = "."\n'
+                '    def dependency "dependency" {\n        str path = "../dependency"\n    }\n}\n',
                 encoding="utf-8",
             )
             program.write_text(
@@ -129,7 +129,7 @@ def main() -> None:
             assert escaped.returncode != 0, escaped
             assert escaped.stdout == "", escaped
 
-            (root / "luce.toml").unlink()
+            (root / "package.prisma").unlink()
             program.write_text(
                 "pub func main(arguments: list[str]) -> int!:\n"
                 "    var i = 0\n"

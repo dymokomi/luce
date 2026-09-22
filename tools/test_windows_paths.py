@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix='luce-パス-😀-') as directory:
     scratch.mkdir()
     source = root / 'src'
     source.mkdir()
-    (root / 'luce.toml').write_text('[package]\nname = "unicode"\nsource = "src"\n', encoding='utf-8')
+    (root / 'package.prisma').write_text('#prisma 4.0\ndef package "unicode" {\n    str source = "src"\n}\n', encoding='utf-8')
     (source / 'helper.luc').write_bytes(('pub func message() -> str:\n    return "日本語 😀"\n').replace('\n', '\r\n').encode('utf-8'))
     entry = source / 'main.luc'
     entry.write_bytes(('import helper\npub func main(arguments: list[str]) -> int!:\n'

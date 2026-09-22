@@ -25,11 +25,11 @@ def run(*args, expected=0):
 
 with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     root = Path(temporary)
-    write(root, 'helper/luce.toml', '[package]\nname = "helper"\n[exports]\nmeasure = "helper.measure"\n')
+    write(root, 'helper/package.prisma', '#prisma 4.0\ndef package "helper" {\n    def export "measure" {\n        str module = "helper.measure"\n    }\n}\n')
     write(root, 'helper/src/helper/measure.lucb', 'pub interface Measured:\n    func length() -> i64\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func length(text: str) -> i64:\n    return (i64)text.length\n')
-    write(root, 'library/luce.toml', '[package]\nname = "luce_ui"\n[dependencies]\nhelper = "../helper"\n[exports]\nui = "luce_ui.ui"\ncontrols = "luce_ui.ui"\n')
+    write(root, 'library/package.prisma', '#prisma 4.0\ndef package "luce-ui" {\n    def dependency "helper" {\n        str path = "../helper"\n    }\n    def export "ui" {\n        str module = "luce_ui.ui"\n    }\n    def export "controls" {\n        str module = "luce_ui.ui"\n    }\n}\n')
     write(root, 'library/src/luce_ui/ui.lucb', 'import measure\nimport net\npub type Measured = measure.Measured\npub func version() -> net.IpVersion:\n    return net.IpVersion.ipv4\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func distinct_errors() -> bool:\n    return invalid != measure.invalid\npub struct Button: measure.Measured:\n    var size: i64\n    pub func init(label: str):\n        self.size = measure.length(label)\n    pub func length() -> i64:\n        return self.size\n')
-    write(root, 'app/luce.toml', '[package]\nname = "demo"\n[dependencies]\nluce_ui = "../library"\n')
+    write(root, 'app/package.prisma', '#prisma 4.0\ndef package "demo" {\n    def dependency "luce-ui" {\n        str path = "../library"\n    }\n}\n')
     entry = write(root, 'app/src/main.luc', 'from ui import Button\nimport controls\nimport ui\nimport math\nimport net\nfunc length(value: ui.Measured) -> int:\n    return value.length()\npub func main(arguments: list[str]) -> int!:\n    let button: controls.Button = Button("pause")\n    assert(button.length() == 5 and length(button) == 5 and ui.distinct_errors())\n    assert(ui.version() == net.IpVersion.ipv4)\n    assert(math.pi > 3.0 and math.sin(0.0) == 0.0)\n    return 0\n')
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'consumer')
@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     run(COMPILER, 'build', entry, '--emit=base', '-o', output)
     emitted = Path(str(output) + '.base')
     assert not (emitted / 'math.lucb').exists()
-    assert 'measure = "helper.measure"' in (emitted / 'luce.toml').read_text()
+    assert 'def export "measure" {\n        str module = "helper.measure"' in (emitted / 'package.prisma').read_text()
     relocated = root / 'relocated'
     shutil.move(emitted, relocated)
     shutil.rmtree(root / 'library')

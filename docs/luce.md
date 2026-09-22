@@ -916,18 +916,20 @@ pub func main(arguments: list[str]) -> int!:
 
 ### 15.5 Packages
 
-A package is a directory with a `luce.toml` naming the package, its source root, its tests,
+A package is a directory with a `package.prisma` naming the package, its source root, its tests,
 and its dependencies exactly. There is no build script and no network during a build. The
 manifest is the same document for the Base modules the package contains.
 
-```toml
-[package]
-name = "demo"
-source = "src"
+```text
+#prisma 4.0
+def package "demo" {
+    str source = "src"
+}
 ```
 
-`name` is the package's identity (§12.3); `source` is the root the modules are named
-from, `src` unless written. The nearest manifest above the entry module is the program's.
+The package's name is its identity (§12.3), spelled as an identifier (`luce-ui` is `luce_ui`);
+`source` is the root the modules are named from, `src` unless written. The nearest definition
+above the entry module is the program's.
 
 `[dependencies]` maps a dependency's package name to its local directory, relative
 to this manifest. The dependency's `[exports]` maps public import names to modules

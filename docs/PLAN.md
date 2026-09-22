@@ -15,7 +15,7 @@ defines each stage's completion gate. Standard-library work stays in `luce-base`
 `luce-tls`, `luce-server` and `luce-pkg` are three separate new repositories,
 created as their work begins. The server is written in Luce. The package-manager
 stage adds `luce install` and `luce-base install`, a shared `luce.yaml` manifest with
-explicit migration from `luce.toml`, and deployment to `pkg.luciaos.com`.
+the `package.prisma` project file, and deployment to `pkg.luciaos.com`.
 The package manager still requires both server and TLS completion; compiler/runtime
 changes are made as needed to support the active stage. What stands ready for it: `tests/programs/`
 holds the proving programs, `tools/fuzz.py --minutes 60` runs the generator for an hour,

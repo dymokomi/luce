@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory(prefix="luce-base-packages-") as temporary:
     for collision in (False, True):
         package = work / ("collisions" if collision else "diamond")
         source = package / "source with spaces"
-        write(package, "luce.toml", '[package]\nname = "packaging"\nsource = "source with spaces"\n')
+        write(package, "package.prisma", '#prisma 4.0\ndef package "packaging" {\n    str source = "source with spaces"\n}\n')
         entry = write(source, "main.luc", "import api.boundary\n\n"
             'test "dependency closure":\n    assert(boundary.answer() == 42)\n\n'
             "pub func main(arguments: list[str]) -> int!:\n"
