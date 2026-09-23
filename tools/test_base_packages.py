@@ -115,9 +115,18 @@ with tempfile.TemporaryDirectory(prefix="luce-base-packages-") as temporary:
     # A compiler protocol mismatch must be an explicit failure, never an incomplete
     # package that happens to compile by finding source in a parent directory.
     wrapper = work / "base-protocol-probe"
-    wrapper.write_text(f"#!{sys.executable}\nimport os, sys\n"
+    # the report is the tail of a closure description (after the empty record) and the
+    # whole reply of `dependencies`; either way the malformed report is what luce reads
+    wrapper.write_text(f"#!{sys.executable}\nimport os, subprocess, sys\n"
+                      "response = bytes.fromhex(os.environ['DEPENDENCY_RESPONSE'])\n"
                       "if sys.argv[1] == 'dependencies':\n"
-                      "    sys.stdout.buffer.write(bytes.fromhex(os.environ['DEPENDENCY_RESPONSE']))\n"
+                      "    sys.stdout.buffer.write(response)\n"
+                      "elif sys.argv[1] == 'describe-closure':\n"
+                      "    real = subprocess.run([os.environ['REAL_BASE'], *sys.argv[1:]], capture_output=True)\n"
+                      "    if real.returncode != 0:\n"
+                      "        sys.stderr.buffer.write(real.stderr); sys.exit(real.returncode)\n"
+                      "    end = real.stdout.index(b'\\0\\0') + 2\n"
+                      "    sys.stdout.buffer.write(real.stdout[:end] + response)\n"
                       "else:\n    os.execv(os.environ['REAL_BASE'], [os.environ['REAL_BASE'], *sys.argv[1:]])\n")
     wrapper.chmod(0o755)
     responses = [
