@@ -15,7 +15,7 @@ A class instance is a heap block: a header, then the fields in declaration order
 | --- | --- |
 | `strong` | references that keep the object alive |
 | `weak` | `Weak` references; the storage stays while any remain |
-| `flags` | the collector's colour, whether the object is in the root buffer, whether it is dead |
+| `flags` | the collector's color, whether the object is in the root buffer, whether it is dead |
 | `info` | the class's descriptor: its name, size, `deinit`, field release, field trace |
 | `generation`, `context` | unique allocation and runtime-thread identities |
 | `allocation_size`, `allocator` | the actual block and its recorded allocation owner |
