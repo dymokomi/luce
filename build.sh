@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build Luce natively with the exact Base commit in bootstrap/BASE. The isolated
 # build/luce-base checkout makes normal builds independent of another working tree.
-# LUCE_BASE_SOURCE selects the repository (default ../luce-base).
+# LUCE_BASE_SOURCE selects the repository (default ../luce-base), LUCE_STD_SOURCE the
+# luce-std repository Base's pin is fetched from (default ../luce-std).
 # LUCE_BASE_COMPILER selects an already-built compiler for dependency development.
 set -eu
 cd "$(dirname "$0")"
@@ -28,6 +29,12 @@ else
         git --git-dir=build/luce-base/.git fetch -q --depth 1 "$source" "$revision"
         git -C build/luce-base checkout -q --detach FETCH_HEAD
         [ "$(git -C build/luce-base rev-parse HEAD)" = "$revision" ]
+        # Base's own package depends on luce-std beside it, at the commit Base pins
+        std_revision=$(cat build/luce-base/bootstrap/STD)
+        rm -rf build/luce-std
+        git init -q build/luce-std
+        git --git-dir=build/luce-std/.git fetch -q --depth 1 "${LUCE_STD_SOURCE:-../luce-std}" "$std_revision"
+        git -C build/luce-std checkout -q --detach FETCH_HEAD
         (cd build/luce-base && ./build.sh > /dev/null)
     fi
     description=$revision
