@@ -19,7 +19,7 @@
 #   LUCE_INSTALL_NO_PATH  1 leaves every startup file alone
 set -eu
 
-version=0.8.1
+version=0.8.2
 product=luce
 version=${LUCE_INSTALL_VERSION:-$version}
 base_url=${LUCE_INSTALL_URL:-https://github.com/dymokomi/luce/releases/download/luce-$version}
