@@ -36,7 +36,10 @@ if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -
 if ([Environment]::OSVersion.Version.Major -lt 10) {
     Fail 'this release needs Windows 10 or newer'
 }
-if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
+# Windows' own bsdtar: Git for Windows puts a GNU tar earlier on PATH that reads
+# "C:\..." as a remote host "C" and cannot open the archive.
+$tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) {
     Fail 'tar.exe is required (it ships with Windows 10 1803 and newer)'
 }
 
@@ -85,7 +88,7 @@ try {
 
     # The checksum authenticates the bytes; the archive is still confined to its own
     # directory before anything is written.
-    $members = & tar.exe -tzf $archive
+    $members = & $tar -tzf $archive
     if ($LASTEXITCODE -ne 0) { Fail 'the archive cannot be listed' }
     foreach ($member in $members) {
         $path = $member.TrimEnd('/')
@@ -95,7 +98,7 @@ try {
     }
     $unpack = Join-Path $tmp 'unpack'
     New-Item -ItemType Directory -Path $unpack | Out-Null
-    & tar.exe -xzf $archive -C $unpack
+    & $tar -xzf $archive -C $unpack
     if ($LASTEXITCODE -ne 0) { Fail 'the archive could not be unpacked' }
     $release = Join-Path $unpack $tree
     # `luce` compiles a program to Base and runs the `luce-base` beside it; both ship in the tree
