@@ -15,7 +15,7 @@
 #   LUCE_INSTALL_URL      the directory the archives are read from; a file:/// URL works
 #   LUCE_INSTALL_NO_PATH  1 leaves the user PATH alone
 $ErrorActionPreference = 'Stop'
-$version = '0.8.4'
+$version = '0.8.5'
 $product = 'luce'
 
 if ($env:LUCE_INSTALL_VERSION) { $version = $env:LUCE_INSTALL_VERSION }
