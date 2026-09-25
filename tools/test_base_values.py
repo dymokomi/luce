@@ -91,6 +91,10 @@ pub func borrow(text: str) -> Borrowed:
     entry.write_text('''from values import Counter, Defaults
 import values
 
+## A top-level constant of a Base struct, built through its conversion: read
+## by calling what the compiler emits for it.
+let preset: Defaults = Defaults(count = 3)
+
 func on_worker(value: Counter) -> Counter:
     assert(value.value() == 21)
     return value
@@ -149,6 +153,7 @@ func finish() -> int!:
     assert(initial() == values.Mode.ready)
     let defaults = Defaults()
     assert(defaults.label == "field default" and defaults.count == 0)
+    assert(preset.label == "field default" and preset.count == 3)
     let fields = Defaults(count = 3, label = "given")
     assert(fields.label == "given" and fields.count == 3)
     let locked = values.lock(89)
