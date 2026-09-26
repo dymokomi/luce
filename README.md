@@ -32,6 +32,11 @@ build/luce --sandbox-policy           print the lockfile-visible sandbox policy 
 build/luce build program.luc -o app  Base out, then the Base compiler, native in
 ```
 
+`./build.sh` fetches the Base commit from a luce-base checkout beside this one
+(`../luce-base`) and luce-std's pin from `../luce-std`. In a worktree or clone that
+does not sit beside them, set `LUCE_BASE_SOURCE` and `LUCE_STD_SOURCE` to those
+repositories.
+
 Licensed under MIT or Apache-2.0, at your option.
 
 Compiled Luce programs and `luce test --build` use Base’s native backend by default.
