@@ -103,6 +103,13 @@ returns; each run:
 Both executions discover in the same order, so the deinits of a cycle print in the same
 order.
 
+Any release can fill the buffer and so run the collector, whose walk visits every reference
+an object's trace reports. A collection therefore lets an entry go only once it no longer
+holds it: `clear()` on a list or a map detaches the entries (fresh storage, a zero count)
+before releasing them, `remove` releases the stored key after the entry is gone, and a
+replaced element or value is released after the new one is stored. A walk never meets an
+entry already let go of.
+
 An object whose type is acyclic is never a possible root and never walked into: text and
 bytes, a list, set, or map of acyclic values, and a struct, enum, or class (classes are
 final) whose fields are all acyclic and which does not hold itself. Such an object cannot be
