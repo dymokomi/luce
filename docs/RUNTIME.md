@@ -112,10 +112,12 @@ entry already let go of.
 
 An object whose type is acyclic is never a possible root and never walked into: text and
 bytes, a list, set, or map of acyclic values, and a struct, enum, or class (classes are
-final) whose fields are all acyclic and which does not hold itself. Such an object cannot be
-part of a cycle, so a million strings in a list cost the collector nothing, where each
-collection would otherwise walk the whole list again. Every step skips the same objects, so
-the trial counts stay balanced.
+final) declared in Luce whose fields are all acyclic and which does not hold itself. A Base
+type holding references never is: its description names only the fields that cross, while
+its trace visits every one, a widget's parent and the callbacks that capture it among them.
+An acyclic object cannot be part of a cycle, so a million strings in a list cost the
+collector nothing, where each collection would otherwise walk the whole list again. Every
+step skips the same objects, so the trial counts stay balanced.
 
 ## Weak references
 
