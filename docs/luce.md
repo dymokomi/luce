@@ -341,7 +341,9 @@ func log(message: str):
 ```
 
 Parameters are `let` bindings. A result type after `->`; none means `unit`. A default is a
-constant expression or a constructor of one. Every path through a function with a result
+constant expression or a constructor of one, or an empty collection, `[]` or `{}`: each call
+that omits the argument gets a fresh one, never a value shared between calls. A field's
+default is the same, made afresh for each construction. Every path through a function with a result
 returns a value; the compiler proves it. A function may be recursive.
 
 ### 7.2 Calls

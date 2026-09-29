@@ -249,6 +249,12 @@ kernel.drain(L_mark)
 `drain` releases everything above the mark in the order it was pooled. A second `drain` to
 the same mark is a no-op, which is why the `errdefer` is safe.
 
+A `continue`, `break` or `return` inside a statement ends that statement too: before the
+jump, every statement open between it and where it lands drains its mark, innermost first
+(`x else continue` after an operand was pooled, a `return` from inside a `for` whose
+iterator is pooled). A `return` computes its value first. A loop that `continue`s a
+million times holds no more temporaries than one that runs through.
+
 ## What a run leaves alive
 
 After `main` returns and the collector has run, no object may be alive: the language has no

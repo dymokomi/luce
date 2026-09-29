@@ -119,6 +119,10 @@ pub struct Emitter:
     var test_names: list.List[str]
     ## Whether the statement being written pooled a temporary, so it needs a drain.
     var pooled: bool
+    ## The statements being written, outermost first (RUNTIME 5): each one's node, and the
+    ## name its mark takes once a `break`, `continue` or `return` inside it drains it.
+    var frame_nodes: list.List[ast.Node*]
+    var frame_marks: list.List[str]
     ## Whether the function being written can fail, so that a drain on the failing path
     ## (`errdefer`) is possible and needed.
     var fallible: bool
@@ -152,7 +156,8 @@ pub struct Emitter:
                        shown_done = 0, lifetimes_done = 0, equalities_done = 0, orderings_done = 0, hashes_done = 0, ops_done = 0,
                        pooled = false, fallible = false, raw_payloads = false, self_name = "self",
                        tests_mode = false, test_names = try list.List[str].create(8), prelude = try buffer.Buffer.create(1024), prelude_floor = 0, hoisted_floor = 0,
-                       hoisted_nodes = try list.List[ast.Node*].create(8), hoisted_names = try list.List[str].create(8))
+                       hoisted_nodes = try list.List[ast.Node*].create(8), hoisted_names = try list.List[str].create(8),
+                       frame_nodes = try list.List[ast.Node*].create(16), frame_marks = try list.List[str].create(16))
 
     pub func text() -> str:
         return self.out.view()
@@ -200,11 +205,15 @@ pub struct Emitter:
 
     ## `drained`, except that a statement every path of which leaves the function gets no
     ## drain after it: Base would see the function's end reachable through the dead line,
-    ## and the caller's next drain releases what such a statement pooled.
-    mutating func drained_unless(start: usize, pooled_before: bool, terminal: bool) -> !:
+    ## and the caller's next drain releases what such a statement pooled. `reserved` is the
+    ## mark's name when a jump inside the statement already drains it by that name; when
+    ## the statement pooled nothing, those drains are taken out again.
+    mutating func drained_unless(start: usize, pooled_before: bool, terminal: bool, reserved: str = "") -> !:
+        if not self.pooled and reserved.length > 0:
+            try self.strip_drains(start, reserved)
         if self.pooled:
             let text = try self.capture(start)
-            let m = try self.temp("mark")
+            let m = reserved if reserved.length > 0 else try self.temp("mark")
             try self.begin("let ")
             try self.put(m)
             try self.put(" = heap.mark()")
@@ -226,6 +235,68 @@ pub struct Emitter:
         self.hoisted_nodes.count = self.hoisted_floor
         self.hoisted_names.count = self.hoisted_floor
         self.pooled = pooled_before
+
+    ## The lines `heap.drain(name)` written since `start` taken back out: the jumps that
+    ## drained a statement which in the end has no mark.
+    mutating func strip_drains(start: usize, name: str) -> !:
+        let text = try self.capture(start)
+        let half = self.checker.scratch.length // 2
+        let wanted = try emission.copy_text(try format(self.checker.scratch[half..], f"heap.drain({name})"))
+        var at: usize = 0
+        while at < text.length:
+            var end = at
+            while end < text.length and text.bytes[end] != u8(10):
+                end += 1
+            let line = (str)text.bytes[at..<end]
+            var first: usize = 0
+            while first < line.length and line.bytes[first] == u8(32):
+                first += 1
+            if (str)line.bytes[first..] != wanted:
+                try self.out.put(line)
+                if end < text.length:
+                    try self.out.put("\n")
+            at = end + 1
+
+    ## A statement opens: a `break`, `continue` or `return` inside it may need to drain it.
+    mutating func open_frame(s: ast.Node*) -> !:
+        try self.frame_nodes.push(s)
+        try self.frame_marks.push("")
+
+    ## The statement closes: the name its mark takes, when a jump inside it reserved one.
+    mutating func close_frame() -> str:
+        self.frame_nodes.count -= 1
+        self.frame_marks.count -= 1
+        return self.frame_marks.items[self.frame_marks.count]
+
+    ## Before a `break` or `continue` leaving to `target`, or a `return` (no target): a
+    ## drain of every statement open between the jump and where it lands, innermost first,
+    ## so that a statement's temporaries die when it ends, however it ends (RUNTIME 5).
+    ## The jump's own statement is the innermost one, and drains itself. Whether any was
+    ## written.
+    mutating func drain_open_statements(target: ast.Node*?) -> bool!:
+        var low: usize = 0
+        if let loop = target:
+            var k = self.frame_nodes.count
+            while k > 0:
+                k -= 1
+                if self.frame_nodes.get(k) == loop:
+                    low = k + 1
+                    break
+        if self.frame_nodes.count < 1:
+            return false
+        var i = self.frame_nodes.count - 1
+        var wrote = false
+        while i > low:
+            i -= 1
+            var name = self.frame_marks.get(i)
+            if name.length == 0:
+                name = try self.temp("mark")
+                self.frame_marks.set(i, name)
+            try self.begin("heap.drain(")
+            try self.put(name)
+            try self.end(")")
+            wrote = true
+        return wrote
 
     ## Synthetic handler loops must not intercept source `break` or `continue`.
     mutating func loop_name(loop: ast.Node*) -> str!:
@@ -2749,6 +2820,8 @@ pub struct Emitter:
     ## A function's statements name their own positions; the caller's is back on return,
     ## and the lines after the body are the program's own again.
     mutating func site_prologue() -> !:
+        if self.frame_nodes.count != 0:
+            trap("a function body was written inside a statement")
         let saved = try self.temp("site")
         try self.begin("let ")
         try self.put(saved)
@@ -2773,6 +2846,7 @@ pub struct Emitter:
         let start = self.out.used
         let pooled_before = self.pooled
         self.pooled = false
+        try self.open_frame(s)
         match s.kind:
             .let_, .var_: try self.binding(s)
             .assign: try self.assign(s)
@@ -2783,6 +2857,7 @@ pub struct Emitter:
             .with_: try self.with_statement(s)
             .return_: try self.return_statement(s)
             .break_, .continue_:
+                discard(try self.drain_open_statements(s.resolved))
                 try self.begin("break" if s.kind == ast.Kind.break_ else "continue")
                 if let loop = s.resolved:
                     try self.put(" ")
@@ -2807,7 +2882,8 @@ pub struct Emitter:
                     try self.use(e)
                 try self.end()
             _: return try self.fail(s, "a statement this slice does not compile")
-        try self.drained_unless(start, pooled_before, self.exits(s))
+        let reserved = self.close_frame()
+        try self.drained_unless(start, pooled_before, self.exits(s), reserved)
 
     ## `defer` the drop of a binding that owns references, right after it.
     mutating func drop_at_exit(name: str, t: u32) -> !:
@@ -2821,21 +2897,42 @@ pub struct Emitter:
         try self.end()
 
     ## `return e`: the value is owned by the caller; the statement's temporaries die after
-    ## it is computed and before the function's bindings (RUNTIME 5).
+    ## it is computed and before the function's bindings, and so do those of the statements
+    ## the `return` is inside (RUNTIME 5).
     mutating func return_statement(s: ast.Node*) -> !:
-        let v = s.left else return try self.line("return")
+        if s.left == none:
+            discard(try self.drain_open_statements(none))
+            return try self.line("return")
+        let v = s.left else return
         let start = self.out.used
         try self.owned(v)
         let text = try self.capture(start)
-        if self.pooled:
+        if not self.pooled and v.type_id == types.unit_id and v.kind == ast.Kind.call:
+            # a call returning `unit` is a statement of its own, before the drains
+            try self.begin("")
+            try self.put(text)
+            try self.end()
+            discard(try self.drain_open_statements(none))
+            return try self.line("return")
+        if not self.pooled and (v.kind == ast.Kind.literal or v.type_id == types.unit_id or v.type_id == types.never_id):
+            # nothing to compute, or nothing after it: the statements drain first, and a
+            # `none` keeps the context that types it
+            discard(try self.drain_open_statements(none))
+            try self.begin("return ")
+            try self.put(text)
+            try self.end()
+            return
+        if self.pooled or self.frame_nodes.count > 1:
             let r = try self.temp("result")
             try self.begin("let ")
             try self.put(r)
             try self.put(" = ")
             try self.put(text)
             try self.end()
-            try self.drained(start, true)
-            self.pooled = false
+            if self.pooled:
+                try self.drained(start, true)
+                self.pooled = false
+            discard(try self.drain_open_statements(none))
             try self.begin("return ")
             try self.put(r)
             try self.end()
@@ -3178,11 +3275,16 @@ pub struct Emitter:
         let start = self.out.used
         let pooled_before = self.pooled
         self.pooled = false
+        # a jump inside the condition, `x else break`, drains what it pooled
+        try self.open_frame(cond)
         if s.has(ast.flag_if_let):
             let init = cond.left else return ""
             try self.owned(init)
         else:
             try self.use(cond)
+        let reserved = self.close_frame()
+        if not self.pooled and reserved.length > 0:
+            try self.strip_drains(start, reserved)
         let text = try self.capture(start)
         if not self.pooled:
             self.pooled = pooled_before
@@ -3193,7 +3295,7 @@ pub struct Emitter:
         try self.put(" = ")
         try self.put(text)
         try self.end()
-        try self.drained(start, pooled_before)
+        try self.drained_unless(start, pooled_before, false, reserved)
         return c
 
     mutating func if_statement(s: ast.Node*) -> !:
