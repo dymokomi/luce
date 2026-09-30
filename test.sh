@@ -43,4 +43,7 @@ echo "== luce --version"
 tests/conformance/run.sh
 tools/fmt_check.sh
 python3 tools/fuzz.py --gate
+# random object graphs through both collectors, collecting at every candidate too, under
+# MallocScribble on macOS and valgrind on Linux (tools/cycles_fuzz.py)
+python3 tools/cycles_fuzz.py --gate
 echo ok

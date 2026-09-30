@@ -197,6 +197,7 @@ There is no implicit conversion between any two of these. `int(x)`, `float(x)`, 
 | Spelling | Meaning |
 | --- | --- |
 | `(A, B)` | tuple, a value |
+| `(T)` | `T` itself, grouped: `(func() -> int)?` is an optional function |
 | `struct Name` | a named value with fields (§9.1) |
 | `enum Name` | a closed set of cases, each with an optional payload (§9.2) |
 | `class Name` | a shared object with identity (§10) |

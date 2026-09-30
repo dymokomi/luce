@@ -96,9 +96,16 @@ returns; each run:
 2. scans: a grey object whose count is still above zero is reached from outside, and it and
    everything it reaches are revived (black); the rest are white, garbage;
 3. collects the white objects in discovery order (a depth-first walk from each candidate in
-   buffer order, fields in declaration order): every `deinit` first, then every object's
-   fields released, where a reference to a live object is an ordinary release and a
-   reference to another white object is simply dropped, then the storage freed.
+   buffer order, fields in declaration order): the counts step 1 took for the garbage's own
+   references are given back, to garbage and to live objects alike; then every `deinit`;
+   then every object's fields released, where a reference to a live object is an ordinary
+   release, so that object loses exactly the references the garbage held, and a reference
+   to another white object only lowers its count; then the storage freed.
+
+`LUCE_CYCLE_STRESS=1` in the environment makes both executions collect at every new
+candidate, so a collection happens at every release that could leave a cycle: inside
+`clear()`, `remove`, a `deinit` and a failed `init` too. `tools/cycles_fuzz.py` runs
+generated object graphs that way, and the gate runs a short batch of them.
 
 Both executions discover in the same order, so the deinits of a cycle print in the same
 order.
