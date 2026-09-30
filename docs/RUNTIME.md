@@ -95,8 +95,8 @@ returns; each run:
 1. marks every candidate's graph grey, subtracting internal references from the counts;
 2. scans: a grey object whose count is still above zero is reached from outside, and it and
    everything it reaches are revived (black); the rest are white, garbage;
-3. collects the white objects in discovery order (a depth-first walk from each candidate in
-   buffer order, fields in declaration order): the counts step 1 took for the garbage's own
+3. collects the white objects in the order they were made, oldest first: the counts step 1
+   took for the garbage's own
    references are given back, to garbage and to live objects alike; then every `deinit`;
    then every object's fields released, where a reference to a live object is an ordinary
    release, so that object loses exactly the references the garbage held, and a reference
@@ -107,8 +107,9 @@ candidate, so a collection happens at every release that could leave a cycle: in
 `clear()`, `remove`, a `deinit` and a failed `init` too. `tools/cycles_fuzz.py` runs
 generated object graphs that way, and the gate runs a short batch of them.
 
-Both executions discover in the same order, so the deinits of a cycle print in the same
-order.
+Both executions make objects in the same order, so the deinits of a cycle run in the same
+order in both, whichever releases made its objects candidates and whenever the collection
+ran.
 
 Any release can fill the buffer and so run the collector, whose walk visits every reference
 an object's trace reports. A collection therefore lets an entry go only once it no longer
