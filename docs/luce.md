@@ -133,7 +133,9 @@ let large = 6.022e23
 An integer literal is an `int` and a literal with a point or an exponent is a `float`. There
 are no suffixes and no other widths. Underscores separate digits; based prefixes `0x`, `0o`
 and `0b` are lowercase. A literal outside its type's range is a compile error. `-` before a
-literal is negation, and `-9223372036854775808` is accepted.
+literal is negation, and `-9223372036854775808` is accepted. A float prints as the shortest
+decimal that reads back as it, with `.0` after digits that have no point: `print(0.1 + 0.2)`
+shows `0.30000000000000004`, `print(5.0)` shows `5.0`, and `6.022e23` shows as written.
 
 ### 3.3 Text and bytes
 
