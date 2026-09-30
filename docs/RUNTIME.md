@@ -127,6 +127,20 @@ An acyclic object cannot be part of a cycle, so a million strings in a list cost
 collector nothing, where each collection would otherwise walk the whole list again. Every
 step skips the same objects, so the trial counts stay balanced.
 
+### In a Base program
+
+The collector is the same when a Base program holds Luce objects (through
+`interop.Reference`, or a Luce package's types): a release that leaves a count above zero
+makes a candidate, and the collector runs when the buffer holds 1024 of them. What a Base
+program lacks is the end of a run: its `main` is its own, not Luce's `main` wrapped in
+`finish_run`, so nothing collects after it and nothing counts what is left. Until the next
+collection, an object in a cycle stays alive, and a candidate whose count then reached zero
+has run its `deinit` and released its fields but keeps its own storage, which the buffer
+refers to. A Base program that needs those gone at a point, a test counting the heap after
+releasing models, a long-lived tool between documents, calls `ownership.collect()` there:
+it runs the collector at once, frees every cycle nothing outside it refers to and every
+dead candidate's storage, and returns. It is a no-op while a collection is running.
+
 ## Weak references
 
 `Weak(object)` is a value holding a non-owning reference: constructing or copying it raises
