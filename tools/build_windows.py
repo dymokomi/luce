@@ -12,5 +12,7 @@ args = parser.parse_args()
 (ROOT / 'build').mkdir(exist_ok=True)
 for script in ('embed_version.py', 'embed_runtime.py', 'embed_prelude.py'):
     subprocess.run([sys.executable, ROOT / 'tools' / script], cwd=ROOT, check=True)
+# the compiler Luce is built with is the one it runs, and its version the one it accepts
+subprocess.run([sys.executable, ROOT / 'tools/embed_toolchain.py', args.base.resolve()], cwd=ROOT, check=True)
 subprocess.run([args.base.resolve(), 'build', 'src/main.lucb', '--native', '-o', ROOT / 'build/luce.exe'], cwd=ROOT, check=True)
 print('built build/luce.exe')

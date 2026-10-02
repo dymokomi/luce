@@ -5,6 +5,8 @@ import files
 import memory
 import process
 import strings
+import support.list
+import support.text_table
 
 pub let invalid: ErrorCode = ErrorCode.package(29)
 
@@ -22,6 +24,13 @@ func field(text: str, position: usize*) -> str!:
     return value
 
 pub func resolve(compiler: str, importer: str, root: str, name: str, base_only: bool) -> Resolution!:
+    if not base_only:
+        let key = try resolution_key(importer, root, name)
+        defer strings.release(key)
+        if let record = resolutions.find(key):
+            if strings.starts_with(record, failed_resolution):
+                error(invalid, try strings.copy((str)record.bytes[failed_resolution.length..]))
+            return try parse_resolution(record)
     let executable = try strings.copy(compiler)
     let source = try strings.copy(importer)
     let directory = try strings.copy(root)
@@ -35,6 +44,10 @@ pub func resolve(compiler: str, importer: str, root: str, name: str, base_only: 
         if strings.starts_with(message, "luce-base: "):
             message = (str)message.bytes[11..]
         error(invalid, try strings.copy(message if message.length > 0 else "the Base module resolver could not be run"))
+    return try parse_resolution(output)
+
+## One module's resolution, as `luce-base resolve` writes it.
+func parse_resolution(output: str) -> Resolution!:
     let header = "luce-base-module-v1\0"
     if not strings.starts_with(output, header):
         error(invalid, "the Base compiler returned an unsupported module resolution format")
@@ -51,19 +64,71 @@ pub func resolve(compiler: str, importer: str, root: str, name: str, base_only: 
 
 pub let dependency_header: str = "luce-base-dependencies-v3\0"
 
+# The resolutions Base has given this run, by importer, root and name: a module's imports
+# are resolved together (`resolve_imports`), one process for them all instead of one each,
+# and each import then reads its own here. A record is what `luce-base resolve` writes, or
+# `failed_resolution` and the message.
+var resolutions: text_table.TextTable
+let failed_resolution: str = "error\0"
+
+func resolution_key(importer: str, root: str, name: str) -> str!:
+    return try strings.join([importer, root, name], "\0")
+
+## Resolve every import `names` of the module at `importer` in one run of the Base compiler
+## (`resolve-all`), keeping each answer for `resolve`, which then asks nothing.
+pub func resolve_imports(compiler: str, importer: str, root: str, names: const str[]) -> !:
+    with memory.heap:
+        var arguments = try alloc c.str[names.length + 3]
+        defer free(arguments)
+        var owned = try alloc str[names.length + 3]
+        defer free(owned)
+        owned[0] = try strings.copy(importer)
+        owned[1] = try strings.copy(root)
+        for k in 0..<names.length:
+            owned[k + 2] = try strings.copy(names[k])
+        arguments[0] = "resolve-all"
+        for k in 0..<names.length + 2:
+            arguments[k + 1] = (c.str)owned[k]
+        let executable = try strings.copy(compiler)
+        let (status, output, diagnostic) = try process.run((c.str)executable, arguments[..<names.length + 3])
+        defer process.release(output)
+        defer process.release(diagnostic)
+        if status != 0:
+            error(invalid, try strings.copy(strings.trim(diagnostic)))
+        let header = "luce-base-modules-v1\0"
+        if not strings.starts_with(output, header):
+            error(invalid, "the Base compiler returned an unsupported module resolution format")
+        var position = header.length
+        while position < output.length:
+            let kind = try field(output, &position)
+            let name = try field(output, &position)
+            var record = ""
+            if kind == "module":
+                let module_kind = try field(output, &position)
+                let canonical = try field(output, &position)
+                let path = try field(output, &position)
+                let source_root = try field(output, &position)
+                record = try strings.join(["luce-base-module-v1", module_kind, canonical, path, source_root, ""], "\0")
+            elif kind == "error":
+                let message = try field(output, &position)
+                record = try strings.join([failed_resolution, message], "")
+            else:
+                error(invalid, "the Base compiler returned an unknown resolution record")
+            let key = try resolution_key(importer, root, name)
+            discard(try resolutions.insert(key, record))
+
 # The reports Base has given this run, by source path. Checking a module's closure is most
 # of what a report costs, and nothing it reports changes while luce runs, so each source
-# is asked once; the texts live until luce exits.
-var reported_sources: str[1024]
-var reported_texts: str[1024]
-var reported_count: usize = 0
+# is asked once; the texts live until luce exits. A source is kept once, by the first
+# report that covers it: the closures `describe-closure` reports overlap (every closure
+# of luced-3d's holds luce-prism), and keeping each of their modules again filled the
+# table, after which every module was asked again (luced-3d: 198 reports, 23 s).
+var reports: text_table.TextTable
 
 # The descriptions Base has given this run, by canonical source path, each filled with its
 # whole closure by one `describe-closure`: describing a module and reporting its
 # dependencies both check its closure, so a closure is checked once, not once per module.
-var described_sources: str[4096]
-var described_texts: str[4096]
-var described_count: usize = 0
+var descriptions: text_table.TextTable
 
 pub let cannot_run: ErrorCode = ErrorCode.package(30)
 
@@ -77,10 +142,9 @@ func canonical_key(path: str) -> str!:
 pub func description(compiler: str, path: str) -> str!:
     with memory.heap:
         let key = try canonical_key(path)
-        for index in 0..<described_count:
-            if described_sources[index] == key:
-                strings.release(key)
-                return described_texts[index]
+        if let kept = descriptions.find(key):
+            strings.release(key)
+            return kept
         let executable = try strings.copy(compiler)
         defer strings.release(executable)
         let source_text = try strings.copy(path)
@@ -95,14 +159,41 @@ pub func description(compiler: str, path: str) -> str!:
             if let end = strings.find(diagnostic, "\n"):
                 first = (str)diagnostic.bytes[..<end]
             error(invalid, try strings.copy(first))
+        let found = try take_closure(output, key)
+        return found else error(invalid, "a Base module is absent from its own closure")
+
+## Describe the Base modules `modules` (each its canonical name, path and package source
+## root, in turn) together, in one run of the Base compiler that checks the union of their
+## closures once (`describe-closure --modules`), keeping every module's description and the
+## union's dependency report for `description` and `dependency_report`.
+pub func describe_modules(compiler: str, modules: const str[]) -> !:
+    with memory.heap:
+        var arguments = try alloc c.str[modules.length + 2]
+        defer free(arguments)
+        arguments[0] = "describe-closure"
+        arguments[1] = "--modules"
+        for k in 0..<modules.length:
+            arguments[k + 2] = (c.str)try strings.copy(modules[k])
+        let executable = try strings.copy(compiler)
+        let (status, output, diagnostic) = try process.run((c.str)executable, arguments[..<modules.length + 2])
+        defer process.release(output)
+        defer process.release(diagnostic)
+        if status != 0:
+            error(invalid, try strings.copy(strings.trim(diagnostic)))
+        discard(try take_closure(output, ""))
+
+## Keep every module a closure description describes, and its dependency report for each;
+## the description of the module whose canonical path is `key`, when it is there.
+func take_closure(output: str, key: str) -> str?!:
+    with memory.heap:
         let header = "luce-base-closure-v1\0"
         if not strings.starts_with(output, header):
             error(invalid, "the Base compiler returned an unsupported closure description")
         let text = try strings.copy(output)
         var position = header.length
         var found: str? = none
-        var paths: str[4096]
-        var path_count: usize = 0
+        var paths = try list.List[str].create(64)
+        defer paths.destroy()
         while position < text.length and text.bytes[position] != 0:
             let kind = try field(text, &position)
             if kind != "module":
@@ -112,13 +203,8 @@ pub func description(compiler: str, path: str) -> str!:
             let described = (str)text.bytes[position..<end]
             position = end + 1
             let module_key = try canonical_key(module_path)
-            if described_count < described_sources.length:
-                described_sources[described_count] = module_key
-                described_texts[described_count] = described
-                described_count += 1
-            if path_count < paths.length:
-                paths[path_count] = module_key
-                path_count += 1
+            discard(try descriptions.insert(module_key, described))
+            try paths.push(module_key)
             if module_key == key:
                 found = described
         position += 1
@@ -126,20 +212,16 @@ pub func description(compiler: str, path: str) -> str!:
         let report = (str)text.bytes[position..]
         if not strings.starts_with(report, dependency_header):
             error(invalid, "the Base compiler returned an unsupported dependency format")
-        for index in 0..<path_count:
-            if reported_count < reported_sources.length:
-                reported_sources[reported_count] = paths[index]
-                reported_texts[reported_count] = report
-                reported_count += 1
-        return found else error(invalid, "a Base module is absent from its own closure")
+        for module_key in paths.span():
+            discard(try reports.insert(module_key, report))
+        return found
 
 ## Base's checked dependency report for `source` (`luce-base dependencies`), header and all.
 pub func dependency_report(compiler: str, source: str) -> str!:
     let key = try canonical_key(source)
     defer strings.release(key)
-    for index in 0..<reported_count:
-        if reported_sources[index] == key:
-            return reported_texts[index]
+    if let kept = reports.find(key):
+        return kept
     with memory.heap:
         let executable = try strings.copy(compiler)
         defer strings.release(executable)
@@ -153,10 +235,7 @@ pub func dependency_report(compiler: str, source: str) -> str!:
         if not strings.starts_with(output, dependency_header):
             error(invalid, "the Base compiler returned an unsupported dependency format")
         let text = try strings.copy(output)
-        if reported_count < reported_sources.length:
-            reported_sources[reported_count] = try strings.copy(key)
-            reported_texts[reported_count] = text
-            reported_count += 1
+        discard(try reports.insert(try strings.copy(key), text))
         return text
 
 ## Descriptions name the declaration's canonical module, which may be private to

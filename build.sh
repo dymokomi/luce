@@ -39,5 +39,7 @@ else
     fi
     description=$revision
 fi
+# the compiler Luce is built with is the one it runs, and its version the one it accepts
+python3 tools/embed_toolchain.py "$base" > /dev/null
 "$base" build src/main.lucb --native -o build/luce
 echo "built build/luce ($description)"
