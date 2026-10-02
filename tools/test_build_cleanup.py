@@ -74,8 +74,10 @@ import time
 if sys.argv[1] != "build":
     os.execv(os.environ["REAL_BASE"], [os.environ["REAL_BASE"], *sys.argv[1:]])
 assert sys.argv[1] == "build", sys.argv
-workspace = Path(sys.argv[2]).parent
-assert workspace.parent == Path(os.environ["TMPDIR"])
+# luce runs luce-base inside the workspace and names the entry relative to it
+assert not Path(sys.argv[2]).is_absolute(), sys.argv
+workspace = Path.cwd()
+assert workspace.parent.resolve() == Path(os.environ["TMPDIR"]).resolve()
 assert workspace.stat().st_mode & 0o777 == 0o700
 (Path(os.environ["WORKSPACE_RECORDS"]) / str(os.getpid())).write_text(str(workspace))
 extra = workspace / "partial" / "nested"
@@ -94,7 +96,7 @@ os.execv(os.environ["REAL_BASE"], [os.environ["REAL_BASE"], *sys.argv[1:]])
         WORKSPACE_RECORDS=str(records), OUTSIDE=str(outside))
     failed = dict(probe, FAIL_BUILD="1")
     result = run([COMPILER, "build", source, "-o", output], expected=1, env=failed)
-    assert b"deliberate Base failure" in result.stderr and b"--emit=base" in result.stderr
+    assert b"deliberate Base failure" in result.stderr and b"--emit=base" in result.stderr, result.stderr
     clean()
     result = run([COMPILER, "test", source, "--build"], expected=1, env=failed)
     assert b"deliberate Base failure" in result.stderr
