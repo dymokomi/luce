@@ -72,4 +72,19 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cache-") as tmp:
     build(work / "four" / ("program" + EXE), work, {"LUCE_CACHE": "none"})
     if len(objects()) != 2:
         sys.exit(f"FAIL: LUCE_CACHE=none kept an object: {objects()}")
-print("PASS Luce builds reuse the user's build cache across workspaces, keep a new object for an edit, and none with LUCE_CACHE=none")
+    # past LUCE_CACHE_LIMIT megabytes the objects written longest ago go, the newest stay,
+    # and anything that is not an object is left
+    for n, year in (("a", 2020), ("b", 2021), ("c", 2022)):
+        old = cache / f"{n}-n.o"
+        old.write_bytes(bytes(1048576))
+        stamp = __import__("datetime").datetime(year, 1, 1).timestamp()
+        os.utime(old, (stamp, stamp))
+    (cache / "staging").mkdir()
+    kept_before = objects()
+    build(work / "six" / ("program" + EXE), work, {"LUCE_CACHE_LIMIT": "2"})
+    left = objects()
+    if "a-n.o" in left or "b-n.o" in left or not (cache / "staging").is_dir():
+        sys.exit(f"FAIL: trimming kept the wrong files: {left}")
+    if not set(kept_before) - {"a-n.o", "b-n.o", "c-n.o"} <= set(left) | {"c-n.o"}:
+        sys.exit(f"FAIL: trimming removed this build's objects: {left}")
+print("PASS Luce builds reuse the user's build cache across workspaces, keep a new object for an edit, none with LUCE_CACHE=none, and stay within LUCE_CACHE_LIMIT")
