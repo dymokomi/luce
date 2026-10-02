@@ -154,7 +154,8 @@ A `str` literal is UTF-8 with the escapes `\\ \" \n \r \t \0 \u{HEX}`. A raw lit
 has no escapes. A formatted literal `f"..."` interpolates any expression whose type has a
 display (§10.5); a format spec after `:` is not part of the language and a `{` is written
 `{{`. A field's expression holds no brace of its own: a set or map literal is bound to a
-name first. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
+name first. A field is code, not text: a string inside it is written with plain quotes,
+`f"{name if name != "" else "none"}"`, and a backslash there is an error. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
 `b"..."` admits `\xNN` and is the only place a byte is spelled.
 
 There is no character literal: a text of one scalar is a `str` of length one.
@@ -630,6 +631,7 @@ list, `is` says so, and `.copy()` makes an independent shallow copy. Indexing is
 | `contains(x)`, `index_of(x) -> int?` | search, `x` equatable |
 | `sort()`, `sorted()`, `reverse()`, `reversed()` | in place and as a copy; elements ordered |
 | `map(f)`, `filter(f)`, `join(separator)` | with a function value; `join` on `list[str]` |
+| `indexed()` | in a `for` only: each element with its index, `(int, T)` (§8.3) |
 | `a + b` | a new list of both |
 | `copy()` | a shallow copy |
 
