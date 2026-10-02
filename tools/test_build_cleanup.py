@@ -35,11 +35,11 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cleanup-") as temporary:
     output = work / "products with spaces" / "nested" / "program"
     run([COMPILER, "build", source, "-o", output])
     assert run([output]).stdout == b"42\n"
-    assert list(output.parent.iterdir()) == [output]
+    assert [p.name for p in output.parent.iterdir()] == [output.name]
     clean()
     result = run([COMPILER, "test", source, "--build"])
     assert b"1 passed" in result.stdout
-    assert list((work / "build/tests").iterdir()) == [work / "build/tests/main"]
+    assert [p.name for p in (work / "build/tests").iterdir()] == ["main"]
     clean()
 
     # Explicit emission remains inspectable and rebuildable. A later ordinary
@@ -102,7 +102,7 @@ os.execv(os.environ["REAL_BASE"], [os.environ["REAL_BASE"], *sys.argv[1:]])
     assert b"deliberate Base failure" in result.stderr
     clean()
     assert sentinel.read_text() == "owned by the caller"
-    assert list(outside.iterdir()) == [sentinel]
+    assert [p.name for p in outside.iterdir()] == [sentinel.name]
 
     def parallel(index):
         binary = work / "parallel" / f"program-{index}"

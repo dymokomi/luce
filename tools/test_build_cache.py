@@ -57,7 +57,8 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cache-") as tmp:
     build(work / "two" / ("program" + EXE), elsewhere)
     if objects() != first:
         sys.exit(f"FAIL: the same program built again kept a new object: {objects()}")
-    if list((work / "two").iterdir()) != [work / "two" / ("program" + EXE)]:
+    # by name: Windows spells the same path with either separator
+    if sorted(p.name for p in (work / "two").iterdir()) != ["program" + EXE]:
         sys.exit(f"FAIL: the output directory holds more than the program: {list((work / 'two').iterdir())}")
     # a comment changes nothing Luce emits, so it keeps nothing new; a changed program does
     source.write_text(source.read_text() + "# a comment\n")
