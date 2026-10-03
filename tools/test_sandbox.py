@@ -109,7 +109,7 @@ def main() -> None:
             dependency.mkdir()
             (dependency / "package.prisma").write_text(
                 '#prisma 4.0\ndef package "dependency" {\n    str source = "src"\n'
-                '    def export "secret" {\n        str module = "secret"\n    }\n}\n',
+                '    str[] public = ["secret"]\n}\n',
                 encoding="utf-8",
             )
             (dependency / "src").mkdir()
@@ -122,7 +122,7 @@ def main() -> None:
                 encoding="utf-8",
             )
             program.write_text(
-                "import secret\n\npub func main(arguments: list[str]) -> int!:\n    return secret.value()\n",
+                "import dependency.secret\n\npub func main(arguments: list[str]) -> int!:\n    return secret.value()\n",
                 encoding="utf-8",
             )
             escaped = run("run", "--sandbox", str(root), str(program))

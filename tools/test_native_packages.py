@@ -33,22 +33,22 @@ with tempfile.TemporaryDirectory(prefix='native-package-inputs-') as temporary:
     archive = leaf / 'native/libpackage_bonus.a'
     run('cc', '-c', archive_source, '-o', leaf / 'native/bonus.o')
     run('ar', 'rcs', archive, leaf / 'native/bonus.o')
-    write(leaf, 'package.prisma', '#prisma 4.0\ndef package "leaf" {\n    str source = "src"\n    def export "native_core" {\n        str module = "leaf.core"\n    }\n'
+    write(leaf, 'package.prisma', '#prisma 4.0\ndef package "leaf" {\n    str source = "src"\n    str[] public = ["core"]\n'
           '    def native "inputs" {\n        str[] sources = ["native/source,one.c"]\n        str[] link_search = ["native"]\n        str[] libraries = ["package_bonus"]\n    }\n}\n')
-    write(leaf, 'src/leaf/core.lucb', 'extern func package_value() -> i64\nextern func package_bonus() -> i64\n'
+    write(leaf, 'src/core.lucb', 'extern func package_value() -> i64\nextern func package_bonus() -> i64\n'
           'pub func answer() -> i64:\n    return package_value() + package_bonus()\n')
     middle = root / 'middle'
-    write(middle, 'package.prisma', '#prisma 4.0\ndef package "middle" {\n    str source = "src"\n    def dependency "leaf" {\n        str path = "../leaf"\n    }\n    def export "api" {\n        str module = "middle.api"\n    }\n}\n')
-    write(middle, 'src/middle/api.lucb', 'from native_core import answer\npub func number() -> i64:\n    return answer()\n')
+    write(middle, 'package.prisma', '#prisma 4.0\ndef package "middle" {\n    str source = "src"\n    def dependency "leaf" {\n        str path = "../leaf"\n    }\n    str[] public = ["api"]\n}\n')
+    write(middle, 'src/api.lucb', 'from leaf.core import answer\npub func number() -> i64:\n    return answer()\n')
     app = root / 'app'
     write(app, 'package.prisma', '#prisma 4.0\ndef package "consumer" {\n    str source = "src"\n    def dependency "middle" {\n        str path = "../middle"\n    }\n'
           '    def native "inputs" {\n        str[] sources = ["native/root.c"]\n    }\n}\n')
     write(app, 'native/root.c', '#include <stdint.h>\nint64_t root_value(void) { return 1; }\n')
     write(app, 'src/own.lucb', 'extern func root_value() -> i64\npub func value() -> i64:\n    return root_value()\n')
-    entry = write(app, 'src/main.lucb', 'from api import number\nimport own\npub func main(arguments: str[]) -> i32:\n'
+    entry = write(app, 'src/main.lucb', 'from middle.api import number\nimport own\npub func main(arguments: str[]) -> i32:\n'
                   '    print(f"{number() + own.value()}")\n    return 0\n')
     if luce:
-        entry = write(app, 'src/main.luc', 'from api import number\nimport own\n'
+        entry = write(app, 'src/main.luc', 'from middle.api import number\nimport own\n'
                       'pub func main(arguments: list[str]) -> int!:\n    print(number() + own.value())\n    return 0\n')
     compiler = luce or base
     binary = root / 'app-bin'

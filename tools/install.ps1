@@ -15,7 +15,7 @@
 #   LUCE_INSTALL_URL      the directory the archives are read from; a file:/// URL works
 #   LUCE_INSTALL_NO_PATH  1 leaves the user PATH alone
 $ErrorActionPreference = 'Stop'
-$version = '0.8.33'
+$version = '0.9.0'
 $product = 'luce'
 
 if ($env:LUCE_INSTALL_VERSION) { $version = $env:LUCE_INSTALL_VERSION }
@@ -83,7 +83,15 @@ try {
 
     $expected = ((Get-Content "$archive.sha256" -First 1) -split '\s+')[0].ToLowerInvariant()
     if ($expected -notmatch '^[0-9a-f]{64}$') { Fail 'the published checksum is not a SHA-256 digest' }
-    $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+    # .NET hashes directly: Get-FileHash lives in a module that Windows PowerShell 5.1 cannot
+    # find when PowerShell 7 started it (`luc update` from pwsh passes its own PSModulePath)
+    $stream = [System.IO.File]::OpenRead($archive)
+    try {
+        $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
+    } finally {
+        $stream.Dispose()
+    }
+    $actual = ([System.BitConverter]::ToString($digest) -replace '-', '').ToLowerInvariant()
     if ($actual -ne $expected) { Fail "the archive's checksum does not match the published digest" }
 
     # The checksum authenticates the bytes; the archive is still confined to its own

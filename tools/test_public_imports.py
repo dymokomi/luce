@@ -27,26 +27,30 @@ def run(*args, expected=0):
 
 with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     root = Path(temporary)
-    write(root, 'helper/package.prisma', '#prisma 4.0\ndef package "helper" {\n    def export "measure" {\n        str module = "helper.measure"\n    }\n}\n')
-    write(root, 'helper/src/helper/measure.lucb', 'pub interface Measured:\n    func length() -> i64\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func length(text: str) -> i64:\n    return (i64)text.length\n')
-    write(root, 'library/package.prisma', '#prisma 4.0\ndef package "luce-ui" {\n' + USES_STD + '    def dependency "helper" {\n        str path = "../helper"\n    }\n    def export "ui" {\n        str module = "luce_ui.ui"\n    }\n    def export "controls" {\n        str module = "luce_ui.ui"\n    }\n}\n')
-    write(root, 'library/src/luce_ui/ui.lucb', 'import measure\nimport net\npub type Measured = measure.Measured\npub func version() -> net.IpVersion:\n    return net.IpVersion.ipv4\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func distinct_errors() -> bool:\n    return invalid != measure.invalid\npub struct Button: measure.Measured:\n    var size: i64\n    pub func init(label: str):\n        self.size = measure.length(label)\n    pub func length() -> i64:\n        return self.size\n')
+    write(root, 'helper/package.prisma', '#prisma 4.0\ndef package "helper" {\n    str[] public = ["measure"]\n}\n')
+    write(root, 'helper/src/measure.lucb', 'pub interface Measured:\n    func length() -> i64\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func length(text: str) -> i64:\n    return (i64)text.length\n')
+    write(root, 'library/package.prisma', '#prisma 4.0\ndef package "luce-ui" {\n' + USES_STD + '    def dependency "helper" {\n        str path = "../helper"\n    }\n    str[] public = ["ui"]\n}\n')
+    write(root, 'library/src/ui.lucb', 'import helper.measure\nfrom luce_std import net\npub type Measured = measure.Measured\npub func version() -> net.IpVersion:\n    return net.IpVersion.ipv4\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func distinct_errors() -> bool:\n    return invalid != measure.invalid\npub struct Button: measure.Measured:\n    var size: i64\n    pub func init(label: str):\n        self.size = measure.length(label)\n    pub func length() -> i64:\n        return self.size\n')
     write(root, 'app/package.prisma', '#prisma 4.0\ndef package "demo" {\n' + USES_STD + '    def dependency "luce-ui" {\n        str path = "../library"\n    }\n}\n')
-    entry = write(root, 'app/src/main.luc', 'from ui import Button\nimport controls\nimport ui\nimport math\nimport net\nfunc length(value: ui.Measured) -> int:\n    return value.length()\npub func main(arguments: list[str]) -> int!:\n    let button: controls.Button = Button("pause")\n    assert(button.length() == 5 and length(button) == 5 and ui.distinct_errors())\n    assert(ui.version() == net.IpVersion.ipv4)\n    assert(math.pi > 3.0 and math.sin(0.0) == 0.0)\n    return 0\n')
+    entry = write(root, 'app/src/main.luc', 'from luce_ui.ui import Button\nimport luce_ui.ui as controls\nfrom luce_ui import ui\nfrom luce_std import math, net\nfunc length(value: ui.Measured) -> int:\n    return value.length()\npub func main(arguments: list[str]) -> int!:\n    let button: controls.Button = Button("pause")\n    assert(button.length() == 5 and length(button) == 5 and ui.distinct_errors())\n    assert(ui.version() == net.IpVersion.ipv4)\n    assert(math.pi > 3.0 and math.sin(0.0) == 0.0)\n    return 0\n')
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'consumer')
         run(root / 'consumer')
     original = entry.read_text()
     entry.write_text('import helper.measure\npub func main(arguments: list[str]) -> int:\n    return 0\n')
     rejected = run(COMPILER, 'build', entry, '-o', root / 'consumer', expected=1)
-    assert 'neither local nor a public package export' in rejected.stderr, rejected.stderr
+    assert 'public module of a package it depends on' in rejected.stderr, rejected.stderr
     entry.write_text(original)
     assert sorted(path.name for path in entry.parent.iterdir()) == ['main.luc']
     output = root / 'kept'
     run(COMPILER, 'build', entry, '--emit=base', '-o', output)
     emitted = Path(str(output) + '.base')
     assert not (emitted / 'math.lucb').exists()
-    assert 'def export "measure" {\n        str module = "helper.measure"' in (emitted / 'package.prisma').read_text()
+    # each Base package the program reaches is a package of its own under deps/
+    workspace = (emitted / 'package.prisma').read_text()
+    assert 'def dependency "luce_ui"' in workspace and 'def dependency "helper"' in workspace, workspace
+    assert (emitted / 'deps' / 'luce_ui' / 'ui.lucb').exists() and (emitted / 'deps' / 'helper' / 'measure.lucb').exists()
+    assert 'def dependency "helper"' in (emitted / 'deps' / 'luce_ui' / 'package.prisma').read_text()
     relocated = root / 'relocated'
     shutil.move(emitted, relocated)
     shutil.rmtree(root / 'library')
@@ -55,4 +59,4 @@ with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     for flags in FLAGS:
         run(BASE, 'build', relocated / 'main.lucb', *flags, '-o', root / 'consumer')
         run(root / 'consumer')
-print('PASS public imports, private foreign interfaces, aliases, standard math and relocation; six modes')
+print('PASS package modules: qualified imports, private foreign interfaces, standard packages, per-package emission and relocation; six modes')

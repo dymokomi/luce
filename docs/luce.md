@@ -938,14 +938,17 @@ The package's name is its identity (§12.3), spelled as an identifier (`luce-ui`
 `source` is the root the modules are named from, `src` unless written. The nearest definition
 above the entry module is the program's.
 
-`[dependencies]` maps a dependency's package name to its local directory, relative
-to this manifest. The dependency's `[exports]` maps public import names to modules
-under its source root. For example, `ui = "luce_ui.ui"` exposes
-`src/luce_ui/ui.lucb` as `from ui import Button`; construction is `Button("pause")`.
-Aliases retain the canonical type identity. Conflicting exports are errors.
+`def dependency "name" { str path = "..." }` names a dependency's local directory, relative to
+this manifest. Every package keeps its sources directly under its source root, with no
+directory repeating its name: a module is named by its path there, `src/widgets/button.lucb`
+is `widgets.button`. Inside the package that path is the import; another package names the
+module behind the package's identifier and may import it only when the package lists it in
+`str[] public = [...]`: `import luce_ui.ui`, `from luce_ui import ui` and
+`from luce_ui.ui import Button` all reach `src/ui.lucb` of `luce-ui` when it is public, and
+construction is `Button("pause")`. `import luce_ui` is an error: a package is not a module.
+The standard packages are packages too, `from luce_std import math`.
 Base owns module resolution; Luce invokes the compiler `LUCE_BASE` names, else `luce-base`
 beside the `luce` executable, as a release lays them out, else `luce-base` on the path.
-Standard imports such as `math` use its embedded modules.
 See [the package import contract](../../luce-base/docs/PACKAGE-IMPORTS.md) for complete
 examples and source-bundle relocation. Builds do not fetch dependencies.
 
