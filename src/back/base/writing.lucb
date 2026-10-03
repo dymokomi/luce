@@ -1,0 +1,419 @@
+#==============================================================================================
+#
+#   base/writing - Writing
+#
+#   DESCRIPTION:
+#       Output primitives: indentation, names, and the spelling of Luce types as Base.
+#
+#==============================================================================================
+extend Emitter:
+    # mark: Writing ============================================================================
+
+    mutating func put(text: str) -> !:
+        try self.writer().put(text)
+
+    mutating func line(text: str) -> !:
+        try self.writer().line(text)
+
+    mutating func begin(text: str) -> !:
+        try self.writer().begin(text)
+
+    mutating func end(text: str = "") -> !:
+        try self.writer().put(text)
+        try self.writer().end()
+
+    func fail(node: ast.Node*, what: str) -> never!:
+        return try self.checker.fail(node, what)
+
+    mutating func temp(prefix: str) -> str!:
+        self.temps += 1
+        let half = self.checker.scratch.length // 2
+        # an underscore keeps `i16` and the like from becoming Base's type names
+        let name = try format(self.checker.scratch[half..], f"{prefix}_{self.temps}")
+        return try emission.copy_text(name)
+
+    ## The text written since `start`, taken back out of the output.
+    mutating func capture(start: usize) -> str!:
+        let text = try emission.copy_text((str)self.out.bytes()[start..])
+        self.out.used = start
+        return text
+
+    ## A statement's text wrapped in a mark and a drain when it pooled a temporary.
+    mutating func drained(start: usize, pooled_before: bool) -> !:
+        try self.drained_unless(start, pooled_before, false)
+
+    ## `drained`, except that a statement every path of which leaves the function gets no
+    ## drain after it: Base would see the function's end reachable through the dead line,
+    ## and the caller's next drain releases what such a statement pooled. `reserved` is the
+    ## mark's name when a jump inside the statement already drains it by that name; when
+    ## the statement pooled nothing, those drains are taken out again.
+    mutating func drained_unless(start: usize, pooled_before: bool, terminal: bool, reserved: str = "") -> !:
+        if not self.pooled and reserved.length > 0:
+            try self.strip_drains(start, reserved)
+        if self.pooled:
+            let text = try self.capture(start)
+            let m = reserved if reserved.length > 0 else try self.temp("mark")
+            try self.begin("let ")
+            try self.put(m)
+            try self.put(" = heap.mark()")
+            try self.end()
+            if self.fallible:
+                try self.begin("errdefer heap.drain(")
+                try self.put(m)
+                try self.put(")")
+                try self.end()
+            if self.prelude.used > self.prelude_floor:
+                try self.put((str)self.prelude.bytes()[self.prelude_floor..])
+                self.prelude.used = self.prelude_floor
+            try self.put(text)
+            if not terminal:
+                try self.begin("heap.drain(")
+                try self.put(m)
+                try self.put(")")
+                try self.end()
+        self.hoisted_nodes.count = self.hoisted_floor
+        self.hoisted_names.count = self.hoisted_floor
+        self.pooled = pooled_before
+
+    ## The lines `heap.drain(name)` written since `start` taken back out: the jumps that
+    ## drained a statement which in the end has no mark.
+    mutating func strip_drains(start: usize, name: str) -> !:
+        let text = try self.capture(start)
+        let half = self.checker.scratch.length // 2
+        let wanted = try emission.copy_text(try format(self.checker.scratch[half..], f"heap.drain({name})"))
+        var at: usize = 0
+        while at < text.length:
+            var end = at
+            while end < text.length and text.bytes[end] != u8(10):
+                end += 1
+            let line = (str)text.bytes[at..<end]
+            var first: usize = 0
+            while first < line.length and line.bytes[first] == u8(32):
+                first += 1
+            if (str)line.bytes[first..] != wanted:
+                try self.out.put(line)
+                if end < text.length:
+                    try self.out.put("\n")
+            at = end + 1
+
+    ## A statement opens: a `break`, `continue` or `return` inside it may need to drain it.
+    mutating func open_frame(s: ast.Node*) -> !:
+        try self.frame_nodes.push(s)
+        try self.frame_marks.push("")
+
+    ## The statement closes: the name its mark takes, when a jump inside it reserved one.
+    mutating func close_frame() -> str:
+        self.frame_nodes.count -= 1
+        self.frame_marks.count -= 1
+        return self.frame_marks.items[self.frame_marks.count]
+
+    ## Before a `break` or `continue` leaving to `target`, or a `return` (no target): a
+    ## drain of every statement open between the jump and where it lands, innermost first,
+    ## so that a statement's temporaries die when it ends, however it ends (RUNTIME 5).
+    ## The jump's own statement is the innermost one, and drains itself. Whether any was
+    ## written.
+    mutating func drain_open_statements(target: ast.Node*?) -> bool!:
+        var low: usize = 0
+        if let loop = target:
+            var k = self.frame_nodes.count
+            while k > 0:
+                k -= 1
+                if self.frame_nodes.get(k) == loop:
+                    low = k + 1
+                    break
+        if self.frame_nodes.count < 1:
+            return false
+        var i = self.frame_nodes.count - 1
+        var wrote = false
+        while i > low:
+            i -= 1
+            var name = self.frame_marks.get(i)
+            if name.length == 0:
+                name = try self.temp("mark")
+                self.frame_marks.set(i, name)
+            try self.begin("heap.drain(")
+            try self.put(name)
+            try self.end(")")
+            wrote = true
+        return wrote
+
+    ## Synthetic handler loops must not intercept source `break` or `continue`.
+    mutating func loop_name(loop: ast.Node*) -> str!:
+        if loop.text.length > 0:
+            return loop.text
+        let half = self.checker.scratch.length // 2
+        return try emission.copy_text(try format(self.checker.scratch[half..], f"L_loop_{loop.module}_{loop.start}"))
+
+    ## Operand preludes remain in this scope. A defer drains partial values on
+    ## success, failure and loop exits; the destination receives its own value.
+    mutating func scoped_value(e: ast.Node*, destination: str) -> !:
+        let start = self.out.used
+        let saved_prelude = self.prelude_floor
+        let saved_hoisted = self.hoisted_floor
+        let first = self.prelude.used
+        let nodes = self.hoisted_nodes.count
+        let pooled_before = self.pooled
+        self.prelude_floor = first
+        self.hoisted_floor = nodes
+        self.pooled = false
+        try self.begin("")
+        if e.type_id != types.unit_id and e.type_id != types.never_id:
+            try self.put(destination)
+            try self.put(" = ")
+        elif e.type_id == types.unit_id:
+            try self.put("discard(")
+        try self.owned(e)
+        if e.type_id == types.unit_id:
+            try self.put(")")
+        try self.end()
+        let text = try self.capture(start)
+        if self.pooled:
+            let mark = try self.temp("scope")
+            try self.begin("let ")
+            try self.put(mark)
+            try self.end(" = heap.mark()")
+            try self.begin("defer heap.drain(")
+            try self.put(mark)
+            try self.end(")")
+        if self.prelude.used > first:
+            try self.put((str)self.prelude.bytes()[first..])
+            self.prelude.used = first
+        try self.put(text)
+        self.hoisted_nodes.count = nodes
+        self.hoisted_names.count = nodes
+        self.prelude_floor = saved_prelude
+        self.hoisted_floor = saved_hoisted
+        self.pooled = pooled_before
+
+    ## Own an error before leaving its operand scope: draining temporaries must
+    ## not invalidate its message. With no local destination, forward it normally.
+    mutating func propagate(e: ast.Node*) -> !:
+        let inner = e.left else return
+        try self.put("(")
+        if self.failure_label.length == 0:
+            try self.put("try ")
+            try self.expr(inner)
+            try self.put(")")
+            return
+        try self.expr(inner)
+        let raw = try self.temp("raw_failure")
+        try self.put(" catch ")
+        try self.put(raw)
+        try self.end(":")
+        self.indent += 1
+        try self.begin(self.failure_name)
+        try self.put(" = kernel.catch_failure(")
+        try self.put(raw)
+        try self.put(".code, ")
+        try self.put(raw)
+        try self.end(".message)")
+        try self.begin("break ")
+        try self.put(self.failure_label)
+        try self.end()
+        self.indent -= 1
+        try self.begin(")")
+
+    ## A catch evaluates its operand in a separate lexical region. Failure ends
+    ## that region before the handler starts; the handler uses the outer edge.
+    mutating func handled_expression(e: ast.Node*) -> !:
+        let operand = e.left else return
+        let body = e.body else return
+        let result = try self.temp("handled")
+        let done = try self.temp("handler_done")
+        let failed = try self.temp("handler_error")
+        let evaluating = try self.temp("operand_done")
+        let start = self.out.used
+        let has_value = e.type_id != types.unit_id and e.type_id != types.never_id
+        if has_value:
+            try self.begin("var ")
+            try self.put(result)
+            try self.put(": ")
+            try self.type_of(e.type_id)
+            try self.end(" = ---")
+        try self.begin(done)
+        try self.end(": while true:")
+        self.indent += 1
+        try self.begin("var ")
+        try self.put(failed)
+        try self.end(": kernel.Failure? = none")
+        try self.begin(evaluating)
+        try self.end(": while true:")
+        self.indent += 1
+        let saved_failure_label = self.failure_label
+        let saved_failure_name = self.failure_name
+        self.failure_label = evaluating
+        self.failure_name = failed
+        try self.scoped_value(operand, result)
+        self.failure_label = saved_failure_label
+        self.failure_name = saved_failure_name
+        if operand.type_id != types.never_id:
+            try self.begin("break ")
+            try self.put(done)
+            try self.end()
+        self.indent -= 1
+        let caught = try self.temp("caught") if e.text.length == 0 else try emission.copy_text(try format(self.checker.scratch[self.checker.scratch.length // 2..], f"L_{e.text}"))
+        try self.begin("let ")
+        try self.put(caught)
+        try self.put(" = ")
+        try self.put(failed)
+        try self.end(" else trap(\"missing handled failure\")")
+        try self.begin("defer kernel.drop_failure(")
+        try self.put(caught)
+        try self.end(")")
+        let saved_recover_label = self.recover_label
+        let saved_recover_name = self.recover_name
+        self.recover_label = done
+        self.recover_name = result if has_value else ""
+        try self.block(body)
+        self.recover_label = saved_recover_label
+        self.recover_name = saved_recover_name
+        if e.type_id == types.unit_id and not self.exits(body):
+            try self.begin("break ")
+            try self.put(done)
+            try self.end()
+        self.indent -= 1
+        try self.finish_region(start, result, e.type_id)
+
+    ## Register a region's owned result before any later operand runs. Its reader
+    ## receives a copy; the statement drains the region's original on every exit.
+    mutating func finish_region(start: usize, result: str, t: u32) -> !:
+        let refs = self.checker.table.has_references(t)
+        if refs:
+            try self.begin(result)
+            try self.put(" = ")
+            try self.put(try self.lifetime_name("L_pool_", t))
+            try self.put("(")
+            try self.put(result)
+            try self.end(")")
+        let text = try self.capture(start)
+        try self.prelude.put(text)
+        self.pooled = true
+        if refs:
+            try self.put(try self.lifetime_name("L_copy_", t))
+            try self.put("(")
+        if t == types.unit_id:
+            try self.put("discard(0)")
+        elif t == types.never_id:
+            try self.put("trap(\"unreachable expression result\")")
+        else:
+            try self.put(result)
+        if refs:
+            try self.put(")")
+
+    mutating func region_variable(name: str, t: u32) -> !:
+        if t == types.unit_id or t == types.never_id:
+            return
+        try self.begin("var ")
+        try self.put(name)
+        try self.put(": ")
+        try self.type_of(t)
+        try self.end(" = ---")
+
+    ## Branch-local preludes must run only after that branch is selected. Keeping
+    ## them in ordinary Base scopes also gives their temporary owners exact exits.
+    mutating func lazy_expression(e: ast.Node*) -> !:
+        let left = e.left else return
+        let right = e.right else return
+        let result = try self.temp("selected")
+        let start = self.out.used
+        try self.region_variable(result, e.type_id)
+        try self.line("if true:")
+        self.indent += 1
+        if e.kind == ast.Kind.binary:
+            try self.scoped_value(left, result)
+            try self.begin("if " if e.text == "and" else "if not ")
+            try self.put(result)
+            try self.end(":")
+            self.indent += 1
+            try self.scoped_value(right, result)
+            self.indent -= 1
+        elif e.kind == ast.Kind.conditional:
+            let condition = e.ty else return
+            let choice = try self.temp("choice")
+            try self.region_variable(choice, types.bool_id)
+            try self.scoped_value(condition, choice)
+            try self.begin("if ")
+            try self.put(choice)
+            try self.end(":")
+            self.indent += 1
+            try self.scoped_value(left, result)
+            self.indent -= 1
+            try self.line("else:")
+            self.indent += 1
+            try self.scoped_value(right, result)
+            self.indent -= 1
+        else:
+            try self.unwrap_region(left, right, result, e.type_id)
+        self.indent -= 1
+        try self.finish_region(start, result, e.type_id)
+
+    ## The inside of `optional else fallback`'s region: `result` takes a copy of the value
+    ## when there is one, else the fallback's value, or the fallback leaves. A read of a
+    ## binding no code in the region can replace is unwrapped where it is, not through a copy
+    ## of its own that is let go of at once, which would count as a release and make the
+    ## object a candidate of the collector where the interpreter makes none (RUNTIME, Cycles).
+    mutating func unwrap_region(left: ast.Node*, right: ast.Node*, result: str, t: u32) -> !:
+        let present = try self.temp("present")
+        let refs = self.checker.table.has_references(t)
+        var optional = ""
+        if self.plain_binding(left):
+            let start = self.out.used
+            try self.expr(left)
+            optional = try self.capture(start)
+        else:
+            optional = try self.temp("optional")
+            try self.region_variable(optional, left.type_id)
+            try self.scoped_value(left, optional)
+            if refs:
+                try self.begin("defer ")
+                try self.put(try self.lifetime_name("L_drop_", left.type_id))
+                try self.put("(")
+                try self.put(optional)
+                try self.end(")")
+        try self.begin("if let ")
+        try self.put(present)
+        try self.put(" = ")
+        try self.put(optional)
+        try self.end(":")
+        self.indent += 1
+        try self.begin(result)
+        try self.put(" = ")
+        if refs:
+            try self.put(try self.lifetime_name("L_copy_", t))
+            try self.put("(")
+        try self.put(present)
+        if refs:
+            try self.put(")")
+        try self.end()
+        self.indent -= 1
+        try self.line("else:")
+        self.indent += 1
+        if right.kind == ast.Kind.return_ or right.kind == ast.Kind.break_ or right.kind == ast.Kind.continue_:
+            try self.statement(right)
+        else:
+            try self.scoped_value(right, result)
+        self.indent -= 1
+
+    ## Whether every path through the statement leaves the function, as the checker
+    ## decided (§7.1): a `return`, a call that never returns, a `match` whose arms all do
+    ## (`flag_all_exit`), an `if` whose branches all do, a block whose last statement does.
+    func exits(s: ast.Node*) -> bool:
+        match s.kind:
+            .return_: return true
+            .match_: return s.has(ast.flag_all_exit)
+            .expr_stmt:
+                let e = s.left else return false
+                return e.type_id == types.never_id
+            .if_:
+                let body = s.body else return false
+                let rest = s.right else return false
+                return self.exits(body) and self.exits(rest)
+            .block:
+                var last: ast.Node*? = none
+                var cursor = s.body
+                while let st = cursor:
+                    last = st
+                    cursor = st.next
+                let l = last else return false
+                return self.exits(l)
+            _: return false

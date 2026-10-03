@@ -1,0 +1,489 @@
+#==============================================================================================
+#
+#   base/calls - Calls
+#
+#   DESCRIPTION:
+#       Calls to functions, methods, list, text and map methods, function values, and the
+#       core functions.
+#
+#==============================================================================================
+extend Emitter:
+    # mark: Calls ==============================================================================
+
+    ## A later call can change an earlier read, and can create branch-local
+    ## preludes. Freeze the eager arguments before parameter-order emission.
+    func arguments_call(args: ast.Node*?) -> bool:
+        var cursor = args
+        while let arg = cursor:
+            if self.has_call(arg.left) or self.may_fail(arg.left):
+                return true
+            cursor = arg.next
+        return false
+
+    mutating func sequence_arguments(args: ast.Node*?) -> !:
+        if not self.arguments_call(args):
+            return
+        var cursor = args
+        while let arg = cursor:
+            let value = arg.left else return
+            try self.hold_operand(value)
+            cursor = arg.next
+
+    ## A struct method borrows a location. Keep its owner/indices stable without
+    ## replacing that location with a value copy before a mutating call.
+    mutating func pin_place(place: ast.Node*) -> !:
+        if place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.struct_:
+                try self.pin_place(receiver)
+            else:
+                try self.hold_operand(receiver)
+        elif place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            try self.hold_operand(receiver)
+            try self.hold_operand(index)
+
+    mutating func call(e: ast.Node*) -> !:
+        let callee = e.left else return
+        if callee.kind == ast.Kind.name and callee.resolved == none and self.checker.find_declaration(callee.text) == none:
+            if callee.text != "print" and callee.text != "assert":
+                try self.sequence_arguments(e.body)
+            try self.core_call(e, callee.text)
+            return
+        if callee.kind == ast.Kind.member and callee.text == "package":
+            let first = e.body else return
+            let v = first.left else return
+            try self.put("ErrorCode.package(")
+            try self.put(v.text)
+            try self.put(")")
+            return
+        if callee.kind == ast.Kind.case_value:
+            try self.sequence_arguments(e.body)
+            try self.case_value(callee, e.body)
+            return
+        if self.arguments_call(e.body):
+            if self.checker.table.kind(callee.type_id) == types.Kind.func_ and e.resolved == none:
+                try self.hold_operand(callee)
+            elif callee.kind == ast.Kind.member:
+                let receiver = callee.left else return
+                let kind = self.checker.table.kind(receiver.type_id)
+                if kind == types.Kind.struct_:
+                    try self.pin_place(receiver)
+                elif kind != types.Kind.module and kind != types.Kind.type_name:
+                    try self.hold_operand(receiver)
+            try self.sequence_arguments(e.body)
+        if callee.has(ast.flag_builtin):
+            let k = self.checker.table.kind(callee.type_id)
+            if k == types.Kind.map_ or k == types.Kind.set_:
+                try self.map_method(e, callee, k == types.Kind.map_)
+            elif k == types.Kind.str_ or k == types.Kind.bytes_:
+                try self.text_method(e, callee)
+            else:
+                try self.list_method(e, callee)
+            return
+        if callee.kind == ast.Kind.member and callee.text == "get" and self.checker.table.kind(callee.type_id) == types.Kind.weak_:
+            # `weak.get()`: the object with a reference of its own, or none (§10.4)
+            let receiver = callee.left else return
+            let elem = self.checker.table.get(callee.type_id).elem
+            try self.put(try self.lifetime_name("L_weak_get_", elem))
+            try self.put("(")
+            try self.use(receiver)
+            try self.put(")")
+            return
+        let d = e.resolved else return try self.call_value(e, callee)
+        match d.kind:
+            .enum_case:
+                let owner = callee.left else return
+                if let od = owner.resolved:
+                    # the enum by its declaration: an instance of a generic one has its own name
+                    try self.put("L_")
+                    try self.put(self.type_name(od))
+                else:
+                    try self.expr(owner)
+                try self.put(".L_")
+                try self.put(d.text)
+                try self.arguments(e, d.body, false, true)
+            .struct_:
+                if d.has(ast.flag_base):
+                    try self.put(try self.native_call_name(e))
+                    try self.base_arguments(e, d)
+                else:
+                    try self.put("L_")
+                    try self.put(self.type_name(d))
+                    try self.arguments(e, d.body, false, true)
+            .class_:
+                if d.native_object != none:
+                    try self.put(try self.native_call_name(e))
+                    try self.base_arguments(e, d)
+                    return
+                # a class with defaults for every field and no `init`
+                try self.put("L_")
+                try self.put(self.type_name(d))
+                try self.put("__new()")
+            .func_:
+                if d.text == "init":
+                    if d.has(ast.flag_base):
+                        try self.put(try self.native_call_name(e))
+                        try self.base_arguments(e, d)
+                        return
+                    let owner = callee.resolved else return try self.fail(e, "no class")
+                    try self.put("L_")
+                    try self.put(self.type_name(owner))
+                    try self.put("__new")
+                    try self.arguments(e, d.right, true, false)
+                    return
+                if d.has(ast.flag_base) and d.resolved != none:
+                    try self.put(try self.native_call_name(e))
+                    try self.base_arguments(e, d)
+                    return
+                if check.has_self(d):
+                    let receiver = callee.left else return
+                    let owner = self.checker.table.get(receiver.type_id)
+                    if owner.kind == types.Kind.enum_ or owner.kind == types.Kind.class_ or owner.kind == types.Kind.interface_:
+                        try self.put("L_")
+                        try self.put(owner.name)
+                        try self.put("__L_")
+                        try self.put(d.text)
+                        try self.put("(")
+                        try self.use(receiver)
+                        if ast.count(d.right) > 1:
+                            try self.put(", ")
+                        try self.arguments_bare(e, d.right, true, false)
+                        try self.put(")")
+                        return
+                    try self.use(receiver)
+                    try self.put(".L_")
+                    try self.put(d.text)
+                    try self.arguments(e, d.right, true, false)
+                    return
+                if d.has(ast.flag_base) and ast.count(e.body) < ast.count(d.right):
+                    try self.put(try self.native_call_name(e))
+                elif callee.kind == ast.Kind.member and (callee.left else return).type_id != 0 and self.checker.table.kind((callee.left else return).type_id) != types.Kind.module:
+                    let receiver = callee.left else return
+                    let owner = self.checker.table.get(receiver.type_id).decl else return
+                    try self.put("L_")
+                    try self.put(self.type_name(owner))
+                    try self.put("__L_" if owner.kind == ast.Kind.enum_ or owner.kind == ast.Kind.class_ else ".L_")
+                    try self.put(d.text)
+                else:
+                    try self.put("L_")
+                    try self.put(try self.decl_name(d))
+                if d.has(ast.flag_base):
+                    try self.base_arguments(e, d)
+                    return
+                try self.arguments(e, d.right, true, false)
+            _: return try self.fail(e, "a call this slice does not compile")
+
+    ## A list's own method (§11.1), one kernel call each.
+    mutating func list_method(e: ast.Node*, callee: ast.Node*) -> !:
+        let receiver = callee.left else return
+        let lt = self.checker.table.get(callee.type_id)
+        let name = callee.text
+        if name == "join":
+            try self.put("kernel.list_join(")
+        elif name == "map":
+            try self.put("kernel.list_map[")
+            try self.type_of(lt.elem)
+            try self.put(", ")
+            try self.type_of(self.checker.table.get(e.type_id).elem)
+            try self.put("](")
+        else:
+            try self.put("kernel.list_")
+            try self.put(name)
+            try self.put("[")
+            try self.type_of(lt.elem)
+            try self.put("](")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            # a stored value is the list's own; anything else is borrowed for the call
+            if name == "append" or name == "insert":
+                try self.owned(v)
+            else:
+                try self.use(v)
+            cursor = a.next
+        if name == "map":
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(self.checker.table.get(e.type_id).elem))
+        try self.put(")")
+
+    ## A text's or bytes' own method (§11.3, §11.4), one kernel call each.
+    mutating func text_method(e: ast.Node*, callee: ast.Node*) -> !:
+        let receiver = callee.left else return
+        let name = callee.text
+        if callee.type_id == types.bytes_id:
+            try self.put("kernel.decode_text(")
+            try self.use(receiver)
+            try self.put(")")
+            return
+        if name == "contains":
+            try self.put("kernel.contains(")
+        elif name == "bytes":
+            try self.put("kernel.text_to_bytes(")
+            try self.use(receiver)
+            try self.put(")")
+            return
+        else:
+            try self.put("kernel.")
+            try self.put(name)
+            try self.put("(")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            try self.use(v)
+            cursor = a.next
+        if name == "split" or name == "lines":
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(types.str_id))
+        try self.put(")")
+
+    ## `K, V` of a map, or `T, unit` of a set, as type arguments.
+    mutating func map_types(id: u32) -> !:
+        let t = self.checker.table.get(id)
+        try self.type_of(t.elem)
+        try self.put(", ")
+        if t.kind == types.Kind.map_:
+            try self.type_of(self.checker.table.map_value(id))
+        else:
+            try self.put("u8")
+
+    ## A map's or a set's own method (§11.2), one kernel call each.
+    mutating func map_method(e: ast.Node*, callee: ast.Node*, is_map: bool) -> !:
+        let receiver = callee.left else return
+        let name = callee.text
+        if is_map or name == "clear" or name == "copy":
+            try self.put("kernel.map_")
+            try self.put(name)
+        else:
+            try self.put("kernel.set_")
+            try self.put(name)
+        try self.put("[")
+        if is_map or name == "clear" or name == "copy":
+            try self.map_types(callee.type_id)
+        else:
+            try self.type_of(self.checker.table.get(callee.type_id).elem)
+        try self.put("](")
+        try self.use(receiver)
+        var cursor = e.body
+        while let a = cursor:
+            let v = a.left else return
+            try self.put(", ")
+            if name == "insert":
+                try self.owned(v)
+            else:
+                try self.use(v)
+            cursor = a.next
+        if name == "keys" or name == "values" or name == "items":
+            # a new list: its descriptor and its element operations
+            let result = self.checker.table.get(e.type_id)
+            try self.put(", &")
+            try self.put(try self.lifetime_name("L_info_", e.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(result.elem))
+        try self.put(")")
+
+    ## A call through a function value: the closure's code, its object first (§7.4).
+    mutating func call_value(e: ast.Node*, callee: ast.Node*) -> !:
+        try self.put(try self.call_name(callee.type_id))
+        try self.put("(")
+        try self.use(callee)
+        var cursor = e.body
+        while let a = cursor:
+            try self.put(", ")
+            let v = a.left else return
+            try self.use(v)
+            cursor = a.next
+        try self.put(")")
+
+    ## `(a, b, c)` in parameter order, defaults filled in; a call borrows its arguments,
+    ## a construction owns them (`own`).
+    mutating func arguments(e: ast.Node*, params: ast.Node*?, skip_self: bool, own: bool) -> !:
+        try self.put("(")
+        try self.arguments_bare(e, params, skip_self, own)
+        try self.put(")")
+
+    mutating func arguments_bare(e: ast.Node*, params: ast.Node*?, skip_self: bool, own: bool) -> !:
+        var hoisted = false
+        if own and not self.in_constant:
+            var a = e.body
+            while let arg = a:
+                if self.may_fail(arg.left) or self.has_call(arg.left):
+                    hoisted = true
+                a = arg.next
+        if hoisted:
+            # in source order, each argument a temporary; the defaults are constants
+            var a = e.body
+            while let arg = a:
+                let v = arg.left else return
+                arg.text = try self.hoist(v, true)
+                a = arg.next
+        var first = true
+        var cursor = params
+        while let p = cursor:
+            if (p.kind == ast.Kind.param or p.kind == ast.Kind.field) and not (skip_self and p.text == "self"):
+                if not first:
+                    try self.put(", ")
+                first = false
+                var found = false
+                var a = e.body
+                while let arg = a:
+                    if arg.resolved == p:
+                        let v = arg.left else return
+                        if hoisted:
+                            try self.put(arg.text)
+                        elif own:
+                            try self.owned(v)
+                        else:
+                            try self.use(v)
+                        found = true
+                    a = arg.next
+                if not found:
+                    let d = p.left else return try self.fail(e, "a missing argument")
+                    if own:
+                        try self.owned(d)
+                    else:
+                        try self.use(d)
+            cursor = p.next
+
+    mutating func case_value(e: ast.Node*, args: ast.Node*?) -> !:
+        let case_node = e.resolved else return try self.fail(e, "an unresolved case")
+        var t = self.checker.table.get(e.type_id)
+        if t.kind == types.Kind.optional:
+            t = self.checker.table.get(t.elem)
+        try self.put("L_")
+        try self.put(t.name)
+        try self.put(".L_")
+        try self.put(case_node.text)
+        if case_node.body != none:
+            let saved = e.body
+            e.body = args
+            try self.arguments(e, case_node.body, false, true)
+            e.body = saved
+
+    ## The address of an object, or zero, as a `usize`.
+    mutating func identity(e: ast.Node*) -> !:
+        if e.kind == ast.Kind.literal and e.text == "none":
+            try self.put("0")
+            return
+        try self.put(try self.lifetime_name("L_id_", e.type_id))
+        try self.put("(")
+        try self.use(e)
+        try self.put(")")
+
+    ## `print`, `assert`, `trap`, `error`, `discard`, the conversions.
+    mutating func core_call(e: ast.Node*, name: str) -> !:
+        if name == "print":
+            try self.put("kernel.print_line(")
+            let n = ast.count(e.body)
+            if n == 1:
+                let first = e.body else return
+                let v = first.left else return
+                try self.put(try self.shown_operand(v))
+            else:
+                # the joined line is a fresh text of the statement's
+                try self.put(try self.lifetime_name("L_pool_", types.str_id))
+                try self.put("(kernel.join([")
+                self.pooled = true
+                var cursor = e.body
+                var first = true
+                while let a = cursor:
+                    if not first:
+                        try self.put(", ")
+                        try self.put(try self.text_ref(" ", false))
+                        try self.put(", ")
+                    first = false
+                    let v = a.left else return
+                    try self.put(try self.shown_operand(v))
+                    cursor = a.next
+                if n == 0:
+                    try self.put(try self.text_ref("", false))
+                try self.put("]))")
+            try self.put(")")
+            return
+        let first = e.body else return
+        let arg = first.left else return
+        if name == "assert":
+            let start = self.out.used
+            let condition = try self.temp("asserted")
+            try self.region_variable(condition, types.bool_id)
+            try self.scoped_value(arg, condition)
+            try self.begin("if not ")
+            try self.put(condition)
+            try self.end(":")
+            self.indent += 1
+            if let second = first.next:
+                let message = second.left else return
+                let text = try self.temp("assert_message")
+                try self.region_variable(text, types.str_id)
+                try self.scoped_value(message, text)
+                try self.begin("trap(kernel.concat(")
+                try self.put(try self.text_ref("assert failed: ", false))
+                try self.put(", ")
+                try self.put(text)
+                try self.end(").data)")
+            else:
+                try self.line("trap(\"assert failed\")")
+            self.indent -= 1
+            try self.finish_region(start, "", types.unit_id)
+            return
+        if name == "trap":
+            try self.put("trap((")
+            try self.use(arg)
+            try self.put(").data)")
+            return
+        if name == "error":
+            # Hold the text through Base propagation; the catching Luce value takes ownership.
+            let second = first.next else return
+            let m = second.left else return
+            try self.put("kernel.fail(")
+            try self.use(arg)
+            try self.put(", ")
+            try self.use(m)
+            try self.put(")")
+            return
+        if name == "discard":
+            try self.put("discard(")
+            try self.use(arg)
+            try self.put(")")
+            return
+        if name == "Weak":
+            try self.put("heap.weak_make((heap.Object*)")
+            try self.use(arg)
+            try self.put(")")
+            return
+        if name == "hash":
+            try self.put("(i64)")
+            try self.put(try self.hash_name(arg.type_id))
+            try self.put("(")
+            try self.use(arg)
+            try self.put(")")
+            return
+        let t = arg.type_id
+        if name == "int":
+            try self.put("kernel.to_int(" if t == types.float_id else "kernel.parse_int(")
+            try self.use(arg)
+            try self.put(")")
+            return
+        if name == "float":
+            try self.put("f64(" if t == types.int_id else "kernel.parse_float(")
+            try self.use(arg)
+            try self.put(")")
+            return
+        if name == "bool":
+            try self.put("kernel.parse_bool(")
+            try self.use(arg)
+            try self.put(")")
+            return
+        if name == "str":
+            try self.shown_value(arg)
+            return
+        return try self.fail(e, "a core call this slice does not compile")

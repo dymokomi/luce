@@ -1,0 +1,1038 @@
+#==============================================================================================
+#
+#   base/statements - Statements
+#
+#   DESCRIPTION:
+#       Each Luce statement as Base: bindings, assignment, control flow, and loops.
+#
+#==============================================================================================
+extend Emitter:
+    # mark: Statements =========================================================================
+
+    pub mutating func type_of(id: u32) -> !:
+        try self.writer().type_of(id)
+
+    mutating func block(b: ast.Node*) -> !:
+        if b.body == none:
+            try self.line("discard(0)")
+            return
+        var cursor = b.body
+        while let s = cursor:
+            try self.statement(s)
+            cursor = s.next
+
+    ## One statement; whatever it pooled is drained when it ends (RUNTIME 5).
+    ## `#: file:line:column` names what the statement's lines were compiled from (base.md
+    ## §3.3), and `heap.site` the same for the kernel's own traps (§12.4).
+    mutating func position_lines(s: ast.Node*) -> !:
+        let module = self.checker.modules.get((usize)s.module)
+        let (line, column) = module.src.position(ast.statement_start(s))
+        let room = try alloc u8[module.path.length + 24]
+        let where = try format(room, f"{module.path}:{line}:{column}")
+        try self.begin("#: ")
+        try self.put(where)
+        try self.end()
+        try self.begin("heap.site = ")
+        try self.text_literal(where, false)
+        try self.end()
+
+    ## A function's statements name their own positions; the caller's is back on return,
+    ## and the lines after the body are the program's own again.
+    mutating func site_prologue() -> !:
+        if self.frame_nodes.count != 0:
+            trap("a function body was written inside a statement")
+        let saved = try self.temp("site")
+        try self.begin("let ")
+        try self.put(saved)
+        try self.put(" = heap.site")
+        try self.end()
+        try self.begin("defer heap.restore_site(")
+        try self.put(saved)
+        try self.put(")")
+        try self.end()
+
+    mutating func restore_operand_scope(prelude_floor: usize, hoisted_floor: usize):
+        self.prelude_floor = prelude_floor
+        self.hoisted_floor = hoisted_floor
+
+    mutating func statement(s: ast.Node*) -> !:
+        let saved_prelude_floor = self.prelude_floor
+        let saved_hoisted_floor = self.hoisted_floor
+        self.prelude_floor = self.prelude.used
+        self.hoisted_floor = self.hoisted_nodes.count
+        defer self.restore_operand_scope(saved_prelude_floor, saved_hoisted_floor)
+        try self.position_lines(s)
+        let start = self.out.used
+        let pooled_before = self.pooled
+        self.pooled = false
+        try self.open_frame(s)
+        match s.kind:
+            .let_, .var_: try self.binding(s)
+            .assign: try self.assign(s)
+            .if_: try self.if_statement(s)
+            .while_: try self.while_statement(s)
+            .for_: try self.for_statement(s)
+            .match_: try self.match_statement(s)
+            .with_: try self.with_statement(s)
+            .return_: try self.return_statement(s)
+            .break_, .continue_:
+                discard(try self.drain_open_statements(s.resolved))
+                try self.begin("break" if s.kind == ast.Kind.break_ else "continue")
+                if let loop = s.resolved:
+                    try self.put(" ")
+                    try self.put(try self.loop_name(loop))
+                try self.end()
+            .recover_:
+                let v = s.left else return
+                if self.recover_label.length == 0:
+                    return try self.fail(s, "a checked recovery has no handler")
+                try self.scoped_value(v, self.recover_name)
+                try self.begin("break ")
+                try self.put(self.recover_label)
+                try self.end()
+            .expr_stmt:
+                let e = s.left else return
+                try self.begin("")
+                if e.type_id != types.unit_id and e.type_id != types.never_id:
+                    try self.put("discard(")
+                    try self.use(e)
+                    try self.put(")")
+                else:
+                    try self.use(e)
+                try self.end()
+            _: return try self.fail(s, "a statement this slice does not compile")
+        let reserved = self.close_frame()
+        try self.drained_unless(start, pooled_before, self.exits(s), reserved)
+
+    ## `defer` the drop of a binding that owns references, right after it.
+    mutating func drop_at_exit(name: str, t: u32) -> !:
+        if not self.checker.table.has_references(t):
+            return
+        try self.begin("defer ")
+        try self.put(try self.lifetime_name("L_drop_", t))
+        try self.put("(L_")
+        try self.put(name)
+        try self.put(")")
+        try self.end()
+
+    ## `return e`: the value is owned by the caller; the statement's temporaries die after
+    ## it is computed and before the function's bindings, and so do those of the statements
+    ## the `return` is inside (RUNTIME 5).
+    mutating func return_statement(s: ast.Node*) -> !:
+        if s.left == none:
+            discard(try self.drain_open_statements(none))
+            return try self.line("return")
+        let v = s.left else return
+        let start = self.out.used
+        try self.owned(v)
+        let text = try self.capture(start)
+        if not self.pooled and v.type_id == types.unit_id and v.kind == ast.Kind.call:
+            # a call returning `unit` is a statement of its own, before the drains
+            try self.begin("")
+            try self.put(text)
+            try self.end()
+            discard(try self.drain_open_statements(none))
+            return try self.line("return")
+        if not self.pooled and (v.kind == ast.Kind.literal or v.type_id == types.unit_id or v.type_id == types.never_id):
+            # nothing to compute, or nothing after it: the statements drain first, and a
+            # `none` keeps the context that types it
+            discard(try self.drain_open_statements(none))
+            try self.begin("return ")
+            try self.put(text)
+            try self.end()
+            return
+        if self.pooled or self.frame_nodes.count > 1:
+            let r = try self.temp("result")
+            try self.begin("let ")
+            try self.put(r)
+            try self.put(" = ")
+            try self.put(text)
+            try self.end()
+            if self.pooled:
+                try self.drained(start, true)
+                self.pooled = false
+            discard(try self.drain_open_statements(none))
+            try self.begin("return ")
+            try self.put(r)
+            try self.end()
+            return
+        try self.begin("return ")
+        try self.put(text)
+        try self.end()
+
+    mutating func binding(s: ast.Node*) -> !:
+        let init = s.left else return
+        if s.body == none and not s.has(ast.flag_captured) and init.kind == ast.Kind.else_ and self.checker.table.has_references(s.type_id):
+            # `let x = optional else fallback`: the region gives the binding its value
+            # directly, one copy, not a pooled result copied again (RUNTIME, Cycles)
+            let left = init.left else return
+            let right = init.right else return
+            let half = self.checker.scratch.length // 2
+            let name = try emission.copy_text(try format(self.checker.scratch[half..], f"L_{s.text}"))
+            try self.region_variable(name, s.type_id)
+            try self.line("if true:")
+            self.indent += 1
+            try self.unwrap_region(left, right, name, s.type_id)
+            self.indent -= 1
+            try self.drop_at_exit(s.text, s.type_id)
+            return
+        let word = "let " if s.kind == ast.Kind.let_ else "var "
+        try self.begin(word)
+        if s.body != none:
+            try self.put("(")
+            var cursor = s.body
+            var first = true
+            while let part = cursor:
+                if not first:
+                    try self.put(", ")
+                first = false
+                if part.has(ast.flag_wildcard) and self.checker.table.has_references(part.type_id):
+                    # `let (_, key) = entry`: the owned copy holds this slot too; it is
+                    # bound to a temporary and let go below, or it would leak
+                    part.text = try self.temp("unused")
+                    try self.put(part.text)
+                elif part.has(ast.flag_wildcard):
+                    try self.put("_")
+                else:
+                    try self.put("L_")
+                    try self.put(part.text)
+                cursor = part.next
+            try self.put(")")
+        elif s.has(ast.flag_captured):
+            # a `var` some closure captures: one cell shared with the closures (§7.4)
+            try self.put("L_")
+            try self.put(s.text)
+            try self.put(" = kernel.cell_new[")
+            try self.type_of(s.type_id)
+            try self.put("](&")
+            try self.put(try self.cell_info_name(s.type_id))
+            try self.put(", ")
+            try self.put(try self.ops_name(s.type_id))
+            try self.put(", ")
+            try self.owned(init)
+            try self.put(")")
+            try self.end()
+            try self.begin("defer heap.release((heap.Object*)L_")
+            try self.put(s.text)
+            try self.put(")")
+            try self.end()
+            return
+        else:
+            try self.put("L_")
+            try self.put(s.text)
+            try self.put(": ")
+            try self.type_of(s.type_id)
+        try self.put(" = ")
+        try self.owned(init)
+        try self.end()
+        if s.body != none:
+            var cursor = s.body
+            while let part = cursor:
+                if not part.has(ast.flag_wildcard):
+                    try self.drop_at_exit(part.text, part.type_id)
+                elif self.checker.table.has_references(part.type_id):
+                    try self.begin(try self.lifetime_name("L_drop_", part.type_id))
+                    try self.put("(")
+                    try self.put(part.text)
+                    try self.put(")")
+                    try self.end()
+                cursor = part.next
+        else:
+            try self.drop_at_exit(s.text, s.type_id)
+
+    ## The new value is computed and stored, then the old one dropped (RUNTIME 1, 2).
+    mutating func assign(s: ast.Node*) -> !:
+        let place = s.left else return
+        let value = s.right else return
+        if place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if let owner = self.checker.table.get(receiver.type_id).decl:
+                if owner.native_object != none:
+                    try self.hold_operand(receiver)
+                    try self.begin("L_")
+                    try self.put(self.type_name(owner))
+                    try self.put("__set_")
+                    try self.put(place.text)
+                    try self.put("(")
+                    try self.use(receiver)
+                    try self.put(", ")
+                    if s.text == "=":
+                        try self.use(value)
+                    else:
+                        try self.arithmetic((str)s.text.bytes[..<s.text.length - 1], place.type_id, place, value)
+                    try self.put(")")
+                    try self.end()
+                    return
+        if place.kind == ast.Kind.tuple:
+            # the places' receivers and indexes come first (§5.3), then the tuple, then the stores
+            var ahead = place.body
+            while let part = ahead:
+                try self.place_ahead(part)
+                try self.hold_place(part, value)
+                ahead = part.next
+            let t = try self.temp("tuple")
+            try self.begin("let ")
+            try self.put(t)
+            try self.put(" = ")
+            try self.owned(value)
+            try self.end()
+            var i: usize = 0
+            var cursor = place.body
+            while let part = cursor:
+                let half = self.checker.scratch.length // 2
+                let member = try emission.copy_text(try format(self.checker.scratch[half..], f"{t}.{i}"))
+                try self.store(part, member)
+                i += 1
+                cursor = part.next
+            return
+        try self.hold_place(place, value)
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.map_:
+                # `m[key] = v`: an insertion or a replacement, the map's own key and value
+                try self.begin("kernel.map_set[")
+                try self.map_types(receiver.type_id)
+                try self.put("](")
+                if self.may_fail(value) or self.may_fail(index) or self.has_call(value):
+                    let r = try self.hoist(receiver, false)
+                    let k = try self.hoist(index, true)
+                    let v = try self.hoist(value, true)
+                    try self.put(r)
+                    try self.put(", ")
+                    try self.put(k)
+                    try self.put(", ")
+                    try self.put(v)
+                else:
+                    try self.use(receiver)
+                    try self.put(", ")
+                    try self.owned(index)
+                    try self.put(", ")
+                    try self.owned(value)
+                try self.put(")")
+                try self.end()
+                return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.list_:
+                # `values[i] = x`, or `values[i] op= x` as the operation then the store; the
+                # place is computed once, ahead of the value (§5.3)
+                if s.text != "=" and (self.has_call(receiver) or self.has_call(index)):
+                    discard(try self.hoist(receiver, false))
+                    discard(try self.hoist(index, false))
+                try self.begin("kernel.list_set[")
+                try self.type_of(place.type_id)
+                try self.put("](")
+                try self.use(receiver)
+                try self.put(", ")
+                try self.use(index)
+                try self.put(", ")
+                if s.text == "=":
+                    try self.owned(value)
+                else:
+                    let op = (str)s.text.bytes[..<s.text.length - 1]
+                    try self.arithmetic(op, place.type_id, place, value)
+                try self.put(")")
+                try self.end()
+                return
+        if place.kind == ast.Kind.name:
+            if let d = place.resolved:
+                if d.has(ast.flag_captured):
+                    # `x = v` or `x op= v` on a captured `var`: the cell takes the value
+                    try self.begin("kernel.cell_set[")
+                    try self.type_of(place.type_id)
+                    try self.put("](")
+                    try self.captured_name(d, place.text)
+                    try self.put(", ")
+                    if s.text == "=":
+                        try self.owned(value)
+                    else:
+                        let op = (str)s.text.bytes[..<s.text.length - 1]
+                        try self.arithmetic(op, place.type_id, place, value)
+                    try self.put(")")
+                    try self.end()
+                    return
+        if self.checker.table.has_references(place.type_id):
+            # `s = v` and `s += v` on a reference: the new value made, stored, the old dropped
+            let n = try self.temp("new")
+            try self.begin("let ")
+            try self.put(n)
+            try self.put(": ")
+            try self.type_of(place.type_id)
+            try self.put(" = ")
+            if s.text == "=":
+                try self.owned(value)
+            else:
+                let op = (str)s.text.bytes[..<s.text.length - 1]
+                try self.arithmetic(op, place.type_id, place, value)
+            try self.end()
+            try self.store(place, n)
+            return
+        try self.begin("")
+        try self.place_expr(place)
+        if s.text == "=" or s.text == "+=" and place.type_id != types.str_id or s.text == "-=" or s.text == "*=" or (s.text == "/=" and place.type_id == types.float_id):
+            try self.put(" ")
+            try self.put(s.text)
+            try self.put(" ")
+            try self.expr(value)
+            try self.end()
+            return
+        # `//=`, `%=`, `**=`, and `+=` on text are the operation then the store
+        try self.put(" = ")
+        let op = (str)s.text.bytes[..<s.text.length - 1]
+        try self.arithmetic(op, place.type_id, place, value)
+        try self.end()
+
+    ## What a place reaches through a call, computed ahead of the value it takes (§5.3): a
+    ## list's or map's receiver and index, a field's object.
+    mutating func place_ahead(place: ast.Node*) -> !:
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            if self.has_call(receiver) or self.has_call(index):
+                discard(try self.hoist(receiver, false))
+                let is_map = self.checker.table.kind(receiver.type_id) == types.Kind.map_
+                discard(try self.hoist(index, is_map))
+        elif place.kind == ast.Kind.member:
+            let receiver = place.left else return
+            if let owner = self.checker.table.get(receiver.type_id).decl:
+                if owner.native_object != none:
+                    try self.hold_operand(receiver)
+                    return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
+                discard(try self.hoist(receiver, false))
+
+    ## §5.3: the place is evaluated, then the value. When the value runs code (a call), that
+    ## code may replace what the place reaches, `h.child.mark = h.replace()` or
+    ## `items[i] = clear_and_count(items)`: the object the store lands in, reached through a
+    ## field, an element or a captured binding, is held for the statement ahead of the value,
+    ## so the store reaches the object the place named and never freed storage. The
+    ## interpreter holds exactly these (hir/interp.lucb, `holds_place`).
+    mutating func hold_place(place: ast.Node*, value: ast.Node*) -> !:
+        if not self.has_call(value):
+            return
+        var cursor = place
+        while true:
+            if cursor.kind == ast.Kind.index:
+                let receiver = cursor.left else return
+                let index = cursor.body else return
+                if not self.plain_binding(receiver):
+                    discard(try self.hoist(receiver, false))
+                discard(try self.hoist(index, false))
+                return
+            if cursor.kind != ast.Kind.member:
+                return
+            let receiver = cursor.left else return
+            if let owner = self.checker.table.get(receiver.type_id).decl:
+                if owner.native_object != none:
+                    return
+            if self.checker.table.kind(receiver.type_id) == types.Kind.class_:
+                if not self.plain_binding(receiver):
+                    discard(try self.hoist(receiver, false))
+                return
+            # a struct field of a struct: the object is further in
+            cursor = receiver
+
+    ## A read of a binding no code can replace during the statement: a local or `self`, not a
+    ## `var` a closure captured.
+    func plain_binding(e: ast.Node*) -> bool:
+        if e.kind == ast.Kind.self_:
+            return true
+        if e.kind != ast.Kind.name:
+            return false
+        let d = e.resolved else return false
+        return not d.has(ast.flag_captured) and d.kind != ast.Kind.constant
+
+    ## `place = name`, the old value dropped after the store when it held references.
+    mutating func store(place: ast.Node*, name: str) -> !:
+        if place.kind == ast.Kind.name:
+            if let d = place.resolved:
+                if d.has(ast.flag_captured):
+                    try self.begin("kernel.cell_set[")
+                    try self.type_of(place.type_id)
+                    try self.put("](")
+                    try self.captured_name(d, place.text)
+                    try self.put(", ")
+                    try self.put(name)
+                    try self.put(")")
+                    try self.end()
+                    return
+        if place.kind == ast.Kind.index:
+            let receiver = place.left else return
+            let index = place.body else return
+            try self.begin("kernel.list_set[")
+            try self.type_of(place.type_id)
+            try self.put("](")
+            try self.use(receiver)
+            try self.put(", ")
+            try self.use(index)
+            try self.put(", ")
+            try self.put(name)
+            try self.put(")")
+            try self.end()
+            return
+        if self.checker.table.has_references(place.type_id):
+            let old = try self.temp("old")
+            try self.begin("let ")
+            try self.put(old)
+            try self.put(" = ")
+            try self.place_expr(place)
+            try self.end()
+            try self.begin("")
+            try self.place_expr(place)
+            try self.put(" = ")
+            try self.put(name)
+            try self.end()
+            try self.begin("")
+            try self.put(try self.lifetime_name("L_drop_", place.type_id))
+            try self.put("(")
+            try self.put(old)
+            try self.put(")")
+            try self.end()
+            return
+        try self.begin("")
+        try self.place_expr(place)
+        try self.put(" = ")
+        try self.put(name)
+        try self.end()
+
+    ## A place as written: no copy is taken of a field on the way.
+    mutating func place_expr(e: ast.Node*) -> !:
+        match e.kind:
+            .index:
+                let receiver = e.left else return
+                let index = e.body else return
+                let rt = self.checker.table.get(receiver.type_id)
+                if rt.kind != types.Kind.list_:
+                    return try self.expr(e)
+                # `items[i].field = v`: the element's slot, so the store reaches the element in
+                # the list (a struct) and takes no reference that nothing releases (a class)
+                if self.has_call(receiver) or self.has_call(index) or self.may_fail(receiver) or self.may_fail(index):
+                    try self.hold_operand(receiver)
+                    try self.hold_operand(index)
+                try self.put("(*kernel.list_slot[")
+                try self.type_of(rt.elem)
+                try self.put("](")
+                if receiver.kind == ast.Kind.index or receiver.kind == ast.Kind.member:
+                    try self.place_expr(receiver)  # `grid[i][j].x`: the inner list borrowed too
+                else:
+                    try self.use(receiver)
+                try self.put(", ")
+                try self.use(index)
+                try self.put("))")
+            .name, .self_, .group: try self.expr(e)
+            .member:
+                let receiver = e.left else return
+                if let owner = self.checker.table.get(receiver.type_id).decl:
+                    if owner.native_object != none:
+                        try self.put("L_")
+                        try self.put(self.type_name(owner))
+                        try self.put("__value(")
+                        try self.use(receiver)
+                        let native = owner.native_object else return
+                        try self.put(").value_mut()." if native.view else ").value().")
+                        try self.put(e.text)
+                        return
+                if let held = self.hoisted_name(receiver):
+                    # the object `hold_place` kept for the statement
+                    try self.put(held)
+                elif self.checker.table.kind(receiver.type_id) == types.Kind.class_ and self.has_call(receiver):
+                    # `f().field = v`: the object is computed once, ahead of the value (§5.3)
+                    try self.put(try self.hoist(receiver, false))
+                else:
+                    try self.place_expr(receiver)
+                try self.put(".L_")
+                try self.put(e.text)
+            _: return try self.fail(e, "this is not a place the emitter knows")
+
+    mutating func put_u64(n: u64) -> !:
+        try self.writer().put_u64(n)
+
+    ## The condition of an `if` or `while`, hoisted into a binding when it pooled a
+    ## temporary, so that the temporary dies before the body runs (RUNTIME 5). The name
+    ## of what to test, or the condition's text.
+    mutating func hoisted_condition(s: ast.Node*) -> str!:
+        let cond = s.left else return ""
+        let start = self.out.used
+        let pooled_before = self.pooled
+        self.pooled = false
+        # a jump inside the condition, `x else break`, drains what it pooled
+        try self.open_frame(cond)
+        if s.has(ast.flag_if_let):
+            let init = cond.left else return ""
+            try self.owned(init)
+        else:
+            try self.use(cond)
+        let reserved = self.close_frame()
+        if not self.pooled and reserved.length > 0:
+            try self.strip_drains(start, reserved)
+        let text = try self.capture(start)
+        if not self.pooled:
+            self.pooled = pooled_before
+            return text
+        let c = try self.temp("cond")
+        try self.begin("let ")
+        try self.put(c)
+        try self.put(" = ")
+        try self.put(text)
+        try self.end()
+        try self.drained_unless(start, pooled_before, false, reserved)
+        return c
+
+    mutating func if_statement(s: ast.Node*) -> !:
+        let cond = s.left else return
+        let value = try self.hoisted_condition(s)
+        try self.begin("if ")
+        if s.has(ast.flag_if_let):
+            try self.put("let L_")
+            try self.put(cond.text)
+            try self.put(" = ")
+        try self.put(value)
+        try self.put(":")
+        try self.end()
+        let body = s.body else return
+        self.indent += 1
+        if s.has(ast.flag_if_let):
+            try self.drop_at_exit(cond.text, cond.type_id)
+        try self.block(body)
+        self.indent -= 1
+        if let rest = s.right:
+            try self.line("else:")
+            self.indent += 1
+            if rest.kind == ast.Kind.if_:
+                try self.statement(rest)
+            else:
+                try self.block(rest)
+            self.indent -= 1
+
+    mutating func while_statement(s: ast.Node*) -> !:
+        let cond = s.left else return
+        let body = s.body else return
+        # the condition is evaluated inside the loop, so it is written there
+        try self.begin("")
+        try self.put(try self.loop_name(s))
+        try self.put(": while true:")
+        try self.end()
+        self.indent += 1
+        let value = try self.hoisted_condition(s)
+        if s.has(ast.flag_if_let):
+            try self.begin("if let L_")
+            try self.put(cond.text)
+            try self.put(" = ")
+            try self.put(value)
+            try self.put(":")
+            try self.end()
+            self.indent += 1
+            try self.drop_at_exit(cond.text, cond.type_id)
+            try self.block(body)
+            self.indent -= 1
+            try self.line("else:")
+            try self.line("    break")
+        else:
+            try self.begin("if not (")
+            try self.put(value)
+            try self.put("):")
+            try self.end()
+            try self.line("    break")
+            try self.block(body)
+        self.indent -= 1
+
+    ## `with e as x:` is a block that binds, closes on every exit, then drops (§8.5).
+    mutating func with_statement(s: ast.Node*) -> !:
+        let body = s.body else return
+        try self.line("if true:")
+        self.indent += 1
+        var cursor = s.left
+        while let item = cursor:
+            let e = item.left else return
+            let close = item.resolved else return
+            try self.begin("let L_")
+            try self.put(item.text)
+            try self.put(" = ")
+            # the operand's hoisted prelude drains at the statement's indent, before the
+            # `if true:` this block opened, so it is written one level out; the binding line
+            # that uses it stays in the block
+            self.indent -= 1
+            try self.owned(e)
+            self.indent += 1
+            try self.end()
+            try self.drop_at_exit(item.text, item.type_id)
+            let t = self.checker.table.get(item.type_id)
+            try self.begin("defer ")
+            if t.kind == types.Kind.class_ or t.kind == types.Kind.enum_:
+                try self.put("L_")
+                try self.put(t.name)
+                try self.put("__L_close(L_")
+                try self.put(item.text)
+                try self.put(")")
+            else:
+                try self.put("L_")
+                try self.put(item.text)
+                try self.put(".L_close()")
+            try self.end()
+            cursor = item.next
+        try self.block(body)
+        self.indent -= 1
+
+    mutating func for_statement(s: ast.Node*) -> !:
+        let binding = s.left else return
+        let seq = s.right else return
+        let body = s.body else return
+        let st = self.checker.table.get(seq.type_id)
+        let label = try self.loop_name(s)
+        if let iterator_method = s.resolved:
+            # `Iterable` (§13.3): the iterator is a temporary of the statement; each element
+            # is owned by its pass
+            let it = try self.temp("it")
+            let iterator_type = self.checker.table.get(iterator_method.type_id).elem
+            try self.begin("let ")
+            try self.put(it)
+            try self.put(" = ")
+            try self.put(try self.lifetime_name("L_pool_", iterator_type))
+            try self.put("(")
+            try self.method_on(seq.type_id, iterator_method, try self.used(seq))
+            try self.put("))")
+            try self.end()
+            self.pooled = true
+            let next = self.checker.find_member(self.checker.table.get(iterator_type).decl else return try self.fail(s, "no iterator"), "next") else return try self.fail(s, "no next")
+            try self.begin("")
+            if label.length > 0:
+                try self.put(label)
+                try self.put(": ")
+            try self.put("while true:")
+            try self.end()
+            self.indent += 1
+            if binding.body != none:
+                let elem = try self.temp("elem")
+                try self.begin("let ")
+                try self.put(elem)
+                try self.put(" = ")
+                try self.method_on(iterator_type, next, it)
+                try self.put(") else break")
+                try self.end()
+                if self.checker.table.has_references(binding.type_id):
+                    try self.begin("defer ")
+                    try self.put(try self.lifetime_name("L_drop_", binding.type_id))
+                    try self.put("(")
+                    try self.put(elem)
+                    try self.put(")")
+                    try self.end()
+                try self.bind_parts(binding, elem)
+            else:
+                try self.begin("let L_")
+                try self.put(binding.text)
+                try self.put(" = ")
+                try self.method_on(iterator_type, next, it)
+                try self.put(") else break")
+                try self.end()
+                try self.drop_at_exit(binding.text, binding.type_id)
+            try self.block(body)
+            self.indent -= 1
+            return
+        match st.kind:
+            .range_:
+                # a written range iterates directly; a range value through its bounds
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("for L_")
+                try self.put(binding.text)
+                try self.put(" in ")
+                if seq.kind == ast.Kind.binary and (seq.text == "..<" or seq.text == "..="):
+                    let l = seq.left else return
+                    let r = seq.right else return
+                    try self.expr(l)
+                    try self.put(seq.text)
+                    try self.expr(r)
+                else:
+                    let t = try self.temp("range")
+                    try self.put(t)
+                    try self.put(".low..<kernel.range_end(")
+                    try self.put(t)
+                    try self.put(")")
+                try self.put(":")
+                try self.end()
+                if not (seq.kind == ast.Kind.binary and (seq.text == "..<" or seq.text == "..=")):
+                    return try self.fail(seq, "a range value in `for` compiles in the collections slice")
+                self.indent += 1
+                try self.block(body)
+                self.indent -= 1
+            .str_:
+                let it = try self.temp("scalars")
+                try self.begin("var ")
+                try self.put(it)
+                try self.put(" = kernel.Scalars.over(")
+                try self.use(seq)
+                try self.put(")")
+                try self.end()
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("while let L_")
+                try self.put(binding.text)
+                try self.put(" = ")
+                try self.put(it)
+                try self.put(".next():")
+                try self.end()
+                self.indent += 1
+                try self.drop_at_exit(binding.text, types.str_id)
+                try self.block(body)
+                self.indent -= 1
+            .bytes_:
+                let raw = try self.temp("byte")
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("for ")
+                try self.put(raw)
+                try self.put(" in (")
+                try self.use(seq)
+                try self.put(").data:")
+                try self.end()
+                self.indent += 1
+                try self.begin("let L_")
+                try self.put(binding.text)
+                try self.put(" = (i64)")
+                try self.put(raw)
+                try self.end()
+                try self.block(body)
+                self.indent -= 1
+            .list_:
+                # the runtime's protocol: the check, the bound, the element, the step, the body
+                let store = try self.temp("store")
+                let version = try self.temp("version")
+                let i = try self.temp("i")
+                try self.begin("let ")
+                try self.put(store)
+                try self.put(" = ")
+                try self.use(seq)
+                try self.end()
+                try self.begin("let ")
+                try self.put(version)
+                try self.put(" = ")
+                try self.put(store)
+                try self.put(".version")
+                try self.end()
+                try self.begin("var ")
+                try self.put(i)
+                try self.put(": usize = 0")
+                try self.end()
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("while true:")
+                try self.end()
+                self.indent += 1
+                try self.begin("kernel.list_check[")
+                try self.type_of(st.elem)
+                try self.put("](")
+                try self.put(store)
+                try self.put(", ")
+                try self.put(version)
+                try self.put(")")
+                try self.end()
+                try self.begin("if ")
+                try self.put(i)
+                try self.put(" >= ")
+                try self.put(store)
+                try self.put(".count:")
+                try self.end()
+                try self.line("    break")
+                if s.has(ast.flag_indexed):
+                    try self.indexed_element(binding, store, i, st.elem)
+                elif binding.body != none:
+                    # `for (a, b) in items`: the parts copied out of the element in place
+                    let half = self.checker.scratch.length // 2
+                    let element = try emission.copy_text(try format(self.checker.scratch[half..], f"{store}.items[{i}]"))
+                    try self.bind_parts(binding, element)
+                else:
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = ")
+                    if self.checker.table.has_references(st.elem):
+                        try self.put(try self.lifetime_name("L_copy_", st.elem))
+                        try self.put("(")
+                        try self.put(store)
+                        try self.put(".items[")
+                        try self.put(i)
+                        try self.put("])")
+                    else:
+                        try self.put(store)
+                        try self.put(".items[")
+                        try self.put(i)
+                        try self.put("]")
+                    try self.end()
+                    try self.drop_at_exit(binding.text, st.elem)
+                try self.begin("")
+                try self.put(i)
+                try self.put(" += 1")
+                try self.end()
+                try self.block(body)
+                self.indent -= 1
+            .map_, .set_:
+                let store = try self.temp("store")
+                let version = try self.temp("version")
+                let i = try self.temp("i")
+                let is_map = st.kind == types.Kind.map_
+                try self.begin("let ")
+                try self.put(store)
+                try self.put(" = ")
+                try self.use(seq)
+                try self.end()
+                try self.begin("let ")
+                try self.put(version)
+                try self.put(" = ")
+                try self.put(store)
+                try self.put(".version")
+                try self.end()
+                try self.begin("var ")
+                try self.put(i)
+                try self.put(": usize = 0")
+                try self.end()
+                try self.begin("")
+                if label.length > 0:
+                    try self.put(label)
+                    try self.put(": ")
+                try self.put("while true:")
+                try self.end()
+                self.indent += 1
+                try self.begin("kernel.map_check[")
+                try self.map_types(seq.type_id)
+                try self.put("](")
+                try self.put(store)
+                try self.put(", ")
+                try self.put(version)
+                try self.put(")")
+                try self.end()
+                try self.begin("if ")
+                try self.put(i)
+                try self.put(" >= ")
+                try self.put(store)
+                try self.put(".count:")
+                try self.end()
+                try self.line("    break")
+                let value_type = self.checker.table.map_value(seq.type_id) if is_map else types.unit_id
+                if is_map and binding.body != none:
+                    # `for (k, v) in m`: each its own copy
+                    var part = binding.body
+                    var which: usize = 0
+                    while let name = part:
+                        if not name.has(ast.flag_wildcard):
+                            try self.begin("let L_")
+                            try self.put(name.text)
+                            try self.put(" = ")
+                            try self.element_copy(st.elem if which == 0 else value_type, store, ".keys[" if which == 0 else ".values[", i)
+                            try self.end()
+                            try self.drop_at_exit(name.text, name.type_id)
+                        which += 1
+                        part = name.next
+                elif is_map:
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = (")
+                    try self.element_copy(st.elem, store, ".keys[", i)
+                    try self.put(", ")
+                    try self.element_copy(value_type, store, ".values[", i)
+                    try self.put(")")
+                    try self.end()
+                    try self.drop_at_exit(binding.text, binding.type_id)
+                elif binding.body != none:
+                    let half = self.checker.scratch.length // 2
+                    let element = try emission.copy_text(try format(self.checker.scratch[half..], f"{store}.keys[{i}]"))
+                    try self.bind_parts(binding, element)
+                else:
+                    try self.begin("let L_")
+                    try self.put(binding.text)
+                    try self.put(" = ")
+                    try self.element_copy(st.elem, store, ".keys[", i)
+                    try self.end()
+                    try self.drop_at_exit(binding.text, st.elem)
+                try self.begin("")
+                try self.put(i)
+                try self.put(" += 1")
+                try self.end()
+                try self.block(body)
+                self.indent -= 1
+            _: return try self.fail(seq, "iterating this compiles in a later slice")
+
+    ## `for (a, b) in items` over a tuple element read at `source`: each named part its own
+    ## copy, dropped when its pass ends; `_` takes nothing.
+    ## `for (index, value) in values.indexed()` (§8.3): the count `i` as the index and the
+    ## element at it, bound as parts or as one pair, before the count steps.
+    mutating func indexed_element(binding: ast.Node*, store: str, i: str, elem: u32) -> !:
+        let half = self.checker.scratch.length // 2
+        let element = try emission.copy_text(try format(self.checker.scratch[half..], f"{store}.items[{i}]"))
+        if binding.body == none:
+            try self.begin("let L_")
+            try self.put(binding.text)
+            try self.put(" = ((i64)")
+            try self.put(i)
+            try self.put(", ")
+            try self.element_value(elem, element)
+            try self.put(")")
+            try self.end()
+            try self.drop_at_exit(binding.text, binding.type_id)
+            return
+        let index_part = binding.body else return
+        if not index_part.has(ast.flag_wildcard):
+            try self.begin("let L_")
+            try self.put(index_part.text)
+            try self.put(" = (i64)")
+            try self.put(i)
+            try self.end()
+        let value_part = index_part.next else return
+        if not value_part.has(ast.flag_wildcard):
+            try self.begin("let L_")
+            try self.put(value_part.text)
+            try self.put(" = ")
+            try self.element_value(elem, element)
+            try self.end()
+            try self.drop_at_exit(value_part.text, elem)
+
+    ## `element`, a list's element of type `elem`, copied when it holds references.
+    mutating func element_value(elem: u32, element: str) -> !:
+        if self.checker.table.has_references(elem):
+            try self.put(try self.lifetime_name("L_copy_", elem))
+            try self.put("(")
+            try self.put(element)
+            try self.put(")")
+            return
+        try self.put(element)
+
+    mutating func bind_parts(binding: ast.Node*, source: str) -> !:
+        let members = self.checker.table.get(binding.type_id).args
+        var part = binding.body
+        var which: usize = 0
+        while let name = part:
+            if not name.has(ast.flag_wildcard) and which < members.length:
+                let half = self.checker.scratch.length // 2
+                let member = try emission.copy_text(try format(self.checker.scratch[half..], f"{source}.{which}"))
+                try self.begin("let L_")
+                try self.put(name.text)
+                try self.put(" = ")
+                if self.checker.table.has_references(members[which]):
+                    try self.put(try self.lifetime_name("L_copy_", members[which]))
+                    try self.put("(")
+                    try self.put(member)
+                    try self.put(")")
+                else:
+                    try self.put(member)
+                try self.end()
+                try self.drop_at_exit(name.text, members[which])
+            which += 1
+            part = name.next
+
+    ## `store.keys[i]` or the like, copied when the element holds references.
+    mutating func element_copy(t: u32, store: str, member: str, i: str) -> !:
+        let holds = self.checker.table.has_references(t)
+        if holds:
+            try self.put(try self.lifetime_name("L_copy_", t))
+            try self.put("(")
+        try self.put(store)
+        try self.put(member)
+        try self.put(i)
+        try self.put("]")
+        if holds:
+            try self.put(")")

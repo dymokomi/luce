@@ -1,0 +1,210 @@
+#==============================================================================================
+#
+#   base/ownership - Ownership of operands
+#
+#   DESCRIPTION:
+#       Which operands are borrowed and which are owned, and the temporaries hoisted so
+#       an owned value is released once.
+#
+#==============================================================================================
+extend Emitter:
+    # mark: Ownership of operands ==============================================================
+
+    ## `L_x`, or `L_env.L_x` inside a lambda that captured `x` (§7.4); a captured `var` is
+    ## a cell either way, and the caller adds `.value`.
+    mutating func captured_name(d: ast.Node*, name: str) -> !:
+        if let lambda = self.lambda:
+            var cursor = lambda.left
+            while let capture = cursor:
+                if capture.resolved == d:
+                    try self.put("L_env.L_")
+                    try self.put(name)
+                    return
+                cursor = capture.next
+        try self.put("L_")
+        try self.put(name)
+
+    ## Whether the expression reads a binding, so its value is borrowed (RUNTIME 4).
+    func borrowed(e: ast.Node*) -> bool:
+        match e.kind:
+            .name:
+                let d = e.resolved else return false
+                # a named function's closure is immortal: read, never released
+                return d.kind != ast.Kind.constant
+            .self_: return true
+            .literal:
+                # a text literal is an immortal object: read, never released
+                let b = e.text.bytes
+                return b.length > 0 and (b[0] == '"' or b[0] == 'r' or b[0] == 'b') and e.text != "b" and e.text != "r"
+            .group:
+                let inner = e.left else return false
+                return self.borrowed(inner)
+            _: return false
+
+    ## The expression as a value the reader will keep: a borrowed one is copied.
+    mutating func owned(e: ast.Node*) -> !:
+        if not self.in_constant and self.checker.table.has_references(e.type_id) and (self.borrowed(e) or self.hoisted_name(e) != none):
+            # a hoisted operand is the statement's temporary: an owner takes a copy
+            try self.put(try self.lifetime_name("L_copy_", e.type_id))
+            try self.put("(")
+            try self.expr(e)
+            try self.put(")")
+            return
+        try self.expr(e)
+
+    ## An operand of a construct whose other operand may fail (a `try` beside it): evaluated
+    ## ahead of the statement into a temporary of the statement, in source order, so that a
+    ## failure drains what was made and nothing is copied for a taker that never took it
+    ## (RUNTIME 5). The name to write at the site: a copy of the temporary for an owned
+    ## reference, the temporary itself otherwise.
+    mutating func hoist(e: ast.Node*, owned: bool) -> str!:
+        # `none` is immutable and needs the consuming expression's optional type.
+        if is_none(e):
+            return "none"
+        if let already = self.hoisted_name(e):
+            if owned and self.checker.table.has_references(e.type_id):
+                let half = self.checker.scratch.length // 2
+                return try emission.copy_text(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({already})"))
+            return already
+        let name = try self.temp("arg")
+        let start = self.out.used
+        if owned:
+            try self.owned(e)
+        else:
+            try self.use(e)
+        let text = try self.capture(start)
+        let refs = self.checker.table.has_references(e.type_id)
+        var i: u32 = 0
+        while i < self.indent:
+            try self.prelude.put("    ")
+            i += 1
+        try self.prelude.put("let ")
+        try self.prelude.put(name)
+        try self.prelude.put(" = ")
+        if owned and refs:
+            try self.prelude.put(try self.lifetime_name("L_pool_", e.type_id))
+            try self.prelude.put("(")
+            try self.prelude.put(text)
+            try self.prelude.put(")")
+        else:
+            try self.prelude.put(text)
+        try self.prelude.put("\n")
+        # a hoisted operand is spliced in like a pooled temporary, whatever it holds
+        self.pooled = true
+        if owned and refs:
+            let half = self.checker.scratch.length // 2
+            return try emission.copy_text(try format(self.checker.scratch[half..], f"{try self.lifetime_name("L_copy_", e.type_id)}({name})"))
+        try self.hoisted_nodes.push(e)
+        try self.hoisted_names.push(name)
+        return name
+
+    ## The name an operand was hoisted under in this statement, if it was.
+    func hoisted_name(e: ast.Node*) -> str?:
+        var i: usize = 0
+        while i < self.hoisted_nodes.count:
+            if self.hoisted_nodes.get(i) == e:
+                return self.hoisted_names.get(i)
+            i += 1
+        return none
+
+    ## Preserve an operand across later argument evaluation. A later callback can
+    ## replace a captured binding, so a pointer snapshot must also own its value.
+    mutating func hold_operand(e: ast.Node*) -> !:
+        # a constant's operands have no effects to order, and the top level has no temporaries
+        if self.in_constant or is_none(e) or self.hoisted_name(e) != none:
+            return
+        if not self.checker.table.has_references(e.type_id):
+            discard(try self.hoist(e, false))
+            return
+        let name = try self.temp("held")
+        let start = self.out.used
+        try self.owned(e)
+        let value = try self.capture(start)
+        var i: u32 = 0
+        while i < self.indent:
+            try self.prelude.put("    ")
+            i += 1
+        try self.prelude.put("let ")
+        try self.prelude.put(name)
+        try self.prelude.put(" = ")
+        try self.prelude.put(try self.lifetime_name("L_pool_", e.type_id))
+        try self.prelude.put("(")
+        try self.prelude.put(value)
+        try self.prelude.put(")\n")
+        try self.hoisted_nodes.push(e)
+        try self.hoisted_names.push(name)
+        self.pooled = true
+
+    ## Whether a call appears anywhere in the expression: evaluating it may have an effect.
+    func has_call(n: ast.Node*?) -> bool:
+        let node = n else return false
+        if node.kind == ast.Kind.call or node.kind == ast.Kind.spawn_ or node.kind == ast.Kind.wait_:
+            return true
+        if node.kind == ast.Kind.lambda:
+            return false
+        return self.has_call(node.left) or self.has_call(node.right) or self.has_call(node.body) or self.has_call(node.ty) or self.has_call(node.next)
+
+    ## Whether `try` appears anywhere in the expression: evaluating it may fail.
+    func may_fail(n: ast.Node*?) -> bool:
+        let node = n else return false
+        if node.kind == ast.Kind.propagate or (node.kind == ast.Kind.unary and node.text == "try"):
+            return true
+        if node.kind == ast.Kind.lambda:
+            return false
+        return self.may_fail(node.left) or self.may_fail(node.right) or self.may_fail(node.body) or self.may_fail(node.ty) or self.may_fail(node.next)
+
+    ## The elements of a list, set or tuple literal, each owned; hoisted when one may fail.
+    mutating func owned_items(items: ast.Node*?) -> !:
+        var risky = false
+        var cursor = items
+        while let item = cursor:
+            if self.may_fail(item) or self.has_call(item):
+                risky = true
+            cursor = item.next
+        var names = try list.List[str].create(8)
+        if risky:
+            cursor = items
+            while let item = cursor:
+                try names.push(try self.hoist(item, true))
+                cursor = item.next
+        cursor = items
+        var first = true
+        var i: usize = 0
+        while let item = cursor:
+            if not first:
+                try self.put(", ")
+            first = false
+            if risky:
+                try self.put(names.get(i))
+            else:
+                try self.owned(item)
+            i += 1
+            cursor = item.next
+
+    ## Native parameters borrow for the complete call, including reentrant callbacks.
+    ## Pin inline so lazy branches and source argument order remain unchanged.
+    mutating func borrow_for_call(e: ast.Node*) -> !:
+        if self.checker.table.has_references(e.type_id) and (self.borrowed(e) or self.hoisted_name(e) != none):
+            try self.put(try self.lifetime_name("L_pool_", e.type_id))
+            try self.put("(")
+            try self.owned(e)
+            try self.put(")")
+            self.pooled = true
+        else:
+            try self.use(e)
+
+    ## The expression as a value used and let go of: an owned one becomes a temporary of
+    ## the statement, pooled until the drain.
+    mutating func use(e: ast.Node*) -> !:
+        if let name = self.hoisted_name(e):
+            # pooled when it was hoisted
+            try self.put(name)
+            return
+        if self.checker.table.has_references(e.type_id) and not self.borrowed(e):
+            try self.put(try self.lifetime_name("L_pool_", e.type_id))
+            try self.put("(")
+            try self.expr(e)
+            try self.put(")")
+            self.pooled = true
+            return
+        try self.expr(e)
