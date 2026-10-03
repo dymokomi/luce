@@ -12,6 +12,8 @@ python3 tools/test_native_default.py
 python3 tools/test_toolchain_choice.py
 python3 tools/test_build_cache.py
 # the compile budget with both compilers named relative to here, a Luce entry first
+# the shape of the tree never regresses (luce-base tools/shape.py, the limits in tools/shape.limits)
+python3 "$(dirname "$base")/../tools/shape.py" --check --root .
 python3 "$(dirname "$base")/../tools/compile_budget.py" --compiler "$base" --luce build/luce --seconds 240 --megabytes 2048 tests/programs/calc/main.luc
 python3 tools/test_build_cleanup.py
 python3 tools/test_base_packages.py
