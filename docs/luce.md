@@ -943,10 +943,12 @@ this manifest. Every package keeps its sources directly under its source root, w
 directory repeating its name: a module is named by its path there, `src/widgets/button.lucb`
 is `widgets.button`. Inside the package that path is the import; another package names the
 module behind the package's identifier and may import it only when the package lists it in
-`str[] public = [...]`: `import luce_ui.ui`, `from luce_ui import ui` and
+`str[] public = [...]`: `from luce_ui import ui`, `import luce_ui.ui` and
 `from luce_ui.ui import Button` all reach `src/ui.lucb` of `luce-ui` when it is public, and
-construction is `Button("pause")`. `import luce_ui` is an error: a package is not a module.
-The standard packages are packages too, `from luce_std import math`.
+construction is `Button("pause")`. The `from` form is the usual one; it may name a directory
+of modules, `from luce_geocore.core import parallel`, and alias what it brings,
+`from luce_crypto import native as crypto`. `import luce_ui` is an error: a package is not a
+module. The standard packages are packages too, `from luce_std import math`.
 Base owns module resolution; Luce invokes the compiler `LUCE_BASE` names, else `luce-base`
 beside the `luce` executable, as a release lays them out, else `luce-base` on the path.
 See [the package import contract](../../luce-base/docs/PACKAGE-IMPORTS.md) for complete

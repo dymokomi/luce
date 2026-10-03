@@ -29,13 +29,20 @@ with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     root = Path(temporary)
     write(root, 'helper/package.prisma', '#prisma 4.0\ndef package "helper" {\n    str[] public = ["measure"]\n}\n')
     write(root, 'helper/src/measure.lucb', 'pub interface Measured:\n    func length() -> i64\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func length(text: str) -> i64:\n    return (i64)text.length\n')
-    write(root, 'library/package.prisma', '#prisma 4.0\ndef package "luce-ui" {\n' + USES_STD + '    def dependency "helper" {\n        str path = "../helper"\n    }\n    str[] public = ["ui"]\n}\n')
+    write(root, 'library/package.prisma', '#prisma 4.0\ndef package "luce-ui" {\n' + USES_STD + '    def dependency "helper" {\n        str path = "../helper"\n    }\n    str[] public = ["ui", "widgets.label"]\n}\n')
+    write(root, 'library/src/widgets/label.lucb', 'pub func width(text: str) -> i64:\n    return (i64)text.length * 2\n')
     write(root, 'library/src/ui.lucb', 'import helper.measure\nfrom luce_std import net\npub type Measured = measure.Measured\npub func version() -> net.IpVersion:\n    return net.IpVersion.ipv4\npub let invalid: ErrorCode = ErrorCode.package(1)\npub func distinct_errors() -> bool:\n    return invalid != measure.invalid\npub struct Button: measure.Measured:\n    var size: i64\n    pub func init(label: str):\n        self.size = measure.length(label)\n    pub func length() -> i64:\n        return self.size\n')
     write(root, 'app/package.prisma', '#prisma 4.0\ndef package "demo" {\n' + USES_STD + '    def dependency "luce-ui" {\n        str path = "../library"\n    }\n}\n')
     entry = write(root, 'app/src/main.luc', 'from luce_ui.ui import Button\nimport luce_ui.ui as controls\nfrom luce_ui import ui\nfrom luce_std import math, net\nfunc length(value: ui.Measured) -> int:\n    return value.length()\npub func main(arguments: list[str]) -> int!:\n    let button: controls.Button = Button("pause")\n    assert(button.length() == 5 and length(button) == 5 and ui.distinct_errors())\n    assert(ui.version() == net.IpVersion.ipv4)\n    assert(math.pi > 3.0 and math.sin(0.0) == 0.0)\n    return 0\n')
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'consumer')
         run(root / 'consumer')
+    # a `from` import names a directory of modules and aliases what it brings
+    aliases = write(root, 'app/src/aliases.luc', 'from luce_ui import ui as controls\nfrom luce_ui.widgets import label as text_label\nfrom luce_ui.ui import Button as Control\n\npub func main(arguments: list[str]) -> int!:\n    let button: controls.Button = Control("abc")\n    assert(text_label.width("ab") == 4 and button.length() == 3)\n    return 0\n')
+    run(COMPILER, 'build', aliases, '-o', root / 'aliases')
+    run(root / 'aliases')
+    run(COMPILER, 'fmt', aliases, '--check')
+    aliases.unlink()
     original = entry.read_text()
     entry.write_text('import helper.measure\npub func main(arguments: list[str]) -> int:\n    return 0\n')
     rejected = run(COMPILER, 'build', entry, '-o', root / 'consumer', expected=1)
@@ -59,4 +66,4 @@ with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     for flags in FLAGS:
         run(BASE, 'build', relocated / 'main.lucb', *flags, '-o', root / 'consumer')
         run(root / 'consumer')
-print('PASS package modules: qualified imports, private foreign interfaces, standard packages, per-package emission and relocation; six modes')
+print('PASS package modules: qualified imports, `from` directories and aliases, private foreign interfaces, standard packages, per-package emission and relocation; six modes')
