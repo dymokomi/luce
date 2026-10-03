@@ -95,9 +95,8 @@ is its documentation, read by `luce doc`. A comment is never a directive.
 Names are case-sensitive. Scope is static and lexical: a module, then a function, then each
 suite. A name is visible from its binding to the end of its suite. Shadowing is an error: a
 local may not reuse the name of another visible local, parameter, or top-level declaration,
-and an import may not be shadowed. Conventions, enforced by `luce fmt` and warned by the
-checker: `snake_case` for functions, bindings and fields; `CapitalCase` for types and enum
-cases; `UPPER_CASE` for nothing.
+and an import may not be shadowed. Conventions: `snake_case` for functions, bindings, fields
+and enum cases; `CapitalCase` for types; `UPPER_CASE` for nothing.
 
 The core names are reserved everywhere and cannot be declared at any level: `assert`,
 `discard`, `error`, `hash`, `print`, `trap`, `int`, `float`, `bool`, `str`, `bytes`, `unit`,
@@ -923,8 +922,8 @@ pub func main(arguments: list[str]) -> int!:
 
 ### 15.5 Packages
 
-A package is a directory with a `package.prisma` naming the package, its source root, its tests,
-and its dependencies exactly. There is no build script and no network during a build. The
+A package is a directory with a `package.prisma` naming the package, its source root, and its
+dependencies exactly. There is no build script and no network during a build. The
 manifest is the same document for the Base modules the package contains.
 
 ```text
@@ -959,7 +958,9 @@ examples and source-bundle relocation. Builds do not fetch dependencies.
 ### 16.1 What a Luce module sees of a Base module
 
 A Luce module imports a Base module by the same `import`, a `.lucb` file under the source
-root. It sees the module's `pub` functions, `pub let` constants, `pub` structs and
+root, a public module of a Base package it depends on, or one of Base's standard modules
+(`import io`), which luce-base describes from the source it carries; a sandboxed program
+imports no Base module. It sees the module's `pub` functions, `pub let` constants, `pub` structs and
 integer-backed enums whose fields are crossable, and `pub handle` types, through the
 description luce-base prints for the module (base.md §17.7): the compiler never parses
 Base. It does not see pointers, spans, arrays, unions, atomics, `c` types, `extern`
@@ -968,7 +969,7 @@ mentions one of those: those are the Base package's own, and the package writes 
 function a Luce program can call. A program that imports a Base module is built; the
 interpreter runs Luce alone and refuses it (§17.1).
 
-The current description begins with `description 7`; a mismatched compiler is
+The current description begins with `description 9`; a mismatched compiler is
 rejected before declarations are read. There is one current format. Field
 mutability and default availability are explicit in the records. Named arguments
 keep their parameter association. Omitted defaults are evaluated by Base in their
@@ -1049,9 +1050,9 @@ uses them in a signature or exports a type alias. Lists of handles are supported
 as function arguments, not aggregate fields or callback parameters. Closed handles
 are checked while unwrapping each element, just as for an individual argument.
 
-The project's `[native]` libraries, frameworks, and pkg_config requirements are
-preserved in compiled and explicitly emitted Base workspaces. Native source and
-search paths currently require a Base build and are rejected explicitly by Luce.
+The project's `def native` inputs (sources, search paths, libraries, frameworks and
+pkg_config requirements) are merged into compiled and explicitly emitted Base
+workspaces; an absolute source or search path keeps the declaring package's root.
 
 ### 16.3 Errors and traps
 
@@ -1099,18 +1100,36 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
 | `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
 | `luce --sandbox-policy` | prints the stable policy identity recorded by package locks; policy `luce-sandbox/1` uses a supervised child, a 30-second wall limit, 10-second CPU limit, 256 MiB interpreter allocation arena, one-MiB combined output limit, 16 MiB file limit, 64 descriptors, no child threads/processes or network, and rooted Luce-only imports |
-| `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package |
+| `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package; `--native` (the default), `--backend=c` and `--release` pass to luce-base |
 | `luce check program.luc` | checks it and prints every diagnostic |
 | `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, native by default; `--backend=c` explicitly selects Base’s C comparison backend |
 | `luce fmt`, `luce doc`, `luce explain` | as named |
+| `luce lex`, `luce parse`, `luce --version` | the tokens, the tree, the compiler's version |
 
 ### 17.2 Diagnostics
 
-Every diagnostic is `file:line:column: message`, one per line, the first one first, and a
+Every diagnostic is `file:line:column: message`, one per line behind the tool's name (`luce: `), the first one first, and a
 rejection exits with status 1. A declaration that does not check is reported and the next
 is checked, so one run names several; a syntax error ends the run. A crash, a hang, or a message without a position is a
 compiler bug. The interpreter and the emitted Base trap with the same message and the Luce
 position, which the emitted Base carries through base.md's position directive.
+
+### 17.3 Tests
+
+```luce
+test "parsing an empty document fails":
+    let n = parse("") catch failure:
+        assert(failure.message == "empty")
+        recover -1
+    assert(n == -1)
+```
+
+A `test` is a registered function that runs under `luce test` and never in a build. It may
+`try`, `assert`, and `error`; a test that fails is reported with its name, its position and
+the failure's message, and one that traps ends the run after its name. The report is one
+line per test, `ok    name` or `FAIL  name` followed by an indented `file:line:column:
+message`, then `N passed` and, when any failed, `M failed`; the status is 1 then. The
+interpreter and a built runner print the same report.
 
 ### 17.4 Documentation
 
@@ -1119,6 +1138,13 @@ a heading per module, a heading per declaration with its signature, the declarat
 comment beneath, and a type's public members (an interface's methods, an enum's cases) as
 a list, each with its own doc comment. A doc comment is the `##` lines directly above a
 declaration or a member (§3.3); one anywhere else documents nothing.
+
+### 17.5 Explanations
+
+`luce explain program.luc:line:column` names what the identifier at that place is: a
+binding, a parameter, a function or method, a type, a member or a module, with its type and
+where it was declared, as one line `file:line:column: `name` is a … of type `T`, declared
+at file:line:column`.
 
 ### 17.6 Formatting
 
@@ -1130,28 +1156,6 @@ before a method, at most one blank line between statements where the source had 
 comments kept: one on a line of its own stays before what follows it, one after code stays
 after that line. The parser reads the result back into the same tree, and formatting it
 again changes nothing.
-
-### 17.5 Explanations
-
-`luce explain program.luc:line:column` names what the identifier at that place is: a
-binding, a parameter, a function or method, a type, a member or a module, with its type and
-where it was declared, as one line `file:line:column: `name` is a … of type `T`, declared
-at file:line:column`.
-
-### 17.3 Tests
-
-```luce
-test "parsing an empty document fails":
-    let result = parse("")
-    assert(result is_error)
-```
-
-A `test` is a registered function that runs under `luce test` and never in a build. It may
-`try`, `assert`, and `error`; a test that fails is reported with its name, its position and
-the failure's message, and one that traps ends the run after its name. The report is one
-line per test, `ok    name` or `FAIL  name` followed by an indented `file:line:column:
-message`, then `N passed` and, when any failed, `M failed`; the status is 1 then. The
-interpreter and a built runner print the same report.
 
 ## 18. Deliberate exclusions
 
@@ -1168,7 +1172,8 @@ macros, reflection, conditional compilation, build scripts (the language is the 
 
 ```text
 module      = {import} {declaration}
-import      = "import" path ["as" NAME] | "from" path "import" NAME {"," NAME}
+import      = "import" path ["as" NAME]
+            | "from" path "import" NAME ["as" NAME] {"," NAME ["as" NAME]}
 declaration = ["pub"] (func | struct | enum | class | interface | alias | constant | test)
 func        = "func" NAME [generics] "(" [params] ")" ["->" type] ":" suite
 struct      = "struct" NAME [generics] [":" NAME {"," NAME}] ":" NEWLINE INDENT {field | func} DEDENT

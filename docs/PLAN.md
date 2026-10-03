@@ -9,15 +9,11 @@ name their statement, over the runtime of `docs/RUNTIME.md`. The conformance gat
 checks native optimization levels 0–3, both Base C comparison modes, and the interpreter
 where applicable; every runtime execution checks that it left nothing alive.
 
-The active stage is **luce-server**. Base standard-library work shipped in 0.12.0;
-TLS is paused at the user's request while HTTP and file serving proceed. The canonical [ecosystem roadmap](https://github.com/dymokomi/luce-base/blob/main/docs/ECOSYSTEM.md)
-defines each stage's completion gate. Standard-library work stays in `luce-base`;
-`luce-tls`, `luce-server` and `luce-pkg` are three separate new repositories,
-created as their work begins. The server is written in Luce. The package-manager
-stage adds `luce install` and `luce-base install`, a shared `luce.yaml` manifest with
-the `package.prisma` project file, and deployment to `pkg.luciaos.com`.
-The package manager still requires both server and TLS completion; compiler/runtime
-changes are made as needed to support the active stage. What stands ready for it: `tests/programs/`
+The ecosystem around the compiler is in place: the runtime's standard modules in
+`luce-base`, the rest of the standard library as the luce-std package, the project tool
+`luc` with the registry at `pkg.luciaos.com` (luce-pkg, luce-pkg-server), and the
+packages and applications built on them; each package keeps its own plan. Compiler and
+runtime changes are made as those packages need them. What stands ready for that: `tests/programs/`
 holds the proving programs, `tools/fuzz.py --minutes 60` runs the generator for an hour,
 and the standing rules below hold for whatever comes next.
 
@@ -26,7 +22,7 @@ and the standing rules below hold for whatever comes next.
 - Two executions agree or the feature is not done.
 - The interpreter is fixed first; the emitter follows it.
 - Every rejection names a position; every literal is checked where it sits.
-- luce-base is a pinned release; a change it needs is made there, released, and pinned.
+- luce-base is pinned by commit; a change it needs is made there, landed, and pinned.
 - No history here: this file says what to do, `git log` says what was done.
 
 Native compilation is the production path and the main hardening target. Prioritize

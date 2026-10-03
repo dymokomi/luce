@@ -1,7 +1,7 @@
 # Continuous correctness checks
 
 The `Correctness` workflow runs on every push, pull request, manual dispatch and weekly
-schedule, on macOS ARM64, Linux x86-64 and Linux ARM64. Each job clones the Base release named in
+schedule, on macOS ARM64, Linux x86-64 and Linux ARM64. Each job clones the luce-base commit named in
 `bootstrap/BASE`, asserts its actual architecture, records the toolchain and the pins
 (`tools/ci_provenance.py`), runs `./test.sh`, and keeps the whole gate log. The hosts
 finish independently, so one host's failure cannot hide another's result.

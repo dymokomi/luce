@@ -393,7 +393,7 @@ spans lack that reverse adapter and are rejected for managed implementations.
 ## Package link inputs
 
 The source bundle resolves native inputs through Base's current dependency
-protocol. Base owns interpretation of `[native]`; Luce merges the returned
+protocol. Base owns interpretation of `def native`; Luce merges the returned
 sources, libraries, search directories, frameworks and pkg-config entries into
 one generated manifest. Source/search paths are absolute paths resolved against
 the declaring package. Both direct Luce packages and transitive Base packages
@@ -401,9 +401,9 @@ participate. Normal builds discard the temporary source bundle on success and
 failure; explicit Base emission retains it for inspection and keeps references
 to original native inputs.
 
-Standard window/GPU backends supply their own system requirements. Base selects
+The window and GPU packages (luce-window, luce-gpu) supply their own system requirements. Base selects
 those from the actual generated object, so a Luce application need not copy
-platform framework lists. Portable `gpu.Frame` recording and checked targets can
+platform framework lists. Portable luce-gpu `Frame` recording and checked targets can
 be used without a window or graphics library; an attached surface supplies the
 presentation operations. Retained target methods share the frame's checked lease
 and fail after presentation or closure.

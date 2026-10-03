@@ -12,10 +12,10 @@ luce        Base     this tree: front end, interpreter, Base emitter, the runtim
 an app      Luce     plus any Base packages it imports, built as one Base package
 ```
 
-`bootstrap/BASE` names the luce-base release this tree is written against. `build.sh` builds
-that release from its tag into `build/luce-base/`, so the compiler this tree uses is never a
-binary another tree's gate may be rewriting, and a build here depends on a tag, not on a
-working directory.
+`bootstrap/BASE` names the luce-base commit this tree is written against, by its full SHA.
+`build.sh` fetches and builds that commit into `build/luce-base/`, so the compiler this tree
+uses is never a binary another tree's gate may be rewriting, and a build here depends on a
+commit, not on a working directory.
 
 ## The pipeline
 
@@ -80,9 +80,11 @@ admits and demands the same agreement, from the first slice.
 | `back.native_callbacks` | retained callable layouts, tracing and callback round trips |
 | `sema.transfer` | shared task/worker transfer rules and native worker payload validation |
 | `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture |
-| `sema.base` | what a Base module offers, read from luce-base's description of it |
-| `hir.value`, `hir.interp` | the interpreter |
+| `hir.value`, `hir.interp`, `hir.heap` | the interpreter and its heap |
 | `back.base`, `back.package` | the typed tree as Base; the package handed to luce-base |
+| `back.sources`, `back.workspace` | which package each emitted module belongs to; the workspace written for luce-base |
+| `support.module_paths`, `support.toolchain`, `support.native` | Base's module resolution and descriptions, the luce-base this Luce runs, a package's native inputs |
+| `support.sandbox` | the confinement of `luce run --sandbox` |
 | `support.*` | list, buffer, the version, the runtime's embedded source |
 | `main` | the `luce` command |
 
