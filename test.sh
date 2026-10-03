@@ -46,6 +46,8 @@ for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
 done
 echo "== luce --version"
 ./build/luce --version
+# a program read from a pipe is read once: the import prescan and the check see one text
+[ "$(printf 'pub func main(arguments: list[str]) -> int!:\n    print("piped")\n    return 0\n' | ./build/luce run /dev/stdin)" = "piped" ] || { echo "FAIL: luce run /dev/stdin"; exit 1; }
 tests/conformance/run.sh
 tools/fmt_check.sh
 python3 tools/fuzz.py --gate
