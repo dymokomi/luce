@@ -2,22 +2,20 @@
 
 ## The application language of the Luce project
 
-Luce is Python's ease with a compiler's guarantees: one integer, one float, text, values
-that copy, classes that share, memory that manages itself, failure that is visible, and
-nothing about machines. Everything about machines is Luce Base (`base.md`), the systems
-language this compiler is written in and the only door to C. A Luce program reaches Base by
-import, and it compiles to Base, so every backend, optimiser and target Base has is Luce's.
+Luce is a compiled application language: one integer, one float, text, values that copy,
+classes that share, memory that manages itself, failure that is visible in types, and
+nothing about machines. Everything about machines is
+[Luce Base](https://luce-base.luciaos.com), the systems language this compiler is written
+in and the only way to C. A Luce program reaches Base by import, and it compiles to Base,
+so every backend, optimiser and target Base has is Luce's.
 
-The language sentence:
+In one sentence:
 
 > **Values copy. Classes share. Nothing is freed by hand. Failure is a type. The machine is
 > a Base package away.**
 
-The product sentence:
-
-> **Readable like Python, checked like a compiler, fast like the systems language under it.**
-
-This document is the complete contract of the language. `base.md` is the contract of the
+This document is the complete contract of the language. The
+[Luce Base reference](https://luce-base.luciaos.com/reference/) is the contract of the
 language under it, and chapter 16 is the contract between the two. Where an implementation
 and this document disagree, the document is right and the implementation is a bug; where
 this document is silent, the behaviour is not promised.
@@ -63,7 +61,8 @@ not implemented until they agree on its programs and its traps.
 Source is UTF-8. A byte-order mark is accepted only at byte zero. NUL bytes, invalid UTF-8,
 the Unicode bidirectional format characters (U+202A to U+202E and U+2066 to U+2069), and
 characters confusable with ASCII punctuation are rejected with a diagnostic naming the line
-and column. CRLF is normalised for parsing. These rules are base.md §3.1's.
+and column. CRLF is normalised for parsing. These rules are
+[Luce Base's](https://luce-base.luciaos.com/reference/source-text/).
 
 Identifiers are ASCII: a letter or `_`, then letters, digits or `_`, at most 128 bytes. The
 standalone `_` is the pattern wildcard. Unicode is fully supported inside text and comments.
@@ -154,7 +153,8 @@ has no escapes. A formatted literal `f"..."` interpolates any expression whose t
 display (§10.5); a format spec after `:` is not part of the language and a `{` is written
 `{{`. A field's expression holds no brace of its own: a set or map literal is bound to a
 name first. A field is code, not text: a string inside it is written with plain quotes,
-`f"{name if name != "" else "none"}"`, and a backslash there is an error. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
+`f"{name if name != "" else "none"}"`. A formatted literal is one line: there is no
+triple-quoted form. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
 `b"..."` admits `\xNN` and is the only place a byte is spelled.
 
 There is no character literal: a text of one scalar is a `str` of length one.
@@ -229,7 +229,7 @@ whose fields have it, enums whose payloads have it, optionals of it, and collect
 `<`, `<=`, `>`, `>=` are defined for `int`, `float`, `str` (scalar-value order, not locale),
 `bytes`, and tuples of those, and for a struct that declares `Ordered` (§13.3). `hash` is
 defined for every equatable value, consistently with `==`, and is the same number in every
-execution (`docs/RUNTIME.md` states the function). Classes have identity, not
+execution ([the runtime](RUNTIME.md#hashing) states the function). Classes have identity, not
 equality: `is` and `is not` compare identity, and `==` on a class is an error unless it
 declares `Equatable` (§13.3).
 
@@ -564,7 +564,7 @@ A class is a shared object: assignment and passing share it, and it lives while 
 refers to it. Construction is `Name(args)`, the same spelling as a struct; the declaration,
 not the use, says which is which. A class has one `init(self, ...)`, which assigns every
 field without a default exactly once before it ends and cannot publish `self` before that;
-`init` may be `!` when construction can fail. `Name(args)` then propagates in a fallible caller or is handled with `catch`. A
+`init` may be fallible, `-> unit!`, when construction can fail. `Name(args)` then propagates in a fallible caller or is handled with `catch`. A
 class without an `init` and with defaults for every field is constructed with no arguments.
 Classes are final: no inheritance, no override, no base class. Alternative construction is a
 type function returning the class, `Document.from_file(path)`.
@@ -591,8 +591,8 @@ binding releases its reference when it leaves its scope or is reassigned, a fiel
 reassigned or its owner is destroyed, and an object that no binding took, the result of a
 call or a construction inside an expression, at the end of the statement that produced it.
 A cycle of objects that nothing else refers to is reclaimed by the runtime's cycle
-collector, which runs at the end of the program and periodically before; `docs/RUNTIME.md`
-states the exact order.
+collector, which runs at the end of the program and periodically before;
+[the runtime](RUNTIME.md#cycles) states the exact order.
 A class may declare `deinit(self)`, run once at destruction, taking no arguments, returning
 `unit`, unable to fail, spawn, or publish `self`. Fields are then released in reverse
 declaration order. A class that holds a resource also offers `close()`, so that `with` can
@@ -676,7 +676,7 @@ program when the data is not text; a Luce program does not compute on bytes, it 
 
 ```luce
 let found: User? = find(users, id)
-let name = found.name if found != none else "nobody"
+let present = found != none
 let user = find(users, id) else return
 let count = counts[key] else 0
 ```
@@ -810,7 +810,8 @@ func show_sorted[T: Ordered & Display](values: list[T]) -> str:
 ```
 
 A value of a conforming type converts to an interface value where one is expected: a copy
-of the value behind the interface, with the ownership of a value (§10.5, `docs/RUNTIME.md`),
+of the value behind the interface, with the ownership of a value (§10.5,
+[the runtime](RUNTIME.md#interface-values)),
 so a class behind it lives while any copy of the interface value does. A call dispatches to
 the value's own method; an interface value has no `==`, no ordering, no hash and no display
 of its own, and an optional of one is compared with `none` like any optional. A generic
@@ -857,7 +858,7 @@ type: `let e: Equatable = x` is an error, and no program may declare one itself.
 declares `Equatable` keys a map or sits in a set only when it declares `Hashable` beside
 it, so its hash agrees with its `equals`; `Hashable` and `Ordered` are declared beside
 `Equatable`, never alone. A value with a declared `hashed` hashes as the `int` it returns
-(`docs/RUNTIME.md`).
+([the runtime](RUNTIME.md#hashing)).
 
 ## 14. Workers
 
@@ -950,8 +951,8 @@ of modules, `from luce_geocore.core import parallel`, and alias what it brings,
 module. The standard packages are packages too, `from luce_std import math`.
 Base owns module resolution; Luce invokes the compiler `LUCE_BASE` names, else `luce-base`
 beside the `luce` executable, as a release lays them out, else `luce-base` on the path.
-See [the package import contract](../../luce-base/docs/PACKAGE-IMPORTS.md) for complete
-examples and source-bundle relocation. Builds do not fetch dependencies.
+See [the package import contract](https://github.com/dymokomi/luce-base/blob/main/docs/PACKAGE-IMPORTS.md)
+for complete examples and source-bundle relocation. Builds do not fetch dependencies.
 
 ## 16. The Base boundary
 
@@ -962,7 +963,8 @@ root, a public module of a Base package it depends on, or one of Base's standard
 (`import io`), which luce-base describes from the source it carries; a sandboxed program
 imports no Base module. It sees the module's `pub` functions, `pub let` constants, `pub` structs and
 integer-backed enums whose fields are crossable, and `pub handle` types, through the
-description luce-base prints for the module (base.md §17.7): the compiler never parses
+description luce-base prints for the module
+([Luce Base §17.7](https://luce-base.luciaos.com/reference/modules-packages-and-tests/)): the compiler never parses
 Base. It does not see pointers, spans, arrays, unions, atomics, `c` types, `extern`
 declarations, generic declarations, or any function, constant or struct whose signature
 mentions one of those: those are the Base package's own, and the package writes the
@@ -1112,7 +1114,7 @@ Every diagnostic is `file:line:column: message`, one per line behind the tool's 
 rejection exits with status 1. A declaration that does not check is reported and the next
 is checked, so one run names several; a syntax error ends the run. A crash, a hang, or a message without a position is a
 compiler bug. The interpreter and the emitted Base trap with the same message and the Luce
-position, which the emitted Base carries through base.md's position directive.
+position, which the emitted Base carries through Luce Base's position directive.
 
 ### 17.3 Tests
 

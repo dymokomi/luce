@@ -49,6 +49,10 @@ echo "== luce --version"
 # a program read from a pipe is read once: the import prescan and the check see one text
 [ "$(printf 'pub func main(arguments: list[str]) -> int!:\n    print("piped")\n    return 0\n' | ./build/luce run /dev/stdin)" = "piped" ] || { echo "FAIL: luce run /dev/stdin"; exit 1; }
 tests/conformance/run.sh
+# the guide: every complete program in docs/guide runs in the interpreter and built, and
+# prints what the page shows; the site built from docs/ has no link to a missing page
+python3 tools/doc_examples.py
+python3 tools/site.py build/site > /dev/null
 tools/fmt_check.sh
 python3 tools/fuzz.py --gate
 # random object graphs through both collectors, collecting at every candidate too, under

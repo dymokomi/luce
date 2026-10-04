@@ -328,7 +328,7 @@ owners. Each emission snapshots registration order, skips removed connections an
 defers additions to the next emission. The active callback stays retained through
 return. Closing the signal skips remaining delivery; failure stops the emission
 with an owned error. Connections and callback captures participate in the shared
-cycle graph. See [the lifecycle contract](../../luce-base/docs/CALLBACKS-WORKERS.md).
+cycle graph. See [the lifecycle contract](https://github.com/dymokomi/luce-base/blob/main/docs/CALLBACKS-WORKERS.md).
 
 ## Native application workers
 
