@@ -123,10 +123,11 @@ Comparisons do not chain: `a < b < c` is an error, written `a < b and b < c`.
 
 ## Hashing
 
-`hash(x)` gives an `int` for any value that can be compared with `==`, consistently with it:
-equal values have equal hashes. Map keys and set elements must be hashable. Unlike Python,
-whose string hashes change from run to run, a value's hash is the same number in every run
-of every Luce program.
+`x.hash()` gives an `int` for any value that can be compared with `==`, consistently with it:
+equal values have equal hashes. It is Python's `hash(x)`, written as a method, as `len(x)` is
+`x.length`. Map keys and set elements must be hashable. Unlike Python, whose string hashes
+change from run to run, a value's hash is the same number in every run of every Luce
+program.
 
 ## Printing
 
@@ -180,17 +181,21 @@ The conversions from text can fail, so their results are `int!`, `float!` and `b
 the first raises in both languages, the second is `True` in Python, since any non-empty
 string is true there, and a failure in Luce.
 
-## Built-in functions
+## Standard modules
 
-Besides `print`, the conversions and `hash`, a few of Python's built-in functions are part of
-the language:
+Besides `print` and the conversions, a few of Python's built-in functions come with Luce, in
+three small modules imported like any other: `math`, `text` and `console`.
 
 ```luce
+import console
+import math
+import text
+
 pub func main(arguments: list[str]) -> int!:
-    print(abs(-7), abs(-2.5), min(3, 8), max("pear", "apple"))
-    print(round(2.675, 2), round(2.5), round(1234.5, -2))
-    print(ord("é"), chr(233), int("ff", 16), int("0b101", base = 2))
-    let name = input("Your name? ") else "nobody"
+    print(math.abs(-7), math.abs(-2.5), math.min(3, 8), math.max("pear", "apple"))
+    print(math.round(2.675, 2), math.round(2.5), math.round(1234.5, -2))
+    print(text.code_of("é"), text.from_code(233), int("ff", 16), int("0b101", base = 2))
+    let name = console.read_line("Your name? ") else "nobody"
     print(f"hello, {name}")
     return 0
 ```
@@ -202,31 +207,36 @@ pub func main(arguments: list[str]) -> int!:
 Your name? hello, nobody
 ```
 
-| Call | Result |
-| --- | --- |
-| `abs(x)` | the magnitude of an `int` or a `float`; `abs` of the smallest `int` traps |
-| `min(a, b)`, `max(a, b)` | the lesser or greater of two values of the same ordered type; of two equal, the first |
-| `round(x, digits = 0)` | a `float` rounded to `digits` decimals, half to even on the exact value, as Python's |
-| `ord(text)` | the number of a one-character text |
-| `chr(code)` | the one-character text of a number; one that names no character traps |
-| `input(prompt = "")` | writes the prompt and reads a line without its line end: a `str?`, `none` at the end of the input |
+| Call | Python's | Result |
+| --- | --- | --- |
+| `math.abs(x)` | `abs(x)` | the magnitude of an `int` or a `float`; of the smallest `int` it traps |
+| `math.min(a, b)`, `math.max(a, b)` | `min(a, b)`, `max(a, b)` | the lesser or greater of two values of the same ordered type; of two equal, the first |
+| `math.round(x, digits = 0)` | `round(x, digits)` | a `float` rounded to `digits` decimals, half to even on the exact value |
+| `text.code_of(s)` | `ord(s)` | the number of a one-character text |
+| `text.from_code(n)` | `chr(n)` | the one-character text of a number; one that names no character traps |
+| `console.read_line(prompt = "")` | `input(prompt)` | writes the prompt and reads a line without its line end: a `str?`, `none` at the end of the input |
+
+`from math import abs` brings one function in by its name, as in Python, and then `abs(x)`
+calls it. An import that is not used is an error, as for any module
+([Modules](13-modules-and-packages.md)).
 
 Compared with Python:
 
-- **`round` always gives a `float`** and takes only a `float`: `round(2.5)` is `2.0`, where
-  Python gives the `int` 2. Like Python, it rounds a half to the even neighbour, on the
-  number's exact binary value, so `round(2.675, 2)` is `2.67`. Convert with `int(...)` for an
-  `int`.
-- **`min` and `max` take two values.** A list has its own: `values.min()` and
+- **`math.round` always gives a `float`** and takes only a `float`: `math.round(2.5)` is
+  `2.0`, where Python gives the `int` 2. Like Python, it rounds a half to the even neighbour,
+  on the number's exact binary value, so `math.round(2.675, 2)` is `2.67`. Convert with
+  `int(...)` for an `int`.
+- **`math.min` and `math.max` take two values.** A list has its own: `values.min()` and
   `values.max()` ([Collections](04-collections.md#lists)).
-- **`input` answers `none` at the end of the input**, where Python raises `EOFError`, so
-  `while let line = input():` reads every line. The program above ran with no input, so it
-  printed the prompt and went on with `nobody`.
-- **`abs` and `round` follow the no-mixing rule**: `round(3)` is an error, since an `int` is
-  whole already.
+- **`console.read_line` answers `none` at the end of the input**, where Python's `input`
+  raises `EOFError`, so `while let line = console.read_line():` reads every line. The
+  program above ran with no input, so it printed the prompt and went on with `nobody`.
+- **`math.abs` and `math.round` follow the no-mixing rule**: `math.round(3)` is an error,
+  since an `int` is whole already.
 
-Their names are reserved, like `print`: a variable cannot be called `max` or `input`
-([Syntax](01-syntax.md#reserved-words)).
+The names these functions had in Python are free: a variable may be called `max` or
+`input`. Square roots, trigonometry and the like are in luce-std's `math`, a package
+([Standard library](15-standard-library.md#math)).
 
 ## `unit` and `never`
 

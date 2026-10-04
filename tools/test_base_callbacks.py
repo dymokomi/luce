@@ -28,8 +28,8 @@ with tempfile.TemporaryDirectory(prefix='luce-retained-callbacks-') as temporary
     entry.write_text('''import events
 pub func main(arguments: list[str]) -> int!:
     let captured = "a captured value"
-    try events.wrong_thread(func (text: str) -> unit!:
-        discard(captured + text)
+    events.wrong_thread(func (text: str) -> unit!:
+        _ = captured + text
     )
     return 0
 ''')

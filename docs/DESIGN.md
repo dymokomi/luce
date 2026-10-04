@@ -95,7 +95,7 @@ directory of fragments its `ORDER` lists (`sema/bodies/`, `hir/interp/`, `back/b
 `rt/` is a Base package compiled by luce-base with the program. Its `kernel` provides the
 object header, retain and release, the temporaries pool, the cycle collector, weak
 references, `deinit` dispatch, owned text and bytes, the three collections and their methods,
-ranges, the built-in functions, closure cells, workers, and the trap reporter; beside it
+ranges, the standard modules' functions, closure cells, workers, and the trap reporter; beside it
 `numerals`, embedded from `src/support/numerals.lucb`, formats numbers as the interpreter
 does. `docs/RUNTIME.md` is its written contract, and the
 interpreter follows the same contract so that the two executions destroy objects in the same

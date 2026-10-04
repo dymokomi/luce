@@ -74,8 +74,8 @@ Python's built-in functions over lists are methods here: `sorted(values, key=f)`
 `values.sorted(key = f)`, `min(values)` is `values.min()`, `sum(values)` is
 `values.sum()`, `any(f(x) for x in values)` is `values.any(f)`, `zip(a, b)` is `a.zip(b)`,
 `enumerate(values)` is `values.indexed()`, and `list(dict.fromkeys(values))` is
-`values.distinct()`. `min` and `max` of two values are the built-in functions `min(a, b)` and
-`max(a, b)` ([Types and values](02-types-and-values.md#built-in-functions)).
+`values.distinct()`. The lesser or greater of two values is `math.min(a, b)` or
+`math.max(a, b)` ([Types and values](02-types-and-values.md#standard-modules)).
 
 ```luce
 struct Person:

@@ -1,8 +1,11 @@
 # The standard library
 
-The language has its built-in types and their methods, covered in the earlier chapters. The
-rest of the standard library is a package, `luce-std`, which a project adds as a
-dependency:
+The language has its built-in types and their methods, covered in the earlier chapters, and
+three small modules that come with the compiler, `math`, `text` and `console`, which hold
+Python's `abs`, `min`, `max`, `round`, `ord`, `chr` and `input`
+([Types and values](02-types-and-values.md#standard-modules)). They need no package and run
+in the interpreter. The rest of the standard library is a package, `luce-std`, which a
+project adds as a dependency:
 
 ```sh
 luc add dymokomi/luce-std
@@ -378,6 +381,25 @@ pub func main(arguments: list[str]) -> int!:
 | `mod`, `remainder`, `modf`, `nextafter`, `next_up`, `next_down` | for numerical work |
 
 `math32` has the same functions for single-precision floats, for Base programs.
+
+This `math` is not the language's own `math` module, which has `abs`, `min`, `max` and a
+`round` that rounds halves to even. The name `math` alone always means the language's; this
+one is reached through its package, and when a module wants both, it gives this one another
+name:
+
+<!-- needs luce-std -->
+```luce
+import math
+from luce_std import math as fmath
+
+pub func main(arguments: list[str]) -> int!:
+    print(fmath.sqrt(math.abs(-16.0)), math.round(2.5), fmath.round(2.5))
+    return 0
+```
+
+```output
+4.0 2.0 3.0
+```
 
 ## `unicode`
 

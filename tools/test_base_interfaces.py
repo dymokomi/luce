@@ -38,8 +38,8 @@ pub func main(arguments: list[str]) -> int!:
     assert 'requires interop.Owned' in run(COMPILER, 'check', entry, expected=1).stderr
     entry.write_text("""import widgets
 pub func main(arguments: list[str]) -> int!:
-    let value = try widgets.Counter("raw")
-    discard(widgets.raw(value))
+    let value = widgets.Counter("raw")
+    _ = widgets.raw(value)
     return 0
 """)
     assert 'has no `raw`' in run(COMPILER, 'check', entry, expected=1).stderr
@@ -47,7 +47,7 @@ pub func main(arguments: list[str]) -> int!:
 func worker(value: widgets.Widget) -> int:
     return value.value()
 pub func main(arguments: list[str]) -> int!:
-    let value = try widgets.Counter("worker")
+    let value = widgets.Counter("worker")
     let widget = widgets.as_widget(value)
     let job = spawn worker(widget)
     return wait job
@@ -56,14 +56,14 @@ pub func main(arguments: list[str]) -> int!:
     for after, call, message in [
         ('owner.close()', 'bound()', 'a native object is closed'),
         ('owner.close()', 'bound()', 'a native view has expired')]:
-        maker = 'widgets.frame_widget(try widgets.frame(owner))' if 'view' in message else 'widgets.as_widget(owner)'
+        maker = 'widgets.frame_widget(widgets.frame(owner))' if 'view' in message else 'widgets.as_widget(owner)'
         entry.write_text(f"""import widgets
 pub func main(arguments: list[str]) -> int!:
-    let owner = try widgets.Counter("expired")
+    let owner = widgets.Counter("expired")
     let widget = {maker}
     let bound = widget.title
     {after}
-    discard({call})
+    _ = {call}
     return 0
 """)
         for flags in FLAGS:

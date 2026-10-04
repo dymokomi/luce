@@ -70,11 +70,11 @@ func twice(value: int) -> int:
     return value * 2
 
 pub func main(arguments: list[str]) -> int!:
-    assert((try api.combine(4)) == (38, "native default"))
-    assert((try combine(label = "named", second = 5, first = 4)) == (45, "named"))
-    assert((try api.combine(label = "omitted middle", first = 4)) == (38, "omitted middle"))
+    assert(api.combine(4) == (38, "native default"))
+    assert(combine(label = "named", second = 5, first = 4) == (45, "named"))
+    assert(api.combine(label = "omitted middle", first = 4) == (38, "omitted middle"))
     let combined = api.combine
-    assert((try combined(4, 6, "value")) == (46, "value"))
+    assert(combined(4, 6, "value") == (46, "value"))
     let point: exports.Position = points.Point(3)
     let maybe: points.Point? = point
     let empty: points.Point? = none

@@ -36,7 +36,7 @@ pub func main(arguments: list[str]) -> int!:
     let factory = func (prefix: str) -> Handler!:
         return func (message: str) -> str!:
             return captured + prefix + message
-    let service = try Service(factory, "test")
+    let service = Service(factory, "test")
     service.close()
     return 0
 '''
@@ -46,8 +46,8 @@ pub func main(arguments: list[str]) -> int!:
 
     # An ordinary function value erases native parameter metadata. Its adapter
     # must still reject a captured factory before creating any worker thread.
-    entry.write_text(captured.replace('let service = try Service(factory, "test")',
-        'let create = workers.create_service\n    let service = try create(factory)').replace(
+    entry.write_text(captured.replace('let service = Service(factory, "test")',
+        'let create = workers.create_service\n    let service = create(factory)').replace(
         'from workers import Service, Handler', 'from workers import Handler'))
     for flags in FLAGS:
         run(COMPILER, 'build', entry, *flags, '-o', root / 'captured')

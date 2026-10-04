@@ -97,17 +97,20 @@ local may not reuse the name of another visible local, parameter, or top-level d
 and an import may not be shadowed. Conventions: `snake_case` for functions, bindings, fields
 and enum cases; `CapitalCase` for types; `UPPER_CASE` for nothing.
 
-The core names are reserved everywhere and cannot be declared at any level: `assert`,
-`discard`, `error`, `hash`, `print`, `trap`, `int`, `float`, `bool`, `str`, `bytes`, `unit`,
-`never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`, and the built-in
-functions `abs`, `min`, `max`, `round`, `ord`, `chr`, `input` (§6.8).
+The core names are the language's own functions and types: `assert`, `error`, `print`,
+`trap`, `int`, `float`, `bool`, `str`, `bytes`, `unit`, `never`, `list`, `map`, `set`,
+`Error`, `ErrorCode`, `Weak`, `task`. No module-level declaration, import, local or
+parameter takes one. A member (a field, a method, an enum case) may take any name but a
+reserved word, a core name too, since it is only reached through its value or its type:
+`report.print`, `Token.str`. What else the language provides is in its standard modules
+(§6.8), so `abs`, `min` or `input` is an ordinary name.
 
 ### 2.5 Reserved words
 
 ```text
 and as break catch class continue elif else enum false for from func if import in
-interface is let match none not or pub recover return self spawn struct test true try
-type var wait while with
+interface is let match none not or pub recover return self spawn struct test true type
+var wait while with
 ```
 
 `init`, `deinit`, `close`, and `main` are ordinary names with a meaning in one position each.
@@ -262,11 +265,13 @@ they are meant and never inferred from a `none` or an `error`.
 Every value type has `==` and `!=` by structure: scalars, `str`, `bytes`, tuples, structs
 whose fields have it, enums whose payloads have it, optionals of it, and collections of it.
 `<`, `<=`, `>`, `>=` are defined for `int`, `float`, `str` (scalar-value order, not locale),
-`bytes`, and tuples of those, and for a struct that declares `Ordered` (§13.3). `hash` is
-defined for every equatable value, consistently with `==`, and is the same number in every
-execution ([the runtime](RUNTIME.md#hashing) states the function). Classes have identity, not
-equality: `is` and `is not` compare identity, and `==` on a class is an error unless it
-declares `Equatable` (§13.3).
+`bytes`, and tuples of those, and for a struct that declares `Ordered` (§13.3).
+`value.hash()` is an `int` for every equatable value, consistent with `==` and the same in
+every execution ([the runtime](RUNTIME.md#hashing) states the function); a type that
+declares `Hashable` answers with its own `hash` (§13.3), and a type with any member named
+`hash` is reached through that member. Classes have identity, not equality: `is` and
+`is not` compare identity, and `==` on a class is an error unless it declares `Equatable`
+(§13.3).
 
 ### 4.5 Recursion
 
@@ -307,6 +312,11 @@ A tuple destructures into as many bindings as it has members; `_` discards one.
 `=` assigns a `var`, a `var` field through any path, an element of a list or map, or a tuple
 of those from a tuple. `+=`, `-=`, `*=`, `/=`, `//=`, `%=` read then write once. The place is
 evaluated before the value.
+
+`_ = value` evaluates the value and drops it, the way to ignore a result on purpose (§12.2).
+The value is checked as a binding's would be: it has a value, and a failure in it propagates
+or is handled as it would in `let`. A value a `catch` handles is dropped too, so that suite
+may end without `recover`: `_ = save(doc) catch failure: print(failure.message)`.
 
 ## 6. Expressions
 
@@ -373,20 +383,48 @@ From tightest: member, call, index; unary `-`; `**`; `* / // %`; `+ -`; `..<` `.
 `is`, `is not`, comparisons; `not`; `and`; `or`; `if`-`else`; `=>`; assignment. `not` sits
 below the comparisons so that `not a == b` negates the comparison, as in Python.
 
-### 6.8 Built-in functions
+### 6.8 Standard modules
 
-| Call | Meaning |
-| --- | --- |
-| `abs(x)` | the magnitude of an `int`, where the smallest traps, or of a `float` |
-| `min(a, b)`, `max(a, b)` | the lesser or greater of two values of one ordered type (§4.4); of two equal ones, the first |
-| `round(x, digits = 0)` | a `float` rounded to `digits` after the point, or before it when negative, half to even on the exact value, as Python's; a result past the largest `float` traps |
-| `ord(text)` | the value of a text's one scalar; a text of any other length traps |
-| `chr(code)` | the text of the scalar `code`; a number that is no scalar (negative, a surrogate, past `0x10FFFF`) traps |
-| `input(prompt = "")` | writes the prompt, then reads a line of standard input without its `\n` and a `\r` before it: `str?`, `none` at the end of the input |
+```luce
+import console
+import math
+from text import code_of
 
-`round` takes no `int`, since an `int` is whole already (§6.2); `min` and `max` take two
-values, and a list's own are its methods (§11.1). Arguments are positional, or named by the
-parameters shown, as for any call (§7.2).
+let longest = math.max(first.length, second.length)
+let name = console.read_line("name? ") else "nobody"
+let letter = code_of("A")
+```
+
+Three modules come with the language: `math`, `text` and `console`. They are imported by
+name like any module (§15.2), in the interpreter and in a built program alike: `import math`
+binds `math`, and `math.abs(x)` calls one of its functions; `from math import abs` binds the
+function by its name. Nothing of them is visible without an import, an import not used is
+an error, and their functions are called, never read as values. They declare no types: a
+module's functions are all it has.
+
+| Module | Function | Meaning |
+| --- | --- | --- |
+| `math` | `abs(x)` | the magnitude of an `int`, where the smallest traps, or of a `float` |
+| `math` | `min(a, b)`, `max(a, b)` | the lesser or greater of two values of one ordered type (§4.4); of two equal ones, the first |
+| `math` | `round(x: float, digits: int = 0) -> float` | rounded to `digits` after the point, or before it when negative, half to even on the exact value, as Python's; a result past the largest `float` traps |
+| `text` | `code_of(s: str) -> int` | the value of a text's one scalar; a text of any other length traps |
+| `text` | `from_code(n: int) -> str` | the text of the scalar `n`; a number that is no scalar (negative, a surrogate, past `0x10FFFF`) traps |
+| `console` | `read_line(prompt: str = "") -> str?` | writes the prompt, then reads a line of standard input without its `\n` and a `\r` before it; `none` at the end of the input, and always in a sandboxed run (§17.1) |
+
+`math.round` takes no `int`, since an `int` is whole already (§6.2); `math.min` and
+`math.max` take two values, and a list's own are its methods (§11.1). Arguments are
+positional, or named by the parameters shown, as for any call (§7.2).
+
+The modules hold what a program needs that no type's method holds, and nothing more.
+Mathematics beyond them (roots, trigonometry, constants) is a library's: luce-std's `math`
+module, reached through its package (§15.5). Both live in one module under two names:
+
+```luce
+import math
+from luce_std import math as fmath
+
+let side = fmath.sqrt(math.abs(area))
+```
 
 ## 7. Functions
 
@@ -823,8 +861,9 @@ let config3 = parse(text) catch failure:
 an explicitly fallible function, operations propagate automatically: their success
 values compose normally, and the first failure leaves the expression. A nonfallible
 function must handle each fallible operation with `catch`. This is checked at compile
-time; a failure is never silently discarded. Ignoring a successful non-`unit` value
-still requires `discard(...)`.
+time; a failure is never silently discarded, and there is no marker to write: a call that
+can fail reads like any other. Ignoring a successful non-`unit` value is said with
+`_ = value` (§5.3).
 
 `expression catch failure:` protects its whole left expression, including nested
 arguments, receivers and conversions. The nearest handler runs first. Failures in
@@ -832,11 +871,6 @@ its handler body go outward, to an enclosing handled operand or the declared fal
 function. A handler must `recover value`, return, fail, trap, or leave an enclosing
 loop; a `unit` handler may fall through. `error(code, message)` raises an error to the
 same destination and cannot be caught by the handler that is currently executing it.
-
-An optional `try` marker may cover a whole expression, with the same checked behavior.
-A leading marker includes binary operations, conditional branches and optional fallback,
-stopping before an attached `catch`. In an operator operand it has unary precedence;
-use parentheses to mark a larger operand. It must cover a fallible operation.
 
 Arguments run once, left to right in source order, including named arguments.
 Short-circuit operators, optional fallback, conditional branches and match guards keep
@@ -959,8 +993,8 @@ The compiler knows these interfaces, and syntax uses them:
 | Interface | Methods | Used by |
 | --- | --- | --- |
 | `Equatable` | `equals(self, other: Self) -> bool` | `==`, `!=`, `in`, keys |
-| `Hashable` | `hashed(self) -> int` with `Equatable` | map keys, set elements |
-| `Ordered` | `compare(self, other: Self) -> int` | `<` and friends, `sort`, `min`, `max` |
+| `Hashable` | `hash(self) -> int` with `Equatable` | map keys, set elements, `value.hash()` |
+| `Ordered` | `compare(self, other: Self) -> int` | `<` and friends, `sort`, `math.min`, `math.max` |
 | `Display` | `display(self) -> str` | `print`, `str(x)`, f-strings |
 | `Iterable[T]` | `iterator(self) -> Iterator[T]` | `for` |
 | `Iterator[T]` | `next(self) -> T?` | `for`, `while let` |
@@ -974,7 +1008,7 @@ is a class, since a struct's method for a requirement may not change `self` (§1
 type: `let e: Equatable = x` is an error, and no program may declare one itself. A type that
 declares `Equatable` keys a map or sits in a set only when it declares `Hashable` beside
 it, so its hash agrees with its `equals`; `Hashable` and `Ordered` are declared beside
-`Equatable`, never alone. A value with a declared `hashed` hashes as the `int` it returns
+`Equatable`, never alone. A value with a declared `hash` hashes as the `int` it returns
 ([the runtime](RUNTIME.md#hashing)).
 
 ## 14. Workers
@@ -1026,6 +1060,12 @@ struct with a private field that does not declare `Display` (§10.5). A public s
 mentions only public types. A module's name
 is read only to reach a member, `shapes.origin`, `shapes.Point`; the closed protocols
 (§13.3) are visible in every module without an import.
+
+The names `math`, `text` and `console` always name the standard modules (§6.8): `import
+math` and `from math import abs` never reach a module of the package. So a package with a
+module of one of those names at its source root may not import that name, and doing so is
+an error; another package's module of that name is reached through its package,
+`from luce_std import math as fmath`, under a name of its own.
 
 ### 15.3 Top level
 
@@ -1224,7 +1264,7 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | Command | Does |
 | --- | --- |
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
-| `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter, whose `input` reads nothing and answers `none`; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
+| `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter, whose `console.read_line` reads nothing and answers `none`; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
 | `luce --sandbox-policy` | prints the stable policy identity recorded by package locks; policy `luce-sandbox/1` uses a supervised child, a 30-second wall limit, 10-second CPU limit, 256 MiB interpreter allocation arena, one-MiB combined output limit, 16 MiB file limit, 64 descriptors, no child threads/processes or network, and rooted Luce-only imports |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package; `--native` (the default), `--backend=c` and `--release` pass to luce-base |
 | `luce check program.luc` | checks it and prints every diagnostic |
@@ -1251,7 +1291,7 @@ test "parsing an empty document fails":
 ```
 
 A `test` is a registered function that runs under `luce test` and never in a build. It may
-`try`, `assert`, and `error`; a test that fails is reported with its name, its position and
+fail, `assert`, and `error`; a test that fails is reported with its name, its position and
 the failure's message, and one that traps ends the run after its name. The report is one
 line per test, `ok    name` or `FAIL  name` followed by an indented `file:line:column:
 message`, then `N passed` and, when any failed, `M failed`; the status is 1 then. The
@@ -1291,8 +1331,8 @@ bit operations, shifts, wrapping and saturating arithmetic (Base); `char` (a sca
 `str` of one); fixed arrays, slices as views, unions, pointers, spans, atomics, `asm`,
 allocators, `defer`, `new`, `free`, `weak` as a word (memory is not the programmer's);
 inheritance, overloading, variadics, default interface methods, associated types, downcasts
-(one way to do each thing); exceptions, force unwrap, nullable-by-default (failure is
-visible); `extern`, `cfunc`, C++ bridges, an audited tier (the machine is a Base package);
+(one way to do each thing); exceptions, force unwrap, nullable-by-default, a marker on
+a call that can fail (failure is visible in the type); `extern`, `cfunc`, C++ bridges, an audited tier (the machine is a Base package);
 macros, reflection, conditional compilation, build scripts (the language is the language).
 
 ## 19. Grammar summary
@@ -1321,6 +1361,9 @@ statement   = simple NEWLINE | if | while | for | match | with
 simple      = binding | assignment | expression | "return" [expression] | "break" [NAME]
             | "continue" [NAME] | "recover" expression | "error" "(" expression "," expression ")"
 binding     = ("let" | "var") (NAME | "(" NAME {"," NAME} ")") [":" type] "=" expression
+assignment  = place ("=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=") expression
+            | "(" place {"," place} ")" "=" expression | "_" "=" expression
+place       = NAME | postfix "." NAME | postfix "[" expression "]"
 if          = "if" (expression | "let" NAME "=" expression) ":" suite
               {"elif" ... ":" suite} ["else" ":" suite]
 while       = [NAME ":"] "while" (expression | "let" NAME "=" expression) ":" suite
@@ -1337,6 +1380,6 @@ add         = mul {("+" | "-") mul}       mul = unary {("*" | "/" | "//" | "%") 
 unary       = "-" unary | power           power = postfix ["**" unary]
 postfix     = primary {"." NAME | "(" [args] ")" | "[" expression "]" | "[" [expression] ".." ["<" expression] "]"}
 primary     = literal | NAME | "self" | "." NAME | "(" expression ")" | tuple | list | map
-            | "try" expression | expression "catch" NAME ":" suite | expression "else" expression
+            | expression "catch" NAME ":" suite | expression "else" expression
             | "match" expression ":" arms | "spawn" call | "wait" expression
 ```

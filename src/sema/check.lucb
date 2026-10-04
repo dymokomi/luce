@@ -21,6 +21,7 @@ import luce_std.paths
 import luce_std.process
 import sema.boundary
 import sema.native_availability
+import sema.standard
 import strings
 import support.prelude
 import front.parser
@@ -73,6 +74,9 @@ pub struct Import:
     pub var node: ast.Node*
     ## Some name in the module went through this import (§15.2).
     pub var used: bool
+    ## The standard module (§6.8) the import names, or names a function of; empty for any
+    ## other, whose `module` is then the one imported.
+    pub var standard: str = ""
 
 ## One module of the program: its dotted name, its tree, its source for positions, and
 ## what it imports. Module 0 is the prelude (§13.3).
@@ -130,10 +134,13 @@ pub struct Checker:
     pub var current_func: ast.Node*?
     ## The unwrapped result type of the function being checked, and whether it may fail.
     pub var result_type: u32
-    ## The function's result is `T!`: `try` may propagate.
+    ## The function's result is `T!`: a failure propagates.
     pub var fallible: bool
     ## The operand of a local handler allows checked failure without escaping the function.
     pub var handled_effect: bool = false
+    ## The `catch` about to be checked is the value of `_ = ...`: its value is dropped, so its
+    ## suite may end without `recover` (§5.3).
+    pub var dropped_handler: bool = false
     ## How many fallible operations the body propagates so far; saved and restored per lambda.
     pub var effect_count: u64 = 0
     ## The type `self` has in the method being checked, and whether it may be assigned.
@@ -287,6 +294,7 @@ pub struct Checker:
         self.in_conformance = false
         self.in_catch = false
         self.handled_effect = false
+        self.dropped_handler = false
         self.effect_count = 0
         self.at_top_level = false
         self.loop_depth = 0
@@ -659,7 +667,7 @@ pub struct Checker:
         var names = try list.List[str].create(8)
         var cursor = tree.body
         while let d = cursor:
-            if (d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import) and not d.has(ast.flag_base_standard):
+            if (d.kind == ast.Kind.import_ or d.kind == ast.Kind.from_import) and not d.has(ast.flag_base_standard) and not standard.is_module(d.text):
                 try names.push(d.text)
             cursor = d.next
         return names
@@ -676,7 +684,7 @@ pub struct Checker:
         var cursor = tree.body
         while let d = cursor:
             cursor = d.next
-            if d.kind != ast.Kind.from_import or d.has(ast.flag_base_standard):
+            if d.kind != ast.Kind.from_import or d.has(ast.flag_base_standard) or standard.is_module(d.text):
                 previous = d
                 continue
             let resolved = module_paths.resolve(compiler, path, self.root, d.text, false) catch failure:
@@ -714,7 +722,7 @@ pub struct Checker:
 
     ## A Base module (§16): what luce-base describes of it, read as declarations without
     ## bodies; its index. The Base compiler is the one `support.toolchain` finds.
-    mutating func load_base_module(path: str, name: str, at: ast.Node*, standard: bool = false) -> u32!:
+    mutating func load_base_module(path: str, name: str, at: ast.Node*, canonical: bool = false) -> u32!:
         var i: usize = 1
         while i < self.modules.count:
             if self.modules.get(i).name == name:
@@ -722,7 +730,7 @@ pub struct Checker:
             i += 1
         let compiler = (str)(try toolchain.base_compiler())
         var text: str
-        if standard:
+        if canonical:
             var arguments: c.str[3] = ["describe", "--standard", try c_text.copy(name)]
             let ran = try process.run(try c_text.copy(compiler), arguments[..<3])
             defer ran.release()
@@ -746,7 +754,7 @@ pub struct Checker:
         let tree = try boundary.read(text, name)
         let src = try source.Source.over(path, text.bytes)
         let index = (u32)self.modules.count
-        try self.modules.push(Module(name = name, tree = tree, src = src, imports = try list.List[Import].create(1), path = path, base = true, standard = standard))
+        try self.modules.push(Module(name = name, tree = tree, src = src, imports = try list.List[Import].create(1), path = path, base = true, standard = canonical))
         stamp_module(tree.body, index)
         let importer = self.current
         self.current = (usize)index
@@ -792,6 +800,8 @@ pub struct Checker:
     ## One import of module `index`: the file under the root, loaded, and the names it
     ## brings in, each once.
     mutating func load_import(index: u32, d: ast.Node*) -> !:
+        if standard.is_module(d.text) and not self.modules.get((usize)index).base:
+            return try self.standard_import(index, d)
         var child: u32 = 0
         if self.sandbox_root.length > 0:
             if d.has(ast.flag_base_standard):
@@ -835,6 +845,46 @@ pub struct Checker:
                 try self.add_import(&m, Import(name = bound, module = child, decl = target, node = n, used = false))
                 cursor = n.next
         self.modules.set((usize)index, m)
+
+    ## An import of a standard module (§6.8), which has no source: its name bound, or the
+    ## functions a `from` names, each checked to be one of it. The package may not have a
+    ## module of that name, which the import could never reach (§15.2).
+    mutating func standard_import(index: u32, d: ast.Node*) -> !:
+        let extensions: str[2] = [".luc", ".lucb"]
+        for extension in extensions:
+            let own = try strings.join([try copied.join(self.root, d.text), extension], "")
+            if files.exists(try c_text.copy(own)):
+                return try self.fail(d, try self.message(["the package's module `", d.text, "` has the name of Luce's standard module, which `import ", d.text, "` always names; rename the module (§15.2)"]))
+        var m = self.modules.get((usize)index)
+        if d.kind == ast.Kind.import_:
+            var under = d.text
+            if let alias = d.left:
+                under = alias.text
+            try self.add_import(&m, Import(name = under, module = 0, decl = none, node = d, used = false, standard = d.text))
+        else:
+            var cursor = d.body
+            while let n = cursor:
+                if standard.qualified(d.text, n.text) == none:
+                    return try self.fail(n, try self.message(["the module `", d.text, "` has no `", n.text, "`"]))
+                var bound = n.text
+                if let alias = n.left:
+                    bound = alias.text
+                try self.add_import(&m, Import(name = bound, module = 0, decl = none, node = n, used = false, standard = d.text))
+                cursor = n.next
+        self.modules.set((usize)index, m)
+
+    ## The standard function a name imported by `from` stands for, qualified (§6.8), marking
+    ## its import used; none for any other name.
+    pub mutating func standard_function(name: str) -> str?:
+        let imp = self.find_import(name) else return none
+        if imp.standard.length == 0 or imp.node.kind == ast.Kind.import_:
+            return none
+        return standard.qualified(imp.standard, imp.node.text)
+
+    ## Whether `name` is an import of a whole standard module, `import math`, marking it used.
+    pub mutating func standard_module(name: str) -> bool:
+        let imp = self.find_import(name) else return false
+        return imp.standard.length > 0 and imp.node.kind == ast.Kind.import_
 
     ## Resolve a sandbox import without invoking the Base compiler. Only `.luc` below the
     ## checked package source root is eligible; a matching `.lucb` gets an explicit refusal.
@@ -895,7 +945,7 @@ pub struct Checker:
     ## The module the current module imports under `name`.
     pub mutating func find_module(name: str) -> u32?:
         let imp = self.find_import(name) else return none
-        if imp.decl != none:
+        if imp.decl != none or imp.standard.length > 0:
             return none
         return imp.module
 

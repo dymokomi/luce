@@ -151,9 +151,10 @@ luce: main.luc:2:15: this operation can fail; declare `-> T!` or handle it with 
 Every fallible operation is either inside a fallible function or handled. A failure is never
 silently dropped.
 
-`try` may be written in front of an expression to mark, for the reader, that it can fail:
-`let age = try lookup(ages, name)`. It changes nothing; the failure passes up with or without
-it.
+Nothing marks the call itself: `let age = lookup(ages, name)` reads like any other line. As
+in Python, where an exception passes up through every call that does not catch it, a
+failure passes up by itself; what Luce adds is the `!` in the signature, so a reader knows
+which functions it can pass through.
 
 ## Handling a failure: `catch`
 
@@ -203,7 +204,11 @@ The block decides what happens next, and must end in one of these:
 | `error(code, message)` | fail in turn, usually with added context; it goes to the caller, or to an enclosing `catch` |
 | `break`, `continue` | leave or continue an enclosing loop |
 | `trap(...)` | stop the program |
-| the end of the block | only when the expression has no value, like a call to a `unit!` function |
+| the end of the block | only when the expression has no value, like a call to a `unit!` function, or its value is dropped with `_ = ...` |
+
+A value nobody needs is dropped with `_ = ...`, and so is a handled one: in
+`_ = int(text) catch failure: print(failure.message)` the block may simply end, since there
+is no value to recover. It is Python's `try: int(text)` with an `except` that only reports.
 
 - **`catch` covers its whole expression**: in `int(a) + int(b) catch ...`, either conversion
   failing runs the block.

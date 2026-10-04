@@ -173,8 +173,8 @@ method bound to a receiver is a closure holding the receiver. A closure is relea
 any object, and lets its captures go when it goes; the collector traces through them.
 
 The checker inserts explicit propagation nodes for every permitted fallible operation
-before ownership-sensitive emission. Source `try` markers are optional in declared
-fallible Luce functions; temporary cleanup does not depend on their presence.
+before ownership-sensitive emission; the source has no marker of its own, and temporary
+cleanup depends only on those nodes.
 
 When an operand of a construction, collection literal or map store sits beside an
 operation that can fail, its owned value is held in source order before the taker
@@ -242,7 +242,7 @@ optionals member by member, copies a text or bytes answered, and wraps a handle 
 
 ## Hashing
 
-`hash(x)` (§4.4) is the same number in both executions: FNV-1a over 64 bits (offset
+`value.hash()` (§4.4) is the same number in both executions: FNV-1a over 64 bits (offset
 14695981039346656037, prime 1099511628211) of the value's canonical bytes, and the result
 reinterpreted as an `int`. The canonical bytes: an `int` is its eight bytes little-endian;
 a `float` the eight bytes of its IEEE encoding, with `-0.0` written as `0.0`; a `bool` one
@@ -252,8 +252,8 @@ case's index as an `int` then its payload; an optional the byte 0 for `none` or 
 then the value; a range its two bounds, a byte for inclusion, and its step as an `int` when the step is not 1; a list its elements in
 order; a set its elements' hashes summed (as unsigned arithmetic, wrapping); a map each
 entry's key hash times 31 plus its value hash, summed the same way; an `ErrorCode` its
-number. A type that declares `Hashable` (§13.3) hashes as the `int` its `hashed` returns
-(so `hash(v)` is the hash of that `int`, and `v` inside a tuple or list mixes the same way);
+number. A type that declares `Hashable` (§13.3) answers `value.hash()` with its own `hash`,
+and as a key, or inside a tuple or a list, it hashes as the `int` that method returns does;
 a class hashes only that way, never structurally.
 
 Maps and sets keep insertion order, and removing an entry keeps the order of the rest, so

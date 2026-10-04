@@ -101,7 +101,7 @@ pub func main(arguments: list[str]) -> int!:
 
 - **A generic function is checked once**, against its bounds, not at each call. Inside it, a
   `T` supports only what the bounds promise: `<` with `Ordered`, `==` with `Equatable`,
-  display with `Display`, `hash` with `Hashable`, and the methods of any other interface named.
+  display with `Display`, `hash()` with `Hashable`, and the methods of any other interface named.
   Every type supports being bound, passed, returned, and put in tuples, optionals and
   collections.
 - **Type arguments are usually inferred** from the arguments. When they cannot be, write
@@ -168,7 +168,7 @@ The language knows six interfaces, because operators, `print`, `for`, maps and s
 | Interface | Method to write | Enables |
 | --- | --- | --- |
 | `Equatable` | `equals(self, other: Self) -> bool` | `==`, `!=`, `in`, `contains`, `index_of` |
-| `Hashable` | `hashed(self) -> int` | map keys, set elements, `hash(x)` |
+| `Hashable` | `hash(self) -> int` | map keys, set elements, `x.hash()` |
 | `Ordered` | `compare(self, other: Self) -> int` | `<`, `<=`, `>`, `>=`, `sort`, `sorted` |
 | `Display` | `display(self) -> str` | `print`, `str(x)`, f-strings |
 | `Iterable[T]` | `iterator(self) -> Iterator[T]` | `for` |
@@ -192,7 +192,7 @@ class Key: Equatable, Hashable, Display:
     func equals(self, other: Key) -> bool:
         return self.id == other.id
 
-    func hashed(self) -> int:
+    func hash(self) -> int:
         return self.id
 
     func display(self) -> str:
@@ -211,7 +211,8 @@ one true false {#1: one, #2: two}
 The rules that keep these consistent:
 
 - `Hashable` and `Ordered` are declared together with `Equatable`, so that equal values hash
-  alike and compare as neither less nor greater.
+  alike and compare as neither less nor greater. `x.hash()` of a type that declares
+  `Hashable` is its own `hash`, as Python's `hash(x)` calls `__hash__`.
 - `compare` answers a negative number, zero or a positive number.
 - These interfaces describe what a type can do; they are not types of values: `let x:
   Equatable = ...` is an error, and a program cannot declare its own interface with these

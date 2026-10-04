@@ -68,7 +68,7 @@ A private field stays private in every way a field could be seen, not only `p.ca
   The same goes for a list, an optional or another struct holding one. Inside its own
   module the struct prints as usual.
 
-`==` and `hash` still compare and hash every field, private ones included; they reveal no
+`==` and `hash()` still compare and hash every field, private ones included; they reveal no
 values.
 
 `shapes.luc`:
@@ -160,6 +160,14 @@ name, with `-` written `_`, and only if that package lists it as public (below).
 
 The built-in interfaces (`Equatable`, `Display` and the others), `Result`, `Error`,
 `ErrorCode` and `Weak` are available in every module without an import.
+
+`math`, `text` and `console` always name the language's own modules
+([Types and values](02-types-and-values.md#standard-modules)). In Python a `math.py` beside
+your program hides the standard `math`; here the language's module always wins, so a module
+of your package with one of those names could never be imported, and importing that name in
+a package that has one is an error: rename the module. Another
+package's module of that name is imported through its package, and given a name of its own
+when a module also wants the language's: `from luce_std import math as fmath`.
 
 ## Packages
 

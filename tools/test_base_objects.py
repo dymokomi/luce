@@ -35,10 +35,10 @@ with tempfile.TemporaryDirectory(prefix='luce-native-objects-') as temporary:
         ('method()', 'a native object is closed')]:
         entry.write_text(f'''from objects import Counter
 pub func main(arguments: list[str]) -> int!:
-    let value = try Counter("closed")
+    let value = Counter("closed")
     let method = value.value
     value.close()
-    discard({use})
+    _ = {use}
     return 0
 ''')
         for flags in FLAGS:
@@ -48,14 +48,14 @@ pub func main(arguments: list[str]) -> int!:
 func worker(value: Counter) -> int:
     return value.value()
 pub func main(arguments: list[str]) -> int!:
-    let value = try Counter("thread")
+    let value = Counter("thread")
     let job = spawn worker(value)
     return wait job
 ''')
     assert 'send' in run(COMPILER, 'check', entry, expected=1).stderr
     entry.write_text('''from objects import Counter
 pub func main(arguments: list[str]) -> int!:
-    let value = try Counter("temporary")
+    let value = Counter("temporary")
     value.child = value
     return 0
 ''')
@@ -65,8 +65,8 @@ pub func main(arguments: list[str]) -> int!:
         source.write('\npub func unowned(value: Counter) -> Counter:\n    return value\n')
     entry.write_text('''import objects
 pub func main(arguments: list[str]) -> int!:
-    let value = try objects.Counter("unowned")
-    discard(objects.unowned(value))
+    let value = objects.Counter("unowned")
+    _ = objects.unowned(value)
     return 0
 ''')
     assert 'has no `unowned`' in run(COMPILER, 'check', entry, expected=1).stderr

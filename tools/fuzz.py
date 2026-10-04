@@ -138,7 +138,7 @@ class Gen:
         pool = {
             "int": ["a", "b", "c", "p.x", "len(s)", "int(d)", "q.n", "obj.n", "h.count", "nums.length", "(nums.first else 0)",
                     "apply((n) => n % 4096 + a % 4096, b)", "apply(halve, a)", "counter()", "(nums.map((n) => n % 8).first else 0)",
-                    "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(hash(a) % 1000)", "(hash(s) % 1000)",
+                    "(ages[s] else 0)", "words.length", "ages.length", "seen.length", "(a.hash() % 1000)", "(s.hash() % 1000)",
                     "(s.index_of(t) else -1)", "s.byte_count", "choose(a, b, flag)", "count_of(nums, a)", "count_of(words, s)",
                     "(largest(nums) else 0)", "shown(nums).length", "Two(first = a, second = s).flipped().second", "Two(first = s, second = b).second",
                     "(wait spawn choose(a, b, flag))", "(wait spawn count_of(nums, a))"],
@@ -256,7 +256,7 @@ class Gen:
                               f"{pad}h.item = none", f"{pad}h.count = obj.bump({n})"])]
         if k == 16:
             return [r.choice([f"{pad}print(name_of(opt), obj.tag(), name_of(h.item))",
-                              f"{pad}print({self.fresh(n)}.tag())", f"{pad}discard(obj.bump({n}))",
+                              f"{pad}print({self.fresh(n)}.tag())", f"{pad}_ = obj.bump({n})",
                               f"{pad}print(name_of(hold({self.fresh(n)}).item))",
                               f"{pad}print(obj is opt, opt is none, obj.link is none)"])]
         if k == 17 and depth > 0:
@@ -472,9 +472,9 @@ class Gen:
                 "func len(text: str) -> int:", "    return text.length", "",
                 "func find(x: int) -> int?:", "    if (x % 4) == 0:", "        return none", "    return x % 1024", "",
                 "func risky(x: int) -> int!:", "    if (x % 8) == 3:", "        error(bad, \"three\")", "    return (x % 4096) + 11", "",
-                "func gather(x: int) -> list[int]!:", "    return [x % 4096, try risky(x), (x % 4096) + 1]", "",
-                "func packed(x: int) -> str!:", "    let pair = (str(x % 100), try risky(x))", "    return f\"{pair.0}:{pair.1}\"", "",
-                "func keyed(x: int) -> map[str, int]!:", "    return {\"k\" + str(x % 10): x % 100, \"r\": try risky(x)}", "",
+                "func gather(x: int) -> list[int]!:", "    return [x % 4096, risky(x), (x % 4096) + 1]", "",
+                "func packed(x: int) -> str!:", "    let pair = (str(x % 100), risky(x))", "    return f\"{pair.0}:{pair.1}\"", "",
+                "func keyed(x: int) -> map[str, int]!:", "    return {\"k\" + str(x % 10): x % 100, \"r\": risky(x)}", "",
                 "class Tracer:", "    let name: str", "    var n: int = 0", "    var link: Tracer? = none", "",
                 "    func init(self, name: str):", "        self.name = name", "        print(f\"make {name}\")", "",
                 "    func deinit(self):", "        print(f\"gone {self.name}\")", "",
@@ -482,7 +482,7 @@ class Gen:
                 "    pub func tag(self) -> str:", "        return f\"{self.name}/{self.n}\"", "",
                 "    pub func close(self):", "        print(f\"close {self.name}\")", "",
                 "struct Holder:", "    var item: Tracer?", "    var count: int", "",
-                "func make(name: str, n: int) -> Tracer:", "    let t = Tracer(name)", "    discard(t.bump(n))", "    return t", "",
+                "func make(name: str, n: int) -> Tracer:", "    let t = Tracer(name)", "    _ = t.bump(n)", "    return t", "",
                 "func hold(t: Tracer?) -> Holder:", "    return Holder(item = t, count = 1)", "",
                 "func name_of(t: Tracer?) -> str:", "    if let x = t:", "        return x.tag()", "    return \"-\"", "",
                 "func name_label(n: Named?) -> str:", "    if let x = n:", "        return x.label()", "    return \"-\"", "",
@@ -492,9 +492,9 @@ class Gen:
                 "func apply(f: func(int) -> int, x: int) -> int:", "    return f(x)", "",
                 "func make_counter() -> func() -> int:", "    var count = 0", "    return func () -> int:", "        count += 1", "        return count", "",
                 "interface Named:", "    func label(self) -> str", "    func weight(self) -> int", "    func check(self) -> int!", "",
-                "struct Tag: Named:", "    var text: str", "", "    func label(self) -> str:", "        return self.text", "", "    func weight(self) -> int:", "        return self.text.length", "", "    func check(self) -> int!:", "        return try risky(self.text.length)", "",
-                "enum Level: Named:", "    low", "    high(by: int)", "", "    func label(self) -> str:", "        match self:", "            .low: return \"low\"", "            .high(by): return f\"high{by}\"", "", "    func weight(self) -> int:", "        match self:", "            .low: return 1", "            .high(by): return by % 1024", "", "    func check(self) -> int!:", "        match self:", "            .low: return 0", "            .high(by): return try risky(by)", "",
-                "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "", "    func check(self) -> int!:", "        let w = match self.owner.n % 3:", "            0 => 1", "            _ => 2", "        if w == 1:", "            error(bad, \"one\")", "        return try risky(self.owner.n)", "",
+                "struct Tag: Named:", "    var text: str", "", "    func label(self) -> str:", "        return self.text", "", "    func weight(self) -> int:", "        return self.text.length", "", "    func check(self) -> int!:", "        return risky(self.text.length)", "",
+                "enum Level: Named:", "    low", "    high(by: int)", "", "    func label(self) -> str:", "        match self:", "            .low: return \"low\"", "            .high(by): return f\"high{by}\"", "", "    func weight(self) -> int:", "        match self:", "            .low: return 1", "            .high(by): return by % 1024", "", "    func check(self) -> int!:", "        match self:", "            .low: return 0", "            .high(by): return risky(by)", "",
+                "class Badge: Named:", "    let owner: Tracer", "", "    func init(self, owner: Tracer):", "        self.owner = owner", "", "    func label(self) -> str:", "        return self.owner.tag()", "", "    func weight(self) -> int:", "        return self.owner.n", "", "    func check(self) -> int!:", "        let w = match self.owner.n % 3:", "            0 => 1", "            _ => 2", "        if w == 1:", "            error(bad, \"one\")", "        return risky(self.owner.n)", "",
                 "func named(x: int, t: Tracer) -> Named:", "    match x % 3:", "        0: return Tag(text = f\"t{x % 100}\")", "        1: return Level.high(by = x % 50)", "        _: return Badge(t)", "",
                 "func heaviest(items: list[Named]) -> int:", "    var best = 0", "    for item in items:", "        if item.weight() > best:", "            best = item.weight()", "    return best", "",
                 "func choose[T](a: T, b: T, first: bool) -> T:", "    return a if first else b", "",

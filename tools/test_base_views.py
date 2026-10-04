@@ -32,12 +32,12 @@ with tempfile.TemporaryDirectory(prefix='luce-native-views-') as temporary:
         entry.write_text(f'''from views import Resource
 import views
 pub func main(arguments: list[str]) -> int!:
-    let owner = try Resource("expired")
-    let frame = try views.begin(owner)
+    let owner = Resource("expired")
+    let frame = views.begin(owner)
     let read = frame.read
     let captured: func() -> str = () => frame.read()
     owner.end()
-    discard({expression})
+    _ = {expression}
     return 0
 ''')
         for flags in FLAGS:
@@ -45,7 +45,7 @@ pub func main(arguments: list[str]) -> int!:
             assert 'a native view has expired' in run(root / 'expired', expected=1).stderr
     entry.write_text('''import views
 pub func main(arguments: list[str]) -> int!:
-    discard(views.BorrowedFrame())
+    _ = views.BorrowedFrame()
     return 0
 ''')
     assert 'private initializer' in run(COMPILER, 'check', entry, expected=1).stderr
@@ -53,10 +53,10 @@ pub func main(arguments: list[str]) -> int!:
 func worker(frame: views.Frame) -> str:
     return frame.read()
 pub func main(arguments: list[str]) -> int!:
-    let owner = try views.Resource("thread")
-    let frame = try views.begin(owner)
+    let owner = views.Resource("thread")
+    let frame = views.begin(owner)
     let job = spawn worker(frame)
-    discard(wait job)
+    _ = wait job
     return 0
 ''')
     assert 'not sendable' in run(COMPILER, 'check', entry, expected=1).stderr

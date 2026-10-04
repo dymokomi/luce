@@ -105,7 +105,7 @@ func make_bound() -> func() -> int:
     return value.value
 
 pub func main(arguments: list[str]) -> int!:
-    let original = try Counter("copy " + str(1))
+    let original = Counter("copy " + str(1))
     assert(values.read(original) == ("copy 1", 21, 7))
     var copy = original
     copy.shown = 42
@@ -115,33 +115,33 @@ pub func main(arguments: list[str]) -> int!:
     assert(values.read(again) == ("copy 1", 21, 42))
     assert(copy == again)
     var changed = original
-    discard(try changed.increase(1))
+    _ = changed.increase(1)
     changed.shown = 7
     assert(changed != original)
-    let named = try Counter(count = 9, label = "named")
+    let named = Counter(count = 9, label = "named")
     assert(values.read(named) == ("named", 27, 9))
     assert(original.value() == 21)
     let bound = copy.value
-    assert((try copy.increase()) == 23)
+    assert(copy.increase() == 23)
     assert(copy.value() == 23 and bound() == 21)
     let update = copy.increase
-    assert((try update(3)) == 26)
+    assert(update(3) == 26)
     assert(copy.value() == 23)
     assert(make_bound()() == 12)
-    let alias = try values.Count("alias", 5)
+    let alias = values.Count("alias", 5)
     assert(alias.value() == 15)
-    assert((try values.Count.scaled()).value() == 18)
+    assert(values.Count.scaled().value() == 18)
     let work = spawn on_worker(original)
     let transferred = wait work
     assert(values.read(transferred) == ("copy 1", 21, 7))
-    let scaled = try Counter.scaled()
+    let scaled = Counter.scaled()
     assert(scaled.value() == 18)
     let scale = Counter.scaled
-    assert((try scale(4)).value() == 24)
+    assert(scale(4).value() == 24)
     let failed_update = copy.increase(-1) catch failure:
         assert(failure.code == values.invalid and failure.message == "copy 1")
         assert(copy.value() == 22 and copy.shown == 43)
-        return try finish()
+        return finish()
     return 1
 
 func finish() -> int!:

@@ -104,7 +104,7 @@ func walk(n: Node?, depth: int) -> int:
         # whether a weak target is still alive depends on when collections run, which the
         # stress mode moves; `get` is exercised, its answer kept out of the output
         if let p = b.get():
-            discard(p.id)
+            _ = p.id
         total = total + 1
     if let o = node.owner:
         total = total + o.hook()
@@ -152,11 +152,11 @@ class Generator:
         if k == 8:
             return self.one([r.choice(["a.items.clear()", "a.table.clear()", "a.next = none", "a.hook = none", "a.owner = none"])], pad)
         if k == 9:
-            return self.one([f"discard(a.table.remove({r.randint(0, 4)}))"], pad)
+            return self.one([f"_ = a.table.remove({r.randint(0, 4)})"], pad)
         if k == 10:
-            return self.one(["if a.items.length > 0:", "    discard(a.items.pop())"], pad)
+            return self.one(["if a.items.length > 0:", "    _ = a.items.pop()"], pad)
         if k == 11:
-            return self.one(["if a.items.length > 0:", "    discard(a.items.remove_at(0))"], pad)
+            return self.one(["if a.items.length > 0:", "    _ = a.items.remove_at(0)"], pad)
         if k == 12:
             return [f"{pad}{self.slot()} = none"]
         if k == 13:
@@ -173,7 +173,7 @@ class Generator:
         if k == 16:
             self.panels += 1
             name = f"p{self.panels}"
-            lines = [f"{pad}let {name} = try Panel({self.fresh()}, false)"]
+            lines = [f"{pad}let {name} = Panel({self.fresh()}, false)"]
             lines += self.one([f"a.owner = {name}", f"{name}.child.next = a"], pad)
             return lines
         if k == 17 and depth > 0:
@@ -197,7 +197,7 @@ class Generator:
 
     def program(self):
         lines = PRELUDE.split("\n")
-        lines += ["pub func main(arguments: list[str]) -> int!:", "    discard(arguments)"]
+        lines += ["pub func main(arguments: list[str]) -> int!:", "    _ = arguments"]
         for i in range(self.slots):
             lines.append(f"    var v{i}: Node? = Node({self.fresh()})")
         for _ in range(self.rng.randint(8, 40)):

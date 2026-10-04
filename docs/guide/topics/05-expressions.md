@@ -44,9 +44,9 @@ The operators follow Python's definitions. What differs:
 Float arithmetic is IEEE 754, as in Python: dividing a float by zero gives `inf` or `nan`,
 and `nan` is not equal to itself.
 
-`abs(x)`, `min(a, b)`, `max(a, b)` and `round(x, digits)` are built-in functions, as in
-Python, and follow the same rule: `min(1, 2.5)` is an error, and `round` takes a `float`
-([Types and values](02-types-and-values.md#built-in-functions)).
+Python's `abs`, `min`, `max` and `round` are in the `math` module, `math.abs(x)` and so on,
+and follow the same rule: `math.min(1, 2.5)` is an error, and `math.round` takes a `float`
+([Types and values](02-types-and-values.md#standard-modules)).
 
 ## Comparison and logic
 

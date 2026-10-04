@@ -37,7 +37,7 @@ pub func main(arguments: list[str]) -> int!:
     for value in 0..<32:
         let success = spawn work(value, false)
         let failure = spawn work(value, true)
-        assert((try wait success) == f"first {value}, second {value}")
+        assert((wait success) == f"first {value}, second {value}")
         var caught = false
         let recovered = wait failure catch problem:
             assert(problem.code == failed)

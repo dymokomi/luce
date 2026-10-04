@@ -132,7 +132,7 @@ A few interfaces are known to the language, because operators and `print` use th
 | Interface | Method | Gives the type |
 | --- | --- | --- |
 | `Equatable` | `equals(self, other: Self) -> bool` | `==` and `!=` |
-| `Hashable` | `hashed(self) -> int` | use as a map key or in a set |
+| `Hashable` | `hash(self) -> int` | use as a map key or in a set |
 | `Ordered` | `compare(self, other: Self) -> int` | `<`, `>`, `sort()` |
 | `Display` | `display(self) -> str` | `print`, `str(x)` and f-strings |
 | `Iterable[T]` | `iterator(self) -> Iterator[T]` | `for` |

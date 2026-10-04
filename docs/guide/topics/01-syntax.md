@@ -105,16 +105,21 @@ These words are the language's own and cannot be used as names:
 
 ```text
 and as break catch class continue elif else enum false for from func if import in
-interface is let match none not or pub recover return self spawn struct test true try
-type var wait while with
+interface is let match none not or pub recover return self spawn struct test true type
+var wait while with
 ```
 
-The names of the built-in types and functions cannot be declared either, at any level:
-`assert`, `discard`, `error`, `hash`, `print`, `trap`, `int`, `float`, `bool`, `str`,
-`bytes`, `unit`, `never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`, and the
-built-in functions `abs`, `min`, `max`, `round`, `ord`, `chr` and `input`. So
-`let list = [1]`, `let max = 3` and a parameter named `str` are errors. Python lets you reuse `list` and
-`str` and then breaks in surprising places; Luce refuses.
+The names of the built-in types and of the few functions every program has cannot name a
+function, a type, a variable or a parameter either: `assert`, `error`, `print`, `trap`,
+`int`, `float`, `bool`, `str`, `bytes`, `unit`, `never`, `list`, `map`, `set`, `Error`,
+`ErrorCode`, `Weak` and `task`. So `let list = [1]` and a parameter named `str` are errors.
+Python lets you reuse `list` and `str` and then breaks in surprising places; Luce refuses.
+
+A field, a method or an enum case may take any of those names, since it is always reached
+through its value or its type: `report.print()` and `Token.str` cannot be mistaken for the
+built-ins. Everything else, `abs`, `min`, `max`, `round` and `input` among them, lives in a
+module ([Types and values](02-types-and-values.md#standard-modules)), so those are ordinary
+names: `let max = 3` is fine.
 
 `init`, `deinit`, `close` and `main` are ordinary names that have a meaning in one place each:
 a class's constructor and destructor, the method `with` calls, and the program's entry point.
@@ -134,11 +139,13 @@ pub func main(arguments: list[str]) -> int!:
 ```
 
 ```output
-luce: main.luc:5:10: this value is unused; `discard(...)` it or bind it
+luce: main.luc:5:10: this value is unused; bind it, or drop it with `_ = ...` (§5.3)
 ```
 
-Python silently drops it. Luce asks you to say so, `discard(width())`, because a result
-that is computed and dropped is more often a mistake than a choice.
+Python silently drops it. Luce asks you to say so, `_ = width()`, because a result that is
+computed and dropped is more often a mistake than a choice. `_` is the name Python uses for
+a value nobody reads, too; in Luce it is never bound, so it can be assigned any number of
+times.
 
 Assignment is a statement, not an expression, and there is no walrus operator (`:=`); the
 places where Python uses it are covered by `if let` and `while let` ([Control

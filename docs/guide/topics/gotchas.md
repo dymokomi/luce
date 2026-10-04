@@ -9,13 +9,16 @@ chapter that explains it.
   parameter named like a top-level function, or a local named like an import, is an error.
   [Syntax](01-syntax.md#a-name-is-never-shadowed)
 - **The built-in names are reserved**: `list`, `map`, `set`, `str`, `int`, `task`, `unit`,
-  `print`, `error`, `hash`, `min`, `max`, `round`, `input` and the others cannot name a
-  variable, parameter, field or function.
-  [Syntax](01-syntax.md#reserved-words)
+  `print`, `error` and the others cannot name a variable, parameter or function; a field or
+  a method may take one. [Syntax](01-syntax.md#reserved-words)
+- **`abs`, `min`, `max`, `round`, `ord`, `chr` and `input` are in modules**: `import math`
+  for `math.abs(x)`, `import text` for `text.code_of(s)`, `import console` for
+  `console.read_line()`. [Types and values](02-types-and-values.md#standard-modules)
+- **`hash(x)` is a method**, `x.hash()`. [Types and values](02-types-and-values.md#hashing)
 - **Names are ASCII.** `café` is not a valid name; text and comments may hold anything.
 - **Indentation is four spaces; tabs are errors.** There is no `\` line continuation: wrap
   in parentheses. [Syntax](01-syntax.md#layout)
-- **An unused result is an error.** Write `discard(f())` to drop it on purpose.
+- **An unused result is an error.** Write `_ = f()` to drop it on purpose.
   [Syntax](01-syntax.md#statements-and-values)
 - **An unused import is an error**, and imports must come before declarations.
   [Modules and packages](13-modules-and-packages.md#imports)
@@ -51,9 +54,12 @@ chapter that explains it.
   module. [Luce and Base](16-base.md#when-to-write-base)
 - **A format specification must fit its value's type**: `f"{count:.2f}"` of an `int` is an
   error; write `f"{float(count):.2f}"`. [Text and bytes](03-text-and-bytes.md#format-specifications)
-- **`round` takes and gives a `float`**: `round(2.5)` is `2.0`, and `round(3)` is an error.
-  [Types and values](02-types-and-values.md#built-in-functions)
-- **`min` and `max` take two values**; a list has `values.min()` and `values.max()`.
+- **`math.round` takes and gives a `float`**: `math.round(2.5)` is `2.0`, and
+  `math.round(3)` is an error. [Types and values](02-types-and-values.md#standard-modules)
+- **`math.min` and `math.max` take two values**; a list has `values.min()` and
+  `values.max()`.
+- **`math` alone is the language's module**; luce-std's is `from luce_std import math`, under
+  another name when a module wants both. [Standard library](15-standard-library.md#math)
 
 ## Text
 
