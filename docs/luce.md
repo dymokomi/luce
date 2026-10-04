@@ -1113,8 +1113,9 @@ values and their public methods. Unsupported methods are unavailable individuall
 an unsupported initializer cannot become an implicit memberwise constructor.
 
 Base structs declared with `interop.Type[T]` import as owning Luce objects.
-An object's `close()` is the dispose function its `interop.Type` names, whatever Base
-calls that method; a Base method named `close` that is not it stays Base's own.
+An object's `close()` is Base's own `close` when that takes nothing and cannot fail;
+otherwise it is the dispose function its `interop.Type` names, whatever Base calls it, and
+a Base `close` that fails or takes arguments stays Base's own.
 Aliases and bound methods share one native owner. Real initializers run in stable
 allocated storage; failed construction releases that storage. Explicit close is
 visible through every alias, while active native calls finish before disposal.
