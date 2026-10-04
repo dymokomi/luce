@@ -162,13 +162,13 @@ pub func main(arguments: list[str]) -> int!:
     let pair = (1, "one")
     let (_, name) = pair
     print(quotient, remainder, pair.0, pair.1, name)
-    print((1, "b") < (2, "a"), divide(9, 3) == (3, 0))
+    print((1, "b") < (2, "a"), divide(9, 3) == (3, 0), (1,))
     return 0
 ```
 
 ```output
 3 2 1 one one
-true true
+true true (1,)
 ```
 
 Members are read as `.0`, `.1` and so on, or taken apart with `let (a, b) = ...`, where `_`

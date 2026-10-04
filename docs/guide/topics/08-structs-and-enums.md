@@ -33,7 +33,8 @@ door false true
 - **Fields** are `let` or `var`, with a type and an optional default. A default is a
   constant or an empty collection, made afresh for each struct built.
 - **Construction** gives the fields by position, in declaration order, or by name; fields
-  with defaults may be left out. This is what Python's `@dataclass` generates.
+  with defaults may be left out. This is what Python's `@dataclass` generates. A struct can
+  replace it with its own `init` (below).
 - **Equality, hashing and printing** are worked out from the fields: two structs are equal
   when all their fields are, and a struct prints as `Name(field = value, ...)`. They exist
   when every field supports them; a struct with a class field, for instance, has no `==`
@@ -41,6 +42,43 @@ door false true
 - A struct can declare interfaces, `struct Circle: Shape:`, and replace the generated
   equality, ordering or display by declaring `Equatable`, `Ordered` or `Display`
   ([Interfaces](11-interfaces-and-generics.md#the-built-in-interfaces)).
+
+### Its own `init`
+
+A struct can declare `init` when construction should do more than store the fields: convert
+units, compute a field, or check the values. `Name(...)` then calls it, and the memberwise
+form is no longer available:
+
+```luce
+let below_absolute_zero = ErrorCode.package(1)
+
+struct Celsius:
+    let degrees: float
+    var label: str = "°C"
+
+    func init(self, fahrenheit: float) -> unit!:
+        if fahrenheit < -459.67:
+            error(below_absolute_zero, "below absolute zero")
+        self.degrees = (fahrenheit - 32.0) * 5.0 / 9.0
+
+pub func main(arguments: list[str]) -> int!:
+    print(Celsius(212.0))
+    let cold = Celsius(-500.0) catch failure:
+        print(failure.message)
+        recover Celsius(32.0)
+    print(cold.degrees, cold.label)
+    return 0
+```
+
+```output
+Celsius(degrees = 100.0, label = °C)
+below absolute zero
+0.0 °C
+```
+
+Fields with defaults get them before `init` runs, and `init` must assign every other field.
+An `init` that can fail is declared `-> unit!`, as for classes
+([Classes](09-classes-and-memory.md#construction)).
 
 A struct cannot contain itself directly, `var next: Node?` inside `struct Node`, since a
 value would then have no fixed size. A list of itself is allowed, `var children: list[Tree]`,
