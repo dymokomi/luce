@@ -99,7 +99,8 @@ and enum cases; `CapitalCase` for types; `UPPER_CASE` for nothing.
 
 The core names are reserved everywhere and cannot be declared at any level: `assert`,
 `discard`, `error`, `hash`, `print`, `trap`, `int`, `float`, `bool`, `str`, `bytes`, `unit`,
-`never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`.
+`never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`, and the built-in
+functions `abs`, `min`, `max`, `round`, `ord`, `chr`, `input` (§6.8).
 
 ### 2.5 Reserved words
 
@@ -150,14 +151,48 @@ let data = b"\x00\x01"
 
 A `str` literal is UTF-8 with the escapes `\\ \" \n \r \t \0 \u{HEX}`. A raw literal `r"..."`
 has no escapes. A formatted literal `f"..."` interpolates any expression whose type has a
-display (§10.5); a format spec after `:` is not part of the language and a `{` is written
-`{{`. A field's expression holds no brace of its own: a set or map literal is bound to a
-name first. A field is code, not text: a string inside it is written with plain quotes,
+display (§10.5), each field `{expression}` or `{expression:spec}` with a format
+specification (below); a `{` is written `{{`. A field's expression holds no brace of its
+own: a set or map literal is bound to a name first. A field is code, not text: a string inside it is written with plain quotes,
 `f"{name if name != "" else "none"}"`. A formatted literal is one line: there is no
 triple-quoted form. A triple-quoted literal strips the common indentation of its lines. A `bytes` literal
 `b"..."` admits `\xNN` and is the only place a byte is spelled.
 
 There is no character literal: a text of one scalar is a `str` of length one.
+
+A format specification is Python's format mini-language,
+`[[fill]align][sign][z][#][0][width][grouping][.precision][type]`:
+
+```luce
+print(f"{1234.5:,.2f} {42:>6} {255:#x} {"total":*^11} {0.25:.0%} {-7:+05}")
+```
+
+prints `1,234.50     42 0xff ***total*** 25% -0007`.
+
+| Part | Meaning |
+| --- | --- |
+| `fill` | any one scalar, written before an alignment; a space when not written |
+| `align` | `<` left, `>` right, `^` centred, `=` a number's padding put after its sign; a number aligns right and anything else left when not written |
+| `sign` | `+` before every number, `-` before a negative one only (as when not written), a space before a positive one |
+| `z` | a `float` that rounds to negative zero shows as zero |
+| `#` | the alternate form: `0b`, `0o`, `0x`, `0X` before an `int` in that base; a `float`'s point kept |
+| `0` | zeros fill a number after its sign, as `0=` does; for anything else, a fill of `0` |
+| `width` | the least width, in scalars |
+| `grouping` | `,` or `_` between groups of three digits; `_` groups the digits of `b`, `o`, `x` and `X` by four |
+| `.precision` | digits after the point for `f`, `e` and `%`, significant digits for `g` and for no type, the scalars kept of a display |
+| `type` | of an `int`: `d` decimal (when not written), `b`, `o`, `x`, `X`, and `c`, the scalar the number names; of a `float`: `f` and `F` fixed, `e` and `E` with an exponent, `g` and `G` general, `%` a percentage in fixed; of anything else, `s`, its display |
+
+The specification is the text after the field's own `:`, the first `:` outside the field's
+brackets and strings, up to its `}`; it holds no field of its own and no escape. One that
+does not read as that grammar, or whose parts do not fit the value, is a compile error: a
+type letter of another type, a precision of an `int`, a sign, `z`, `#`, `=` or grouping of
+anything but a number. An `int` takes no `float` type, so `{n:.2f}` is written
+`{float(n):.2f}` (§6.2). Digits are rounded half to even on the exact binary value, as
+Python's are: `f"{2.675:.2f}"` is `2.67`. A `float` with neither type nor precision shows its
+display where Python shows its repr (`1e16`, not `1e+16`); a precision without a type is
+Python's general format with a digit always after the point. Anything but an `int` and a
+`float` is laid out from its display, `bool` included; widths and precisions count scalars.
+A `c` of a number that names no Unicode scalar traps.
 
 ### 3.4 Collections
 
@@ -310,7 +345,7 @@ membership: an element of a list or set, a key of a map, a substring of a `str`.
 | Call | Meaning |
 | --- | --- |
 | `int(f)` | truncates a `float` toward zero; traps on NaN or out of range |
-| `int(s)` | parses a `str` as a decimal integer, a sign and digits with spaces around them; `int!` |
+| `int(s)`, `int(s, base)` | parses a `str` as Python's `int` does: white space around, a sign, digits of `base` (10 when not given, 2 to 36, letters either case) with single `_` between them, and for bases 2, 8 and 16 an optional `0b`, `0o`, `0x` prefix; `int!`, and a base outside 2 to 36 traps |
 | `float(i)` | the nearest `float` |
 | `float(s)` | parses a `str` as a decimal number, a sign, digits with an optional fraction and an optional exponent, spaces around them; `float!` |
 | `str(x)` | the display of any value with one (§10.5) |
@@ -330,6 +365,21 @@ and `a..=b` are values of type `range` that iterate `int`s.
 From tightest: member, call, index; unary `-`; `**`; `* / // %`; `+ -`; `..<` `..=`; `in`,
 `is`, `is not`, comparisons; `not`; `and`; `or`; `if`-`else`; `=>`; assignment. `not` sits
 below the comparisons so that `not a == b` negates the comparison, as in Python.
+
+### 6.8 Built-in functions
+
+| Call | Meaning |
+| --- | --- |
+| `abs(x)` | the magnitude of an `int`, where the smallest traps, or of a `float` |
+| `min(a, b)`, `max(a, b)` | the lesser or greater of two values of one ordered type (§4.4); of two equal ones, the first |
+| `round(x, digits = 0)` | a `float` rounded to `digits` after the point, or before it when negative, half to even on the exact value, as Python's; a result past the largest `float` traps |
+| `ord(text)` | the value of a text's one scalar; a text of any other length traps |
+| `chr(code)` | the text of the scalar `code`; a number that is no scalar (negative, a surrogate, past `0x10FFFF`) traps |
+| `input(prompt = "")` | writes the prompt, then reads a line of standard input without its `\n` and a `\r` before it: `str?`, `none` at the end of the input |
+
+`round` takes no `int`, since an `int` is whole already (§6.2); `min` and `max` take two
+values, and a list's own are its methods (§11.1). Arguments are positional, or named by the
+parameters shown, as for any call (§7.2).
 
 ## 7. Functions
 
@@ -665,20 +715,36 @@ Maps and sets have identity, keep insertion order, and require equatable and has
 
 | Operation | Meaning |
 | --- | --- |
-| `length` | scalars, O(n); `byte_count` is O(1) |
+| `length` | scalars, O(n); `byte_count` is O(1); `is_empty` |
 | `a + b`, `f"..."` | concatenation and formatting |
 | `text[a..<b]` | a substring by scalar index; bounds checked |
-| `for c in text` | one-scalar strings |
-| `contains`, `starts_with`, `ends_with`, `index_of -> int?` | search |
-| `split(separator) -> list[str]`, `lines()`, `trim()`, `upper()`, `lower()`, `replace(a, b)`, `repeat(n)` | the common transforms |
+| `for c in text`, `characters() -> list[str]` | one-scalar strings |
+| `contains(text)`, `starts_with(prefix)`, `ends_with(suffix)`, `index_of(text) -> int?`, `last_index_of(text) -> int?`, `count(text) -> int` | search |
+| `split() -> list[str]`, `split(separator)`, `lines()` | pieces |
+| `trim()`, `trim_start()`, `trim_end()`, `remove_prefix(prefix)`, `remove_suffix(suffix)` | the text without some of it |
+| `upper()`, `lower()`, `capitalize()`, `title()`, `replace(old, new)`, `repeat(count)`, `reversed()` | the common transforms |
+| `pad_left(width, fill = " ")`, `pad_right(width, fill = " ")`, `center(width, fill = " ")` | padded to a width in scalars |
+| `is_digit()`, `is_alpha()`, `is_alnum()`, `is_space()` | ASCII classes |
 | `bytes()` | the UTF-8 as `bytes` |
 
+White space is ASCII's: space, tab, line feed, carriage return, vertical tab and form feed.
+`split()` cuts at runs of white space and keeps no empty piece, as Python's does;
 `split(separator)` cuts at every occurrence of a non-empty separator, keeping empty pieces,
 so `"a,,b".split(",")` is `["a", "", "b"]`; an empty separator traps. `lines()` cuts at
 `"\n"`, drops a `"\r"` before it, and a trailing newline ends the last line rather than
-opening an empty one. `trim()` removes spaces, tabs and newlines at both ends; `upper()`
-and `lower()` map the ASCII letters; `replace(a, b)` replaces every non-overlapping
-occurrence left to right and traps on an empty `a`; `repeat(n)` traps on a negative `n`.
+opening an empty one. `trim()` removes white space at both ends, `trim_start()` and
+`trim_end()` at one. `count(text)` counts occurrences that do not overlap, left to right,
+and traps on an empty `text`; `last_index_of` finds the last occurrence, an empty text at
+the end. `remove_prefix` and `remove_suffix` remove one occurrence at that end, or nothing.
+`upper()` and `lower()` map the ASCII letters; `capitalize()` maps the first scalar up and
+the rest down, and `title()` the first letter of every word up and the rest down, a word
+being a run of letters in which any scalar past ASCII counts as one and stays as it is.
+`replace(old, new)` replaces every non-overlapping occurrence left to right and traps on an
+empty `old`; `repeat(count)` traps on a negative count; `reversed()` reverses the scalars.
+`pad_left` puts the fill before the text, `pad_right` after it, and `center` on both sides,
+the odd one where Python's `str.center` puts it; a width the text already has changes
+nothing, and a fill that is not one scalar traps. The `is_` tests are true when the text
+has a scalar and every one is an ASCII digit, letter, either, or white space.
 Normalisation, grapheme segmentation, collation and locale are library operations.
 
 ### 11.4 `bytes`
@@ -1121,7 +1187,7 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | Command | Does |
 | --- | --- |
 | `luce run program.luc` | runs it in the interpreter, the definition of behaviour; a program importing a Base module (§16) is refused, since the interpreter runs Luce alone |
-| `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
+| `luce run --sandbox ROOT program.luc -- ARGS` | resolves `ROOT` and the program, requires the program below that root, enters irreversible host filesystem/process/network confinement before parsing, then runs the Luce-only interpreter, whose `input` reads nothing and answers `none`; unavailable host containment fails closed; exit zero publishes the bounded result on stdout, while any nonzero exit makes all captured text diagnostic output |
 | `luce --sandbox-policy` | prints the stable policy identity recorded by package locks; policy `luce-sandbox/1` uses a supervised child, a 30-second wall limit, 10-second CPU limit, 256 MiB interpreter allocation arena, one-MiB combined output limit, 16 MiB file limit, 64 descriptors, no child threads/processes or network, and rooted Luce-only imports |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package; `--native` (the default), `--backend=c` and `--release` pass to luce-base |
 | `luce check program.luc` | checks it and prints every diagnostic |

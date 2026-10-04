@@ -67,9 +67,9 @@ def package(name):
 
 
 def run(command, work, status):
-    """Run a command in `work`: what it showed (with standard error after the output for a
-    program meant to fail), and the finished process."""
-    ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=120)
+    """Run a command in `work`, its standard input empty: what it showed (with standard
+    error after the output for a program meant to fail), and the finished process."""
+    ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=120, stdin=subprocess.DEVNULL)
     shown = ran.stdout + ran.stderr if status != 0 else ran.stdout
     return shown.replace(str(work) + os.sep, ""), ran
 
@@ -106,7 +106,7 @@ for page in PAGES:
             if testing:
                 for mode, command in (("interpreted", [str(COMPILER), "test", "main.luc"]),
                                       ("built", [str(COMPILER), "test", "main.luc", "--build"])):
-                    ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=300)
+                    ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=300, stdin=subprocess.DEVNULL)
                     shown = (ran.stdout + ran.stderr).replace(str(work) + os.sep, "")
                     if expected is not None and shown != expected:
                         print(f"FAIL {where} ({mode}): report differs\n--- expected\n{expected}--- got\n{shown}")

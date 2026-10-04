@@ -111,8 +111,9 @@ type var wait while with
 
 The names of the built-in types and functions cannot be declared either, at any level:
 `assert`, `discard`, `error`, `hash`, `print`, `trap`, `int`, `float`, `bool`, `str`,
-`bytes`, `unit`, `never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`. So
-`let list = [1]` and a parameter named `str` are errors. Python lets you reuse `list` and
+`bytes`, `unit`, `never`, `list`, `map`, `set`, `Error`, `ErrorCode`, `Weak`, `task`, and the
+built-in functions `abs`, `min`, `max`, `round`, `ord`, `chr` and `input`. So
+`let list = [1]`, `let max = 3` and a parameter named `str` are errors. Python lets you reuse `list` and
 `str` and then breaks in surprising places; Luce refuses.
 
 `init`, `deinit`, `close` and `main` are ordinary names that have a meaning in one place each:

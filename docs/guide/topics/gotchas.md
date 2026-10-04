@@ -9,7 +9,8 @@ chapter that explains it.
   parameter named like a top-level function, or a local named like an import, is an error.
   [Syntax](01-syntax.md#a-name-is-never-shadowed)
 - **The built-in names are reserved**: `list`, `map`, `set`, `str`, `int`, `task`, `unit`,
-  `print`, `error`, `hash` and the others cannot name a variable, parameter or function.
+  `print`, `error`, `hash`, `min`, `max`, `round`, `input` and the others cannot name a
+  variable, parameter, field or function.
   [Syntax](01-syntax.md#reserved-words)
 - **Names are ASCII.** `café` is not a valid name; text and comments may hold anything.
 - **Indentation is four spaces; tabs are errors.** There is no `\` line continuation: wrap
@@ -48,8 +49,11 @@ chapter that explains it.
 - **`2 ** -1` traps**; write `2.0 ** -1.0`.
 - **No bit operations** (`&`, `|`, `<<`, ...), unsigned integers or other sizes. Use a Base
   module. [Luce and Base](16-base.md#when-to-write-base)
-- **No format specifications**: `f"{x:.2f}"` is not available. Round with
-  `math.round(x * 100.0) / 100.0`. [Text and bytes](03-text-and-bytes.md#formatted-strings)
+- **A format specification must fit its value's type**: `f"{count:.2f}"` of an `int` is an
+  error; write `f"{float(count):.2f}"`. [Text and bytes](03-text-and-bytes.md#format-specifications)
+- **`round` takes and gives a `float`**: `round(2.5)` is `2.0`, and `round(3)` is an error.
+  [Types and values](02-types-and-values.md#built-in-functions)
+- **`min` and `max` take two values**; a list has `values.min()` and `values.max()`.
 
 ## Text
 
@@ -58,7 +62,8 @@ chapter that explains it.
 - **Slices use ranges**: `text[1..<3]`, `values[2..]`, not `[1:3]`.
 - **`upper()` and `lower()` change ASCII letters only.** Use `unicode.to_upper` for all of
   Unicode.
-- **`split` needs a separator and keeps empty pieces.**
+- **`split(",")` keeps empty pieces**, as in Python; `split()` splits on runs of white space.
+- **Searches answer `none`, not `-1`**: `index_of`, `last_index_of`. [Text and bytes](03-text-and-bytes.md#operations-on-str)
 - **`join` is a list method**: `["a", "b"].join(", ")`.
 - **Formatted strings are one line**; `f"""` is not available.
 - **Single quotes are not strings.**

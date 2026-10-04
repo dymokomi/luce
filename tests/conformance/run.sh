@@ -3,7 +3,8 @@
 # `.expect` runs through the interpreter and through the emitted Base under every generator
 # luce-base has, and every execution must print the expectation. One beside a `.trap` must
 # stop with that text on every execution. One under `errors/` must be rejected with the
-# diagnostic its `# error:` line names, at a position.
+# diagnostic its `# error:` line names, at a position. A program reads its `.input` as
+# standard input, and an empty one when it has none.
 set -eu
 cd "$(dirname "$0")/../.."
 export LUCE_BASE=${LUCE_BASE:-$PWD/build/luce-base/build/luce-base}
@@ -25,6 +26,8 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
     for f in "$dir"*.expect "$dir"*/main.expect "$dir"*/src/main.expect; do
         [ -e "$f" ] || continue
         src="${f%.expect}.luc"
+        input="${f%.expect}.input"
+        [ -e "$input" ] || input=/dev/null
         echo "== $src"
         if ls "$(dirname "$src")"/*.lucb > /dev/null 2>&1; then
             # a program importing a Base module is built, never run in the interpreter (§16)
@@ -37,7 +40,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
             grep -q "the interpreter runs Luce alone" build/conformance.err || { echo "FAIL $src: [$(cat build/conformance.err)]"; exit 1; }
         else
             echo "   interpreter"
-            run ./build/luce run "$src" > build/conformance.out
+            run ./build/luce run "$src" < "$input" > build/conformance.out
             compare "$f"
         fi
         # Native optimization levels are independent correctness targets; C remains
@@ -45,7 +48,7 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         for flags in "--native --opt 0" "--native --opt 1" "--native --opt 2" "--native --opt 3" "--backend=c" "--backend=c --release"; do
             echo "   compiled ${flags:-native}"
             run ./build/luce build "$src" -o build/conformance $flags
-            run ./build/conformance > build/conformance.out
+            run ./build/conformance < "$input" > build/conformance.out
             compare "$f"
         done
         programs=$((programs + 1))

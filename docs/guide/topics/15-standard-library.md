@@ -96,7 +96,7 @@ from luce_std import math
 
 pub func main(arguments: list[str]) -> int!:
     print(math.sqrt(16.0), math.round(2.5), math.floor(-1.5), math.abs(-3.0))
-    print(math.imax(3, 7), math.iabs(-4), math.round(3.14159 * 100.0) / 100.0)
+    print(math.imax(3, 7), math.iabs(-4), round(3.14159, 2))
     return 0
 ```
 
@@ -107,7 +107,7 @@ pub func main(arguments: list[str]) -> int!:
 
 | Functions | Notes |
 | --- | --- |
-| `floor`, `ceil`, `round`, `trunc` | `round` rounds halves away from zero |
+| `floor`, `ceil`, `round`, `trunc` | `math.round` rounds halves away from zero; the built-in `round(x, digits)` rounds them to even, as Python's |
 | `sqrt`, `cbrt`, `hypot`, `pow`, `exp`, `exp2`, `log`, `log2`, `log10`, `log1p`, `expm1`, `fma` | as in C and Python's `math` |
 | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh` | radians |
 | `abs`, `sign`, `copysign`, `min`, `max`, `clamp` | for `float` |

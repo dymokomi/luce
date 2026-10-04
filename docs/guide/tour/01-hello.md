@@ -90,8 +90,8 @@ Hello from Luce, 2026.
 Arguments: 0 []
 ```
 
-The braces hold any expression. Two differences from Python: there is no format
-specification after a colon (`{price:.2f}` is not available), and `arguments` holds only
+The braces hold any expression, with Python's format specification after a colon when you
+want one: `{price:.2f}`, `{count:>5}`. One difference from Python: `arguments` holds only
 the arguments, without the program's name that Python's `sys.argv[0]` holds. Run it as
 `luce run hello.luc one two` and the second line reads `Arguments: 2 [one, two]`.
 

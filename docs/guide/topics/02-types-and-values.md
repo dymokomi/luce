@@ -168,7 +168,8 @@ There are no implicit conversions, and no casts. Converting is a call:
 | Call | Result |
 | --- | --- |
 | `int(x)` for a `float` | the `float` without its fraction, toward zero; traps if it is NaN or does not fit |
-| `int(s)` for a `str` | the decimal number in the text, spaces around it allowed; fails with `not an integer` |
+| `int(s)` for a `str` | the decimal number in the text, spaces around it and `_` between digits allowed; fails with `not an integer` |
+| `int(s, base)` for a `str` | the number in that base, 2 to 36, with `0x`, `0o` or `0b` allowed for 16, 8 and 2, as Python's `int(s, base)` |
 | `float(i)` for an `int` | the nearest `float` |
 | `float(s)` for a `str` | the decimal number, with an optional fraction and exponent; fails if it is not one |
 | `str(x)` | the display of `x` |
@@ -178,6 +179,54 @@ The conversions from text can fail, so their results are `int!`, `float!` and `b
 ([Errors](10-optionals-and-errors.md#errors)). Python's `int("3.5")` and `bool("no")` differ:
 the first raises in both languages, the second is `True` in Python, since any non-empty
 string is true there, and a failure in Luce.
+
+## Built-in functions
+
+Besides `print`, the conversions and `hash`, a few of Python's built-in functions are part of
+the language:
+
+```luce
+pub func main(arguments: list[str]) -> int!:
+    print(abs(-7), abs(-2.5), min(3, 8), max("pear", "apple"))
+    print(round(2.675, 2), round(2.5), round(1234.5, -2))
+    print(ord("é"), chr(233), int("ff", 16), int("0b101", base = 2))
+    let name = input("Your name? ") else "nobody"
+    print(f"hello, {name}")
+    return 0
+```
+
+```output
+7 2.5 3 pear
+2.67 2.0 1200.0
+233 é 255 5
+Your name? hello, nobody
+```
+
+| Call | Result |
+| --- | --- |
+| `abs(x)` | the magnitude of an `int` or a `float`; `abs` of the smallest `int` traps |
+| `min(a, b)`, `max(a, b)` | the lesser or greater of two values of the same ordered type; of two equal, the first |
+| `round(x, digits = 0)` | a `float` rounded to `digits` decimals, half to even on the exact value, as Python's |
+| `ord(text)` | the number of a one-character text |
+| `chr(code)` | the one-character text of a number; one that names no character traps |
+| `input(prompt = "")` | writes the prompt and reads a line without its line end: a `str?`, `none` at the end of the input |
+
+Compared with Python:
+
+- **`round` always gives a `float`** and takes only a `float`: `round(2.5)` is `2.0`, where
+  Python gives the `int` 2. Like Python, it rounds a half to the even neighbour, on the
+  number's exact binary value, so `round(2.675, 2)` is `2.67`. Convert with `int(...)` for an
+  `int`.
+- **`min` and `max` take two values.** A list has its own: `values.min()` and
+  `values.max()` ([Collections](04-collections.md#lists)).
+- **`input` answers `none` at the end of the input**, where Python raises `EOFError`, so
+  `while let line = input():` reads every line. The program above ran with no input, so it
+  printed the prompt and went on with `nobody`.
+- **`abs` and `round` follow the no-mixing rule**: `round(3)` is an error, since an `int` is
+  whole already.
+
+Their names are reserved, like `print`: a variable cannot be called `max` or `input`
+([Syntax](01-syntax.md#reserved-words)).
 
 ## `unit` and `never`
 
