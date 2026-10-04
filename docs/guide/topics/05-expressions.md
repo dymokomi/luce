@@ -44,6 +44,10 @@ The operators follow Python's definitions. What differs:
 Float arithmetic is IEEE 754, as in Python: dividing a float by zero gives `inf` or `nan`,
 and `nan` is not equal to itself.
 
+`abs(x)`, `min(a, b)`, `max(a, b)` and `round(x, digits)` are built-in functions, as in
+Python, and follow the same rule: `min(1, 2.5)` is an error, and `round` takes a `float`
+([Types and values](02-types-and-values.md#built-in-functions)).
+
 ## Comparison and logic
 
 `==`, `!=`, `<`, `<=`, `>` and `>=` compare two values of the same type and give a `bool`
@@ -76,7 +80,8 @@ true true true
 ```
 
 `x in c` asks whether a list or set contains `x`, whether a map has the key `x`, whether a
-string contains the substring `x`, or whether a range contains the number `x`. `is` and
+string contains the substring `x`, or whether a range contains the number `x`, its step
+counted: `4 in (0..<10).step(3)` is `false`. `is` and
 `is not` compare identity, for objects: classes and collections.
 
 ## The conditional expression

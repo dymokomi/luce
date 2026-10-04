@@ -70,11 +70,15 @@ chapter that explains it.
 
 ## Collections
 
-- **`m[key]` answers an optional**, never raises `KeyError`: write `m[key] else default`.
+- **`m[key]` answers an optional**, never raises `KeyError`: write `m[key] else default`
+  or `m.get(key, default)`.
   [Collections](04-collections.md#maps)
 - **A `for` over a map gives `(key, value)` pairs**, not keys. [Collections and loops](../tour/03-collections-and-loops.md#loops)
 - **Changing a collection's size inside a `for` over it traps.**
-- **There is no `key=` for sorting**: declare `Ordered`, or sort tuples. [Collections](04-collections.md#lists)
+- **`sorted`, `min`, `max`, `sum`, `any` and `zip` over a list are methods**: `values.sorted(key = f)`,
+  not `sorted(values, key=f)`. [Collections](04-collections.md#lists)
+- **A step is a method of the range**: `(0..<10).step(2)`, not `range(0, 10, 2)`.
+  [Control flow](06-control-flow.md#for)
 - **No comprehensions**: use `map` and `filter`.
 - **An out-of-range slice traps** instead of shortening.
 

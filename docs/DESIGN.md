@@ -63,7 +63,8 @@ admits and demands the same agreement, from the first slice.
 
 ## Modules
 
-`src/<area>/<module>.lucb`, one file per concern.
+`src/<area>/<module>.lucb`, one file per concern; a module that outgrows one file is a
+directory of fragments its `ORDER` lists (`sema/bodies/`, `hir/interp/`, `back/base/`).
 
 | Module | Owns |
 | --- | --- |
@@ -79,8 +80,9 @@ admits and demands the same agreement, from the first slice.
 | `back.native_objects`, `back.native_interfaces` | canonical owner layouts and interface witness storage |
 | `back.native_callbacks` | retained callable layouts, tracing and callback round trips |
 | `sema.transfer` | shared task/worker transfer rules and native worker payload validation |
-| `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture |
+| `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture; the core functions, format specifications and the methods of the built-in types in fragments of their own |
 | `hir.value`, `hir.interp`, `hir.heap` | the interpreter and its heap |
+| `support.numerals` | format specifications, decimal rounding and integers in a base: the one module both executions run |
 | `back.base`, `back.package` | the typed tree as Base; the package handed to luce-base |
 | `back.sources`, `back.workspace` | which package each emitted module belongs to; the workspace written for luce-base |
 | `support.module_paths`, `support.toolchain`, `support.native` | Base's module resolution and descriptions, the luce-base this Luce runs, a package's native inputs |
@@ -90,10 +92,12 @@ admits and demands the same agreement, from the first slice.
 
 ## The runtime
 
-`rt/` is a Base package compiled by luce-base with the program. It provides the object
-header, retain and release, the temporaries pool, the cycle collector, weak references,
-`deinit` dispatch, owned text and bytes, the three collections, closure cells, workers, and
-the trap reporter, and nothing else. `docs/RUNTIME.md` is its written contract, and the
+`rt/` is a Base package compiled by luce-base with the program. Its `kernel` provides the
+object header, retain and release, the temporaries pool, the cycle collector, weak
+references, `deinit` dispatch, owned text and bytes, the three collections and their methods,
+ranges, the built-in functions, closure cells, workers, and the trap reporter; beside it
+`numerals`, embedded from `src/support/numerals.lucb`, formats numbers as the interpreter
+does. `docs/RUNTIME.md` is its written contract, and the
 interpreter follows the same contract so that the two executions destroy objects in the same
 order.
 

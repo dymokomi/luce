@@ -48,7 +48,7 @@ the bound name is visible only in the block where it has a value.
 
 | Over | Gives |
 | --- | --- |
-| a range, `0..<n` or `1..=n` | each `int` |
+| a range, `0..<n` or `1..=n`, or one with a step or reversed | each `int` |
 | a `list` or `set` | each element, in order |
 | a `map` | each `(key, value)` tuple, in insertion order |
 | a `str` | each character, as a one-character `str` |
@@ -58,6 +58,31 @@ the bound name is visible only in the block where it has a value.
 
 A tuple in the `for` takes each item apart: `for (name, age) in ages:`. Changing the size of
 the collection being iterated traps ([Collections](04-collections.md#what-they-share)).
+
+A range is Python's `range`: `0..<n` is `range(n)`, `1..=n` includes its end, and `step` and
+`reversed` give the other forms, as methods of the range:
+
+```luce
+pub func main(arguments: list[str]) -> int!:
+    var evens: list[int] = []
+    for i in (0..<10).step(2):
+        evens.append(i)
+    var countdown: list[int] = []
+    for i in (1..=5).reversed():
+        countdown.append(i)
+    let odds = (1..<10).step(2)
+    print(evens, countdown, odds, odds.length, odds.contains(7), 4 in odds)
+    return 0
+```
+
+```output
+[0, 2, 4, 6, 8] [5, 4, 3, 2, 1] (1..<10).step(2) 5 true false
+```
+
+`(a..<b).step(n)` is `range(a, b, n)`, and `(a..<b).reversed()` is `reversed(range(a, b))`,
+the same numbers from the last; a negative step is written that way, as
+`(0..<10).step(3).reversed()` for 9, 6, 3, 0. A step below one traps. A range is a value:
+it can be stored, passed and compared, and has `length`, `is_empty` and `contains`.
 
 `break` leaves the innermost loop and `continue` goes on to its next round. A loop can carry a
 *label*, and `break` and `continue` can name it, to leave or continue an outer loop from an

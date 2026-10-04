@@ -249,7 +249,7 @@ a `float` the eight bytes of its IEEE encoding, with `-0.0` written as `0.0`; a 
 byte, 0 or 1; a `str` or `bytes` its bytes then the byte 255 (so that `("a", "b")` and
 `("ab", "")` differ); `unit` nothing; a tuple or struct its members in order; an enum its
 case's index as an `int` then its payload; an optional the byte 0 for `none` or the byte 1
-then the value; a range its two bounds and a byte for inclusion; a list its elements in
+then the value; a range its two bounds, a byte for inclusion, and its step as an `int` when the step is not 1; a list its elements in
 order; a set its elements' hashes summed (as unsigned arithmetic, wrapping); a map each
 entry's key hash times 31 plus its value hash, summed the same way; an `ErrorCode` its
 number. A type that declares `Hashable` (§13.3) hashes as the `int` its `hashed` returns

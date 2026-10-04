@@ -18,7 +18,8 @@ Python's `list`, `dict` and `set`, and tuples for fixed groups of values.
 - **Changing a collection's size while a `for` goes through it traps**, for lists, maps and
   sets. Changing an element in place, `values[i] = x`, is allowed.
 - **Maps and sets keep insertion order**, as Python's `dict` does. Sets in Python do not.
-- `length` is a property, written without parentheses, and immediate for every collection.
+- `length` and `is_empty` are properties, written without parentheses, and immediate for
+  every collection. `is_empty` is what Python writes `not values`.
 
 ## Lists
 
@@ -51,23 +52,64 @@ b+a
 | `values[i]`, `values[i] = x` | read or replace an element; a negative `i` counts from the end; out of range traps |
 | `values[a..<b]`, `values[a..]`, `values[..<b]` | a new list of those elements; out of range traps |
 | `append(x)`, `insert(i, x)` | add at the end, or before position `i` |
+| `extend(other)` | add copies of `other`'s elements at the end |
 | `remove_at(i)`, `pop()` | remove and return the element at `i`, or the last; an empty list traps |
+| `remove(x)` | remove the first element equal to `x`, answering whether there was one |
 | `clear()` | remove everything |
 | `first`, `last` | the first and last element, as an optional: `none` for an empty list |
-| `contains(x)`, `index_of(x)` | search; `index_of` answers an `int?`; `x in values` is `contains` |
-| `sort()`, `reverse()` | in place |
-| `sorted()`, `reversed()` | as a new list |
-| `map(f)`, `filter(f)` | a new list of `f`'s results, or of the elements for which `f` is true |
+| `contains(x)`, `index_of(x)`, `count(x)` | search; `index_of` answers an `int?`; `x in values` is `contains` |
+| `sort(key = f, reverse = false)`, `reverse()` | in place |
+| `sorted(key = f, reverse = false)`, `reversed()` | as a new list |
+| `min(key = f)`, `max(key = f)` | the first least or greatest element, an optional: `none` for an empty list |
+| `sum()` | the total of a `list[int]` or a `list[float]` |
+| `map(f)`, `filter(f)`, `flat_map(f)` | a new list of `f`'s results, of the elements for which `f` is true, or of the lists `f` makes, joined |
+| `any(f)`, `all(f)`, `find(f)` | whether `f` is true for some or every element, and the first one it is true for, an optional |
+| `reduce(f, initial)` | `f(f(initial, first), second)` and so on, as Python's `functools.reduce` |
+| `zip(other)`, `chunks(n)`, `distinct()`, `indexed()` | new lists: pairs, lists of `n`, without repeats, each element with its index |
 | `join(separator)` | for a `list[str]`, the strings joined |
-| `indexed()` | in a `for`, each element with its index: `for (i, x) in values.indexed()` |
 | `a + b` | a new list of both |
 | `copy()` | a shallow copy |
 
-Sorting needs ordered elements: numbers, text, tuples of those, or a type that declares
-`Ordered`. **There is no `key=` argument**: to sort records by a field, declare `Ordered` on
-the struct, or sort a list of tuples whose first member is the key, since tuples compare
-member by member. There is also no `del`, no slice assignment, and no list comprehension;
-`map` and `filter` replace the last.
+Python's built-in functions over lists are methods here: `sorted(values, key=f)` is
+`values.sorted(key = f)`, `min(values)` is `values.min()`, `sum(values)` is
+`values.sum()`, `any(f(x) for x in values)` is `values.any(f)`, `zip(a, b)` is `a.zip(b)`,
+`enumerate(values)` is `values.indexed()`, and `list(dict.fromkeys(values))` is
+`values.distinct()`. `min` and `max` of two values are the built-in functions `min(a, b)` and
+`max(a, b)` ([Types and values](02-types-and-values.md#built-in-functions)).
+
+```luce
+struct Person:
+    let name: str
+    let age: int
+
+pub func main(arguments: list[str]) -> int!:
+    let people = [Person(name = "Grace", age = 45), Person(name = "Ada", age = 36), Person(name = "Alan", age = 36)]
+    print(people.sorted(key = (p) => p.age).map((p) => p.name))
+    print(people.sorted(key = (p) => (p.age, p.name), reverse = true).map((p) => p.name))
+    let oldest = people.max(key = (p) => p.age) else return 1
+    print(oldest.name, people.map((p) => p.age).sum(), people.any((p) => p.age > 40))
+    print([1, 2, 3].zip(["one", "two"]), [1, 2, 3, 4, 5].chunks(2), [3, 1, 3].distinct())
+    print([1, 2, 3, 4].reduce((total, n) => total * n, 1), ["a", "b"].indexed())
+    return 0
+```
+
+```output
+[Ada, Alan, Grace]
+[Grace, Alan, Ada]
+Grace 117 true
+[(1, one), (2, two)] [[1, 2], [3, 4], [5]] [3, 1]
+24 [(0, a), (1, b)]
+```
+
+Sorting compares the elements, or the `key` of each, which must be ordered: numbers, text,
+tuples of those, or a type that declares `Ordered`. The sort is stable, as Python's is:
+elements with equal keys keep their order, also when `reverse = true`. While a list sorts,
+its elements are out of it, as in Python, and a key that changes the list traps. The
+functions you give `map`, `sort` and the others take one element; one that adds to or
+removes from the list it is given traps, as changing a list inside a `for` over it does.
+
+There is no `del`, no slice assignment, and no list comprehension; `map` and `filter`
+replace the last.
 
 A slice never fails silently: `values[2..<10]` on a three-element list traps, where Python
 would quietly return what exists.
@@ -100,16 +142,19 @@ Grace: 45
 | Operation | Meaning |
 | --- | --- |
 | `m[key]` | the value, as an optional: `none` when the key is missing |
+| `get(key, default)` | the value, or `default` when the key is missing |
 | `m[key] = value` | insert, or replace the value of an existing key in its place |
+| `update(other)` | insert or replace every entry of `other`, Python's `dict.update` |
 | `key in m` | whether the key is present |
 | `remove(key)` | remove and return the value, an optional |
 | `keys()`, `values()`, `items()` | lists of the keys, the values, and key-value tuples |
 | `for (key, value) in m` | each entry, in insertion order |
-| `clear()`, `copy()`, `length` | as for lists |
+| `clear()`, `copy()`, `length`, `is_empty` | as for lists |
 
 The main difference from Python is that **a missing key is not an error**: `m[key]` is a
-`V?`, which you must unwrap. Python's `m.get(key, default)` is `m[key] else default`. To
-count, write `counts[word] = (counts[word] else 0) + 1`.
+`V?`, which you must unwrap. `m.get(key, default)` is Python's, and so is
+`m[key] else default`, which computes the default only when the key is missing. To count,
+write `counts[word] = counts.get(word, 0) + 1`.
 
 A map is changed through `m[key] = value` even when bound with `let`, since `let` fixes which
 map the name refers to, not its contents. The same holds for lists and sets.
@@ -143,8 +188,9 @@ true false {3, 2, 4}
 | `insert(x)` | add `x` if it is not there |
 | `remove(x)` | remove `x`, answering whether it was there |
 | `x in s` | membership |
-| `union(t)`, `intersection(t)`, `difference(t)` | a new set; Python's `|`, `&` and `-` |
-| `clear()`, `copy()`, `length` | as for lists |
+| `union(t)`, `intersection(t)`, `difference(t)`, `symmetric_difference(t)` | a new set; Python's `|`, `&`, `-` and `^` |
+| `is_subset(t)`, `is_superset(t)`, `is_disjoint(t)` | Python's `<=`, `>=` and `isdisjoint` |
+| `clear()`, `copy()`, `length`, `is_empty` | as for lists |
 
 `{}` is an empty *map*; an empty set is written with its type, `let empty: set[str] = {}`.
 

@@ -78,8 +78,9 @@ pub func main(arguments: list[str]) -> int!:
 Looking up a key that is not there is not an error, as Python's `KeyError` would be.
 `ages["Linus"]` answers `none`, "no value", and its type says so: it is an `int?`, an
 *optional* `int`, rather than an `int`. You cannot do arithmetic on it until you say what
-should happen when it is missing. `else` supplies a value for that case, like Python's
-`ages.get("Linus", 0)`. [Chapter 7](07-absence-and-failure.md) covers optionals in full.
+should happen when it is missing. `else` supplies a value for that case, and
+`ages.get("Linus", 0)` is there too, as in Python. [Chapter 7](07-absence-and-failure.md)
+covers optionals in full.
 
 ## Sets and tuples
 
@@ -133,7 +134,8 @@ Grace is 45
 ```
 
 - **Ranges** are written `0..<3` (0, 1 and 2, like Python's `range(3)`) or `1..=3` (1, 2
-  and 3, the end included).
+  and 3, the end included); `(0..<10).step(2)` and `(1..=3).reversed()` are Python's other
+  forms of `range`.
 - **A map gives key and value pairs**, as Python's `ages.items()` does, where Python's
   `for name in ages` gives only the keys. Use `ages.keys()` for the keys alone.
 - **`indexed()`** pairs each element with its position, as Python's `enumerate` does.

@@ -358,7 +358,14 @@ There is no cast. A conversion is a call, and one that can fail says so.
 `value.field`, `value.method(args)`, `Type.function(args)`, `callable(args)`, `list[i]`,
 `map[key]`, `list[a..<b]`, `text[a..<b]`. Indexing a list with an `int` out of range traps;
 reading `map[key]` yields `V?`; a slice of a list or a `str` is a copy (§11). Ranges `a..<b`
-and `a..=b` are values of type `range` that iterate `int`s.
+and `a..=b` are values of type `range` that iterate `int`s. `r.step(size)` keeps every
+`size`th element, from the first the range walks, and traps on a size below one;
+`r.reversed()` walks the same elements from the last; so `(0..<10).step(3)` walks 0, 3, 6, 9
+and `(0..<10).step(3).reversed()` 9, 6, 3, 0, Python's `range(0, 10, 3)` and its
+`reversed`. `r.length`, `r.is_empty` and `r.contains(x)`, which is `x in r`, count and test
+the elements; a length past the largest `int` traps. A range displays as written, a step or
+a direction as the calls that made them, `(0..<10).step(3)`, and two ranges are equal when
+their bounds, inclusion and step are.
 
 ### 6.7 Precedence
 
@@ -477,6 +484,8 @@ while let line = reader.next():
 ```luce
 for i in 0..<10:
     print(i)
+for i in (0..<10).step(2).reversed():
+    print(i)
 for name in names:
     print(name)
 for (index, name) in names.indexed():
@@ -487,9 +496,9 @@ for character in "héllo":
     print(character)
 ```
 
-`for` iterates a range, a list, a set, a map (as key-value tuples), a `str` (as one-scalar
-strings), `bytes` (as `int`s 0 to 255), or any value of a type that declares `Iterable`
-(§13.3). `break` and `continue` apply to the innermost loop; a loop may be labelled,
+`for` iterates a range, with its step and direction (§6.6), a list, a set, a map (as
+key-value tuples), a `str` (as one-scalar strings), `bytes` (as `int`s 0 to 255), or any
+value of a type that declares `Iterable` (§13.3). `break` and `continue` apply to the innermost loop; a loop may be labelled,
 `outer: for ...`, and `break outer` leaves it. Structurally mutating a collection while a
 `for` runs over it traps.
 
@@ -689,25 +698,50 @@ list, `is` says so, and `.copy()` makes an independent shallow copy. Indexing is
 
 | Operation | Meaning |
 | --- | --- |
-| `length` | a property, O(1) |
+| `length`, `is_empty` | properties, O(1) |
 | `values[i]`, `values[i] = x` | get and set; `i` out of range traps; negative indexes count from the end |
 | `values[a..<b]`, `values[a..]`, `values[..<b]` | a new list of the elements; bounds checked |
-| `append(x)`, `insert(i, x)`, `remove_at(i) -> T`, `pop() -> T`, `clear()` | shape changes |
+| `append(value)`, `insert(index, value)`, `extend(other)`, `remove_at(index) -> T`, `pop() -> T`, `remove(value) -> bool`, `clear()` | shape changes |
 | `first`, `last` | `T?` |
-| `contains(x)`, `index_of(x) -> int?` | search, `x` equatable |
-| `sort()`, `sorted()`, `reverse()`, `reversed()` | in place and as a copy; elements ordered |
-| `map(f)`, `filter(f)`, `join(separator)` | with a function value; `join` on `list[str]` |
-| `indexed()` | in a `for` only: each element with its index, `(int, T)` (§8.3) |
+| `contains(value)`, `index_of(value) -> int?`, `count(value) -> int` | search, elements equatable |
+| `sort(key = f, reverse = false)`, `sorted(...)`, `reverse()`, `reversed()` | in place and as a copy |
+| `min(key = f) -> T?`, `max(key = f) -> T?` | the first least or greatest; `none` when empty |
+| `sum()` | of a `list[int]`, checked, or a `list[float]` |
+| `map(function)`, `flat_map(function)`, `filter(predicate)`, `any(predicate)`, `all(predicate)`, `find(predicate) -> T?`, `reduce(function, initial)` | with a function value |
+| `zip(other) -> list[(T, U)]`, `chunks(size) -> list[list[T]]`, `distinct()`, `indexed() -> list[(int, T)]` | new lists |
+| `join(separator)` | on `list[str]` |
 | `a + b` | a new list of both |
 | `copy()` | a shallow copy |
+
+`remove(value)` takes out the first element equal to `value` and says whether there was
+one. `sort` and `sorted` are stable, as Python's are: elements, or their keys, that compare
+equal keep their order, also with `reverse`. A `key` is a function of an element whose
+result is of an ordered type (§4.4); it is called once per element, in order. Without a key
+the elements are ordered. While a list sorts, its elements are out of it, as in Python: a
+key or a comparison sees it empty, and one that changes it traps. `min` and `max` compare
+elements, or their keys, and answer the first least or greatest. `sum()` adds left to
+right; an `int` overflow traps, and a `list[float]` is added with Neumaier's compensation,
+as Python's `sum` does; an empty list sums to zero. `any` and `all` stop at the first
+element that decides, and `find` answers the first element `predicate` holds for.
+`reduce(function, initial)` folds left, `function(function(initial, first), second)`, its
+total of the initial value's type, `func(A, T) -> A`. `flat_map` joins the lists its
+function makes. A function given the elements gets a copy of each, and one that changes the
+list's length traps, as a `for` over it does (§8.3). `zip` pairs the elements at each index
+for the shorter list's length; `chunks(size)` cuts the list into lists of `size`, the last
+shorter, and traps on a size below one; `distinct()` keeps the first of equal elements, which
+are hashable, in order; `indexed()` pairs each element with its index, and in a `for` walks
+the list without making the pairs (§8.3).
 
 ### 11.2 `map[K, V]` and `set[T]`
 
 Maps and sets have identity, keep insertion order, and require equatable and hashable keys.
-`m[key]` is `V?`; `m[key] = v` inserts or replaces; `m.remove(key) -> V?`; `key in m`;
-`m.keys()`, `m.values()`, `m.items()` iterate. `s.insert(x)`, `s.remove(x) -> bool`,
-`x in s`, `s.union(t)`, `s.intersection(t)`, `s.difference(t)`. Both have `length`,
-`clear()`, `copy()`.
+`m[key]` is `V?`; `m.get(key, default) -> V` is the value or `default`; `m[key] = v`
+inserts or replaces; `m.update(other)` inserts or replaces every entry of `other`, in its
+order; `m.remove(key) -> V?`; `key in m`; `m.keys()`, `m.values()`, `m.items()` iterate.
+`s.insert(x)`, `s.remove(x) -> bool`, `x in s`, `s.union(t)`, `s.intersection(t)`,
+`s.difference(t)`, `s.symmetric_difference(t)`, each a new set in the order of `s` and then
+`t`, and the tests `s.is_subset(t)`, `s.is_superset(t)`, `s.is_disjoint(t)`. Both have
+`length`, `is_empty`, `clear()`, `copy()`.
 
 ### 11.3 `str`
 
@@ -926,7 +960,7 @@ The compiler knows these interfaces, and syntax uses them:
 | --- | --- | --- |
 | `Equatable` | `equals(self, other: Self) -> bool` | `==`, `!=`, `in`, keys |
 | `Hashable` | `hashed(self) -> int` with `Equatable` | map keys, set elements |
-| `Ordered` | `compare(self, other: Self) -> int` | `<` and friends, `sort` |
+| `Ordered` | `compare(self, other: Self) -> int` | `<` and friends, `sort`, `min`, `max` |
 | `Display` | `display(self) -> str` | `print`, `str(x)`, f-strings |
 | `Iterable[T]` | `iterator(self) -> Iterator[T]` | `for` |
 | `Iterator[T]` | `next(self) -> T?` | `for`, `while let` |
