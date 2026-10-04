@@ -1139,7 +1139,8 @@ interpreter and a built runner print the same report.
 a heading per module, a heading per declaration with its signature, the declaration's doc
 comment beneath, and a type's public members (an interface's methods, an enum's cases) as
 a list, each with its own doc comment. A doc comment is the `##` lines directly above a
-declaration or a member (§3.3); one anywhere else documents nothing.
+declaration or a member (§3.3); one anywhere else documents nothing. The `##` lines opening
+a file with a blank line after them are the module's doc comment, beneath its heading.
 
 ### 17.5 Explanations
 
