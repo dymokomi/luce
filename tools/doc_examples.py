@@ -13,7 +13,8 @@ built, since the interpreter runs Luce alone. One that uses another package says
 checkout the build made under build/, or else the one beside this repository. `<!-- fragment -->` marks a block that shows part of a
 program, `...` and all, though it declares `main`. `<!-- tests -->` marks a module whose
 tests are the point: it is run with `luce test`, in the interpreter and built, and the
-report compared with the output block.
+report compared with the output block. Notes combine on consecutive lines, as a rejected
+program that needs a companion module, `<!-- with shapes.luc -->` above `<!-- exits 1 -->`.
 
 Usage: tools/doc_examples.py [COMPILER] [PAGE...]
 """
@@ -32,23 +33,26 @@ NOTE = re.compile(r"^<!--\s*(exits|with|file|needs|fragment|tests)\s*(.*?)\s*-->
 
 
 def blocks(text):
-    """Each fenced block with its language, its text, the note before it and its line."""
+    """Each fenced block with its language, its text, the notes before it by kind and its
+    line."""
     lines = text.split("\n")
     out = []
     i = 0
     while i < len(lines):
         m = FENCE.match(lines[i])
         if m and m.group(1):
-            note = None
+            notes = {}
             j = i - 1
             while j >= 0 and lines[j].strip() == "":
                 j -= 1
-            if j >= 0 and NOTE.match(lines[j]):
-                note = NOTE.match(lines[j]).groups()
+            while j >= 0 and NOTE.match(lines[j]):
+                kind, value = NOTE.match(lines[j]).groups()
+                notes[kind] = value
+                j -= 1
             k = i + 1
             while k < len(lines) and not lines[k].startswith("```"):
                 k += 1
-            out.append((m.group(1), "\n".join(lines[i + 1:k]) + "\n", note, i + 1))
+            out.append((m.group(1), "\n".join(lines[i + 1:k]) + "\n", notes, i + 1))
             i = k + 1
             continue
         i += 1
@@ -75,16 +79,16 @@ checked = 0
 for page in PAGES:
     found = blocks(page.read_text())
     files = {}
-    for index, (language, body, note, line) in enumerate(found):
-        if note and note[0] == "file":
-            files[note[1]] = body
+    for index, (language, body, notes, line) in enumerate(found):
+        if "file" in notes:
+            files[notes["file"]] = body
             continue
-        testing = bool(note and note[0] == "tests")
-        if language != "luce" or ("func main(" not in body and not testing) or (note and note[0] == "fragment"):
+        testing = "tests" in notes
+        if language != "luce" or ("func main(" not in body and not testing) or "fragment" in notes:
             continue
-        status = int(note[1]) if note and note[0] == "exits" else 0
-        companions = note[1].split() if note and note[0] == "with" else []
-        needs = note[1].split() if note and note[0] == "needs" else []
+        status = int(notes.get("exits", "0"))
+        companions = notes.get("with", "").split()
+        needs = notes.get("needs", "").split()
         expected = None
         if index + 1 < len(found) and found[index + 1][0] == "output":
             expected = found[index + 1][1]

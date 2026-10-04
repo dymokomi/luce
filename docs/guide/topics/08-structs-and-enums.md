@@ -39,6 +39,9 @@ door false true
   when all their fields are, and a struct prints as `Name(field = value, ...)`. They exist
   when every field supports them; a struct with a class field, for instance, has no `==`
   unless that class declares `Equatable`.
+- **Private fields** (those not marked `pub`) are left out of construction in other modules,
+  and there a struct that has one prints only through a `Display` of its own
+  ([Visibility](13-modules-and-packages.md#visibility)).
 - A struct can declare interfaces, `struct Circle: Shape:`, and replace the generated
   equality, ordering or display by declaring `Equatable`, `Ordered` or `Display`
   ([Interfaces](11-interfaces-and-generics.md#the-built-in-interfaces)).

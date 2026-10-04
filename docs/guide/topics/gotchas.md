@@ -103,6 +103,9 @@ chapter that explains it.
 - **No global variables**, and a top-level `let` must be a constant.
   [Modules and packages](13-modules-and-packages.md#what-a-module-contains)
 - **A package is not a module**: `import luce_std` is an error; `from luce_std import files`.
+- **Another module cannot print a struct with a private field**, nor set that field or call
+  an `init` that is not `pub`; the struct declares `Display`, or its module offers a `pub`
+  function. [Visibility](13-modules-and-packages.md#visibility)
 - **A program that imports Base must be built**: `luce run` refuses it. [Luce and Base](16-base.md#importing-a-base-module)
 - **Base functions with pointers or other Base-only types are invisible to Luce.**
   [Luce and Base](16-base.md#what-crosses)

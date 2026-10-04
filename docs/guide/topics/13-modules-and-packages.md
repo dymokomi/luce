@@ -57,6 +57,80 @@ pub struct Point:
 
 Python marks private names with a leading underscore by convention; Luce checks `pub`.
 
+A private field stays private in every way a field could be seen, not only `p.cache`:
+
+- **Construction.** Another module builds the struct from its `pub` fields alone, and the
+  private ones take their defaults. A private field without a default means only the
+  struct's own module can build it; it offers a `pub` function that does. An `init` is
+  a method like any other, so another module calls it only when it is `pub`.
+- **Printing.** `print`, `str(x)` and f-strings show every field of a struct, so another
+  module can print a struct with a private field only if the struct declares `Display`.
+  The same goes for a list, an optional or another struct holding one. Inside its own
+  module the struct prints as usual.
+
+`==` and `hash` still compare and hash every field, private ones included; they reveal no
+values.
+
+`shapes.luc`:
+
+<!-- file shapes.luc -->
+```luce
+pub struct Point:
+    pub let x: float
+    pub let y: float
+    let cache: float = 0.0
+
+pub struct Label: Display:
+    pub let text: str
+    let width: int
+
+    pub func make(text: str) -> Label:
+        return Label(text = text, width = text.length)
+
+    pub func display(self) -> str:
+        return f"{self.text} ({self.width} wide)"
+
+pub func describe(p: Point) -> str:
+    return str(p)
+```
+
+`main.luc`:
+
+<!-- with shapes.luc -->
+```luce
+import shapes
+
+pub func main(arguments: list[str]) -> int!:
+    let p = shapes.Point(x = 1.0, y = 2.0)
+    print(p.x, p == shapes.Point(x = 1.0, y = 2.0))
+    print(shapes.describe(p))
+    print(shapes.Label.make("door"))
+    return 0
+```
+
+```output
+1.0 true
+Point(x = 1.0, y = 2.0, cache = 0.0)
+door (4 wide)
+```
+
+`describe` prints the point inside `shapes`, where every field is visible. `main` cannot
+print the point itself, nor build a `Label`, whose `width` has no default:
+
+<!-- with shapes.luc -->
+<!-- exits 1 -->
+```luce
+import shapes
+
+pub func main(arguments: list[str]) -> int!:
+    print(shapes.Point(x = 1.0, y = 2.0))
+    return 0
+```
+
+```output
+luce: main.luc:4:23: `Point` has fields private to the module `shapes`; to be printed outside it, it declares `Display` (§10.5)
+```
+
 ## Imports
 
 | Form | Makes available |

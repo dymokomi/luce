@@ -41,7 +41,8 @@ Untitled
 
 - **`init(self, ...)`** is the constructor, Python's `__init__`, and `Document("Notes")`
   calls it. A class has at most one `init`; other ways to make one are type functions
-  returning the class, like `Document.untitled()`.
+  returning the class, like `Document.untitled()`. Like any method, `init` is private to
+  its module unless it is `pub func init`.
 - **`init` must assign every field that has no default, exactly once**, and cannot pass
   `self` anywhere before it has. Fields with defaults get them before `init` runs.
 - **A class without `init`** whose fields all have defaults is constructed with no

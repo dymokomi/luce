@@ -157,7 +157,9 @@ Point(x = 1.0, y = 2.0) Light.red 3 none
 
 Text is shown without quotes, also inside collections, so `print(["a", "b"])` shows
 `[a, b]` where Python shows `['a', 'b']`. There is no separate `repr`. A class has no display
-until it declares `Display`.
+until it declares `Display`. Nor, outside its own module, has a struct with a private field,
+since its display would show that field; it declares `Display` to be printed there
+([Visibility](13-modules-and-packages.md#visibility)).
 
 ## Conversions
 

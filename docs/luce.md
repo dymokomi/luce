@@ -512,7 +512,11 @@ A struct is a value: assignment and passing copy it, and the copy is independent
 are `let` or `var`, and a `var` field may be assigned through a `var` binding. Construction
 is memberwise, `Point(x = 0.0, y = 0.0)`, positional or named; a field with a default may be
 omitted. A struct with a custom `init(self, ...)` is constructed through it instead. Structs
-have structural `==` and `hash` when their fields do, and a display when their fields do.
+have structural `==` and `hash` when their fields do, and a display when their fields do
+(§10.5). Another module constructs a struct memberwise through its `pub` fields alone: it
+names none of the others and no positional argument reaches one, so they take their
+defaults, and a struct with a private field without a default is made there only by a
+function of its module (§15.2).
 
 ### 9.2 Enums
 
@@ -564,7 +568,9 @@ A class is a shared object: assignment and passing share it, and it lives while 
 refers to it. Construction is `Name(args)`, the same spelling as a struct; the declaration,
 not the use, says which is which. A class has one `init(self, ...)`, which assigns every
 field without a default exactly once before it ends and cannot publish `self` before that;
-`init` may be fallible, `-> unit!`, when construction can fail. `Name(args)` then propagates in a fallible caller or is handled with `catch`. A
+`init` may be fallible, `-> unit!`, when construction can fail. `Name(args)` then propagates in a fallible caller or is handled with `catch`. Like any
+method, `init` is private to its module unless `pub`, so another module constructs a class
+or struct with its own `init` only when that `init` is `pub` (§15.2). A
 class without an `init` and with defaults for every field is constructed with no arguments.
 Classes are final: no inheritance, no override, no base class. Alternative construction is a
 type function returning the class, `Document.from_file(path)`.
@@ -610,8 +616,19 @@ collector handles the cycle.
 
 Every scalar, `str`, `bytes`, tuple, struct and enum of displayable members, optional, and
 collection of displayable elements has a display used by `print`, `str(x)` and f-strings. A
-class or struct may declare its own by conforming to `Display` (§13.3). `print(x)` writes the
-display and a newline to standard output; `print(a, b)` separates with a space.
+class or struct may declare its own by conforming to `Display` (§13.3), and then displays
+through it everywhere. `print(x)` writes the display and a newline to standard output;
+`print(a, b)` separates with a space.
+
+The structural display of a struct shows every field, so it is available only where every
+field is visible (§15.2): in the struct's own module, or anywhere when all its fields are
+`pub`. Elsewhere a struct with a private field has no display, and neither has anything
+that holds one: a collection, an optional, a tuple, an enum payload or another struct.
+Displaying it there is a compile error; the struct declares `Display` to be printed
+outside its module. An enum's payloads are as visible as the enum. Whether a type
+argument meets a `Display` bound (§13.2) is decided in the module whose code fixes it, so
+a generic function or type displays a value only where its caller could. Equality and
+hashing stay structural: they reveal no field.
 
 ## 11. Collections and text
 
@@ -903,7 +920,10 @@ from image.geometry import Point, Size
 public declarations in. Imports come first and are used; a name is imported once and never
 declared beside its import. Declarations, fields and methods are private to their module
 unless `pub`: a `pub` type with no `pub` member can be named and passed but not read or
-called from another module. A public signature mentions only public types. A module's name
+called from another module. Another module neither names nor reaches a private field in a
+memberwise construction (§9.1), calls an `init` that is not `pub` (§10.1), nor displays a
+struct with a private field that does not declare `Display` (§10.5). A public signature
+mentions only public types. A module's name
 is read only to reach a member, `shapes.origin`, `shapes.Point`; the closed protocols
 (§13.3) are visible in every module without an import.
 
