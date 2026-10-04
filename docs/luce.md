@@ -1044,12 +1044,14 @@ lease and reject access after expiry.
 
 | Luce | Base | Crossing |
 | --- | --- | --- |
-| `int` | `i64` | by value |
-| `float` | `f64` | by value |
+| `int` | `i64`, and `i8` to `u64`, `isize`, `usize` | by value; an `int` outside a narrower type's range traps as it crosses in, and a `u64` or `usize` past `int`'s range traps as it crosses out |
+| `float` | `f64`, `f32` | by value; an `f32` is rounded on the way in |
 | `bool` | `bool` | by value |
 | `str` | `str` | lent as Base's view of the bytes; a Base result is copied into an owned `str` |
+| `str` | `c.str` | lent as a zero-terminated copy that lives until the end of the calling statement; a text holding a zero byte traps; a result is copied |
 | `bytes` | `const u8[]` | lent; a Base result is copied |
-| `list[T]` of `int`, `float`, `bool`, `str` or handles | `const T[]` | lent for the call; texts and handles use temporary converted arrays. Base must retain individual resources it keeps; a Base span never crosses back |
+| `list[T]` of `int`, `float`, `bool`, `str` or handles | `const T[]` | lent for the call; texts and handles use temporary converted arrays. Base must retain individual resources it keeps; a borrowed Base span never crosses back |
+| `list[T]` | `interop.Owned[const T[]]`, as a result | the elements converted into a new list, then the owner released |
 | struct with copyable native storage | the same struct, declared in Base | complete native value plus owned public text/data |
 | declared owned object | `interop.Reference[T]` | shared native owner; parameter borrows and result transfers a reference |
 | declared borrowed view | `interop.View[T]` | shared checked lease; no public construction |
@@ -1062,9 +1064,8 @@ lease and reject access after expiry.
 | `func(A) -> R` of scalars, `str` and `bytes` answering a scalar or nothing | `func(A) -> R` | a named function, never a closure; Base calls a thunk that copies the texts for the call |
 | handle | `pub handle` | as an object (§16.4) |
 
-Nothing else crosses in either direction. A `usize`, `u32`, or `u64` in Base is an `int` in
-Luce, and a negative or oversized value traps at the crossing; a list of them is copied
-into a converted array for the call. A Base enum value that names no
+Nothing else crosses in either direction. A list of narrower integers is copied into a
+converted array for the call. A Base enum value that names no
 declared case traps as it crosses.
 
 Public handles retain their declaring module's identity when another Base module

@@ -121,12 +121,14 @@ values, handles, and object types, as long as their signatures use only types th
 
 | Base | In Luce | How |
 | --- | --- | --- |
-| `i64`, and `i8` to `u64`, `isize`, `usize` | `int` | by value; a negative or too large value for an unsigned or narrower type traps as it crosses |
-| `f64` | `float` | by value |
+| `i64`, and `i8` to `u64`, `isize`, `usize` | `int` | by value; an `int` too large or too small for a narrower type traps as it crosses |
+| `f64`, `f32` | `float` | by value |
 | `bool` | `bool` | by value |
 | `str` | `str` | a Luce string is lent to Base for the call; a Base result is copied into a new Luce string |
+| `c.str` (C text) | `str` | lent as a copy ending in a zero byte; a string holding a zero byte traps |
 | `const u8[]` | `bytes` | lent; a result is copied |
 | `const T[]` | `list[T]` of numbers, `bool`, `str` or handles | lent for the duration of the call |
+| `interop.Owned[const T[]]`, as a result | `list[T]` | the elements copied into a new list |
 | a struct of crossing fields | the same struct, with its fields and `pub` methods | copied, like any Luce struct |
 | an enum `as u8` (or another integer type) | the same enum | by value; a number that names no case traps |
 | `T?`, `T!`, tuples | `T?`, `T!`, tuples | each part crossing |
