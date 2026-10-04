@@ -171,9 +171,10 @@ returned by the module's functions; Luce cannot construct one.
 ### Objects
 
 A Base type declared with `interop.Type[T]` appears in Luce as a class with a constructor and
-methods, `files.Entries("notes")` for example. It is shared and closed like a handle, with
-methods instead of module functions. Writing such types is covered in the Base
-documentation.
+methods, `files.TemporaryDirectory()` for example, or is answered by a function, as
+`files.open(path)` answers a `File`. It is shared and closed like a handle, with methods
+instead of module functions; its `close()` is the function its declaration names. Writing
+such types is covered in the Base documentation.
 
 ### Callbacks
 
