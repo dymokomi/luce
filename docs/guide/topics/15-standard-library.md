@@ -289,9 +289,9 @@ true
 since. `sleep(seconds)` waits. `timestamp()` is the system's time as seconds since 1970, as
 Python's `time.time()`.
 
-A `Duration` is made with `Duration.of_seconds`, `of_milliseconds` or `of_nanoseconds`, read
-back with `seconds()`, `milliseconds()` or `nanoseconds()`, and combined with `plus`,
-`minus` and `times`.
+A `Duration` is made with `Duration.of_seconds`, `Duration.of_milliseconds` or
+`Duration(nanoseconds = n)`, read back with `seconds()`, `milliseconds()` or its
+`nanoseconds` field, and combined with `plus`, `minus` and `times`.
 
 A `DateTime` is a date and time of day at an offset from UTC, as Python's `datetime` with a
 time zone is:
