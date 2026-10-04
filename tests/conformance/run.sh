@@ -29,7 +29,13 @@ for dir in tests/conformance/[0-9]*/ tests/programs/; do
         input="${f%.expect}.input"
         [ -e "$input" ] || input=/dev/null
         echo "== $src"
-        if ls "$(dirname "$src")"/*.lucb > /dev/null 2>&1; then
+        # a directory program counts the Base modules of the packages it carries too
+        if [ "$(basename "$src")" = main.luc ]; then
+            bases=$(find "$(dirname "$src")" -name '*.lucb' | head -n 1)
+        else
+            bases=$(ls "$(dirname "$src")"/*.lucb 2>/dev/null | head -n 1)
+        fi
+        if [ -n "$bases" ]; then
             # a program importing a Base module is built, never run in the interpreter (§16)
             if reject ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
                 echo "FAIL $src: the interpreter ran a program that imports a Base module"; exit 1

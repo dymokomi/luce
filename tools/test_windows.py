@@ -66,7 +66,9 @@ def evaluate(source, workspaces):
                     result = run(args.compiler, 'test', name, *(['--build', *mode] if mode else []))
                 elif mode is None:
                     result = run(args.compiler, 'run', name, feed=feed)
-                    if list(source.parent.glob('*.lucb')):
+                    # a directory program counts the Base modules of the packages it carries too
+                    bases = source.parent.rglob('*.lucb') if source.name == 'main.luc' else source.parent.glob('*.lucb')
+                    if next(bases, None) is not None:
                         assert result.returncode == 1 and b'the interpreter runs Luce alone' in result.stderr, result
                         executions += 1
                         continue
