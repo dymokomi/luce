@@ -34,11 +34,13 @@ python3 tools/test_worker_heap.py
 python3 tools/embed_version.py --check
 python3 tools/embed_runtime.py --check
 python3 tools/embed_prelude.py --check
-for f in src/*.lucb src/*/*.lucb rt/*.lucb; do
+# a file module by its file, a directory module (its ORDER and fragments) by its directory
+for f in src/*.lucb src/*/*.lucb src/*/*/ORDER rt/*.lucb rt/*/ORDER; do
     [ -e "$f" ] || continue
+    case "$f" in */ORDER) f=$(dirname "$f") ;; esac
     echo "== check $f"
     "$base" check "$f"
-    if grep -q '^test "' "$f"; then
+    if grep -rqs '^test "' "$f"; then
         echo "== test $f"
         "$base" test "$f"
         "$base" test "$f" --backend=c

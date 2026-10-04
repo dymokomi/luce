@@ -1,8 +1,11 @@
 # The runtime
 
-`rt/kernel.lucb` supplies Luce's managed values. Base's standard `ownership` module
+`rt/kernel/` supplies Luce's managed values. Base's standard `ownership` module
 supplies their shared intrusive lifetime protocol, also available to Base libraries
-with explicit retain/release. Every compiled Luce program links these modules. The
+with explicit retain/release. `src/support/numerals.lucb`, the format specifications,
+decimal rounding and integer parsing of §3.3 and §6.5, is one module both executions run:
+the interpreter imports it, and every compiled program carries it beside the kernel.
+Every compiled Luce program links these modules. The
 interpreter (`luce run`) follows the same contract with its own data structures, and the
 conformance suite holds the two to it: the order in which objects die is observable through
 `deinit`, so it is specified here rather than left to either implementation.
