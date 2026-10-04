@@ -28,8 +28,9 @@ if args.c_only:
     MODES = MODES[-2:]
 
 
-def run(*command):
-    return run_owned(command, cwd=ROOT, capture_output=True, timeout=120)
+def run(*command, feed=b''):
+    # a program reads `feed` as its standard input, as run.sh gives it its `.input`
+    return run_owned(command, cwd=ROOT, capture_output=True, timeout=120, input=feed)
 
 
 def evaluate(source, workspaces):
@@ -58,11 +59,13 @@ def evaluate(source, workspaces):
             directory = tempfile.mkdtemp(prefix='luce-conformance-')
             workspaces.append(directory)
             binary = Path(directory) / 'case.exe'
+            given = source.with_suffix('.input')
+            feed = given.read_bytes() if given.exists() else b''
             for mode in [None, *MODES]:
                 if tests:
                     result = run(args.compiler, 'test', name, *(['--build', *mode] if mode else []))
                 elif mode is None:
-                    result = run(args.compiler, 'run', name)
+                    result = run(args.compiler, 'run', name, feed=feed)
                     if list(source.parent.glob('*.lucb')):
                         assert result.returncode == 1 and b'the interpreter runs Luce alone' in result.stderr, result
                         executions += 1
@@ -70,7 +73,7 @@ def evaluate(source, workspaces):
                 else:
                     built = run(args.compiler, 'build', name, *mode, '-o', binary)
                     assert built.returncode == 0, built.stderr
-                    result = run(binary)
+                    result = run(binary, feed=feed)
                 assert result.returncode == wanted, (mode, result.returncode, result.stderr)
                 actual = result.stdout + result.stderr if tests else result.stdout
                 assert expected.strip() in result.stderr if trap else actual == expected, (mode, expected, actual, result.stderr)
