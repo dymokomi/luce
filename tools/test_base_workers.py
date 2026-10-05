@@ -64,7 +64,7 @@ pub func main(arguments: list[str]) -> int!:
         (root / 'bad.lucb').write_text(f'''import interop
 import workers
 pub func rejected(factory: interop.WorkerEntry[{configuration}, {message}, {result}]):
-    discard(factory)
+    _ = factory
 pub func ordinary() -> i64:
     return 1
 ''')

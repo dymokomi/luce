@@ -40,14 +40,14 @@ pub struct Counter:
     pub func value() -> i64:
         return self.hidden
 
-    pub mutating func increase(amount: i64 = 2) -> i64!:
+    pub func increase(amount: i64 = 2) -> i64!:
         self.hidden += amount
         self.shown += amount
         if amount < 0:
             error(invalid, self.label)
         return self.hidden
 
-    pub static func scaled(count: i64 = 3) -> Counter!:
+    pub func scaled(count: i64 = 3) -> Counter!:
         return try Counter("scaled", count * 2)
 
 pub type Count = Counter
@@ -78,7 +78,7 @@ pub enum Mode as u8:
     busy = 1
     pub func name() -> str:
         return "ready" if self == Mode.ready else "busy"
-    pub static func initial() -> Mode:
+    pub func initial() -> Mode:
         return Mode.ready
 
 pub struct Borrowed:

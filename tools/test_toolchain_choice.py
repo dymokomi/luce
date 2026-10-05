@@ -38,7 +38,7 @@ pub func main(arguments: str[]) -> i32:
         return 0
     # asked to do anything else: leave the mark the test looks for
     if let file = fopen("MARK", "w"):
-        discard(fclose(file))
+        _ = fclose(file)
     return 3
 '''
 
