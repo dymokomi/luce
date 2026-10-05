@@ -196,7 +196,7 @@ def package "shapes" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.3.2"
+        str version = "^0.4.0"
     }
 }
 ```
@@ -227,7 +227,7 @@ directory beside the project:
 ```text
 def dependency "luce-std" {
     str owner = "dymokomi"
-    str version = "^0.3.2"
+    str version = "^0.4.0"
 }
 
 def dependency "shapes" {
@@ -236,7 +236,7 @@ def dependency "shapes" {
 ```
 
 `luc add owner/name` adds the newest release of a registry package with a caret version:
-`^0.3.2` accepts any `0.3.x` from `0.3.2` on, and any `1.x` after `^1.0.0`. `luc add
+`^0.4.0` accepts any `0.4.x` from `0.4.0` on, and any `1.x` after `^1.0.0`. `luc add
 ../path` adds a local package, which is convenient while developing two packages together.
 
 `luc.lock` records the exact version and the SHA-256 checksum of every registry package in
