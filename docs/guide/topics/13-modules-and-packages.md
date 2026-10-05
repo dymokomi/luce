@@ -259,6 +259,7 @@ missing, and works offline after that. Reading from the registry needs no accoun
 | `luc build [--release]` | build into `build/<name>` |
 | `luc run [--release] [-- arguments]` | build and run, passing the arguments to the program |
 | `luc test` | run the tests of every module ([Testing](14-testing.md)) |
+| `--diagnostic` on `build`, `run`, `test` | build with Base's diagnostic profile, into `build/<name>-diagnostic` ([Tools](17-tools.md#run-and-build)) |
 | `luc check` | type-check without building |
 | `luc fmt [--check]` | format the sources, or check that they are formatted |
 | `luc clean` | remove `build/` |

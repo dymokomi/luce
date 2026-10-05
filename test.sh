@@ -9,6 +9,7 @@ base=${LUCE_BASE_COMPILER:-build/luce-base/build/luce-base}
 case "$base" in /*) ;; *) base=$PWD/$base ;; esac
 export LUCE_BASE=$base
 python3 tools/test_native_default.py
+python3 tools/test_diagnostic_profile.py
 python3 tools/test_toolchain_choice.py
 python3 tools/test_build_cache.py
 # the compile budget with both compilers named relative to here, a Luce entry first

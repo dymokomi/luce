@@ -17,6 +17,8 @@
 
 In a project, `luc build`, `luc run`, `luc test`, `luc check` and `luc fmt` run these on the
 whole package ([Modules and packages](13-modules-and-packages.md#building-and-running-a-package)).
+`luc build --diagnostic`, `luc run --diagnostic` and `luc test --diagnostic` build with the
+diagnostic profile below, into `build/<name>-diagnostic` beside the normal build.
 
 ### `run` and `build`
 
@@ -30,6 +32,7 @@ the compiler's test suite holds them to it.
 | `--release` | optimise; checks and traps stay |
 | `--emit=base` | also keep the generated Base package, as `name.base`, to read |
 | `--backend=c` | compile the generated Base through C, for comparison |
+| `--profile diagnostic` | Base's diagnostic profile: storage not yet written reads as `0xAA`, and a double free or a write after free traps ([Base: Finding memory bugs](https://luce-base.luciaos.com/guide/memory/#finding-memory-bugs)); on `test` it implies `--build` |
 
 Use `luce build` (or `luc run`) when the program imports Base modules, which the interpreter
 cannot run, and for anything where speed matters: a built program runs many times faster than
