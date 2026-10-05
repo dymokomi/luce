@@ -47,7 +47,7 @@ pub struct Counter:
             error(invalid, self.label)
         return self.hidden
 
-    pub func scaled(count: i64 = 3) -> Counter!:
+    pub static func scaled(count: i64 = 3) -> Counter!:
         return try Counter("scaled", count * 2)
 
 pub type Count = Counter
@@ -78,7 +78,7 @@ pub enum Mode as u8:
     busy = 1
     pub func name() -> str:
         return "ready" if self == Mode.ready else "busy"
-    pub func initial() -> Mode:
+    pub static func initial() -> Mode:
         return Mode.ready
 
 pub struct Borrowed:
