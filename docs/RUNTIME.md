@@ -2,9 +2,11 @@
 
 `rt/kernel/` supplies Luce's managed values. Base's standard `ownership` module
 supplies their shared intrusive lifetime protocol, also available to Base libraries
-with explicit retain/release. `src/support/numerals.lucb`, the format specifications,
+with explicit retain/release. `src/support/number_text.lucb`, the format specifications,
 decimal rounding and integer parsing of §3.3 and §6.5, is one module both executions run:
-the interpreter imports it, and every compiled program carries it beside the kernel.
+the interpreter imports it, and every compiled program carries it beside the kernel. Its
+fields and decimal digits are Base's standard `numerals`, the layout Luce Base's own
+fields use, so the two languages format a number alike.
 Every compiled Luce program links these modules. The
 interpreter (`luce run`) follows the same contract with its own data structures, and the
 conformance suite holds the two to it: the order in which objects die is observable through

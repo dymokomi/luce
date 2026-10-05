@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 ./build.sh
 python3 tools/test_run_case.py
 python3 tools/test_sandbox.py
+sh tools/test_install_layout.sh
 base=${LUCE_BASE_COMPILER:-build/luce-base/build/luce-base}
 case "$base" in /*) ;; *) base=$PWD/$base ;; esac
 export LUCE_BASE=$base

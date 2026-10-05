@@ -110,4 +110,7 @@ confinement, the command refuses to run.
 | --- | --- |
 | `LUCE_BASE` | the Base compiler to use, if not the `luce-base` installed beside `luce` |
 
-`luc update` installs the newest `luce`, `luce-base` and `luc` together.
+`luc update` installs the newest `luce`, `luce-base` and `luc` together, into the tree the
+running `luc` belongs to. Only an install in the default place, `~/.local/luce` with
+`~/.luce`, edits the shell's startup file; one anywhere else, or with `LUC_HOME` set, is
+readied by sourcing its `env` file.

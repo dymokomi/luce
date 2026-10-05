@@ -210,8 +210,13 @@ def package "shapes" {
 | `entry` | for a tool or application, the main module's file, `src/main.luc` |
 | `str[] public` | the modules other packages may import |
 | `str source` | the source directory, if not `src` |
+| `description`, `readme` | one line of at most 256 bytes, and the README file, for the registry |
+| `license` | optional: the package's license as an SPDX expression, `"MIT OR Apache-2.0"` |
 | `def dependency` | a package this one uses (below) |
 | `def task` | a named command for `luc run <task>` |
+
+Each field is set once in its element: a second `str source = ...` in the same `def` is an
+error at the line that repeats it, from `luce` and from `luc` alike.
 
 The package's name is also the namespace of its error codes: `ErrorCode.package(1)` in
 `shapes` is a different code from `ErrorCode.package(1)` in any other package.

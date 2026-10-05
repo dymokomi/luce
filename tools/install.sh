@@ -9,14 +9,17 @@
 # place. ~/.local/luce/env puts bin/ and ~/.luce/bin (where `luc install` links
 # applications) on PATH; the shell's startup profile sources it, and sourcing it by hand,
 # as the command above does, makes the current terminal ready at once. Running it again
-# installs a fresh copy of the same release.
+# installs a fresh copy of the same release; `luc update` runs it for the tree luc is in.
 #
 # Overrides, for testing and managed layouts, all absolute paths:
 #   LUCE_INSTALL_DIR      where to install (default ~/.local/luce)
+#   LUC_HOME              where luc keeps what it installs (default ~/.luce); env sets it
 #   LUCE_INSTALL_VERSION  the release to install (default the one below)
 #   LUCE_INSTALL_URL      the directory the archives are read from; a file:// URL works
 #   LUCE_INSTALL_PROFILE  the startup file to edit (default the login shell's)
 #   LUCE_INSTALL_NO_PATH  1 leaves every startup file alone
+# A startup file is edited for the default place alone, ~/.local/luce with ~/.luce, or
+# when LUCE_INSTALL_PROFILE names one: an install anywhere else is sourced from its env.
 set -eu
 
 version=0.12.3
@@ -24,6 +27,7 @@ product=luce
 version=${LUCE_INSTALL_VERSION:-$version}
 base_url=${LUCE_INSTALL_URL:-https://github.com/dymokomi/luce/releases/download/luce-$version}
 install_root=${LUCE_INSTALL_DIR:-$HOME/.local/luce}
+luc_home=${LUC_HOME:-$HOME/.luce}
 profile_override=${LUCE_INSTALL_PROFILE:-}
 
 system=$(uname -s)
@@ -107,6 +111,7 @@ check_path() {
     fi
 }
 check_path LUCE_INSTALL_DIR "$install_root"
+check_path LUC_HOME "$luc_home"
 [ -z "$profile_override" ] || check_path LUCE_INSTALL_PROFILE "$profile_override"
 
 parent=$(dirname "$install_root")
@@ -187,27 +192,36 @@ if ! mv "$release" "$install_root"; then
     exit 1
 fi
 
-# The default location is spelled with $HOME so the files stay right however the home
+# The default locations are spelled with $HOME so the files stay right however the home
 # directory is spelled in a later shell.
+default_layout=0
 if [ "$install_root" = "$HOME/.local/$product" ]; then
     spelled_root="\$HOME/.local/$product"
+    [ "$luc_home" != "$HOME/.luce" ] || default_layout=1
 else
     spelled_root="$install_root"
 fi
+if [ "$luc_home" = "$HOME/.luce" ]; then
+    spelled_home="\$HOME/.luce"
+else
+    spelled_home="$luc_home"
+fi
 
 # env and env.fish: the compiler's commands and the applications luc installs, each
-# added once however often the file is sourced.
+# added once however often the file is sourced, and luc's home when it is not the default.
 write_env() {
-    cat > "$install_root/env" <<ENV
-# Luce: the compiler's commands, and the applications luc installs.
-case ":\$PATH:" in *":$spelled_root/bin:"*) ;; *) PATH="$spelled_root/bin:\$PATH" ;; esac
-case ":\$PATH:" in *":\$HOME/.luce/bin:"*) ;; *) PATH="\$HOME/.luce/bin:\$PATH" ;; esac
-export PATH
-ENV
-    cat > "$install_root/env.fish" <<ENV
-# Luce: the compiler's commands, and the applications luc installs.
-fish_add_path --prepend "$spelled_root/bin" "\$HOME/.luce/bin"
-ENV
+    {
+        printf '%s\n' "# Luce: the compiler's commands, and the applications luc installs."
+        printf '%s\n' "case \":\$PATH:\" in *\":$spelled_root/bin:\"*) ;; *) PATH=\"$spelled_root/bin:\$PATH\" ;; esac"
+        printf '%s\n' "case \":\$PATH:\" in *\":$spelled_home/bin:\"*) ;; *) PATH=\"$spelled_home/bin:\$PATH\" ;; esac"
+        printf '%s\n' "export PATH"
+        [ "$luc_home" = "$HOME/.luce" ] || printf '%s\n' "export LUC_HOME=\"$luc_home\""
+    } > "$install_root/env"
+    {
+        printf '%s\n' "# Luce: the compiler's commands, and the applications luc installs."
+        printf '%s\n' "fish_add_path --prepend \"$spelled_root/bin\" \"$spelled_home/bin\""
+        [ "$luc_home" = "$HOME/.luce" ] || printf '%s\n' "set -gx LUC_HOME \"$luc_home\""
+    } > "$install_root/env.fish"
 }
 write_env
 
@@ -238,10 +252,16 @@ add_to_profile() {
     elif printf '\n# Luce\n%s\n' "$line" >> "$profile"; then
         echo "==> $profile now sets up Luce in every new shell"
     else
-        echo "$product: installed, but could not update $profile; add $install_root/bin and ~/.luce/bin to PATH" >&2
+        echo "$product: installed, but could not update $profile; add $install_root/bin and $luc_home/bin to PATH" >&2
     fi
 }
-[ "${LUCE_INSTALL_NO_PATH:-0}" = 1 ] || add_to_profile
+if [ "${LUCE_INSTALL_NO_PATH:-0}" = 1 ]; then
+    :
+elif [ "$default_layout" = 1 ] || [ -n "$profile_override" ]; then
+    add_to_profile
+else
+    echo "==> startup files left alone for an install outside ~/.local/$product with ~/.luce"
+fi
 
 echo "==> $product $version installed at $install_root"
 case "${SHELL:-}" in

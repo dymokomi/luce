@@ -5,22 +5,29 @@
 # The release archive for x86-64 Windows is downloaded from the GitHub release, its
 # SHA-256 checked against the published digest, its contents checked, and only then does
 # it replace %LOCALAPPDATA%\luce; an interrupted run leaves the previous installation
-# in place. bin\ and ~\.luce\bin are added to the user PATH and to this session's.
-# Running it again installs a fresh copy of the same release. Works in Windows
-# PowerShell 5.1 and PowerShell 7.
+# in place. bin\ and ~\.luce\bin are added to this session's PATH, and to the user PATH
+# for the default place. Running it again installs a fresh copy of the same release;
+# `luc update` runs it for the tree luc is in. Works in Windows PowerShell 5.1 and
+# PowerShell 7.
 #
 # Overrides, for testing and managed layouts, all absolute paths:
 #   LUCE_INSTALL_DIR      where to install (default %LOCALAPPDATA%\luce)
+#   LUC_HOME              where luc keeps what it installs (default ~\.luce)
 #   LUCE_INSTALL_VERSION  the release to install (default the one below)
 #   LUCE_INSTALL_URL      the directory the archives are read from; a file:/// URL works
 #   LUCE_INSTALL_NO_PATH  1 leaves the user PATH alone
+# The user PATH is edited for the default place alone, %LOCALAPPDATA%\luce with ~\.luce:
+# an install anywhere else is put on this session's PATH only.
 $ErrorActionPreference = 'Stop'
 $version = '0.12.3'
 $product = 'luce'
 
 if ($env:LUCE_INSTALL_VERSION) { $version = $env:LUCE_INSTALL_VERSION }
 $baseUrl = if ($env:LUCE_INSTALL_URL) { $env:LUCE_INSTALL_URL } else { "https://github.com/dymokomi/luce/releases/download/luce-$version" }
-$installRoot = if ($env:LUCE_INSTALL_DIR) { $env:LUCE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA $product }
+$defaultRoot = Join-Path $env:LOCALAPPDATA $product
+$installRoot = if ($env:LUCE_INSTALL_DIR) { $env:LUCE_INSTALL_DIR } else { $defaultRoot }
+$defaultHome = Join-Path $env:USERPROFILE '.luce'
+$lucHome = if ($env:LUC_HOME) { $env:LUC_HOME } else { $defaultHome }
 $host_ = 'x86_64-windows'
 $archiveName = "$product-$version-$host_.tar.gz"
 $tree = "$product-$version"
@@ -135,11 +142,16 @@ try {
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
 }
 
-# The compiler's commands, and ~\.luce\bin where `luc install` links applications: on the
-# user PATH for every new terminal, and on this session's PATH now, since `irm | iex` runs here.
+# The compiler's commands, and ~\.luce\bin (LUC_HOME\bin) where `luc install` links
+# applications: on the user PATH for every new terminal when this is the default place, and
+# on this session's PATH now, since `irm | iex` runs here.
 $bin = Join-Path $installRoot 'bin'
-$apps = Join-Path $env:USERPROFILE '.luce\bin'
-if ($env:LUCE_INSTALL_NO_PATH -ne '1') {
+$apps = Join-Path $lucHome 'bin'
+$defaultLayout = ($installRoot -eq [System.IO.Path]::GetFullPath($defaultRoot).TrimEnd('\')) -and ($lucHome -eq $defaultHome)
+if ($env:LUCE_INSTALL_NO_PATH -ne '1' -and -not $defaultLayout) {
+    Write-Host "==> the user PATH left alone for an install outside $defaultRoot with $defaultHome"
+}
+if ($env:LUCE_INSTALL_NO_PATH -ne '1' -and $defaultLayout) {
     New-Item -ItemType Directory -Force -Path $apps | Out-Null
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $entries = @()
@@ -151,6 +163,8 @@ if ($env:LUCE_INSTALL_NO_PATH -ne '1') {
         [Environment]::SetEnvironmentVariable('Path', ($missing + $entries) -join ';', 'User')
         Write-Host "==> added $($missing -join ' and ') to the user PATH"
     }
+}
+if ($env:LUCE_INSTALL_NO_PATH -ne '1') {
     foreach ($directory in @($apps, $bin)) {
         if (-not (($env:Path -split ';') -contains $directory)) { $env:Path = "$directory;$env:Path" }
     }

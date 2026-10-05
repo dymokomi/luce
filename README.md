@@ -16,7 +16,10 @@ installs in one line from [luce.luciaos.com](https://luce.luciaos.com): `curl -f
 https://luce.luciaos.com/install.sh | sh && . "$HOME/.local/luce/env"` on macOS and Linux
 (the second half readies the terminal it runs in; new shells are set up by the profile),
 `irm https://luce.luciaos.com/install.ps1 | iex` in PowerShell on Windows. The installers
-are `tools/install.sh` and `tools/install.ps1`; the site serves copies. It needs the host's
+are `tools/install.sh` and `tools/install.ps1`; the site serves copies. `LUCE_INSTALL_DIR`
+installs elsewhere and `LUC_HOME` moves luc's home from `~/.luce`; a startup file (the user
+PATH on Windows) is edited only for the default layout, and `luc update` reinstalls into the
+tree it runs from (`tools/test_install_layout.sh`). It needs the host's
 C toolchain, which Base drives to assemble and link; a program it builds links the
 standard library statically and runs on its own. `luce` finds `luce-base` beside itself
 (`support.toolchain`); `LUCE_BASE` names another. The `Release` workflow builds the

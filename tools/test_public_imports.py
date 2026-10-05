@@ -66,4 +66,10 @@ with tempfile.TemporaryDirectory(prefix='luce public imports ü-') as temporary:
     for flags in FLAGS:
         run(BASE, 'build', relocated / 'main.lucb', *flags, '-o', root / 'consumer')
         run(root / 'consumer')
-print('PASS package modules: qualified imports, `from` directories and aliases, private foreign interfaces, standard packages, per-package emission and relocation; six modes')
+    # a key set twice in one element is refused at the second, by Luce as by luce-base
+    write(root, 'twice/package.prisma', '#prisma 4.0\ndef package "twice" {\n    str source = "src"\n    def dependency "x" {\n        str path = "x"\n    }\n    str source = "src"\n}\n')
+    twice = write(root, 'twice/src/main.luc', 'pub func main(arguments: list[str]) -> int!:\n    return 0\n')
+    for command in (['run'], ['build', '-o', root / 'twice-out']):
+        refused = run(COMPILER, *command[:1], twice, *command[1:], expected=1)
+        assert 'package.prisma:7:9: `source` is set twice in one element; it was set on line 3' in refused.stderr, refused.stderr
+print('PASS package modules: qualified imports, `from` directories and aliases, private foreign interfaces, standard packages, per-package emission and relocation, a manifest key set twice refused; six modes')

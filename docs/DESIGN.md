@@ -82,7 +82,7 @@ directory of fragments its `ORDER` lists (`sema/bodies/`, `hir/interp/`, `back/b
 | `sema.transfer` | shared task/worker transfer rules and native worker payload validation |
 | `sema.bodies` | every statement and expression typed, with initialisation, exhaustiveness, generics, conformance and capture; the core functions, format specifications and the methods of the built-in types in fragments of their own |
 | `hir.value`, `hir.interp`, `hir.heap` | the interpreter and its heap |
-| `support.numerals` | format specifications, decimal rounding and integers in a base: the one module both executions run |
+| `support.number_text` | Luce's fields, `math.round` and `int(text, base)` over Base's standard `numerals`, which lays fields out for Luce and Base alike: the one module both executions run |
 | `back.base`, `back.package` | the typed tree as Base; the package handed to luce-base |
 | `back.sources`, `back.workspace` | which package each emitted module belongs to; the workspace written for luce-base |
 | `support.module_paths`, `support.toolchain`, `support.native` | Base's module resolution and descriptions, the luce-base this Luce runs, a package's native inputs |
@@ -96,8 +96,8 @@ directory of fragments its `ORDER` lists (`sema/bodies/`, `hir/interp/`, `back/b
 object header, retain and release, the temporaries pool, the cycle collector, weak
 references, `deinit` dispatch, owned text and bytes, the three collections and their methods,
 ranges, the standard modules' functions, closure cells, workers, and the trap reporter; beside it
-`numerals`, embedded from `src/support/numerals.lucb`, formats numbers as the interpreter
-does. `docs/RUNTIME.md` is its written contract, and the
+`number_text`, embedded from `src/support/number_text.lucb`, formats numbers as the interpreter
+does, through Base's standard `numerals`. `docs/RUNTIME.md` is its written contract, and the
 interpreter follows the same contract so that the two executions destroy objects in the same
 order.
 
