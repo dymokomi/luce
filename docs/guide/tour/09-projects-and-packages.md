@@ -104,12 +104,12 @@ This writes the dependency into `package.prisma`:
 ```text
 def dependency "luce-std" {
     str owner = "dymokomi"
-    str version = "^0.4.0"
+    str version = "^0.5.0"
 }
 ```
 
 and records the exact version, with a checksum of its source, in `luc.lock`, which belongs
-in version control. `^0.4.0` accepts any later `0.4.x`. The next build downloads what is
+in version control. `^0.5.0` accepts any later `0.5.x`. The next build downloads what is
 missing; after that, builds work offline.
 
 `luce-std` is the standard library: files, paths, processes, networking, maths and Unicode.
