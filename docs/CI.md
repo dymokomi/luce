@@ -28,9 +28,10 @@ standard library beside them (`tools/package.sh`), prove the archive with
 luce.luciaos.com download.
 
 Releases are cut in batches, not after every fix. To cut one: on the current mains, set
-the new versions (each package's package.prisma `version`, and the dependency carets that
-must move) and publish the packages that changed with `luc publish`; release luce-base
+each changed package's new `version` in its package.prisma and publish it with `luc
+publish` (dependencies name no version, so they take the newest release and nothing else
+moves); release luce-base
 (tag `luce-base-VERSION`); bump `VERSION` here, wait for Correctness and Windows on that
 commit, tag `luce-VERSION`; then point the installers (`tools/install.sh`, `install.ps1`)
 at the new version. Nothing pins a commit: the release is built from the mains of the
-moment, and the versions in package.prisma are what fix it.
+moment, and the released versions, recorded in each project's luc.lock, are what fix it.
