@@ -44,8 +44,13 @@ def main():
     except OSError as error:
         print(f"FAIL: cannot execute {shlex.join(command)}: {error}", file=sys.stderr)
         return 126
+    # standard output whole, then standard error: flushed in that order, so a check that
+    # sends both to one file reads them in one order on every host (tools/test_windows.py
+    # joins them the same way)
     sys.stdout.buffer.write(stdout)
+    sys.stdout.flush()
     sys.stderr.buffer.write(stderr)
+    sys.stderr.flush()
     if timeout or status != args.expected:
         folder = Path("build/failures") / f"{time.time_ns()}-{os.getpid()}"
         folder.mkdir(parents=True)
