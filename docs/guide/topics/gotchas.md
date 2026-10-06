@@ -50,8 +50,9 @@ chapter that explains it.
 - **`int` overflow traps.** Integers have 64 bits, not Python's unlimited size.
 - **`1 / 0` is `inf`**, since `/` is a float division; `1 // 0` traps.
 - **`2 ** -1` traps**; write `2.0 ** -1.0`.
-- **No bit operations** (`&`, `|`, `<<`, ...), unsigned integers or other sizes. Use a Base
-  module. [Luce and Base](16-base.md#when-to-write-base)
+- **No unsigned integers or other sizes.** The bit operators work on the 64-bit `int`, and
+  `<<` traps when the result does not fit, where Python's would grow. Use a Base module for
+  fixed sizes. [Luce and Base](16-base.md#when-to-write-base)
 - **A format specification must fit its value's type**: `f"{count:.2f}"` of an `int` is an
   error; write `f"{float(count):.2f}"`. [Text and bytes](03-text-and-bytes.md#format-specifications)
 - **`math.round` takes and gives a `float`**: `math.round(2.5)` is `2.0`, and

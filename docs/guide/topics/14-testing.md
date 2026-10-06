@@ -86,7 +86,7 @@ FAIL  parses its input
 FAIL  reports a wrong answer
       main.luc:13:1: double(3) is 6
 FAIL  checks with assert
-      main.luc:18:5: assert failed: double(5) is 10
+      main.luc:18:5: assert failed: double(5) == 11: double(5) is 10
 ok    runs after the failures
 2 passed
 3 failed
@@ -98,8 +98,9 @@ ok    runs after the failures
   goes on. This holds for an `assert` written in the test itself; one inside a function the
   test calls traps, since that function is not a test.
 - **A test that traps**, through a bug such as an index out of range or through an `assert`
-  in a function it calls, ends the whole run at that test, printing the trap. The tests
-  after it do not run.
+  in a function it calls, ends the whole run at that test, as an uncaught exception ends a
+  Python program. The report still names the test as `FAIL`, prints the trap, and counts
+  the tests run so far; the tests after it do not run.
 
 The run exits with status 1 when any test failed.
 

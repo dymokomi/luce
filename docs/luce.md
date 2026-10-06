@@ -30,8 +30,9 @@ one value carried by `T!`; tests are registered fallible functions; packages are
 a manifest. Nothing else is a concept.
 
 **One number of each kind.** `int` is a 64-bit signed integer and `float` a 64-bit IEEE
-double. There is no other width, no unsigned integer, no wrapping or saturating arithmetic,
-and no bit operation. Code that needs them is Base code.
+double. There is no other width, no unsigned integer, and no wrapping or saturating
+arithmetic; the bit operators work on `int` as Python's do. Code that needs the rest is Base
+code.
 
 **The machine is elsewhere.** Luce has no pointer, span, fixed array, union, allocator,
 `asm`, atomic, or foreign declaration. A Base package has all of them and exposes a Luce
@@ -335,10 +336,15 @@ A conditional expression evaluates only the arm it picks.
 | `%` | remainder with the divisor's sign, as Python's; by zero traps | IEEE remainder |
 | `**` | checked power with an `int` exponent that is not negative | `float` power |
 | unary `-` | checked | IEEE |
+| `& \| ^` | and, or, exclusive or of the two's complement bits, as Python's | — |
+| unary `~` | `-x - 1`, the bits inverted | — |
+| `<<` | checked: a result past the range traps; a negative count traps | — |
+| `>>` | arithmetic, flooring as Python's: `-7 >> 1` is -4, a negative value ends at -1; a negative count traps | — |
 
 `int` and `float` never mix in one operation: `count * 1.5` is an error and is written
-`float(count) * 1.5`. There is no bit operation, shift, wrapping or saturating form; a
-program that needs them calls a Base package.
+`float(count) * 1.5`. The bit operators take `int`s alone, and each has its compound
+assignment (`&=`, `|=`, `^=`, `<<=`, `>>=`). There is no wrapping or saturating form; a
+program that needs one calls a Base package.
 
 ### 6.3 Comparison and logic
 
@@ -379,8 +385,10 @@ their bounds, inclusion and step are.
 
 ### 6.7 Precedence
 
-From tightest: member, call, index; unary `-`; `**`; `* / // %`; `+ -`; `..<` `..=`; `in`,
-`is`, `is not`, comparisons; `not`; `and`; `or`; `if`-`else`; `=>`; assignment. `not` sits
+From tightest: member, call, index; unary `-` and `~`; `**`; `* / // %`; `+ -`; `<< >>`;
+`&`; `^`; `|`; `..<` `..=`; `in`, `is`, `is not`, comparisons; `not`; `and`; `or`;
+`if`-`else`; `=>`; assignment. The bit operators sit where Python puts them, so
+`flags & mask == 0` compares the masked bits and `1 << n - 1` shifts by `n - 1`. `not` sits
 below the comparisons so that `not a == b` negates the comparison, as in Python.
 
 ### 6.8 Standard modules
@@ -395,7 +403,7 @@ let name = console.read_line("name? ") else "nobody"
 let letter = code_of("A")
 ```
 
-Three modules come with the language: `math`, `text` and `console`. They are imported by
+Four modules come with the language: `math`, `text`, `console` and `time`. They are imported by
 name like any module (§15.2), in the interpreter and in a built program alike: `import math`
 binds `math`, and `math.abs(x)` calls one of its functions; `from math import abs` binds the
 function by its name. Nothing of them is visible without an import, an import not used is
@@ -410,6 +418,9 @@ module's functions are all it has.
 | `text` | `code_of(s: str) -> int` | the value of a text's one scalar; a text of any other length traps |
 | `text` | `from_code(n: int) -> str` | the text of the scalar `n`; a number that is no scalar (negative, a surrogate, past `0x10FFFF`) traps |
 | `console` | `read_line(prompt: str = "") -> str?` | writes the prompt, then reads a line of standard input without its `\n` and a `\r` before it; `none` at the end of the input, and always in a sandboxed run (§17.1) |
+| `time` | `sleep(seconds)` | waits at least `seconds`, an `int` or a `float`, as Python's; a negative count or NaN traps |
+| `time` | `now() -> int` | nanoseconds from an arbitrary origin that never goes backwards, for measuring intervals |
+| `time` | `unix() -> int` | whole seconds since the Unix epoch |
 
 `math.round` takes no `int`, since an `int` is whole already (§6.2); `math.min` and
 `math.max` take two values, and a list's own are its methods (§11.1). Arguments are
@@ -916,7 +927,8 @@ iteration, a `trap("message")`, and out of memory. It writes `trap: file:line:co
 message` to standard error and exits with status 1: the position is the statement the
 program was running, the innermost one inside a called function, and the interpreter and
 a built program name the same one. `assert(condition)` and `assert(condition, "message")`
-stay in every build and report `assert failed`, then the message when one is given.
+stay in every build and report `assert failed`, the condition as written, then the message
+when one is given: `assert failed: limit > 5: the limit is too small`.
 
 ## 13. Interfaces and generics
 
@@ -1061,7 +1073,7 @@ mentions only public types. A module's name
 is read only to reach a member, `shapes.origin`, `shapes.Point`; the closed protocols
 (§13.3) are visible in every module without an import.
 
-The names `math`, `text` and `console` always name the standard modules (§6.8): `import
+The names `math`, `text`, `console` and `time` always name the standard modules (§6.8): `import
 math` and `from math import abs` never reach a module of the package. So a package with a
 module of one of those names at its source root may not import that name, and doing so is
 an error; another package's module of that name is reached through its package,
@@ -1293,11 +1305,14 @@ test "parsing an empty document fails":
 A `test` is a registered function that runs under `luce test` and never in a build. It may
 fail, `assert`, and `error`. A test fails when a failure leaves it, reported at the test's
 position with the failure's message, or when an `assert` written in its own body (not in a
-lambda in it) is false, reported at the `assert` with `assert failed` and its message; the
-run goes on with the next test. Any other trap, an `assert` in a function the test calls
-included, ends the run after the test's name (§12.4). The report is one line per test,
-`ok    name` or `FAIL  name` followed by an indented `file:line:column: message`, then
-`N passed` and, when any failed, `M failed`; the status is 1 then. The interpreter and a
+lambda in it) is false, reported at the `assert` with `assert failed`, its condition and its
+message; the run goes on with the next test. Any other trap, an `assert` in a function the
+test calls included, ends the run (§12.4): the test is reported `FAIL  name`, the trap's own
+line follows on standard error, then the tally of the tests run so far, and the status is 1.
+The report is one line per test, `ok    name` or `FAIL  name` followed by an indented
+`file:line:column: message`, then `N passed` and, when any failed, `M failed`; the status is
+1 then. A position names its file relative to the project root, the directory holding
+`package.prisma`, and a file outside any package as it was given. The interpreter and a
 built runner print the same report.
 
 The tests run are those of the file and of the modules of its package it imports, an
@@ -1335,7 +1350,7 @@ again changes nothing.
 ## 18. Deliberate exclusions
 
 Not in Luce, with the reason: integer widths and unsigned integers (one number of each kind);
-bit operations, shifts, wrapping and saturating arithmetic (Base); `char` (a scalar is a
+wrapping and saturating arithmetic (Base); `char` (a scalar is a
 `str` of one); fixed arrays, slices as views, unions, pointers, spans, atomics, `asm`,
 allocators, `defer`, `new`, `free`, `weak` as a word (memory is not the programmer's);
 inheritance, overloading, variadics, default interface methods, associated types, downcasts

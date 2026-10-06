@@ -63,8 +63,9 @@ and `**` is a power, all as in Python. Three things differ:
   up to about 9.2 × 10¹⁸. Going past that is not a silent wrap-around, as in C: the program
   stops with a message. [Chapter 7](07-absence-and-failure.md) covers this kind of stop, a
   *trap*.
-- **There are no bit operations** (`&`, `|`, `<<`) and no other integer sizes. Programs
-  that need them are written in Luce Base, the language Luce is built on; [Chapter
+- **There are no other integer sizes**, and no unsigned integers. The bit operators (`&`,
+  `|`, `^`, `~`, `<<`, `>>`) work on `int` as in Python. Programs that need fixed sizes are
+  written in Luce Base, the language Luce is built on; [Chapter
   10](10-workers-and-where-next.md) introduces it.
 
 ## Text

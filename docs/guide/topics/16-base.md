@@ -193,7 +193,7 @@ Base are not: they belong to the worker that made them.
 
 Reach for a Base module when:
 
-- the code needs **bit operations, fixed-size integers or floats**: parsers of binary
+- the code needs **fixed-size integers or floats**, or wrapping arithmetic: parsers of binary
   formats, hashes, checksums, compression, image pixels;
 - it is a **hot loop** over many numbers, where control over memory layout matters;
 - it **calls a C library**: Base can call C directly, and declares the C functions it uses;

@@ -58,7 +58,7 @@ any other module:
 
 <!-- file checksum.lucb -->
 ```lucb
-## A checksum, written in Base for its bit operations.
+## A checksum, written in Base for its 32-bit arithmetic.
 
 ## The Adler-32 checksum of `text`.
 pub func adler32(text: str) -> u32:

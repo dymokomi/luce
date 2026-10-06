@@ -51,7 +51,7 @@ IMPORTED = ["ok    a square's area", "ok    the entry's own", "2 passed"]
 PACKAGE = [
     "ok    a square's area", "ok    the entry's own",
     # a module the entry does not import is named by its full path, as an imported one is
-    "FAIL  an orphan fails", "      ROOT/src/orphan.luc:4:5: assert failed: two squared is not five",
+    "FAIL  an orphan fails", "      src/orphan.luc:4:5: assert failed: area.square(2) == 5: two squared is not five",
     "ok    an orphan passes", "ok    a nested module's", "4 passed", "1 failed"]
 RUNNERS = ([], ["--build"], ["--build", "--backend=c"])
 
@@ -75,6 +75,8 @@ with tempfile.TemporaryDirectory(prefix="luce-package-tests-") as directory:
         shown = whole.stdout.replace(str(root.resolve()), "ROOT")
         assert shown.splitlines() == PACKAGE, f"FAIL luce test --package {runner}: {whole.stdout}{whole.stderr}"
         trapped = run(root, "test", "traps/main.luc", *runner, status=1)
-        assert trapped.stdout == "" and trapped.stderr == "trap: traps/main.luc:2:5: assert failed\n", \
+        # a trap ends the run with its test named and the tally so far (§17.3)
+        assert trapped.stdout == "FAIL  a helper's assert traps\n0 passed\n1 failed\n" \
+            and trapped.stderr == "trap: traps/main.luc:2:5: assert failed: n > 0\n", \
             f"FAIL a helper's assert {runner}: {trapped.stdout}{trapped.stderr}"
-print("ok luce test: the package's modules with --package, never a dependency's; a test's assert fails it, a helper's traps")
+print("ok luce test: the package's modules with --package, never a dependency's; a test's assert fails it, a helper's traps and names its test")

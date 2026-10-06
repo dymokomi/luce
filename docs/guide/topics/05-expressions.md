@@ -38,8 +38,24 @@ The operators follow Python's definitions. What differs:
 - **`1 / 0` is `inf`**, not an error, since `/` converts both sides to `float` first. `1 // 0`
   and `1 % 0` trap.
 - `2 ** -1` traps; write `2.0 ** -1.0` for a fractional result.
-- **There are no bit operations** (`&`, `|`, `^`, `~`, `<<`, `>>`), and no wrapping or
-  saturating arithmetic. These belong to Base ([Luce and Base](16-base.md)).
+- **The bit operators** `&`, `|`, `^`, `~`, `<<` and `>>` work on `int` as Python's do:
+  negative values in two's complement, `>>` flooring (`-7 >> 1` is -4), and the same
+  precedence, so `flags & mask == 0` compares the masked bits. `<<` traps when the result
+  passes the `int` limit, and a negative shift count traps. There is no wrapping or
+  saturating arithmetic; that belongs to Base ([Luce and Base](16-base.md)).
+
+```luce
+pub func main(arguments: list[str]) -> int!:
+    let flags = 0b1010
+    print(flags & 0b0010 != 0, flags | 1, flags ^ 0b1111, ~flags)
+    print(1 << 10, -7 >> 1, (0x1F3 >> 4) & 0xF)
+    return 0
+```
+
+```output
+true 11 5 -11
+1024 -4 15
+```
 
 Float arithmetic is IEEE 754, as in Python: dividing a float by zero gives `inf` or `nan`,
 and `nan` is not equal to itself.

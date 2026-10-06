@@ -184,7 +184,7 @@ string is true there, and a failure in Luce.
 ## Standard modules
 
 Besides `print` and the conversions, a few of Python's built-in functions come with Luce, in
-three small modules imported like any other: `math`, `text` and `console`.
+four small modules imported like any other: `math`, `text`, `console` and `time`.
 
 ```luce
 import console
@@ -215,6 +215,9 @@ Your name? hello, nobody
 | `text.code_of(s)` | `ord(s)` | the number of a one-character text |
 | `text.from_code(n)` | `chr(n)` | the one-character text of a number; one that names no character traps |
 | `console.read_line(prompt = "")` | `input(prompt)` | writes the prompt and reads a line without its line end: a `str?`, `none` at the end of the input |
+| `time.sleep(seconds)` | `time.sleep(seconds)` | waits at least that long, an `int` or a `float` of seconds; a negative one traps |
+| `time.now()` | `time.monotonic_ns()` | nanoseconds from a fixed point, for measuring how long something took |
+| `time.unix()` | `int(time.time())` | whole seconds since 1970 |
 
 `from math import abs` brings one function in by its name, as in Python, and then `abs(x)`
 calls it. An import that is not used is an error, as for any module
@@ -233,6 +236,23 @@ Compared with Python:
   program above ran with no input, so it printed the prompt and went on with `nobody`.
 - **`math.abs` and `math.round` follow the no-mixing rule**: `math.round(3)` is an error,
   since an `int` is whole already.
+- **`time.now()` counts nanoseconds as an `int`**, like Python's `time.monotonic_ns()`, so
+  an interval is a subtraction:
+
+```luce
+import time
+
+pub func main(arguments: list[str]) -> int!:
+    let start = time.now()
+    time.sleep(0.01)
+    let elapsed = time.now() - start
+    print(elapsed >= 10000000)
+    return 0
+```
+
+```output
+true
+```
 
 The names these functions had in Python are free: a variable may be called `max` or
 `input`. Square roots, trigonometry and the like are in luce-std's `math`, a package

@@ -271,7 +271,7 @@ handle, and **cannot be caught**:
 | `pop` or `remove_at` on an empty list | `pop of an empty list` |
 | `int(x)` of a float that does not fit, or NaN | `integer conversion out of range` |
 | a collection changed while a `for` goes through it | `the list changed while it was iterated` |
-| `assert(condition)` with a false condition | `assert failed`, then the message if one was given |
+| `assert(condition)` with a false condition | `assert failed`, the condition, then the message if one was given |
 | `trap("message")` | the message |
 | running out of memory | |
 
@@ -284,7 +284,7 @@ pub func main(arguments: list[str]) -> int!:
 ```
 
 ```output
-trap: main.luc:3:5: assert failed: the limit is too small
+trap: main.luc:3:5: assert failed: limit > 5: the limit is too small
 ```
 
 The position is the statement that was running, in the innermost function. `assert` stays in

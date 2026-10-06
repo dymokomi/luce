@@ -206,5 +206,6 @@ A `bytes` literal is written `b"..."`, with `\xNN` for any byte. Indexing gives 
 from 0 to 255, and `for` goes through the bytes as `int`s. `text()` decodes UTF-8 and fails
 on invalid input. Bytes display as a `b"..."` literal with every byte escaped.
 
-Luce has no bit operations, so code that takes binary formats apart byte by byte is usually
-written in Base, and hands Luce the result ([Luce and Base](16-base.md)).
+Luce's bit operators work on these `int`s, so a byte's fields come apart as in Python:
+`(byte >> 4) & 15`. Code that reads fixed-size binary formats in bulk is usually written in
+Base, and hands Luce the result ([Luce and Base](16-base.md)).

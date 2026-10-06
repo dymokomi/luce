@@ -1,8 +1,8 @@
 # The standard library
 
 The language has its built-in types and their methods, covered in the earlier chapters, and
-three small modules that come with the compiler, `math`, `text` and `console`, which hold
-Python's `abs`, `min`, `max`, `round`, `ord`, `chr` and `input`
+four small modules that come with the compiler, `math`, `text`, `console` and `time`, which
+hold Python's `abs`, `min`, `max`, `round`, `ord`, `chr`, `input` and `time.sleep`
 ([Types and values](02-types-and-values.md#standard-modules)). They need no package and run
 in the interpreter. The rest of the standard library is a package, `luce-std`, which a
 project adds as a dependency:
