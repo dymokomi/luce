@@ -447,7 +447,7 @@ func start(editor: Editor) -> unit!:
 | `recovery_directory()` | `~/.luce/recovery/<program>`, made when missing: where a hook saves |
 | `note_recovery(path)` | from a hook: the report, and the crash window, say where the copy is |
 | `relaunch_on_crash()` | after a crash, start the program again to show the report (luce-ui does this) |
-| `report_to_show()` | in that new process, the report's path; `none` in an ordinary run |
+| `report_to_show()` | in that new process, the report's path; empty text in an ordinary run |
 | `read_report(path)`, `take_report(app)` | a report's text, marked as seen; the newest unseen one |
 | `reopen()` | start the program again as an ordinary run |
 
