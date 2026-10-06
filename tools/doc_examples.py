@@ -60,10 +60,8 @@ def blocks(text):
 
 
 def package(name):
-    """Where the package `name` is checked out: build/ first, where ./build.sh puts the
-    revision the compiler pins, then beside this repository."""
-    built = ROOT / "build" / name
-    return built if (built / "package.prisma").exists() else ROOT.parent / name
+    """Where the package `name` is checked out: beside this repository."""
+    return ROOT.parent / name
 
 
 def run(command, work, status):

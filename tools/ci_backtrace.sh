@@ -2,7 +2,7 @@
 # Recover useful compiler frames even when bootstrap stops before its usual logs.
 set -u
 root=.
-if [ -d build/luce-base/.git ]; then root=build/luce-base; fi
+if [ -d ../luce-base/.git ]; then root=../luce-base; fi
 mkdir -p build
 if [ "$(uname -s)" != Linux ]; then exit 0; fi
 cd "$root"

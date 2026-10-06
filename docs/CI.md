@@ -1,9 +1,10 @@
 # Continuous correctness checks
 
 The `Correctness` workflow runs on every push, pull request, manual dispatch and weekly
-schedule, on macOS ARM64, Linux x86-64 and Linux ARM64. Each job clones the luce-base commit named in
-`bootstrap/BASE`, asserts its actual architecture, records the toolchain and the pins
-(`tools/ci_provenance.py`), runs `./test.sh`, and keeps the whole gate log. The hosts
+schedule, on macOS ARM64, Linux x86-64 and Linux ARM64. Each job clones luce-base's main
+and every package the tests depend on at main (`luce-base/tools/checkout_main.py`; there
+are no commit pins), asserts its actual architecture, records the toolchain and the
+revisions it built (`tools/ci_provenance.py`), runs `./test.sh`, and keeps the whole gate log. The hosts
 finish independently, so one host's failure cannot hide another's result.
 
 Use `./test.sh` locally; it is the same gate. Hosted jobs have a 90-minute deadline. Every
@@ -21,7 +22,15 @@ Runner labels follow [GitHub's runner documentation](https://docs.github.com/en/
 The `Release` workflow runs on a tag `luce-VERSION` (the tag must name `VERSION`): macOS
 ARM64, Linux x86-64 and Linux ARM64 on the oldest supported runners, and Windows x64 under
 MSYS2 each build
-`luce` with the Base compiler `bootstrap/BASE` names, package it with that compiler and
-Base's standard library beside it (`tools/package.sh`), prove the archive with
-`tools/install_smoke.sh`, and the three archives become the GitHub release the installers
-at luce.luciaos.com download.
+`luce` with luce-base's main, bundle luc from luce-luc's main, package them with Base's
+standard library beside them (`tools/package.sh`), prove the archive with
+`tools/install_smoke.sh`, and the archives become the GitHub release the installers at
+luce.luciaos.com download.
+
+Releases are cut in batches, not after every fix. To cut one: on the current mains, set
+the new versions (each package's package.prisma `version`, and the dependency carets that
+must move) and publish the packages that changed with `luc publish`; release luce-base
+(tag `luce-base-VERSION`); bump `VERSION` here, wait for Correctness and Windows on that
+commit, tag `luce-VERSION`; then point the installers (`tools/install.sh`, `install.ps1`)
+at the new version. Nothing pins a commit: the release is built from the mains of the
+moment, and the versions in package.prisma are what fix it.

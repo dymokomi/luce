@@ -26,7 +26,7 @@ standard library statically and runs on its own. `luce` finds `luce-base` beside
 archives, one per host, from a tag `luce-VERSION`.
 
 ```text
-./build.sh          builds build/luce with the Base compiler bootstrap/BASE names
+./build.sh          builds build/luce with the Base compiler of ../luce-base
 ./test.sh           the gate: every execution of every program must agree
 build/luce run  program.luc          the interpreter, the definition of behaviour
 build/luce run --sandbox ROOT program.luc -- ARGS
@@ -35,10 +35,11 @@ build/luce --sandbox-policy           print the lockfile-visible sandbox policy 
 build/luce build program.luc -o app  Base out, then the Base compiler, native in
 ```
 
-`./build.sh` fetches the Base commit from a luce-base checkout beside this one
-(`../luce-base`) and luce-std's pin from `../luce-std`. In a worktree or clone that
-does not sit beside them, set `LUCE_BASE_SOURCE` and `LUCE_STD_SOURCE` to those
-repositories.
+`./build.sh` builds the luce-base checkout beside this one (`../luce-base`, with
+`../luce-std` beside it) when its compiler is missing or older than its sources, and
+builds Luce with it. There are no commit pins: CI checks out main of luce-base and every
+package (`python3 ../luce-base/tools/checkout_main.py luce`); versions are fixed only when
+a batch of releases is cut.
 
 Licensed under MIT or Apache-2.0, at your option.
 
@@ -54,12 +55,9 @@ The conformance gate executes native builds at optimization levels 0–3, alongs
 the interpreter where applicable and both Base C comparison modes.
 
 
-For dependency development, `LUCE_BASE_COMPILER=/absolute/path/to/luce-base ./test.sh`
-builds and tests Luce with that exact native Base executable. Omitting the override
-uses the exact commit in `bootstrap/BASE`, fetched into an isolated checkout. The manually dispatched correctness workflow accepts a full
-Base commit SHA for the same purpose and records the checkout and explicit compiler
-selection in its provenance artifacts. Both compilers advance together; dependency
-pins make builds reproducible without requiring release tags.
+`LUCE_BASE_COMPILER=/absolute/path/to/luce-base ./test.sh` builds and tests Luce with
+that native Base executable instead of `../luce-base`'s. Both compilers advance together
+on main; CI records the luce-base commit it built in its provenance artifacts.
 
 ## Windows x64
 

@@ -4,15 +4,15 @@
 # holding one tree, `luce-VERSION/`:
 #
 #   bin/luce                          the compiler (luce.exe on Windows)
-#   bin/luce-base                     the Base compiler it emits to, from bootstrap/BASE
+#   bin/luce-base                     the Base compiler it emits to, built from ../luce-base
 #   share/luce-base/std/              Base's standard library source, read with every build
 #   share/luce/                       licences, VERSION, the language and runtime documents
 #
 # `luce` finds `luce-base` beside itself and luce-base finds the library beside its `bin`,
 # so the tree runs from wherever it is unpacked; a program it builds links the library
 # statically and needs nothing from the tree at run time. The Base tree is the one
-# build.sh built under build/luce-base/build, or the one `LUCE_BASE_BUILD` names (the
-# Windows build uses ../luce-base/build). Runs on macOS, Linux, and Windows in MSYS2.
+# build.sh built under build/luce-base/build (a link to ../luce-base), or the one
+# `LUCE_BASE_BUILD` names (the Windows build uses ../luce-base/build). Runs on macOS, Linux, and Windows in MSYS2.
 set -eu
 cd "$(dirname "$0")/.."
 export COPYFILE_DISABLE=1

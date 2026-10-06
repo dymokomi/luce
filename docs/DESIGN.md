@@ -12,10 +12,9 @@ luce        Base     this tree: front end, interpreter, Base emitter, the runtim
 an app      Luce     plus any Base packages it imports, built as one Base package
 ```
 
-`bootstrap/BASE` names the luce-base commit this tree is written against, by its full SHA.
-`build.sh` fetches and builds that commit into `build/luce-base/`, so the compiler this tree
-uses is never a binary another tree's gate may be rewriting, and a build here depends on a
-commit, not on a working directory.
+This tree is written against luce-base's main: `build.sh` builds the checkout beside it
+(`../luce-base`) and links it as `build/luce-base/`, where a development build finds its
+Base compiler. A release bundles the luce-base main it was cut from.
 
 ## The pipeline
 

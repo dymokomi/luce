@@ -19,15 +19,14 @@ host = ("arm64" if platform.machine() in ("arm64", "aarch64") else platform.mach
 expected = os.environ.get("LUCE_CI_HOST", host)
 if host != expected:
     raise SystemExit(f"wrong runner architecture: expected {expected}, got {host}")
-paths = [Path("."), Path("../luce-seed"), Path("../luce-base"), Path("build/luce-base")]
+paths = [Path("."), Path("../luce-base")]
 repos = []
 for path in paths:
     if (path / ".git").exists():
         repos.append(dict(path=str(path.resolve()), revision=command(["git", "rev-parse", "HEAD"], path),
                           changes=command(["git", "status", "--porcelain"], path),
                           version=(path / "VERSION").read_text().strip()))
-pins = {str(p): p.read_text().strip() for p in (Path("bootstrap/SEED"), Path("bootstrap/BASE")) if p.exists()}
 print(json.dumps(dict(host=host, os=platform.platform(), cc=command(["cc", "--version"]),
                      python=platform.python_version(), cmake=command(["cmake", "--version"]),
-                     pins=pins, repositories=repos,
+                     repositories=repos,
                      base_compiler_override=os.environ.get("LUCE_BASE_COMPILER")), indent=2))
