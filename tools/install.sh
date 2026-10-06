@@ -38,9 +38,8 @@ case "$system:$machine" in
         echo "$product: this macOS release is for Apple Silicon; use a native arm64 shell, not a Rosetta one" >&2
         exit 1 ;;
     Linux:x86_64|Linux:amd64) host=x86_64-linux; host_name='Linux x86-64' ;;
-    Linux:aarch64|Linux:arm64) host=arm64-linux; host_name='Linux ARM64' ;;
     Linux:*)
-        echo "$product: released for Linux x86-64 and ARM64, not Linux $machine; build from source instead" >&2
+        echo "$product: released for Linux x86-64, not Linux $machine; build from source instead" >&2
         exit 1 ;;
     *)
         echo "$product: this installer is for macOS and Linux; on Windows run: irm https://luce.luciaos.com/install.ps1 | iex" >&2

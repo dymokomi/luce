@@ -8,7 +8,7 @@ set -eu
 cd "$(dirname "$0")/.."
 case "$(uname -s)" in
     Darwin) host=arm64-macos; [ "$(uname -m)" = arm64 ] || { echo "skip install layout: not Apple Silicon"; exit 0; } ;;
-    Linux) case "$(uname -m)" in x86_64|amd64) host=x86_64-linux ;; *) host=arm64-linux ;; esac ;;
+    Linux) host=x86_64-linux ;;
     *) echo "skip install layout: the shell installer is for macOS and Linux"; exit 0 ;;
 esac
 work=$(mktemp -d)

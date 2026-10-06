@@ -1,37 +1,15 @@
-# Continuous correctness checks
+# The gate and the release
 
-The `Correctness` workflow runs on every push, pull request, manual dispatch and weekly
-schedule, on macOS ARM64, Linux x86-64 and Linux ARM64. Each job clones luce-base's main
-and every package the tests depend on at main (`luce-base/tools/checkout_main.py`; there
-are no commit pins), asserts its actual architecture, records the toolchain and the
-revisions it built (`tools/ci_provenance.py`), runs `./test.sh`, and keeps the whole gate log. The hosts
-finish independently, so one host's failure cannot hide another's result.
+Luce is tested by the three-platform gate in luce-base (`tools/gate.py`) and released by its
+`tools/release.py`; [luce-base's docs/CI.md](https://github.com/dymokomi/luce-base/blob/main/docs/CI.md)
+describes both. This repository's `gate.toml` names what the gate runs here: `./test.sh` on
+macOS and Linux, the Windows contracts on Windows, the long differential and
+cycle-collector fuzzing with `--extended`, and, after a pass, the release archive
+(`tools/package.sh`, proved by `tools/install_smoke.sh`) that the installers download.
 
-Use `./test.sh` locally; it is the same gate. Hosted jobs have a 90-minute deadline. Every
-conformance command runs under `tools/run_case.py` with a 60-second deadline: it kills the
-command's process group on timeout and requires the exact status the case expects, a
-success, a rejection or a trap, so a matching message never excuses a signal or a timeout.
-A failing case leaves a replay record under `build/failures/` naming the command, the
-working directory, the revision and the outputs.
-
-A failed Linux gate runs `tools/ci_backtrace.sh`, which loads the crashed step under GDB
-and records the faulting frames beside the log.
-
-Runner labels follow [GitHub's runner documentation](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
-
-The `Release` workflow runs on a tag `luce-VERSION` (the tag must name `VERSION`): macOS
-ARM64, Linux x86-64 and Linux ARM64 on the oldest supported runners, and Windows x64 under
-MSYS2 each build
-`luce` with luce-base's main, bundle luc from luce-luc's main, package them with Base's
-standard library beside them (`tools/package.sh`), prove the archive with
-`tools/install_smoke.sh`, and the archives become the GitHub release the installers at
-luce.luciaos.com download.
-
-Releases are cut in batches, not after every fix. To cut one: on the current mains, set
-each changed package's new `version` in its package.prisma and publish it with `luc
-publish` (dependencies name no version, so they take the newest release and nothing else
-moves); release luce-base
-(tag `luce-base-VERSION`); bump `VERSION` here, wait for Correctness and Windows on that
-commit, tag `luce-VERSION`; then point the installers (`tools/install.sh`, `install.ps1`)
-at the new version. Nothing pins a commit: the release is built from the mains of the
-moment, and the released versions, recorded in each project's luc.lock, are what fix it.
+Use `./test.sh` locally; it is the same check. Every conformance command runs under
+`tools/run_case.py` with a 60-second deadline: it kills the command's process group on
+timeout and requires the exact status the case expects, a success, a rejection or a trap,
+so a matching message never excuses a signal or a timeout. A failing case leaves a replay
+record under `build/failures/` naming the command, the working directory, the revision and
+the outputs.

@@ -12,7 +12,7 @@
 # so the tree runs from wherever it is unpacked; a program it builds links the library
 # statically and needs nothing from the tree at run time. The Base tree is the one
 # build.sh built under build/luce-base/build (a link to ../luce-base), or the one
-# `LUCE_BASE_BUILD` names (the Windows build uses ../luce-base/build). Runs on macOS, Linux, and Windows in MSYS2.
+# `LUCE_BASE_BUILD` names (the Windows build uses ../luce-base/build). Runs on macOS, Linux, and Windows in Git's or MSYS2's bash.
 set -eu
 cd "$(dirname "$0")/.."
 export COPYFILE_DISABLE=1

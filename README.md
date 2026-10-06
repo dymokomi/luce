@@ -22,8 +22,8 @@ PATH on Windows) is edited only for the default layout, and `luc update` reinsta
 tree it runs from (`tools/test_install_layout.sh`). It needs the host's
 C toolchain, which Base drives to assemble and link; a program it builds links the
 standard library statically and runs on its own. `luce` finds `luce-base` beside itself
-(`support.toolchain`); `LUCE_BASE` names another. The `Release` workflow builds the
-archives, one per host, from a tag `luce-VERSION`.
+(`support.toolchain`); `LUCE_BASE` names another. The gate builds the archives, one per
+host, and luce-base's `tools/release.py` publishes them as the release `luce-VERSION`.
 
 ```text
 ./build.sh          builds build/luce with the Base compiler of ../luce-base
