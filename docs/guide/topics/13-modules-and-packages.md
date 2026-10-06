@@ -196,7 +196,6 @@ def package "shapes" {
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.5.0"
     }
 }
 ```
@@ -232,7 +231,6 @@ directory beside the project:
 ```text
 def dependency "luce-std" {
     str owner = "dymokomi"
-    str version = "^0.5.0"
 }
 
 def dependency "shapes" {
@@ -240,9 +238,11 @@ def dependency "shapes" {
 }
 ```
 
-`luc add owner/name` adds the newest release of a registry package with a caret version:
-`^0.5.0` accepts any `0.5.x` from `0.5.0` on, and any `1.x` after `^1.0.0`. `luc add
-../path` adds a local package, which is convenient while developing two packages together.
+`luc add owner/name` adds a registry package with no version, which means its newest
+release; `luc.lock` records the one chosen. To hold a project back, give a caret version,
+`luc add owner/name@^0.5.0`, which writes `str version = "^0.5.0"`: any `0.5.x` from
+`0.5.0` on (and any `1.x` after `^1.0.0`). `luc add ../path` adds a local package, which is
+convenient while developing two packages together.
 
 `luc.lock` records the exact version and the SHA-256 checksum of every registry package in
 the build; commit it, as you would `poetry.lock` or `package-lock.json`. Registry packages
