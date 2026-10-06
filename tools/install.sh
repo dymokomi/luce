@@ -22,7 +22,7 @@
 # when LUCE_INSTALL_PROFILE names one: an install anywhere else is sourced from its env.
 set -eu
 
-version=0.13.0
+version=0.14.0
 product=luce
 version=${LUCE_INSTALL_VERSION:-$version}
 base_url=${LUCE_INSTALL_URL:-https://github.com/dymokomi/luce/releases/download/luce-$version}
