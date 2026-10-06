@@ -9,7 +9,7 @@
 | `luce run file.luc [arguments]` | run the program in the interpreter |
 | `luce build file.luc -o name` | compile to a native executable |
 | `luce check file.luc` | check the program and print every problem found, without running it |
-| `luce test file.luc` | run the tests ([Testing](14-testing.md)) |
+| `luce test file.luc [--package]` | run the tests, with `--package` those of every module of the package ([Testing](14-testing.md)) |
 | `luce fmt file.luc` | print the file in the standard layout; `--write` rewrites it, `--check` only reports |
 | `luce doc file.luc` | print the public declarations and their documentation, as Markdown |
 | `luce explain file.luc:line:column` | say what the name at that position is |

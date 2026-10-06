@@ -1268,7 +1268,7 @@ object; a callback into Luce is a capture-free Luce function passed as a functio
 | `luce --sandbox-policy` | prints the stable policy identity recorded by package locks; policy `luce-sandbox/1` uses a supervised child, a 30-second wall limit, 10-second CPU limit, 256 MiB interpreter allocation arena, one-MiB combined output limit, 16 MiB file limit, 64 descriptors, no child threads/processes or network, and rooted Luce-only imports |
 | `luce build program.luc -o name` | emits a Base package and compiles it with Base's compiler; `--emit=base` keeps the package; `--native` (the default), `--backend=c`, `--release` and `--profile diagnostic` pass to luce-base |
 | `luce check program.luc` | checks it and prints every diagnostic |
-| `luce test program.luc` | runs its tests in the interpreter; `--build` runs them as a program luce-base compiles, native by default; `--backend=c` explicitly selects Base’s C comparison backend; `--profile diagnostic` builds them with Base's diagnostic profile and implies `--build` |
+| `luce test program.luc` | runs its tests and those of the package's modules it imports, in the interpreter; `--package` adds every other `.luc` module under the package's source root, as `luc test` does; `--build` runs them as a program luce-base compiles, native by default; `--backend=c` explicitly selects Base’s C comparison backend; `--profile diagnostic` builds them with Base's diagnostic profile and implies `--build` |
 | `luce fmt`, `luce doc`, `luce explain` | as named |
 | `luce lex`, `luce parse`, `luce --version` | the tokens, the tree, the compiler's version |
 
@@ -1291,11 +1291,19 @@ test "parsing an empty document fails":
 ```
 
 A `test` is a registered function that runs under `luce test` and never in a build. It may
-fail, `assert`, and `error`; a test that fails is reported with its name, its position and
-the failure's message, and one that traps ends the run after its name. The report is one
-line per test, `ok    name` or `FAIL  name` followed by an indented `file:line:column:
-message`, then `N passed` and, when any failed, `M failed`; the status is 1 then. The
-interpreter and a built runner print the same report.
+fail, `assert`, and `error`. A test fails when a failure leaves it, reported at the test's
+position with the failure's message, or when an `assert` written in its own body (not in a
+lambda in it) is false, reported at the `assert` with `assert failed` and its message; the
+run goes on with the next test. Any other trap, an `assert` in a function the test calls
+included, ends the run after the test's name (§12.4). The report is one line per test,
+`ok    name` or `FAIL  name` followed by an indented `file:line:column: message`, then
+`N passed` and, when any failed, `M failed`; the status is 1 then. The interpreter and a
+built runner print the same report.
+
+The tests run are those of the file and of the modules of its package it imports, an
+imported module's before its importer's and each module's in order; with `--package`, also
+those of every other module under the package's source root, by their paths. A dependency's
+tests never run.
 
 ### 17.4 Documentation
 
