@@ -430,20 +430,30 @@ from luce_std import paths
 
 class Editor:
     var scene: Scene
+    var recovery: crash.Hook?
 
-    func save_for_recovery() -> unit!:
+    func start(self) -> unit!:
+        self.recovery = crash.on_crash(self.save_for_recovery)
+
+    func save_for_recovery(self) -> unit!:
         let path = paths.join(crash.recovery_directory(), "scene.recovered")
         self.scene.write(path)
         crash.note_recovery(path)
 
-func start(editor: Editor) -> unit!:
-    crash.on_crash(editor.save_for_recovery)
+    func close(self) -> unit!:
+        if let hook = self.recovery:
+            hook.remove()
 ```
+
+`on_crash` answers the hook as a `Hook`, which works like a signal's connection: the hook runs
+while the `Hook` is kept, and `remove()`, or letting go of it, takes the hook away. A hook
+holds what its function captures, here the editor, so a program removes it when it closes,
+or the objects it captured are still alive when the program ends.
 
 | Function | Does |
 | --- | --- |
 | `enable(app = "", version = "")` | turn reports on, named after the package unless given a name |
-| `on_crash(hook)` | run `hook` after a trap, before the program ends: five seconds for all hooks |
+| `on_crash(hook)` | run `hook` after a trap, before the program ends, while the `Hook` it answers is kept: five seconds for all hooks |
 | `recovery_directory()` | `~/.luce/recovery/<program>`, made when missing: where a hook saves |
 | `note_recovery(path)` | from a hook: the report, and the crash window, say where the copy is |
 | `relaunch_on_crash()` | after a crash, start the program again to show the report (luce-ui does this) |
