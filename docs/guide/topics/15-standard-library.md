@@ -414,10 +414,47 @@ handle ASCII only:
 
 ## `crash`
 
-`crash.enable("my-app", "1.0.0")` turns on crash reports: when the program traps or crashes,
-a report with a stack trace is written to `crash.directory()`, and the next run can read it
-with `crash.take_report("my-app")`. This is for applications started from a desktop, which
-have no terminal to print a trap to.
+`crash.enable()` turns on crash reports: when the program traps or crashes, a report with a
+stack trace is written to `crash.directory()` (`~/.luce/crashes`), named after the package
+and version in the program's `package.prisma`. This is for applications started from a
+desktop, which have no terminal to print a trap to. A UI application built with luce-ui needs
+none of this: its reports are on, and after a crash it shows the report in a window of its
+own, with Copy, Reopen and Quit.
+
+A program can save its work when it traps, the way an editor writes an autosave file:
+
+<!-- fragment -->
+```luce
+from luce_std import crash
+from luce_std import paths
+
+class Editor:
+    var scene: Scene
+
+    func save_for_recovery() -> unit!:
+        let path = paths.join(crash.recovery_directory(), "scene.recovered")
+        self.scene.write(path)
+        crash.note_recovery(path)
+
+func start(editor: Editor) -> unit!:
+    crash.on_crash(editor.save_for_recovery)
+```
+
+| Function | Does |
+| --- | --- |
+| `enable(app = "", version = "")` | turn reports on, named after the package unless given a name |
+| `on_crash(hook)` | run `hook` after a trap, before the program ends: five seconds for all hooks |
+| `recovery_directory()` | `~/.luce/recovery/<program>`, made when missing: where a hook saves |
+| `note_recovery(path)` | from a hook: the report, and the crash window, say where the copy is |
+| `relaunch_on_crash()` | after a crash, start the program again to show the report (luce-ui does this) |
+| `report_to_show()` | in that new process, the report's path; `none` in an ordinary run |
+| `read_report(path)`, `take_report(app)` | a report's text, marked as seen; the newest unseen one |
+| `reopen()` | start the program again as an ordinary run |
+
+Hooks run on the thread that trapped. A fatal signal, such as an invalid memory access, runs
+none: nothing but the report can be written safely from it, so a program that must not lose
+work also saves as it goes and looks in `recovery_directory()` when it starts. Reports stay
+on the computer; nothing is sent anywhere.
 
 ## Other packages
 
