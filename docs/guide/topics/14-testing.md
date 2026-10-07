@@ -142,13 +142,18 @@ tests/
 ```
 
 `luc test` finds every directory `tests/<name>/` with a `main.luc` or `main.lucb`, as pytest
-finds `test_*.py` files, builds it with the package's dependencies and runs it from its own
-directory, so `files.read_text("sample.csv")` reads the fixture beside it. A program passes
-when it exits with status 0 and, if its directory has an `expected` file, when what it
-printed is exactly that file. It imports the package's modules by their names, as code under
-`src/` does (`import csv`). Programs run in parallel, each with `LUC_HOME` set to a scratch
-directory and `LUCE` and `LUCE_BASE` naming the compilers `luc test` uses. A directory under
-`tests/` without a `main` is data, left as it is.
+finds `test_*.py` files, builds it with the package's dependencies and runs it from the
+package root, as `luc test` itself runs. `LUC_TEST_DIR` names the program's own directory,
+so `files.read_text(paths.join(process.variable("LUC_TEST_DIR") else "", "sample.csv"))`
+reads the fixture beside it. A program passes when it exits with status 0 and, if its
+directory has an `expected` file, when what it printed is exactly that file. One that exits 0
+after printing a line `skip: reason` is skipped, the way pytest's `skip` reports a test that
+cannot run here. It imports any module of the package, private ones too, by its name, as
+code under `src/` does (`import csv`), and the package's dependencies. Programs run in
+parallel, each with `HOME` and `LUC_HOME` pointing at a fresh scratch directory, removed
+afterwards, so a test never touches your own settings, libraries or keychain, and with
+`LUCE` and `LUCE_BASE` naming the compilers `luc test` uses. A directory under `tests/`
+without a `main` is data, left as it is.
 
 The report lists the programs after the `test` blocks, a failed one with the end of its
 output, and ends with one total:
@@ -158,10 +163,11 @@ ok    parses a quoted field
 ok    rejects an open quote
 2 passed
 ok    tests/roundtrip
+skip  tests/server: no network here
 FAIL  tests/vectors
       exit status 1
       vector 12: expected 3 fields, got 2
-total: 3 passed, 1 failed (2 test blocks, 2 programs)
+total: 3 passed, 1 failed, 1 skipped (2 test blocks, 3 programs)
 ```
 
 `luc test --list` names the test programs and the test blocks without running anything. A
