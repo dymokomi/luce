@@ -1120,7 +1120,8 @@ module behind the package's identifier and may import it only when the package l
 construction is `Button("pause")`. The `from` form is the usual one; it may name a directory
 of modules, `from luce_geocore.core import parallel`, and alias what it brings,
 `from luce_crypto import native as crypto`. `import luce_ui` is an error: a package is not a
-module. The standard packages are packages too, `from luce_std import math`.
+module, except inside the package when it has a module of its name, `src/luce_ui.luc`, its
+starter module. The standard packages are packages too, `from luce_std import math`.
 Base owns module resolution; Luce invokes the compiler `LUCE_BASE` names, else `luce-base`
 beside the `luce` executable, as a release lays them out, else `luce-base` on the path.
 See [the package import contract](https://github.com/dymokomi/luce-base/blob/main/docs/PACKAGE-IMPORTS.md)
