@@ -35,7 +35,12 @@ machine=$(uname -m)
 case "$system:$machine" in
     Darwin:arm64|Darwin:aarch64) host=arm64-macos; host_name='macOS on Apple Silicon' ;;
     Darwin:*)
-        echo "$product: this macOS release is for Apple Silicon; use a native arm64 shell, not a Rosetta one" >&2
+        # an Apple Silicon Mac answers x86_64 in a Rosetta shell; an Intel Mac always does
+        if [ "$(sysctl -in sysctl.proc_translated 2>/dev/null)" = 1 ]; then
+            echo "$product: this shell runs under Rosetta; open a native arm64 shell and run the installer again" >&2
+        else
+            echo "$product: Intel Macs are not supported; Luce runs on macOS on Apple Silicon, Linux x86-64 and Windows x86-64" >&2
+        fi
         exit 1 ;;
     Linux:x86_64|Linux:amd64) host=x86_64-linux; host_name='Linux x86-64' ;;
     Linux:*)

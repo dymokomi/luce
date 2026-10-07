@@ -37,6 +37,10 @@ function Fail($message) {
     exit 1
 }
 
+# PowerShell 7 runs on macOS and Linux too, where this installer does not apply
+if ($IsMacOS -or $IsLinux) {
+    Fail 'this installer is for Windows; on macOS (Apple Silicon only: Intel Macs are not supported) or Linux run: curl -fsSL https://luce.luciaos.com/install.sh | sh'
+}
 if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
     Fail 'this release is for x86-64 Windows'
 }
