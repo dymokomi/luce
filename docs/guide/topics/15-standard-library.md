@@ -374,6 +374,7 @@ pub func main(arguments: list[str]) -> int!:
 | `floor`, `ceil`, `round`, `trunc` | `round` rounds halves away from zero |
 | `sqrt`, `cbrt`, `hypot`, `pow`, `exp`, `exp2`, `log`, `log2`, `log10`, `log1p`, `expm1`, `fma` | as in C and Python's `math` |
 | `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh` | radians |
+| `erf`, `erfc` | the error function and `1 - erf(x)`, as Python's `math.erf` and `math.erfc` |
 | `abs`, `sign`, `copysign`, `min`, `max`, `clamp` | for `float` |
 | `iabs`, `imin`, `imax`, `iclamp`, `div_floor`, `mod_floor` | for `int` |
 | `checked_iabs`, `checked_div_floor`, `checked_mod_floor` | `int?`: `none` instead of a trap |
