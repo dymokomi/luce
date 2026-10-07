@@ -1,7 +1,11 @@
 #!/bin/sh
-# The gate. Green, or the tree does not move.
+# The gate. Green, or the tree does not move. `./test.sh --quick` is the gate's default
+# level (luce-base tools/gate.py): everything but the compile budget and the fuzzers, which
+# `./test.sh` (gate.py --full) adds.
 set -eu
 cd "$(dirname "$0")"
+full=true
+[ "${1:-}" = --quick ] && full=false
 ./build.sh
 python3 tools/test_run_case.py
 python3 tools/test_sandbox.py
@@ -18,7 +22,7 @@ python3 tools/test_build_cache.py
 # the compile budget with both compilers named relative to here, a Luce entry first
 # the shape of the tree never regresses (luce-base tools/shape.py, the limits in tools/shape.limits)
 python3 "$(dirname "$base")/../tools/shape.py" --check --root .
-python3 "$(dirname "$base")/../tools/compile_budget.py" --compiler "$base" --luce build/luce --seconds 240 --megabytes 2048 tests/programs/calc/main.luc
+$full && python3 "$(dirname "$base")/../tools/compile_budget.py" --compiler "$base" --luce build/luce --seconds 240 --megabytes 2048 tests/programs/calc/main.luc
 python3 tools/test_build_cleanup.py
 python3 tools/test_base_packages.py
 python3 tools/test_public_imports.py
@@ -60,8 +64,8 @@ tests/conformance/run.sh
 python3 tools/doc_examples.py
 python3 tools/site.py build/site > /dev/null
 tools/fmt_check.sh
-python3 tools/fuzz.py --gate
+$full && python3 tools/fuzz.py --gate
 # random object graphs through both collectors, collecting at every candidate too, under
 # MallocScribble on macOS and valgrind on Linux (tools/cycles_fuzz.py)
-python3 tools/cycles_fuzz.py --gate
+$full && python3 tools/cycles_fuzz.py --gate
 echo ok

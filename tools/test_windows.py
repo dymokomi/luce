@@ -17,7 +17,7 @@ from validation_process import run as run_owned, remove_directory
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--compiler', type=Path, default=ROOT / 'build/luce.exe')
 parser.add_argument('--base', type=Path, default=ROOT.parent / 'luce-base/build/luce-base.exe')
-parser.add_argument('--jobs', type=int, default=2)
+parser.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
 parser.add_argument('--match', default='')
 parser.add_argument('--c-only', action='store_true', help='recheck the comparison backend after a C emitter change')
 args = parser.parse_args()

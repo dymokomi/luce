@@ -4,140 +4,37 @@
 # luce-base has, and every execution must print the expectation. One beside a `.trap` must
 # stop with that text on every execution. One under `errors/` must be rejected with the
 # diagnostic its `# error:` line names, at a position. A program reads its `.input` as
-# standard input, and an empty one when it has none.
+# standard input, and an empty one when it has none. Every case runs in a directory of its
+# own (case.sh), as many at once as the machine has cores (LUCE_JOBS overrides).
 set -eu
 cd "$(dirname "$0")/../.."
 export LUCE_BASE=${LUCE_BASE:-$PWD/build/luce-base/build/luce-base}
-run() { python3 tools/run_case.py -- "$@"; }
-reject() { python3 tools/run_case.py --expected 1 -- "$@"; }
-compare() { diff -u "$1" build/conformance.out; }
-programs=0
-rejections=0
-parsed=0
+jobs=${LUCE_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)}
+mkdir -p build/cases
+cases=build/cases/list
+: > "$cases"
 # every program the suite holds parses, whatever slice runs it
-for f in $(find tests/conformance tests/programs -name '*.luc' -not -path '*/errors/*' | sort); do
-    run ./build/luce parse "$f" > /dev/null
-    parsed=$((parsed + 1))
-done
-# a program is a file beside its `.expect`, or a directory of modules whose entry is
-# `main.luc` (§15), a `src/main.luc` under a manifest among them
+find tests/conformance tests/programs -name '*.luc' -not -path '*/errors/*' | sort > build/cases/parse
+xargs -P "$jobs" -n 1 python3 tools/run_case.py -- ./build/luce parse < build/cases/parse > /dev/null
+parsed=$(wc -l < build/cases/parse | tr -d ' ')
 # the proving programs under tests/programs are run the same way, each a directory
 for dir in tests/conformance/[0-9]*/ tests/programs/; do
     for f in "$dir"*.expect "$dir"*/main.expect "$dir"*/src/main.expect; do
-        [ -e "$f" ] || continue
-        src="${f%.expect}.luc"
-        input="${f%.expect}.input"
-        [ -e "$input" ] || input=/dev/null
-        echo "== $src"
-        # a directory program counts the Base modules of the packages it carries too
-        if [ "$(basename "$src")" = main.luc ]; then
-            bases=$(find "$(dirname "$src")" -name '*.lucb' | head -n 1)
-        else
-            bases=$(ls "$(dirname "$src")"/*.lucb 2>/dev/null | head -n 1)
-        fi
-        if [ -n "$bases" ]; then
-            # a program importing a Base module is built, never run in the interpreter (§16)
-            if reject ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
-                echo "FAIL $src: the interpreter ran a program that imports a Base module"; exit 1
-            else
-                rc=$?
-                [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
-            fi
-            grep -q "the interpreter runs Luce alone" build/conformance.err || { echo "FAIL $src: [$(cat build/conformance.err)]"; exit 1; }
-        else
-            echo "   interpreter"
-            run ./build/luce run "$src" < "$input" > build/conformance.out
-            compare "$f"
-        fi
-        # Native optimization levels are independent correctness targets; C remains
-        # a supplemental comparison for the emitted Base.
-        for flags in "--native --opt 0" "--native --opt 1" "--native --opt 2" "--native --opt 3" "--backend=c" "--backend=c --release"; do
-            echo "   compiled ${flags:-native}"
-            run ./build/luce build "$src" -o build/conformance $flags
-            run ./build/conformance < "$input" > build/conformance.out
-            compare "$f"
+        [ -e "$f" ] && echo "expect $f" >> "$cases"
+    done
+    for kind in tests doc explain trap; do
+        for f in "$dir"*."$kind"; do
+            [ -e "$f" ] && echo "$kind $f" >> "$cases"
         done
-        programs=$((programs + 1))
-    done
-    # a program beside a `.tests` file prints that report under `luce test`, from the
-    # interpreter and from a built runner alike (§17.3); the status is 1 when a test failed
-    for f in "$dir"*.tests; do
-        [ -e "$f" ] || continue
-        src="${f%.tests}.luc"
-        echo "== $src (tests)"
-        if grep -q ' failed$' "$f"; then want_status=1; else want_status=0; fi
-        for flags in "" "--build --native --opt 0" "--build --native --opt 1" "--build --native --opt 2" "--build --native --opt 3" "--build --backend=c" "--build --backend=c --release"; do
-            python3 tools/run_case.py --expected "$want_status" -- ./build/luce test "$src" $flags > build/conformance.out 2>&1 && status=0 || status=$?
-            [ "$status" -eq "$want_status" ] || { echo "FAIL $src ($flags): status $status, expected $want_status: [$(cat build/conformance.out)]"; exit 1; }
-            cmp build/conformance.out "$f"
-        done
-        programs=$((programs + 1))
-    done
-    # a program beside a `.doc` file documents as it says (§17.4)
-    for f in "$dir"*.doc; do
-        [ -e "$f" ] || continue
-        src="${f%.doc}.luc"
-        echo "== $src (doc)"
-        run ./build/luce doc "$src" > build/conformance.out
-        cmp build/conformance.out "$f"
-        programs=$((programs + 1))
-    done
-    # a program beside a `.explain` file: each line `LINE:COLUMN|answer` is what
-    # `luce explain` says of that place (§17.5)
-    for f in "$dir"*.explain; do
-        [ -e "$f" ] || continue
-        src="${f%.explain}.luc"
-        echo "== $src (explain)"
-        while IFS='|' read -r place want; do
-            got=$(run ./build/luce explain "$src:$place" 2>&1) || { echo "FAIL $src:$place: [$got]"; exit 1; }
-            [ "$got" = "$want" ] || { echo "FAIL $src:$place: expected [$want], got [$got]"; exit 1; }
-        done < "$f"
-        programs=$((programs + 1))
-    done
-    # a program beside a `.trap` file must stop with that text on every execution
-    for f in "$dir"*.trap; do
-        [ -e "$f" ] || continue
-        src="${f%.trap}.luc"
-        want=$(cat "$f")
-        echo "== $src (traps)"
-        if reject ./build/luce run "$src" > build/conformance.out 2> build/conformance.err; then
-            echo "FAIL $src: expected a trap, the program finished"; exit 1
-        else
-            rc=$?
-            [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
-        fi
-        grep -q "$want" build/conformance.err || { echo "FAIL $src: expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
-        for flags in "--native --opt 0" "--native --opt 1" "--native --opt 2" "--native --opt 3" "--backend=c" "--backend=c --release"; do
-            run ./build/luce build "$src" -o build/conformance $flags
-            if reject ./build/conformance > build/conformance.out 2> build/conformance.err; then
-                echo "FAIL $src ($flags): expected a trap, the compiled program finished"; exit 1
-            else
-                rc=$?
-                [ "$rc" -eq 1 ] || { echo "FAIL $src: unexpected status $rc"; exit 1; }
-            fi
-            grep -q "$want" build/conformance.err || { echo "FAIL $src ($flags): expected [$want], got [$(cat build/conformance.err)]"; exit 1; }
-        done
-        programs=$((programs + 1))
     done
     for f in "$dir"errors/*.luc "$dir"errors/*/main.luc; do
         [ -e "$f" ] || continue
-        want=$(LC_ALL=C sed -n 's/^# error: //p' "$f")
-        [ -n "$want" ] || continue
-        got=$(reject ./build/luce check "$f" 2>&1) && rc=0 || rc=$?
-        if [ "$rc" -eq 0 ]; then echo "FAIL $f: accepted"; exit 1; fi
-        if [ "$rc" -ne 1 ]; then echo "FAIL $f: status $rc: [$got]"; exit 1; fi
-        case "$got" in
-            *.luc:[0-9]*:[0-9]*:\ *) ;;
-            *) echo "FAIL $f: a diagnostic without a position: [$got]"; exit 1;;
-        esac
-        # every `# error:` line names a diagnostic the run must print (§17.2)
-        echo "$want" | while IFS= read -r line; do
-            case "$got" in
-                *"$line"*) ;;
-                *) echo "FAIL $f: expected [$line], got [$got]"; exit 1;;
-            esac
-        done || exit 1
-        rejections=$((rejections + 1))
+        # a program under errors/ without an `# error:` line is a module another one imports
+        grep -q '^# error: ' "$f" && echo "error $f" >> "$cases"
     done
 done
+programs=$(grep -c -v '^error ' "$cases")
+rejections=$(grep -c '^error ' "$cases")
+xargs -P "$jobs" -n 2 sh tests/conformance/case.sh < "$cases" || { echo "FAIL conformance: the cases above"; exit 1; }
+rm -rf build/cases
 echo "ok conformance: $programs programs, $rejections rejections, $parsed parsed"

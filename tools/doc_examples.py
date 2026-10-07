@@ -18,6 +18,7 @@ program that needs a companion module, `<!-- with shapes.luc -->` above `<!-- ex
 
 Usage: tools/doc_examples.py [COMPILER] [PAGE...]
 """
+import concurrent.futures
 import os
 from pathlib import Path
 import re
@@ -72,8 +73,54 @@ def run(command, work, status):
     return shown.replace(str(work) + os.sep, ""), ran
 
 
-failures = 0
-checked = 0
+def check(where, body, notes, files, expected):
+    """One example in a directory of its own: what failed, as messages."""
+    failures = []
+    testing = "tests" in notes
+    status = int(notes.get("exits", "0"))
+    companions = notes.get("with", "").split()
+    needs = notes.get("needs", "").split()
+    with tempfile.TemporaryDirectory() as work:
+        work = Path(work).resolve()
+        for name in companions:
+            (work / name).parent.mkdir(parents=True, exist_ok=True)
+            (work / name).write_text(files[name])
+        if needs:
+            dependencies = "".join(f'    def dependency "{name}" {{\n        str path = "{package(name)}"\n    }}\n' for name in needs)
+            (work / "package.prisma").write_text(f'#prisma 4.0\ndef package "example" {{\n    str source = "."\n{dependencies}}}\n')
+        (work / "main.luc").write_text(body)
+        if testing:
+            for mode, command in (("interpreted", [str(COMPILER), "test", "main.luc"]),
+                                  ("built", [str(COMPILER), "test", "main.luc", "--build"])):
+                ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=300, stdin=subprocess.DEVNULL)
+                shown = (ran.stdout + ran.stderr).replace(str(work) + os.sep, "")
+                if expected is not None and shown != expected:
+                    failures.append(f"FAIL {where} ({mode}): report differs\n--- expected\n{expected}--- got\n{shown}")
+            return failures
+        runs = []
+        if not needs and not any(name.endswith(".lucb") for name in companions):
+            runs.append(("interpreted", [str(COMPILER), "run", "main.luc"]))
+        built = subprocess.run([str(COMPILER), "build", "main.luc", "-o", "program"],
+                               capture_output=True, text=True, cwd=work)
+        if built.returncode != 0:
+            # a program shown to be rejected: the compiler's message is its output
+            rejected = built.stderr.replace(str(work) + os.sep, "")
+            if status == 0 or (expected is not None and rejected != expected):
+                failures.append(f"FAIL {where}: does not build\n{built.stderr}")
+            return failures
+        # run as a reader would, from its directory: its first argument is `./program`
+        runs.append(("built", ["./program"]))
+        for mode, command in runs:
+            shown, ran = run(command, work, status)
+            if ran.returncode != status:
+                failures.append(f"FAIL {where} ({mode}): exit {ran.returncode}, expected {status}\n{ran.stdout}{ran.stderr}")
+            elif expected is not None and shown != expected:
+                failures.append(f"FAIL {where} ({mode}): output differs\n--- expected\n{expected}--- got\n{shown}")
+    return failures
+
+
+# every example, each with the companion files its page defined before it, checked at once
+examples = []
 for page in PAGES:
     found = blocks(page.read_text())
     files = {}
@@ -81,57 +128,17 @@ for page in PAGES:
         if "file" in notes:
             files[notes["file"]] = body
             continue
-        testing = "tests" in notes
-        if language != "luce" or ("func main(" not in body and not testing) or "fragment" in notes:
+        if language != "luce" or ("func main(" not in body and "tests" not in notes) or "fragment" in notes:
             continue
-        status = int(notes.get("exits", "0"))
-        companions = notes.get("with", "").split()
-        needs = notes.get("needs", "").split()
-        expected = None
-        if index + 1 < len(found) and found[index + 1][0] == "output":
-            expected = found[index + 1][1]
-        where = f"{page.relative_to(ROOT)}:{line}"
-        checked += 1
-        with tempfile.TemporaryDirectory() as work:
-            work = Path(work).resolve()
-            for name in companions:
-                (work / name).parent.mkdir(parents=True, exist_ok=True)
-                (work / name).write_text(files[name])
-            if needs:
-                dependencies = "".join(f'    def dependency "{name}" {{\n        str path = "{package(name)}"\n    }}\n' for name in needs)
-                (work / "package.prisma").write_text(f'#prisma 4.0\ndef package "example" {{\n    str source = "."\n{dependencies}}}\n')
-            (work / "main.luc").write_text(body)
-            if testing:
-                for mode, command in (("interpreted", [str(COMPILER), "test", "main.luc"]),
-                                      ("built", [str(COMPILER), "test", "main.luc", "--build"])):
-                    ran = subprocess.run(command, capture_output=True, text=True, cwd=work, timeout=300, stdin=subprocess.DEVNULL)
-                    shown = (ran.stdout + ran.stderr).replace(str(work) + os.sep, "")
-                    if expected is not None and shown != expected:
-                        print(f"FAIL {where} ({mode}): report differs\n--- expected\n{expected}--- got\n{shown}")
-                        failures += 1
-                continue
-            runs = []
-            if not needs and not any(name.endswith(".lucb") for name in companions):
-                runs.append(("interpreted", [str(COMPILER), "run", "main.luc"]))
-            built = subprocess.run([str(COMPILER), "build", "main.luc", "-o", "program"],
-                                   capture_output=True, text=True, cwd=work)
-            if built.returncode != 0:
-                # a program shown to be rejected: the compiler's message is its output
-                rejected = built.stderr.replace(str(work) + os.sep, "")
-                if status == 0 or (expected is not None and rejected != expected):
-                    print(f"FAIL {where}: does not build\n{built.stderr}")
-                    failures += 1
-                continue
-            # run as a reader would, from its directory: its first argument is `./program`
-            runs.append(("built", ["./program"]))
-            for mode, command in runs:
-                shown, ran = run(command, work, status)
-                if ran.returncode != status:
-                    print(f"FAIL {where} ({mode}): exit {ran.returncode}, expected {status}\n{ran.stdout}{ran.stderr}")
-                    failures += 1
-                elif expected is not None and shown != expected:
-                    print(f"FAIL {where} ({mode}): output differs\n--- expected\n{expected}--- got\n{shown}")
-                    failures += 1
+        expected = found[index + 1][1] if index + 1 < len(found) and found[index + 1][0] == "output" else None
+        examples.append((f"{page.relative_to(ROOT)}:{line}", body, notes, dict(files), expected))
+failures = 0
+with concurrent.futures.ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    for messages in pool.map(lambda example: check(*example), examples):
+        for message in messages:
+            print(message)
+            failures += 1
+checked = len(examples)
 if failures:
     sys.exit(1)
 print(f"ok guide examples: {checked} programs")
