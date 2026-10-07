@@ -111,18 +111,59 @@ The run exits with status 1 when any test failed.
 | `luce test file.luc` | the file's tests and those of the modules it imports, in the interpreter |
 | `luce test file.luc --build` | the same, compiled to a native program first |
 | `luce test file.luc --package` | also those of every other module of the file's package |
-| `luc test` | every module's tests in a project, imported or not (`--package` on the entry) |
+| `luc test` | every module's tests in a project, imported or not (`--package` on the entry), and its test programs |
 
 The interpreter and the compiled runner print the same report. The interpreter starts at
 once; `--build` runs at full speed. Tests that reach a Base module are always built, since the
 interpreter runs Luce alone: `luce test` switches to `--build` by itself for them.
 
 In a package with Base modules of its own (`.lucb` files under `src/`), `luc test` also runs
-their tests, with `luce-base test --package`, and ends with one total for both languages:
-
-```text
-Luce and Base together: 5 passed, 0 failed
-```
+their tests, with `luce-base test --package`, so a test in either language is never left out.
 
 A test's name is any string, shown in the report; it does not have to be unique, but a unique
 one makes the report easier to read. Tests run one at a time, in the order they appear.
+
+## Test programs
+
+Some checks need a process of their own: they read fixtures from disk, start a server, open
+a window, or compare with another tool. Write those as a program instead of a `test` block,
+in a directory of its own under `tests/`:
+
+```text
+src/
+  csv.luc
+tests/
+  roundtrip/
+    main.luc       pub func main(arguments: list[str]) -> int!
+    sample.csv
+    expected       what main prints, exactly
+  vectors/
+    main.luc
+```
+
+`luc test` finds every directory `tests/<name>/` with a `main.luc` or `main.lucb`, as pytest
+finds `test_*.py` files, builds it with the package's dependencies and runs it from its own
+directory, so `files.read_text("sample.csv")` reads the fixture beside it. A program passes
+when it exits with status 0 and, if its directory has an `expected` file, when what it
+printed is exactly that file. It imports the package's modules by their names, as code under
+`src/` does (`import csv`). Programs run in parallel, each with `LUC_HOME` set to a scratch
+directory and `LUCE` and `LUCE_BASE` naming the compilers `luc test` uses. A directory under
+`tests/` without a `main` is data, left as it is.
+
+The report lists the programs after the `test` blocks, a failed one with the end of its
+output, and ends with one total:
+
+```text
+ok    parses a quoted field
+ok    rejects an open quote
+2 passed
+ok    tests/roundtrip
+FAIL  tests/vectors
+      exit status 1
+      vector 12: expected 3 fields, got 2
+total: 3 passed, 1 failed (2 test blocks, 2 programs)
+```
+
+`luc test --list` names the test programs and the test blocks without running anything. A
+package with no test at all, no `test` block and no test program, fails with "no tests
+found": every package has tests.
