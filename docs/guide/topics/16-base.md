@@ -112,7 +112,8 @@ high Level.low
 ```
 
 A program that imports a Base module must be built, with `luce build` or `luc run`. The
-interpreter runs Luce alone and refuses it. Its tests run with `luce test --build`.
+interpreter runs Luce alone and refuses it. `luce test` builds its tests by itself, as
+`--build` would, and `luc test` runs the Base modules' own tests too.
 
 ## What crosses
 

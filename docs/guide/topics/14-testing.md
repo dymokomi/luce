@@ -114,8 +114,15 @@ The run exits with status 1 when any test failed.
 | `luc test` | every module's tests in a project, imported or not (`--package` on the entry) |
 
 The interpreter and the compiled runner print the same report. The interpreter starts at
-once; `--build` runs at full speed, and is how tests of modules that import Base code are
-run, since the interpreter runs Luce alone.
+once; `--build` runs at full speed. Tests that reach a Base module are always built, since the
+interpreter runs Luce alone: `luce test` switches to `--build` by itself for them.
+
+In a package with Base modules of its own (`.lucb` files under `src/`), `luc test` also runs
+their tests, with `luce-base test --package`, and ends with one total for both languages:
+
+```text
+Luce and Base together: 5 passed, 0 failed
+```
 
 A test's name is any string, shown in the report; it does not have to be unique, but a unique
 one makes the report easier to read. Tests run one at a time, in the order they appear.
