@@ -64,6 +64,7 @@ tests/conformance/run.sh
 python3 tools/doc_examples.py
 python3 tools/site.py build/site > /dev/null
 tools/fmt_check.sh
+python3 tools/test_fmt_comments.py
 $full && python3 tools/fuzz.py --gate
 # random object graphs through both collectors, collecting at every candidate too, under
 # MallocScribble on macOS and valgrind on Linux (tools/cycles_fuzz.py)
