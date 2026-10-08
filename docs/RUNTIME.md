@@ -73,8 +73,8 @@ for this representation.
 
 Mutating native methods defer writeback of the complete value on success and
 failure. Writeback copies new public references before releasing the old ones.
-Errors are given owned text before that cleanup can invalidate a native message
-borrow. Bound methods retain an independent value copy. Equality compares rebased
+An error's message is copied when it is raised, before that cleanup can invalidate
+a native message borrow. Bound methods retain an independent value copy. Equality compares rebased
 native values, so private fields participate and stale projections do not. Worker
 transfer preserves private scalar storage and creates new public text/data owners
 on the destination thread.
@@ -295,11 +295,12 @@ A caught `Error` owns a counted text. Copying the error retains that text; dropp
 last copy releases it. Errors saved in collections or returned from a catch follow the
 same ownership rules as other values containing references.
 
-While Base propagates its borrowed error view, a thread-local chain holds a reference
-to each raised Luce message. A catch takes that reference and removes the chain entry;
-a Base or builtin failure supplies a copied text. Nested catches during cleanup cannot
-replace a message still propagating. No dynamic text becomes immortal or leaves the
-heap's live-object accounting.
+Raising goes through Base's `error`, which copies the message into the thread's room
+for errors in flight before any cleanup runs (base.md §11.3). The copy lives until the
+Base handler that catches the error finishes, and a Luce catch copies it into a counted
+text of its own first, so the raised text stays its owner's. Nested catches during
+cleanup cannot replace a message still propagating. No dynamic text becomes immortal or
+leaves the heap's live-object accounting.
 
 A worker keeps its failure until the waiter copies the text to its own heap. The worker
 then releases it, including when a task is abandoned. Sending an `Error` as an ordinary
@@ -324,7 +325,7 @@ even for a named function with immortal storage. Raw native function pointers ke
 their capture-free contract.
 
 Invocations return `Outcome[R]`. Reverse calls place managed results in traced
-`Owned` storage, and transfer dynamic failures out of Luce's pending-error chain.
+`Owned` storage, and give a failure's text to the outcome as an owned copy.
 Native callers can handle and release them directly. Captured checked views retain
 their lease and still expire at the original scope boundary.
 
