@@ -71,7 +71,9 @@ if ($missing.Count -gt 0) {
 # An override may not turn a user installer into a request to replace a system tree.
 if (-not [System.IO.Path]::IsPathRooted($installRoot)) { Fail "LUCE_INSTALL_DIR must be an absolute path: $installRoot" }
 $normalized = [System.IO.Path]::GetFullPath($installRoot).TrimEnd('\')
-foreach ($protected in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:SystemDrive + '\')) {
+# the drive's root in parentheses: a comma binds tighter than +, so without them the whole
+# list would be joined to '\' and the bare drive (C:) would refuse every folder on it
+foreach ($protected in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, ($env:SystemDrive + '\'))) {
     if ($protected -and ($normalized -eq $protected.TrimEnd('\') -or $normalized.StartsWith($protected.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) -and -not $normalized.StartsWith($env:LOCALAPPDATA, [System.StringComparison]::OrdinalIgnoreCase)) {
         if ($protected -ne $env:SystemDrive + '\') { Fail "refusing a system directory: $installRoot" }
     }
