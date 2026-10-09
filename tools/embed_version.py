@@ -14,5 +14,7 @@ if "--check" in sys.argv:
         print("src/support/version.lucb is not VERSION; run tools/embed_version.py")
         sys.exit(1)
     sys.exit(0)
+if target.exists() and target.read_text(encoding="utf-8") == text:
+    sys.exit(0)
 target.write_bytes((text).encode("utf-8"))
 print(f"wrote src/support/version.lucb ({version})")

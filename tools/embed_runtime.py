@@ -10,7 +10,9 @@ root = pathlib.Path(__file__).resolve().parent.parent
 target = root / "src" / "support" / "runtime.lucb"
 # the kernel is a directory module (its ORDER and fragments); number_text is the one module
 # the compiler shares with the programs it emits, kept once under src/support
-files = sorted(p for p in (root / "rt").rglob("*") if p.is_file() and (p.suffix == ".lucb" or p.name == "ORDER"))
+# Sorted by the path's text: Windows paths compare without case, which would move ORDER.
+files = sorted((p for p in (root / "rt").rglob("*") if p.is_file() and (p.suffix == ".lucb" or p.name == "ORDER")),
+               key=lambda p: p.relative_to(root / "rt").as_posix())
 sources = [(f.relative_to(root / "rt").as_posix(), f) for f in files]
 sources.append(("number_text.lucb", root / "src" / "support" / "number_text.lucb"))
 
@@ -34,6 +36,9 @@ if "--check" in sys.argv:
     if not target.exists() or target.read_text(encoding="utf-8") != text:
         print("src/support/runtime.lucb is stale; run tools/embed_runtime.py")
         sys.exit(1)
+    sys.exit(0)
+# Unchanged text is left alone, so a CRLF checkout does not show the file as modified.
+if target.exists() and target.read_text(encoding="utf-8") == text:
     sys.exit(0)
 target.write_bytes((text).encode("utf-8"))
 print(f"wrote src/support/runtime.lucb ({len(sources)} files)")
