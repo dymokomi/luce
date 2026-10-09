@@ -19,7 +19,7 @@
 # The user PATH is edited for the default place alone, %LOCALAPPDATA%\luce with ~\.luce:
 # an install anywhere else is put on this session's PATH only.
 $ErrorActionPreference = 'Stop'
-$version = '0.14.0'
+$version = '0.15.0'
 $product = 'luce'
 
 if ($env:LUCE_INSTALL_VERSION) { $version = $env:LUCE_INSTALL_VERSION }
