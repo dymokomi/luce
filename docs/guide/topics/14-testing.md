@@ -155,6 +155,12 @@ afterwards, so a test never touches your own settings, libraries or keychain, an
 `LUCE` and `LUCE_BASE` naming the compilers `luc test` uses. A directory under `tests/`
 without a `main` is data, left as it is.
 
+`luc test --jobs N` runs at most N programs at once; the default is half the processors,
+since each build is already parallel inside the compiler. However they finish, the report
+lists them in name order. A program that must have the machine to itself, a long benchmark
+or one with tight timeouts, says so with an empty file `serial` in its directory: it runs
+after all the others, alone, the way pytest-xdist leaves a test to a single worker.
+
 The report lists the programs after the `test` blocks, a failed one with the end of its
 output, and ends with one total:
 
@@ -170,6 +176,10 @@ FAIL  tests/vectors
 total: 3 passed, 1 failed, 1 skipped (2 test blocks, 3 programs)
 ```
 
-`luc test --list` names the test programs and the test blocks without running anything. A
+When the `test` blocks cannot even be built, a type error in `src/` say, the run counts as a
+failure and is named in the report, and the test programs still run.
+
+`luc test --list` names the test programs and the test blocks without running anything, and
+marks the serial ones. A
 package with no test at all, no `test` block and no test program, fails with "no tests
 found": every package has tests.
