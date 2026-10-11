@@ -43,7 +43,36 @@ pub func main(arguments: list[str]) -> int!:
 ''')
         for flags in FLAGS:
             run(COMPILER, 'build', entry, *flags, '-o', root / 'closed')
-            assert message in run(root / 'closed', expected=1).stderr
+            # the trap names the Luce statement, not the library's
+            assert f'main.luc:6:5: {message}' in run(root / 'closed', expected=1).stderr
+    # A garbage cycle through a closure: the Holder's close reads the Counter it holds, which
+    # was made first, so the collector disposes the Holder before the Counter.
+    entry.write_text('''import objects
+from objects import Counter, Holder
+class Child:
+    pub var on_click: func() -> unit!? = none
+class Owner:
+    let holder: Holder
+    let child: Child
+    func init(self) -> unit!:
+        self.holder = Holder(Counter("held", 5))
+        self.child = Child()
+        self.child.on_click = func () -> unit!: self.clicked()
+    func clicked(self) -> unit!:
+        print("clicked")
+func make() -> unit!:
+    let owner = Owner()
+    owner.clicked()
+pub func main(arguments: list[str]) -> int!:
+    let before = objects.disposal_count()
+    make()
+    objects.collect()
+    print(objects.disposal_count() - before)
+    return 0
+''')
+    for flags in FLAGS:
+        run(COMPILER, 'build', entry, *flags, '-o', root / 'cycle')
+        assert run(root / 'cycle').stdout == 'clicked\n6\n'
     entry.write_text('''from objects import Counter
 func worker(value: Counter) -> int:
     return value.value()

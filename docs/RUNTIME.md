@@ -101,9 +101,13 @@ returns; each run:
 2. scans: a grey object whose count is still above zero is reached from outside, and it and
    everything it reaches are revived (black); the rest are white, garbage;
 3. collects the white objects in the order they were made, oldest first: the counts step 1
-   took for the garbage's own
-   references are given back, to garbage and to live objects alike; then every `deinit`;
-   then every object's fields released, where a reference to a live object is an ordinary
+   took for the garbage's own references are given back, to garbage and to live objects
+   alike; then every `deinit`; then the native objects' disposals (an `interop.Type`'s
+   dispose function, whose `Info` says `disposes`), each before the objects it refers to:
+   a depth-first walk of the garbage, from the objects that do not dispose, oldest first,
+   then the rest, disposes in reverse postorder, the edge back into the walk counting as
+   released last, so a dispose that reaches into what its object holds finds it open; then
+   every object's fields released, where a reference to a live object is an ordinary
    release, so that object loses exactly the references the garbage held, and a reference
    to another white object only lowers its count; then the storage freed.
 

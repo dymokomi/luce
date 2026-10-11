@@ -1172,7 +1172,9 @@ a Base `close` that fails or takes arguments stays Base's own.
 Aliases and bound methods share one native owner. Real initializers run in stable
 allocated storage; failed construction releases that storage. Explicit close is
 visible through every alias, while active native calls finish before disposal.
-Other methods and public fields reject closed access.
+Other methods and public fields reject closed access. A garbage cycle's native objects
+are disposed after every `deinit` in it has run, each before the objects it refers to,
+so a dispose function may still use what its object holds.
 
 `interop.ViewType[T]` imports a nonconstructible borrowed reference with a checked
 lease. Retaining a view, binding a method or capturing it keeps validity checks
