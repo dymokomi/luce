@@ -120,9 +120,9 @@ Both executions make objects in the same order, so the deinits of a cycle run in
 order in both, whichever releases made its objects candidates and whenever the collection
 ran.
 
-Any release can fill the buffer and so run the collector, whose walk visits every reference
-an object's trace reports. A collection therefore lets an entry go only once it no longer
-holds it: `clear()` on a list or a map detaches the entries (fresh storage, a zero count)
+Any release in Luce code or its runtime can fill the buffer and so run the collector, whose
+walk visits every reference an object's trace reports. A collection therefore lets an entry
+go only once it no longer holds it: `clear()` on a list or a map detaches the entries (fresh storage, a zero count)
 before releasing them, `remove` releases the stored key after the entry is gone, and a
 replaced element or value is released after the new one is stored. A walk never meets an
 entry already let go of.
@@ -140,8 +140,20 @@ step skips the same objects, so the trial counts stay balanced.
 
 The collector is the same when a Base program holds Luce objects (through
 `interop.Reference`, or a Luce package's types): a release that leaves a count above zero
-makes a candidate, and the collector runs when the buffer holds 1024 of them. What a Base
-program lacks is the end of a run: its `main` is its own, not Luce's `main` wrapped in
+makes a candidate. A release through a native handle (`Reference`, `Interface`, `View`,
+`Callback` and the rest of `interop`, which call `ownership.release_held`) never runs the
+collector, though: Base code may release a traced field before it overwrites it,
+
+```
+if let old = self.item:
+    old.release()           # the edge is gone, `self.item` still names it
+self.item = next.clone()
+```
+
+and a collection in between would trace `self.item` and take the same edge away a second
+time, freeing an object still held. Its candidates wait in the buffer, which then drops
+those no longer purple or alive as it fills, for the next release in Luce code that finds
+1024 of them, or for `ownership.collect()`. What a Base program lacks is the end of a run: its `main` is its own, not Luce's `main` wrapped in
 `finish_run`, so nothing collects after it and nothing counts what is left. Until the next
 collection, an object in a cycle stays alive, and a candidate whose count then reached zero
 has run its `deinit` and released its fields but keeps its own storage, which the buffer
