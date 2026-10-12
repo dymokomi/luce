@@ -10,7 +10,8 @@ With neither `--cache-dir` nor `LUCE_CACHE`, the cache is the user's (`~/.luce/c
   - a comment keeps nothing new (Luce emits the same program); an edit keeps a second;
   - `LUCE_CACHE=none` keeps nothing, and neither the workspace nor the output directory
     holds a cache;
-  - past `LUCE_CACHE_LIMIT` the files written longest ago go, whatever their kind.
+  - past `LUCE_CACHE_LIMIT` the files used longest ago go, whatever their kind, down to three
+    quarters of it; a build's hit marks what it found as used, so it stays.
 
 Usage: tools/test_build_cache.py   (after build.sh or tools/build_windows.py)
 """
@@ -79,19 +80,23 @@ with tempfile.TemporaryDirectory(prefix="luce-build-cache-") as tmp:
     build(work / "four" / ("program" + EXE), work, {"LUCE_CACHE": "none"})
     if kept() != edited:
         sys.exit(f"FAIL: LUCE_CACHE=none kept something: {kept()}")
-    # past LUCE_CACHE_LIMIT megabytes the files written longest ago go, objects or not, the
-    # newest stay, and directories are left
+    # past LUCE_CACHE_LIMIT megabytes the files used longest ago go, objects or not, and
+    # directories are left; this program's files, written long ago too, are hits, which mark
+    # them used, so they stay
+    stamp = __import__("datetime").datetime(2019, 1, 1).timestamp()
+    for n in kept():
+        os.utime(cache / n, (stamp, stamp))
     for n, year in (("a-n.o", 2020), ("b-f.pack", 2021), ("c-n.o", 2022)):
         old = cache / n
         old.write_bytes(bytes(1048576))
         stamp = __import__("datetime").datetime(year, 1, 1).timestamp()
         os.utime(old, (stamp, stamp))
     (cache / "staging").mkdir()
-    kept_before = kept()
     build(work / "six" / ("program" + EXE), work, {"LUCE_CACHE_LIMIT": "2"})
     left = kept()
     if "a-n.o" in left or "b-f.pack" in left or not (cache / "staging").is_dir():
         sys.exit(f"FAIL: trimming kept the wrong files: {left}")
-    if not set(kept_before) - {"a-n.o", "b-f.pack", "c-n.o"} <= set(left) | {"c-n.o"}:
+    # the edited program's own files; the first program's, which this build does not use, may go
+    if not set(edited) - set(first) <= set(left):
         sys.exit(f"FAIL: trimming removed this build's objects: {left}")
 print("PASS Luce builds reuse the user's build cache across workspaces, keep a new build for an edit, none with LUCE_CACHE=none, and stay within LUCE_CACHE_LIMIT")
