@@ -17,15 +17,15 @@ https://luce.luciaos.com/install.sh | sh && . "$HOME/.local/luce/env"` on macOS 
 (the second half readies the terminal it runs in; new shells are set up by the profile),
 `curl -fsSLo "%TEMP%\luce-install.cmd" https://luce.luciaos.com/install.cmd && "%TEMP%\luce-install.cmd"`
 in Command Prompt on Windows (or `irm https://luce.luciaos.com/install.ps1 | iex` in
-PowerShell; `install.cmd` runs that script and readies the window it runs in). On Windows
-the installer also fetches the MinGW-w64 GCC Luce is tested with when none is on `PATH`,
-pinned by checksum. The installers are `tools/install.sh`, `tools/install.ps1` and
+PowerShell; `install.cmd` runs that script and readies the window it runs in). The
+installers are `tools/install.sh`, `tools/install.ps1` and
 `tools/install.cmd`; the site serves copies. `LUCE_INSTALL_DIR`
 installs elsewhere and `LUC_HOME` moves luc's home from `~/.luce`; a startup file (the user
 PATH on Windows) is edited only for the default layout, and `luc update` reinstalls into the
-tree it runs from (`tools/test_install_layout.sh`). It needs the host's
-C toolchain, which Base drives to assemble and link; a program it builds links the
-standard library statically and runs on its own. `luce` finds `luce-base` beside itself
+tree it runs from (`tools/test_install_layout.sh`). On macOS and Linux it needs the host's
+C toolchain, which Base drives to assemble and link; on Windows Base assembles and links
+itself and needs nothing else. A program it builds links the standard library statically
+and runs on its own. `luce` finds `luce-base` beside itself
 (`support.toolchain`); `LUCE_BASE` names another. The gate builds the archives, one per
 host, and luce-base's `tools/release.py` publishes them as the release `luce-VERSION`.
 

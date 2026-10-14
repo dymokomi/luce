@@ -1,7 +1,7 @@
-/* Platform ABI isolation only; sandbox policy and execution live in sandbox.lucb. */
+/* Platform ABI isolation only; sandbox policy and execution live in sandbox.lucb. Built on
+ * macOS and Linux (package.prisma); on Windows sandbox.lucb reaches none of these and fails
+ * closed. */
 #include <stdint.h>
-
-#if !defined(_WIN32)
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -13,18 +13,6 @@ int luce_sandbox_set_limit(int resource, uint64_t value) {
 int luce_sandbox_close(int descriptor) {
     return close(descriptor);
 }
-#else
-int luce_sandbox_set_limit(int resource, uint64_t value) {
-    (void)resource;
-    (void)value;
-    return -1;
-}
-
-int luce_sandbox_close(int descriptor) {
-    (void)descriptor;
-    return -1;
-}
-#endif
 
 #if defined(__APPLE__)
 /* Present in libSystem but no longer declared without deprecated SDK annotations. */

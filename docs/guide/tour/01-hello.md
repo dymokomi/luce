@@ -20,12 +20,11 @@ or in PowerShell:
 irm https://luce.luciaos.com/install.ps1 | iex
 ```
 
-This puts the compiler, `luce`, and the project tool, `luc`, on your `PATH`. Building a
-program uses the C toolchain on your machine to assemble and link, so it needs one: the
-Xcode command line tools on macOS (`xcode-select --install`) and `gcc` or `clang` on
-Linux; the installer tells you if it is missing. On Windows it uses a MinGW-w64 `gcc` already
-on your `PATH`, or else fetches the one Luce is tested with (about 110 MB, once). Check that
-it worked:
+This puts the compiler, `luce`, and the project tool, `luc`, on your `PATH`. On macOS and
+Linux, building a program uses the C toolchain on your machine to assemble and link, so it
+needs one: the Xcode command line tools on macOS (`xcode-select --install`) and `gcc` or
+`clang` on Linux; the installer tells you if it is missing. On Windows the compiler
+assembles and links by itself, so nothing else is needed. Check that it worked:
 
 ```sh
 luce --version
