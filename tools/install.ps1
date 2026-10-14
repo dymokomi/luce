@@ -16,6 +16,8 @@
 #   LUCE_INSTALL_VERSION  the release to install (default the one below)
 #   LUCE_INSTALL_URL      the directory the archives are read from; a file:/// URL works
 #   LUCE_INSTALL_NO_PATH  1 leaves the user PATH alone
+#   LUCE_MINGW_DIR        where to keep the C toolchain it fetches (default
+#                         %LOCALAPPDATA%\luce-mingw\<its release>)
 # The user PATH is edited for the default place alone, %LOCALAPPDATA%\luce with ~\.luce:
 # an install anywhere else is put on this session's PATH only.
 $ErrorActionPreference = 'Stop'
@@ -54,18 +56,70 @@ if (-not (Test-Path -LiteralPath $tar -PathType Leaf)) {
     Fail 'tar.exe is required (it ships with Windows 10 1803 and newer)'
 }
 
-# The compiler drives MSYS2's UCRT64 GCC to assemble and link; without it, a successful
-# install would leave a compiler that cannot build its first program.
-$missing = @()
-foreach ($tool in 'gcc', 'as', 'ar', 'nm') {
-    if (-not (Get-Command "$tool.exe" -ErrorAction SilentlyContinue)) { $missing += $tool }
+# The SHA-256 of a file, lowercase hex. .NET hashes directly: Get-FileHash lives in a module
+# that Windows PowerShell 5.1 cannot find when PowerShell 7 started it (`luc update` from
+# pwsh passes its own PSModulePath).
+function Get-Sha256($path) {
+    $stream = [System.IO.File]::OpenRead($path)
+    try {
+        $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
+    } finally {
+        $stream.Dispose()
+    }
+    return ([System.BitConverter]::ToString($digest) -replace '-', '').ToLowerInvariant()
 }
-if ($missing.Count -gt 0) {
-    Write-Host "${product}: a C toolchain is required on PATH (missing: $($missing -join ', '))"
-    Write-Host "${product}: install MSYS2 from https://www.msys2.org, then in its shell run:"
-    Write-Host "${product}:     pacman -S mingw-w64-ucrt-x86_64-gcc"
-    Write-Host "${product}: and add C:\msys64\ucrt64\bin to your PATH, then run this command again"
-    exit 1
+
+# Download `url` to `path` and check it against the pinned digest `sha256`.
+function Get-Pinned($url, $path, $sha256) {
+    (New-Object System.Net.WebClient).DownloadFile($url, $path)
+    if ((Get-Sha256 $path) -ne $sha256) { Fail "$url does not match its pinned checksum" }
+}
+
+# The compiler drives MinGW-w64's GCC (UCRT, POSIX threads, SEH) to assemble and link;
+# without it, a successful install would leave a compiler that cannot build its first
+# program. One already on PATH is used. Otherwise the installer fetches the build Luce is
+# tested with, MinGW-Builds 16.2.0 rt_v14-rev1, unpacked by 7-Zip's standalone 7zr (Windows'
+# own tar cannot read its LZMA), both pinned by checksum, into its own directory beside the
+# compiler's, which `luc update` keeps; its bin\ goes on PATH with the compiler's.
+$mingwRelease = '16.2.0-rt_v14-rev1'
+$mingwUrl = "https://github.com/niXman/mingw-builds-binaries/releases/download/$mingwRelease/x86_64-16.2.0-release-posix-seh-ucrt-rt_v14-rev1.7z"
+$mingwSha256 = '26788998d615856a915e1eeacb0854fce87bc608fa9a0c16f96bcbfdcf3415c0'
+$sevenZipUrl = 'https://github.com/ip7z/7zip/releases/download/26.04/7zr.exe'
+$sevenZipSha256 = '256feca8e274e5da655e2a284fabafd9f554365eb164862089dacd4e8276d282'
+$toolchainBin = $null
+$needed = @()
+foreach ($tool in 'gcc', 'as', 'ar', 'nm') {
+    if (-not (Get-Command "$tool.exe" -ErrorAction SilentlyContinue)) { $needed += $tool }
+}
+if ($needed.Count -gt 0) {
+    $mingwRoot = if ($env:LUCE_MINGW_DIR) { $env:LUCE_MINGW_DIR } else { Join-Path $env:LOCALAPPDATA "luce-mingw\$mingwRelease" }
+    if (-not [System.IO.Path]::IsPathRooted($mingwRoot)) { Fail "LUCE_MINGW_DIR must be an absolute path: $mingwRoot" }
+    $toolchainBin = Join-Path $mingwRoot 'mingw64\bin'
+    if (-not (Test-Path (Join-Path $toolchainBin 'gcc.exe'))) {
+        Write-Host "==> no C toolchain on PATH (missing: $($needed -join ', ')): fetching MinGW-w64 GCC $mingwRelease (about 110 MB)"
+        $mingwParent = Split-Path -Parent $mingwRoot
+        New-Item -ItemType Directory -Force -Path $mingwParent | Out-Null
+        $fetch = Join-Path $mingwParent ".luce-mingw-$([System.Guid]::NewGuid().ToString('N').Substring(0, 8))"
+        New-Item -ItemType Directory -Path $fetch | Out-Null
+        try {
+            $sevenZip = Join-Path $fetch '7zr.exe'
+            Get-Pinned $sevenZipUrl $sevenZip $sevenZipSha256
+            $packed = Join-Path $fetch 'mingw.7z'
+            Get-Pinned $mingwUrl $packed $mingwSha256
+            Write-Host "==> unpacking the C toolchain"
+            $unpacked = Join-Path $fetch 'tree'
+            & $sevenZip x $packed "-o$unpacked" -y | Out-Null
+            if ($LASTEXITCODE -ne 0) { Fail 'the C toolchain could not be unpacked' }
+            foreach ($tool in 'gcc', 'as', 'ar', 'nm') {
+                if (-not (Test-Path (Join-Path $unpacked "mingw64\bin\$tool.exe"))) { Fail "the C toolchain has no $tool.exe" }
+            }
+            if (Test-Path $mingwRoot) { Remove-Item -Recurse -Force $mingwRoot }
+            Move-Item $unpacked $mingwRoot
+        } finally {
+            if (Test-Path $fetch) { Remove-Item -Recurse -Force $fetch }
+        }
+    }
+    $env:Path = "$toolchainBin;$env:Path"
 }
 
 # An override may not turn a user installer into a request to replace a system tree.
@@ -96,16 +150,7 @@ try {
 
     $expected = ((Get-Content "$archive.sha256" -First 1) -split '\s+')[0].ToLowerInvariant()
     if ($expected -notmatch '^[0-9a-f]{64}$') { Fail 'the published checksum is not a SHA-256 digest' }
-    # .NET hashes directly: Get-FileHash lives in a module that Windows PowerShell 5.1 cannot
-    # find when PowerShell 7 started it (`luc update` from pwsh passes its own PSModulePath)
-    $stream = [System.IO.File]::OpenRead($archive)
-    try {
-        $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($stream)
-    } finally {
-        $stream.Dispose()
-    }
-    $actual = ([System.BitConverter]::ToString($digest) -replace '-', '').ToLowerInvariant()
-    if ($actual -ne $expected) { Fail "the archive's checksum does not match the published digest" }
+    if ((Get-Sha256 $archive) -ne $expected) { Fail "the archive's checksum does not match the published digest" }
 
     # The checksum authenticates the bytes; the archive is still confined to its own
     # directory before anything is written.
@@ -149,10 +194,13 @@ try {
 }
 
 # The compiler's commands, and ~\.luce\bin (LUC_HOME\bin) where `luc install` links
-# applications: on the user PATH for every new terminal when this is the default place, and
-# on this session's PATH now, since `irm | iex` runs here.
+# applications, and the C toolchain when the installer fetched it: on the user PATH for
+# every new terminal when this is the default place, and on this session's PATH now, since
+# `irm | iex` runs here.
 $bin = Join-Path $installRoot 'bin'
 $apps = Join-Path $lucHome 'bin'
+$wanted = @($bin, $apps)
+if ($toolchainBin) { $wanted += $toolchainBin }
 $defaultLayout = ($installRoot -eq [System.IO.Path]::GetFullPath($defaultRoot).TrimEnd('\')) -and ($lucHome -eq $defaultHome)
 if ($env:LUCE_INSTALL_NO_PATH -ne '1' -and -not $defaultLayout) {
     Write-Host "==> the user PATH left alone for an install outside $defaultRoot with $defaultHome"
@@ -162,9 +210,9 @@ if ($env:LUCE_INSTALL_NO_PATH -ne '1' -and $defaultLayout) {
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $entries = @()
     if ($userPath) { $entries = @($userPath -split ';' | Where-Object { $_ -ne '' }) }
-    $missing = @(@($bin, $apps) | Where-Object { $entries -notcontains $_ })
+    $missing = @($wanted | Where-Object { $entries -notcontains $_ })
     if ($missing.Count -eq 0) {
-        Write-Host "==> the user PATH already names $bin and $apps"
+        Write-Host "==> the user PATH already names $($wanted -join ' and ')"
     } else {
         [Environment]::SetEnvironmentVariable('Path', ($missing + $entries) -join ';', 'User')
         Write-Host "==> added $($missing -join ' and ') to the user PATH"

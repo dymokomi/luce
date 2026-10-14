@@ -14,7 +14,13 @@ On macOS or Linux:
 curl -fsSL https://luce.luciaos.com/install.sh | sh && . "$HOME/.local/luce/env"
 ```
 
-On Windows, in PowerShell:
+On Windows, in Command Prompt:
+
+```bat
+curl -fsSLo "%TEMP%\luce-install.cmd" https://luce.luciaos.com/install.cmd && "%TEMP%\luce-install.cmd"
+```
+
+or in PowerShell:
 
 ```sh
 irm https://luce.luciaos.com/install.ps1 | iex

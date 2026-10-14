@@ -47,7 +47,7 @@ case "$system:$machine" in
         echo "$product: released for Linux x86-64, not Linux $machine; build from source instead" >&2
         exit 1 ;;
     *)
-        echo "$product: this installer is for macOS and Linux; on Windows run: irm https://luce.luciaos.com/install.ps1 | iex" >&2
+        echo "$product: this installer is for macOS and Linux; on Windows see https://luce.luciaos.com (Command Prompt: install.cmd, PowerShell: install.ps1)" >&2
         exit 1 ;;
 esac
 archive_name="$product-$version-$host.tar.gz"

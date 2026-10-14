@@ -15,8 +15,12 @@ A released `luce`, with the Base compiler and its standard library bundled besid
 installs in one line from [luce.luciaos.com](https://luce.luciaos.com): `curl -fsSL
 https://luce.luciaos.com/install.sh | sh && . "$HOME/.local/luce/env"` on macOS and Linux
 (the second half readies the terminal it runs in; new shells are set up by the profile),
-`irm https://luce.luciaos.com/install.ps1 | iex` in PowerShell on Windows. The installers
-are `tools/install.sh` and `tools/install.ps1`; the site serves copies. `LUCE_INSTALL_DIR`
+`curl -fsSLo "%TEMP%\luce-install.cmd" https://luce.luciaos.com/install.cmd && "%TEMP%\luce-install.cmd"`
+in Command Prompt on Windows (or `irm https://luce.luciaos.com/install.ps1 | iex` in
+PowerShell; `install.cmd` runs that script and readies the window it runs in). On Windows
+the installer also fetches the MinGW-w64 GCC Luce is tested with when none is on `PATH`,
+pinned by checksum. The installers are `tools/install.sh`, `tools/install.ps1` and
+`tools/install.cmd`; the site serves copies. `LUCE_INSTALL_DIR`
 installs elsewhere and `LUC_HOME` moves luc's home from `~/.luce`; a startup file (the user
 PATH on Windows) is edited only for the default layout, and `luc update` reinstalls into the
 tree it runs from (`tools/test_install_layout.sh`). It needs the host's
