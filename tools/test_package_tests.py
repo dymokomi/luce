@@ -6,6 +6,8 @@ and in a runner built natively and through C:
 - `--package`, which `luc test` passes, runs those of every module under the package's
   source root as well, imported or not, nested ones too, each after the modules it imports
   and the rest in the order of their paths; a dependency's tests never run;
+- `luce check FILE` checks the file and what it imports; `--package`, which `luc check`
+  passes, every module under the source root too;
 - a false `assert` in a test fails that test and the run goes on, while one in a function a
   test calls traps and ends the run, as a trap does anywhere.
 """
@@ -79,4 +81,9 @@ with tempfile.TemporaryDirectory(prefix="luce-package-tests-") as directory:
         assert trapped.stdout == "FAIL  a helper's assert traps\n0 passed\n1 failed\n" \
             and trapped.stderr == "trap: traps/main.luc:2:5: assert failed: n > 0\n", \
             f"FAIL a helper's assert {runner}: {trapped.stdout}{trapped.stderr}"
-print("ok luce test: the package's modules with --package, never a dependency's; a test's assert fails it, a helper's traps and names its test")
+    run(root, "check", "src/main.luc", "--package")
+    (root / "src/shapes/broken.luc").write_text('func three() -> int:\n    return "three"\n')
+    run(root, "check", "src/main.luc")
+    unreached = run(root, "check", "src/main.luc", "--package", status=1)
+    assert "broken.luc:2:" in unreached.stderr, f"FAIL luce check --package missed a module nothing imports: {unreached.stderr}"
+print("ok luce test: the package's modules with --package, never a dependency's; a test's assert fails it, a helper's traps and names its test; luce check --package every module")
