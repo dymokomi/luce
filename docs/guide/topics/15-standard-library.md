@@ -200,6 +200,10 @@ methods:
 | `cancel()` | stop it |
 | `close()` | stop it if it still runs, and let it go; `with` does it |
 
+A window does not ask `is_finished()` on a timer. Given `waker = notifier.waker()`, a
+luce-ui notifier's waker, the command wakes the window's loop as the program writes and once
+it ends, and the notifier's callback reads `is_finished()` and `output()` then.
+
 | Function | Does |
 | --- | --- |
 | `variable(name)` | an environment variable's value, or `none` |
